@@ -3548,6 +3548,23 @@ pub mod ane_residency {
         pub restarts: u64,
     }
 
+    // Test-only observation separates complete lease latency from the compile RPC,
+    // which starts after the connection lock and excludes queued inference work.
+    #[cfg(test)]
+    #[derive(Clone, serde::Serialize)]
+    struct AdmissionWait {
+        shape: usize,
+        elapsed_ms: f64,
+        admitted: bool,
+    }
+    #[cfg(test)]
+    type AdmissionWaits = Arc<Mutex<Vec<AdmissionWait>>>;
+    #[cfg(test)]
+    tokio::task_local! {
+        static ADMISSION_WAITS: AdmissionWaits;
+        static COMPILE_RPC_MS: Arc<Mutex<Option<f64>>>;
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct ShapeKey {
         model_ref: String,
@@ -3777,6 +3794,26 @@ pub mod ane_residency {
         /// leases it. The lease must be dropped before the caller waits for
         /// anything else in the supervisor.
         pub async fn lease(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            shape: usize,
+        ) -> Result<AneShapeLease, AneResidencyError> {
+            #[cfg(test)]
+            let started = std::time::Instant::now();
+            let result = self.lease_inner(worker, model_ref, shape).await;
+            #[cfg(test)]
+            let _ = ADMISSION_WAITS.try_with(|waits| {
+                waits.lock().unwrap().push(AdmissionWait {
+                    shape,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    admitted: result.is_ok(),
+                })
+            });
+            result
+        }
+
+        async fn lease_inner(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
@@ -4296,6 +4333,8 @@ pub mod ane_residency {
             })?;
             let stream = &mut session.stream;
             let max_frame = self.max_frame;
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             let result = async {
                 write_json(stream, request, max_frame).await?;
                 if let Some(raw) = raw {
@@ -4310,6 +4349,12 @@ pub mod ane_residency {
                 Ok::<_, TransportError>((response, raw))
             }
             .await;
+            #[cfg(test)]
+            if matches!(request, WorkerRequest::AneAdmitShape { .. }) {
+                let _ = COMPILE_RPC_MS.try_with(|elapsed| {
+                    *elapsed.lock().unwrap() = Some(started.elapsed().as_secs_f64() * 1000.0)
+                });
+            }
             match result {
                 Ok((response, raw)) => {
                     let mut models = self.loaded_models.lock().unwrap_or_else(|p| p.into_inner());
@@ -4714,6 +4759,7 @@ pub mod ane_residency {
         }
         #[derive(Default)]
         struct Ledger {
+            compile_samples: BTreeMap<String, Vec<Value>>,
             admitted: usize,
             evicted: usize,
             leased_evicts: usize,
@@ -4737,7 +4783,14 @@ pub mod ane_residency {
                 shape: usize,
             ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
                 Box::pin(async move {
-                    let result = self.channel.admit_shape(model_ref, shape).await;
+                    let elapsed = Arc::new(Mutex::new(None));
+                    let result = COMPILE_RPC_MS
+                        .scope(elapsed.clone(), self.channel.admit_shape(model_ref, shape))
+                        .await;
+                    let milliseconds = elapsed.lock().unwrap().expect(
+                        "compile exchange must report elapsed time after acquiring its stream lock",
+                    );
+                    self.ledger.lock().unwrap().compile_samples.entry(self.slug.clone()).or_default().push(json!({"shape":shape,"elapsed_ms":milliseconds,"admitted":result.is_ok()}));
                     match &result {
                         Ok(inventory) => {
                             let model = &manifest()["models"][&self.slug];
@@ -4903,6 +4956,7 @@ pub mod ane_residency {
                     "string" => value.is_string(),
                     "integer" => value.is_u64() || value.is_i64(),
                     "number" => value.is_number(),
+                    "boolean" => value.is_boolean(),
                     other => return Err(format!("unsupported schema type {other}")),
                 };
                 if !valid {
@@ -4989,8 +5043,14 @@ pub mod ane_residency {
         }
         #[test]
         fn stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes() {
-            let valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
+            let mut valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
             let schema = stress_schema();
+            assert!(
+                schema_validate(&valid, &schema).is_ok(),
+                "historical reports without timing fields remain valid"
+            );
+            valid["compile_duration_ms_by_model"] = json!({"gte-modernbert-base":{"count":1,"min":10,"median":10,"max":10,"samples":[{"shape":128,"elapsed_ms":10,"admitted":true}]}});
+            valid["request_wait_times"]=json!((0..37).map(|index|json!({"model":"gte-modernbert-base","request_id":format!("request-{index}"),"admission_wait_ms":12,"waits":[{"shape":128,"elapsed_ms":12,"admitted":true}]})).collect::<Vec<_>>());
             assert!(schema_validate(&valid, &schema).is_ok());
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove("sample_count");
@@ -5004,6 +5064,15 @@ pub mod ane_residency {
                 ("schema", json!(2)),
                 ("sample_count", json!(-1)),
                 ("source_commit", json!("short")),
+                ("request_wait_times", json!([])),
+                (
+                    "compile_duration_ms_by_model",
+                    json!({"m":{"count":1,"min":-1,"median":0,"max":0,"samples":[]}}),
+                ),
+                (
+                    "compile_duration_ms_by_model",
+                    json!({"m":{"count":1,"min":1,"median":1,"max":1,"samples":[{"shape":128,"elapsed_ms":1,"admitted":"true"}]}}),
+                ),
             ] {
                 let mut malformed = valid.clone();
                 malformed[field] = bad;
@@ -5016,6 +5085,68 @@ pub mod ane_residency {
             extra["unknown"] = json!(true);
             assert!(schema_validate(&extra, &schema).is_err());
         }
+        type RequestWaits = Arc<Mutex<BTreeMap<(String, String), AdmissionWaits>>>;
+
+        fn spawn_stress_request(
+            tasks: &mut tokio::task::JoinSet<Result<(), AneResidencyError>>,
+            waits: &RequestWaits,
+            model: String,
+            request_id: String,
+            request: impl std::future::Future<Output = Result<(), AneResidencyError>> + Send + 'static,
+        ) {
+            let samples = AdmissionWaits::default();
+            waits
+                .lock()
+                .unwrap()
+                .insert((model, request_id), samples.clone());
+            tasks.spawn(ADMISSION_WAITS.scope(samples, request));
+        }
+
+        fn compile_duration_summary(samples: &BTreeMap<String, Vec<Value>>) -> Value {
+            let mut summary = serde_json::Map::new();
+            for (model, records) in samples {
+                let mut elapsed = records
+                    .iter()
+                    .map(|record| record["elapsed_ms"].as_f64().unwrap())
+                    .collect::<Vec<_>>();
+                elapsed.sort_by(f64::total_cmp);
+                let count = elapsed.len();
+                if count > 0 {
+                    summary.insert(model.clone(),json!({"count":count,"min":elapsed[0],"median":(elapsed[(count-1)/2]+elapsed[count/2])/2.0,"max":elapsed[count-1],"samples":records}));
+                }
+            }
+            Value::Object(summary)
+        }
+
+        fn request_wait_summary(waits: &RequestWaits) -> Vec<Value> {
+            waits.lock().unwrap().iter().map(|((model,request_id),samples)|{
+                let samples=samples.lock().unwrap();
+                json!({"model":model,"request_id":request_id,"admission_wait_ms":samples.iter().map(|sample|sample.elapsed_ms).sum::<f64>(),"waits":*samples})
+            }).collect()
+        }
+
+        #[test]
+        fn compile_duration_summary_reports_independent_even_and_odd_medians() {
+            let records = |elapsed: &[f64]| {
+                elapsed
+                    .iter()
+                    .map(|elapsed| json!({"shape":128,"elapsed_ms":elapsed,"admitted":true}))
+                    .collect::<Vec<_>>()
+            };
+            let summary = compile_duration_summary(&BTreeMap::from([
+                ("gte".into(), records(&[9.0, 1.0, 7.0, 3.0])),
+                ("qwen".into(), records(&[8.0, 4.0, 2.0])),
+            ]));
+            assert_eq!(summary["gte"]["min"], 1.0);
+            assert_eq!(summary["gte"]["median"], 5.0);
+            assert_eq!(summary["gte"]["max"], 9.0);
+            assert_eq!(summary["gte"]["count"], 4);
+            assert_eq!(summary["qwen"]["min"], 2.0);
+            assert_eq!(summary["qwen"]["median"], 4.0);
+            assert_eq!(summary["qwen"]["max"], 8.0);
+            assert_eq!(summary["qwen"]["count"], 3);
+        }
+
         fn write_stress(out: &Path, report: &Value) {
             schema_validate(report, &stress_schema()).unwrap();
             if let Some(parent) = out.parent() {
@@ -5059,84 +5190,104 @@ pub mod ane_residency {
             }
             let barrier = Arc::new(tokio::sync::Barrier::new(38));
             let mut tasks = tokio::task::JoinSet::new();
+            let request_waits = RequestWaits::default();
             for worker in &workers {
                 for shape in [128, 256, 512, 1024, 2048, 4096, 8192] {
                     let worker = worker.clone();
                     let supervisor = supervisor.clone();
                     let barrier = barrier.clone();
-                    tasks.spawn(async move {
-                        barrier.wait().await;
-                        let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                        let lease = supervisor.lease(&channel, &worker.model_ref, shape).await?;
-                        assert!(!lease.inventory().unwrap().executables.is_empty());
-                        drop(lease);
-                        Ok::<_, AneResidencyError>(())
-                    });
+                    spawn_stress_request(
+                        &mut tasks,
+                        &request_waits,
+                        worker.slug.clone(),
+                        format!("admit-{shape}"),
+                        async move {
+                            barrier.wait().await;
+                            let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                            let lease =
+                                supervisor.lease(&channel, &worker.model_ref, shape).await?;
+                            assert!(!lease.inventory().unwrap().executables.is_empty());
+                            drop(lease);
+                            Ok::<_, AneResidencyError>(())
+                        },
+                    );
                 }
             }
-            for _ in 0..8 {
+            for index in 0..8 {
                 let worker = workers[0].clone();
                 let supervisor = supervisor.clone();
                 let barrier = barrier.clone();
-                tasks.spawn(async move {
-                    barrier.wait().await;
-                    let ids = [
-                        fixture_ids(SLUGS[0], "boundary-128"),
-                        fixture_ids(SLUGS[0], "boundary-129"),
-                    ];
-                    let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                    supervisor
-                        .run_by_rung(&channel, &worker.model_ref, &[128, 129], |_, indices| {
-                            let worker = worker.clone();
-                            let input = ids[indices[0]].clone();
-                            async move { infer(&worker, input, false).await.map(|_| vec![()]) }
-                        })
-                        .await
-                        .map(|_| ())
-                });
+                spawn_stress_request(
+                    &mut tasks,
+                    &request_waits,
+                    worker.slug.clone(),
+                    format!("embed-{index}"),
+                    async move {
+                        barrier.wait().await;
+                        let ids = [
+                            fixture_ids(SLUGS[0], "boundary-128"),
+                            fixture_ids(SLUGS[0], "boundary-129"),
+                        ];
+                        let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                        supervisor
+                            .run_by_rung(&channel, &worker.model_ref, &[128, 129], |_, indices| {
+                                let worker = worker.clone();
+                                let input = ids[indices[0]].clone();
+                                async move { infer(&worker, input, false).await.map(|_| vec![()]) }
+                            })
+                            .await
+                            .map(|_| ())
+                    },
+                );
             }
             let pool_results: Arc<Mutex<Vec<(usize, f32)>>> = Arc::new(Mutex::new(Vec::new()));
             let pool_result_task = pool_results.clone();
             let worker = workers[1].clone();
             let supervisor_pool = supervisor.clone();
             let barrier_pool = barrier.clone();
-            tasks.spawn(async move {
-                barrier_pool.wait().await;
-                let mut long = fixture_ids(SLUGS[1], "long-8192");
-                let eos = *long.last().unwrap();
-                long.truncate(1535);
-                long.push(eos);
-                let ids = [
-                    fixture_ids(SLUGS[1], "short-0"),
-                    fixture_ids(SLUGS[1], "boundary-511"),
-                    long,
-                ];
-                let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                supervisor_pool
-                    .run_by_rung(
-                        &channel,
-                        &worker.model_ref,
-                        &[ids[0].len(), ids[1].len(), ids[2].len()],
-                        |shape, indices| {
-                            let worker = worker.clone();
-                            let input = ids[indices[0]].clone();
-                            let pool_results = pool_result_task.clone();
-                            async move {
-                                let first = infer(&worker, input.clone(), true).await?;
-                                let second = infer(&worker, input, true).await?;
-                                assert_eq!(
-                                    first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                                    second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-                                );
-                                assert_eq!(first.len(), 1);
-                                pool_results.lock().unwrap().push((shape, first[0]));
-                                Ok::<_, AneResidencyError>(vec![()])
-                            }
-                        },
-                    )
-                    .await
-                    .map(|_| ())
-            });
+            spawn_stress_request(
+                &mut tasks,
+                &request_waits,
+                worker.slug.clone(),
+                "reranker-pool".into(),
+                async move {
+                    barrier_pool.wait().await;
+                    let mut long = fixture_ids(SLUGS[1], "long-8192");
+                    let eos = *long.last().unwrap();
+                    long.truncate(1535);
+                    long.push(eos);
+                    let ids = [
+                        fixture_ids(SLUGS[1], "short-0"),
+                        fixture_ids(SLUGS[1], "boundary-511"),
+                        long,
+                    ];
+                    let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                    supervisor_pool
+                        .run_by_rung(
+                            &channel,
+                            &worker.model_ref,
+                            &[ids[0].len(), ids[1].len(), ids[2].len()],
+                            |shape, indices| {
+                                let worker = worker.clone();
+                                let input = ids[indices[0]].clone();
+                                let pool_results = pool_result_task.clone();
+                                async move {
+                                    let first = infer(&worker, input.clone(), true).await?;
+                                    let second = infer(&worker, input, true).await?;
+                                    assert_eq!(
+                                        first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                        second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                                    );
+                                    assert_eq!(first.len(), 1);
+                                    pool_results.lock().unwrap().push((shape, first[0]));
+                                    Ok::<_, AneResidencyError>(vec![()])
+                                }
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                },
+            );
             assert_eq!(tasks.len(), 37);
             barrier.wait().await;
             let mut completed = 0;
@@ -5156,7 +5307,7 @@ pub mod ane_residency {
             let clean = {
                 let ledger = ledger.lock().unwrap();
 
-                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
+                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "compile_duration_ms_by_model":compile_duration_summary(&ledger.compile_samples),"request_wait_times":request_wait_summary(&request_waits), "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
                 let out = std::env::var_os("ANE_STRESS_OUT")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
@@ -5767,6 +5918,47 @@ pub mod ane_residency {
             assert_eq!(data.leased_evicts, 0);
             drop(data);
             drop(lease);
+        }
+
+        #[tokio::test]
+        async fn compile_rpc_measurement_observes_the_actual_worker_exchange() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().admit_delay = Duration::from_millis(20);
+            let channel = mock_channel("worker", &ledger).await;
+            let elapsed = Arc::new(Mutex::new(None));
+            COMPILE_RPC_MS
+                .scope(elapsed.clone(), channel.admit_shape("model", 128))
+                .await
+                .unwrap();
+            assert!(
+                elapsed.lock().unwrap().unwrap() >= 20.0,
+                "the compile sample must include the delayed worker response, not a proxy"
+            );
+        }
+
+        #[tokio::test]
+        async fn admission_wait_measurement_covers_success_and_deadline_refusal() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let waits = AdmissionWaits::default();
+            ADMISSION_WAITS
+                .scope(waits.clone(), async {
+                    let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+                    assert!(supervisor.lease(&worker, "model", 256).await.is_err());
+                    drop(held);
+                })
+                .await;
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 2);
+            assert_eq!(waits[0].shape, 128);
+            assert!(waits[0].admitted);
+            assert_eq!(waits[1].shape, 256);
+            assert!(!waits[1].admitted);
+            assert!(
+                waits[1].elapsed_ms >= 20.0,
+                "measure the actual admission future, including its wait deadline"
+            );
         }
 
         #[tokio::test]

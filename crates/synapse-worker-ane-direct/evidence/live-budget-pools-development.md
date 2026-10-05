@@ -29,3 +29,13 @@ The full real-worker stress test, not a unit assertion about syntactic pool plac
 JSON summary: **37 requests,8 completed,29 failed**, all29 failures exactly `admission budget wait deadline exceeded` with250ms retry. **No hardware `no ANE resources` errors**, no nonresident inference errors, no leased eviction. Eight shape admissions, five completed evictions, thirteen residency samples, peak two shapes per model/three overall. The reranker finite/repeat checks did not complete successfully; Metal ranking remains explicitly skipped because its package/lane is unavailable.
 
 This is not a passing hardware regression. The original pre-fix flood failed33 of37 requests while loading layer0 with `Program load failed — no ANE resources`, underlying0x5. This run instead failed only on the admission queue's wait deadline: pooled reclamation has avoided all observed hardware resource refusals, but the37-way cold/debug flood exceeds the unchanged600-second admission wait deadline. No timeout or success assertion was relaxed to turn this run green. A separate decision is needed on cold-start stress scheduling/deadline policy before another run; the evidence does not establish37-request acceptance or a release-quality throughput claim.
+
+## Release comparison instrumentation
+
+The release comparison will prebuild both the worker and module test harness with `--release`, then reuse the 37-request workload, 600-second admission wait deadline, assertions, and load gates from `stress-pooled-live100-development.json`.
+
+New optional version1 JSON fields preserve validation of historical reports:
+- `compile_duration_ms_by_model`: count, minimum, median, maximum and per-shape attempt samples, in milliseconds. The timer measures the shape-compilation request (`ANE_ADMIT_SHAPE`) and its response **after** the connection lock is acquired, excluding queued inference on the same connection; it includes worker graph construction, program compilation/loading and inventory serialization. Both successful and refused attempts are recorded.
+- `request_wait_times`: all 37 model/request identifiers, summed admission wait milliseconds, and individual rung waits with success/refusal outcome. Each wait spans the complete `lease` future, including FIFO queueing, eviction, and compilation if necessary, but excludes inference.
+
+Instrumentation is test-only and does not change production admission behavior. Independent odd/even median fixtures, actual delayed worker-response timing, successful/deadline-refused lease timing, and schema type/count checks cover the new records. The deadline-failed debug run in `stress-pooled-live100-development.json` predates these timers, so exact per-request or per-shape timings cannot be reconstructed and are not fabricated.
