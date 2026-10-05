@@ -46,3 +46,11 @@ python3 crates/synapse-worker-ane-direct/tests/run_scope_capacity.py --driver "$
 ```
 
 The launchers unset TMPDIR and set DEVELOPER_DIR to `/Applications/Xcode.app/Contents/Developer`. The production admission helper retains the same signature and delegates to private `admit_with_limit(shape, os, limit, compiler)` with named `PRODUCTION_SHAPE_LIMIT=4`. Only the ignored measurement test passes 64. A production-path unit test rejects a fifth shape; temporarily raising the constant to 5 makes that test fail while the other ten nonignored unit tests stay green.
+
+## Budget implementation and first stress rerun
+
+The approved 100-executable module-wide reservation budget is committed with five new supervisor tests. The reservation and comparison mutations each fail only the selected policy test; the pinned-layer-count control stays green. See `budget-mutations-development.json` for exact mutation evidence.
+
+The full 37-request hardware stress **still failed** after waiting for a quiet start: load 15.10 / 19.45 / 21.30, rising to 25.97 / 24.93 / 22.92 at end. It ran for 567.29 seconds; 4 requests completed and 33 failed at compile layer 0 with no ANE resources (`0x5`). There were 4 admissions, 4 evictions, 34 resource-exhaustion events, no leased evictions, and no nonresident inference. Peak logical occupancy was 4 shapes, at most 100 reserved executables; the reranker pool checks failed. `stress-executable-budget-development.json` preserves the full report without a platform UUID.
+
+Static reservation alone is therefore **not demonstrated sufficient** for concurrent or turnover-heavy workloads. Unload completion and concurrent compiler behavior require separate controls before selecting an additional production policy; the runtime transient refusal remains essential.

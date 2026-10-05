@@ -1,0 +1,28 @@
+{
+  "classification": "development",
+  "toolchain": "cargo 1.99.0 (5f94df478 2026-08-27), rustc 1.99.0 (b940084d7 2026-09-28)",
+  "controls": [
+    {
+      "control": "Temporarily raise production worker shape cap from 4 to 5",
+      "expected_red": "backend::fresh_process_hardware::production_shape_limit_refuses_fifth_shape",
+      "captured_output": "production_shape_limit_refuses_fifth_shape ... FAILED; left tensor_missing:layers.0.attn.Wqkv.weight, right ane_residency_limit. 10 passed; 1 failed; 7 ignored. Other ten nonignored worker unit tests stayed green.",
+      "applied_evidence": "crates/synapse-worker-ane-direct/src/backend.rs: staged live files, empty git diff --stat; mutant 1 file changed, 1 insertion(+), 1 deletion(-); git checkout -- path && touch path restored empty git diff --stat.",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Count only Resident slots, excluding pending compile reservations",
+      "expected_red": "worker_host::ane_residency::tests::pending_compiles_reserve_full_executable_budget",
+      "captured_output": "pending_compiles_reserve_full_executable_budget ... FAILED: pending compile's four layers must prevent another four-layer reservation. pinned_layer_counts_charge_gte_and_qwen_before_admission ... ok. 1 passed; 1 failed; 569 filtered out.",
+      "applied_evidence": "crates/synapse-module/src/worker_host/mod.rs: staged live file, empty git diff --stat; mutant 1 file changed, 1 insertion(+), 1 deletion(-); git checkout -- path && touch path restored empty git diff --stat.",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Bypass executable budget comparison with executable_full=false",
+      "expected_red": "worker_host::ane_residency::tests::executable_budget_refuses_before_hardware_limit",
+      "captured_output": "executable_budget_refuses_before_hardware_limit ... FAILED: budget sent an over-budget shape to hardware. pinned_layer_counts_charge_gte_and_qwen_before_admission ... ok. 1 passed; 1 failed; 569 filtered out.",
+      "applied_evidence": "crates/synapse-module/src/worker_host/mod.rs: staged live file, empty git diff --stat; mutant 1 file changed, 1 insertion(+), 2 deletions(-); git checkout -- path && touch path restored empty git diff --stat.",
+      "outcome": "reddened"
+    }
+  ],
+  "restored_verification": "cargo test --locked -p synapse-module --lib worker_host::ane_residency: 15 passed, 3 hardware tests ignored; cargo test --locked -p synapse-worker-ane-direct: 11 unit tests and 1 vendor-integrity test passed, 7 hardware tests ignored. All mutants restored before commits."
+}
