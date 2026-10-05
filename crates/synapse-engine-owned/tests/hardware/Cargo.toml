@@ -1,0 +1,15 @@
+[package]
+name = "synapse-metal-hardware-parity"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep hardware-only evaluator dependencies out of the production engine.
+[workspace]
+
+[dependencies]
+synapse-engine-owned = { path = "../.." }
+synapse-core = { path = "../../../synapse-core" }
+synapse-parity = { path = "../../../../bench/parity", default-features = false }
+serde_json = "1"
+sha2 = "0.10"
