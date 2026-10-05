@@ -4378,6 +4378,17 @@ pub mod ane_residency {
         pub confirm_exit: BoxFuture<'static, Result<(), AneResidencyError>>,
     }
 
+    #[cfg(test)]
+    struct CompileRpcClock(std::time::Instant);
+    #[cfg(test)]
+    impl Drop for CompileRpcClock {
+        fn drop(&mut self) {
+            let _ = COMPILE_RPC_MS.try_with(|elapsed| {
+                *elapsed.lock().unwrap() = Some(self.0.elapsed().as_secs_f64() * 1000.0)
+            });
+        }
+    }
+
     // Dropping a partially completed exchange leaves unread framing on the socket.
     // Fault it before the stream mutex is released so no next request can consume it.
     struct ExchangeFaultGuard<'a> {
@@ -4405,6 +4416,8 @@ pub mod ane_residency {
         request_counter: AtomicU64,
         stop_exchanges: Notify,
         generation: AtomicU64,
+        shape_rpc_timeout: std::time::Duration,
+        owner_exit_timeout: std::time::Duration,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -4428,6 +4441,12 @@ pub mod ane_residency {
                 request_counter: AtomicU64::new(0),
                 stop_exchanges: Notify::new(),
                 generation: AtomicU64::new(0),
+                // Compiling/loading all 22 GTE layers at length 8192 took 115.495s
+                // in debug. The 100-program budget permits at most four concurrent
+                // shape compiles (minimum 22 layers each); 600s covers their measured
+                // serialized cost (~462s) plus headroom, but bounds a silent worker.
+                shape_rpc_timeout: std::time::Duration::from_secs(600),
+                owner_exit_timeout: std::time::Duration::from_secs(30),
             })
         }
 
@@ -4456,6 +4475,34 @@ pub mod ane_residency {
             raw: Option<&[u8]>,
             generation: u64,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            let operation = self.exchange_inner(request, raw, generation);
+            if matches!(
+                request,
+                WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneEvictShape { .. }
+            ) {
+                match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if self.generation() == generation {
+                            self.faulted.store(true, Ordering::Relaxed);
+                            self.stop_exchanges.notify_waiters();
+                        }
+                        Err(AneResidencyError::Channel(
+                            "shape exchange deadline exceeded; owner exit required".into(),
+                        ))
+                    }
+                }
+            } else {
+                operation.await
+            }
+        }
+
+        async fn exchange_inner(
+            &self,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+            generation: u64,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
             let mut guard = self.stream.lock().await;
             if self.generation() != generation {
                 return Err(AneResidencyError::Channel("stale worker generation".into()));
@@ -4478,7 +4525,8 @@ pub mod ane_residency {
                 completed: false,
             };
             #[cfg(test)]
-            let started = std::time::Instant::now();
+            let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
+                .then(|| CompileRpcClock(std::time::Instant::now()));
             let result = tokio::select! {
                 _=stopped=>Err(AneResidencyError::Channel("worker recovery interrupted an active exchange".into())),
                 result=async {
@@ -4496,11 +4544,7 @@ pub mod ane_residency {
             }=>result
             };
             #[cfg(test)]
-            if matches!(request, WorkerRequest::AneAdmitShape { .. }) {
-                let _ = COMPILE_RPC_MS.try_with(|elapsed| {
-                    *elapsed.lock().unwrap() = Some(started.elapsed().as_secs_f64() * 1000.0)
-                });
-            }
+            drop(compile_clock);
             match result {
                 Ok((response, raw)) => {
                     exchange_guard.completed = true;
@@ -4638,16 +4682,22 @@ pub mod ane_residency {
                 if let Some(old) = guard.take() {
                     self.exit_unconfirmed.store(true, Ordering::Relaxed);
                     drop(old.stream);
-                    old.confirm_exit.await?;
+                    tokio::time::timeout(self.owner_exit_timeout,old.confirm_exit).await.map_err(|_|AneResidencyError::Channel("owner exit confirmation deadline exceeded; ownership remains closed".into()))??;
                     self.exit_unconfirmed.store(false, Ordering::Relaxed);
                 }
-                let mut fresh = (self.connect)().await?;
+                let mut fresh = tokio::time::timeout(self.shape_rpc_timeout, (self.connect)())
+                    .await
+                    .map_err(|_| {
+                        AneResidencyError::Channel(
+                            "replacement connection deadline exceeded".into(),
+                        )
+                    })??;
                 let models = self
                     .loaded_models
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
-                let reload = async {
+                let reload = tokio::time::timeout(self.shape_rpc_timeout, async {
                     for (model_ref, mut request) in models {
                         let req_id = self.next_req_id("reload");
                         if let WorkerRequest::Load { req_id: id, .. } = &mut request {
@@ -4670,12 +4720,21 @@ pub mod ane_residency {
                         }
                     }
                     Ok::<_, AneResidencyError>(())
-                }
-                .await;
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AneResidencyError::Channel(
+                        "pinned model restoration deadline exceeded".into(),
+                    ))
+                });
                 if let Err(error) = reload {
                     self.exit_unconfirmed.store(true, Ordering::Relaxed);
                     drop(fresh.stream);
-                    fresh.confirm_exit.await?;
+                    tokio::time::timeout(self.owner_exit_timeout, fresh.confirm_exit)
+                        .await
+                        .map_err(|_| {
+                            AneResidencyError::Channel("replacement owner exit unconfirmed".into())
+                        })??;
                     self.exit_unconfirmed.store(false, Ordering::Relaxed);
                     return Err(error);
                 }
@@ -4980,9 +5039,9 @@ pub mod ane_residency {
                                 .admit_shape_at_generation(generation, model_ref, shape),
                         )
                         .await;
-                    let milliseconds = elapsed.lock().unwrap().expect(
-                        "compile exchange must report elapsed time after acquiring its stream lock",
-                    );
+                    // No compilation RPC is written until the worker socket mutex
+                    // is acquired; a refusal before that point has zero dispatched time.
+                    let milliseconds = elapsed.lock().unwrap().unwrap_or(0.0);
                     self.ledger.lock().unwrap().compile_samples.entry(self.slug.clone()).or_default().push(json!({"shape":shape,"elapsed_ms":milliseconds,"admitted":result.is_ok()}));
                     match &result {
                         Ok(inventory) => {
@@ -5745,6 +5804,9 @@ pub mod ane_residency {
             fail_admit: HashSet<(String, usize)>,
             fail_evict: HashSet<(String, usize)>,
             fail_confirm_exit: bool,
+            exit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            no_reply_admit: HashSet<(String, usize)>,
+            no_reply_evict: HashSet<(String, usize)>,
             exhaust_admit: HashMap<(String, usize), usize>,
             admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
@@ -5801,6 +5863,13 @@ pub mod ane_residency {
                         model_ref,
                         shape,
                     } => {
+                        let key = (model_ref.clone(), *shape);
+                        let unacknowledged = ledger.lock().unwrap().no_reply_admit.remove(&key);
+                        if unacknowledged {
+                            own.insert(key.clone());
+                            ledger.lock().unwrap().resident.insert(key);
+                            continue;
+                        }
                         let delay = ledger.lock().unwrap().admit_delay;
                         tokio::time::sleep(delay).await;
                         let key = (model_ref.clone(), *shape);
@@ -5860,6 +5929,14 @@ pub mod ane_residency {
                         model_ref,
                         shape,
                     } => {
+                        let unacknowledged = ledger
+                            .lock()
+                            .unwrap()
+                            .no_reply_evict
+                            .remove(&(model_ref.clone(), *shape));
+                        if unacknowledged {
+                            continue;
+                        }
                         let failed = ledger
                             .lock()
                             .unwrap()
@@ -6336,6 +6413,29 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
+        async fn exit_confirmation_timeout_retains_reservations_and_never_spawns_replacement() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().exit_gate =
+                Some((Arc::new(Notify::new()), Arc::new(Notify::new())));
+            let mut channel = mock_channel("worker", &ledger).await;
+            Arc::get_mut(&mut channel).unwrap().0.owner_exit_timeout = Duration::from_millis(20);
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(!tokio::time::timeout(
+                Duration::from_millis(200),
+                recover_worker(&supervisor.inner, &worker)
+            )
+            .await
+            .expect("unconfirmed exit must produce a bounded failure"));
+            assert!(channel.exit_unconfirmed.load(Ordering::Relaxed));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            assert!(supervisor.lease(&worker, "model", 256).await.is_err());
+            drop(held);
+        }
+
+        #[tokio::test]
         async fn unconfirmed_exit_keeps_worker_closed_and_budget_charged() {
             let ledger = SharedLedger::default();
             ledger.lock().unwrap().fail_confirm_exit = true;
@@ -6349,6 +6449,70 @@ pub mod ane_residency {
             assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
             assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
             drop(held);
+        }
+
+        async fn unacknowledged_shape_operation(execute_eviction: bool) {
+            let ledger = SharedLedger::default();
+            let started = Arc::new(Notify::new());
+            let confirm = Arc::new(Notify::new());
+            ledger.lock().unwrap().exit_gate = Some((started.clone(), confirm.clone()));
+            let mut channel = mock_channel("worker", &ledger).await;
+            Arc::get_mut(&mut channel).unwrap().0.shape_rpc_timeout = Duration::from_millis(20);
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(4, Duration::from_secs(3));
+            let shape = if execute_eviction {
+                drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+                ledger
+                    .lock()
+                    .unwrap()
+                    .no_reply_evict
+                    .insert(("model".into(), 128));
+                256
+            } else {
+                ledger
+                    .lock()
+                    .unwrap()
+                    .no_reply_admit
+                    .insert(("model".into(), 128));
+                128
+            };
+            let waiting_supervisor = supervisor.clone();
+            let waiting_worker = worker.clone();
+            let task = tokio::spawn(async move {
+                waiting_supervisor
+                    .lease(&waiting_worker, "model", shape)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_millis(200), started.notified())
+                .await
+                .expect(
+                    "unacknowledged shape RPC must time out and request owner exit confirmation",
+                );
+            assert!(channel.faulted.load(Ordering::Relaxed));
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                4,
+                "timeout alone must not refund capacity"
+            );
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            confirm.notify_one();
+            let result = task.await.unwrap();
+            if execute_eviction {
+                drop(result.expect("confirmed eviction recovery may resume the waiting admission"));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(supervisor.stats().restarts, 1);
+            drop(supervisor.lease(&worker, "model", shape).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn unacknowledged_admission_times_out_without_refunding_before_exit() {
+            unacknowledged_shape_operation(false).await;
+        }
+        #[tokio::test]
+        async fn unacknowledged_eviction_times_out_without_refunding_before_exit() {
+            unacknowledged_shape_operation(true).await;
         }
 
         #[tokio::test]
@@ -6667,6 +6831,7 @@ pub mod ane_residency {
                         .entry(worker_id)
                         .or_default() += 1;
                     let fail_exit = ledger.lock().unwrap().fail_confirm_exit;
+                    let exit_gate = ledger.lock().unwrap().exit_gate.clone();
                     let task = tokio::spawn(serve_mock(worker, ledger));
                     Ok(AneWorkerSession {
                         stream: host,
@@ -6674,6 +6839,10 @@ pub mod ane_residency {
                             task.await.map_err(|error| {
                                 AneResidencyError::Channel(format!("mock owner exit: {error}"))
                             })?;
+                            if let Some((started, release)) = exit_gate {
+                                started.notify_one();
+                                release.notified().await;
+                            }
                             if fail_exit {
                                 Err(AneResidencyError::Channel(
                                     "mock owner exit unconfirmed".into(),

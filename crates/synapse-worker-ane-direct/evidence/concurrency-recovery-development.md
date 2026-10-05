@@ -55,3 +55,32 @@ cancelled exchange must fault the stream instead of returning the abandoned evic
 The mock acknowledges receiving the eviction request, withholds its response, and the client task is aborted. Releasing the mock response must not let a subsequent Ping read the abandoned eviction response. An RAII guard faults any exchange dropped before both JSON and optional raw response frames complete, before releasing the connection mutex. Confirmed-exit restart permits a fresh Ping afterward.
 
 Caller audit of snapshot `0293b3ba`: production `AneWorkerChannel::exchange` calls are the channel's `admit_shape` and `evict_shape` trait methods. The direct embed/rerank exchange in `infer` belongs to the macOS-only hardware-test module; `run_by_rung` groups requests by admitted sequence-length bucket and accepts caller-supplied inference futures, which can be dropped, and the same guard covers those direct exchanges. Regular `WorkerHost` embed/rerank uses separate `send_request`, not this channel, with request-timeout wrappers. Frame `read_json`/`read_raw` in `synapse-core` Unix/Windows transports and framing `read_exact` have no intrinsic timeout; only handshake and ordinary host request wrappers supply one.
+
+## Unacknowledged shape commands
+
+Before adding shape exchange deadlines, the admission and eviction no-reply tests failed while the worker held its socket open and read further requests without acknowledging the shape command:
+
+```text
+unacknowledged_admission_times_out_without_refunding_before_exit ... FAILED
+unacknowledged_eviction_times_out_without_refunding_before_exit ... FAILED
+unacknowledged shape RPC must time out and request owner exit confirmation: Elapsed(())
+0 passed;2 failed; finished in0.41s
+```
+
+After fix: 30 ordinary residency/schema/timing tests pass; three hardware tests remain ignored. The tests use 20 ms exchange deadlines and hold the mock exit-confirmation future on a notification until explicitly released: four executables remain charged, the channel is faulted, and no replacement connection exists before confirmation. After confirmed exit, failed admission refuses while recovered eviction can transparently resume the waiting admission. Later requests succeed in both cases. A separate test bounds an exit-confirmation future that never completes and proves reservations remain charged and no replacement is spawned.
+
+Production admit/evict exchanges have a 600-second deadline covering connection-lock wait, writes, JSON response, and any raw response. The largest measured debug shape compile was 115.495 s (`capacity-development-scope-large.json`); the 100-program budget allows at most four simultaneous shape reservations, each at least 22 programs. Four such measured compiles total about 462 s; 600 s adds about 138 s of headroom while remaining finite under a silent worker. Expiry faults/interrupts the owner and follows confirmed-exit recovery; it never refunds a reservation by itself. Exit confirmation is bounded at 30 s (the owned real child already gets a 10 s graceful wait before kill/exit confirmation). Replacement connection and pinned-model replay are bounded too; failed confirmation or restoration stays closed. Interrupted compile timing is recorded on drop; a refused request that never acquires the stream records zero dispatched compile time.
+
+The mock-transport regression tests verify deadlock recovery, drain escalation, stale-operation rejection, cancellation, and no-reply timeouts; they do not certify hardware behavior. No additional hardware measurement was run. No process not started by this worker was stopped.
+
+Final corrected regression output (same test names as the failing runs):
+
+```text
+failed_resource_victim_eviction_recovers_without_waiting_on_its_own_admission ... ok
+drain_timeout_forces_confirmed_exit_and_reopens_worker ... ok
+queued_eviction_from_old_owner_is_refused_after_restart ... ok
+cancelled_exchange_faults_channel_before_a_later_request_reads_stale_reply ... ok
+unacknowledged_admission_times_out_without_refunding_before_exit ... ok
+unacknowledged_eviction_times_out_without_refunding_before_exit ... ok
+test result: ok. 30 passed;0 failed;3 ignored
+```
