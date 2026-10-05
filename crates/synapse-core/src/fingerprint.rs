@@ -375,7 +375,8 @@ mod tests {
     #[test]
     fn every_fingerprint_input_changes_identity_independently() {
         let original = sample_profile();
-        let fields: &[(&str, fn(&mut NumericProfile))] = &[
+        type Mutation = (&'static str, fn(&mut NumericProfile));
+        let fields: &[Mutation] = &[
             ("model_digest", |p| p.model_digest.push('x')),
             ("quant", |p| p.quant.push('x')),
             ("lane", |p| p.engine.engine.push('x')),
