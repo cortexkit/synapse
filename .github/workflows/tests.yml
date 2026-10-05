@@ -191,6 +191,16 @@ jobs:
         working-directory: synapse
         run: bash scripts/public-banlist-check.sh
 
+      # Crates from other CortexKit repos come from crates.io or a pinned git
+      # commit, never a path into a sibling checkout, whose releases would
+      # leave Cargo.lock stale. The self-test proves the check can refuse.
+      - name: no external path dependencies
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: |
+          bash scripts/check-no-external-path-deps.sh --self-test
+          bash scripts/check-no-external-path-deps.sh
+
       # The ANE campaign harness pins the probe's comparator, gate and row set by
       # digest, and refuses every candidate when they drift. A spike merge once
       # changed that code without re-pinning and nothing noticed until a later

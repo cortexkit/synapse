@@ -3,6 +3,7 @@
 # here first because a drifted workflow would fail in seconds on CI anyway and
 # failing locally is free.
 bash scripts/check-train-preconditions.sh || refuse "train preconditions failed — see scripts/check-train-preconditions.sh"
+bash scripts/check-no-external-path-deps.sh || refuse "a Cargo path dependency resolves outside the repository — see scripts/check-no-external-path-deps.sh"
 
 # CI compiles 7 of the workspace members. The Metal engine and the ANE worker
 # need a Mac, and the macos runner left with the M1 box, so this
