@@ -191,7 +191,7 @@ impl Session {
     async fn observations(&mut self) -> Result<Value> {
         let value = self.request("certify.observations", json!({})).await?;
         if value["available"] != true {
-            return Err(refuse("certify.observations unavailable"));
+            return Err(refuse(format!("certify.observations unavailable: {value}")));
         }
         Ok(value)
     }
@@ -399,6 +399,9 @@ async fn observe(
         let response = session
             .request(method, request_params(case, operation))
             .await?;
+        if outputs.is_empty() && response.get("error").is_some() {
+            eprintln!("certification input {} refused: {response}", case["id"]);
+        }
         if let Some(value) = response["fingerprint"].as_str() {
             if fingerprint.as_deref().is_some_and(|old| old != value) {
                 return Err(refuse("fingerprint changed during run"));
