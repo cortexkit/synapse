@@ -29,3 +29,12 @@ runs. Selecting full Xcode instead of Command Line Tools and rebuilding the
 engine generated the embedded Metal kernels, allowing all three decode kernel
 tests to pass. The full owned package suite passed 58 unit tests, 9 integration
 tests (12 ignored), and 2 doc tests.
+
+## Repository gates
+
+`cargo fmt --all --check` and the standalone hardware crate's formatting check
+passed. `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test
+--workspace` passed: 1114 tests passed, 64 ignored, no failures. An initial
+workspace attempt still used cached spike kernels built with Command Line
+Tools; cleaning `spike-unified-rt` and rebuilding under full Xcode resolved
+those three convolution-test failures without source changes.
