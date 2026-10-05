@@ -23906,6 +23906,66 @@ async fn ensure_catalog_lane_ready(
     ensure_catalog_lane_ready_owned(state, entry, backend, guard).await
 }
 
+// Nanosecond ctime is essential: restoring mtime after an in-place write must
+// not make corrupted bytes eligible for the persisted verification fast path.
+fn catalog_file_stamp(path: &Path) -> Option<[String; 5]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some([
+            metadata.dev().to_string(),
+            metadata.ino().to_string(),
+            metadata.size().to_string(),
+            (i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()))
+                .to_string(),
+            (i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+                .to_string(),
+        ])
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn verified_catalog_file_digest(
+    store: &SynapseStore,
+    install: &store::CatalogInstallRecord,
+    member_path: &str,
+    expected: &str,
+    path: &Path,
+    hash: impl FnOnce(&Path) -> Option<String>,
+) -> Result<Option<String>, WireOperationError> {
+    let before = catalog_file_stamp(path);
+    if let Some(stamp) = &before {
+        if store
+            .catalog_file_verified(install, member_path, expected, stamp)
+            .map_err(catalog_store_error)?
+        {
+            return Ok(Some(expected.to_owned()));
+        }
+    }
+    let digest = hash(path);
+    let after = catalog_file_stamp(path);
+    // A file modified while hashing cannot certify the bytes subsequently loaded.
+    if before != after {
+        return Ok(None);
+    }
+    if digest.as_deref() == Some(expected) {
+        if let Some(stamp) = &after {
+            store
+                .record_catalog_file_verification(install, member_path, expected, stamp)
+                .map_err(catalog_store_error)?;
+        }
+    }
+    Ok(digest)
+}
+
 async fn ensure_catalog_lane_ready_owned(
     state: Arc<ModuleState>,
     entry: catalog::CatalogEntry,
@@ -23957,7 +24017,10 @@ async fn ensure_catalog_lane_ready_owned(
                     .map_err(catalog_store_error)?;
                 let path = state.model_cache.blob_path(&member.digest);
                 let hash_started = std::time::Instant::now();
-                let digest = sha256_file(&path).ok();
+                let digest = verified_catalog_file_digest(
+                    &state.store, &install, &file.path, &file.sha256, &path,
+                    |path| sha256_file(path).ok(),
+                )?;
                 catalog_validation_timing(&lane, &file.path, hash_started);
                 if size != Some(file.size_bytes)
                     || digest.as_deref() != Some(member.digest.as_str())

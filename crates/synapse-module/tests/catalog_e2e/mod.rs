@@ -1470,7 +1470,30 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
         assert_eq!(served["fingerprint"], fingerprint, "{served}");
         assert_eq!(served["dims"], 1024);
     }
-    eprintln!("Qwen first cold load wall time: {:?}", cold_started.elapsed());
+    eprintln!(
+        "Qwen first cold load wall time: {:?}",
+        cold_started.elapsed()
+    );
+    let unloaded = h
+        .call(
+            "model.unload",
+            serde_json::json!({"model_id":"qwen3-embedding-0.6b-metal"}),
+        )
+        .await;
+    assert_eq!(unloaded["state"], "unloaded");
+    let load = std::process::Command::new("uptime").output().unwrap();
+    eprintln!(
+        "Qwen second cold load machine load: {}",
+        String::from_utf8_lossy(&load.stdout)
+    );
+    let cold_started = Instant::now();
+    let served = h.serve_when_ready("embed.query", serde_json::json!({"model":"qwen3-embedding-0.6b-metal","text":"hello","deadline_ms":30000})).await;
+    eprintln!(
+        "Qwen second cold load wall time: {:?}",
+        cold_started.elapsed()
+    );
+    assert_eq!(served["fingerprint"], fingerprint, "{served}");
+    assert_eq!(served["dims"], 1024);
     let unloaded = h
         .call(
             "model.unload",

@@ -774,6 +774,30 @@ const MIGRATIONS: &[Migration] = &[
                    INSERT INTO self_check_run_seq (id, value) VALUES (0, 0);
         "#,
     },
+    Migration {
+        version: 14,
+        statements: r#"
+            CREATE TABLE catalog_file_verifications (
+                catalog_id TEXT NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                path TEXT NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                device TEXT NOT NULL,
+                inode TEXT NOT NULL,
+                size TEXT NOT NULL,
+                mtime_ns TEXT NOT NULL,
+                ctime_ns TEXT NOT NULL,
+                PRIMARY KEY (catalog_id, manifest_digest, backend, path)
+            );
+            CREATE TRIGGER catalog_member_verification_cleanup
+            AFTER DELETE ON catalog_install_members BEGIN
+                DELETE FROM catalog_file_verifications
+                WHERE catalog_id = OLD.catalog_id AND manifest_digest = OLD.manifest_digest
+                  AND backend = OLD.backend AND path = OLD.path;
+            END;
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -786,6 +810,7 @@ const RESTORE_APPLICATION_TABLES: &[&str] = &[
     "approval_migration_markers",
     "approvals",
     "cert_row_rebuild_events",
+    "catalog_file_verifications",
     "catalog_install_members",
     "catalog_installs",
     "catalog_self_checks",
@@ -843,6 +868,7 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
     "download_key_bindings",
     "download_acquisitions",
     "jobs",
+    "catalog_file_verifications",
     "catalog_install_members",
     "catalog_installs",
     "catalog_self_checks",
@@ -7326,6 +7352,16 @@ impl SynapseStore {
         cache: &dyn CatalogBlobCache,
     ) -> Result<RegistrationReconciliation, SynapseStoreError> {
         let reconciliation = self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "DELETE FROM catalog_file_verifications WHERE NOT EXISTS (
+                SELECT 1 FROM catalog_install_members m WHERE
+                m.catalog_id=catalog_file_verifications.catalog_id AND
+                m.manifest_digest=catalog_file_verifications.manifest_digest AND
+                m.backend=catalog_file_verifications.backend AND
+                m.path=catalog_file_verifications.path AND
+                m.digest=catalog_file_verifications.expected_sha256)",
+                [],
+            )?;
             let mut stmt = tx.prepare(
                 "SELECT model_id, engine, task, config_json FROM models
                  ORDER BY created_ms ASC, model_id ASC",
@@ -7370,6 +7406,68 @@ impl SynapseStore {
             Ok(reconciliation)
         })?;
         Ok(reconciliation)
+    }
+
+    /// Match derived verification against the expected digest and current file identity.
+    pub fn catalog_file_verified(
+        &self,
+        install: &CatalogInstallRecord,
+        path: &str,
+        expected: &str,
+        stamp: &[String; 5],
+    ) -> Result<bool, SynapseStoreError> {
+        Ok(self.store.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM catalog_file_verifications
+                 WHERE catalog_id=?1 AND manifest_digest=?2 AND backend=?3 AND path=?4
+                   AND expected_sha256=?5 AND device=?6 AND inode=?7 AND size=?8
+                   AND mtime_ns=?9 AND ctime_ns=?10)",
+                params![
+                    install.catalog_id,
+                    install.manifest_digest,
+                    install.backend,
+                    path,
+                    expected,
+                    stamp[0],
+                    stamp[1],
+                    stamp[2],
+                    stamp[3],
+                    stamp[4]
+                ],
+                |row| row.get(0),
+            )
+        })?)
+    }
+
+    pub fn record_catalog_file_verification(
+        &self,
+        install: &CatalogInstallRecord,
+        path: &str,
+        expected: &str,
+        stamp: &[String; 5],
+    ) -> Result<(), SynapseStoreError> {
+        self.store.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO catalog_file_verifications
+                 SELECT catalog_id, manifest_digest, backend, path, ?5, ?6, ?7, ?8, ?9, ?10
+                 FROM catalog_install_members WHERE catalog_id=?1 AND manifest_digest=?2
+                 AND backend=?3 AND path=?4 AND digest=?5",
+                params![
+                    install.catalog_id,
+                    install.manifest_digest,
+                    install.backend,
+                    path,
+                    expected,
+                    stamp[0],
+                    stamp[1],
+                    stamp[2],
+                    stamp[3],
+                    stamp[4]
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Every install record of a catalog entry, current and stale manifests
@@ -10228,6 +10326,7 @@ mod tests {
         assert_eq!(
             triggers,
             vec![
+                "catalog_member_verification_cleanup".to_string(),
                 "remote_checkpoint_immutable".to_string(),
                 "remote_url_binding_identity_immutable".to_string(),
             ],
@@ -10550,7 +10649,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10..=13 => store,
+                    10..=14 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -10702,6 +10801,8 @@ mod tests {
                 // The run-sequence counter is seeded with its single row.
                 "catalog_installs" => 0,
                 "catalog_install_members" => 0,
+                // v14 verification rows are derived only after hashing installed files.
+                "catalog_file_verifications" => 0,
                 "download_acquisitions" => 0,
                 "download_key_bindings" => 0,
                 "catalog_self_checks" => 0,
@@ -12573,6 +12674,9 @@ mod tests {
                         catalog_id, manifest_digest, backend, path, digest
                     ) VALUES ('catalog-{seed}', 'manifest-{seed}', 'metal', 'model.safetensors',
                               'blob-{seed}');
+                    INSERT INTO catalog_file_verifications VALUES (
+                        'catalog-{seed}', 'manifest-{seed}', 'metal', 'model.safetensors',
+                        'blob-{seed}', '1', '2', '3', '4', '5');
                     INSERT INTO download_acquisitions (job_id, digest, newly_published)
                     VALUES ('download-{seed}', 'blob-{seed}', 1);
                     INSERT INTO download_key_bindings (request_key, request_digest, job_id)
@@ -12641,6 +12745,157 @@ mod tests {
                 })
             })
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn verification_fixture() -> (
+        std::path::PathBuf,
+        SynapseStore,
+        CatalogInstallRecord,
+        std::path::PathBuf,
+        String,
+    ) {
+        let (root, descriptor) = temp_descriptor("catalog-verification");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        let path = root.join("weights");
+        std::fs::write(&path, b"original").unwrap();
+        let digest = crate::sha256_file(&path).unwrap();
+        let install = CatalogInstallRecord {
+            catalog_id: "model".into(),
+            manifest_digest: "manifest".into(),
+            backend: "metal".into(),
+            members: vec![CatalogInstallMember {
+                path: "weights".into(),
+                digest: digest.clone(),
+            }],
+        };
+        store.store.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO catalog_installs VALUES ('model','manifest','metal')", [])?;
+            tx.execute("INSERT INTO catalog_install_members VALUES ('model','manifest','metal','weights',?1)", params![digest])?;
+            Ok(())
+        }).unwrap();
+        (root, store, install, path, digest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_verification_unchanged_cold_load_skips_hash_and_removal_clears_row() {
+        let (root, store, install, path, digest) = verification_fixture();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let result = crate::verified_catalog_file_digest(
+                &store,
+                &install,
+                "weights",
+                &digest,
+                &path,
+                |p| {
+                    calls.set(calls.get() + 1);
+                    crate::sha256_file(p).ok()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.as_deref(), Some(digest.as_str()));
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(table_count(&store, "catalog_file_verifications"), 1);
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute("DELETE FROM catalog_install_members", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(table_count(&store, "catalog_file_verifications"), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_verification_touch_forces_rehash() {
+        let (root, store, install, path, digest) = verification_fixture();
+        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+            crate::sha256_file(p).ok()
+        })
+        .unwrap();
+        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old + std::time::Duration::from_secs(1))
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result =
+            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+                calls.set(calls.get() + 1);
+                crate::sha256_file(p).ok()
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.as_deref(), Some(digest.as_str()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_verification_content_change_with_restored_mtime_is_refused() {
+        let (root, store, install, path, digest) = verification_fixture();
+        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+            crate::sha256_file(p).ok()
+        })
+        .unwrap();
+        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        let calls = std::cell::Cell::new(0);
+        let result =
+            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+                calls.set(calls.get() + 1);
+                crate::sha256_file(p).ok()
+            })
+            .unwrap();
+        assert_ne!(
+            result.as_deref(),
+            Some(digest.as_str()),
+            "corrupted artifact must be refused"
+        );
+        assert_eq!(calls.get(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_verification_startup_discards_orphaned_rows() {
+        let (root, store, install, path, digest) = verification_fixture();
+        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
+            crate::sha256_file(p).ok()
+        })
+        .unwrap();
+        store.store.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO catalog_file_verifications VALUES ('orphan','manifest','metal','weights',?1,'1','2','3','4','5')", params![digest])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(table_count(&store, "catalog_file_verifications"), 2);
+        store
+            .reconcile_persisted_registrations(&|_| false, &FakeBlobCache::default())
+            .unwrap();
+        assert_eq!(table_count(&store, "catalog_file_verifications"), 1);
+        assert!(store
+            .catalog_file_verified(
+                &install,
+                "weights",
+                &digest,
+                &crate::catalog_file_stamp(&path).unwrap()
+            )
+            .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14013,6 +14268,19 @@ mod tests {
             .unwrap();
         cache.publish(&blob('e'), 5);
 
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO catalog_file_verifications
+                SELECT catalog_id, manifest_digest, backend, path, digest, '1','2','3','4','5'
+                FROM catalog_install_members",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let verified_before = table_count(&store, "catalog_file_verifications");
         let error = serde_json::json!({ "code": "artifact_invalid" });
         let report = store
             .quarantine_catalog_blob(&format!("sha256:{bad}"), &error, &cache, 20)
@@ -14035,6 +14303,10 @@ mod tests {
                 failed_jobs: vec![holder.job_id.clone()],
                 freed_bytes: 10 + 4,
             }
+        );
+        assert_eq!(
+            table_count(&store, "catalog_file_verifications"),
+            verified_before - 2
         );
         assert!(!cache.has_blob(&bad));
         assert!(!cache.pinned(&bad));
