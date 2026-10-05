@@ -1,0 +1,1192 @@
+{
+  "classification": "development",
+  "machine_model": "Mac17,6",
+  "os_build": "26A434",
+  "production_coreml_lane": "Resident per task context; not stopped. Pool sharing cannot be inferred without a no-Core-ML control.",
+  "runs": [
+    {
+      "experiment": "paired-gte",
+      "load_before_1_5_15": [
+        26.5556640625,
+        25.41552734375,
+        27.0556640625
+      ],
+      "load_after_1_5_15": [
+        19.61865234375,
+        23.767578125,
+        26.3349609375
+      ],
+      "processes": [
+        {
+          "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+          "admissions": [
+            {
+              "elapsed_ms": 10146.77175,
+              "error": null,
+              "length": 128,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 486711,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 222592928
+            },
+            {
+              "elapsed_ms": 16908.576333999998,
+              "error": null,
+              "length": 256,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 565098,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 224953120
+            },
+            {
+              "elapsed_ms": 16462.028625,
+              "error": "ane_resources_exhausted:compile layer 14: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+              "length": 512,
+              "loaded_before_rollback": 14,
+              "mil_bytes_submitted": 482939,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 156699398
+            }
+          ],
+          "classification": "development",
+          "exhausted": true,
+          "layer_events": [
+            {
+              "loaded": true,
+              "unix_ns": "1791184395387153000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184395751077000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184396174425000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184396585727000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184397015705000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184397438127000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184397853241000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184398281937000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184398723750000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184399150699000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184399581256000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184400008239000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184400421934000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184400835209000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184401280909000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184401890472000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184402388903000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184402864471000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184403401025000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184403973427000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184404599427000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184405159820000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184405717342000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184406335904000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184406985428000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184407601053000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184408226680000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184408830235000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184412752298000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184413381980000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184413998352000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184414603517000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184415184474000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184415787173000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184416413586000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184416997925000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184417621188000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184418228304000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184418833422000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184419504419000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184420208799000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184420826190000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184421448399000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184422068741000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184422867211000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184423891028000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184425582993000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184426489972000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184427364485000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184428251610000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184429155542000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184429962075000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184430750359000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184431735999000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184432515142000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184433308094000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184434131601000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184434906375000"
+            },
+            {
+              "loaded": false,
+              "unix_ns": "1791184438498494000"
+            }
+          ],
+          "mix": "gte",
+          "resident_executables": 44,
+          "resident_mil_bytes": 1051809,
+          "resident_shapes": [
+            {
+              "executables": 22,
+              "length": 128,
+              "mil_bytes": 486711,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 222592928
+            },
+            {
+              "executables": 22,
+              "length": 256,
+              "mil_bytes": 565098,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 224953120
+            }
+          ],
+          "resident_weight_bytes": 447546048,
+          "submitted_mil_bytes": 1534748,
+          "submitted_weight_bytes": 604245446
+        },
+        {
+          "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+          "admissions": [
+            {
+              "elapsed_ms": 10401.961209,
+              "error": null,
+              "length": 128,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 486752,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 222592928
+            },
+            {
+              "elapsed_ms": 16983.697625,
+              "error": null,
+              "length": 256,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 565089,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 224953120
+            },
+            {
+              "elapsed_ms": 13002.623875,
+              "error": "ane_resources_exhausted:compile layer 13: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+              "length": 512,
+              "loaded_before_rollback": 13,
+              "mil_bytes_submitted": 450116,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 146176112
+            }
+          ],
+          "classification": "development",
+          "exhausted": true,
+          "layer_events": [
+            {
+              "loaded": true,
+              "unix_ns": "1791184395544409000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184395965015000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184396378754000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184396800843000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184397230643000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184397655812000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184398058019000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184398506145000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184398948139000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184399372531000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184399791006000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184400219505000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184400627390000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184401054376000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184401590467000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184402128538000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184402636528000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184403137635000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184403682975000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184404304572000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184404900228000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184405414856000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184405993890000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184406664847000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184407295325000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184407916475000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184408534829000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184412453429000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184413065075000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184413686030000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184414309757000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184414891467000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184415487352000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184416123668000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184416698133000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184417302416000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184417936069000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184418525587000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184419163086000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184419888590000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184420516282000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184421128383000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184421757661000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184422398564000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184423285938000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184425063636000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184426043116000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184426925739000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184427799023000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184428716046000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184429559402000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184430356823000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184431240425000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184432124224000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184432908630000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184433725270000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184434518470000"
+            },
+            {
+              "loaded": false,
+              "unix_ns": "1791184435370435000"
+            }
+          ],
+          "mix": "gte",
+          "resident_executables": 44,
+          "resident_mil_bytes": 1051841,
+          "resident_shapes": [
+            {
+              "executables": 22,
+              "length": 128,
+              "mil_bytes": 486752,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 222592928
+            },
+            {
+              "executables": 22,
+              "length": 256,
+              "mil_bytes": 565089,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 224953120
+            }
+          ],
+          "resident_weight_bytes": 447546048,
+          "submitted_mil_bytes": 1501957,
+          "submitted_weight_bytes": 593722160
+        }
+      ]
+    },
+    {
+      "experiment": "gte-large",
+      "load_before_1_5_15": [
+        19.61865234375,
+        23.767578125,
+        26.3349609375
+      ],
+      "load_after_1_5_15": [
+        22.63720703125,
+        24.1201171875,
+        25.89599609375
+      ],
+      "processes": [
+        {
+          "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+          "admissions": [
+            {
+              "elapsed_ms": 56657.291916,
+              "error": null,
+              "length": 4096,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 2728218,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 295758880
+            },
+            {
+              "elapsed_ms": 115495.39224999999,
+              "error": null,
+              "length": 8192,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 5033735,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 371285024
+            },
+            {
+              "elapsed_ms": 7779.210083,
+              "error": null,
+              "length": 128,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 486769,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 222592928
+            },
+            {
+              "elapsed_ms": 8654.835542,
+              "error": null,
+              "length": 256,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 565099,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 224953120
+            },
+            {
+              "elapsed_ms": 15154.689208,
+              "error": null,
+              "length": 512,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 708482,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 229673504
+            },
+            {
+              "elapsed_ms": 5064.484708,
+              "error": "ane_resources_exhausted:compile layer 5: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+              "length": 1024,
+              "loaded_before_rollback": 5,
+              "mil_bytes_submitted": 271223,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 65301184
+            }
+          ],
+          "classification": "development",
+          "exhausted": true,
+          "layer_events": [
+            {
+              "loaded": true,
+              "unix_ns": "1791184457421010000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184459520719000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184461709289000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184464538918000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184466636072000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184468633210000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184471816089000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184474259479000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184476611015000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184480251175000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184482378948000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184484498705000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184487283063000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184489357147000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184491763441000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184495582498000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184497850921000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184500139172000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184503035318000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184505081065000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184507420861000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184511009331000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184516821512000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184521116295000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184528274941000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184542904201000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184547602968000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184552927037000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184558761014000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184563263332000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184567979720000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184574645303000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184578430519000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184582438692000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184587827859000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184591158259000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184594890346000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184600478550000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184604475725000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184608389969000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184613727979000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184617484890000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184621205299000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184626505316000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184626802232000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184627163555000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184627539667000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184627856927000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184628190476000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184628551528000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184628910359000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184629255352000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184629605816000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184629942098000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184630327068000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184630658886000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184631000196000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184631429442000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184631796707000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184632194286000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184632580296000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184632946831000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184633265647000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184633604433000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184633920799000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184634284571000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184634710258000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184635147422000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184635565130000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184635930150000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184636358639000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184636772164000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184637142670000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184637516645000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184637924627000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184638275501000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184638639683000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184639034867000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184639440168000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184639821560000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184640206270000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184640577918000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184641008488000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184641410205000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184641782150000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184642160524000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184642562226000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184642939443000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184643392645000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184643952432000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184644459217000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184644973554000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184645517036000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184646355131000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184647141739000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184647928812000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184648822604000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184649589133000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184650575868000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184651578093000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184652492121000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184653319868000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184654008050000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184654619547000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184655211340000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184655754153000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184656309119000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184656886641000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184657473071000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184658093837000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184658817246000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184659616956000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184660385540000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184661253737000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791184662295303000"
+            },
+            {
+              "loaded": false,
+              "unix_ns": "1791184663125907000"
+            }
+          ],
+          "mix": "gte-large",
+          "resident_executables": 110,
+          "resident_mil_bytes": 9522303,
+          "resident_shapes": [
+            {
+              "executables": 22,
+              "length": 4096,
+              "mil_bytes": 2728218,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 295758880
+            },
+            {
+              "executables": 22,
+              "length": 8192,
+              "mil_bytes": 5033735,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 371285024
+            },
+            {
+              "executables": 22,
+              "length": 128,
+              "mil_bytes": 486769,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 222592928
+            },
+            {
+              "executables": 22,
+              "length": 256,
+              "mil_bytes": 565099,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 224953120
+            },
+            {
+              "executables": 22,
+              "length": 512,
+              "mil_bytes": 708482,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 229673504
+            }
+          ],
+          "resident_weight_bytes": 1344263456,
+          "submitted_mil_bytes": 9793526,
+          "submitted_weight_bytes": 1409564640
+        }
+      ]
+    }
+  ]
+}

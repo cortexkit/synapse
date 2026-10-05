@@ -1,0 +1,554 @@
+{
+  "classification": "development",
+  "machine_model": "Mac17,6",
+  "os_build": "26A434",
+  "production_coreml_lane": "Resident per task context; untouched",
+  "available_selectors": {
+    "classification": "development",
+    "classes": {
+      "_ANEClient": {
+        "instance": [
+          {
+            "selector": ".cxx_destruct",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "allowRestrictedAccess",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "beginRealTimeTask",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "buffersReadyWithModel:inputBuffers:options:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "compileModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "compiledModelExistsFor:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "compiledModelExistsInCacheFor:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "compiledModelExistsInCacheFor:limitToCurrentProcess:",
+            "encoding": "B28@0:8@16B24"
+          },
+          {
+            "selector": "compiledModelExistsMatchingHash:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "conn",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "connectionForLoadingModel:options:",
+            "encoding": "@32@0:8@16@24"
+          },
+          {
+            "selector": "connectionUsedForLoadingModel:",
+            "encoding": "@24@0:8@16"
+          },
+          {
+            "selector": "connections",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "connectionsUsedForLoadingModels",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "dealloc",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "doBuffersReadyWithModel:inputBuffers:options:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "doEnqueueSetsWithModel:outputSet:options:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "doEvaluateDirectWithModel:options:request:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "doLoadModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "doLoadModelNewInstance:options:modelInstParams:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "doPrepareChainingWithModel:options:chainingReq:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "doUnloadModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "echo:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "endRealTimeTask",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "enqueueSetsWithModel:outputSet:options:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "evaluateRealTimeWithModel:options:request:error:",
+            "encoding": "B48@0:8@16@24@32^@40"
+          },
+          {
+            "selector": "evaluateWithModel:options:request:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "fastConn",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "fastConnWithoutLock",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "init",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "initWithRestrictedAccessAllowed:",
+            "encoding": "@20@0:8B16"
+          },
+          {
+            "selector": "isAnetoolRootDaemonConnection",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "isRootDaemon",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "isVirtualClient",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "loadModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "loadModelNewInstance:options:modelInstParams:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "loadRealTimeModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "mapIOSurfacesWithModel:request:cacheInference:error:",
+            "encoding": "B44@0:8@16@24B32^@36"
+          },
+          {
+            "selector": "mapMutableWeightsForModel:andProcedure:mappedWeightsBuffer:size:error:",
+            "encoding": "B56@0:8@16@24^^v32^Q40^@48"
+          },
+          {
+            "selector": "prepareChainingWithModel:options:chainingReq:qos:error:",
+            "encoding": "B52@0:8@16@24@32I40^@44"
+          },
+          {
+            "selector": "priorityQ",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "purgeCompiledModel:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "purgeCompiledModelMatchingHash:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "reportEvaluateFailure:failureReason:qIdx:",
+            "encoding": "v36@0:8@16I24Q28"
+          },
+          {
+            "selector": "sessionHintWithModel:hint:options:report:error:",
+            "encoding": "B56@0:8@16@24@32@40^@48"
+          },
+          {
+            "selector": "syncMutableWeightsForModel:andProcedure:fromOffset:withSize:error:",
+            "encoding": "B56@0:8@16@24Q32Q40^@48"
+          },
+          {
+            "selector": "unloadModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "unloadRealTimeModel:options:qos:error:",
+            "encoding": "B44@0:8@16@24I32^@36"
+          },
+          {
+            "selector": "unmapIOSurfacesWithModel:request:",
+            "encoding": "v32@0:8@16@24"
+          },
+          {
+            "selector": "unmapMutableWeightsForModel:andProcedure:",
+            "encoding": "B32@0:8@16@24"
+          },
+          {
+            "selector": "updateCachedModelLocationForModelTrackedByHash:toAppGroup:error:",
+            "encoding": "B40@0:8@16@24^@32"
+          },
+          {
+            "selector": "updatePurgeabilityLevelForModelTrackedByHash:to:",
+            "encoding": "v32@0:8@16Q24"
+          },
+          {
+            "selector": "updateSourcePathForModelTrackedByHash:to:error:",
+            "encoding": "B40@0:8@16@24^@32"
+          },
+          {
+            "selector": "virtualClient",
+            "encoding": "@16@0:8"
+          }
+        ],
+        "class": [
+          {
+            "selector": "initialize",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "new",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "sharedConnection",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "sharedPrivateConnection",
+            "encoding": "@16@0:8"
+          }
+        ]
+      },
+      "_ANEInMemoryModel": {
+        "instance": [
+          {
+            "selector": ".cxx_destruct",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "compileWithQoS:options:error:",
+            "encoding": "B36@0:8I16@20^@28"
+          },
+          {
+            "selector": "compiledModelExists",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "compilerOptionsFileName",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "compilerOptionsWithOptions:isCompiledModelCached:",
+            "encoding": "@28@0:8@16B24"
+          },
+          {
+            "selector": "dealloc",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "descriptor",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "evaluateWithQoS:options:request:error:",
+            "encoding": "B44@0:8I16@20@28^@36"
+          },
+          {
+            "selector": "hexStringIdentifier",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "init",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "initWithDesctiptor:",
+            "encoding": "@24@0:8@16"
+          },
+          {
+            "selector": "intermediateBufferHandle",
+            "encoding": "Q16@0:8"
+          },
+          {
+            "selector": "isMILModel",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "loadWithQoS:options:error:",
+            "encoding": "B36@0:8I16@20^@28"
+          },
+          {
+            "selector": "localModelPath",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "mapIOSurfacesWithRequest:cacheInference:error:",
+            "encoding": "B36@0:8@16B24^@28"
+          },
+          {
+            "selector": "model",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "modelAttributes",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "modelURL",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "perFileHashes",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "perfStatsMask",
+            "encoding": "I16@0:8"
+          },
+          {
+            "selector": "program",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "programHandle",
+            "encoding": "Q16@0:8"
+          },
+          {
+            "selector": "purgeCompiledModel",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "queueDepth",
+            "encoding": "c16@0:8"
+          },
+          {
+            "selector": "saveModelFiles",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "setCompilerOptionsFileName:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setDescriptor:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setIntermediateBufferHandle:",
+            "encoding": "v24@0:8Q16"
+          },
+          {
+            "selector": "setModel:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setModelAttributes:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setModelURL:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setPerFileHashes:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setPerfStatsMask:",
+            "encoding": "v20@0:8I16"
+          },
+          {
+            "selector": "setProgram:",
+            "encoding": "v24@0:8@16"
+          },
+          {
+            "selector": "setProgramHandle:",
+            "encoding": "v24@0:8Q16"
+          },
+          {
+            "selector": "setQueueDepth:",
+            "encoding": "v20@0:8c16"
+          },
+          {
+            "selector": "setState:",
+            "encoding": "v24@0:8Q16"
+          },
+          {
+            "selector": "sharedConnection",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "state",
+            "encoding": "Q16@0:8"
+          },
+          {
+            "selector": "string_id",
+            "encoding": "Q16@0:8"
+          },
+          {
+            "selector": "unloadWithQoS:error:",
+            "encoding": "B28@0:8I16^@20"
+          },
+          {
+            "selector": "unmapIOSurfacesWithRequest:",
+            "encoding": "v24@0:8@16"
+          }
+        ],
+        "class": [
+          {
+            "selector": "inMemoryModelWithDescriptor:",
+            "encoding": "@24@0:8@16"
+          },
+          {
+            "selector": "initialize",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "new",
+            "encoding": "@16@0:8"
+          }
+        ]
+      },
+      "_ANEInMemoryModelDescriptor": {
+        "instance": [
+          {
+            "selector": ".cxx_destruct",
+            "encoding": "v16@0:8"
+          },
+          {
+            "selector": "hash",
+            "encoding": "Q16@0:8"
+          },
+          {
+            "selector": "hexStringIdentifier",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "init",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "initWithNetworkText:weights:optionsPlist:isMILModel:",
+            "encoding": "@44@0:8@16@24@32B40"
+          },
+          {
+            "selector": "isEqual:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "isEqualToInMemoryModelDescriptor:",
+            "encoding": "B24@0:8@16"
+          },
+          {
+            "selector": "isMILModel",
+            "encoding": "B16@0:8"
+          },
+          {
+            "selector": "networkText",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "networkTextHash",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "optionsPlist",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "optionsPlistHash",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "perFileHashes",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "weights",
+            "encoding": "@16@0:8"
+          },
+          {
+            "selector": "weightsHash",
+            "encoding": "@16@0:8"
+          }
+        ],
+        "class": [
+          {
+            "selector": "modelWithMILText:weights:optionsPlist:",
+            "encoding": "@40@0:8@16@24@32"
+          },
+          {
+            "selector": "modelWithNetworkDescription:weights:optionsPlist:",
+            "encoding": "@40@0:8@16@24@32"
+          },
+          {
+            "selector": "new",
+            "encoding": "@16@0:8"
+          }
+        ]
+      }
+    }
+  },
+  "runs": [
+    {
+      "attempts": [
+        {
+          "actual_start_after_reclaim_ms": 306.00266700000003,
+          "delay_after_previous_attempt_ms": 0,
+          "error": null,
+          "finished_after_reclaim_ms": 59761.315083,
+          "loaded": 22
+        }
+      ],
+      "classification": "development",
+      "experiment": "in-process-reclaim-paths",
+      "initial_executables": 110,
+      "method": "autorelease-all",
+      "observations": [
+        "all shapes dropped and enclosing Objective-C autorelease pool drained before replacement"
+      ],
+      "remaining_fully_resident_executables": 22,
+      "unloads": {
+        "calls": 132,
+        "success_true": 132,
+        "success_false": 0,
+        "non_null_errors": []
+      },
+      "load_before_1_5_15": [
+        12.5927734375,
+        12.62646484375,
+        13.92236328125
+      ],
+      "load_after_1_5_15": [
+        13.30419921875,
+        13.28564453125,
+        14.00439453125
+      ]
+    }
+  ]
+}

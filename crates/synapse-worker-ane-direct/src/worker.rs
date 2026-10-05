@@ -235,8 +235,8 @@ fn request_loop<S: Read + Write>(
                     shape,
                 } => {
                     let model = models.get_mut(&model_ref).context("model_not_loaded")?;
-                    // Drop unloads every executable before acknowledging eviction.
-                    drop(model.resident.remove(&shape));
+                    // Acknowledge only after executable release and autorelease-pool drain.
+                    model.evict(shape);
                     (WorkerResponse::Evicted { req_id }, None)
                 }
                 WorkerRequest::EmbedBatch {

@@ -1,0 +1,2174 @@
+{
+  "classification": "development",
+  "machine_model": "Mac17,6",
+  "os_build": "26A434",
+  "production_coreml_lane": "Resident per run context, untouched; shared pool consumption remains unproven.",
+  "runs": [
+    {
+      "attempts": [
+        {
+          "actual_start_after_release_ms": 0.001083,
+          "delay_after_previous_attempt_ms": 0,
+          "error": "ane_resources_exhausted:compile layer 14: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "finished_after_release_ms": 36805.987541,
+          "loaded_before_rollback": 14
+        },
+        {
+          "actual_start_after_release_ms": 36862.756708,
+          "delay_after_previous_attempt_ms": 50,
+          "error": "ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "finished_after_release_ms": 39549.869583,
+          "loaded_before_rollback": 0
+        },
+        {
+          "actual_start_after_release_ms": 39760.270958,
+          "delay_after_previous_attempt_ms": 200,
+          "error": "ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "finished_after_release_ms": 42681.318458,
+          "loaded_before_rollback": 0
+        },
+        {
+          "actual_start_after_release_ms": 43690.608583,
+          "delay_after_previous_attempt_ms": 1000,
+          "error": "ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "finished_after_release_ms": 46645.701457999996,
+          "loaded_before_rollback": 0
+        },
+        {
+          "actual_start_after_release_ms": 51646.489041,
+          "delay_after_previous_attempt_ms": 5000,
+          "error": "ane_resources_exhausted:compile layer 0: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "finished_after_release_ms": 54769.192707999995,
+          "loaded_before_rollback": 0
+        }
+      ],
+      "before_exit_error": null,
+      "classification": "development",
+      "experiment": "in-process-reclaim",
+      "resident_executables": 88,
+      "target_length": 4096,
+      "timing": "Actual times include graph construction and compilation; configured intervals are delays between attempts, not a hardware reclamation clock.",
+      "load_before_1_5_15": [
+        20.15234375,
+        22.15087890625,
+        22.69091796875
+      ],
+      "load_after_1_5_15": [
+        17.642578125,
+        20.95849609375,
+        22.14013671875
+      ],
+      "unloads": [
+        {
+          "calls": 124,
+          "success_true": 124,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "experiment": "owner-exit-reclaim",
+      "processes": [
+        {
+          "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer.",
+          "admissions": [
+            {
+              "elapsed_ms": 8304.120417,
+              "error": null,
+              "length": 128,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 486733,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 222592928
+            },
+            {
+              "elapsed_ms": 9227.926291,
+              "error": null,
+              "length": 256,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 565104,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 224953120
+            },
+            {
+              "elapsed_ms": 12268.67875,
+              "error": null,
+              "length": 512,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 708456,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 229673504
+            },
+            {
+              "elapsed_ms": 18112.901084,
+              "error": null,
+              "length": 1024,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 998862,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 239114272
+            },
+            {
+              "elapsed_ms": 26283.075375,
+              "error": null,
+              "length": 2048,
+              "loaded_before_rollback": 22,
+              "mil_bytes_submitted": 1575273,
+              "model": "gte-modernbert-base",
+              "weight_bytes_submitted": 257995808
+            }
+          ],
+          "classification": "development",
+          "exhausted": false,
+          "layer_events": [
+            {
+              "loaded": true,
+              "unix_ns": "1791188558396301000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188558775354000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188559139615000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188559465823000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188559805064000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188560201867000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188560561949000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188560959204000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188561320639000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188561778735000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188562104395000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188562475355000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188562853359000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188563175120000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188563504674000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188563824332000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188564169979000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188564552943000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188564915247000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188565280387000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188565656302000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188565971843000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188566333895000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188566811858000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188567223197000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188567684204000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188568134746000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188568547973000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188568900246000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188569253523000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188569609912000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188569981499000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188570372305000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188570742190000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188571146479000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188571539252000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188571953113000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188572377513000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188572777551000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188573267682000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188573722136000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188574226642000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188574678562000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188575199689000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188575846022000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188576495850000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188577023448000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188577542744000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188578095547000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188578664230000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188579161802000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188579756926000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188580304653000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188580819602000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188581350152000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188581876222000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188582369176000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188582850069000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188583346565000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188584014209000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188584572585000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188585120227000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188585660999000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188586331618000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188586905697000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188587468456000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188588262375000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188589064801000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188589878880000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188590692806000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188591462588000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188592242066000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188593030904000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188593925821000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188594708811000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188595728305000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188596634655000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188597467936000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188598343300000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188599059594000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188599798891000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188600642122000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188601378309000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188602149781000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188602918126000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188603817845000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188604718390000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188605581474000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188606894949000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188608046155000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188609195080000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188610554456000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188611811550000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188613007278000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188614471928000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188615565046000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188616674183000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188617969686000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188619124010000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188620258595000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188621610703000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188622869021000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188623945266000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188625219012000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188626439714000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188627517654000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188628715300000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188629700921000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188630688692000"
+            },
+            {
+              "loaded": true,
+              "unix_ns": "1791188631864575000"
+            }
+          ],
+          "mix": "gte",
+          "resident_executables": 110,
+          "resident_mil_bytes": 4334428,
+          "resident_shapes": [
+            {
+              "executables": 22,
+              "length": 128,
+              "mil_bytes": 486733,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 222592928
+            },
+            {
+              "executables": 22,
+              "length": 256,
+              "mil_bytes": 565104,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 224953120
+            },
+            {
+              "executables": 22,
+              "length": 512,
+              "mil_bytes": 708456,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 229673504
+            },
+            {
+              "executables": 22,
+              "length": 1024,
+              "mil_bytes": 998862,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 239114272
+            },
+            {
+              "executables": 22,
+              "length": 2048,
+              "mil_bytes": 1575273,
+              "model": "gte-modernbert-base",
+              "weight_bytes": 257995808
+            }
+          ],
+          "resident_weight_bytes": 1174329632,
+          "submitted_mil_bytes": 4334428,
+          "submitted_weight_bytes": 1174329632
+        },
+        {
+          "attempts": [
+            {
+              "actual_start_after_release_ms": 0.001083,
+              "delay_after_previous_attempt_ms": 0,
+              "error": null,
+              "finished_after_release_ms": 7787.836,
+              "loaded_before_rollback": 22
+            }
+          ],
+          "before_exit_error": "ane_resources_exhausted:compile layer 11: ANE load failed: createProgramInstanceForModel:modelToken:modelFilePath:qos:isPreCompiled:enablePowerSaving:skipPreparePhase:statsMask:memoryPoolID:enableLateLatch:modelIdentityStr:owningPid:cacheUrlIdentifier:aotCacheUrlIdentifier:optOutOfModelMemoryUnwiring:intermediateBufferSizeHint:error:: Program load failed \u2014 no ANE resources (transient; retry) (underlying=0x5)",
+          "classification": "development",
+          "experiment": "owner-exit-reclaim",
+          "resident_executables": 22,
+          "target_length": 128,
+          "timing": "Actual times include graph construction and compilation; configured intervals are delays between attempts, not a hardware reclamation clock."
+        }
+      ],
+      "load_before_1_5_15": [
+        17.642578125,
+        20.95849609375,
+        22.14013671875
+      ],
+      "load_after_1_5_15": [
+        12.93798828125,
+        17.96630859375,
+        20.79248046875
+      ],
+      "unloads": [
+        {
+          "calls": 110,
+          "success_true": 110,
+          "success_false": 0,
+          "non_null_errors": []
+        },
+        {
+          "calls": 32,
+          "success_true": 32,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 2,
+      "experiment": "concurrent-compiles",
+      "full_shapes": true,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188678397452000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188678399578000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188679083370000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188679087867000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188679839514000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188679842223000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188680567860000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188680569885000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188681542987000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188681565559000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188682402505000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188682404861000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188683224520000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188683250236000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188684169603000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188684176314000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188685283935000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188685289997000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188686036296000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188686040935000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188687015679000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188687021935000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188688298308000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188688302285000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188689175999000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188689180349000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188690558933000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188690564025000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188691631779000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188691634949000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188692731843000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188692736884000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188693587640000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188693597121000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188694392395000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188694395772000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188695223812000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188695228470000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188696007125000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188696010423000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188696811519000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188696814130000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188697690086000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188697694949000"
+        }
+      ],
+      "loaded_total": 44,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 256
+        }
+      ],
+      "load_before_1_5_15": [
+        12.93798828125,
+        17.96630859375,
+        20.79248046875
+      ],
+      "load_after_1_5_15": [
+        18.4501953125,
+        18.66650390625,
+        20.912109375
+      ],
+      "unloads": [
+        {
+          "calls": 44,
+          "success_true": 44,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 4,
+      "experiment": "concurrent-compiles",
+      "full_shapes": true,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188735953303000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188735957972000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188735965758000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188735971006000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188739480192000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188739490174000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188739498309000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188739509471000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188748966324000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188748972732000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188748977772000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188748983410000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188755177659000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188755180898000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188755183857000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188755188411000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188761552890000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188761555476000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188761558573000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188761566654000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188768356222000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188768358194000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188768360564000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188768362524000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188774436776000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188774436838000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188774439837000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188774442950000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188780091356000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188780095988000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188780101113000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188780106728000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188785049731000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188785052888000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188785056448000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188785059542000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188791320429000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188791323334000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188791326604000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188791330084000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188794611425000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188794613913000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188794617196000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188794619975000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188796806870000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188796806901000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188796808697000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188796811090000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188799124540000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188799128877000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188799133867000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188799145718000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188801649189000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188801652107000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188801655957000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188801658976000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188804085821000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188804088828000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188804091897000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188804097313000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188810347238000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188810349398000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188810351610000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188810354089000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188812848011000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188812850216000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188812853876000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188812857528000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188815755015000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188815757425000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188815759599000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188815761477000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188819126426000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188819128141000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188819131293000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188819133356000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188822147002000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188822147028000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188822148678000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188822157222000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188825208711000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188825211223000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188825214287000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188825216805000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188827211393000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188827213745000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188827218674000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188827220774000"
+        }
+      ],
+      "loaded_total": 88,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 256
+        },
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 512
+        },
+        {
+          "error": null,
+          "loaded": 22,
+          "shape": 1024
+        }
+      ],
+      "load_before_1_5_15": [
+        18.4501953125,
+        18.66650390625,
+        20.912109375
+      ],
+      "load_after_1_5_15": [
+        30.7998046875,
+        25.38671875,
+        23.38134765625
+      ],
+      "unloads": [
+        {
+          "calls": 88,
+          "success_true": 88,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 2,
+      "experiment": "concurrent-compiles",
+      "full_shapes": false,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188843170350000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188843173217000"
+        }
+      ],
+      "loaded_total": 2,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 256
+        }
+      ],
+      "load_before_1_5_15": [
+        30.7998046875,
+        25.38671875,
+        23.38134765625
+      ],
+      "load_after_1_5_15": [
+        27.18798828125,
+        24.845703125,
+        23.22265625
+      ],
+      "unloads": [
+        {
+          "calls": 2,
+          "success_true": 2,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 4,
+      "experiment": "concurrent-compiles",
+      "full_shapes": false,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188871050731000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188871053195000"
+        },
+        {
+          "loaded": true,
+          "shape": 384,
+          "unix_ns": "1791188871055698000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188871058083000"
+        }
+      ],
+      "loaded_total": 4,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 256
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 384
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 512
+        }
+      ],
+      "load_before_1_5_15": [
+        27.18798828125,
+        24.845703125,
+        23.22265625
+      ],
+      "load_after_1_5_15": [
+        26.31201171875,
+        24.83837890625,
+        23.2666015625
+      ],
+      "unloads": [
+        {
+          "calls": 4,
+          "success_true": 4,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 8,
+      "experiment": "concurrent-compiles",
+      "full_shapes": false,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188893384764000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188893386884000"
+        },
+        {
+          "loaded": true,
+          "shape": 768,
+          "unix_ns": "1791188893389457000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188893391711000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188893393820000"
+        },
+        {
+          "loaded": true,
+          "shape": 896,
+          "unix_ns": "1791188893395949000"
+        },
+        {
+          "loaded": true,
+          "shape": 640,
+          "unix_ns": "1791188893398020000"
+        },
+        {
+          "loaded": true,
+          "shape": 384,
+          "unix_ns": "1791188893399954000"
+        }
+      ],
+      "loaded_total": 8,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 256
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 384
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 512
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 640
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 768
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 896
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1024
+        }
+      ],
+      "load_before_1_5_15": [
+        26.31201171875,
+        24.83837890625,
+        23.2666015625
+      ],
+      "load_after_1_5_15": [
+        20.11669921875,
+        23.48779296875,
+        22.82373046875
+      ],
+      "unloads": [
+        {
+          "calls": 8,
+          "success_true": 8,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 16,
+      "experiment": "concurrent-compiles",
+      "full_shapes": false,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791188921608656000"
+        },
+        {
+          "loaded": true,
+          "shape": 640,
+          "unix_ns": "1791188921608670000"
+        },
+        {
+          "loaded": true,
+          "shape": 1536,
+          "unix_ns": "1791188921610716000"
+        },
+        {
+          "loaded": true,
+          "shape": 1152,
+          "unix_ns": "1791188921613152000"
+        },
+        {
+          "loaded": true,
+          "shape": 384,
+          "unix_ns": "1791188921615750000"
+        },
+        {
+          "loaded": true,
+          "shape": 2048,
+          "unix_ns": "1791188921618242000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791188921620255000"
+        },
+        {
+          "loaded": true,
+          "shape": 768,
+          "unix_ns": "1791188921622657000"
+        },
+        {
+          "loaded": true,
+          "shape": 1664,
+          "unix_ns": "1791188921629290000"
+        },
+        {
+          "loaded": true,
+          "shape": 1920,
+          "unix_ns": "1791188921630942000"
+        },
+        {
+          "loaded": true,
+          "shape": 1792,
+          "unix_ns": "1791188921633018000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791188921634452000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791188921636357000"
+        },
+        {
+          "loaded": true,
+          "shape": 1280,
+          "unix_ns": "1791188921638773000"
+        },
+        {
+          "loaded": true,
+          "shape": 896,
+          "unix_ns": "1791188921640135000"
+        },
+        {
+          "loaded": true,
+          "shape": 1408,
+          "unix_ns": "1791188921641995000"
+        }
+      ],
+      "loaded_total": 16,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 256
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 384
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 512
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 640
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 768
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 896
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1024
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1152
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1280
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1408
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1536
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1664
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1792
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1920
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2048
+        }
+      ],
+      "load_before_1_5_15": [
+        20.11669921875,
+        23.48779296875,
+        22.82373046875
+      ],
+      "load_after_1_5_15": [
+        24.72705078125,
+        24.24560546875,
+        23.1181640625
+      ],
+      "unloads": [
+        {
+          "calls": 16,
+          "success_true": 16,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    },
+    {
+      "classification": "development",
+      "count": 32,
+      "experiment": "concurrent-compiles",
+      "full_shapes": false,
+      "layer_events": [
+        {
+          "loaded": true,
+          "shape": 3712,
+          "unix_ns": "1791189000668259000"
+        },
+        {
+          "loaded": true,
+          "shape": 2176,
+          "unix_ns": "1791189000670092000"
+        },
+        {
+          "loaded": true,
+          "shape": 2944,
+          "unix_ns": "1791189000672077000"
+        },
+        {
+          "loaded": true,
+          "shape": 1920,
+          "unix_ns": "1791189000674460000"
+        },
+        {
+          "loaded": true,
+          "shape": 2816,
+          "unix_ns": "1791189000676358000"
+        },
+        {
+          "loaded": true,
+          "shape": 768,
+          "unix_ns": "1791189000678287000"
+        },
+        {
+          "loaded": true,
+          "shape": 512,
+          "unix_ns": "1791189000680649000"
+        },
+        {
+          "loaded": true,
+          "shape": 2304,
+          "unix_ns": "1791189000682445000"
+        },
+        {
+          "loaded": true,
+          "shape": 1792,
+          "unix_ns": "1791189000684015000"
+        },
+        {
+          "loaded": true,
+          "shape": 3968,
+          "unix_ns": "1791189000685919000"
+        },
+        {
+          "loaded": true,
+          "shape": 2560,
+          "unix_ns": "1791189000687621000"
+        },
+        {
+          "loaded": true,
+          "shape": 2688,
+          "unix_ns": "1791189000689370000"
+        },
+        {
+          "loaded": true,
+          "shape": 1152,
+          "unix_ns": "1791189000691122000"
+        },
+        {
+          "loaded": true,
+          "shape": 640,
+          "unix_ns": "1791189000692470000"
+        },
+        {
+          "loaded": true,
+          "shape": 896,
+          "unix_ns": "1791189000693903000"
+        },
+        {
+          "loaded": true,
+          "shape": 1536,
+          "unix_ns": "1791189000696433000"
+        },
+        {
+          "loaded": true,
+          "shape": 3072,
+          "unix_ns": "1791189000698847000"
+        },
+        {
+          "loaded": true,
+          "shape": 3200,
+          "unix_ns": "1791189000700605000"
+        },
+        {
+          "loaded": true,
+          "shape": 3456,
+          "unix_ns": "1791189000702272000"
+        },
+        {
+          "loaded": true,
+          "shape": 128,
+          "unix_ns": "1791189000703847000"
+        },
+        {
+          "loaded": true,
+          "shape": 2048,
+          "unix_ns": "1791189000707336000"
+        },
+        {
+          "loaded": true,
+          "shape": 1664,
+          "unix_ns": "1791189000709099000"
+        },
+        {
+          "loaded": true,
+          "shape": 3584,
+          "unix_ns": "1791189000710635000"
+        },
+        {
+          "loaded": true,
+          "shape": 3840,
+          "unix_ns": "1791189000712300000"
+        },
+        {
+          "loaded": true,
+          "shape": 1024,
+          "unix_ns": "1791189000713964000"
+        },
+        {
+          "loaded": true,
+          "shape": 1280,
+          "unix_ns": "1791189000715874000"
+        },
+        {
+          "loaded": true,
+          "shape": 256,
+          "unix_ns": "1791189000717611000"
+        },
+        {
+          "loaded": true,
+          "shape": 3328,
+          "unix_ns": "1791189000721486000"
+        },
+        {
+          "loaded": true,
+          "shape": 4096,
+          "unix_ns": "1791189000723324000"
+        },
+        {
+          "loaded": true,
+          "shape": 384,
+          "unix_ns": "1791189000724885000"
+        },
+        {
+          "loaded": true,
+          "shape": 1408,
+          "unix_ns": "1791189000726512000"
+        },
+        {
+          "loaded": true,
+          "shape": 2432,
+          "unix_ns": "1791189000728152000"
+        }
+      ],
+      "loaded_total": 32,
+      "peak_transient_counter": "Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.",
+      "results": [
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 128
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 256
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 384
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 512
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 640
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 768
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 896
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1024
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1152
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1280
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1408
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1536
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1664
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1792
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 1920
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2048
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2176
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2304
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2432
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2560
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2688
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2816
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 2944
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3072
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3200
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3328
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3456
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3584
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3712
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3840
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 3968
+        },
+        {
+          "error": null,
+          "loaded": 1,
+          "shape": 4096
+        }
+      ],
+      "load_before_1_5_15": [
+        24.72705078125,
+        24.24560546875,
+        23.1181640625
+      ],
+      "load_after_1_5_15": [
+        16.2958984375,
+        22.0,
+        22.37451171875
+      ],
+      "unloads": [
+        {
+          "calls": 32,
+          "success_true": 32,
+          "success_false": 0,
+          "non_null_errors": []
+        }
+      ]
+    }
+  ]
+}

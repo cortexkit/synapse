@@ -3359,9 +3359,10 @@ mod tests {
 /// and keeps it resident on the Neural Engine. Too many resident shapes
 /// exhaust the ANE, so the supervisor owns a budget of
 /// [`ANE_RESIDENT_SHAPES_PER_MODEL`] shapes per model ref and
-/// [`ANE_RESIDENT_SHAPES_TOTAL`] overall, enforced with `ANE_ADMIT_SHAPE` and
-/// `ANE_EVICT_SHAPE`. A shape counts against the budget from its admit request
-/// until its `EVICTED` ack. While a request runs on a shape it holds a lease,
+/// [`ANE_RESIDENT_SHAPES_TOTAL`] overall, plus a module-wide
+/// [`ANE_RESIDENT_EXECUTABLES_TOTAL`] layer-executable budget, enforced with
+/// `ANE_ADMIT_SHAPE` and `ANE_EVICT_SHAPE`. A shape counts against both budgets
+/// from its admit request until its `EVICTED` ack. While a request runs on a shape it holds a lease,
 /// and a leased shape is never evicted.
 ///
 /// A request runs its rungs one at a time in ascending order and releases each
@@ -3375,7 +3376,7 @@ mod tests {
 /// workers are driven through [`AneShapeWorker`], whose connection is held only
 /// for a single exchange ([`AneWorkerChannel`]).
 pub mod ane_residency {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::future::Future;
     use std::io;
     #[cfg(unix)]
@@ -3399,6 +3400,15 @@ pub mod ane_residency {
     pub const ANE_SHAPE_LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
     pub const ANE_RESIDENT_SHAPES_PER_MODEL: usize = 4;
     pub const ANE_RESIDENT_SHAPES_TOTAL: usize = 8;
+    /// Only M5 Max was measured: Mac17,6, OS build 26A434 failed at 115-118
+    /// loaded layer executables across processes, including gte-modernbert-base
+    /// at sequence lengths 4096 and 8192.
+    /// Reserve 15 slots below the lowest observed failure; other ANE users can
+    /// still exhaust resources, so the worker's transient refusal remains a backstop.
+    pub const ANE_RESIDENT_EXECUTABLES_TOTAL: usize = 100;
+    /// Bound admission queue waits; worker admit/evict exchanges finish separately
+    /// so a timed-out waiter cannot leave an unaccounted partially admitted shape.
+    pub const ANE_ADMISSION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// Lock file, relative to the home directory, held by the one module
@@ -3469,6 +3479,65 @@ pub mod ane_residency {
     pub trait AneShapeWorker: Send + Sync {
         /// Stable id of this worker; shapes are dropped per worker on restart.
         fn worker_id(&self) -> &str;
+        /// Identifies the owning process, not just the stable worker name.
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn evict_shape_at_generation<'a>(
+            &'a self,
+            generation: u64,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+            if self.generation() != generation {
+                Box::pin(async {
+                    Err(AneResidencyError::Channel("stale worker generation".into()))
+                })
+            } else {
+                self.evict_shape(model_ref, shape)
+            }
+        }
+        /// Full layer count reserved before compilation, from the model profile in
+        /// the repository's versioned bench/parity/models.json manifest.
+        fn executable_count(&self, model_ref: &str) -> Result<usize, AneResidencyError> {
+            static MANIFEST: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            let manifest = MANIFEST.get_or_init(|| {
+                serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../bench/parity/models.json"
+                )))
+                .expect("pinned parity manifest")
+            });
+            let profile = model_ref
+                .strip_prefix("ane-direct:")
+                .and_then(|value| value.split(':').next());
+            let layers = profile
+                .and_then(|profile| {
+                    let model = manifest["profiles"][profile]["model"].as_str()?;
+                    manifest["models"][model]["architecture"]["params"]["num_hidden_layers"]
+                        .as_u64()
+                })
+                .and_then(|layers| usize::try_from(layers).ok())
+                .filter(|layers| *layers > 0);
+            layers.ok_or_else(|| AneResidencyError::WorkerErr {
+                code: "model_unsupported".into(),
+                msg: "no pinned layer count for direct-ANE model reference".into(),
+            })
+        }
+        fn admit_shape_at_generation<'a>(
+            &'a self,
+            generation: u64,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+            if self.generation() != generation {
+                Box::pin(async {
+                    Err(AneResidencyError::Channel("stale worker generation".into()))
+                })
+            } else {
+                self.admit_shape(model_ref, shape)
+            }
+        }
         /// Sends `ANE_ADMIT_SHAPE` and waits for `ADMITTED`.
         fn admit_shape<'a>(
             &'a self,
@@ -3511,6 +3580,23 @@ pub mod ane_residency {
         pub restarts: u64,
     }
 
+    // Test-only observation separates complete lease latency from the compile RPC,
+    // which starts after the connection lock and excludes queued inference work.
+    #[cfg(test)]
+    #[derive(Clone, serde::Serialize)]
+    struct AdmissionWait {
+        shape: usize,
+        elapsed_ms: f64,
+        admitted: bool,
+    }
+    #[cfg(test)]
+    type AdmissionWaits = Arc<Mutex<Vec<AdmissionWait>>>;
+    #[cfg(test)]
+    tokio::task_local! {
+        static ADMISSION_WAITS: AdmissionWaits;
+        static COMPILE_RPC_MS: Arc<Mutex<Option<f64>>>;
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct ShapeKey {
         model_ref: String,
@@ -3522,6 +3608,7 @@ pub mod ane_residency {
         Admitting,
         Resident,
         Evicting,
+        Failed,
     }
 
     struct Slot {
@@ -3533,11 +3620,14 @@ pub mod ane_residency {
         leases: u32,
         last_used: u64,
         inventory: Option<Arc<AnePlacementInventory>>,
+        executables: usize,
+        generation: u64,
     }
 
     #[derive(Default)]
     struct State {
         slots: BTreeMap<ShapeKey, Slot>,
+        recovering: BTreeSet<String>,
         waiters: VecDeque<u64>,
         next_ticket: u64,
         next_slot: u64,
@@ -3551,6 +3641,11 @@ pub mod ane_residency {
         fn tick(&mut self) -> u64 {
             self.clock += 1;
             self.clock
+        }
+
+        fn reserved_executables(&self) -> usize {
+            // Admitting and evicting shapes retain their full reservation until the worker ack.
+            self.slots.values().map(|slot| slot.executables).sum()
         }
 
         fn model_count(&self, model_ref: &str) -> usize {
@@ -3584,8 +3679,12 @@ pub mod ane_residency {
 
     struct Inner {
         limits: AneResidencyLimits,
+        executable_budget: usize,
+        wait_timeout: std::time::Duration,
         state: Mutex<State>,
         changed: Notify,
+        #[cfg(test)]
+        admission_gate: Option<Arc<tokio::sync::Mutex<()>>>,
         #[cfg(unix)]
         lane_lock: Option<AneDirectLaneLock>,
     }
@@ -3651,8 +3750,12 @@ pub mod ane_residency {
             Self {
                 inner: Arc::new(Inner {
                     limits,
+                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
+                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
+                    #[cfg(test)]
+                    admission_gate: None,
                     #[cfg(unix)]
                     lane_lock: None,
                 }),
@@ -3665,8 +3768,12 @@ pub mod ane_residency {
             Self {
                 inner: Arc::new(Inner {
                     limits,
+                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
+                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
                     state: Mutex::new(State::default()),
                     changed: Notify::new(),
+                    #[cfg(test)]
+                    admission_gate: None,
                     lane_lock: Some(lock),
                 }),
             }
@@ -3725,10 +3832,37 @@ pub mod ane_residency {
             model_ref: &str,
             shape: usize,
         ) -> Result<AneShapeLease, AneResidencyError> {
+            #[cfg(test)]
+            let started = std::time::Instant::now();
+            let result = self.lease_inner(worker, model_ref, shape).await;
+            #[cfg(test)]
+            let _ = ADMISSION_WAITS.try_with(|waits| {
+                waits.lock().unwrap().push(AdmissionWait {
+                    shape,
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    admitted: result.is_ok(),
+                })
+            });
+            result
+        }
+
+        async fn lease_inner(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            shape: usize,
+        ) -> Result<AneShapeLease, AneResidencyError> {
             let key = ShapeKey {
                 model_ref: model_ref.to_string(),
                 shape,
             };
+            let executables = worker.executable_count(model_ref)?;
+            if executables > self.inner.executable_budget {
+                return Err(resource_refusal(AneResidencyError::Channel(
+                    "shape exceeds executable budget".into(),
+                )));
+            }
+            let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
             let ticket = QueueTicket::enqueue(&self.inner);
             loop {
                 // Register for wakeups before reading the state, so a change
@@ -3736,7 +3870,7 @@ pub mod ane_residency {
                 let notified = self.inner.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                match self.next_step(ticket.id, &key, worker) {
+                match self.next_step(ticket.id, &key, worker, executables) {
                     Step::Leased(lease) => return Ok(lease),
                     Step::Admit(slot_id) => return self.admit(worker.clone(), key, slot_id).await,
                     Step::Evict {
@@ -3746,7 +3880,13 @@ pub mod ane_residency {
                     } => {
                         self.evict(owner, key, slot_id).await;
                     }
-                    Step::Wait => notified.await,
+                    Step::Wait => {
+                        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                            return Err(resource_refusal(AneResidencyError::Channel(
+                                "admission budget wait deadline exceeded".into(),
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -3799,9 +3939,17 @@ pub mod ane_residency {
                 .collect())
         }
 
-        fn next_step(&self, ticket: u64, key: &ShapeKey, worker: &Arc<dyn AneShapeWorker>) -> Step {
+        fn next_step(
+            &self,
+            ticket: u64,
+            key: &ShapeKey,
+            worker: &Arc<dyn AneShapeWorker>,
+            executables: usize,
+        ) -> Step {
             let mut state = self.inner.lock();
-            if state.waiters.front() != Some(&ticket) {
+            if state.waiters.front() != Some(&ticket)
+                || state.recovering.contains(worker.worker_id())
+            {
                 return Step::Wait;
             }
             let now = state.tick();
@@ -3824,7 +3972,9 @@ pub mod ane_residency {
             }
             let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
             let total_full = state.slots.len() >= self.inner.limits.total;
-            if !model_full && !total_full {
+            let executable_full = state.reserved_executables().saturating_add(executables)
+                > self.inner.executable_budget;
+            if !model_full && !total_full && !executable_full {
                 state.next_slot += 1;
                 let id = state.next_slot;
                 state.slots.insert(
@@ -3836,6 +3986,8 @@ pub mod ane_residency {
                         leases: 0,
                         last_used: now,
                         inventory: None,
+                        executables,
+                        generation: worker.generation(),
                     },
                 );
                 state.waiters.pop_front();
@@ -3850,6 +4002,7 @@ pub mod ane_residency {
                 .filter(|(candidate, slot)| {
                     slot.state == SlotState::Resident
                         && slot.leases == 0
+                        && !state.recovering.contains(slot.worker.worker_id())
                         && (!model_full || candidate.model_ref == key.model_ref)
                 })
                 .min_by_key(|(_, slot)| slot.last_used)
@@ -3874,16 +4027,38 @@ pub mod ane_residency {
             slot_id: u64,
         ) -> Result<AneShapeLease, AneResidencyError> {
             let inner = self.inner.clone();
+            let generation = inner
+                .lock()
+                .slots
+                .get(&key)
+                .filter(|slot| slot.id == slot_id)
+                .map(|slot| slot.generation)
+                .ok_or_else(|| {
+                    AneResidencyError::Channel("admission reservation retired".into())
+                })?;
             // The exchange runs on its own task so its outcome is recorded even
             // if the waiting request is dropped part way through.
             let supervisor = self.clone();
             let task = tokio::spawn(async move {
-                match worker.admit_shape(&key.model_ref, key.shape).await {
+                #[cfg(test)]
+                let _serial_admission = match &inner.admission_gate {
+                    Some(gate) => Some(gate.lock().await),
+                    None => None,
+                };
+                match worker
+                    .admit_shape_at_generation(generation, &key.model_ref, key.shape)
+                    .await
+                {
                     Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                    Err(error) if worker.generation() != generation => {
+                        mark_failed_admission(&inner, &key, slot_id);
+                        Err(resource_refusal(error))
+                    }
                     Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
                         retry_resource_admission(&supervisor, &worker, key, slot_id, error).await
                     }
                     Err(error) => {
+                        mark_failed_admission(&inner, &key, slot_id);
                         recover_worker(&inner, &worker).await;
                         Err(error)
                     }
@@ -3895,9 +4070,31 @@ pub mod ane_residency {
         }
 
         async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
+            self.evict_with_recovery(owner, key, slot_id, true).await
+        }
+
+        async fn evict_with_recovery(
+            &self,
+            owner: Arc<dyn AneShapeWorker>,
+            key: ShapeKey,
+            slot_id: u64,
+            recover_on_failure: bool,
+        ) -> bool {
             let inner = self.inner.clone();
+            let Some(generation) = inner
+                .lock()
+                .slots
+                .get(&key)
+                .filter(|slot| slot.id == slot_id)
+                .map(|slot| slot.generation)
+            else {
+                return true;
+            };
             let task = tokio::spawn(async move {
-                match owner.evict_shape(&key.model_ref, key.shape).await {
+                match owner
+                    .evict_shape_at_generation(generation, &key.model_ref, key.shape)
+                    .await
+                {
                     Ok(()) => {
                         let mut state = inner.lock();
                         if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
@@ -3909,6 +4106,7 @@ pub mod ane_residency {
                         inner.changed.notify_waiters();
                         true
                     }
+                    Err(_) if owner.generation() != generation => true,
                     Err(error) => {
                         tracing::warn!(
                             target: "worker",
@@ -3918,7 +4116,9 @@ pub mod ane_residency {
                             error = %error,
                             "direct-ANE evict failed; restarting the worker"
                         );
-                        recover_worker(&inner, &owner).await;
+                        if recover_on_failure {
+                            recover_worker(&inner, &owner).await;
+                        }
                         false
                     }
                 }
@@ -3938,13 +4138,26 @@ pub mod ane_residency {
         let victim = state
             .slots
             .iter()
-            .filter(|(_, slot)| slot.state == SlotState::Resident && slot.leases == 0)
+            .filter(|(_, slot)| {
+                slot.state == SlotState::Resident
+                    && slot.leases == 0
+                    && !state.recovering.contains(slot.worker.worker_id())
+            })
             .min_by_key(|(_, slot)| slot.last_used)
             .map(|(key, slot)| (key.clone(), slot.id, slot.worker.clone()));
         if let Some((key, _, _)) = &victim {
             state.slots.get_mut(key).unwrap().state = SlotState::Evicting;
         }
         victim
+    }
+
+    fn mark_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
+        let mut state = inner.lock();
+        if let Some(slot) = state.slots.get_mut(key).filter(|slot| slot.id == slot_id) {
+            slot.state = SlotState::Failed;
+        }
+        drop(state);
+        inner.changed.notify_waiters();
     }
 
     fn forget_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
@@ -3981,19 +4194,47 @@ pub mod ane_residency {
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         };
-        if !supervisor.evict(owner, victim, victim_id).await {
+        if !supervisor
+            .evict_with_recovery(owner.clone(), victim, victim_id, false)
+            .await
+        {
+            // The admission RPC has finished, but its reservation remains charged.
+            // Recovery must not wait on the operation that is requesting recovery.
+            if owner.worker_id() == worker.worker_id() {
+                mark_failed_admission(&supervisor.inner, &key, slot_id);
+            }
+            recover_worker(&supervisor.inner, &owner).await;
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         }
-        // One retry only. A second resource refusal must leave the target absent
-        // without restarting a healthy worker or recursively evicting the lane.
-        match worker.admit_shape(&key.model_ref, key.shape).await {
+        let Some(generation) = supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&key)
+            .filter(|slot| slot.id == slot_id)
+            .map(|slot| slot.generation)
+        else {
+            return Err(resource_refusal(error));
+        };
+        // One retry only. Persistent exhaustion after completed eviction triggers
+        // confirmed-exit recovery, not further eviction or an unbounded compile loop.
+        match worker
+            .admit_shape_at_generation(generation, &key.model_ref, key.shape)
+            .await
+        {
             Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
+            Err(error) if worker.generation() != generation => {
+                mark_failed_admission(&supervisor.inner, &key, slot_id);
+                Err(resource_refusal(error))
+            }
             Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
-                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                mark_failed_admission(&supervisor.inner, &key, slot_id);
+                recover_worker(&supervisor.inner, worker).await;
                 Err(resource_refusal(error))
             }
             Err(error) => {
+                mark_failed_admission(&supervisor.inner, &key, slot_id);
                 recover_worker(&supervisor.inner, worker).await;
                 Err(error)
             }
@@ -4031,26 +4272,53 @@ pub mod ane_residency {
         })
     }
 
-    /// Restarts a worker after a non-resource admission error or eviction error
-    /// (including a lost connection), then forgets its shapes, since the new
-    /// process has none, and wakes the waiting requests.
-    async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) {
+    /// Recovery stops new leases and waits for already dispatched work to finish.
+    /// Reservations remain until confirmed process exit and pinned model restoration.
+    /// Drain timeout escalates by interrupting active I/O and closing the owner.
+    /// Only an unconfirmed exit or failed replacement/restoration stays closed:
+    /// its hardware ownership cannot safely be made available to another worker.
+    async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) -> bool {
+        let id = worker.worker_id().to_owned();
+        let leader = inner.lock().recovering.insert(id.clone());
+        let deadline = tokio::time::Instant::now() + inner.wait_timeout;
+        loop {
+            let notified = inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let drained = {
+                let state = inner.lock();
+                if !state.recovering.contains(&id) {
+                    return true;
+                }
+                state
+                    .slots
+                    .values()
+                    .filter(|slot| slot.worker.worker_id() == id)
+                    .all(|slot| slot.leases == 0 && slot.state != SlotState::Admitting)
+            };
+            if leader && drained {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if leader {
+                    tracing::warn!(target:"worker",worker_id=%id,"worker recovery drain deadline exceeded; forcing confirmed-exit restart");
+                    break;
+                }
+                return false;
+            }
+        }
         if let Err(error) = worker.restart().await {
-            tracing::warn!(
-                target: "worker",
-                worker_id = worker.worker_id(),
-                error = %error,
-                "direct-ANE worker restart failed"
-            );
+            tracing::warn!(target:"worker",worker_id=%id,error=%error,"direct-ANE worker restart failed; reservations retained");
+            inner.changed.notify_waiters();
+            return false;
         }
         let mut state = inner.lock();
-        let worker_id = worker.worker_id();
-        state
-            .slots
-            .retain(|_, slot| slot.worker.worker_id() != worker_id);
+        state.slots.retain(|_, slot| slot.worker.worker_id() != id);
+        state.recovering.remove(&id);
         state.stats.restarts += 1;
         drop(state);
         inner.changed.notify_waiters();
+        true
     }
 
     /// A held lease on one resident shape; dropping it releases the lease.
@@ -4095,17 +4363,61 @@ pub mod ane_residency {
 
     /// Opens a fresh connection to a direct-ANE worker process (spawning it
     /// and completing its HELLO).
-    pub type AneWorkerConnector<S> =
-        Box<dyn Fn() -> BoxFuture<'static, Result<S, AneResidencyError>> + Send + Sync>;
+    pub type AneWorkerConnector<S> = Box<
+        dyn Fn() -> BoxFuture<'static, Result<AneWorkerSession<S>, AneResidencyError>>
+            + Send
+            + Sync,
+    >;
+
+    /// A stream plus its owning process's exit confirmation. After the stream
+    /// closes, `confirm_exit` must wait for the child's exit status, not merely
+    /// send a termination signal. In-memory tests model a process with a server
+    /// task and confirm that task ended instead.
+    pub struct AneWorkerSession<S> {
+        pub stream: S,
+        pub confirm_exit: BoxFuture<'static, Result<(), AneResidencyError>>,
+    }
+
+    #[cfg(test)]
+    struct CompileRpcClock(std::time::Instant);
+    #[cfg(test)]
+    impl Drop for CompileRpcClock {
+        fn drop(&mut self) {
+            let _ = COMPILE_RPC_MS.try_with(|elapsed| {
+                *elapsed.lock().unwrap() = Some(self.0.elapsed().as_secs_f64() * 1000.0)
+            });
+        }
+    }
+
+    // Dropping a partially completed exchange leaves unread framing on the socket.
+    // Fault it before the stream mutex is released so no next request can consume it.
+    struct ExchangeFaultGuard<'a> {
+        faulted: &'a std::sync::atomic::AtomicBool,
+        completed: bool,
+    }
+    impl Drop for ExchangeFaultGuard<'_> {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.faulted.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 
     /// A direct-ANE worker connection used for one exchange at a time, so a
-    /// shape admission or eviction never waits behind a whole request.
+    /// admission waits never hold the connection; an exchange or restart locks it.
     pub struct AneWorkerChannel<S> {
         worker_id: String,
         max_frame: u32,
-        stream: tokio::sync::Mutex<Option<S>>,
+        stream: tokio::sync::Mutex<Option<AneWorkerSession<S>>>,
         connect: AneWorkerConnector<S>,
+        loaded_models: Mutex<BTreeMap<String, WorkerRequest>>,
+        faulted: std::sync::atomic::AtomicBool,
+        exit_unconfirmed: std::sync::atomic::AtomicBool,
         request_counter: AtomicU64,
+        stop_exchanges: Notify,
+        generation: AtomicU64,
+        shape_rpc_timeout: std::time::Duration,
+        owner_exit_timeout: std::time::Duration,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -4123,7 +4435,18 @@ pub mod ane_residency {
                 max_frame,
                 stream: tokio::sync::Mutex::new(Some(stream)),
                 connect,
+                loaded_models: Mutex::new(BTreeMap::new()),
+                faulted: std::sync::atomic::AtomicBool::new(false),
+                exit_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                 request_counter: AtomicU64::new(0),
+                stop_exchanges: Notify::new(),
+                generation: AtomicU64::new(0),
+                // Compiling/loading all 22 GTE layers at length 8192 took 115.495s
+                // in debug. The 100-program budget permits at most four concurrent
+                // shape compiles (minimum 22 layers each); 600s covers their measured
+                // serialized cost (~462s) plus headroom, but bounds a silent worker.
+                shape_rpc_timeout: std::time::Duration::from_secs(600),
+                owner_exit_timeout: std::time::Duration::from_secs(30),
             })
         }
 
@@ -4135,19 +4458,78 @@ pub mod ane_residency {
         }
 
         /// Sends one request (and its raw frame) and reads the response (and
-        /// its raw frame). A transport failure closes the connection; the
+        /// its raw frame). A transport failure marks the connection unusable; the
         /// worker is unusable until [`AneShapeWorker::restart`].
         pub async fn exchange(
             &self,
             request: &WorkerRequest,
             raw: Option<&[u8]>,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            self.exchange_in_generation(request, raw, self.generation())
+                .await
+        }
+
+        async fn exchange_in_generation(
+            &self,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+            generation: u64,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            let operation = self.exchange_inner(request, raw, generation);
+            if matches!(
+                request,
+                WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneEvictShape { .. }
+            ) {
+                match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if self.generation() == generation {
+                            self.faulted.store(true, Ordering::Relaxed);
+                            self.stop_exchanges.notify_waiters();
+                        }
+                        Err(AneResidencyError::Channel(
+                            "shape exchange deadline exceeded; owner exit required".into(),
+                        ))
+                    }
+                }
+            } else {
+                operation.await
+            }
+        }
+
+        async fn exchange_inner(
+            &self,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+            generation: u64,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
             let mut guard = self.stream.lock().await;
-            let stream = guard.as_mut().ok_or_else(|| {
+            if self.generation() != generation {
+                return Err(AneResidencyError::Channel("stale worker generation".into()));
+            }
+            let stopped = self.stop_exchanges.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
+            if self.faulted.load(Ordering::Relaxed) {
+                return Err(AneResidencyError::Channel(
+                    "worker connection requires confirmed-exit restart".into(),
+                ));
+            }
+            let session = guard.as_mut().ok_or_else(|| {
                 AneResidencyError::Channel(format!("worker {} is not connected", self.worker_id))
             })?;
+            let stream = &mut session.stream;
             let max_frame = self.max_frame;
-            let result = async {
+            let mut exchange_guard = ExchangeFaultGuard {
+                faulted: &self.faulted,
+                completed: false,
+            };
+            #[cfg(test)]
+            let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
+                .then(|| CompileRpcClock(std::time::Instant::now()));
+            let result = tokio::select! {
+                _=stopped=>Err(AneResidencyError::Channel("worker recovery interrupted an active exchange".into())),
+                result=async {
                 write_json(stream, request, max_frame).await?;
                 if let Some(raw) = raw {
                     write_raw(stream, raw, max_frame).await?;
@@ -4158,13 +4540,41 @@ pub mod ane_residency {
                 } else {
                     None
                 };
-                Ok::<_, TransportError>((response, raw))
+                Ok::<_, AneResidencyError>((response, raw))
+            }=>result
+            };
+            #[cfg(test)]
+            drop(compile_clock);
+            match result {
+                Ok((response, raw)) => {
+                    exchange_guard.completed = true;
+                    let mut models = self.loaded_models.lock().unwrap_or_else(|p| p.into_inner());
+                    match (request, &response) {
+                        (
+                            WorkerRequest::Load { req_id, .. },
+                            WorkerResponse::Loaded {
+                                req_id: got,
+                                model_ref,
+                                ..
+                            },
+                        ) if req_id == got => {
+                            models.insert(model_ref.clone(), request.clone());
+                        }
+                        (
+                            WorkerRequest::Unload { req_id, model_ref },
+                            WorkerResponse::Unloaded { req_id: got },
+                        ) if req_id == got => {
+                            models.remove(model_ref);
+                        }
+                        _ => {}
+                    }
+                    Ok((response, raw))
+                }
+                Err(error) => {
+                    self.faulted.store(true, Ordering::Relaxed);
+                    Err(error)
+                }
             }
-            .await;
-            result.map_err(|error| {
-                *guard = None;
-                error.into()
-            })
         }
     }
 
@@ -4175,9 +4585,20 @@ pub mod ane_residency {
         fn worker_id(&self) -> &str {
             &self.worker_id
         }
+        fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
 
         fn admit_shape<'a>(
             &'a self,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+            self.admit_shape_at_generation(self.generation(), model_ref, shape)
+        }
+        fn admit_shape_at_generation<'a>(
+            &'a self,
+            generation: u64,
             model_ref: &'a str,
             shape: usize,
         ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
@@ -4188,7 +4609,10 @@ pub mod ane_residency {
                     model_ref: model_ref.to_string(),
                     shape,
                 };
-                match self.exchange(&request, None).await? {
+                match self
+                    .exchange_in_generation(&request, None, generation)
+                    .await?
+                {
                     (
                         WorkerResponse::Admitted {
                             req_id: got,
@@ -4211,6 +4635,15 @@ pub mod ane_residency {
             model_ref: &'a str,
             shape: usize,
         ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+            self.evict_shape_at_generation(self.generation(), model_ref, shape)
+        }
+
+        fn evict_shape_at_generation<'a>(
+            &'a self,
+            generation: u64,
+            model_ref: &'a str,
+            shape: usize,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
             Box::pin(async move {
                 let req_id = self.next_req_id("evict");
                 let request = WorkerRequest::AneEvictShape {
@@ -4218,7 +4651,10 @@ pub mod ane_residency {
                     model_ref: model_ref.to_string(),
                     shape,
                 };
-                match self.exchange(&request, None).await? {
+                match self
+                    .exchange_in_generation(&request, None, generation)
+                    .await?
+                {
                     (WorkerResponse::Evicted { req_id: got }, _) if got == req_id => Ok(()),
                     (WorkerResponse::Err { code, msg, .. }, _) => {
                         Err(AneResidencyError::WorkerErr { code, msg })
@@ -4232,11 +4668,78 @@ pub mod ane_residency {
 
         fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
             Box::pin(async move {
+                // Stop active I/O before taking the stream lock. A lease or a
+                // nonresponsive request cannot prevent escalation after drain timeout.
+                self.faulted.store(true, Ordering::Relaxed);
+                self.stop_exchanges.notify_waiters();
                 let mut guard = self.stream.lock().await;
-                // Closing the connection ends the old worker process, which
-                // exits when its supervisor connection closes.
-                *guard = None;
-                *guard = Some((self.connect)().await?);
+                if self.exit_unconfirmed.load(Ordering::Relaxed) {
+                    return Err(AneResidencyError::Channel(
+                        "old owner exit remains unconfirmed".into(),
+                    ));
+                }
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                if let Some(old) = guard.take() {
+                    self.exit_unconfirmed.store(true, Ordering::Relaxed);
+                    drop(old.stream);
+                    tokio::time::timeout(self.owner_exit_timeout,old.confirm_exit).await.map_err(|_|AneResidencyError::Channel("owner exit confirmation deadline exceeded; ownership remains closed".into()))??;
+                    self.exit_unconfirmed.store(false, Ordering::Relaxed);
+                }
+                let mut fresh = tokio::time::timeout(self.shape_rpc_timeout, (self.connect)())
+                    .await
+                    .map_err(|_| {
+                        AneResidencyError::Channel(
+                            "replacement connection deadline exceeded".into(),
+                        )
+                    })??;
+                let models = self
+                    .loaded_models
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                let reload = tokio::time::timeout(self.shape_rpc_timeout, async {
+                    for (model_ref, mut request) in models {
+                        let req_id = self.next_req_id("reload");
+                        if let WorkerRequest::Load { req_id: id, .. } = &mut request {
+                            *id = req_id.clone();
+                        }
+                        write_json(&mut fresh.stream, &request, self.max_frame).await?;
+                        let response: WorkerResponse =
+                            read_json(&mut fresh.stream, self.max_frame).await?;
+                        match response {
+                            WorkerResponse::Loaded {
+                                req_id: got,
+                                model_ref: got_ref,
+                                ..
+                            } if got == req_id && got_ref == model_ref => {}
+                            other => {
+                                return Err(AneResidencyError::Channel(format!(
+                                    "model reload returned {other:?}"
+                                )))
+                            }
+                        }
+                    }
+                    Ok::<_, AneResidencyError>(())
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AneResidencyError::Channel(
+                        "pinned model restoration deadline exceeded".into(),
+                    ))
+                });
+                if let Err(error) = reload {
+                    self.exit_unconfirmed.store(true, Ordering::Relaxed);
+                    drop(fresh.stream);
+                    tokio::time::timeout(self.owner_exit_timeout, fresh.confirm_exit)
+                        .await
+                        .map_err(|_| {
+                            AneResidencyError::Channel("replacement owner exit unconfirmed".into())
+                        })??;
+                    self.exit_unconfirmed.store(false, Ordering::Relaxed);
+                    return Err(error);
+                }
+                *guard = Some(fresh);
+                self.faulted.store(false, Ordering::Relaxed);
                 Ok(())
             })
         }
@@ -4356,8 +4859,52 @@ pub mod ane_residency {
                             .map_err(|error| AneResidencyError::Channel(format!("{error:?}")))?;
                         let WorkerConnection { stream, child, .. } =
                             host.connection.take().unwrap();
+                        let pid = child.id().expect("new child pid");
                         children.lock().unwrap().push(child);
-                        Ok(stream)
+                        Ok(AneWorkerSession {
+                            stream,
+                            confirm_exit: Box::pin(async move {
+                                let mut child = {
+                                    let mut children = children.lock().unwrap();
+                                    let index = children
+                                        .iter()
+                                        .position(|child| child.id() == Some(pid))
+                                        .ok_or_else(|| {
+                                            AneResidencyError::Channel(
+                                                "old worker child handle missing".into(),
+                                            )
+                                        })?;
+                                    children.remove(index)
+                                };
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    child.wait(),
+                                )
+                                .await
+                                {
+                                    Ok(status) => {
+                                        status.map_err(|error| {
+                                            AneResidencyError::Channel(format!(
+                                                "worker exit wait: {error}"
+                                            ))
+                                        })?;
+                                    }
+                                    Err(_) => {
+                                        child.start_kill().map_err(|error| {
+                                            AneResidencyError::Channel(format!(
+                                                "worker termination: {error}"
+                                            ))
+                                        })?;
+                                        child.wait().await.map_err(|error| {
+                                            AneResidencyError::Channel(format!(
+                                                "worker exit confirmation: {error}"
+                                            ))
+                                        })?;
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        })
                     })
                 });
                 Arc::new(
@@ -4449,6 +4996,7 @@ pub mod ane_residency {
         }
         #[derive(Default)]
         struct Ledger {
+            compile_samples: BTreeMap<String, Vec<Value>>,
             admitted: usize,
             evicted: usize,
             leased_evicts: usize,
@@ -4466,13 +5014,35 @@ pub mod ane_residency {
             fn worker_id(&self) -> &str {
                 self.channel.worker_id()
             }
+            fn generation(&self) -> u64 {
+                self.channel.generation()
+            }
             fn admit_shape<'a>(
                 &'a self,
                 model_ref: &'a str,
                 shape: usize,
             ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.admit_shape_at_generation(self.generation(), model_ref, shape)
+            }
+            fn admit_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
                 Box::pin(async move {
-                    let result = self.channel.admit_shape(model_ref, shape).await;
+                    let elapsed = Arc::new(Mutex::new(None));
+                    let result = COMPILE_RPC_MS
+                        .scope(
+                            elapsed.clone(),
+                            self.channel
+                                .admit_shape_at_generation(generation, model_ref, shape),
+                        )
+                        .await;
+                    // No compilation RPC is written until the worker socket mutex
+                    // is acquired; a refusal before that point has zero dispatched time.
+                    let milliseconds = elapsed.lock().unwrap().unwrap_or(0.0);
+                    self.ledger.lock().unwrap().compile_samples.entry(self.slug.clone()).or_default().push(json!({"shape":shape,"elapsed_ms":milliseconds,"admitted":result.is_ok()}));
                     match &result {
                         Ok(inventory) => {
                             let model = &manifest()["models"][&self.slug];
@@ -4519,6 +5089,14 @@ pub mod ane_residency {
                 model_ref: &'a str,
                 shape: usize,
             ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.evict_shape_at_generation(self.generation(), model_ref, shape)
+            }
+            fn evict_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
                 Box::pin(async move {
                     if self
                         .supervisor
@@ -4534,22 +5112,15 @@ pub mod ane_residency {
                     {
                         self.ledger.lock().unwrap().leased_evicts += 1;
                     }
-                    self.channel.evict_shape(model_ref, shape).await?;
+                    self.channel
+                        .evict_shape_at_generation(generation, model_ref, shape)
+                        .await?;
                     self.ledger.lock().unwrap().evicted += 1;
                     Ok(())
                 })
             }
             fn restart<'a>(&'a self) -> BoxFuture<'a, Result<(), AneResidencyError>> {
-                Box::pin(async move {
-                    self.channel.restart().await?;
-                    let model_ref = load(&self.channel, &self.slug).await;
-                    if model_ref != self.model_ref {
-                        return Err(AneResidencyError::Channel(
-                            "model_ref changed after restart".into(),
-                        ));
-                    }
-                    Ok(())
-                })
+                Box::pin(async move { self.channel.restart().await })
             }
         }
         async fn infer(
@@ -4647,6 +5218,7 @@ pub mod ane_residency {
                     "string" => value.is_string(),
                     "integer" => value.is_u64() || value.is_i64(),
                     "number" => value.is_number(),
+                    "boolean" => value.is_boolean(),
                     other => return Err(format!("unsupported schema type {other}")),
                 };
                 if !valid {
@@ -4733,8 +5305,14 @@ pub mod ane_residency {
         }
         #[test]
         fn stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes() {
-            let valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test","platform_uuid":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
+            let mut valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
             let schema = stress_schema();
+            assert!(
+                schema_validate(&valid, &schema).is_ok(),
+                "historical reports without timing fields remain valid"
+            );
+            valid["compile_duration_ms_by_model"] = json!({"gte-modernbert-base":{"count":1,"min":10,"median":10,"max":10,"samples":[{"shape":128,"elapsed_ms":10,"admitted":true}]}});
+            valid["request_wait_times"]=json!((0..37).map(|index|json!({"model":"gte-modernbert-base","request_id":format!("request-{index}"),"admission_wait_ms":12,"waits":[{"shape":128,"elapsed_ms":12,"admitted":true}]})).collect::<Vec<_>>());
             assert!(schema_validate(&valid, &schema).is_ok());
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove("sample_count");
@@ -4748,6 +5326,15 @@ pub mod ane_residency {
                 ("schema", json!(2)),
                 ("sample_count", json!(-1)),
                 ("source_commit", json!("short")),
+                ("request_wait_times", json!([])),
+                (
+                    "compile_duration_ms_by_model",
+                    json!({"m":{"count":1,"min":-1,"median":0,"max":0,"samples":[]}}),
+                ),
+                (
+                    "compile_duration_ms_by_model",
+                    json!({"m":{"count":1,"min":1,"median":1,"max":1,"samples":[{"shape":128,"elapsed_ms":1,"admitted":"true"}]}}),
+                ),
             ] {
                 let mut malformed = valid.clone();
                 malformed[field] = bad;
@@ -4760,6 +5347,68 @@ pub mod ane_residency {
             extra["unknown"] = json!(true);
             assert!(schema_validate(&extra, &schema).is_err());
         }
+        type RequestWaits = Arc<Mutex<BTreeMap<(String, String), AdmissionWaits>>>;
+
+        fn spawn_stress_request(
+            tasks: &mut tokio::task::JoinSet<Result<(), AneResidencyError>>,
+            waits: &RequestWaits,
+            model: String,
+            request_id: String,
+            request: impl std::future::Future<Output = Result<(), AneResidencyError>> + Send + 'static,
+        ) {
+            let samples = AdmissionWaits::default();
+            waits
+                .lock()
+                .unwrap()
+                .insert((model, request_id), samples.clone());
+            tasks.spawn(ADMISSION_WAITS.scope(samples, request));
+        }
+
+        fn compile_duration_summary(samples: &BTreeMap<String, Vec<Value>>) -> Value {
+            let mut summary = serde_json::Map::new();
+            for (model, records) in samples {
+                let mut elapsed = records
+                    .iter()
+                    .map(|record| record["elapsed_ms"].as_f64().unwrap())
+                    .collect::<Vec<_>>();
+                elapsed.sort_by(f64::total_cmp);
+                let count = elapsed.len();
+                if count > 0 {
+                    summary.insert(model.clone(),json!({"count":count,"min":elapsed[0],"median":(elapsed[(count-1)/2]+elapsed[count/2])/2.0,"max":elapsed[count-1],"samples":records}));
+                }
+            }
+            Value::Object(summary)
+        }
+
+        fn request_wait_summary(waits: &RequestWaits) -> Vec<Value> {
+            waits.lock().unwrap().iter().map(|((model,request_id),samples)|{
+                let samples=samples.lock().unwrap();
+                json!({"model":model,"request_id":request_id,"admission_wait_ms":samples.iter().map(|sample|sample.elapsed_ms).sum::<f64>(),"waits":*samples})
+            }).collect()
+        }
+
+        #[test]
+        fn compile_duration_summary_reports_independent_even_and_odd_medians() {
+            let records = |elapsed: &[f64]| {
+                elapsed
+                    .iter()
+                    .map(|elapsed| json!({"shape":128,"elapsed_ms":elapsed,"admitted":true}))
+                    .collect::<Vec<_>>()
+            };
+            let summary = compile_duration_summary(&BTreeMap::from([
+                ("gte".into(), records(&[9.0, 1.0, 7.0, 3.0])),
+                ("qwen".into(), records(&[8.0, 4.0, 2.0])),
+            ]));
+            assert_eq!(summary["gte"]["min"], 1.0);
+            assert_eq!(summary["gte"]["median"], 5.0);
+            assert_eq!(summary["gte"]["max"], 9.0);
+            assert_eq!(summary["gte"]["count"], 4);
+            assert_eq!(summary["qwen"]["min"], 2.0);
+            assert_eq!(summary["qwen"]["median"], 4.0);
+            assert_eq!(summary["qwen"]["max"], 8.0);
+            assert_eq!(summary["qwen"]["count"], 3);
+        }
+
         fn write_stress(out: &Path, report: &Value) {
             schema_validate(report, &stress_schema()).unwrap();
             if let Some(parent) = out.parent() {
@@ -4781,8 +5430,13 @@ pub mod ane_residency {
             std::fs::create_dir_all(&root).unwrap();
             let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
             let factory = Factory::new(root.clone(), &lock);
-            let supervisor =
+            let mut supervisor =
                 AneResidencySupervisor::with_lane_lock(AneResidencyLimits::default(), lock);
+            // Serialize shape compiles only in this test to isolate concurrency effects from residency limits.
+            if std::env::var_os("ANE_STRESS_SERIALIZE_ADMISSION").is_some() {
+                Arc::get_mut(&mut supervisor.inner).unwrap().admission_gate =
+                    Some(Arc::new(tokio::sync::Mutex::new(())));
+            }
             let ledger = Arc::new(Mutex::new(Ledger::default()));
             let mut workers = Vec::new();
             for (index, slug) in SLUGS.iter().enumerate() {
@@ -4798,84 +5452,104 @@ pub mod ane_residency {
             }
             let barrier = Arc::new(tokio::sync::Barrier::new(38));
             let mut tasks = tokio::task::JoinSet::new();
+            let request_waits = RequestWaits::default();
             for worker in &workers {
                 for shape in [128, 256, 512, 1024, 2048, 4096, 8192] {
                     let worker = worker.clone();
                     let supervisor = supervisor.clone();
                     let barrier = barrier.clone();
-                    tasks.spawn(async move {
-                        barrier.wait().await;
-                        let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                        let lease = supervisor.lease(&channel, &worker.model_ref, shape).await?;
-                        assert!(!lease.inventory().unwrap().executables.is_empty());
-                        drop(lease);
-                        Ok::<_, AneResidencyError>(())
-                    });
+                    spawn_stress_request(
+                        &mut tasks,
+                        &request_waits,
+                        worker.slug.clone(),
+                        format!("admit-{shape}"),
+                        async move {
+                            barrier.wait().await;
+                            let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                            let lease =
+                                supervisor.lease(&channel, &worker.model_ref, shape).await?;
+                            assert!(!lease.inventory().unwrap().executables.is_empty());
+                            drop(lease);
+                            Ok::<_, AneResidencyError>(())
+                        },
+                    );
                 }
             }
-            for _ in 0..8 {
+            for index in 0..8 {
                 let worker = workers[0].clone();
                 let supervisor = supervisor.clone();
                 let barrier = barrier.clone();
-                tasks.spawn(async move {
-                    barrier.wait().await;
-                    let ids = [
-                        fixture_ids(SLUGS[0], "boundary-128"),
-                        fixture_ids(SLUGS[0], "boundary-129"),
-                    ];
-                    let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                    supervisor
-                        .run_by_rung(&channel, &worker.model_ref, &[128, 129], |_, indices| {
-                            let worker = worker.clone();
-                            let input = ids[indices[0]].clone();
-                            async move { infer(&worker, input, false).await.map(|_| vec![()]) }
-                        })
-                        .await
-                        .map(|_| ())
-                });
+                spawn_stress_request(
+                    &mut tasks,
+                    &request_waits,
+                    worker.slug.clone(),
+                    format!("embed-{index}"),
+                    async move {
+                        barrier.wait().await;
+                        let ids = [
+                            fixture_ids(SLUGS[0], "boundary-128"),
+                            fixture_ids(SLUGS[0], "boundary-129"),
+                        ];
+                        let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                        supervisor
+                            .run_by_rung(&channel, &worker.model_ref, &[128, 129], |_, indices| {
+                                let worker = worker.clone();
+                                let input = ids[indices[0]].clone();
+                                async move { infer(&worker, input, false).await.map(|_| vec![()]) }
+                            })
+                            .await
+                            .map(|_| ())
+                    },
+                );
             }
             let pool_results: Arc<Mutex<Vec<(usize, f32)>>> = Arc::new(Mutex::new(Vec::new()));
             let pool_result_task = pool_results.clone();
             let worker = workers[1].clone();
             let supervisor_pool = supervisor.clone();
             let barrier_pool = barrier.clone();
-            tasks.spawn(async move {
-                barrier_pool.wait().await;
-                let mut long = fixture_ids(SLUGS[1], "long-8192");
-                let eos = *long.last().unwrap();
-                long.truncate(1535);
-                long.push(eos);
-                let ids = [
-                    fixture_ids(SLUGS[1], "short-0"),
-                    fixture_ids(SLUGS[1], "boundary-511"),
-                    long,
-                ];
-                let channel: Arc<dyn AneShapeWorker> = worker.clone();
-                supervisor_pool
-                    .run_by_rung(
-                        &channel,
-                        &worker.model_ref,
-                        &[ids[0].len(), ids[1].len(), ids[2].len()],
-                        |shape, indices| {
-                            let worker = worker.clone();
-                            let input = ids[indices[0]].clone();
-                            let pool_results = pool_result_task.clone();
-                            async move {
-                                let first = infer(&worker, input.clone(), true).await?;
-                                let second = infer(&worker, input, true).await?;
-                                assert_eq!(
-                                    first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                                    second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-                                );
-                                assert_eq!(first.len(), 1);
-                                pool_results.lock().unwrap().push((shape, first[0]));
-                                Ok::<_, AneResidencyError>(vec![()])
-                            }
-                        },
-                    )
-                    .await
-                    .map(|_| ())
-            });
+            spawn_stress_request(
+                &mut tasks,
+                &request_waits,
+                worker.slug.clone(),
+                "reranker-pool".into(),
+                async move {
+                    barrier_pool.wait().await;
+                    let mut long = fixture_ids(SLUGS[1], "long-8192");
+                    let eos = *long.last().unwrap();
+                    long.truncate(1535);
+                    long.push(eos);
+                    let ids = [
+                        fixture_ids(SLUGS[1], "short-0"),
+                        fixture_ids(SLUGS[1], "boundary-511"),
+                        long,
+                    ];
+                    let channel: Arc<dyn AneShapeWorker> = worker.clone();
+                    supervisor_pool
+                        .run_by_rung(
+                            &channel,
+                            &worker.model_ref,
+                            &[ids[0].len(), ids[1].len(), ids[2].len()],
+                            |shape, indices| {
+                                let worker = worker.clone();
+                                let input = ids[indices[0]].clone();
+                                let pool_results = pool_result_task.clone();
+                                async move {
+                                    let first = infer(&worker, input.clone(), true).await?;
+                                    let second = infer(&worker, input, true).await?;
+                                    assert_eq!(
+                                        first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                        second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                                    );
+                                    assert_eq!(first.len(), 1);
+                                    pool_results.lock().unwrap().push((shape, first[0]));
+                                    Ok::<_, AneResidencyError>(vec![()])
+                                }
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                },
+            );
             assert_eq!(tasks.len(), 37);
             barrier.wait().await;
             let mut completed = 0;
@@ -4894,15 +5568,8 @@ pub mod ane_residency {
                 pool_results.iter().map(|entry| entry.0).collect::<Vec<_>>() == [128, 512, 2048];
             let clean = {
                 let ledger = ledger.lock().unwrap();
-                let uuid = output("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])
-                    .lines()
-                    .find(|line| line.contains("IOPlatformUUID"))
-                    .unwrap()
-                    .split('"')
-                    .nth(3)
-                    .unwrap()
-                    .to_owned();
-                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"]), "platform_uuid":uuid}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
+
+                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "compile_duration_ms_by_model":compile_duration_summary(&ledger.compile_samples),"request_wait_times":request_wait_summary(&request_waits), "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
                 let out = std::env::var_os("ANE_STRESS_OUT")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
@@ -4965,7 +5632,7 @@ pub mod ane_residency {
                 items,
             };
             let mut guard = channel.stream.lock().await;
-            let stream = guard.as_mut().unwrap();
+            let stream = &mut guard.as_mut().unwrap().stream;
             write_json(stream, &request, DEFAULT_MAX_FRAME_BYTES)
                 .await
                 .unwrap();
@@ -5061,12 +5728,67 @@ pub mod ane_residency {
         use tokio::io::DuplexStream;
 
         const LAYERS: u32 = 4;
-        type Channel = Arc<AneWorkerChannel<DuplexStream>>;
+        struct MockChannel(AneWorkerChannel<DuplexStream>);
+        impl std::ops::Deref for MockChannel {
+            type Target = AneWorkerChannel<DuplexStream>;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        impl AneShapeWorker for MockChannel {
+            fn worker_id(&self) -> &str {
+                self.0.worker_id()
+            }
+            fn generation(&self) -> u64 {
+                self.0.generation()
+            }
+            fn admit_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.0
+                    .admit_shape_at_generation(generation, model_ref, shape)
+            }
+            fn evict_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.0
+                    .evict_shape_at_generation(generation, model_ref, shape)
+            }
+            fn executable_count(&self, _: &str) -> Result<usize, AneResidencyError> {
+                Ok(LAYERS as usize)
+            }
+            fn admit_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.0.admit_shape(model_ref, shape)
+            }
+            fn evict_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.0.evict_shape(model_ref, shape)
+            }
+            fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
+                self.0.restart()
+            }
+        }
+        type Channel = Arc<MockChannel>;
 
         /// What the mock workers observe, kept independently of the
         /// supervisor's own accounting so the budget checks can fail.
         #[derive(Default)]
         struct Ledger {
+            loads: Vec<WorkerRequest>,
+            evict_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             /// Requests currently running on (model_ref, shape); a request
             /// counts itself here only while it holds that shape's lease.
             in_flight: HashMap<(String, usize), u32>,
@@ -5080,6 +5802,11 @@ pub mod ane_residency {
             shape_not_admitted: u64,
             /// Admissions the mock answers with `ERR`, once each.
             fail_admit: HashSet<(String, usize)>,
+            fail_evict: HashSet<(String, usize)>,
+            fail_confirm_exit: bool,
+            exit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            no_reply_admit: HashSet<(String, usize)>,
+            no_reply_evict: HashSet<(String, usize)>,
             exhaust_admit: HashMap<(String, usize), usize>,
             admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
@@ -5114,11 +5841,35 @@ pub mod ane_residency {
                     None
                 };
                 let (response, raw_out) = match &request {
+                    WorkerRequest::Load {
+                        req_id,
+                        artifact_digest,
+                        ..
+                    } => {
+                        ledger.lock().unwrap().loads.push(request.clone());
+                        (
+                            WorkerResponse::Loaded {
+                                req_id: req_id.clone(),
+                                model_ref: format!("mock:{artifact_digest}"),
+                                dims: 4,
+                                cold_load_ms: 0,
+                                buckets: None,
+                            },
+                            None,
+                        )
+                    }
                     WorkerRequest::AneAdmitShape {
                         req_id,
                         model_ref,
                         shape,
                     } => {
+                        let key = (model_ref.clone(), *shape);
+                        let unacknowledged = ledger.lock().unwrap().no_reply_admit.remove(&key);
+                        if unacknowledged {
+                            own.insert(key.clone());
+                            ledger.lock().unwrap().resident.insert(key);
+                            continue;
+                        }
                         let delay = ledger.lock().unwrap().admit_delay;
                         tokio::time::sleep(delay).await;
                         let key = (model_ref.clone(), *shape);
@@ -5178,6 +5929,38 @@ pub mod ane_residency {
                         model_ref,
                         shape,
                     } => {
+                        let unacknowledged = ledger
+                            .lock()
+                            .unwrap()
+                            .no_reply_evict
+                            .remove(&(model_ref.clone(), *shape));
+                        if unacknowledged {
+                            continue;
+                        }
+                        let failed = ledger
+                            .lock()
+                            .unwrap()
+                            .fail_evict
+                            .remove(&(model_ref.clone(), *shape));
+                        if failed {
+                            write_json(
+                                &mut stream,
+                                &WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: "evict_failed".into(),
+                                    msg: "injected eviction failure".into(),
+                                },
+                                max,
+                            )
+                            .await
+                            .unwrap();
+                            continue;
+                        }
+                        let gate = ledger.lock().unwrap().evict_gate.clone();
+                        if let Some((started, release)) = gate {
+                            started.notify_one();
+                            release.notified().await;
+                        }
                         let key = (model_ref.clone(), *shape);
                         let mut ledger = ledger.lock().unwrap();
                         if ledger.in_flight.get(&key).copied().unwrap_or(0) > 0 {
@@ -5253,6 +6036,349 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
+        async fn replacement_never_starts_before_owner_exit_confirmation() {
+            let starts = Arc::new(AtomicU64::new(0));
+            let old_closed = Arc::new(Notify::new());
+            let confirm_allowed = Arc::new(Notify::new());
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let connector: AneWorkerConnector<DuplexStream> = Box::new({
+                let starts = starts.clone();
+                let old_closed = old_closed.clone();
+                let confirm_allowed = confirm_allowed.clone();
+                move || {
+                    let epoch = starts.fetch_add(1, Ordering::SeqCst);
+                    let old_closed = old_closed.clone();
+                    let confirm_allowed = confirm_allowed.clone();
+                    let ledger = ledger.clone();
+                    Box::pin(async move {
+                        let (host, worker) = tokio::io::duplex(1 << 16);
+                        let task = tokio::spawn(serve_mock(worker, ledger));
+                        Ok(AneWorkerSession {
+                            stream: host,
+                            confirm_exit: Box::pin(async move {
+                                task.await.map_err(|error| {
+                                    AneResidencyError::Channel(error.to_string())
+                                })?;
+                                if epoch == 0 {
+                                    old_closed.notify_one();
+                                    confirm_allowed.notified().await;
+                                }
+                                Ok(())
+                            }),
+                        })
+                    })
+                }
+            });
+            let channel = Arc::new(
+                AneWorkerChannel::connect("worker", DEFAULT_MAX_FRAME_BYTES, connector)
+                    .await
+                    .unwrap(),
+            );
+            let restart = tokio::spawn({
+                let channel = channel.clone();
+                async move { channel.restart().await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), old_closed.notified())
+                .await
+                .unwrap();
+            let starts_before_confirmation = starts.load(Ordering::SeqCst);
+            confirm_allowed.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), restart)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                starts_before_confirmation, 1,
+                "replacement must not be spawned while old-owner exit is unconfirmed"
+            );
+            assert_eq!(starts.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn restart_reloads_pinned_models_before_returning_ready() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            let request = WorkerRequest::Load {
+                req_id: "initial-load".into(),
+                artifact_path: "pinned.safetensors".into(),
+                artifact_digest: "sha256:pinned".into(),
+                format: "safetensors".into(),
+                runtime_config: BTreeMap::from([(
+                    "profile".into(),
+                    "pinned-worker-profile".into(),
+                )]),
+            };
+            channel.exchange(&request, None).await.unwrap();
+            channel.restart().await.unwrap();
+            let data = ledger.lock().unwrap();
+            assert_eq!(
+                data.loads.len(),
+                2,
+                "replacement must reload the pinned package"
+            );
+            match (&data.loads[0], &data.loads[1]) {
+                (
+                    WorkerRequest::Load {
+                        req_id: old,
+                        artifact_path: a,
+                        artifact_digest: b,
+                        format: c,
+                        runtime_config: d,
+                    },
+                    WorkerRequest::Load {
+                        req_id: new,
+                        artifact_path: aa,
+                        artifact_digest: bb,
+                        format: cc,
+                        runtime_config: dd,
+                    },
+                ) => {
+                    assert_ne!(old, new);
+                    assert_eq!((a, b, c, d), (aa, bb, cc, dd));
+                }
+                _ => panic!("expected load records"),
+            }
+            assert_eq!(data.connects["worker"], 2);
+        }
+
+        fn budget_supervisor(budget: usize, wait: Duration) -> AneResidencySupervisor {
+            let mut supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let inner = Arc::get_mut(&mut supervisor.inner).unwrap();
+            inner.executable_budget = budget;
+            inner.wait_timeout = wait;
+            supervisor
+        }
+
+        #[tokio::test]
+        async fn executable_budget_refuses_before_hardware_limit() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_millis(20));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let result = supervisor.lease(&worker, "model", 256).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("budget sent an over-budget shape to hardware"),
+            };
+            assert_eq!(error.code(), Some(ERR_ANE_RESOURCES_EXHAUSTED));
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts.len(), 1);
+            assert!(!data.admit_attempts.contains_key(&("model".into(), 256)));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            drop(data);
+            drop(protected);
+        }
+
+        #[tokio::test]
+        async fn pending_compiles_reserve_full_executable_budget() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            let first = ShapeKey {
+                model_ref: "model".into(),
+                shape: 128,
+            };
+            let second = ShapeKey {
+                model_ref: "model".into(),
+                shape: 256,
+            };
+            let first_ticket = QueueTicket::enqueue(&supervisor.inner);
+            assert!(matches!(
+                supervisor.next_step(first_ticket.id, &first, &worker, 4),
+                Step::Admit(_)
+            ));
+            assert_eq!(
+                supervisor.inner.lock().slots[&first].state,
+                SlotState::Admitting
+            );
+            let second_ticket = QueueTicket::enqueue(&supervisor.inner);
+            assert!(
+                matches!(
+                    supervisor.next_step(second_ticket.id, &second, &worker, 4),
+                    Step::Wait
+                ),
+                "pending compile's four layers must prevent another four-layer reservation"
+            );
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
+        }
+
+        #[tokio::test]
+        async fn executable_budget_waits_then_succeeds_when_lease_releases() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let task = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 256).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while supervisor.inner.lock().waiters.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
+            assert!(!ledger
+                .lock()
+                .unwrap()
+                .admit_attempts
+                .contains_key(&("model".into(), 256)));
+            drop(protected);
+            let lease = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let data = ledger.lock().unwrap();
+            assert!(data.events.contains(&"evict model 128".into()));
+            assert!(data.resident.contains(&("model".into(), 256)));
+            assert_eq!(data.leased_evicts, 0);
+            drop(data);
+            drop(lease);
+        }
+
+        #[tokio::test]
+        async fn compile_rpc_measurement_observes_the_actual_worker_exchange() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().admit_delay = Duration::from_millis(20);
+            let channel = mock_channel("worker", &ledger).await;
+            let elapsed = Arc::new(Mutex::new(None));
+            COMPILE_RPC_MS
+                .scope(elapsed.clone(), channel.admit_shape("model", 128))
+                .await
+                .unwrap();
+            assert!(
+                elapsed.lock().unwrap().unwrap() >= 20.0,
+                "the compile sample must include the delayed worker response, not a proxy"
+            );
+        }
+
+        #[tokio::test]
+        async fn admission_wait_measurement_covers_success_and_deadline_refusal() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let waits = AdmissionWaits::default();
+            ADMISSION_WAITS
+                .scope(waits.clone(), async {
+                    let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+                    assert!(supervisor.lease(&worker, "model", 256).await.is_err());
+                    drop(held);
+                })
+                .await;
+            let waits = waits.lock().unwrap();
+            assert_eq!(waits.len(), 2);
+            assert_eq!(waits[0].shape, 128);
+            assert!(waits[0].admitted);
+            assert_eq!(waits[1].shape, 256);
+            assert!(!waits[1].admitted);
+            assert!(
+                waits[1].elapsed_ms >= 20.0,
+                "measure the actual admission future, including its wait deadline"
+            );
+        }
+
+        #[tokio::test]
+        async fn eviction_refunds_executables_only_after_completed_ack() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            ledger.lock().unwrap().evict_gate = Some((started.clone(), release.clone()));
+            let task = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 256).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                4,
+                "eviction in flight must retain its reservation"
+            );
+            assert!(!task.is_finished());
+            assert!(ledger
+                .lock()
+                .unwrap()
+                .resident
+                .contains(&("model".into(), 128)));
+            release.notify_one();
+            let lease = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                4,
+                "completed eviction must permit a new four-layer shape within budget7"
+            );
+            assert_eq!(supervisor.resident_shapes()["model"], vec![256]);
+            let data = ledger.lock().unwrap();
+            assert_eq!(data.admit_attempts[&("model".into(), 256)], 1);
+            assert!(!data.resident.contains(&("model".into(), 128)));
+            assert_eq!(data.connects["worker"], 1);
+            drop(data);
+            drop(lease);
+        }
+
+        #[tokio::test]
+        async fn admission_wait_deadline_is_transient_and_cleans_queue() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let protected = supervisor.lease(&worker, "model", 128).await.unwrap();
+            let error = match supervisor.lease(&worker, "model", 256).await {
+                Err(error) => error,
+                Ok(_) => panic!("leased budget must time out"),
+            };
+            let mapped = error.to_engine_error(synapse_core::EngineErrorStage::Load);
+            assert_eq!(mapped.retry_after_ms, Some(250));
+            assert!(mapped.safe_to_retry_same_request);
+            assert!(supervisor.inner.lock().waiters.is_empty());
+            assert_eq!(supervisor.resident_shapes()["model"], vec![128]);
+            assert_eq!(supervisor.stats().restarts, 0);
+            drop(protected);
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn pinned_layer_counts_charge_gte_and_qwen_before_admission() {
+            let ledger = Arc::new(Mutex::new(Ledger::default()));
+            let channel = mock_channel("worker", &ledger).await;
+            for (slug, count) in [
+                ("gte-modernbert-base", 22),
+                ("gte-reranker-modernbert-base", 22),
+                ("qwen3-embedding-0.6b", 28),
+                ("qwen3-reranker-0.6b", 28),
+            ] {
+                assert_eq!(
+                    channel
+                        .0
+                        .executable_count(&format!(
+                            "ane-direct:{slug}.ane-direct-worker:sha256:placeholder"
+                        ))
+                        .unwrap(),
+                    count
+                );
+            }
+            assert_eq!(
+                channel.0.executable_count("unknown").unwrap_err().code(),
+                Some("model_unsupported")
+            );
+            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
+        }
+
+        #[tokio::test]
         async fn resource_exhaustion_evicts_cross_worker_lru_and_retries_once_without_restart() {
             let ledger = Arc::new(Mutex::new(Ledger::default()));
             let a = mock_channel("a", &ledger).await;
@@ -5287,40 +6413,356 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
-        async fn two_resource_exhaustions_refuse_transiently_after_exactly_one_retry() {
-            let ledger = Arc::new(Mutex::new(Ledger::default()));
+        async fn exit_confirmation_timeout_retains_reservations_and_never_spawns_replacement() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().exit_gate =
+                Some((Arc::new(Notify::new()), Arc::new(Notify::new())));
+            let mut channel = mock_channel("worker", &ledger).await;
+            Arc::get_mut(&mut channel).unwrap().0.owner_exit_timeout = Duration::from_millis(20);
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(4, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(!tokio::time::timeout(
+                Duration::from_millis(200),
+                recover_worker(&supervisor.inner, &worker)
+            )
+            .await
+            .expect("unconfirmed exit must produce a bounded failure"));
+            assert!(channel.exit_unconfirmed.load(Ordering::Relaxed));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            assert!(supervisor.lease(&worker, "model", 256).await.is_err());
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_exit_keeps_worker_closed_and_budget_charged() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().fail_confirm_exit = true;
             let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(8, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(!recover_worker(&supervisor.inner, &worker).await);
+            assert!(channel.exit_unconfirmed.load(Ordering::Relaxed));
+            assert!(supervisor.inner.lock().recovering.contains("worker"));
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            drop(held);
+        }
+
+        async fn unacknowledged_shape_operation(execute_eviction: bool) {
+            let ledger = SharedLedger::default();
+            let started = Arc::new(Notify::new());
+            let confirm = Arc::new(Notify::new());
+            ledger.lock().unwrap().exit_gate = Some((started.clone(), confirm.clone()));
+            let mut channel = mock_channel("worker", &ledger).await;
+            Arc::get_mut(&mut channel).unwrap().0.shape_rpc_timeout = Duration::from_millis(20);
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(4, Duration::from_secs(3));
+            let shape = if execute_eviction {
+                drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+                ledger
+                    .lock()
+                    .unwrap()
+                    .no_reply_evict
+                    .insert(("model".into(), 128));
+                256
+            } else {
+                ledger
+                    .lock()
+                    .unwrap()
+                    .no_reply_admit
+                    .insert(("model".into(), 128));
+                128
+            };
+            let waiting_supervisor = supervisor.clone();
+            let waiting_worker = worker.clone();
+            let task = tokio::spawn(async move {
+                waiting_supervisor
+                    .lease(&waiting_worker, "model", shape)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_millis(200), started.notified())
+                .await
+                .expect(
+                    "unacknowledged shape RPC must time out and request owner exit confirmation",
+                );
+            assert!(channel.faulted.load(Ordering::Relaxed));
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                4,
+                "timeout alone must not refund capacity"
+            );
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
+            confirm.notify_one();
+            let result = task.await.unwrap();
+            if execute_eviction {
+                drop(result.expect("confirmed eviction recovery may resume the waiting admission"));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(supervisor.stats().restarts, 1);
+            drop(supervisor.lease(&worker, "model", shape).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn unacknowledged_admission_times_out_without_refunding_before_exit() {
+            unacknowledged_shape_operation(false).await;
+        }
+        #[tokio::test]
+        async fn unacknowledged_eviction_times_out_without_refunding_before_exit() {
+            unacknowledged_shape_operation(true).await;
+        }
+
+        #[tokio::test]
+        async fn cancelled_exchange_faults_channel_before_a_later_request_reads_stale_reply() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            ledger.lock().unwrap().evict_gate = Some((started.clone(), release.clone()));
+            let cancelling = channel.clone();
+            let task = tokio::spawn(async move { cancelling.evict_shape("model", 128).await });
+            started.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            release.notify_one();
+            let response = channel
+                .exchange(
+                    &WorkerRequest::Ping {
+                        req_id: "later".into(),
+                    },
+                    None,
+                )
+                .await;
+            assert!(response.is_err(),"cancelled exchange must fault the stream instead of returning the abandoned eviction response to Ping");
+            assert!(channel.faulted.load(Ordering::Relaxed));
+            channel.restart().await.unwrap();
+            assert!(channel
+                .exchange(
+                    &WorkerRequest::Ping {
+                        req_id: "fresh".into()
+                    },
+                    None
+                )
+                .await
+                .is_ok());
+        }
+
+        #[tokio::test]
+        async fn queued_eviction_from_old_owner_is_refused_after_restart() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let old_generation = channel.generation();
+            let guard = channel.stream.lock().await;
+            let mut restart = channel.restart();
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    restart.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            let mut eviction = channel.evict_shape("model", 128);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                    eviction.as_mut(),
+                    cx
+                )))
+                .await
+                .is_pending()
+            );
+            drop(guard);
+            restart.await.unwrap();
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 2);
+            assert!(
+                eviction.await.is_err(),
+                "an eviction queued for the retired owner must not reach its replacement"
+            );
+            assert!(!ledger
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.starts_with("evict")));
+            let supervisor = budget_supervisor(8, Duration::from_secs(1));
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(channel
+                .evict_shape_at_generation(old_generation, "model", 128)
+                .await
+                .is_err());
+            assert!(ledger
+                .lock()
+                .unwrap()
+                .resident
+                .contains(&("model".into(), 128)));
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 2);
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn drain_timeout_forces_confirmed_exit_and_reopens_worker() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(8, Duration::from_millis(20));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(200),recover_worker(&supervisor.inner,&worker)).await.unwrap(),"bounded drain timeout must escalate to confirmed owner exit, not permanently close a live worker");
+            assert_eq!(supervisor.stats().restarts, 1);
+            assert!(supervisor.inner.lock().recovering.is_empty());
+            assert!(supervisor.inner.lock().slots.is_empty());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn failed_resource_victim_eviction_recovers_without_waiting_on_its_own_admission() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(8, Duration::from_secs(3));
+            drop(supervisor.lease(&worker, "model", 128).await.unwrap());
+            {
+                let mut ledger = ledger.lock().unwrap();
+                ledger.exhaust_admit.insert(("model".into(), 256), 1);
+                ledger.fail_evict.insert(("model".into(), 128));
+            }
+            let refusal = tokio::time::timeout(
+                Duration::from_millis(200),
+                supervisor.lease(&worker, "model", 256),
+            )
+            .await
+            .expect("recovery must not wait for the triggering admission's own slot");
+            assert!(matches!(
+                refusal,
+                Err(AneResidencyError::ResourcesExhausted { .. })
+            ));
+            assert_eq!(supervisor.stats().restarts, 1);
+            assert!(supervisor.inner.lock().recovering.is_empty());
+            assert!(supervisor.inner.lock().slots.is_empty());
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn persistent_exhaustion_after_eviction_restarts_and_refuses_transiently() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let load = WorkerRequest::Load {
+                req_id: "load".into(),
+                artifact_path: "pinned.safetensors".into(),
+                artifact_digest: "sha256:pinned".into(),
+                format: "safetensors".into(),
+                runtime_config: BTreeMap::from([(
+                    "profile".into(),
+                    "pinned-worker-profile".into(),
+                )]),
+            };
+            let (response, _) = channel.exchange(&load, None).await.unwrap();
+            let WorkerResponse::Loaded { model_ref, .. } = response else {
+                panic!("expected load");
+            };
             let worker: Arc<dyn AneShapeWorker> = channel;
-            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let supervisor = budget_supervisor(100, Duration::from_secs(1));
             for rung in [128, 256] {
-                drop(supervisor.lease(&worker, "model", rung).await.unwrap());
+                drop(supervisor.lease(&worker, &model_ref, rung).await.unwrap());
             }
             ledger
                 .lock()
                 .unwrap()
                 .exhaust_admit
-                .insert(("model".into(), 512), 2);
-            let error = match supervisor.lease(&worker, "model", 512).await {
-                Err(error) => error,
-                Ok(_) => panic!("second exhaustion was not refused"),
-            };
-            assert_eq!(error.code(), Some(ERR_ANE_RESOURCES_EXHAUSTED));
+                .insert((model_ref.clone(), 512), 2);
+            let error = supervisor
+                .lease(&worker, &model_ref, 512)
+                .await
+                .err()
+                .unwrap();
             let refusal = error.to_engine_error(synapse_core::EngineErrorStage::Load);
             assert_eq!(refusal.retry_after_ms, Some(ANE_RESOURCES_RETRY_AFTER_MS));
             assert!(refusal.safe_to_retry_same_request);
-            let data = ledger.lock().unwrap();
-            assert_eq!(data.admit_attempts[&("model".into(), 512)], 2);
+            {
+                let data = ledger.lock().unwrap();
+                assert_eq!(data.admit_attempts[&(model_ref.clone(), 512)], 2);
+                assert_eq!(
+                    data.events
+                        .iter()
+                        .filter(|event| event.starts_with("evict "))
+                        .count(),
+                    1
+                );
+                assert_eq!(data.connects["worker"], 2);
+                assert_eq!(
+                    data.loads.len(),
+                    2,
+                    "persistent exhaustion must restore pinned models after confirmed owner exit"
+                );
+                assert!(data.resident.is_empty());
+                assert!(supervisor.resident_shapes().is_empty());
+                assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
+                assert_eq!(supervisor.stats().restarts, 1);
+            }
+            drop(supervisor.lease(&worker, &model_ref, 512).await.unwrap());
+        }
+
+        #[tokio::test]
+        async fn persistent_exhaustion_drains_existing_leases_before_restart() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(100, Duration::from_secs(2));
+            let held = supervisor.lease(&worker, "model", 128).await.unwrap();
+            drop(supervisor.lease(&worker, "model", 256).await.unwrap());
+            ledger
+                .lock()
+                .unwrap()
+                .exhaust_admit
+                .insert(("model".into(), 512), 2);
+            let task = tokio::spawn({
+                let worker = worker.clone();
+                let supervisor = supervisor.clone();
+                async move { supervisor.lease(&worker, "model", 512).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if supervisor.inner.lock().recovering.contains("worker") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
             assert_eq!(
-                data.events
-                    .iter()
-                    .filter(|e| e.starts_with("evict "))
-                    .count(),
-                1
+                ledger.lock().unwrap().connects["worker"],
+                1,
+                "restart must not interrupt an existing lease"
             );
-            assert_eq!(data.connects["worker"], 1);
-            assert!(!data.resident.contains(&("model".into(), 512)));
-            assert_eq!(supervisor.resident_shapes()["model"], vec![256]);
-            assert_eq!(supervisor.stats().restarts, 0);
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                8,
+                "retain held and failed-admission reservations during recovery"
+            );
+            assert!(ledger
+                .lock()
+                .unwrap()
+                .resident
+                .contains(&("model".into(), 128)));
+            assert_eq!(
+                supervisor.inner.lock().slots[&ShapeKey {
+                    model_ref: "model".into(),
+                    shape: 512
+                }]
+                    .state,
+                SlotState::Failed
+            );
+            drop(held);
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err());
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 2);
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
         }
 
         #[tokio::test]
@@ -5389,15 +6831,35 @@ pub mod ane_residency {
                         .connects
                         .entry(worker_id)
                         .or_default() += 1;
-                    tokio::spawn(serve_mock(worker, ledger));
-                    Ok(host)
+                    let fail_exit = ledger.lock().unwrap().fail_confirm_exit;
+                    let exit_gate = ledger.lock().unwrap().exit_gate.clone();
+                    let task = tokio::spawn(serve_mock(worker, ledger));
+                    Ok(AneWorkerSession {
+                        stream: host,
+                        confirm_exit: Box::pin(async move {
+                            task.await.map_err(|error| {
+                                AneResidencyError::Channel(format!("mock owner exit: {error}"))
+                            })?;
+                            if let Some((started, release)) = exit_gate {
+                                started.notify_one();
+                                release.notified().await;
+                            }
+                            if fail_exit {
+                                Err(AneResidencyError::Channel(
+                                    "mock owner exit unconfirmed".into(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        }),
+                    })
                 })
             });
-            Arc::new(
+            Arc::new(MockChannel(
                 AneWorkerChannel::connect(worker_id, DEFAULT_MAX_FRAME_BYTES, connect)
                     .await
                     .unwrap(),
-            )
+            ))
         }
 
         /// One embed request over sequences of `lengths` tokens, run rung by

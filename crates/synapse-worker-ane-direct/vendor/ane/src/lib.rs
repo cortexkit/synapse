@@ -35,6 +35,9 @@ mod ane_io_surface_object;
 mod ane_performance_stats;
 mod ane_request;
 pub mod client;
+pub mod diagnostics;
+
+pub use objc2::rc::autoreleasepool;
 mod error;
 mod executable;
 pub mod graph;

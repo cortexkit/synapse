@@ -10,6 +10,7 @@ use std::path::Path;
 use synapse_core::{AneExecutable, AnePlacementInventory};
 
 pub const REVISION: &str = "ane-direct-graph-v1";
+const PRODUCTION_SHAPE_LIMIT: usize = 4;
 pub const LADDER: [usize; 7] = [128, 256, 512, 1024, 2048, 4096, 8192];
 pub fn rung(tokens: usize) -> Result<usize> {
     ensure!(tokens > 0, "invalid_request");
@@ -130,6 +131,13 @@ pub struct Resident {
     residual: TensorData,
     mask: TensorData,
 }
+impl Drop for Model {
+    fn drop(&mut self) {
+        // Model unload, replacement, and connection close release all cached programs.
+        ane::autoreleasepool(|_| self.resident.clear());
+    }
+}
+
 impl Model {
     pub fn load(profile: Profile, path: &Path, digest: &str) -> Result<Self> {
         ensure!(
@@ -214,21 +222,33 @@ impl Model {
             .with_context(|| format!("tensor_missing:{name}"))
     }
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
-        self.admit_with_compiler(shape, os, |graph, _| {
-            graph.compile(NSQualityOfService::UserInteractive)
+        // Compile temporaries retain ANE programs until the autorelease pool drains.
+        ane::autoreleasepool(|_| {
+            self.admit_with_compiler(shape, os, |graph, _| {
+                graph.compile(NSQualityOfService::UserInteractive)
+            })
         })
     }
     fn admit_with_compiler(
         &mut self,
         shape: usize,
         os: &str,
+        compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+    ) -> Result<AnePlacementInventory> {
+        self.admit_with_limit(shape, os, PRODUCTION_SHAPE_LIMIT, compile)
+    }
+    fn admit_with_limit(
+        &mut self,
+        shape: usize,
+        os: &str,
+        limit: usize,
         mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
     ) -> Result<AnePlacementInventory> {
         ensure!(LADDER.contains(&shape), "invalid_shape");
         if let Some(resident) = self.resident.get(&shape) {
             return Ok(resident.inventory.clone());
         }
-        ensure!(self.resident.len() < 4, "ane_residency_limit");
+        ensure!(self.resident.len() < limit, "ane_residency_limit");
         let inventory = self.profile.inventory(shape, os)?;
         let hidden = self.profile.n("hidden_size");
         let mut executables = Vec::new();
@@ -295,8 +315,12 @@ impl Model {
         );
         Ok(inventory)
     }
+    pub fn evict(&mut self, shape: usize) {
+        ane::autoreleasepool(|_| drop(self.resident.remove(&shape)));
+    }
+
     pub fn run(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.run_stages(tokens, false)
+        ane::autoreleasepool(|_| self.run_stages(tokens, false))
     }
     fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
         let mut stages = StageClock::new(traced);
@@ -756,6 +780,480 @@ mod fresh_process_hardware {
             .to_owned();
         Model::load(profile, &root.join(format!("{slug}.safetensors")), &digest).unwrap()
     }
+    #[test]
+    fn production_shape_limit_refuses_fifth_shape() {
+        let profile = Profile::select("gte-modernbert-base.ane-direct-worker", "embed").unwrap();
+        let mut model = Model {
+            profile,
+            tensors: BTreeMap::new(),
+            resident: BTreeMap::new(),
+        };
+        // Empty executables isolate the fifth-shape rejection, which must precede graph construction.
+        for shape in [128, 256, 512, 1024] {
+            model.resident.insert(
+                shape,
+                Resident {
+                    inventory: model
+                        .profile
+                        .inventory(shape, "capacity-unit-test")
+                        .unwrap(),
+                    executables: Vec::new(),
+                    a: TensorData::new(modernbert::shape(1, 1)),
+                    b: TensorData::new(modernbert::shape(1, 1)),
+                    residual: TensorData::new(modernbert::shape(1, 1)),
+                    mask: TensorData::new(modernbert::shape(1, 1)),
+                },
+            );
+        }
+        assert_eq!(
+            model
+                .admit(2048, "capacity-unit-test")
+                .unwrap_err()
+                .to_string(),
+            "ane_residency_limit"
+        );
+        assert_eq!(model.resident.len(), 4);
+    }
+
+    #[test]
+    #[ignore = "Sequential capacity experiment with pinned weights; run alone in a fresh process"]
+    fn fresh_process_residency_capacity() {
+        let mix = std::env::var("ANE_CAPACITY_MIX").expect("ANE_CAPACITY_MIX");
+        let slugs: &[&str] = match mix.as_str() {
+            "gte" | "gte-large" => &["gte-modernbert-base"],
+            "qwen" => &["qwen3-embedding-0.6b"],
+            "alternating" => &["gte-modernbert-base", "qwen3-embedding-0.6b"],
+            "all-four" => &[
+                "gte-modernbert-base",
+                "gte-reranker-modernbert-base",
+                "qwen3-embedding-0.6b",
+                "qwen3-reranker-0.6b",
+            ],
+            _ => panic!("unknown capacity mix"),
+        };
+        let mut models: Vec<_> = slugs.iter().map(|slug| model(slug)).collect();
+        let mut resident = Vec::new();
+        let mut resident_mil = 0usize;
+        let mut resident_weights = 0usize;
+        let mut submitted_mil = 0usize;
+        let mut submitted_weights = 0usize;
+        let mut resident_executables = 0usize;
+        let mut admissions = Vec::new();
+        let mut exhausted = false;
+        let mut layer_events = Vec::new();
+        let ladder: &[usize] = if mix == "gte-large" {
+            &[4096, 8192, 128, 256, 512, 1024, 2048]
+        } else {
+            &[128, 256, 512, 1024, 2048]
+        };
+        'ladder: for &shape in ladder {
+            for (index, model) in models.iter_mut().enumerate() {
+                let mut mil_bytes = 0usize;
+                let mut weight_bytes = 0usize;
+                let mut loaded = 0usize;
+                let started = std::time::Instant::now();
+                // The ignored capacity probe bypasses the four-shape cap to measure hardware exhaustion.
+                let result =
+                    model.admit_with_limit(shape, "capacity-development", 64, |graph, _| {
+                        let (mil, weights) = graph.source_payload();
+                        mil_bytes += mil.len();
+                        weight_bytes += weights.len();
+                        let result = graph.compile(NSQualityOfService::UserInteractive);
+                        layer_events.push(serde_json::json!({"unix_ns": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string(), "loaded": result.is_ok()}));
+                        if result.is_ok() {
+                            loaded += 1;
+                        }
+                        result
+                    });
+                submitted_mil += mil_bytes;
+                submitted_weights += weight_bytes;
+                if result.is_ok() {
+                    resident.push(serde_json::json!({"model": slugs[index], "length": shape, "executables": loaded, "mil_bytes": mil_bytes, "weight_bytes": weight_bytes}));
+                    resident_executables += loaded;
+                    resident_mil += mil_bytes;
+                    resident_weights += weight_bytes;
+                }
+                let error = result.err().map(|e| format!("{e:#}"));
+                admissions.push(serde_json::json!({"model": slugs[index], "length": shape, "elapsed_ms": started.elapsed().as_secs_f64()*1000.0, "loaded_before_rollback": loaded, "mil_bytes_submitted": mil_bytes, "weight_bytes_submitted": weight_bytes, "error": error}));
+                if let Some(error) = error {
+                    assert!(
+                        error.starts_with("ane_resources_exhausted:"),
+                        "unexpected admission failure: {error}"
+                    );
+                    exhausted = true;
+                    break 'ladder;
+                }
+            }
+        }
+        let report = serde_json::json!({
+            "classification": "development", "mix": mix, "exhausted": exhausted,
+            "resident_shapes": resident, "resident_executables": resident_executables,
+            "resident_mil_bytes": resident_mil, "resident_weight_bytes": resident_weights,
+            "submitted_mil_bytes": submitted_mil, "submitted_weight_bytes": submitted_weights,
+            "admissions": admissions, "layer_events": layer_events,
+            "accounting": "Compiler source payload, not opaque executable memory. Failed admission's partial executables are rolled back; submitted totals include its failing layer."
+        });
+        std::fs::write(
+            std::env::var_os("ANE_CAPACITY_OUT").expect("ANE_CAPACITY_OUT"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("CAPACITY_RESULT {report}");
+        if let Some(release) = std::env::var_os("ANE_CAPACITY_RELEASE") {
+            // Hold successful shapes until the paired process reports, preserving simultaneous residency.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+            while !std::path::Path::new(&release).exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "paired-process release deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        drop(models);
+        cleanup_diagnostic_artifacts();
+    }
+
+    fn write_experiment(report: serde_json::Value) {
+        std::fs::write(
+            std::env::var_os("ANE_CAPACITY_OUT").expect("ANE_CAPACITY_OUT"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "Fresh-process unload/reclaim probe with real weights"]
+    fn fresh_process_reclaim() {
+        let mut model = model("gte-modernbert-base");
+        let boundary = std::env::var_os("ANE_RECLAIM_OWNER_EXITED");
+        let mut before_exit_error = None;
+        if let Some(ref marker) = boundary {
+            before_exit_error = model
+                .admit_with_limit(128, "reclaim-development", 64, |graph, _| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })
+                .err()
+                .map(|e| format!("{e:#}"));
+            assert!(
+                before_exit_error
+                    .as_ref()
+                    .is_some_and(|e| e.starts_with("ane_resources_exhausted:")),
+                "owner must fill hardware before exit control"
+            );
+            std::fs::write(
+                std::env::var_os("ANE_RECLAIM_READY").expect("ANE_RECLAIM_READY"),
+                b"ready",
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+            while !std::path::Path::new(marker).exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        } else {
+            for shape in [128, 256, 512, 1024, 2048] {
+                model
+                    .admit_with_limit(shape, "reclaim-development", 64, |graph, _| {
+                        graph.compile(NSQualityOfService::UserInteractive)
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                model
+                    .resident
+                    .values()
+                    .map(|s| s.executables.len())
+                    .sum::<usize>(),
+                110
+            );
+            drop(model.resident.remove(&128));
+        }
+        let released = std::time::Instant::now();
+        let target = if boundary.is_some() { 128 } else { 4096 };
+        let mut attempts = Vec::new();
+        for delay_ms in [0u64, 50, 200, 1000, 5000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let actual_start_ms = released.elapsed().as_secs_f64() * 1000.0;
+            let mut loaded = 0;
+            let result = model.admit_with_limit(target, "reclaim-development", 64, |graph, _| {
+                let result = graph.compile(NSQualityOfService::UserInteractive);
+                if result.is_ok() {
+                    loaded += 1;
+                }
+                result
+            });
+            let error = result.err().map(|e| format!("{e:#}"));
+            let success = error.is_none();
+            attempts.push(serde_json::json!({"delay_after_previous_attempt_ms": delay_ms, "actual_start_after_release_ms": actual_start_ms, "finished_after_release_ms": released.elapsed().as_secs_f64()*1000.0, "loaded_before_rollback": loaded, "error": error}));
+            if success {
+                break;
+            }
+        }
+        write_experiment(
+            serde_json::json!({"classification":"development", "experiment":if boundary.is_some(){"owner-exit-reclaim"}else{"in-process-reclaim"}, "target_length":target, "before_exit_error":before_exit_error, "attempts":attempts, "resident_executables":model.resident.values().map(|s|s.executables.len()).sum::<usize>(), "timing":"Actual times include graph construction and compilation; configured intervals are delays between attempts, not a hardware reclamation clock."}),
+        );
+        drop(model);
+    }
+
+    #[test]
+    #[ignore = "Scoped command pools with live retained executables and single-shape eviction"]
+    fn fresh_process_scoped_pools_reclaim() {
+        let slug = std::env::var("ANE_TEST_MODEL").unwrap_or_else(|_| "gte-modernbert-base".into());
+        let method =
+            std::env::var("ANE_RECLAIM_PATH").unwrap_or_else(|_| "scoped-single-evict".into());
+        let qwen = slug == "qwen3-embedding-0.6b";
+        let lengths = if qwen {
+            vec![128, 256, 512, 1024]
+        } else {
+            vec![128, 256, 512, 1024, 2048]
+        };
+        let replacement = if qwen { 2048 } else { 4096 };
+        let mut model = model(&slug);
+        for shape in lengths {
+            let mut compile = || {
+                model.admit_with_limit(shape, "scoped-pools-development", 64, |graph, _| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })
+            };
+            if method == "scoped-compile-no-pool" {
+                compile()
+            } else {
+                ane::diagnostics::with_autorelease_pool(compile)
+            }
+            .unwrap();
+        }
+        let initial_executables = model
+            .resident
+            .values()
+            .map(|resident| resident.executables.len())
+            .sum::<usize>();
+        assert_eq!(initial_executables, if qwen { 112 } else { 110 });
+        let tokens = vec![1u32; 200];
+        let before = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
+        assert!(!before.is_empty());
+        assert!(before.iter().all(|value| value.is_finite()));
+        let started = std::time::Instant::now();
+        if method == "scoped-single-evict-no-pool" {
+            drop(model.resident.remove(&128));
+        } else {
+            ane::diagnostics::with_autorelease_pool(|| drop(model.resident.remove(&128)));
+        }
+        let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut loaded = 0;
+        let mut compile = || {
+            model.admit_with_limit(replacement, "scoped-pools-development", 64, |graph, _| {
+                let result = graph.compile(NSQualityOfService::UserInteractive);
+                if result.is_ok() {
+                    loaded += 1;
+                }
+                result
+            })
+        };
+        let result = if method == "scoped-compile-no-pool" {
+            compile()
+        } else {
+            ane::diagnostics::with_autorelease_pool(compile)
+        };
+        let error = result.err().map(|error| format!("{error:#}"));
+        let after = ane::diagnostics::with_autorelease_pool(|| model.run(&tokens)).unwrap();
+        assert_eq!(before,after,"retained sibling must remain executable and byte-identical across scoped-pool releases");
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":method,"model":slug,"replacement_shape":replacement,"initial_executables":initial_executables,"observations":["retained sibling runs with finite byte-identical output before and after eviction/new compilation"],"attempts":[{"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}],"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+    }
+
+    #[test]
+    #[ignore = "Bounded autorelease-pool reclamation control with every shape object released"]
+    fn fresh_process_autorelease_reclaim() {
+        let mut model = model("gte-modernbert-base");
+        let mut started = std::time::Instant::now();
+        ane::diagnostics::with_autorelease_pool(|| {
+            for shape in [128, 256, 512, 1024, 2048] {
+                model
+                    .admit_with_limit(shape, "autorelease-reclaim-development", 64, |graph, _| {
+                        graph.compile(NSQualityOfService::UserInteractive)
+                    })
+                    .unwrap();
+            }
+            started = std::time::Instant::now();
+            model.resident.clear();
+        });
+        let mut attempts = Vec::new();
+        for delay_ms in [0, 5000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut loaded = 0;
+            let result = ane::diagnostics::with_autorelease_pool(|| {
+                model.admit_with_limit(4096, "autorelease-reclaim-development", 64, |graph, _| {
+                    let result = graph.compile(NSQualityOfService::UserInteractive);
+                    if result.is_ok() {
+                        loaded += 1;
+                    }
+                    result
+                })
+            });
+            let error = result.err().map(|error| format!("{error:#}"));
+            let success = error.is_none();
+            attempts.push(serde_json::json!({"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"delay_after_previous_attempt_ms":delay_ms,"loaded":loaded,"error":error}));
+            if success {
+                break;
+            }
+        }
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":"autorelease-all","initial_executables":110,"observations":["all shapes dropped and enclosing Objective-C autorelease pool drained before replacement"],"attempts":attempts,"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+    }
+
+    #[test]
+    #[ignore = "Bounded in-process reclaim alternatives with runtime-enumerated selectors"]
+    fn fresh_process_reclaim_paths() {
+        let method = std::env::var("ANE_RECLAIM_PATH").unwrap();
+        let mut model = model("gte-modernbert-base");
+        for shape in [128, 256, 512, 1024, 2048] {
+            model
+                .admit_with_limit(shape, "reclaim-path-development", 64, |graph, _| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let observations = if method == "release-all" {
+            model.resident.clear();
+            vec!["all resident executable/model objects and IOSurfaces dropped".to_owned()]
+        } else {
+            let resident = model.resident.remove(&128).unwrap();
+            let probe = match method.as_str() {
+                "model-purge" => ane::diagnostics::ReclaimProbe::ModelPurge,
+                "client-purge" => ane::diagnostics::ReclaimProbe::ClientPurge,
+                "fresh-client" => ane::diagnostics::ReclaimProbe::FreshClientUnload,
+                "fresh-allocated-client" => {
+                    ane::diagnostics::ReclaimProbe::FreshAllocatedClientUnload
+                }
+                "drop-client-references" => {
+                    ane::diagnostics::ReclaimProbe::DropSharedClientReferences
+                }
+                _ => panic!("unknown reclaim path"),
+            };
+            let observations = ane::diagnostics::reclaim(resident.executables, probe);
+            drop((
+                resident.a,
+                resident.b,
+                resident.residual,
+                resident.mask,
+                resident.inventory,
+            ));
+            observations
+        };
+        let mut attempts = Vec::new();
+        for delay_ms in [0, 5000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let offset_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut loaded = 0;
+            let result =
+                model.admit_with_limit(4096, "reclaim-path-development", 64, |graph, _| {
+                    let result = graph.compile(NSQualityOfService::UserInteractive);
+                    if result.is_ok() {
+                        loaded += 1;
+                    }
+                    result
+                });
+            let error = result.err().map(|e| format!("{e:#}"));
+            let success = error.is_none();
+            attempts.push(serde_json::json!({"delay_after_previous_attempt_ms":delay_ms,"actual_start_after_reclaim_ms":offset_ms,"finished_after_reclaim_ms":started.elapsed().as_secs_f64()*1000.0,"loaded":loaded,"error":error}));
+            if success {
+                break;
+            }
+        }
+        write_experiment(
+            serde_json::json!({"classification":"development","experiment":"in-process-reclaim-paths","method":method,"initial_executables":110,"observations":observations,"attempts":attempts,"remaining_fully_resident_executables":model.resident.values().map(|resident|resident.executables.len()).sum::<usize>()}),
+        );
+        drop(model);
+    }
+
+    #[test]
+    #[ignore = "Fresh-process concurrent full-shape and first-layer compiler controls"]
+    fn fresh_process_concurrent_compiles() {
+        let count: usize = std::env::var("ANE_COMPILE_COUNT").unwrap().parse().unwrap();
+        let full = std::env::var_os("ANE_COMPILE_FULL_SHAPE").is_some();
+        assert!(if full {
+            [2, 4].contains(&count)
+        } else {
+            [2, 4, 8, 16, 32].contains(&count)
+        });
+        let model = model("gte-modernbert-base");
+        let mut jobs = Vec::new();
+        let lengths = [128, 256, 512, 1024];
+        let shapes = if full {
+            lengths[..count].to_vec()
+        } else {
+            (1..=count).map(|index| index * 128).collect::<Vec<_>>()
+        };
+        for shape in shapes {
+            // Build graphs before the barrier to isolate concurrent compile/load, not graph construction.
+            let graphs = (0..if full { 22 } else { 1 })
+                .map(|layer| gte_layer_graph(&model, shape, layer))
+                .collect::<Vec<_>>();
+            jobs.push((shape, graphs));
+        }
+        drop(model);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(count));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for (shape, graphs) in jobs {
+            let barrier = barrier.clone();
+            let events = events.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut executables = Vec::new(); let mut error = None;
+                for graph in graphs {
+                    let result = graph.compile(NSQualityOfService::UserInteractive);
+                    events.lock().unwrap().push(serde_json::json!({"shape":shape,"loaded":result.is_ok(),"unix_ns":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_string()}));
+                    match result { Ok(executable) => executables.push(executable), Err(e) => { error=Some(e.to_string()); break; } }
+                }
+                (shape, executables, error)
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        write_experiment(
+            serde_json::json!({"classification":"development", "experiment":"concurrent-compiles", "full_shapes":full, "count":count, "peak_transient_counter":"Private binding exposes no hardware instance counter; events count successful load callbacks retained until all threads finish.", "loaded_total":results.iter().map(|(_,e,_)|e.len()).sum::<usize>(), "results":results.iter().map(|(shape,e,error)|serde_json::json!({"shape":shape,"loaded":e.len(),"error":error})).collect::<Vec<_>>(), "layer_events":*events.lock().unwrap()}),
+        );
+        drop(results);
+    }
+
+    fn gte_layer_graph(model: &Model, shape: usize, layer: usize) -> Graph {
+        let hidden = model.profile.n("hidden_size");
+        let mut graph = Graph::new();
+        let input = graph.placeholder(modernbert::shape(shape, hidden));
+        let mask = graph.placeholder(modernbert::shape(shape, 1));
+        let residual = if layer == 0 {
+            graph.placeholder(modernbert::shape(shape, hidden))
+        } else {
+            input
+        };
+        let config: modernbert::Config =
+            serde_json::from_value(model.profile.params().clone()).unwrap();
+        let base = format!("{}layers.{layer}", model.profile.prefix());
+        let linear = |name: &str| modernbert::Linear {
+            weight: model
+                .tensor(&format!("{base}.{name}.weight"))
+                .unwrap()
+                .to_vec(),
+        };
+        let weights = modernbert::LayerWeights {
+            qkv: linear("attn.Wqkv"),
+            attention_output: linear("attn.Wo"),
+            attention_norm: (layer > 0).then(|| vec![1.0; hidden]),
+            mlp_input: linear("mlp.Wi"),
+            mlp_output: linear("mlp.Wo"),
+            mlp_norm: vec![1.0; hidden],
+        };
+        let _ = modernbert::layer_graph(
+            &mut graph, input, residual, mask, &weights, &config, layer, shape,
+        );
+        graph
+    }
+
     #[test]
     #[ignore = "Nth-load rollback uses real ANE executables and pinned weights"]
     fn nth_load_exhaustion_leaves_shape_fully_absent() {
