@@ -99,9 +99,22 @@ async fn run(args: CliArgs) -> Result<()> {
         )
         .await
         .with_context(|| format!("call {} {}", args.module, args.method))?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    println!("{}", render_response(&response)?);
     consumer.close().await;
     Ok(())
+}
+
+/// The client returns the reply body as raw bytes. Show it as pretty JSON when it
+/// is JSON, as text when it is other UTF-8, and only otherwise as a byte array,
+/// so a JSON reply never prints one byte value per line.
+fn render_response(body: &[u8]) -> Result<String> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        return Ok(serde_json::to_string_pretty(&value)?);
+    }
+    if let Ok(text) = std::str::from_utf8(body) {
+        return Ok(text.to_owned());
+    }
+    Ok(serde_json::to_string(body)?)
 }
 
 fn parse_args<I, S>(args: I) -> Result<ParsedCli>
@@ -193,6 +206,22 @@ mod tests {
             ParsedCli::Run(args) => args,
             ParsedCli::Help => panic!("expected Run, got Help"),
         }
+    }
+
+    #[test]
+    fn json_reply_prints_as_json_not_byte_values() {
+        let body = br#"{"result":{"agents":[]}}"#;
+        let rendered = render_response(body).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap(),
+            serde_json::json!({"result": {"agents": []}})
+        );
+        assert!(
+            !rendered.contains("123"),
+            "rendered byte values: {rendered}"
+        );
+        assert_eq!(render_response(b"plain text").unwrap(), "plain text");
+        assert_eq!(render_response(&[0xff, 0x00]).unwrap(), "[255,0]");
     }
 
     #[test]
