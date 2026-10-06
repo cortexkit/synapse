@@ -1,23 +1,106 @@
-# Direct ANE serving ownership
+# Direct ANE serving
 
-Direct ANE catalog loads use a dedicated backend rather than `WorkerEngine` inference. The module lazily acquires one direct-ANE lane lock, excluding other module processes from this hardware lane, and one shared residency supervisor, budgeting the compiled layer executables across workers. Every loaded direct-ANE model has its own worker channel and I/O runtime, but all those workers share the supervisor's hardware budget.
+How the module serves catalog models on the direct Apple Neural Engine worker
+(`ck-synapse-worker-ane-direct`), which compiles each (model, sequence length)
+shape on demand through the private `AppleNeuralEngine.framework` API.
 
-The production connector uses `WorkerHost` for spawn, log forwarding, removal of the module's daemon-authentication nonce from the child environment, and HELLO validation. Workers inherit the lane lock. Successful LOAD requests are cached by `AneWorkerChannel`, which restores them after confirmed-exit recovery. LOAD and PONG advertise the worker's bucket ladder; serving consumes LOAD metadata rather than choosing its own ladder.
+## Ownership
 
-Embedding and fully composed rerank sequences run in ascending buckets. Each inference task holds its shape lease until the entire response has been validated, then releases it before requesting another bucket. Results are restored to input order. An oversized sequence is rejected before admission or inference transport; there is no truncation or fallback.
+Other worker lanes go through the generic `WorkerEngine`, which sends each
+request straight to its worker. The direct-ANE worker can't take a request for
+a shape it hasn't compiled and admitted, so direct-ANE loads use their own
+backend, one that admits shapes before it sends anything. The first direct-ANE
+load in a module process creates two things that every later direct-ANE load
+shares:
 
-Caller cancellation abandons the result, not the detached inference task. The task drains the response and releases its lease without restarting the worker. Actual I/O faults, malformed responses, and bounded inference timeouts invoke the supervisor's existing confirmed-exit recovery after releasing the lease. A broken exchange may already have executed inference even though its response is missing. Such requests return an error rather than being automatically replayed.
+- **The direct-ANE lane lock.** It's a cross-process lock, so only one module
+  process at a time drives the direct-ANE hardware. Each worker inherits the
+  lock's file descriptor, so the lock stays held until every worker the module
+  started has exited, even if the module itself dies first.
+- **One residency supervisor.** The Neural Engine limits how many compiled
+  layer executables one process can hold (about 115 on an M5 Max). The
+  supervisor charges each shape its layer count against a budget of 100,
+  admits, leases and evicts shapes, and runs confirmed-exit recovery when a
+  worker stays out of resources. One supervisor serves every worker, because
+  the limit is hardware's, not a worker's.
 
-Unload prevents replacement spawning and new leases, drains existing work with the supervisor's bounded wait, closes the channel, and waits for the owned child to exit (terminating it if necessary). Budget reservations for compiled layer executables are refunded only after confirmed exit, because a still-live child can retain ANE resources. Unconfirmed exit retains reservations. Drop performs cleanup on a dedicated thread and bounds the caller's wait, as the generic worker engine does. Worker IDs are unique per load so a retired owner's identity is not reused.
+Each loaded model gets its own worker process and channel, with a worker ID
+unique to that load. Residency is keyed by (worker ID, model reference, shape),
+so two models loaded from the same package in two processes each admit their
+own shapes.
 
-With `certify_observation` enabled before admission, `certify.observations` combines direct-channel request counters with the shared supervisor's retained inventories (executable IDs, layer coverage, and CPU stages) and its admission-event count, maintained separately from both the inventory list and transport counters. Normal serving retains no inventories.
+Workers are spawned through `WorkerHost`. It forwards their logs, removes the
+daemon launch nonce from the child's environment, and checks their HELLO. The
+channel caches each successful LOAD and replays it after a restart. LOAD and
+PONG replies carry the worker's bucket ladder (its sequence-length shapes,
+ending at 8192), and serving uses that ladder rather than one of its own.
 
-## Hardware certification remains gated
+## Requests
 
-The existing `ane-m5` live-certification refusal has intentionally **not** been removed. No hardware evidence is claimed for this integration: observed one-minute system load averages from `uptime` (a dimensionless measure of runnable work) during verification were 30.62, 21.88, and 29.94, all above the permitted threshold of 16. Mock transport tests prove admission, response ordering, cancellation draining, actual-fault recovery, and confirmed-exit retirement, not hardware parity or placement.
+Embedding sequences and fully composed rerank sequences are grouped by the
+smallest bucket that fits them, and run bucket by bucket. Each group leases
+its shape, which admits it first if it isn't resident, and holds the lease
+until its whole reply is validated. It then releases the lease before
+requesting the next bucket, so a request holds at most one lease at a time.
+Results come back in input order. A sequence longer than 8192 tokens, or an
+empty one, is refused before any shape is admitted or any request reaches the
+worker. Nothing is truncated.
 
-The hardware follow-up must first enable the `ane-m5` live row for the trial and commit that source change, then build from a clean tree. Remove the refusal permanently only after that row reaches its actual pass/fail gates. Once the one-minute load is below 16 and a GTE checkpoint directory matching the revision and file digests in `bench/parity/models.json` is available, use the following exact acceptance commands. Set `GTE_MODERNBERT_WEIGHTS` to that directory, containing the original checkpoint files rather than a converted worker package:
+Inference runs on a detached task that owns the request's lease, its module
+execution permit, its catalog-lane guard and its in-flight accounting. When
+the caller goes away, the task still reads the worker's reply, so the stream
+stays in sync and nothing restarts. Only then does it release those guards
+and discard the result. The request's absolute deadline bounds admission waits
+and each bucket's exchange. On expiry, the caller gets `deadline_exceeded` at
+once, and no further buckets are started.
 
+Real faults (I/O errors, malformed replies, an exchange that runs past its
+bound) go through the supervisor's confirmed-exit recovery after the lease is
+released. Recovery is tied to the worker generation that faulted, so one fault
+restarts a worker once, and a stale error that arrives after recovery restarts
+nothing. A request whose exchange broke may already have run on the worker, so
+it returns an error rather than being replayed.
+
+## Unload and shutdown
+
+Retirement happens in this order:
+1. It stops new leases and replacement spawning.
+2. It drains in-flight work within the supervisor's bounded wait.
+3. It closes the channel and waits for the worker process to exit, killing it
+   if it has to.
+4. Only after the exit is confirmed does it refund the worker's executable
+   reservations, because a live process can still hold Neural Engine
+   resources. An unconfirmed exit keeps the reservations charged.
+
+Retirement is checked inside the same locked decision that grants leases and
+reserves admissions, so a lease that raced it can't leave a reservation behind.
+A restart that was already under way re-checks retirement after the old
+process exits, and doesn't connect a replacement. Dropping the backend runs
+this teardown on its own thread and bounds the caller's wait, as the generic
+worker engine does.
+
+## Certification observation
+
+`ck-synapse certify run` sets `certify_observation` in the config it generates
+for the candidate. The supervisor then records every placement inventory the
+workers report: executable IDs, which layers they cover, and which stages run
+on the CPU. It keeps those records alongside its own count of admissions,
+which it maintains separately. The `certify.observations` query returns both,
+plus each worker channel's request count. The placement check refuses when the
+inventories and the admission count disagree, so a dropped inventory can't
+pass. With observation off, which is normal serving, nothing is recorded.
+
+## Hardware certification
+
+`certify run --row ane-m5` still refuses with a message naming this gap. The
+serving integration is covered by mock-transport tests, but it hasn't yet run
+against the real Neural Engine with real weights. That run needs a quiet
+machine (1-minute load under 16) and the original gte-modernbert-base
+checkpoint at the revision and digests pinned in `bench/parity/models.json`.
+To run it:
+1. Remove the `ane-m5` refusal in `crates/synapse-certify/src/live.rs`.
+2. Commit that change, so the build declares a clean commit.
+3. Build and run:
 
 ```sh
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -30,4 +113,24 @@ env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   --weights "${GTE_MODERNBERT_WEIGHTS:?set to the original pinned checkpoint directory}"
 ```
 
-Use the explicit candidate asset directory; do not substitute another checkout's binary. Recheck `uptime` before starting the hardware run. Compilation of ANE models requires `TMPDIR` unset and the Xcode developer directory shown above.
+`--assets` must be the `target/release` directory of the same clean build: the
+record attests to the `ck-synapse` and `ck-synapse-worker-ane-direct` binaries
+it finds there. `TMPDIR` must be unset, because the private ANE compiler only
+accepts the per-user temporary directory. Keep the refusal removed only if the
+row reaches its real pass or fail gates.
+
+## Tests that guard these rules
+
+All of these are in `crates/synapse-module/src/worker_host/mod.rs` and
+`crates/synapse-module/src/lib.rs`, and run on mock transports:
+
+| Rule | Test |
+| --- | --- |
+| A cancelled caller doesn't restart the worker | `serving_caller_cancellation_drains_reply_without_restart` |
+| The detached task keeps the module permit and in-flight count | `cancelled_direct_ane_keeps_module_permit_and_inflight_until_reply_drains` |
+| One fault restarts a worker once | `serving_admission_channel_fault_restarts_exactly_once` |
+| A stale fault restarts nothing | `stale_serving_fault_after_recovery_does_not_restart_restored_owner` |
+| Deadlines bound warm and cold requests | `direct_ane_warm_reply_after_absolute_deadline_is_discarded`, `direct_ane_cold_admission_after_absolute_deadline_is_drained_without_inference` |
+| Residency is per owning worker | `identical_models_in_distinct_workers_each_admit_their_own_shape` |
+| Retirement leaves no reservation behind | `retirement_between_precheck_and_grant_leaves_no_phantom_reservation` |
+| Retirement stops a restart from replacing the worker | `retirement_during_exit_confirmation_never_connects_replacement` |
