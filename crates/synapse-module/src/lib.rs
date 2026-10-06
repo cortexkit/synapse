@@ -6516,6 +6516,9 @@ fn resolve_worker_binary_sibling(engine: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+// Only the macOS direct-ANE backend calls this, but the mapping itself is
+// platform-independent, and its tests run everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ane_residency_error_to_wire(
     error: worker_host::ane_residency::AneResidencyError,
 ) -> WireOperationError {
