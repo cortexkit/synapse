@@ -25,3 +25,6 @@ operations/
 corpus/aft-chunks.jsonl
 .banlist.local
 tools/classify-distill/
+
+# Python bytecode from running the reference generator and its tests.
+__pycache__/
