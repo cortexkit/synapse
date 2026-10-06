@@ -3440,6 +3440,8 @@ pub mod ane_residency {
 
     #[derive(Debug, Error)]
     pub enum AneResidencyError {
+        #[error("direct-ANE request deadline exceeded")]
+        DeadlineExceeded,
         #[error("sequence of {n_tokens} tokens exceeds the largest direct-ANE shape {max}")]
         SequenceTooLong { n_tokens: usize, max: usize },
         /// The worker answered `ERR`.
@@ -3926,9 +3928,23 @@ pub mod ane_residency {
             model_ref: &str,
             shape: usize,
         ) -> Result<AneShapeLease, AneResidencyError> {
+            self.lease_until(worker, model_ref, shape, None).await
+        }
+
+        /// Deadline expiry stops queued admissions; active RPCs finish accounting
+        /// before their late result is discarded.
+        pub async fn lease_until(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            shape: usize,
+            request_deadline: Option<tokio::time::Instant>,
+        ) -> Result<AneShapeLease, AneResidencyError> {
             #[cfg(test)]
             let started = std::time::Instant::now();
-            let result = self.lease_inner(worker, model_ref, shape).await;
+            let result = self
+                .lease_inner(worker, model_ref, shape, request_deadline)
+                .await;
             #[cfg(test)]
             let _ = ADMISSION_WAITS.try_with(|waits| {
                 waits.lock().unwrap().push(AdmissionWait {
@@ -3945,6 +3961,7 @@ pub mod ane_residency {
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
             shape: usize,
+            request_deadline: Option<tokio::time::Instant>,
         ) -> Result<AneShapeLease, AneResidencyError> {
             let key = ShapeKey {
                 model_ref: model_ref.to_string(),
@@ -3959,6 +3976,10 @@ pub mod ane_residency {
             let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
             let ticket = QueueTicket::enqueue(&self.inner);
             loop {
+                if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    return Err(AneResidencyError::DeadlineExceeded);
+                }
                 // Register for wakeups before reading the state, so a change
                 // between the check and the wait is not missed.
                 let notified = self.inner.changed.notified();
@@ -3969,7 +3990,16 @@ pub mod ane_residency {
                 }
                 match self.next_step(ticket.id, &key, worker, executables) {
                     Step::Leased(lease) => return Ok(lease),
-                    Step::Admit(slot_id) => return self.admit(worker.clone(), key, slot_id).await,
+                    Step::Admit(slot_id) => {
+                        let lease = self.admit(worker.clone(), key, slot_id).await?;
+                        if request_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            drop(lease);
+                            return Err(AneResidencyError::DeadlineExceeded);
+                        }
+                        return Ok(lease);
+                    }
                     Step::Evict {
                         key,
                         slot_id,
@@ -3978,7 +4008,17 @@ pub mod ane_residency {
                         self.evict(owner, key, slot_id).await;
                     }
                     Step::Wait => {
-                        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                        let wait_deadline =
+                            request_deadline.map_or(deadline, |request| request.min(deadline));
+                        if tokio::time::timeout_at(wait_deadline, notified)
+                            .await
+                            .is_err()
+                        {
+                            if request_deadline
+                                .is_some_and(|request| tokio::time::Instant::now() >= request)
+                            {
+                                return Err(AneResidencyError::DeadlineExceeded);
+                            }
                             return Err(resource_refusal(AneResidencyError::Channel(
                                 "admission budget wait deadline exceeded".into(),
                             )));
@@ -4017,6 +4057,23 @@ pub mod ane_residency {
             model_ref: &str,
             lengths: &[usize],
             ladder: &[usize],
+            run: F,
+        ) -> Result<Vec<T>, AneResidencyError>
+        where
+            F: FnMut(usize, Vec<usize>) -> Fut,
+            Fut: Future<Output = Result<Vec<T>, AneResidencyError>>,
+        {
+            self.run_by_published_rung_until(worker, model_ref, lengths, ladder, None, run)
+                .await
+        }
+
+        pub async fn run_by_published_rung_until<T, F, Fut>(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            lengths: &[usize],
+            ladder: &[usize],
+            deadline: Option<tokio::time::Instant>,
             mut run: F,
         ) -> Result<Vec<T>, AneResidencyError>
         where
@@ -4045,7 +4102,11 @@ pub mod ane_residency {
             }
             let mut outputs: Vec<Option<T>> = (0..lengths.len()).map(|_| None).collect();
             for (rung, indices) in rungs {
-                let lease = self.lease(worker, model_ref, rung).await?;
+                let lease = self.lease_until(worker, model_ref, rung, deadline).await?;
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    drop(lease);
+                    return Err(AneResidencyError::DeadlineExceeded);
+                }
                 let results = run(rung, indices.clone()).await;
                 drop(lease);
                 let results = results?;
@@ -5127,21 +5188,27 @@ pub mod ane_residency {
             &self,
             sequences: Vec<Vec<u32>>,
             rerank: bool,
+            deadline: Option<tokio::time::Instant>,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
-            self.infer_guarded(sequences, rerank, ()).await
+            self.infer_guarded(sequences, rerank, deadline, ()).await
         }
 
         pub async fn infer_guarded<G: Send + 'static>(
             &self,
             sequences: Vec<Vec<u32>>,
             rerank: bool,
+            deadline: Option<tokio::time::Instant>,
             guards: G,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             let serving = self.serving.clone();
             self.runtime
                 .as_ref()
                 .expect("live ANE runtime")
-                .spawn(async move { serving.infer_guarded(sequences, rerank, guards).await })
+                .spawn(async move {
+                    serving
+                        .infer_guarded(sequences, rerank, deadline, guards)
+                        .await
+                })
                 .await
                 .map_err(|error| AneResidencyError::Channel(error.to_string()))?
         }
@@ -5229,7 +5296,7 @@ pub mod ane_residency {
             sequences: Vec<Vec<u32>>,
             rerank: bool,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
-            self.infer_guarded(sequences, rerank, ()).await
+            self.infer_guarded(sequences, rerank, None, ()).await
         }
 
         /// The detached task retains module scheduling guards until I/O and recovery finish.
@@ -5237,6 +5304,7 @@ pub mod ane_residency {
             self: &Arc<Self>,
             sequences: Vec<Vec<u32>>,
             rerank: bool,
+            deadline: Option<tokio::time::Instant>,
             guards: G,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             if self.channel.retired.load(Ordering::Acquire) {
@@ -5256,29 +5324,33 @@ pub mod ane_residency {
                 });
             }
             let serving = self.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _guards = guards;
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
-                let result = serving
-                    .supervisor
-                    .run_by_published_rung(
-                        &worker,
-                        &serving.metadata.model_ref,
-                        &lengths,
-                        &serving.metadata.buckets,
-                        |_, indices| {
-                            fault_generation.store(worker.generation(), Ordering::Release);
-                            let serving = serving.clone();
-                            let selected: Vec<_> = indices
-                                .iter()
-                                .map(|&index| sequences[index].clone())
-                                .collect();
-                            async move { serving.exchange_sequences(selected, rerank).await }
-                        },
-                    )
-                    .await;
+                let result =
+                    serving
+                        .supervisor
+                        .run_by_published_rung_until(
+                            &worker,
+                            &serving.metadata.model_ref,
+                            &lengths,
+                            &serving.metadata.buckets,
+                            deadline,
+                            |_, indices| {
+                                fault_generation.store(worker.generation(), Ordering::Release);
+                                let serving = serving.clone();
+                                let selected: Vec<_> = indices
+                                    .iter()
+                                    .map(|&index| sequences[index].clone())
+                                    .collect();
+                                async move {
+                                    serving.exchange_sequences(selected, rerank, deadline).await
+                                }
+                            },
+                        )
+                        .await;
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
                     serving
                         .supervisor
@@ -5286,9 +5358,14 @@ pub mod ane_residency {
                         .await;
                 }
                 result
-            })
-            .await
-            .map_err(|error| {
+            });
+            let joined = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, task)
+                    .await
+                    .map_err(|_| AneResidencyError::DeadlineExceeded)?,
+                None => task.await,
+            };
+            joined.map_err(|error| {
                 AneResidencyError::Channel(format!("inference task failed: {error}"))
             })?
         }
@@ -5297,7 +5374,11 @@ pub mod ane_residency {
             &self,
             sequences: Vec<Vec<u32>>,
             rerank: bool,
+            deadline: Option<tokio::time::Instant>,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(AneResidencyError::DeadlineExceeded);
+            }
             use synapse_core::{
                 decode_f32_frame, encode_i32_frame, WorkerSequence, WorkerTokenItem,
             };
@@ -5377,6 +5458,9 @@ pub mod ane_residency {
                 return Err(AneResidencyError::Channel(
                     "invalid inference output count or value".into(),
                 ));
+            }
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err(AneResidencyError::DeadlineExceeded);
             }
             Ok(values.chunks_exact(dims).map(<[f32]>::to_vec).collect())
         }
@@ -6294,7 +6378,7 @@ pub mod ane_residency {
     }
 
     #[cfg(all(test, unix))]
-    pub(crate) use tests::module_mock_engine;
+    pub(crate) use tests::{module_mock_engine, module_mock_engine_admission};
 
     #[cfg(test)]
     mod tests {
@@ -6369,6 +6453,7 @@ pub mod ane_residency {
         struct Ledger {
             loads: Vec<WorkerRequest>,
             inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            admit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             fail_inference: bool,
             evict_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             /// Requests currently running on (model_ref, shape); a request
@@ -6475,6 +6560,11 @@ pub mod ane_residency {
                             own.insert(key.clone());
                             ledger.lock().unwrap().resident.insert(key);
                             continue;
+                        }
+                        let gate = ledger.lock().unwrap().admit_gate.take();
+                        if let Some((started, release)) = gate {
+                            started.notify_one();
+                            release.notified().await;
                         }
                         let delay = ledger.lock().unwrap().admit_delay;
                         tokio::time::sleep(delay).await;
@@ -6931,6 +7021,23 @@ pub mod ane_residency {
             started: Arc<Notify>,
             release: Arc<Notify>,
         ) -> Arc<DirectAneEngine> {
+            module_mock_engine_gate(started, release, false)
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn module_mock_engine_admission(
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        ) -> Arc<DirectAneEngine> {
+            module_mock_engine_gate(started, release, true)
+        }
+
+        #[cfg(unix)]
+        fn module_mock_engine_gate(
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            admission: bool,
+        ) -> Arc<DirectAneEngine> {
             let runtime = Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -6939,7 +7046,11 @@ pub mod ane_residency {
                     .unwrap(),
             );
             let ledger = SharedLedger::default();
-            ledger.lock().unwrap().inference_gate = Some((started, release));
+            if admission {
+                ledger.lock().unwrap().admit_gate = Some((started, release));
+            } else {
+                ledger.lock().unwrap().inference_gate = Some((started, release));
+            }
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
                 let ledger = ledger.clone();
                 Box::pin(async move {

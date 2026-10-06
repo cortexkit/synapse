@@ -38,3 +38,14 @@ test result: FAILED. 0 passed; 1 failed
 ```
 
 Both embedding and composed rerank now transfer the execution permit, catalog lane guard, and activity guard into the detached inference task. The same module-boundary test passes for both operations: while the reply is gated, the sole execution permit remains held and in-flight accounting stays at one; after draining, both return to idle.
+
+## Absolute request deadlines
+
+Both `direct_ane_warm_reply_after_absolute_deadline_is_discarded` and `direct_ane_cold_admission_after_absolute_deadline_is_drained_without_inference` failed on the original deadline-blind module path:
+
+```text
+called `Result::unwrap_err()` on an `Ok` value: [[128.0]]
+test result: FAILED. 0 passed; 2 failed
+```
+
+The absolute deadline now reaches the serving task and the shared rung runner. Queue waits use the remaining deadline; expired requests dispatch no additional rungs. The caller returns the existing `deadline_exceeded` wire error on time, while already active admission/inference RPCs finish their response read and accounting with their scheduling guards still owned. Late successful results are discarded without a restart. Both deadline tests pass, and the cancellation/guard regression still passes.

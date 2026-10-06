@@ -6520,6 +6520,12 @@ fn ane_residency_error_to_wire(
     error: worker_host::ane_residency::AneResidencyError,
 ) -> WireOperationError {
     use worker_host::ane_residency::AneResidencyError;
+    if matches!(error, AneResidencyError::DeadlineExceeded) {
+        return WireOperationError::from_stable(
+            StableError::deadline_exceeded(),
+            error.to_string(),
+        );
+    }
     if let AneResidencyError::SequenceTooLong { n_tokens, max } = &error {
         return WireOperationError::from_stable(
             StableError::sequence_too_long(*n_tokens, *max, None),
@@ -12199,7 +12205,12 @@ async fn execute_embedding(
                 catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
             }
             let values = engine
-                .infer_guarded(batch.items, false, (permit, catalog_guard, _activity))
+                .infer_guarded(
+                    batch.items,
+                    false,
+                    deadline,
+                    (permit, catalog_guard, _activity),
+                )
                 .await
                 .map_err(ane_residency_error_to_wire)?;
             Ok(values)
@@ -12308,7 +12319,7 @@ async fn execute_rerank(
                 artifact_invalid_error("direct-ANE rerank requires composed pairs")
             })?;
             let values = engine
-                .infer_guarded(pairs, true, (permit, catalog_guard, _activity))
+                .infer_guarded(pairs, true, deadline, (permit, catalog_guard, _activity))
                 .await
                 .map_err(ane_residency_error_to_wire)?;
             Ok(synapse_core::RerankScores {
@@ -16855,6 +16866,104 @@ mod tests {
         super::attach_certify_observation(&mut response, None);
         assert_eq!(serde_json::to_vec(&response).unwrap(), before);
         assert!(!super::ModuleConfig::default().certify_observation);
+    }
+
+    #[cfg(unix)]
+    async fn assert_direct_ane_absolute_deadline(cold: bool) {
+        let (root, _) = test_storage_descriptor("ane-deadline");
+        let spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+        let mut model = catalog_test_model(&root, &spec);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let engine = tokio::task::spawn_blocking({
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                if cold {
+                    worker_host::ane_residency::module_mock_engine_admission(started, release)
+                } else {
+                    worker_host::ane_residency::module_mock_engine(started, release)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if !cold {
+            let worker: Arc<dyn worker_host::ane_residency::AneShapeWorker> =
+                engine.serving.channel.clone();
+            drop(
+                engine
+                    .serving
+                    .supervisor
+                    .lease(&worker, &engine.serving.metadata.model_ref, 128)
+                    .await
+                    .unwrap(),
+            );
+        }
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+        let runtime =
+            Arc::new(RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let task = tokio::spawn({
+            let model = model.clone();
+            let runtime = runtime.clone();
+            async move {
+                execute_embedding(
+                    &runtime,
+                    &model,
+                    TokenBatch {
+                        items: vec![vec![1]],
+                    },
+                    Some(deadline),
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+        let finished_before_reply = task.is_finished();
+        let in_flight = runtime.execution_stats.lock().unwrap().in_flight;
+        release.notify_one();
+        let result = task.await.unwrap();
+        tokio::task::spawn_blocking({
+            let engine = engine.clone();
+            move || engine.unload()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.unwrap_err().code, "deadline_exceeded");
+        assert!(
+            finished_before_reply,
+            "caller deadline must bound the result wait"
+        );
+        assert_eq!(
+            in_flight, 1,
+            "expired work must retain guards while its reply drains"
+        );
+        assert_eq!(engine.serving.supervisor.stats().restarts, 0);
+        assert_eq!(
+            engine.serving.channel.request_count(),
+            if cold { 1 } else { 2 },
+            "late admission must not dispatch inference"
+        );
+        drop(model);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn direct_ane_warm_reply_after_absolute_deadline_is_discarded() {
+        assert_direct_ane_absolute_deadline(false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn direct_ane_cold_admission_after_absolute_deadline_is_drained_without_inference() {
+        assert_direct_ane_absolute_deadline(true).await;
     }
 
     #[tokio::test]
