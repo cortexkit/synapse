@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -88,10 +89,56 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(any(call[0] == "score" for call in RecordingBackend.calls))
         document = json.loads(path.read_text())
         self.assertEqual(document["fixture_set_id"], "gte-modernbert-base.ref-v1.transformers-5.16.1.seed-0")
+        for key, value in gr.RUNTIME_SETTINGS.items():
+            self.assertEqual(document["reference"][key], value)
         lengths = {case["id"]: len(case["input_ids"]) for case in document["cases"]}
         for length in gr.BOUNDARY_LENGTHS:
             self.assertEqual(lengths[f"boundary-{length}"], length)
         self.assertEqual(lengths["long-8192"], 8192)
+
+
+class RuntimeSettingsTests(unittest.TestCase):
+    def test_environment_limits_are_set_before_library_imports(self):
+        import subprocess
+
+        command = (
+            "import os; os.environ['OMP_NUM_THREADS']='8'; os.environ['MKL_NUM_THREADS']='8'; "
+            "import generate_reference; "
+            "assert os.environ['OMP_NUM_THREADS']=='1'; "
+            "assert os.environ['MKL_NUM_THREADS']=='1'; "
+            "assert 'torch' not in __import__('sys').modules"
+        )
+        subprocess.run([sys.executable, "-c", command], cwd=Path(gr.__file__).parent, check=True)
+
+    def test_torch_configuration_precedes_loading_and_all_models_use_eager(self):
+        torch = Mock(__version__="2.14.0", float32="fp32")
+        transformers = Mock()
+        events = Mock()
+        events.attach_mock(torch, "torch")
+        events.attach_mock(transformers, "transformers")
+        manifest = gr.load_manifest()
+        with patch.dict(sys.modules, {"torch": torch, "transformers": transformers}), patch.object(gr, "_TORCH_CONFIGURED", False):
+            for entry in manifest["models"].values():
+                gr.TorchBackend(Path("snapshot"), entry, 0)
+        torch.set_num_threads.assert_called_once_with(1)
+        torch.set_num_interop_threads.assert_called_once_with(1)
+        torch.use_deterministic_algorithms.assert_called_once_with(True)
+        self.assertEqual(events.mock_calls[:3], [
+            unittest.mock.call.torch.set_num_threads(1),
+            unittest.mock.call.torch.set_num_interop_threads(1),
+            unittest.mock.call.torch.use_deterministic_algorithms(True),
+        ])
+        torch.manual_seed.assert_called_with(0)
+        for loader in (transformers.AutoModel, transformers.AutoModelForSequenceClassification, transformers.AutoModelForCausalLM):
+            for call in loader.from_pretrained.call_args_list:
+                self.assertEqual(call.kwargs, {"dtype": "fp32", "attn_implementation": "eager"})
+            self.assertTrue(loader.from_pretrained.called)
+
+    def test_unpinned_torch_is_refused_before_configuration(self):
+        torch = Mock(__version__="2.13.0")
+        with self.assertRaisesRegex(gr.Refused, "torch 2.14.0"):
+            gr.configure_torch(torch)
+        torch.set_num_threads.assert_not_called()
 
 
 class CommittedFixtureTests(unittest.TestCase):

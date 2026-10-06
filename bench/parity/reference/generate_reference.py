@@ -9,17 +9,18 @@ seed equals `reference_seed`. Verification machines compare against the
 committed outputs and need no Python.
 
 Usage:
-    python generate_reference.py --hf-cache ~/.cache/huggingface/hub \
-        --model qwen3-reranker-0.6b [--seed 0]
+    uv run --no-project --python 3.12 --with transformers==5.16.1 \
+        --with torch==2.14.0 python bench/parity/reference/generate_reference.py \
+        --hf-cache ~/.cache/huggingface/hub --model qwen3-reranker-0.6b [--seed 0]
 
 Each run writes fixtures/<slug>/<fixture set id>.json and records its SHA-256
 in fixtures/index.json. The fixture set id names the reference version and
 seed, so outputs from a different version or seed can never share an id.
 
-Fixture coverage per model: short inputs, inputs whose composed length sits on
-either side of the direct-ANE ladder rungs 128 and 512, one padded batch, and
-one input of exactly 8192 composed tokens. Rerank models also get candidate
-pools of 10 and 100.
+Fixture coverage per model: short inputs, inputs whose token counts (including
+special tokens and templates) surround the Apple Neural Engine fixed-shape
+boundaries of 128 and 512, one padded batch, and one input of exactly 8192
+tokens. Rerank models also get candidate pools of 10 and 100.
 """
 
 from __future__ import annotations
@@ -27,11 +28,27 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
+# Set these before importing Torch or Transformers: parallel reductions can
+# change fp32 rounding even when deterministic algorithms are enabled.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 PARITY_DIR = Path(__file__).resolve().parent.parent
+TORCH_VERSION = "2.14.0"
+RUNTIME_SETTINGS = {
+    "num_threads": 1,
+    "num_interop_threads": 1,
+    "deterministic_algorithms": True,
+    "attn_implementation": "eager",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+}
+_TORCH_CONFIGURED = False
 FIXTURE_REVISION = "ref-v1"
 BOUNDARY_LENGTHS = (127, 128, 129, 511, 512, 513)
 LONG_LENGTH = 8192
@@ -207,18 +224,34 @@ def build_cases(model_entry: dict, compose) -> list[dict]:
 # Torch backend. Imported lazily so the preflight and its tests need neither
 # torch nor transformers.
 
+def configure_torch(torch) -> None:
+    """Use single-threaded, deterministic reductions to stabilize fp32 rounding.
+
+    Configure once because Torch forbids resetting interop threads after work
+    has started, including when another model is loaded in the same process.
+    """
+    global _TORCH_CONFIGURED
+    if torch.__version__.split("+", 1)[0] != TORCH_VERSION:
+        raise Refused(f"torch {TORCH_VERSION} is required, found {torch.__version__}")
+    if not _TORCH_CONFIGURED:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        torch.use_deterministic_algorithms(True)
+        _TORCH_CONFIGURED = True
+
+
 class TorchBackend:
     def __init__(self, snapshot: Path, model_entry: dict, seed: int):
         import torch
         import transformers
 
+        configure_torch(torch)
         torch.manual_seed(seed)
-        torch.use_deterministic_algorithms(True)
         self.torch = torch
         self.entry = model_entry
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(snapshot)
         kind = model_entry["architecture"]["class"]
-        kwargs = {"dtype": torch.float32}
+        kwargs = {"dtype": torch.float32, "attn_implementation": "eager"}
         if model_entry["operation"] == "embed":
             self.model = transformers.AutoModel.from_pretrained(snapshot, **kwargs)
         elif kind == "ModernBertForSequenceClassification":
@@ -319,6 +352,7 @@ def run(argv: Sequence[str], *, installed_version: str | None = None,
             "device": "cpu",
             "dtype": "fp32",
             "torch_version": getattr(getattr(backend, "torch", None), "__version__", None),
+            **RUNTIME_SETTINGS,
         },
         "cases": cases,
     }
