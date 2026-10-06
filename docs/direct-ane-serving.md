@@ -92,15 +92,11 @@ pass. With observation off, which is normal serving, nothing is recorded.
 
 ## Hardware certification
 
-`certify run --row ane-m5` still refuses with a message naming this gap. The
-serving integration is covered by mock-transport tests, but it hasn't yet run
-against the real Neural Engine with real weights. That run needs a quiet
-machine (1-minute load under 16) and the original gte-modernbert-base
-checkpoint at the revision and digests pinned in `bench/parity/models.json`.
-To run it:
-1. Remove the `ane-m5` refusal in `crates/synapse-certify/src/live.rs`.
-2. Commit that change, so the build declares a clean commit.
-3. Build and run:
+`certify run --row ane-m5` drives a candidate build through this serving path
+against the real Neural Engine. It needs a quiet machine (1-minute load under
+16) and the original checkpoint at the revision and digests pinned in
+`bench/parity/models.json`. Build from a clean, committed tree so the build
+declares its commit, then run:
 
 ```sh
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -116,8 +112,12 @@ env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 `--assets` must be the `target/release` directory of the same clean build: the
 record attests to the `ck-synapse` and `ck-synapse-worker-ane-direct` binaries
 it finds there. `TMPDIR` must be unset, because the private ANE compiler only
-accepts the per-user temporary directory. Keep the refusal removed only if the
-row reaches its real pass or fail gates.
+accepts the per-user temporary directory.
+
+Cold shape compiles dominate a first run: the 8192-token case spends most of
+its 2-3 minutes compiling its shape, while warm requests take milliseconds. A
+passing development run on an M5 Max (macOS 27.0.1) gave gte-modernbert-base a
+minimum cosine of 0.99973 against the fp32 reference, across all 17 fixtures.
 
 ## Tests that guard these rules
 
