@@ -6697,9 +6697,16 @@ const DOWNLOAD_NON_TERMINAL_SQL: &str = "('queued', 'downloading', 'verifying')"
 /// accelerated engines, none of which has a CPU execution mode. Embedding and
 /// reranking serve only on owned accelerated lanes, so every other engine,
 /// including the CPU-bound `ort` and `llama`, is refused for those tasks.
+/// The direct-ANE worker is named through its shared constant so this list
+/// can't drift from the identity the worker reports.
 #[cfg_attr(not(test), allow(dead_code))]
-pub const OWNED_EMBED_RERANK_ENGINES: &[&str] =
-    &["owned-metal", "ane", "owned-cuda", "owned-vulkan"];
+pub const OWNED_EMBED_RERANK_ENGINES: &[&str] = &[
+    "owned-metal",
+    "ane",
+    synapse_core::ANE_DIRECT_WORKER_ENGINE,
+    "owned-cuda",
+    "owned-vulkan",
+];
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_download_non_terminal(state: &str) -> bool {
@@ -14470,6 +14477,12 @@ mod tests {
             registration("bge-rerank", "llama", "rerank", &[blob('c')]),
             registration("gte-modernbert-base", "owned-metal", "embed", &[blob('d')]),
             registration("owned-embed", "owned-metal", "embed", &[blob('c')]),
+            registration(
+                "direct-ane-embed",
+                synapse_core::ANE_DIRECT_WORKER_ENGINE,
+                "embed",
+                &[blob('c')],
+            ),
             registration("decoder", "llama", "generate", &[blob('e')]),
         ];
         for (index, row) in rows.iter().enumerate() {
@@ -14495,7 +14508,7 @@ mod tests {
                 .iter()
                 .map(|model| model.model_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["owned-embed", "decoder"]
+            vec!["owned-embed", "direct-ane-embed", "decoder"]
         );
         assert_eq!(
             reconciliation.skipped_reserved,
@@ -14515,7 +14528,12 @@ mod tests {
                 .iter()
                 .map(|model| model.model_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["gte-modernbert-base", "owned-embed", "decoder"]
+            vec![
+                "gte-modernbert-base",
+                "owned-embed",
+                "direct-ane-embed",
+                "decoder"
+            ]
         );
         drop(store);
         let _ = std::fs::remove_dir_all(root);
