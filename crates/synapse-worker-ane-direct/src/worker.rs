@@ -206,7 +206,7 @@ fn request_loop<S: Read + Write>(
                             model_ref,
                             dims,
                             cold_load_ms: start.elapsed().as_millis() as u64,
-                            buckets: None,
+                            buckets: Some(crate::backend::LADDER.to_vec()),
                         },
                         None,
                     )
@@ -281,7 +281,7 @@ fn request_loop<S: Read + Write>(
                         rss_mb: 0,
                         models_loaded: models.len(),
                         placement_share: None,
-                        buckets: None,
+                        buckets: Some(crate::backend::LADDER.to_vec()),
                         ane_resident_shapes: Some(
                             models
                                 .iter()
@@ -392,7 +392,9 @@ mod tests {
         .unwrap();
         let response: WorkerResponse =
             read_json_frame(&mut io::Cursor::new(stream.output), DEFAULT_MAX_FRAME_BYTES).unwrap();
-        assert!(matches!(response, WorkerResponse::Pong { .. }));
+        assert!(
+            matches!(response, WorkerResponse::Pong { buckets: Some(ref buckets), .. } if buckets == &vec![128, 256, 512, 1024, 2048, 4096, 8192])
+        );
     }
     #[test]
     fn unsupported_rerank_drains_raw_frame_then_pongs() {

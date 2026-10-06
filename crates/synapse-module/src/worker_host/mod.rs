@@ -3937,18 +3937,48 @@ pub mod ane_residency {
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
             lengths: &[usize],
+            run: F,
+        ) -> Result<Vec<T>, AneResidencyError>
+        where
+            F: FnMut(usize, Vec<usize>) -> Fut,
+            Fut: Future<Output = Result<Vec<T>, AneResidencyError>>,
+        {
+            self.run_by_published_rung(worker, model_ref, lengths, &ANE_SHAPE_LADDER, run)
+                .await
+        }
+
+        /// Runs against the ladder advertised by the loaded worker, preserving
+        /// the same lease lifetime and output ordering as `run_by_rung`.
+        pub async fn run_by_published_rung<T, F, Fut>(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            lengths: &[usize],
+            ladder: &[usize],
             mut run: F,
         ) -> Result<Vec<T>, AneResidencyError>
         where
             F: FnMut(usize, Vec<usize>) -> Fut,
             Fut: Future<Output = Result<Vec<T>, AneResidencyError>>,
         {
+            if ladder.is_empty()
+                || ladder[0] == 0
+                || ladder.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(AneResidencyError::Channel(
+                    "invalid published bucket ladder".into(),
+                ));
+            }
             let mut rungs: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
             for (index, &n_tokens) in lengths.iter().enumerate() {
-                let rung = ladder_rung(n_tokens).ok_or(AneResidencyError::SequenceTooLong {
-                    n_tokens,
-                    max: ANE_SHAPE_LADDER[ANE_SHAPE_LADDER.len() - 1],
-                })?;
+                let rung = ladder
+                    .iter()
+                    .copied()
+                    .find(|rung| *rung >= n_tokens)
+                    .ok_or(AneResidencyError::SequenceTooLong {
+                        n_tokens,
+                        max: ladder[ladder.len() - 1],
+                    })?;
                 rungs.entry(rung).or_default().push(index);
             }
             let mut outputs: Vec<Option<T>> = (0..lengths.len()).map(|_| None).collect();
@@ -6323,6 +6353,40 @@ pub mod ane_residency {
                 waits[1].elapsed_ms >= 20.0,
                 "measure the actual admission future, including its wait deadline"
             );
+        }
+
+        #[tokio::test]
+        async fn published_ladder_controls_admission_and_rejects_oversize_before_exchange() {
+            let ledger = SharedLedger::default();
+            let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
+            let supervisor = budget_supervisor(8, Duration::from_secs(1));
+            let out = supervisor
+                .run_by_published_rung(
+                    &worker,
+                    "model",
+                    &[1, 300, 200],
+                    &[128, 512, 8192],
+                    |rung, indices| async move {
+                        Ok(indices.into_iter().map(|index| (index, rung)).collect())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(out, vec![(0, 128), (1, 512), (2, 512)]);
+            let before = ledger.lock().unwrap().events.clone();
+            assert!(matches!(
+                supervisor
+                    .run_by_published_rung(
+                        &worker,
+                        "model",
+                        &[8193],
+                        &[128, 512, 8192],
+                        |_, _| async { Ok::<Vec<usize>, AneResidencyError>(vec![]) }
+                    )
+                    .await,
+                Err(AneResidencyError::SequenceTooLong { .. })
+            ));
+            assert_eq!(ledger.lock().unwrap().events, before);
         }
 
         #[tokio::test]
