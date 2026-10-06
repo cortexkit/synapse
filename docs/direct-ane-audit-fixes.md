@@ -49,3 +49,14 @@ test result: FAILED. 0 passed; 2 failed
 ```
 
 The absolute deadline now reaches the serving task and the shared rung runner. Queue waits use the remaining deadline; expired requests dispatch no additional rungs. The caller returns the existing `deadline_exceeded` wire error on time, while already active admission/inference RPCs finish their response read and accounting with their scheduling guards still owned. Late successful results are discarded without a restart. Both deadline tests pass, and the cancellation/guard regression still passes.
+
+## Owner-qualified residency keys
+
+`identical_models_in_distinct_workers_each_admit_their_own_shape` failed when two channels loaded identical profile/package inputs through one shared supervisor:
+
+```text
+called `Result::unwrap()` on an `Err` value: WorkerErr { code: "shape_not_admitted", msg: "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:test rungs [128] are not resident" }
+test result: FAILED. 0 passed; 1 failed
+```
+
+Residency keys now include the owning worker ID in addition to model reference and shape. Budget totals and per-model caps remain shared. The regression passes: two admissions reserve 44 executables, retiring A refunds only its 22, and B continues serving. All 39 mock residency tests pass; existing assertions were retained.

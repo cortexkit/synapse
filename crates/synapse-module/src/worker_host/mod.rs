@@ -3614,6 +3614,7 @@ pub mod ane_residency {
 
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct ShapeKey {
+        worker_id: String,
         model_ref: String,
         shape: usize,
     }
@@ -3964,6 +3965,7 @@ pub mod ane_residency {
             request_deadline: Option<tokio::time::Instant>,
         ) -> Result<AneShapeLease, AneResidencyError> {
             let key = ShapeKey {
+                worker_id: worker.worker_id().to_owned(),
                 model_ref: model_ref.to_string(),
                 shape,
             };
@@ -5766,6 +5768,7 @@ pub mod ane_residency {
                         .lock()
                         .slots
                         .get(&ShapeKey {
+                            worker_id: self.worker_id().to_owned(),
                             model_ref: model_ref.into(),
                             shape,
                         })
@@ -6909,10 +6912,12 @@ pub mod ane_residency {
             let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
             let supervisor = budget_supervisor(7, Duration::from_secs(1));
             let first = ShapeKey {
+                worker_id: worker.worker_id().to_owned(),
                 model_ref: "model".into(),
                 shape: 128,
             };
             let second = ShapeKey {
+                worker_id: worker.worker_id().to_owned(),
                 model_ref: "model".into(),
                 shape: 256,
             };
@@ -7098,7 +7103,20 @@ pub mod ane_residency {
         }
 
         async fn serving_fixture(ledger: &SharedLedger) -> Arc<AneServing<DuplexStream>> {
-            let mock = mock_channel("serving", ledger).await;
+            serving_fixture_for(
+                ledger,
+                "serving",
+                AneResidencySupervisor::new(Default::default()),
+            )
+            .await
+        }
+
+        async fn serving_fixture_for(
+            ledger: &SharedLedger,
+            id: &str,
+            supervisor: AneResidencySupervisor,
+        ) -> Arc<AneServing<DuplexStream>> {
+            let mock = mock_channel(id, ledger).await;
             let channel = Arc::new(Arc::try_unwrap(mock).ok().unwrap().0);
             let request = WorkerRequest::Load {
                 req_id: channel.next_req_id("load"),
@@ -7126,7 +7144,7 @@ pub mod ane_residency {
             Arc::new(
                 AneServing::new(
                     channel,
-                    AneResidencySupervisor::new(AneResidencyLimits::default()),
+                    supervisor,
                     AneServingMetadata {
                         model_ref,
                         dims,
@@ -7138,6 +7156,35 @@ pub mod ane_residency {
                 )
                 .unwrap(),
             )
+        }
+
+        #[tokio::test]
+        async fn identical_models_in_distinct_workers_each_admit_their_own_shape() {
+            let ledger = SharedLedger::default();
+            let supervisor = AneResidencySupervisor::new(Default::default());
+            let a = serving_fixture_for(&ledger, "A", supervisor.clone()).await;
+            let b = serving_fixture_for(&ledger, "B", supervisor.clone()).await;
+            assert_eq!(a.metadata.model_ref, b.metadata.model_ref);
+            assert_eq!(
+                a.infer(vec![vec![1]], false).await.unwrap(),
+                vec![vec![128.0]]
+            );
+            assert_eq!(
+                b.infer(vec![vec![1]], false).await.unwrap(),
+                vec![vec![128.0]]
+            );
+            assert_eq!(
+                ledger.lock().unwrap().admit_attempts[&(a.metadata.model_ref.clone(), 128)],
+                2
+            );
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 44);
+            a.retire().await.unwrap();
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 22);
+            assert_eq!(
+                b.infer(vec![vec![1]], false).await.unwrap(),
+                vec![vec![128.0]]
+            );
+            b.retire().await.unwrap();
         }
 
         #[tokio::test]
@@ -7891,6 +7938,7 @@ pub mod ane_residency {
                 .contains(&("model".into(), 128)));
             assert_eq!(
                 supervisor.inner.lock().slots[&ShapeKey {
+                    worker_id: worker.worker_id().to_owned(),
                     model_ref: "model".into(),
                     shape: 512
                 }]
