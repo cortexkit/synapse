@@ -60,3 +60,16 @@ test result: FAILED. 0 passed; 1 failed
 ```
 
 Residency keys now include the owning worker ID in addition to model reference and shape. Budget totals and per-model caps remain shared. The regression passes: two admissions reserve 44 executables, retiring A refunds only its 22, and B continues serving. All 39 mock residency tests pass; existing assertions were retained.
+
+## Atomic retired-owner admission refusal
+
+`retirement_between_precheck_and_grant_leaves_no_phantom_reservation` pauses the real lease path after its retired precheck, completes retirement, then resumes the grant decision. The original decision created a failed slot and retained its charge:
+
+```text
+assertion `left == right` failed: retired owner must not acquire an Admitting reservation
+  left: 4
+ right: 0
+test result: FAILED. 0 passed; 1 failed
+```
+
+`next_step` now checks retirement under the same state lock that grants leases and reserves admission slots, returning a terminal refusal instead of a grant. The barrier regression and existing queued-retirement test both pass; no slot or worker admission remains.

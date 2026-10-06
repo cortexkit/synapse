@@ -3705,6 +3705,8 @@ pub mod ane_residency {
         changed: Notify,
         #[cfg(test)]
         admission_gate: Option<Arc<tokio::sync::Mutex<()>>>,
+        #[cfg(test)]
+        lease_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
         #[cfg(unix)]
         lane_lock: Option<AneDirectLaneLock>,
     }
@@ -3756,6 +3758,7 @@ pub mod ane_residency {
             owner: Arc<dyn AneShapeWorker>,
         },
         Wait,
+        Retired,
     }
 
     /// Owns the direct-ANE residency budget. Cheap to clone; clones share it.
@@ -3776,6 +3779,8 @@ pub mod ane_residency {
                     changed: Notify::new(),
                     #[cfg(test)]
                     admission_gate: None,
+                    #[cfg(test)]
+                    lease_decision_gate: Mutex::new(None),
                     #[cfg(unix)]
                     lane_lock: None,
                 }),
@@ -3794,6 +3799,8 @@ pub mod ane_residency {
                     changed: Notify::new(),
                     #[cfg(test)]
                     admission_gate: None,
+                    #[cfg(test)]
+                    lease_decision_gate: Mutex::new(None),
                     lane_lock: Some(lock),
                 }),
             }
@@ -3990,7 +3997,18 @@ pub mod ane_residency {
                 if self.inner.lock().retired.contains(worker.worker_id()) {
                     return Err(AneResidencyError::Channel("worker is retired".into()));
                 }
+                #[cfg(test)]
+                {
+                    let gate = self.inner.lease_decision_gate.lock().unwrap().take();
+                    if let Some((checked, continue_grant)) = gate {
+                        checked.notify_one();
+                        continue_grant.notified().await;
+                    }
+                }
                 match self.next_step(ticket.id, &key, worker, executables) {
+                    Step::Retired => {
+                        return Err(AneResidencyError::Channel("worker is retired".into()))
+                    }
                     Step::Leased(lease) => return Ok(lease),
                     Step::Admit(slot_id) => {
                         let lease = self.admit(worker.clone(), key, slot_id).await?;
@@ -4137,6 +4155,9 @@ pub mod ane_residency {
             executables: usize,
         ) -> Step {
             let mut state = self.inner.lock();
+            if state.retired.contains(worker.worker_id()) {
+                return Step::Retired;
+            }
             if state.waiters.front() != Some(&ticket)
                 || state.recovering.contains(worker.worker_id())
             {
@@ -7265,6 +7286,40 @@ pub mod ane_residency {
             assert_eq!(serving.supervisor.stats().restarts, 0);
             assert_eq!(serving.supervisor.stats().admitted, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
+        }
+
+        #[tokio::test]
+        async fn retirement_between_precheck_and_grant_leaves_no_phantom_reservation() {
+            let ledger = SharedLedger::default();
+            let channel = mock_channel("worker", &ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = budget_supervisor(7, Duration::from_secs(1));
+            let checked = Arc::new(Notify::new());
+            let continue_grant = Arc::new(Notify::new());
+            *supervisor.inner.lease_decision_gate.lock().unwrap() =
+                Some((checked.clone(), continue_grant.clone()));
+            let pending = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 128).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), checked.notified())
+                .await
+                .unwrap();
+            supervisor
+                .retire(&worker, channel.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
+            continue_grant.notify_one();
+            assert!(pending.await.unwrap().is_err());
+            assert_eq!(
+                supervisor.inner.lock().reserved_executables(),
+                0,
+                "retired owner must not acquire an Admitting reservation"
+            );
+            assert!(supervisor.inner.lock().slots.is_empty());
+            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
         }
 
         #[tokio::test]
