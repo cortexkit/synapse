@@ -3843,6 +3843,15 @@ pub mod ane_residency {
             recover_worker(&self.inner, worker).await
         }
 
+        /// Ignore faults from an owner generation that has already been replaced.
+        pub async fn recover_at_generation(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            generation: u64,
+        ) -> bool {
+            recover_worker_at_generation(&self.inner, worker, generation).await
+        }
+
         /// Stop new leases and retain reservations until the owner has confirmed exit.
         pub async fn retire<F>(
             &self,
@@ -4177,7 +4186,7 @@ pub mod ane_residency {
                     }
                     Err(error) => {
                         mark_failed_admission(&inner, &key, slot_id);
-                        recover_worker(&inner, &worker).await;
+                        recover_worker_at_generation(&inner, &worker, generation).await;
                         Err(error)
                     }
                 }
@@ -4235,7 +4244,7 @@ pub mod ane_residency {
                             "direct-ANE evict failed; restarting the worker"
                         );
                         if recover_on_failure {
-                            recover_worker(&inner, &owner).await;
+                            recover_worker_at_generation(&inner, &owner, generation).await;
                         }
                         false
                     }
@@ -4312,6 +4321,7 @@ pub mod ane_residency {
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         };
+        let owner_generation = owner.generation();
         if !supervisor
             .evict_with_recovery(owner.clone(), victim, victim_id, false)
             .await
@@ -4321,7 +4331,7 @@ pub mod ane_residency {
             if owner.worker_id() == worker.worker_id() {
                 mark_failed_admission(&supervisor.inner, &key, slot_id);
             }
-            recover_worker(&supervisor.inner, &owner).await;
+            recover_worker_at_generation(&supervisor.inner, &owner, owner_generation).await;
             forget_failed_admission(&supervisor.inner, &key, slot_id);
             return Err(resource_refusal(error));
         }
@@ -4348,12 +4358,12 @@ pub mod ane_residency {
             }
             Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
                 mark_failed_admission(&supervisor.inner, &key, slot_id);
-                recover_worker(&supervisor.inner, worker).await;
+                recover_worker_at_generation(&supervisor.inner, worker, generation).await;
                 Err(resource_refusal(error))
             }
             Err(error) => {
                 mark_failed_admission(&supervisor.inner, &key, slot_id);
-                recover_worker(&supervisor.inner, worker).await;
+                recover_worker_at_generation(&supervisor.inner, worker, generation).await;
                 Err(error)
             }
         }
@@ -4399,11 +4409,22 @@ pub mod ane_residency {
     /// Only an unconfirmed exit or failed replacement/restoration stays closed:
     /// its hardware ownership cannot safely be made available to another worker.
     async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) -> bool {
+        recover_worker_at_generation(inner, worker, worker.generation()).await
+    }
+
+    async fn recover_worker_at_generation(
+        inner: &Inner,
+        worker: &Arc<dyn AneShapeWorker>,
+        generation: u64,
+    ) -> bool {
         let id = worker.worker_id().to_owned();
         let leader = {
             let mut state = inner.lock();
             if state.retired.contains(&id) {
                 return false;
+            }
+            if worker.generation() != generation {
+                return true;
             }
             state.recovering.insert(id.clone())
         };
@@ -4436,6 +4457,9 @@ pub mod ane_residency {
                 }
                 return false;
             }
+        }
+        if worker.generation() != generation {
+            return true;
         }
         if let Err(error) = worker.restart().await {
             tracing::warn!(target:"worker",worker_id=%id,error=%error,"direct-ANE worker restart failed; reservations retained");
@@ -5216,6 +5240,7 @@ pub mod ane_residency {
             tokio::spawn(async move {
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+                let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
                 let result = serving
                     .supervisor
                     .run_by_published_rung(
@@ -5224,6 +5249,7 @@ pub mod ane_residency {
                         &lengths,
                         &serving.metadata.buckets,
                         |_, indices| {
+                            fault_generation.store(worker.generation(), Ordering::Release);
                             let serving = serving.clone();
                             let selected: Vec<_> = indices
                                 .iter()
@@ -5234,7 +5260,10 @@ pub mod ane_residency {
                     )
                     .await;
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
-                    serving.supervisor.recover(&worker).await;
+                    serving
+                        .supervisor
+                        .recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))
+                        .await;
                 }
                 result
             })
@@ -6933,6 +6962,41 @@ pub mod ane_residency {
             assert_eq!(serving.channel.request_count(), before);
             assert_eq!(ledger.lock().unwrap().shape_not_admitted, 0);
             serving.retire().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn stale_serving_fault_after_recovery_does_not_restart_restored_owner() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+            let fault_generation = worker.generation();
+            assert!(serving.supervisor.recover(&worker).await);
+            assert!(
+                serving
+                    .supervisor
+                    .recover_at_generation(&worker, fault_generation)
+                    .await
+            );
+            assert_eq!(serving.supervisor.stats().restarts, 1);
+            assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
+            serving.retire().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn serving_admission_channel_fault_restarts_exactly_once() {
+            let ledger = SharedLedger::default();
+            let mut serving = serving_fixture(&ledger).await;
+            Arc::get_mut(&mut Arc::get_mut(&mut serving).unwrap().channel)
+                .unwrap()
+                .shape_rpc_timeout = Duration::from_millis(20);
+            ledger
+                .lock()
+                .unwrap()
+                .no_reply_admit
+                .insert((serving.metadata.model_ref.clone(), 128));
+            assert!(serving.infer(vec![vec![1]], false).await.is_err());
+            assert_eq!(serving.supervisor.stats().restarts, 1);
+            assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
         }
 
         #[tokio::test]
