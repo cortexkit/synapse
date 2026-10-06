@@ -346,8 +346,10 @@ def catalog_dumps(value, indent: int = 0) -> str:
 def catalog_embed_ids(entry: dict, compose, text: str) -> list[int]:
     ids = compose(text)
     if entry["grammar"]["pooling"] == "last_non_pad":
-        # The catalog's owned tokenizer policy pools on a terminal EOS, whereas
-        # parity cases preserve the AutoTokenizer output without adding tokens.
+        # Last-token pooling reads the hidden state at the final token, so the
+        # module's tokenizer ends every catalog input with the model's EOS
+        # token; the references must see the same ids. Parity cases instead
+        # keep the AutoTokenizer output unchanged and add no tokens.
         eos = entry["grammar"]["terminal_tokens"][-1]["id"]
         if not ids or ids[-1] != eos:
             ids.append(eos)
