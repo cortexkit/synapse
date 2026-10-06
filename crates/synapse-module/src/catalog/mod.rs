@@ -1652,7 +1652,12 @@ mod tests {
             );
             assert!(files.values().all(|file| file.size_bytes > 0));
             let check = entry.self_check.as_ref().unwrap();
-            assert_eq!(check.fixture_revision, 1);
+            assert_eq!(check.fixture_revision, 2);
+            assert!(check.reference_tool.contains("transformers 5.16.1"));
+            assert!(check.reference_tool.contains("torch 2.14.0"));
+            assert!(check
+                .reference_tool
+                .contains("bench/parity/reference/generate_reference.py --catalog"));
         }
         let qwen_reranker = catalog.entry("qwen3-reranker-0.6b").unwrap();
         assert!(qwen_reranker.backends.is_empty());

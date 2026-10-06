@@ -13,7 +13,11 @@ Usage:
         --with torch==2.14.0 python bench/parity/reference/generate_reference.py \
         --hf-cache ~/.cache/huggingface/hub --model qwen3-reranker-0.6b [--seed 0]
 
-Each run writes fixtures/<slug>/<fixture set id>.json and records its SHA-256
+Use --catalog instead of --model to regenerate the catalog self-checks and
+the GTE reranker release evidence, keeping their existing inputs. --output-dir
+stages either mode under a separate root for comparison before replacement.
+
+Each parity run writes fixtures/<slug>/<fixture set id>.json and records its SHA-256
 in fixtures/index.json. The fixture set id names the reference version and
 seed, so outputs from a different version or seed can never share an id.
 
@@ -28,10 +32,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 # Set these before importing Torch or Transformers: parallel reductions can
 # change fp32 rounding even when deterministic algorithms are enabled.
@@ -39,6 +44,10 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 PARITY_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = PARITY_DIR.parent.parent
+CATALOG_PATH = Path("crates/synapse-module/src/catalog/models.json")
+EVIDENCE_PATH = Path("crates/synapse-module/src/fixtures/catalog_rerank_gte_modernbert_fp32.json")
+CATALOG_FIXTURE_REVISION = 2
 TORCH_VERSION = "2.14.0"
 RUNTIME_SETTINGS = {
     "num_threads": 1,
@@ -150,7 +159,7 @@ def fit_exact(target: int, compose: Callable[[str], list[int]], prefix_words: in
 # ---------------------------------------------------------------------------
 # Composition per model, following the manifest grammar.
 
-def make_composer(model_entry: dict, tokenizer):
+def make_composer(model_entry: dict, tokenizer) -> Callable[..., list[int]]:
     grammar = model_entry["grammar"]
     kind = grammar["kind"]
 
@@ -260,6 +269,14 @@ class TorchBackend:
             self.model = transformers.AutoModelForCausalLM.from_pretrained(snapshot, **kwargs)
         self.model.to("cpu").eval()
 
+    def classifier_logit(self, ids: list[int]) -> float:
+        """Catalog evidence retains raw logits as well as double-precision sigmoid scores."""
+        torch = self.torch
+        input_ids = torch.tensor([ids], dtype=torch.long)
+        with torch.no_grad():
+            logits = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids)).logits
+        return float(logits[0, 0])
+
     def score(self, batch: Sequence[list[int]]) -> list:
         """Outputs for one padded batch: vectors for embed, scores for rerank."""
         torch = self.torch
@@ -298,12 +315,106 @@ def snapshot_dir(hf_cache: Path, model_entry: dict) -> Path:
     return hf_cache / f"models--{repo}" / "snapshots" / model_entry["hf_revision"]
 
 
+def load_backend(hf_cache: Path, entry: dict, seed: int, backend_factory=None):
+    snapshot = snapshot_dir(hf_cache, entry)
+    if backend_factory is None:
+        for name, pinned in entry["files"].items():
+            actual = sha256_file(snapshot / name)
+            if actual != pinned:
+                raise Refused(f"{snapshot / name} has SHA-256 {actual}, manifest pins {pinned}")
+        backend_factory = TorchBackend
+    return backend_factory(snapshot, entry, seed)
+
+
+def catalog_dumps(value, indent: int = 0) -> str:
+    """Keep scalar arrays on one line, matching the catalog's existing JSON layout."""
+    pad, inner = "  " * indent, "  " * (indent + 1)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        rows = [f"{inner}{json.dumps(key, ensure_ascii=False)}: {catalog_dumps(item, indent + 1)}" for key, item in value.items()]
+        return "{\n" + ",\n".join(rows) + "\n" + pad + "}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        if all(not isinstance(item, (dict, list)) for item in value):
+            return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in value) + "]"
+        return "[\n" + ",\n".join(inner + catalog_dumps(item, indent + 1) for item in value) + "\n" + pad + "]"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def catalog_embed_ids(entry: dict, compose, text: str) -> list[int]:
+    ids = compose(text)
+    if entry["grammar"]["pooling"] == "last_non_pad":
+        # The catalog's owned tokenizer policy pools on a terminal EOS, whereas
+        # parity cases preserve the AutoTokenizer output without adding tokens.
+        eos = entry["grammar"]["terminal_tokens"][-1]["id"]
+        if not ids or ids[-1] != eos:
+            ids.append(eos)
+    return ids
+
+
+def generate_catalog(manifest: dict, hf_cache: Path, seed: int, version: str,
+                     repo_root: Path, output_root: Path, backend_factory=None) -> Path:
+    catalog = json.loads((repo_root / CATALOG_PATH).read_text())
+    evidence = json.loads((repo_root / EVIDENCE_PATH).read_text())
+    tool = (
+        f"transformers {version}, torch {TORCH_VERSION}; CPU fp32, eager attention, "
+        "seed 0, intra-op/inter-op threads 1, deterministic algorithms, "
+        "OMP_NUM_THREADS=1, MKL_NUM_THREADS=1; bench/parity/reference/generate_reference.py --catalog"
+    )
+    for model in catalog["models"]:
+        if "self_check" not in model:
+            continue
+        entry = manifest["models"][model["id"]]
+        if model["upstream"] != {"hf_repo": entry["hf_repo"], "revision": entry["hf_revision"]}:
+            raise Refused(f"{model['id']}: catalog and parity upstream pins disagree")
+        for file in model["files"]:
+            if entry["files"].get(file["path"]) != file["sha256"]:
+                raise Refused(f"{model['id']}: catalog and parity file pins disagree")
+        backend = load_backend(hf_cache, entry, seed, backend_factory)
+        compose = make_composer(entry, backend.tokenizer)
+        check = model["self_check"]
+        if entry["operation"] == "embed":
+            check["reference"] = {"vectors": [
+                backend.score([catalog_embed_ids(entry, compose, text)])[0] for text in check["inputs"]
+            ]}
+            kind = "CLS" if entry["grammar"]["pooling"] == "cls" else "terminal EOS last-token"
+            check["reference_tool"] = tool + f"; {kind} pooling, L2 normalization"
+        else:
+            def score_groups(groups):
+                rows = []
+                for group in groups:
+                    logits = [backend.classifier_logit(compose(group["query"], doc)) for doc in group["candidates"]]
+                    rows.append((logits, [1.0 / (1.0 + math.exp(-logit)) for logit in logits]))
+                return rows
+
+            check["reference"] = {"scores": [scores for _, scores in score_groups(check["inputs"])]}
+            check["reference_tool"] = tool + "; sigmoid(raw classifier logit)"
+            for item, (logits, scores) in zip(evidence["items"], score_groups(evidence["items"])):
+                item["raw_logits"], item["scores"] = logits, scores
+            evidence["reference_tool"] = check["reference_tool"]
+            evidence["generation_command"] = (
+                f"uv run --no-project --python 3.12 --with transformers=={version} --with torch=={TORCH_VERSION} "
+                "python bench/parity/reference/generate_reference.py --catalog --hf-cache ~/.cache/huggingface/hub"
+            )
+        check["fixture_revision"] = CATALOG_FIXTURE_REVISION
+    for relative, document in ((CATALOG_PATH, catalog), (EVIDENCE_PATH, evidence)):
+        destination = output_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(catalog_dumps(document) + "\n", encoding="utf-8")
+    return output_root / CATALOG_PATH
+
+
 def run(argv: Sequence[str], *, installed_version: str | None = None,
-        backend_factory: Callable[[Path, dict, int], object] | None = None,
-        parity_dir: Path = PARITY_DIR) -> Path:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+        backend_factory: Callable[[Path, dict, int], Any] | None = None,
+        parity_dir: Path = PARITY_DIR, repo_root: Path = REPO_ROOT) -> Path:
+    parser = argparse.ArgumentParser(description="Generate deterministic parity or catalog CPU fp32 references.")
     parser.add_argument("--hf-cache", type=Path, required=True)
-    parser.add_argument("--model", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--model")
+    mode.add_argument("--catalog", action="store_true", help="write catalog self-checks and reranker evidence")
+    parser.add_argument("--output-dir", type=Path, help="stage outputs under this root instead of overwriting committed files")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -312,19 +423,15 @@ def run(argv: Sequence[str], *, installed_version: str | None = None,
     if installed_version is None:
         import transformers
 
-        installed_version = transformers.__version__
+        installed_version = str(transformers.__version__)
     # Nothing is loaded, hashed or scored before this check.
     preflight(manifest, installed_version, seed)
 
+    if args.catalog:
+        return generate_catalog(manifest, args.hf_cache, seed, installed_version, repo_root,
+                                args.output_dir or repo_root, backend_factory)
     entry = manifest["models"][args.model]
-    snapshot = snapshot_dir(args.hf_cache, entry)
-    if backend_factory is None:
-        for name, pinned in entry["files"].items():
-            actual = sha256_file(snapshot / name)
-            if actual != pinned:
-                raise Refused(f"{snapshot / name} has SHA-256 {actual}, manifest pins {pinned}")
-        backend_factory = TorchBackend
-    backend = backend_factory(snapshot, entry, seed)
+    backend = load_backend(args.hf_cache, entry, seed, backend_factory)
     compose = make_composer(entry, backend.tokenizer)
     cases = build_cases(entry, compose)
 
@@ -356,15 +463,16 @@ def run(argv: Sequence[str], *, installed_version: str | None = None,
         },
         "cases": cases,
     }
-    out_dir = parity_dir / "fixtures" / args.model
+    output_root = args.output_dir or parity_dir
+    out_dir = output_root / "fixtures" / args.model
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{set_id}.json"
     path.write_text(json.dumps(document, indent=1, ensure_ascii=False) + "\n")
 
-    index_path = parity_dir / "fixtures" / "index.json"
+    index_path = output_root / "fixtures" / "index.json"
     index = json.loads(index_path.read_text()) if index_path.exists() else {}
     index[set_id] = {
-        "path": str(path.relative_to(parity_dir)),
+        "path": str(path.relative_to(output_root)),
         "sha256": sha256_file(path),
         "model": args.model,
         "transformers_version": installed_version,

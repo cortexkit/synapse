@@ -1,8 +1,8 @@
 {
   "corpus_id": "catalog_rerank_gte_modernbert_fp32",
   "comment": "Release evidence corpus for the gte-reranker-modernbert-base catalog entry. Each score is sigmoid(raw logit) of the fp32 Transformers reference on CPU.",
-  "generation_command": "uv run --no-project --python 3.12 --with transformers==5.17.0 --with torch==2.14.0 python bench/catalog/gen_catalog_references.py",
-  "reference_tool": "transformers 5.17.0, torch 2.14.0; CPU fp32, eager attention, sigmoid(raw logit) of the classification head; bench/catalog/gen_catalog_references.py",
+  "generation_command": "uv run --no-project --python 3.12 --with transformers==5.16.1 --with torch==2.14.0 python bench/parity/reference/generate_reference.py --catalog --hf-cache ~/.cache/huggingface/hub",
+  "reference_tool": "transformers 5.16.1, torch 2.14.0; CPU fp32, eager attention, seed 0, intra-op/inter-op threads 1, deterministic algorithms, OMP_NUM_THREADS=1, MKL_NUM_THREADS=1; bench/parity/reference/generate_reference.py --catalog; sigmoid(raw classifier logit)",
   "upstream": {
     "hf_repo": "Alibaba-NLP/gte-reranker-modernbert-base",
     "revision": "f7481e6055501a30fb19d090657df9ec1f79ab2c"

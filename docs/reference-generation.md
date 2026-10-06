@@ -68,3 +68,72 @@ IDs and mask values were unchanged (maximum expected-value difference: 0).
 Separately, `subsets_are_exact_copies_of_the_sealed_source_cases` passed,
 confirming that the certification self-check subsets retain the full fixtures'
 metadata and the exact selected case contents.
+
+## Generating references
+
+Run from the repository root. Stage the generated parity fixture JSON files
+before comparing or re-sealing them; each run writes a model fixture under
+`fixtures/<model>/` and its digest entry in `fixtures/index.json` under the
+staging root. For example, to reproduce all four models twice:
+
+```sh
+first=$(mktemp -d)
+second=$(mktemp -d)
+for output in "$first" "$second"; do
+  for model in gte-modernbert-base gte-reranker-modernbert-base \
+    qwen3-embedding-0.6b qwen3-reranker-0.6b; do
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+      uv run --no-project --python 3.12 \
+      --with transformers==5.16.1 --with torch==2.14.0 \
+      python bench/parity/reference/generate_reference.py \
+      --hf-cache ~/.cache/huggingface/hub --model "$model" --output-dir "$output"
+  done
+done
+diff -r "$first/fixtures" "$second/fixtures"
+```
+
+To stage `crates/synapse-module/src/catalog/models.json` (inputs and reference
+outputs used to check newly loaded catalog lanes) and
+`crates/synapse-module/src/fixtures/catalog_rerank_gte_modernbert_fp32.json`
+(query/candidate scores used to verify the reranker before release):
+
+```sh
+output=$(mktemp -d)
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  uv run --no-project --python 3.12 \
+  --with transformers==5.16.1 --with torch==2.14.0 \
+  python bench/parity/reference/generate_reference.py \
+  --hf-cache ~/.cache/huggingface/hub --catalog --output-dir "$output"
+```
+
+The catalog mode reads its input texts and query/candidate groups from the
+committed catalog and evidence JSON, preserves their order and unrelated
+metadata, and writes those same relative paths under the output root. Omit
+`--output-dir` only when ready to overwrite the committed outputs. Catalog mode
+does not add a self-check to entries that have none, including Qwen3 reranker.
+
+Catalog embedding references use the same CPU backend as parity, without
+padding. Qwen3 catalog inputs include the terminal EOS required by the
+catalog's owned tokenizer policy; parity cases retain their existing token
+IDs. GTE reranker catalog scores use a double-precision sigmoid of the fp32
+classifier logit: each stored score equals `1 / (1 + exp(-raw_logit))`.
+
+## Catalog consolidation comparison (2026-10-06)
+
+The measurements below compare the previously committed catalog self-check
+outputs (produced by the libraries in the second column) with the unified
+generator's deterministic Transformers 5.16.1 / Torch 2.14.0 CPU fp32 outputs.
+
+| Model | Previous reference generator libraries | Maximum absolute difference | Minimum cosine |
+| --- | --- | ---: | ---: |
+| gte-modernbert-base | Transformers 5.17.0 / Torch 2.14.0 | 0 | 1.0 |
+| gte-reranker-modernbert-base | Transformers 5.17.0 / Torch 2.14.0 | 0 | 1.0 |
+| qwen3-embedding-0.6b | Candle Transformers 0.10.2 CPU f32 | 7.262907800661966e-7 | 0.9999999999901454 |
+
+Cosine was measured per embedding vector and per reranker query's score row.
+The GTE reranker release evidence's raw logits and scores were unchanged
+(maximum absolute difference: 0 for each). Qwen3 reranker has no catalog
+self-check and therefore no catalog comparison. The three catalog self-checks
+listed in the table use fixture revision 2 so installed lanes re-check against
+the new provenance and references. Catalog manifest digests depend only on upstream and file
+pins, not self-check data, and remain unchanged.

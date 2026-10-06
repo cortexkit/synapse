@@ -611,7 +611,9 @@ mod tests {
 
     #[test]
     fn a_record_for_another_fixture_revision_or_dtype_fails() {
-        let revision = failures_after(GTE, |record| record["fixture_revision"] = json!(2));
+        let revision = failures_after(GTE, |record| {
+            record["fixture_revision"] = json!(record["fixture_revision"].as_i64().unwrap() + 1)
+        });
         assert_single_key_mismatch(&revision, "fixture_revision");
         let dtype = failures_after(GTE, |record| record["dtype"] = json!("f32"));
         assert_single_key_mismatch(&dtype, "dtype");
@@ -757,7 +759,11 @@ mod tests {
         assert!(corpus["reference_tool"]
             .as_str()
             .unwrap()
-            .contains("transformers 5.17.0"));
+            .contains("transformers 5.16.1"));
+        assert!(corpus["reference_tool"]
+            .as_str()
+            .unwrap()
+            .contains("bench/parity/reference/generate_reference.py --catalog"));
         let mut pairs = 0;
         for item in corpus["items"].as_array().unwrap() {
             let candidates = item["candidates"].as_array().unwrap();
