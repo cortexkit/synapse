@@ -5661,7 +5661,7 @@ pub mod ane_residency {
                     .to_string_lossy()
                     .into_owned(),
                 artifact_digest: digest.to_owned(),
-                format: "safetensors".into(),
+                format: "safetensors-package".into(),
                 runtime_config: [
                     ("profile".into(), profile),
                     ("operation".into(), operation.into()),
@@ -6894,7 +6894,7 @@ pub mod ane_residency {
                 req_id: "initial-load".into(),
                 artifact_path: "pinned.safetensors".into(),
                 artifact_digest: "sha256:pinned".into(),
-                format: "safetensors".into(),
+                format: "safetensors-package".into(),
                 runtime_config: BTreeMap::from([(
                     "profile".into(),
                     "pinned-worker-profile".into(),
@@ -7177,7 +7177,7 @@ pub mod ane_residency {
                 req_id: channel.next_req_id("load"),
                 artifact_path: "mock.safetensors".into(),
                 artifact_digest: "sha256:test".into(),
-                format: "safetensors".into(),
+                format: "safetensors-package".into(),
                 runtime_config: BTreeMap::from([
                     (
                         "profile".into(),
@@ -7930,7 +7930,7 @@ pub mod ane_residency {
                 req_id: "load".into(),
                 artifact_path: "pinned.safetensors".into(),
                 artifact_digest: "sha256:pinned".into(),
-                format: "safetensors".into(),
+                format: "safetensors-package".into(),
                 runtime_config: BTreeMap::from([(
                     "profile".into(),
                     "pinned-worker-profile".into(),

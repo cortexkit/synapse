@@ -187,7 +187,12 @@ fn request_loop<S: Read + Write>(
                     runtime_config,
                 } => {
                     probe()?;
-                    anyhow::ensure!(format == "safetensors", "artifact_invalid");
+                    // The module names a converted profile package
+                    // "safetensors-package" for every owned engine.
+                    anyhow::ensure!(
+                        format == "safetensors-package",
+                        "artifact_invalid: expected format safetensors-package, got {format}"
+                    );
                     let id = runtime_config.get("profile").context("model_unsupported")?;
                     let operation = runtime_config
                         .get("operation")
@@ -450,7 +455,7 @@ mod tests {
                 req_id: "load".into(),
                 artifact_path: "absent".into(),
                 artifact_digest: "missing".into(),
-                format: "safetensors".into(),
+                format: "safetensors-package".into(),
                 runtime_config: BTreeMap::new(),
             },
             DEFAULT_MAX_FRAME_BYTES,

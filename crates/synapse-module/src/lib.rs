@@ -3475,8 +3475,10 @@ fn default_artifact_format(engine_name: &str) -> String {
     match engine_name {
         LLAMA_ENGINE => "gguf".to_string(),
         "ane" => "mlmodelc".to_string(),
-        "owned-metal" => "safetensors-package".to_string(),
-        "owned-cuda" => "safetensors-package".to_string(),
+        // Every owned engine loads a converted safetensors profile package.
+        "owned-metal" | "owned-cuda" | "owned-vulkan" | synapse_core::ANE_DIRECT_WORKER_ENGINE => {
+            "safetensors-package".to_string()
+        }
         "owned-metal-decode" => "owned-safetensors".to_string(),
         _ => "onnx".to_string(),
     }
@@ -17069,6 +17071,26 @@ mod tests {
         first.enable_observations();
         assert_eq!(second.observations(), Some((vec![], 0)));
         assert_eq!(certify_worker_snapshot(&runtime)["admitted_count"], 0);
+    }
+
+    /// Every owned engine's worker loads a converted safetensors profile
+    /// package. A missing arm falls through to the legacy "onnx" default,
+    /// which the direct-ANE worker refuses outright and which would make a
+    /// downloaded package fail the ONNX header check.
+    #[test]
+    fn owned_engines_default_to_the_safetensors_package_format() {
+        for engine in [
+            "owned-metal",
+            "owned-cuda",
+            "owned-vulkan",
+            synapse_core::ANE_DIRECT_WORKER_ENGINE,
+        ] {
+            assert_eq!(
+                default_artifact_format(engine),
+                "safetensors-package",
+                "{engine}"
+            );
+        }
     }
 
     #[test]
