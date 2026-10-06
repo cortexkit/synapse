@@ -137,3 +137,43 @@ self-check and therefore no catalog comparison. The three catalog self-checks
 listed in the table use fixture revision 2 so installed lanes re-check against
 the new provenance and references. Catalog manifest digests depend only on upstream and file
 pins, not self-check data, and remain unchanged.
+
+## Verification (2026-10-06)
+
+The final generator was run again through its CLI for all four parity models
+and catalog mode. All seven generated files (four parity fixtures, their
+index, catalog JSON, and reranker evidence JSON) were byte-identical to the
+new committed outputs. This also verifies that adding catalog mode did not
+change the deterministic parity outputs.
+
+Toolchain: Python 3.12.12, uv 0.12.2, rustc 1.99.0
+(`b940084d7`, 2026-09-28), cargo 1.99.0, rustfmt 1.10.0-stable,
+clippy 0.1.99. Rust checks ran sequentially, not as parallel workspace builds.
+
+| Command | Result |
+| --- | --- |
+| `cargo test --locked -p synapse-module --lib catalog` | Passed: 92 tests; 1 ignored release hardware-evidence test |
+| `cargo test --locked -p synapse-module --test catalog_fingerprints` | Passed: 1 test |
+| `cargo test --locked --manifest-path bench/parity/Cargo.toml` | Passed: 55 tests; 1 ignored cached-checkpoint test |
+| `cargo test --locked -p synapse-certify` | Passed: 22 tests; 1 ignored live hardware test |
+| `cargo test --locked -p synapse-worker-ane-direct` | Passed: 12 tests; 12 ignored hardware tests |
+| `uv run --no-project --python 3.12 --with transformers==5.16.1 --with torch==2.14.0 python -m unittest discover -s bench/parity/reference -v` | Passed: 13 tests |
+| `cargo fmt --all -- --check` | Passed (exit 0) |
+| `cargo clippy --locked -p synapse-module -p synapse-certify --all-targets -- -D warnings` | Passed; both packages and all targets checked |
+
+The first catalog test run caught the old fixture-revision and library-version
+assertions, and a negative test whose hardcoded revision 2 became valid.
+The assertions now pin the authorized revision/version; the negative test
+increments the current revision to keep testing stale-evidence rejection.
+No rejection contract was removed or inverted.
+
+Changing the generator's actual inter-op thread setter from 1 to 2 caused
+only `test_torch_configuration_precedes_loading_and_all_models_use_eager`
+to fail; all 12 other Python tests stayed green. Restoring the live code
+returned the suite to 13 passing tests.
+
+The scoped Rust diagnostics were clean. Python diagnostics outside the uv
+environment could not resolve Torch/Transformers; the pinned uv environment
+ran the full generator and tests successfully. Cargo reported unavailable
+Metal developer tools and the pre-existing `block 0.1.6` future-compatibility
+warning; no hardware evidence was claimed. Neither Cargo lockfile changed.
