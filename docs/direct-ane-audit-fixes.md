@@ -25,3 +25,16 @@ test result: FAILED. 0 passed; 1 failed
 ```
 
 The control replaced only the qualified serving recovery wrapper with the former unqualified call. Its diff was one file, two insertions and one deletion; restoration returned an empty unstaged diff before verification. Both named tests pass after restoration. The complete mock residency suite passed: 38 tests, no failures.
+
+## Detached task scheduling ownership
+
+`cancelled_direct_ane_keeps_module_permit_and_inflight_until_reply_drains` failed at the module execution boundary:
+
+```text
+assertion `left == right` failed: cancelled caller must not release an executing ANE task's permit
+  left: 1
+ right: 0
+test result: FAILED. 0 passed; 1 failed
+```
+
+Both embedding and composed rerank now transfer the execution permit, catalog lane guard, and activity guard into the detached inference task. The same module-boundary test passes for both operations: while the reply is gated, the sole execution permit remains held and in-flight accounting stays at one; after draining, both return to idle.

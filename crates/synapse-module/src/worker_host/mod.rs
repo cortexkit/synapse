@@ -5128,11 +5128,20 @@ pub mod ane_residency {
             sequences: Vec<Vec<u32>>,
             rerank: bool,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            self.infer_guarded(sequences, rerank, ()).await
+        }
+
+        pub async fn infer_guarded<G: Send + 'static>(
+            &self,
+            sequences: Vec<Vec<u32>>,
+            rerank: bool,
+            guards: G,
+        ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             let serving = self.serving.clone();
             self.runtime
                 .as_ref()
                 .expect("live ANE runtime")
-                .spawn(async move { serving.infer(sequences, rerank).await })
+                .spawn(async move { serving.infer_guarded(sequences, rerank, guards).await })
                 .await
                 .map_err(|error| AneResidencyError::Channel(error.to_string()))?
         }
@@ -5220,6 +5229,16 @@ pub mod ane_residency {
             sequences: Vec<Vec<u32>>,
             rerank: bool,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            self.infer_guarded(sequences, rerank, ()).await
+        }
+
+        /// The detached task retains module scheduling guards until I/O and recovery finish.
+        pub async fn infer_guarded<G: Send + 'static>(
+            self: &Arc<Self>,
+            sequences: Vec<Vec<u32>>,
+            rerank: bool,
+            guards: G,
+        ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             if self.channel.retired.load(Ordering::Acquire) {
                 return Err(AneResidencyError::Channel("worker is retired".into()));
             }
@@ -5238,6 +5257,7 @@ pub mod ane_residency {
             }
             let serving = self.clone();
             tokio::spawn(async move {
+                let _guards = guards;
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
@@ -6273,6 +6293,9 @@ pub mod ane_residency {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) use tests::module_mock_engine;
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -6387,7 +6410,10 @@ pub mod ane_residency {
         /// One mock direct-ANE worker process: compiles shapes on admit,
         /// refuses inference on a shape it has not admitted, and loses every
         /// shape when its connection closes.
-        async fn serve_mock(mut stream: DuplexStream, ledger: SharedLedger) {
+        async fn serve_mock<S: AsyncRead + AsyncWrite + Unpin>(
+            mut stream: S,
+            ledger: SharedLedger,
+        ) {
             let max = DEFAULT_MAX_FRAME_BYTES;
             let mut own: HashSet<(String, usize)> = HashSet::new();
             while let Ok(request) = read_json::<WorkerRequest, _>(&mut stream, max).await {
@@ -6898,6 +6924,66 @@ pub mod ane_residency {
                 waits[1].elapsed_ms >= 20.0,
                 "measure the actual admission future, including its wait deadline"
             );
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn module_mock_engine(
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        ) -> Arc<DirectAneEngine> {
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().inference_gate = Some((started, release));
+            let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
+                let ledger = ledger.clone();
+                Box::pin(async move {
+                    let (stream, server) = tokio::net::UnixStream::pair().unwrap();
+                    let task = tokio::spawn(serve_mock(server, ledger));
+                    Ok(AneWorkerSession {
+                        stream,
+                        confirm_exit: Box::pin(async move {
+                            task.await
+                                .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
+                            Ok(())
+                        }),
+                    })
+                })
+            });
+            let channel = Arc::new(
+                runtime
+                    .block_on(AneWorkerChannel::connect(
+                        "module-mock",
+                        synapse_core::DEFAULT_MAX_FRAME_BYTES,
+                        connector,
+                    ))
+                    .unwrap(),
+            );
+            let serving = Arc::new(
+                AneServing::new(
+                    channel,
+                    AneResidencySupervisor::new(Default::default()),
+                    AneServingMetadata {
+                        model_ref: "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:test"
+                            .into(),
+                        dims: 1,
+                        buckets: ANE_SHAPE_LADDER.to_vec(),
+                        pooling: synapse_core::WorkerPooling::Mean,
+                        normalize: true,
+                        timeout: Duration::from_secs(1),
+                    },
+                )
+                .unwrap(),
+            );
+            Arc::new(DirectAneEngine {
+                serving,
+                runtime: Some(runtime),
+            })
         }
 
         async fn serving_fixture(ledger: &SharedLedger) -> Arc<AneServing<DuplexStream>> {

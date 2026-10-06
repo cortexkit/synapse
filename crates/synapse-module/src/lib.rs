@@ -12195,16 +12195,11 @@ async fn execute_embedding(
         }
         #[cfg(unix)]
         EmbedBackend::DirectAne(engine) => {
-            let _permit = permit;
-            let _catalog_guard = catalog_guard;
             if let Some(id) = fault_lane.as_deref() {
                 catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
             }
             let values = engine
-                .infer(
-                    batch.items.into_iter().map(|item| item.to_vec()).collect(),
-                    false,
-                )
+                .infer_guarded(batch.items, false, (permit, catalog_guard, _activity))
                 .await
                 .map_err(ane_residency_error_to_wire)?;
             Ok(values)
@@ -12306,8 +12301,6 @@ async fn execute_rerank(
     let result = match &model.backend {
         #[cfg(unix)]
         EmbedBackend::DirectAne(engine) => {
-            let _permit = permit;
-            let _catalog_guard = catalog_guard;
             if let Some(id) = fault_lane.as_deref() {
                 catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
             }
@@ -12315,7 +12308,7 @@ async fn execute_rerank(
                 artifact_invalid_error("direct-ANE rerank requires composed pairs")
             })?;
             let values = engine
-                .infer(pairs, true)
+                .infer_guarded(pairs, true, (permit, catalog_guard, _activity))
                 .await
                 .map_err(ane_residency_error_to_wire)?;
             Ok(synapse_core::RerankScores {
@@ -16862,6 +16855,86 @@ mod tests {
         super::attach_certify_observation(&mut response, None);
         assert_eq!(serde_json::to_vec(&response).unwrap(), before);
         assert!(!super::ModuleConfig::default().certify_observation);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelled_direct_ane_keeps_module_permit_and_inflight_until_reply_drains() {
+        for rerank in [false, true] {
+            let (root, _) = test_storage_descriptor("ane-owned-guards");
+            let spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+            let mut model = catalog_test_model(&root, &spec);
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let engine = tokio::task::spawn_blocking({
+                let started = started.clone();
+                let release = release.clone();
+                move || worker_host::ane_residency::module_mock_engine(started, release)
+            })
+            .await
+            .unwrap();
+            Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+            let mut runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
+            runtime.execution = Arc::new(Semaphore::new(1));
+            let runtime = Arc::new(runtime);
+            let task = tokio::spawn({
+                let model = model.clone();
+                let runtime = runtime.clone();
+                async move {
+                    if rerank {
+                        execute_rerank(
+                            &runtime,
+                            &model,
+                            RerankRequest::default(),
+                            Some(vec![vec![1]]),
+                            None,
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        execute_embedding(
+                            &runtime,
+                            &model,
+                            TokenBatch {
+                                items: vec![vec![1]],
+                            },
+                            None,
+                            None,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let available = runtime.execution.available_permits();
+            let in_flight = runtime.execution_stats.lock().unwrap().in_flight;
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while runtime.execution.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                available, 0,
+                "cancelled caller must not release an executing ANE task's permit"
+            );
+            assert_eq!(in_flight, 1);
+            assert_eq!(runtime.execution_stats.lock().unwrap().in_flight, 0);
+            tokio::task::spawn_blocking(move || engine.unload())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(model);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
