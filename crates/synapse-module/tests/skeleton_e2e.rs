@@ -3073,8 +3073,10 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
 fn deterministic_source_dir(label: &str) -> PathBuf {
     let root = unique_temp_dir(label);
     std::fs::create_dir_all(&root).unwrap();
-    // A 2 MiB file takes multiple delayed copy chunks, letting the restart
-    // test kill the module while model.load is still downloading.
+    // model.load copies the file in chunks, and the test-only
+    // SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS pauses between chunks. 2 MiB spans
+    // several chunks, so model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds
+    // can kill the module while the copy is still in progress.
     let mut artifact = vec![42_u8; 2 * 1024 * 1024];
     artifact[..8].copy_from_slice(b"SYNTEST1");
     std::fs::write(root.join("model.safetensors"), artifact).unwrap();

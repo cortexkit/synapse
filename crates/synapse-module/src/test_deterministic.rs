@@ -43,7 +43,11 @@ impl EmbedEngine for TestDeterministic {
         })
     }
     fn embed_batch(&self, _: &LoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
-        // Keep execution observable to admission tests without depending on GPU speed.
+        // A real engine takes measurable time per batch, and the admission tests
+        // assert on requests that are queued or still running (waiter counts,
+        // concurrent bursts). An instant engine would finish before they could
+        // observe anything, so each batch sleeps briefly; a test can lengthen
+        // the sleep with SYNAPSE_TEST_DETERMINISTIC_DELAY_MS.
         let delay = std::env::var("SYNAPSE_TEST_DETERMINISTIC_DELAY_MS")
             .ok()
             .and_then(|value| value.parse().ok())
