@@ -3140,6 +3140,7 @@ async fn certify_preloaded_models(
     run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
 }
 
+#[cfg(target_os = "macos")]
 async fn poll_probe_status(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
