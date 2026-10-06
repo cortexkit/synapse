@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(target_os = "macos")]
 use common::read_frame_timeout;
 use common::{
     configure_test_module_command, connect_consumer, install_test_tracing, raw_route_frame,
@@ -26,12 +25,9 @@ use serde_json::Value;
 use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
-#[cfg(target_os = "macos")]
 use subc_protocol::Frame;
 use subc_protocol::FrameType;
-#[cfg(target_os = "macos")]
 use subc_protocol::{Flags, Priority};
-#[cfg(target_os = "macos")]
 use subc_transport::write_frame;
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -1107,14 +1103,9 @@ async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM embed.query e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 40).await;
 
@@ -1124,7 +1115,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         4,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm", "id": "q1", "text": "hello world" }
+            "params": { "model": "test-minilm", "id": "q1", "text": "hello world" }
         }),
     )
     .await;
@@ -1134,7 +1125,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         5,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm", "id": "q2", "text": "hello world again" }
+            "params": { "model": "test-minilm", "id": "q2", "text": "hello world again" }
         }),
     )
     .await;
@@ -1155,21 +1146,32 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         result["truncation_disclosures"][0]["truncated"],
         Value::Bool(false)
     );
-    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
+    assert_eq!(
+        result["provenance"]["engine"]["engine"],
+        "test-deterministic"
+    );
+    let mut expected = vec![0.0_f32; 384];
+    // Golden nonzero bins for hello/world (token IDs 1 and 2) and the seed.
+    for bin in [0, 259, 200] {
+        expected[bin] = 1.0 / 3.0_f32.sqrt();
+    }
+    assert_vectors_close(
+        &result["vectors"][0]["vector"],
+        &serde_json::json!(expected),
+    );
+    assert_ne!(
+        result["vectors"][0]["vector"],
+        second["result"]["vectors"][0]["vector"]
+    );
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn probe_refuses_lane_without_matching_reference_fixture() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping missing-reference probe e2e: local HF safetensors snapshot is missing");
-        return;
-    };
+    let preloads = deterministic_preload_config();
     let mut models: Value = serde_json::from_str(&preloads).expect("preload config is json");
     models[0]["model_id"] = Value::String("unreferenced-embed-model".to_string());
     let config = serde_json::json!({ "preload_models": models }).to_string();
-    let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
 
     let body = poll_probe_job(
@@ -1889,14 +1891,9 @@ async fn owned_gte_inline_embed_batch_throughput_sweep() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM embed.batch e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 60).await;
     let items = (0..16)
@@ -1914,7 +1911,7 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
         6,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "model": "minilm", "items": items }
+            "params": { "model": "test-minilm", "items": items }
         }),
     )
     .await;
@@ -1927,19 +1924,18 @@ async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     );
     let vectors = result["vectors"].as_array().unwrap();
     assert_eq!(vectors.len(), 16);
+    for pair in vectors.windows(2) {
+        assert_ne!(pair[0]["vector"], pair[1]["vector"]);
+    }
     for (index, vector) in vectors.iter().enumerate() {
         assert_eq!(vector["id"], format!("item-{index:02}"));
         assert_eq!(vector["vector"].as_array().unwrap().len(), 384);
     }
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn over_budget_embed_batch_returns_job_and_pages_results() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM job-tier e2e: local HF safetensors snapshot is missing");
-        return;
-    };
+    let preloads = deterministic_preload_config();
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
     let config = serde_json::json!({
         "preload_models": preload_models,
@@ -1953,7 +1949,6 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         }
     })
     .to_string();
-    let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     certify_preloaded_models(&mut consumer, route, 80).await;
     let texts = [
@@ -1970,7 +1965,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
             100 + index as u64,
             serde_json::json!({
                 "method": "embed.query",
-                "params": { "model": "minilm", "id": format!("item-{index}"), "text": text }
+                "params": { "model": "test-minilm", "id": format!("item-{index}"), "text": text }
             }),
         )
         .await;
@@ -1993,7 +1988,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         200,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "model": "minilm", "request_key": "job-tier-e2e", "items": items }
+            "params": { "model": "test-minilm", "request_key": "job-tier-e2e", "items": items }
         }),
     )
     .await;
@@ -2014,7 +2009,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         serde_json::json!({
             "method": "embed.batch",
             "params": {
-                "model": "minilm",
+                "model": "test-minilm",
                 "request_key": "job-tier-e2e",
                 "items": texts.iter().enumerate().map(|(index, text)| serde_json::json!({
                     "id": format!("item-{index}"),
@@ -2033,7 +2028,7 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         serde_json::json!({
             "method": "embed.batch",
             "params": {
-                "model": "minilm",
+                "model": "test-minilm",
                 "request_key": "job-tier-e2e",
                 "items": [
                     { "id": "item-0", "text": "different request content" },
@@ -2089,14 +2084,9 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM over-ceiling e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 40).await;
 
@@ -2109,7 +2099,7 @@ async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
         10,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm", "id": "over-cap-query", "text": &submitted_text }
+            "params": { "model": "test-minilm", "id": "over-cap-query", "text": &submitted_text }
         }),
     )
     .await;
@@ -2130,14 +2120,9 @@ async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
     assert!(is_truncated);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_row_under_ceiling_reports_equal_hashes() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM under-ceiling e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 40).await;
 
@@ -2150,7 +2135,7 @@ async fn embed_query_row_under_ceiling_reports_equal_hashes() {
         11,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm", "id": "under-cap-query", "text": submitted_text }
+            "params": { "model": "test-minilm", "id": "under-cap-query", "text": submitted_text }
         }),
     )
     .await;
@@ -2171,14 +2156,9 @@ async fn embed_query_row_under_ceiling_reports_equal_hashes() {
     assert!(!is_truncated);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM mixed-batch e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 40).await;
 
@@ -2198,7 +2178,7 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
         12,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "model": "minilm", "items": items }
+            "params": { "model": "test-minilm", "items": items }
         }),
     )
     .await;
@@ -2236,15 +2216,9 @@ async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
     assert_eq!(result["truncation_disclosures"][2]["truncated"], false);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn job_tier_paged_results_replays_truncated_row_from_storage() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!(
-            "skipping MiniLM job-tier truncation e2e: local HF safetensors snapshot is missing"
-        );
-        return;
-    };
+    let preloads = deterministic_preload_config();
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
     let config = serde_json::json!({
         "preload_models": preload_models,
@@ -2258,7 +2232,6 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
         }
     })
     .to_string();
-    let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     certify_preloaded_models(&mut consumer, route, 80).await;
 
@@ -2276,7 +2249,7 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
         500,
         serde_json::json!({
             "method": "embed.batch",
-            "params": { "model": "minilm", "request_key": "job-truncation-e2e", "items": items }
+            "params": { "model": "test-minilm", "request_key": "job-truncation-e2e", "items": items }
         }),
     )
     .await;
@@ -2338,13 +2311,9 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     assert_eq!(disclosures[1]["truncated"], false);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn admission_status_reports_execution_waiters_during_concurrent_batches() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping execution admission e2e: local HF safetensors snapshot is missing");
-        return;
-    };
+    let preloads = deterministic_preload_config();
     let preload_models: Value = serde_json::from_str(&preloads).expect("preload config is json");
     let config = serde_json::json!({
         "preload_models": preload_models,
@@ -2355,8 +2324,15 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
         }
     })
     .to_string();
-    let _lock = acquire_minilm_e2e_lock();
-    let (daemon, _module, mut first_consumer, first_route) = open_route_with_config(&config).await;
+    let daemon = start_daemon().await;
+    let module = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
+        Some(&config),
+        &[("SYNAPSE_TEST_DETERMINISTIC_DELAY_MS", "100")],
+    );
+    let (daemon, _module, mut first_consumer, first_route) =
+        open_route_for_started_module(daemon, module).await;
     certify_preloaded_models(&mut first_consumer, first_route, 400).await;
 
     let mut second_consumer = connect_consumer(&daemon.connection_file_path).await;
@@ -2391,7 +2367,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
             401,
             serde_json::json!({
                 "method": "embed.batch",
-                "params": { "model": "minilm", "items": first_items }
+                "params": { "model": "test-minilm", "items": first_items }
             }),
         )
         .await
@@ -2404,7 +2380,7 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
             402,
             serde_json::json!({
                 "method": "embed.batch",
-                "params": { "model": "minilm", "items": second_items }
+                "params": { "model": "test-minilm", "items": second_items }
             }),
         )
         .await
@@ -2436,13 +2412,9 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
     let _ = second_task.await.unwrap();
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages() {
-    let Some(preloads) = minilm_alias_preload_config() else {
-        eprintln!("skipping MiniLM alias e2e: local HF safetensors snapshot is missing");
-        return;
-    };
+    let preloads = deterministic_alias_preload_config();
     let config = serde_json::json!({
         "preload_models": preloads,
         "inline": { "max_items": 1 },
@@ -2450,19 +2422,18 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
         "alias_admin_enabled": true
     })
     .to_string();
-    let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
     let probe = certify_preloaded_models(&mut consumer, route, 120).await;
     let lanes = probe["result"]["lanes"].as_array().expect("probe lanes");
     let fingerprint_a = lanes
         .iter()
-        .find(|lane| lane["model_id"] == "minilm-a")
+        .find(|lane| lane["model_id"] == "test-minilm-a")
         .and_then(|lane| lane["fingerprint"].as_str())
         .expect("minilm-a fingerprint")
         .to_string();
     let fingerprint_b = lanes
         .iter()
-        .find(|lane| lane["model_id"] == "minilm-b")
+        .find(|lane| lane["model_id"] == "test-minilm-b")
         .and_then(|lane| lane["fingerprint"].as_str())
         .expect("minilm-b fingerprint")
         .to_string();
@@ -2474,7 +2445,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
         500,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm-a", "text": "alias before retract" }
+            "params": { "model": "test-minilm-a", "text": "alias before retract" }
         }),
     )
     .await;
@@ -2502,7 +2473,7 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
         serde_json::json!({
             "method": "embed.batch",
             "params": {
-                "model": "minilm-a",
+                "model": "test-minilm-a",
                 "request_key": "alias-retroactive-e2e",
                 "items": [
                     {"id": "a", "text": "alias job page one"},
@@ -2579,21 +2550,16 @@ async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages()
         603,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm-a", "text": "alias after retract" }
+            "params": { "model": "test-minilm-a", "text": "alias after retract" }
         }),
     )
     .await;
     assert_eq!(after["result"]["equivalent_to"], Value::Array(Vec::new()));
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping probe.report e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
 
     let before = route_request(
@@ -2641,7 +2607,7 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     assert_eq!(result["current_knob"], "balanced");
     assert_eq!(result["knob_assignments"].as_array().unwrap().len(), 3);
     assert_eq!(result["active_assignments"].as_array().unwrap().len(), 1);
-    assert_eq!(result["active_assignments"][0]["model_id"], "minilm");
+    assert_eq!(result["active_assignments"][0]["model_id"], "test-minilm");
     assert_eq!(result["lanes"][0]["blocking_reason"], Value::Null);
     assert_eq!(result["lanes"][0]["certification_required"], true);
     assert_eq!(result["lanes"][0]["certification_status"], "certified");
@@ -2651,15 +2617,10 @@ async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments
     assert_eq!(result["lanes"][0]["performance"]["stale"], false);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_default() {
-    let Some(preloads) = minilm_alias_preload_config() else {
-        eprintln!("skipping knob routing e2e: local HF safetensors snapshot is missing");
-        return;
-    };
+    let preloads = deterministic_alias_preload_config();
     let config = module_config_with_preloads(preloads.clone(), "balanced");
-    let _lock = acquire_minilm_e2e_lock();
     let (daemon, mut module, mut consumer, route) = open_route_with_config(&config).await;
     certify_preloaded_models(&mut consumer, route, 120).await;
 
@@ -2752,14 +2713,9 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
     assert_eq!(explicit["result"]["fingerprint"], quiet_fingerprint);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping stale probe e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (daemon, mut module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 130).await;
 
@@ -2800,7 +2756,7 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
         true
     );
 
-    ensure_model_loaded_by_query(&mut consumer, route, 132, "minilm").await;
+    ensure_model_loaded_by_query(&mut consumer, route, 132, "test-minilm").await;
     let status = route_request(
         &mut consumer,
         route,
@@ -2814,14 +2770,9 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     assert_eq!(status["result"]["lanes"][0]["performance_stale"], true);
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM deadline e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 90).await;
 
@@ -2831,7 +2782,7 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
         7,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "minilm", "text": "deadline should reject", "deadline_ms": 1 }
+            "params": { "model": "test-minilm", "text": "deadline should reject", "deadline_ms": 1 }
         }),
     )
     .await;
@@ -2843,14 +2794,9 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
     assert_eq!(error["class"], "transient");
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
-    let Some(preloads) = minilm_preload_config() else {
-        eprintln!("skipping MiniLM burst e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 110).await;
     let start_corr = 10_000_u64;
@@ -2864,7 +2810,7 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
             start_corr + offset,
             serde_json::to_vec(&serde_json::json!({
                 "method": "embed.query",
-                "params": { "model": "minilm", "id": format!("burst-{offset}"), "text": format!("burst text {offset}") }
+                "params": { "model": "test-minilm", "id": format!("burst-{offset}"), "text": format!("burst text {offset}") }
             }))
             .unwrap(),
         )
@@ -2893,14 +2839,9 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
-    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-file") else {
-        eprintln!("skipping model.load file e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let source_dir = deterministic_source_dir("synapse-model-load-file");
     let (_daemon, _module, mut consumer, route) = open_route().await;
 
     let accepted = route_request(
@@ -2913,13 +2854,13 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
                 "source": "file",
                 "path": source_dir,
                 "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
-                "engine": "owned-metal",
-                "family": "minilm",
+                "engine": "test-deterministic",
+                "family": "test-minilm",
                 "dtype": "f32",
                 "execution": "explicit",
                 "pooling": "mean",
                 "task": "embed",
-                "model_id": "minilm-loaded",
+                "model_id": "test-minilm-loaded",
                 "pin": true,
                 "request_key": "model-load-file-e2e"
             }
@@ -2928,7 +2869,7 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     .await;
     let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
     let ready = poll_model_load_job(&mut consumer, route, 20_001, &job_id).await;
-    assert_eq!(ready["result"]["state"], "ready");
+    assert_eq!(ready["result"]["state"], "ready", "{ready}");
     let model_id = ready["result"]["model_id"].as_str().unwrap().to_string();
 
     let uncertified = route_request(
@@ -3006,16 +2947,9 @@ async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
     assert_eq!(second["result"]["dims"].as_u64(), Some(384));
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
-    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-digest-mismatch") else {
-        eprintln!(
-            "skipping model.load digest mismatch e2e: local HF safetensors snapshot is missing"
-        );
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let source_dir = deterministic_source_dir("synapse-model-load-digest-mismatch");
     let (_daemon, _module, mut consumer, route) = open_route().await;
 
     let accepted = route_request(
@@ -3029,8 +2963,8 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
                 "path": source_dir,
                 "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
                 "expected_digest": format!("sha256:{}", "0".repeat(64)),
-                "engine": "owned-metal",
-                "family": "minilm",
+                "engine": "test-deterministic",
+                "family": "test-minilm",
                 "dtype": "f32",
                 "execution": "explicit",
                 "pooling": "mean",
@@ -3047,14 +2981,9 @@ async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
     assert_eq!(failed["result"]["error"]["class"], "permanent");
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds() {
-    let Some(source_dir) = copied_minilm_source_dir("synapse-model-load-restart") else {
-        eprintln!("skipping model.load restart e2e: local HF safetensors snapshot is missing");
-        return;
-    };
-    let _lock = acquire_minilm_e2e_lock();
+    let source_dir = deterministic_source_dir("synapse-model-load-restart");
     let daemon = start_daemon().await;
     let module = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
@@ -3071,8 +3000,8 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
             "source": "file",
             "path": source_dir,
             "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
-            "engine": "owned-metal",
-                "family": "minilm",
+            "engine": "test-deterministic",
+                "family": "test-minilm",
                 "dtype": "f32",
                 "execution": "explicit",
             "pooling": "mean",
@@ -3138,10 +3067,71 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     let retried_job_id = retried["result"]["job_id"].as_str().unwrap().to_string();
     assert_ne!(retried_job_id, job_id);
     let ready = poll_model_load_job(&mut consumer, route, 22_201, &retried_job_id).await;
-    assert_eq!(ready["result"]["state"], "ready");
+    assert_eq!(ready["result"]["state"], "ready", "{ready}");
 }
 
-#[cfg(target_os = "macos")]
+fn deterministic_source_dir(label: &str) -> PathBuf {
+    let root = unique_temp_dir(label);
+    std::fs::create_dir_all(&root).unwrap();
+    // A 2 MiB file takes multiple delayed copy chunks, letting the restart
+    // test kill the module while model.load is still downloading.
+    let mut artifact = vec![42_u8; 2 * 1024 * 1024];
+    artifact[..8].copy_from_slice(b"SYNTEST1");
+    std::fs::write(root.join("model.safetensors"), artifact).unwrap();
+    let mut vocab: std::collections::HashMap<String, u32> = [
+        ("[UNK]".to_string(), 0),
+        ("hello".to_string(), 1),
+        ("world".to_string(), 2),
+        ("again".to_string(), 3),
+    ]
+    .into_iter()
+    .collect();
+    for index in 0..64 {
+        vocab.insert(index.to_string(), 9 + index);
+    }
+    for (index, word) in ["first", "second", "third", "alpha", "beta"]
+        .into_iter()
+        .enumerate()
+    {
+        vocab.insert(word.into(), 4 + index as u32);
+    }
+    let model = WordLevel::builder()
+        .vocab(vocab.into_iter().collect())
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(Whitespace));
+    tokenizer.save(root.join("tokenizer.json"), false).unwrap();
+    std::fs::write(root.join("config.json"), "{}").unwrap();
+    root
+}
+
+fn deterministic_preload_config() -> String {
+    deterministic_preload_config_with_max_tokens(512)
+}
+
+fn deterministic_preload_config_with_max_tokens(max_tokens: usize) -> String {
+    let root = deterministic_source_dir("synapse-deterministic-preload");
+    serde_json::json!([{
+        "model_id": "test-minilm", "engine": "test-deterministic", "task": "embed",
+        "model_path": root.join("model.safetensors"), "tokenizer_path": root.join("tokenizer.json"),
+        "format": "test-deterministic", "pooling": "mean", "normalize": true,
+        "max_tokens": max_tokens, "quant": "fp32"
+    }])
+    .to_string()
+}
+
+fn deterministic_alias_preload_config() -> Value {
+    let mut models: Value = serde_json::from_str(&deterministic_preload_config()).unwrap();
+    models[0]["model_id"] = serde_json::json!("test-minilm-a");
+    let mut second = models[0].clone();
+    second["model_id"] = serde_json::json!("test-minilm-b");
+    second["quant"] = serde_json::json!("fp32-alias");
+    models.as_array_mut().unwrap().push(second);
+    models
+}
+
 async fn certify_preloaded_models(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3150,7 +3140,6 @@ async fn certify_preloaded_models(
     run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
 }
 
-#[cfg(target_os = "macos")]
 async fn poll_probe_status(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3246,7 +3235,6 @@ async fn run_probe_job(
     body
 }
 
-#[cfg(target_os = "macos")]
 async fn poll_model_load_job(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3281,7 +3269,6 @@ async fn poll_model_load_job(
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn poll_model_ready(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3350,7 +3337,6 @@ async fn poll_embed_result(
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn ensure_model_loaded_by_query(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -3374,14 +3360,13 @@ async fn ensure_model_loaded_by_query(
     match body["result"]["error"]["code"].as_str() {
         Some("model_loading") => {
             let ready = poll_model_ready(consumer, route, start_corr + 1, model_id).await;
-            assert_eq!(ready["result"]["state"], "ready");
+            assert_eq!(ready["result"]["state"], "ready", "{ready}");
         }
         Some("not_certified" | "probe_required") | None => {}
         other => panic!("unexpected model load kick response {other:?}: {body:?}"),
     }
 }
 
-#[cfg(target_os = "macos")]
 fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     serde_json::json!({
         "preload_models": preloads,
@@ -3390,7 +3375,6 @@ fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     .to_string()
 }
 
-#[cfg(target_os = "macos")]
 fn overwrite_knob_assignment(
     store_path: &Path,
     machine_profile_hash: &str,
@@ -3461,7 +3445,6 @@ fn assert_vector_cosine_at_least(actual: &Value, expected: &Value, minimum: f64)
     );
 }
 
-#[cfg(target_os = "macos")]
 fn assert_vectors_close(actual: &Value, expected: &Value) {
     let actual = actual.as_array().expect("actual vector is an array");
     let expected = expected.as_array().expect("expected vector is an array");
@@ -3476,23 +3459,6 @@ fn assert_vectors_close(actual: &Value, expected: &Value) {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn copied_minilm_source_dir(label: &str) -> Option<PathBuf> {
-    let snapshot = minilm_safetensors_snapshot()?;
-    let model_path = snapshot.join("model.safetensors");
-    let tokenizer_path = snapshot.join("tokenizer.json");
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return None;
-    }
-    let source_dir = unique_temp_dir(label);
-    std::fs::create_dir_all(&source_dir).ok()?;
-    std::fs::copy(&model_path, source_dir.join("model.safetensors")).ok()?;
-    std::fs::copy(&tokenizer_path, source_dir.join("tokenizer.json")).ok()?;
-    std::fs::copy(snapshot.join("config.json"), source_dir.join("config.json")).ok()?;
-    Some(source_dir)
-}
-
-#[cfg(target_os = "macos")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
@@ -3567,44 +3533,6 @@ fn gte_reranker_safetensors_snapshot() -> Option<PathBuf> {
     let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
         .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots");
     first_snapshot_with(&snapshots, "model.safetensors")
-}
-
-#[cfg(target_os = "macos")]
-fn minilm_alias_preload_config() -> Option<Value> {
-    let snapshot = minilm_safetensors_snapshot()?;
-    let model_path = snapshot.join("model.safetensors");
-    let tokenizer_path = snapshot.join("tokenizer.json");
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return None;
-    }
-    Some(serde_json::json!([
-        {
-            "model_id": "minilm-a",
-            "engine": "owned-metal",
-                "family": "minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "pooling": "mean",
-            "normalize": true,
-            "max_tokens": 512,
-            "quant": "fp32"
-        },
-        {
-            "model_id": "minilm-b",
-            "engine": "owned-metal",
-                "family": "minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "pooling": "mean",
-            "normalize": true,
-            "max_tokens": 512,
-            "quant": "fp32-alias"
-        }
-    ]))
 }
 
 #[cfg(target_os = "macos")]
