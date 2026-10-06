@@ -1460,6 +1460,9 @@ struct ExecutionModelInfo {
     dtype: Option<String>,
 }
 
+#[cfg(feature = "test-support")]
+mod test_deterministic;
+
 impl EmbeddingModel {
     fn execution_info(&self) -> ExecutionModelInfo {
         match &self.backend {
@@ -1492,6 +1495,11 @@ impl EmbeddingModel {
                 dims: Some(engine.serving.metadata.dims),
                 buckets: Some(engine.serving.metadata.buckets.clone()),
                 dtype: None,
+            },
+            #[cfg(feature = "test-support")]
+            EmbedBackend::TestDeterministic(_) => ExecutionModelInfo {
+                dims: Some(test_deterministic::DIMS),
+                ..Default::default()
             },
             EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
         }
@@ -1589,6 +1597,8 @@ fn log_job_done(model_id: &str, job_id: &str, lane: &str, tokens: u64, started: 
 
 #[derive(Clone)]
 enum EmbedBackend {
+    #[cfg(feature = "test-support")]
+    TestDeterministic(Arc<test_deterministic::TestDeterministic>),
     #[cfg(unix)]
     DirectAne(Arc<worker_host::ane_residency::DirectAneEngine>),
     Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
@@ -2493,6 +2503,8 @@ async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
             EmbedBackend::Worker(engine) => Some((model.model_id.clone(), Arc::clone(engine))),
             #[cfg(unix)]
             EmbedBackend::DirectAne(_) => None,
+            #[cfg(feature = "test-support")]
+            EmbedBackend::TestDeterministic(_) => None,
             EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
         })
         .collect::<Vec<_>>();
@@ -3190,6 +3202,14 @@ fn build_stored_model_config(
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
+    #[cfg(feature = "test-support")]
+    if engine_name == test_deterministic::NAME
+        && !matches!(task, ModelTask::Embed | ModelTask::Rerank)
+    {
+        return Err(ModuleError::Config(
+            "test-deterministic supports embedding and rerank only".into(),
+        ));
+    }
     if engine_name == "owned-metal" && !matches!(task, ModelTask::Embed | ModelTask::Rerank) {
         return Err(ModuleError::Config(
             "owned-metal supports embedding and rerank models only in wave 1".to_string(),
@@ -3473,6 +3493,8 @@ fn canonical_engine_name(engine: &str) -> String {
 
 fn default_artifact_format(engine_name: &str) -> String {
     match engine_name {
+        #[cfg(feature = "test-support")]
+        test_deterministic::NAME => test_deterministic::NAME.into(),
         LLAMA_ENGINE => "gguf".to_string(),
         "ane" => "mlmodelc".to_string(),
         // Every owned engine loads a converted safetensors profile package.
@@ -3495,6 +3517,10 @@ fn default_quant(engine_name: &str) -> String {
 
 fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, ModuleError> {
     match engine_name {
+        #[cfg(feature = "test-support")]
+        test_deterministic::NAME => Ok(EmbedEngine::identity(
+            &test_deterministic::TestDeterministic,
+        )),
         LLAMA_ENGINE => Ok(worker_catalog_identity(
             LLAMA_WORKER_ENGINE,
             "protocol-v1",
@@ -6361,6 +6387,17 @@ fn load_catalog_model_blocking(
         format: spec.artifact_format.clone(),
     };
     let (backend, loaded_model, owned_tokenizer_policy) = match spec.engine.as_str() {
+        #[cfg(feature = "test-support")]
+        test_deterministic::NAME => {
+            let mut engine = test_deterministic::TestDeterministic;
+            let loaded = EmbedEngine::load(&mut engine, &artifact, &runtime_config)
+                .map_err(engine_error_to_wire)?;
+            (
+                EmbedBackend::TestDeterministic(Arc::new(engine)),
+                loaded,
+                None,
+            )
+        }
         "owned-cuda" => {
             if cfg!(target_os = "macos") {
                 return Err(artifact_invalid_error(format!(
@@ -6714,6 +6751,8 @@ fn materialize_ane_artifacts(
 
 fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
     match &model.backend {
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(_) => Ok(()),
         EmbedBackend::Owned(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -7862,6 +7901,8 @@ fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOper
         .read(&mut header)
         .map_err(|error| io_to_load_error("read downloaded artifact", path, &error))?;
     match expected_format.as_str() {
+        #[cfg(feature = "test-support")]
+        test_deterministic::NAME if read == 8 && &header == b"SYNTEST1" => Ok(()),
         "gguf" if read >= 4 && &header[..4] == b"GGUF" => Ok(()),
         "gguf" => Err(artifact_invalid_error(format!(
             "expected GGUF magic at {}",
@@ -12149,6 +12190,19 @@ async fn execute_embedding(
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(engine) => {
+            let engine = Arc::clone(engine);
+            let loaded = model.loaded_model.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let _catalog_guard = catalog_guard;
+                engine.embed_batch(&loaded, batch)
+            })
+            .await
+            .map_err(|error| artifact_invalid_error(error.to_string()))?
+            .map_err(engine_error_to_wire)
+        }
         EmbedBackend::Owned(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -12315,6 +12369,13 @@ async fn execute_rerank(
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(engine) => {
+            let _permit = permit;
+            let _catalog_guard = catalog_guard;
+            synapse_core::RerankEngine::rerank(&**engine, &model.loaded_model, request)
+                .map_err(engine_error_to_wire)
+        }
         #[cfg(unix)]
         EmbedBackend::DirectAne(engine) => {
             if let Some(id) = fault_lane.as_deref() {
@@ -12557,6 +12618,10 @@ async fn execute_generate(
         #[cfg(unix)]
         EmbedBackend::DirectAne(_) => Err(artifact_invalid_error(
             "direct-ANE does not support generation",
+        )),
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(_) => Err(artifact_invalid_error(
+            "test-deterministic does not generate",
         )),
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -13356,6 +13421,14 @@ async fn execute_embed_probe_for_model(
     fixtures: &[ProbeFixture],
 ) -> Result<ProbeModelResult, WireOperationError> {
     let reference_key = probe_reference_key(&model);
+    #[cfg(feature = "test-support")]
+    let test_fixtures = test_deterministic_probe_fixtures();
+    #[cfg(feature = "test-support")]
+    let fixtures = if model.engine_identity.engine == test_deterministic::NAME {
+        test_fixtures.as_slice()
+    } else {
+        fixtures
+    };
     let reference_candidates = fixtures
         .iter()
         .filter(|fixture| probe_fixture_matches_key(fixture, &reference_key))
@@ -13562,6 +13635,8 @@ async fn ane_placement_share_for_model(
         }
         #[cfg(unix)]
         EmbedBackend::DirectAne(_) => Ok(None),
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(_) => Ok(None),
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
     }
 }
@@ -14696,6 +14771,13 @@ fn probe_fixtures() -> Result<Vec<ProbeFixture>, WireOperationError> {
 }
 
 fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
+    #[cfg(feature = "test-support")]
+    if model.engine_identity.engine == test_deterministic::NAME {
+        return ProbeReferenceKey {
+            family: test_deterministic::NAME.into(),
+            model: model.model_id.clone(),
+        };
+    }
     let model_id = model.model_id.to_ascii_lowercase();
     let family = model
         .engine_identity
@@ -14727,6 +14809,37 @@ fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
         family,
         model: reference_model,
     }
+}
+
+#[cfg(feature = "test-support")]
+fn test_deterministic_probe_fixtures() -> Vec<ProbeFixture> {
+    // Fixed reference values for one and two unknown tokens (ID 0) from
+    // the fixture tokenizer, independent of the engine's inference implementation.
+    let mut one = vec![0.0_f32; test_deterministic::DIMS];
+    one[0] = std::f32::consts::FRAC_1_SQRT_2;
+    one[1] = std::f32::consts::FRAC_1_SQRT_2;
+    let mut two = vec![0.0_f32; test_deterministic::DIMS];
+    two[0] = 1.0 / 5.0_f32.sqrt();
+    two[1] = 2.0 / 5.0_f32.sqrt();
+    [
+        "test-minilm",
+        "test-minilm-a",
+        "test-minilm-b",
+        "test-minilm-loaded",
+    ]
+    .into_iter()
+    .map(|id| {
+        serde_json::from_value(json!({
+            "family": test_deterministic::NAME, "reference_model": id,
+            "dims": test_deterministic::DIMS,
+            "items": [
+                {"id": "one", "text": "probe", "vector": one},
+                {"id": "two", "text": "probe probe", "vector": two}
+            ]
+        }))
+        .expect("static deterministic probe fixture")
+    })
+    .collect()
 }
 
 fn probe_fixture_matches_key(fixture: &ProbeFixture, key: &ProbeReferenceKey) -> bool {
@@ -15753,6 +15866,8 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .and_then(|engine| engine.health_snapshot().ok()),
         #[cfg(unix)]
         EmbedBackend::DirectAne(_) => None,
+        #[cfg(feature = "test-support")]
+        EmbedBackend::TestDeterministic(_) => None,
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
     }
 }

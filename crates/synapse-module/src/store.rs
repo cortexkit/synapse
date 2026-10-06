@@ -6706,7 +6706,36 @@ pub const OWNED_EMBED_RERANK_ENGINES: &[&str] = &[
     synapse_core::ANE_DIRECT_WORKER_ENGINE,
     "owned-cuda",
     "owned-vulkan",
+    #[cfg(feature = "test-support")]
+    "test-deterministic",
 ];
+
+// Normal builds must never admit the inference double as a serving engine.
+#[cfg(not(feature = "test-support"))]
+const _: () = assert!(
+    !list_contains(OWNED_EMBED_RERANK_ENGINES, "test-deterministic"),
+    "production embed/rerank allow-list contains test-deterministic"
+);
+
+#[cfg(not(feature = "test-support"))]
+const fn list_contains(list: &[&str], needle: &str) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        let left = list[i].as_bytes();
+        let right = needle.as_bytes();
+        if left.len() == right.len() {
+            let mut j = 0;
+            while j < left.len() && left[j] == right[j] {
+                j += 1;
+            }
+            if j == left.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_download_non_terminal(state: &str) -> bool {
