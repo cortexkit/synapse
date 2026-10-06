@@ -2659,9 +2659,15 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
     let _ = module.child.wait().await;
     drop(consumer);
 
-    let restarted = spawn_synapse_module_with_config(
+    // An omitted model routes to the catalog default, which this test expects to
+    // report model_not_installed. A host with no runnable backend for that model
+    // reports backend_unavailable instead, which is right for a GPU-less CI
+    // runner but not what this test is about, so declare Metal runnable.
+    let restarted = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
-        &module_config_with_preloads(preloads, "quiet"),
+        None,
+        Some(&module_config_with_preloads(preloads, "quiet")),
+        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")],
     );
     let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, restarted).await;
