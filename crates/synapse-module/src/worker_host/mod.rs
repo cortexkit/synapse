@@ -4963,6 +4963,11 @@ pub mod ane_residency {
                     tokio::time::timeout(self.owner_exit_timeout,old.confirm_exit).await.map_err(|_|AneResidencyError::Channel("owner exit confirmation deadline exceeded; ownership remains closed".into()))??;
                     self.exit_unconfirmed.store(false, Ordering::Relaxed);
                 }
+                if self.retired.load(Ordering::Acquire) {
+                    return Err(AneResidencyError::Channel(
+                        "worker retired during owner exit confirmation".into(),
+                    ));
+                }
                 let mut fresh = tokio::time::timeout(self.shape_rpc_timeout, (self.connect)())
                     .await
                     .map_err(|_| {
@@ -6790,6 +6795,35 @@ pub mod ane_residency {
             for key in own {
                 ledger.resident.remove(&key);
             }
+        }
+
+        #[tokio::test]
+        async fn retirement_during_exit_confirmation_never_connects_replacement() {
+            let ledger = SharedLedger::default();
+            let exiting = Arc::new(Notify::new());
+            let allow_exit = Arc::new(Notify::new());
+            ledger.lock().unwrap().exit_gate = Some((exiting.clone(), allow_exit.clone()));
+            let channel = mock_channel("worker", &ledger).await;
+            let restart = tokio::spawn({
+                let channel = channel.clone();
+                async move { channel.restart().await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), exiting.notified())
+                .await
+                .unwrap();
+            channel.begin_retirement();
+            allow_exit.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(2), restart)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                ledger.lock().unwrap().connects["worker"],
+                1,
+                "retirement must stop a replacement after owner exit"
+            );
+            assert!(result.is_err());
+            channel.shutdown().await.unwrap();
         }
 
         #[tokio::test]

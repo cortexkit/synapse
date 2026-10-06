@@ -73,3 +73,26 @@ test result: FAILED. 0 passed; 1 failed
 ```
 
 `next_step` now checks retirement under the same state lock that grants leases and reserves admission slots, returning a terminal refusal instead of a grant. The barrier regression and existing queued-retirement test both pass; no slot or worker admission remains.
+
+## Retirement during restart exit confirmation
+
+`retirement_during_exit_confirmation_never_connects_replacement` gates the old owner's exit confirmation, starts retirement, then allows exit. The original restart connected a replacement despite retirement:
+
+```text
+assertion `left == right` failed: retirement must stop a replacement after owner exit
+  left: 2
+ right: 1
+test result: FAILED. 0 passed; 1 failed
+```
+
+Restart now rechecks retirement after confirmed exit and before invoking the connector. The regression passes: the connector count remains one, restart returns an error, and shutdown confirms the already exited owner without spawning another process.
+
+## Final verification
+
+After all six fixes, the required gates passed:
+
+- `cargo fmt --all -- --check` — rustfmt 1.10.0-stable.
+- `cargo clippy --locked -p synapse-module -p synapse-certify -p synapse-worker-ane-direct --all-targets -- -D warnings` — clippy 0.1.99.
+- `cargo test --locked -p synapse-module -p synapse-certify -p synapse-worker-ane-direct` — Cargo 1.99.0; 757 tests passed and 28 were ignored across the package and documentation targets. The module library ran 625 tests: 616 passed and nine hardware/evidence tests were ignored.
+
+The clippy and test commands used the environment prefix recorded at the top of this document. No existing assertion was weakened. Cargo.lock and the vendored ANE binding remain unchanged. These regression runs exercise mock transports and module dispatch, not live ANE hardware certification; the existing live-row refusal remains gated as documented in `direct-ane-serving.md`.
