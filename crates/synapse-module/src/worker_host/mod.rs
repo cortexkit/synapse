@@ -3641,6 +3641,7 @@ pub mod ane_residency {
     struct State {
         slots: BTreeMap<ShapeKey, Slot>,
         recovering: BTreeSet<String>,
+        retired: BTreeSet<String>,
         waiters: VecDeque<u64>,
         next_ticket: u64,
         next_slot: u64,
@@ -3837,6 +3838,55 @@ pub mod ane_residency {
             })
         }
 
+        /// Recover a transport-faulted owner after the inference task releases its lease.
+        pub async fn recover(&self, worker: &Arc<dyn AneShapeWorker>) -> bool {
+            recover_worker(&self.inner, worker).await
+        }
+
+        /// Stop new leases and retain reservations until the owner has confirmed exit.
+        pub async fn retire<F>(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            shutdown: F,
+        ) -> Result<(), AneResidencyError>
+        where
+            F: Future<Output = Result<(), AneResidencyError>>,
+        {
+            let id = worker.worker_id().to_owned();
+            {
+                let mut state = self.inner.lock();
+                state.retired.insert(id.clone());
+                state.recovering.insert(id.clone());
+            }
+            self.inner.changed.notify_waiters();
+            let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
+            loop {
+                let notified = self.inner.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let drained = self
+                    .inner
+                    .lock()
+                    .slots
+                    .values()
+                    .filter(|slot| slot.worker.worker_id() == id)
+                    .all(|slot| slot.leases == 0 && slot.state != SlotState::Admitting);
+                if drained {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break;
+                }
+            }
+            shutdown.await?;
+            let mut state = self.inner.lock();
+            state.slots.retain(|_, slot| slot.worker.worker_id() != id);
+            state.recovering.remove(&id);
+            drop(state);
+            self.inner.changed.notify_waiters();
+            Ok(())
+        }
+
         pub fn limits(&self) -> AneResidencyLimits {
             self.inner.limits
         }
@@ -3905,6 +3955,9 @@ pub mod ane_residency {
                 let notified = self.inner.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
+                if self.inner.lock().retired.contains(worker.worker_id()) {
+                    return Err(AneResidencyError::Channel("worker is retired".into()));
+                }
                 match self.next_step(ticket.id, &key, worker, executables) {
                     Step::Leased(lease) => return Ok(lease),
                     Step::Admit(slot_id) => return self.admit(worker.clone(), key, slot_id).await,
@@ -4347,7 +4400,13 @@ pub mod ane_residency {
     /// its hardware ownership cannot safely be made available to another worker.
     async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) -> bool {
         let id = worker.worker_id().to_owned();
-        let leader = inner.lock().recovering.insert(id.clone());
+        let leader = {
+            let mut state = inner.lock();
+            if state.retired.contains(&id) {
+                return false;
+            }
+            state.recovering.insert(id.clone())
+        };
         let deadline = tokio::time::Instant::now() + inner.wait_timeout;
         loop {
             let notified = inner.changed.notified();
@@ -4355,6 +4414,9 @@ pub mod ane_residency {
             notified.as_mut().enable();
             let drained = {
                 let state = inner.lock();
+                if state.retired.contains(&id) {
+                    return false;
+                }
                 if !state.recovering.contains(&id) {
                     return true;
                 }
@@ -4481,6 +4543,7 @@ pub mod ane_residency {
         loaded_models: Mutex<BTreeMap<String, WorkerRequest>>,
         faulted: std::sync::atomic::AtomicBool,
         exit_unconfirmed: std::sync::atomic::AtomicBool,
+        retired: std::sync::atomic::AtomicBool,
         request_counter: AtomicU64,
         stop_exchanges: Notify,
         generation: AtomicU64,
@@ -4506,6 +4569,7 @@ pub mod ane_residency {
                 loaded_models: Mutex::new(BTreeMap::new()),
                 faulted: std::sync::atomic::AtomicBool::new(false),
                 exit_unconfirmed: std::sync::atomic::AtomicBool::new(false),
+                retired: std::sync::atomic::AtomicBool::new(false),
                 request_counter: AtomicU64::new(0),
                 stop_exchanges: Notify::new(),
                 generation: AtomicU64::new(0),
@@ -4516,6 +4580,37 @@ pub mod ane_residency {
                 shape_rpc_timeout: std::time::Duration::from_secs(600),
                 owner_exit_timeout: std::time::Duration::from_secs(30),
             })
+        }
+
+        /// Prevent replacement spawning while retirement drains existing leases.
+        pub fn begin_retirement(&self) {
+            self.retired.store(true, Ordering::Release);
+        }
+
+        /// Permanently close this channel and confirm the process has exited.
+        pub async fn shutdown(&self) -> Result<(), AneResidencyError> {
+            self.begin_retirement();
+            self.faulted.store(true, Ordering::Relaxed);
+            self.stop_exchanges.notify_waiters();
+            let mut guard = self.stream.lock().await;
+            if self.exit_unconfirmed.load(Ordering::Relaxed) {
+                return Err(AneResidencyError::Channel(
+                    "owner exit remains unconfirmed".into(),
+                ));
+            }
+            if let Some(old) = guard.take() {
+                self.exit_unconfirmed.store(true, Ordering::Relaxed);
+                drop(old.stream);
+                tokio::time::timeout(self.owner_exit_timeout, old.confirm_exit)
+                    .await
+                    .map_err(|_| {
+                        AneResidencyError::Channel(
+                            "owner exit confirmation deadline exceeded".into(),
+                        )
+                    })??;
+                self.exit_unconfirmed.store(false, Ordering::Relaxed);
+            }
+            Ok(())
         }
 
         pub fn request_count(&self) -> u64 {
@@ -4745,6 +4840,9 @@ pub mod ane_residency {
                 self.faulted.store(true, Ordering::Relaxed);
                 self.stop_exchanges.notify_waiters();
                 let mut guard = self.stream.lock().await;
+                if self.retired.load(Ordering::Acquire) {
+                    return Err(AneResidencyError::Channel("worker is retired".into()));
+                }
                 if self.exit_unconfirmed.load(Ordering::Relaxed) {
                     return Err(AneResidencyError::Channel(
                         "old owner exit remains unconfirmed".into(),
@@ -4874,6 +4972,364 @@ pub mod ane_residency {
         /// The locked file, for [`super::WorkerHostConfig::inherited_lane_lock`].
         pub fn inheritable(&self) -> Arc<std::fs::File> {
             self.file.clone()
+        }
+    }
+
+    /// The production owner of one direct-ANE worker and its I/O runtime.
+    #[cfg(unix)]
+    pub struct DirectAneEngine {
+        pub serving: Arc<AneServing<tokio::net::UnixStream>>,
+        runtime: Option<Arc<tokio::runtime::Runtime>>,
+    }
+
+    #[cfg(unix)]
+    impl DirectAneEngine {
+        pub fn load(
+            mut config: super::WorkerHostConfig,
+            supervisor: AneResidencySupervisor,
+            artifact: &synapse_core::ValidatedArtifact,
+            runtime_config: &synapse_core::RuntimeConfig,
+        ) -> Result<Self, AneResidencyError> {
+            let artifact_path = runtime_config
+                .values
+                .get("artifact_path")
+                .cloned()
+                .ok_or_else(|| AneResidencyError::Channel("missing artifact path".into()))?;
+            config.worker_id = format!("{}-{}", config.worker_id, super::nonce_hex16());
+            config.inherited_lane_lock = supervisor.lane_lock().map(AneDirectLaneLock::inheritable);
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .map_err(AneResidencyError::Io)?,
+            );
+            let id = config.worker_id.clone();
+            let max_frame = config.max_frame;
+            let pooling = config.pooling;
+            let normalize = config.normalize;
+            let timeout = config.request_timeout;
+            let load_timeout = config.load_timeout;
+            let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
+                let config = config.clone();
+                Box::pin(async move {
+                    let mut host = super::WorkerHost::new(config);
+                    host.ping()
+                        .await
+                        .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+                    let super::WorkerConnection {
+                        stream, mut child, ..
+                    } = host.connection.take().ok_or_else(|| {
+                        AneResidencyError::Channel("spawned worker has no connection".into())
+                    })?;
+                    Ok(AneWorkerSession {
+                        stream,
+                        confirm_exit: Box::pin(async move {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                child.wait(),
+                            )
+                            .await
+                            {
+                                Ok(status) => {
+                                    status.map_err(AneResidencyError::Io)?;
+                                }
+                                Err(_) => {
+                                    child.start_kill().map_err(AneResidencyError::Io)?;
+                                    child.wait().await.map_err(AneResidencyError::Io)?;
+                                }
+                            }
+                            Ok(())
+                        }),
+                    })
+                })
+            });
+            let channel =
+                Arc::new(runtime.block_on(AneWorkerChannel::connect(id, max_frame, connector))?);
+            let request = WorkerRequest::Load {
+                req_id: channel.next_req_id("load"),
+                artifact_path,
+                artifact_digest: artifact.digest.clone(),
+                format: artifact.format.clone(),
+                runtime_config: runtime_config.values.clone(),
+            };
+            let loaded = runtime.block_on(async {
+                let (response, _) =
+                    tokio::time::timeout(load_timeout, channel.exchange(&request, None))
+                        .await
+                        .map_err(|_| {
+                            AneResidencyError::Channel("LOAD deadline exceeded".into())
+                        })??;
+                match response {
+                    WorkerResponse::Loaded {
+                        req_id,
+                        model_ref,
+                        dims,
+                        buckets: Some(buckets),
+                        ..
+                    } if request.req_id() == Some(req_id.as_str()) => AneServing::new(
+                        channel.clone(),
+                        supervisor.clone(),
+                        AneServingMetadata {
+                            model_ref,
+                            buckets,
+                            dims,
+                            pooling,
+                            normalize,
+                            timeout,
+                        },
+                    ),
+                    WorkerResponse::Err { code, msg, .. } => {
+                        Err(AneResidencyError::WorkerErr { code, msg })
+                    }
+                    other => Err(AneResidencyError::Channel(format!(
+                        "invalid LOAD response: {other:?}"
+                    ))),
+                }
+            });
+            match loaded {
+                Ok(serving) => Ok(Self {
+                    serving: Arc::new(serving),
+                    runtime: Some(runtime),
+                }),
+                Err(error) => {
+                    runtime.block_on(channel.shutdown())?;
+                    Err(error)
+                }
+            }
+        }
+
+        pub async fn infer(
+            &self,
+            sequences: Vec<Vec<u32>>,
+            rerank: bool,
+        ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            let serving = self.serving.clone();
+            self.runtime
+                .as_ref()
+                .expect("live ANE runtime")
+                .spawn(async move { serving.infer(sequences, rerank).await })
+                .await
+                .map_err(|error| AneResidencyError::Channel(error.to_string()))?
+        }
+
+        pub fn unload(&self) -> Result<(), AneResidencyError> {
+            self.runtime
+                .as_ref()
+                .expect("live ANE runtime")
+                .block_on(self.serving.retire())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DirectAneEngine {
+        fn drop(&mut self) {
+            let Some(runtime) = self.runtime.take() else {
+                return;
+            };
+            let serving = self.serving.clone();
+            let (done, wait) = std::sync::mpsc::sync_channel(1);
+            // Runtime teardown and child reaping cannot block a Tokio executor.
+            std::thread::spawn(move || {
+                serving.channel.begin_retirement();
+                if let Err(error) = runtime.block_on(serving.retire()) {
+                    tracing::error!(target: "worker", %error, "direct-ANE teardown could not confirm exit");
+                }
+                drop(serving);
+                drop(runtime);
+                let _ = done.send(());
+            });
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
+
+    /// Metadata returned by LOAD, with the request policy supplied by the module.
+    pub struct AneServingMetadata {
+        pub model_ref: String,
+        pub buckets: Vec<usize>,
+        pub dims: usize,
+        pub pooling: synapse_core::WorkerPooling,
+        pub normalize: bool,
+        pub timeout: std::time::Duration,
+    }
+
+    /// A serving connection whose inference tasks own their leases through the
+    /// entire response read, even when their callers abandon the result.
+    pub struct AneServing<S> {
+        pub channel: Arc<AneWorkerChannel<S>>,
+        pub supervisor: AneResidencySupervisor,
+        pub metadata: AneServingMetadata,
+    }
+
+    impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
+        pub fn new(
+            channel: Arc<AneWorkerChannel<S>>,
+            supervisor: AneResidencySupervisor,
+            metadata: AneServingMetadata,
+        ) -> Result<Self, AneResidencyError> {
+            if metadata.buckets.last() != Some(&8192)
+                || metadata.buckets.first().is_none_or(|n| *n == 0)
+                || metadata.buckets.windows(2).any(|pair| pair[0] >= pair[1])
+                || metadata.dims == 0
+            {
+                return Err(AneResidencyError::Channel(
+                    "LOAD returned invalid bucket or dimension metadata".into(),
+                ));
+            }
+            Ok(Self {
+                channel,
+                supervisor,
+                metadata,
+            })
+        }
+
+        pub async fn retire(&self) -> Result<(), AneResidencyError> {
+            self.channel.begin_retirement();
+            let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
+            self.supervisor
+                .retire(&worker, self.channel.shutdown())
+                .await
+        }
+
+        pub async fn infer(
+            self: &Arc<Self>,
+            sequences: Vec<Vec<u32>>,
+            rerank: bool,
+        ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            if self.channel.retired.load(Ordering::Acquire) {
+                return Err(AneResidencyError::Channel("worker is retired".into()));
+            }
+            // Validate the entire request before either admission or transport I/O.
+            if let Some(sequence) = sequences.iter().find(|sequence| sequence.len() > 8192) {
+                return Err(AneResidencyError::SequenceTooLong {
+                    n_tokens: sequence.len(),
+                    max: 8192,
+                });
+            }
+            if sequences.iter().any(Vec::is_empty) {
+                return Err(AneResidencyError::WorkerErr {
+                    code: "invalid_request".into(),
+                    msg: "empty token sequence".into(),
+                });
+            }
+            let serving = self.clone();
+            tokio::spawn(async move {
+                let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
+                let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+                let result = serving
+                    .supervisor
+                    .run_by_published_rung(
+                        &worker,
+                        &serving.metadata.model_ref,
+                        &lengths,
+                        &serving.metadata.buckets,
+                        |_, indices| {
+                            let serving = serving.clone();
+                            let selected: Vec<_> = indices
+                                .iter()
+                                .map(|&index| sequences[index].clone())
+                                .collect();
+                            async move { serving.exchange_sequences(selected, rerank).await }
+                        },
+                    )
+                    .await;
+                if matches!(&result, Err(AneResidencyError::Channel(_))) {
+                    serving.supervisor.recover(&worker).await;
+                }
+                result
+            })
+            .await
+            .map_err(|error| {
+                AneResidencyError::Channel(format!("inference task failed: {error}"))
+            })?
+        }
+
+        async fn exchange_sequences(
+            &self,
+            sequences: Vec<Vec<u32>>,
+            rerank: bool,
+        ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
+            use synapse_core::{
+                decode_f32_frame, encode_i32_frame, WorkerSequence, WorkerTokenItem,
+            };
+            let ids: Vec<i32> = sequences
+                .iter()
+                .flatten()
+                .map(|&id| {
+                    i32::try_from(id).map_err(|_| AneResidencyError::WorkerErr {
+                        code: "invalid_request".into(),
+                        msg: "token ID exceeds i32".into(),
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let req_id = self
+                .channel
+                .next_req_id(if rerank { "rerank" } else { "embed" });
+            let request = if rerank {
+                WorkerRequest::RerankSequences {
+                    req_id: req_id.clone(),
+                    model_ref: self.metadata.model_ref.clone(),
+                    sequences: sequences
+                        .iter()
+                        .map(|s| WorkerSequence { n_tokens: s.len() })
+                        .collect(),
+                }
+            } else {
+                WorkerRequest::EmbedBatch {
+                    req_id: req_id.clone(),
+                    model_ref: self.metadata.model_ref.clone(),
+                    pooling: self.metadata.pooling,
+                    normalize: self.metadata.normalize,
+                    items: sequences
+                        .iter()
+                        .enumerate()
+                        .map(|(index, s)| WorkerTokenItem {
+                            id: index.to_string(),
+                            n_tokens: s.len(),
+                        })
+                        .collect(),
+                }
+            };
+            let raw = encode_i32_frame(&ids);
+            let (response, raw) = tokio::time::timeout(
+                self.metadata.timeout,
+                self.channel.exchange(&request, Some(&raw)),
+            )
+            .await
+            .map_err(|_| {
+                AneResidencyError::Channel("inference exchange deadline exceeded".into())
+            })??;
+            let dims = if rerank { 1 } else { self.metadata.dims };
+            match response {
+                WorkerResponse::Vectors {
+                    req_id: got,
+                    n,
+                    dims: got_dims,
+                } if !rerank && got == req_id && n == sequences.len() && got_dims == dims => {}
+                WorkerResponse::Scores { req_id: got } if rerank && got == req_id => {}
+                WorkerResponse::Err {
+                    req_id: Some(got),
+                    code,
+                    msg,
+                } if got == req_id => return Err(AneResidencyError::WorkerErr { code, msg }),
+                other => {
+                    return Err(AneResidencyError::Channel(format!(
+                        "unexpected inference response: {other:?}"
+                    )))
+                }
+            }
+            let raw = raw
+                .ok_or_else(|| AneResidencyError::Channel("missing inference raw frame".into()))?;
+            let values = decode_f32_frame(&raw)
+                .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+            if values.len() != sequences.len().saturating_mul(dims)
+                || values.iter().any(|v| !v.is_finite())
+            {
+                return Err(AneResidencyError::Channel(
+                    "invalid inference output count or value".into(),
+                ));
+            }
+            Ok(values.chunks_exact(dims).map(<[f32]>::to_vec).collect())
         }
     }
 
@@ -5860,6 +6316,8 @@ pub mod ane_residency {
         #[derive(Default)]
         struct Ledger {
             loads: Vec<WorkerRequest>,
+            inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+            fail_inference: bool,
             evict_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             /// Requests currently running on (model_ref, shape); a request
             /// counts itself here only while it holds that shape's lease.
@@ -5912,20 +6370,41 @@ pub mod ane_residency {
                 } else {
                     None
                 };
+                if matches!(
+                    request,
+                    WorkerRequest::EmbedBatch { .. } | WorkerRequest::RerankSequences { .. }
+                ) {
+                    let gate = ledger.lock().unwrap().inference_gate.take();
+                    if let Some((started, release)) = gate {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    if std::mem::take(&mut ledger.lock().unwrap().fail_inference) {
+                        break;
+                    }
+                }
                 let (response, raw_out) = match &request {
                     WorkerRequest::Load {
                         req_id,
                         artifact_digest,
+                        runtime_config,
                         ..
                     } => {
                         ledger.lock().unwrap().loads.push(request.clone());
+                        let direct_profile = runtime_config
+                            .get("profile")
+                            .filter(|id| id.ends_with(".ane-direct-worker"));
                         (
                             WorkerResponse::Loaded {
                                 req_id: req_id.clone(),
-                                model_ref: format!("mock:{artifact_digest}"),
-                                dims: 4,
+                                model_ref: direct_profile
+                                    .map(|profile| {
+                                        format!("ane-direct:{profile}:{artifact_digest}")
+                                    })
+                                    .unwrap_or_else(|| format!("mock:{artifact_digest}")),
+                                dims: if direct_profile.is_some() { 1 } else { 4 },
                                 cold_load_ms: 0,
-                                buckets: None,
+                                buckets: direct_profile.map(|_| ANE_SHAPE_LADDER.to_vec()),
                             },
                             None,
                         )
@@ -6085,6 +6564,43 @@ pub mod ane_residency {
                                     req_id: Some(req_id.clone()),
                                     code: ERR_SHAPE_NOT_ADMITTED.to_string(),
                                     msg: format!("{model_ref} rungs {rungs:?} are not resident"),
+                                },
+                                None,
+                            )
+                        }
+                    }
+                    WorkerRequest::RerankSequences {
+                        req_id,
+                        model_ref,
+                        sequences,
+                    } => {
+                        let rungs: Vec<_> = sequences
+                            .iter()
+                            .map(|s| ladder_rung(s.n_tokens).unwrap())
+                            .collect();
+                        assert_eq!(
+                            raw.as_ref().map(Vec::len),
+                            Some(sequences.iter().map(|s| s.n_tokens).sum::<usize>() * 4)
+                        );
+                        if rungs
+                            .iter()
+                            .all(|rung| own.contains(&(model_ref.clone(), *rung)))
+                        {
+                            (
+                                WorkerResponse::Scores {
+                                    req_id: req_id.clone(),
+                                },
+                                Some(encode_f32_frame(
+                                    &rungs.iter().map(|rung| *rung as f32).collect::<Vec<_>>(),
+                                )),
+                            )
+                        } else {
+                            ledger.lock().unwrap().shape_not_admitted += 1;
+                            (
+                                WorkerResponse::Err {
+                                    req_id: Some(req_id.clone()),
+                                    code: ERR_SHAPE_NOT_ADMITTED.into(),
+                                    msg: "rerank shape not admitted".into(),
                                 },
                                 None,
                             )
@@ -6353,6 +6869,166 @@ pub mod ane_residency {
                 waits[1].elapsed_ms >= 20.0,
                 "measure the actual admission future, including its wait deadline"
             );
+        }
+
+        async fn serving_fixture(ledger: &SharedLedger) -> Arc<AneServing<DuplexStream>> {
+            let mock = mock_channel("serving", ledger).await;
+            let channel = Arc::new(Arc::try_unwrap(mock).ok().unwrap().0);
+            let request = WorkerRequest::Load {
+                req_id: channel.next_req_id("load"),
+                artifact_path: "mock.safetensors".into(),
+                artifact_digest: "sha256:test".into(),
+                format: "safetensors".into(),
+                runtime_config: BTreeMap::from([
+                    (
+                        "profile".into(),
+                        "gte-modernbert-base.ane-direct-worker".into(),
+                    ),
+                    ("operation".into(), "embed".into()),
+                ]),
+            };
+            let (response, _) = channel.exchange(&request, None).await.unwrap();
+            let WorkerResponse::Loaded {
+                model_ref,
+                dims,
+                buckets: Some(buckets),
+                ..
+            } = response
+            else {
+                panic!("mock LOAD failed")
+            };
+            Arc::new(
+                AneServing::new(
+                    channel,
+                    AneResidencySupervisor::new(AneResidencyLimits::default()),
+                    AneServingMetadata {
+                        model_ref,
+                        dims,
+                        buckets,
+                        pooling: synapse_core::WorkerPooling::Mean,
+                        normalize: true,
+                        timeout: Duration::from_secs(1),
+                    },
+                )
+                .unwrap(),
+            )
+        }
+
+        #[tokio::test]
+        async fn serving_embed_and_composed_rerank_admit_before_exchange_and_preserve_order() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let sequences = vec![vec![1; 300], vec![2; 1], vec![3; 200], vec![4; 8192]];
+            let expected = vec![vec![512.0], vec![128.0], vec![256.0], vec![8192.0]];
+            assert_eq!(
+                serving.infer(sequences.clone(), false).await.unwrap(),
+                expected
+            );
+            assert_eq!(serving.infer(sequences, true).await.unwrap(), expected);
+            let before = serving.channel.request_count();
+            assert!(matches!(
+                serving.infer(vec![vec![1], vec![1; 8193]], false).await,
+                Err(AneResidencyError::SequenceTooLong { .. })
+            ));
+            assert_eq!(serving.channel.request_count(), before);
+            assert_eq!(ledger.lock().unwrap().shape_not_admitted, 0);
+            serving.retire().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn serving_caller_cancellation_drains_reply_without_restart() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            ledger.lock().unwrap().inference_gate = Some((started.clone(), release.clone()));
+            let task = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.infer(vec![vec![1]], false).await }
+            });
+            started.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            release.notify_one();
+            assert_eq!(
+                serving.infer(vec![vec![2]], false).await.unwrap(),
+                vec![vec![128.0]]
+            );
+            assert_eq!(serving.supervisor.stats().restarts, 0);
+            assert_eq!(serving.supervisor.stats().admitted, 1);
+            assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
+        }
+
+        #[tokio::test]
+        async fn retirement_refuses_queued_leases_without_waiting_for_admission_deadline() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+            let mut held = vec![];
+            for rung in [128, 256, 512, 1024] {
+                held.push(
+                    serving
+                        .supervisor
+                        .lease(&worker, &serving.metadata.model_ref, rung)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let pending = serving
+                .supervisor
+                .lease(&worker, &serving.metadata.model_ref, 2048);
+            tokio::pin!(pending);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let retire = serving.retire();
+            tokio::pin!(retire);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(retire.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            drop(held);
+            retire.await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(50), pending)
+                .await
+                .unwrap()
+                .is_err());
+            assert_eq!(serving.supervisor.stats().restarts, 0);
+        }
+
+        #[tokio::test]
+        async fn serving_io_fault_recovers_and_retire_refunds_only_after_exit() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            ledger.lock().unwrap().fail_inference = true;
+            assert!(serving.infer(vec![vec![1]], false).await.is_err());
+            assert_eq!(serving.supervisor.stats().restarts, 1);
+            assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
+            assert_eq!(
+                serving.infer(vec![vec![1]], false).await.unwrap(),
+                vec![vec![128.0]]
+            );
+            serving.retire().await.unwrap();
+            let ledger = SharedLedger::default();
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            ledger.lock().unwrap().exit_gate = Some((started.clone(), release.clone()));
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let task = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.retire().await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            assert!(!serving.supervisor.resident_shapes().is_empty());
+            release.notify_one();
+            task.await.unwrap().unwrap();
+            assert!(serving.supervisor.resident_shapes().is_empty());
         }
 
         #[tokio::test]

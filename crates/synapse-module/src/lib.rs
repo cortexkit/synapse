@@ -1293,6 +1293,7 @@ struct RuntimeState {
     execution: Arc<Semaphore>,
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
+    ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
@@ -1486,6 +1487,12 @@ impl EmbeddingModel {
                 }
                 ExecutionModelInfo::default()
             }
+            #[cfg(unix)]
+            EmbedBackend::DirectAne(engine) => ExecutionModelInfo {
+                dims: Some(engine.serving.metadata.dims),
+                buckets: Some(engine.serving.metadata.buckets.clone()),
+                dtype: None,
+            },
             EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
         }
     }
@@ -1582,6 +1589,8 @@ fn log_job_done(model_id: &str, job_id: &str, lane: &str, tokens: u64, started: 
 
 #[derive(Clone)]
 enum EmbedBackend {
+    #[cfg(unix)]
+    DirectAne(Arc<worker_host::ane_residency::DirectAneEngine>),
     Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
     /// Owned decode is loaded for each supervised generation so its generation
     /// supervisor, rather than the generic worker host, enforces the crash limit.
@@ -2325,6 +2334,7 @@ impl RuntimeState {
             scheduler,
             execution,
             execution_stats,
+            ane_supervisor: Mutex::new(None),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2481,6 +2491,8 @@ async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
         .into_iter()
         .filter_map(|model| match &model.backend {
             EmbedBackend::Worker(engine) => Some((model.model_id.clone(), Arc::clone(engine))),
+            #[cfg(unix)]
+            EmbedBackend::DirectAne(_) => None,
             EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
         })
         .collect::<Vec<_>>();
@@ -3724,8 +3736,8 @@ fn certify_observations(state: Arc<ModuleState>) -> HandlerOutcome {
     result_outcome(certify_worker_snapshot(&state.runtime))
 }
 
-// CUDA and Vulkan need request counts, but no ANE placement evidence. Direct
-// ANE remains unavailable until production inference uses the residency supervisor.
+// Direct ANE placement evidence comes from the shared residency supervisor;
+// transport counters alone cannot certify where its admitted layers execute.
 fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
     let models = runtime.loaded_models();
     let mut available = !models.is_empty();
@@ -3733,6 +3745,16 @@ fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
     for model in models {
         match &model.backend {
             EmbedBackend::Owned(_) => {}
+            #[cfg(unix)]
+            EmbedBackend::DirectAne(engine) => {
+                requests.insert(
+                    worker_host::ane_residency::AneShapeWorker::worker_id(
+                        engine.serving.channel.as_ref(),
+                    )
+                    .to_owned(),
+                    engine.serving.channel.request_count(),
+                );
+            }
             EmbedBackend::Worker(engine) => {
                 let count = engine.lock().ok().and_then(|engine| {
                     let identity = EmbedEngine::identity(&*engine);
@@ -3750,7 +3772,13 @@ fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
             _ => available = false,
         }
     }
-    json!({"inventories": [], "worker_requests": requests, "admitted_count": 0, "available": available})
+    let observations = runtime
+        .ane_supervisor
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().and_then(|s| s.observations()));
+    let (inventories, admitted_count) = observations.unwrap_or_default();
+    json!({"inventories": inventories, "worker_requests": requests, "admitted_count": admitted_count, "available": available})
 }
 
 async fn dispatch_request(
@@ -6014,6 +6042,7 @@ async fn load_catalog_model_task(
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
+    let ane_supervisor = direct_ane_supervisor(&state.runtime, &spec.engine);
     let is_catalog = state.runtime.release_catalog.is_reserved_id(&model_id);
     let fault_lane = model_id.clone();
     let loaded = tokio::task::spawn_blocking(move || {
@@ -6027,6 +6056,7 @@ async fn load_catalog_model_task(
             worker_load_timeout,
             worker_forward_lines_per_sec,
             owned_decode_q8,
+            ane_supervisor?,
         )
     })
     .await
@@ -6236,6 +6266,7 @@ fn load_catalog_model_blocking(
     worker_load_timeout: Duration,
     worker_forward_lines_per_sec: u32,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
+    ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -6341,6 +6372,7 @@ fn load_catalog_model_blocking(
                 &runtime_config,
                 worker_load_timeout,
                 worker_forward_lines_per_sec,
+                ane_supervisor,
             )?;
             (backend, loaded, None)
         }
@@ -6388,6 +6420,7 @@ fn load_catalog_model_blocking(
                 &runtime_config,
                 worker_load_timeout,
                 worker_forward_lines_per_sec,
+                ane_supervisor,
             )?;
             (backend, loaded, None)
         }
@@ -6483,16 +6516,87 @@ fn resolve_worker_binary_sibling(engine: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+fn ane_residency_error_to_wire(
+    error: worker_host::ane_residency::AneResidencyError,
+) -> WireOperationError {
+    use worker_host::ane_residency::AneResidencyError;
+    if let AneResidencyError::SequenceTooLong { n_tokens, max } = &error {
+        return WireOperationError::from_stable(
+            StableError::sequence_too_long(*n_tokens, *max, None),
+            error.to_string(),
+        );
+    }
+    let engine_error = error.to_engine_error(EngineErrorStage::Inference);
+    let safe_to_retry = engine_error.safe_to_retry_same_request;
+    let mut wire = engine_error_to_wire(engine_error);
+    wire.safe_to_retry_same_request = safe_to_retry;
+    if let Some(code) = error.code() {
+        wire.code = code.to_owned();
+    }
+    if error.code() == Some(worker_host::ane_residency::ERR_ANE_RESOURCES_EXHAUSTED) {
+        wire.class = ErrorClass::Transient;
+        wire.retry_after_ms = Some(worker_host::ane_residency::ANE_RESOURCES_RETRY_AFTER_MS);
+        wire.safe_to_retry_same_request = true;
+    } else if matches!(error, AneResidencyError::WorkerErr { .. }) {
+        wire.class = ErrorClass::Permanent;
+        wire.retry_after_ms = None;
+    }
+    if matches!(error, AneResidencyError::ResourcesExhausted { .. }) {
+        wire.safe_to_retry_same_request = true;
+    }
+    wire
+}
+
+fn direct_ane_supervisor(
+    runtime: &RuntimeState,
+    engine: &str,
+) -> Result<Option<worker_host::ane_residency::AneResidencySupervisor>, WireOperationError> {
+    if engine != "ane-direct-worker" {
+        return Ok(None);
+    }
+    if !cfg!(target_os = "macos") {
+        return Err(artifact_invalid_error(
+            "direct-ANE is only supported on macOS",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mut shared = runtime
+            .ane_supervisor
+            .lock()
+            .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"))?;
+        if shared.is_none() {
+            let mut supervisor = worker_host::ane_residency::AneResidencySupervisor::acquire_lane(
+                Default::default(),
+            )
+            .map_err(ane_residency_error_to_wire)?;
+            if runtime.certify_observation {
+                supervisor.enable_observations();
+            }
+            *shared = Some(supervisor);
+        }
+        Ok(shared.clone())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = runtime;
+        Err(artifact_invalid_error(
+            "direct-ANE is only supported on macOS",
+        ))
+    }
+}
+
 fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
     worker_load_timeout: Duration,
     worker_forward_lines_per_sec: u32,
+    ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
-    if spec.engine.as_str() == "ane" && !cfg!(target_os = "macos") {
+    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !cfg!(target_os = "macos") {
         return Err(artifact_invalid_error(format!(
             "{} model '{}' is only supported on macOS",
             spec.engine, spec.model_id
@@ -6530,6 +6634,24 @@ fn load_worker_backend_blocking(
     if spec.task == "generate" {
         config.request_timeout = Duration::from_secs(180);
     }
+    #[cfg(unix)]
+    if spec.engine == "ane-direct-worker" {
+        let supervisor = ane_supervisor
+            .ok_or_else(|| artifact_invalid_error("direct-ANE supervisor unavailable"))?;
+        let engine = worker_host::ane_residency::DirectAneEngine::load(
+            config,
+            supervisor,
+            artifact,
+            runtime_config,
+        )
+        .map_err(ane_residency_error_to_wire)?;
+        let loaded = LoadedModel {
+            model_id: engine.serving.metadata.model_ref.clone(),
+        };
+        return Ok((EmbedBackend::DirectAne(Arc::new(engine)), loaded));
+    }
+    #[cfg(not(unix))]
+    let _ = ane_supervisor;
     let mut engine = WorkerEngine::new(config).map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
@@ -6591,6 +6713,8 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
             EmbedEngine::unload(&mut *engine, &model.loaded_model);
             Ok(())
         }
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(engine) => engine.unload().map_err(ane_residency_error_to_wire),
         EmbedBackend::OwnedDecode => Ok(()),
         EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
@@ -12069,6 +12193,22 @@ async fn execute_embedding(
             })?
             .map_err(engine_error_to_wire)
         }
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(engine) => {
+            let _permit = permit;
+            let _catalog_guard = catalog_guard;
+            if let Some(id) = fault_lane.as_deref() {
+                catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
+            }
+            let values = engine
+                .infer(
+                    batch.items.into_iter().map(|item| item.to_vec()).collect(),
+                    false,
+                )
+                .await
+                .map_err(ane_residency_error_to_wire)?;
+            Ok(values)
+        }
         EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!("model '{}' does not support embedding", model.model_id),
@@ -12164,6 +12304,24 @@ async fn execute_rerank(
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(engine) => {
+            let _permit = permit;
+            let _catalog_guard = catalog_guard;
+            if let Some(id) = fault_lane.as_deref() {
+                catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
+            }
+            let pairs = owned_pairs.ok_or_else(|| {
+                artifact_invalid_error("direct-ANE rerank requires composed pairs")
+            })?;
+            let values = engine
+                .infer(pairs, true)
+                .await
+                .map_err(ane_residency_error_to_wire)?;
+            Ok(synapse_core::RerankScores {
+                scores: values.into_iter().map(|v| v[0]).collect(),
+            })
+        }
         EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!("model '{}' does not support rerank.score", model.model_id),
@@ -12387,6 +12545,10 @@ async fn execute_generate(
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let result = match &model.backend {
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(_) => Err(artifact_invalid_error(
+            "direct-ANE does not support generation",
+        )),
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!(
@@ -13389,6 +13551,8 @@ async fn ane_placement_share_for_model(
             })?;
             Ok(ping.placement_share)
         }
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(_) => Ok(None),
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
     }
 }
@@ -15578,6 +15742,8 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
             .lock()
             .ok()
             .and_then(|engine| engine.health_snapshot().ok()),
+        #[cfg(unix)]
+        EmbedBackend::DirectAne(_) => None,
         EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
     }
 }
@@ -16696,6 +16862,45 @@ mod tests {
         super::attach_certify_observation(&mut response, None);
         assert_eq!(serde_json::to_vec(&response).unwrap(), before);
         assert!(!super::ModuleConfig::default().certify_observation);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn direct_ane_models_reuse_one_runtime_supervisor() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
+        *runtime.ane_supervisor.lock().unwrap() = Some(
+            worker_host::ane_residency::AneResidencySupervisor::new(Default::default()),
+        );
+        assert!(direct_ane_supervisor(&runtime, "owned-metal")
+            .unwrap()
+            .is_none());
+        let mut first = direct_ane_supervisor(&runtime, "ane-direct-worker")
+            .unwrap()
+            .unwrap();
+        let second = direct_ane_supervisor(&runtime, "ane-direct-worker")
+            .unwrap()
+            .unwrap();
+        assert!(second.observations().is_none());
+        first.enable_observations();
+        assert_eq!(second.observations(), Some((vec![], 0)));
+        assert_eq!(certify_worker_snapshot(&runtime)["admitted_count"], 0);
+    }
+
+    #[test]
+    fn ane_wire_errors_keep_resource_retry_and_uncertain_io_unsafe() {
+        use worker_host::ane_residency::AneResidencyError;
+        let wire = ane_residency_error_to_wire(AneResidencyError::WorkerErr {
+            code: "ane_resources_exhausted".into(),
+            msg: "hardware full".into(),
+        });
+        assert_eq!(wire.code, "ane_resources_exhausted");
+        assert_eq!(wire.class, ErrorClass::Transient);
+        assert_eq!(wire.retry_after_ms, Some(250));
+        assert!(wire.safe_to_retry_same_request);
+        let wire = ane_residency_error_to_wire(AneResidencyError::Channel(
+            "partial inference response".into(),
+        ));
+        assert!(!wire.safe_to_retry_same_request);
     }
 
     #[test]
