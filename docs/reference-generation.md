@@ -61,3 +61,10 @@ and ranking behavior. The certification library embeds small subsets of these
 cases for profile self-checks. Their source digests and copied outputs must be
 regenerated when the full fixtures change. The direct-ANE padding golden also
 records source digests that must be refreshed.
+
+After regenerating the direct-ANE padding golden with its existing generator,
+only the 12 `source_sha256` provenance fields changed. All token IDs, padded
+IDs and mask values were unchanged (maximum expected-value difference: 0).
+Separately, `subsets_are_exact_copies_of_the_sealed_source_cases` passed,
+confirming that the certification self-check subsets retain the full fixtures'
+metadata and the exact selected case contents.
