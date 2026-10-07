@@ -17,13 +17,15 @@ async fn candidate_hosted_protocol_matrix() {
     let root = PathBuf::from(root);
     assert!(root.is_absolute(), "CANDIDATE_BIN_DIR must be absolute");
     let suffix = if cfg!(windows) { ".exe" } else { "" };
-    assert!(
-        std::process::Command::new(root.join(format!("ck-synapse{suffix}")))
-            .arg("--version")
-            .status()
+    let scratch = std::env::temp_dir().join(format!("candidate-module-{}", std::process::id()));
+    assert!(std::process::Command::new(
+        synapse_core::dev_binary::ckdev_binary(root.join(format!("ck-synapse{suffix}")), &scratch)
             .unwrap()
-            .success()
-    );
+    )
+    .arg("--version")
+    .status()
+    .unwrap()
+    .success());
     let mut workers = vec![("llama", "llama.cpp-worker", true)];
     if cfg!(target_os = "macos") {
         workers.extend([
@@ -42,8 +44,23 @@ async fn candidate_hosted_protocol_matrix() {
         let nonce = format!("candidate-{}-{worker}", std::process::id());
         let runtime = std::env::temp_dir().join(&nonce);
         let (endpoint, listener) = prepare_listener(&runtime, &nonce).unwrap();
-        let mut command =
-            tokio::process::Command::new(root.join(format!("ck-synapse-worker-{worker}{suffix}")));
+        let mut command = tokio::process::Command::new(
+            synapse_core::dev_binary::ckdev_binary(
+                root.join(format!("ck-synapse-worker-{worker}{suffix}")),
+                &runtime,
+            )
+            .unwrap(),
+        );
+        if worker == "ane" {
+            command.env(
+                "SYNAPSE_ANE_SWIFT_WORKER",
+                synapse_core::dev_binary::ckdev_binary(
+                    root.join("ck-synapse-worker-ane-swift"),
+                    &runtime,
+                )
+                .unwrap(),
+            );
+        }
         command
             .arg(if cfg!(windows) { "--pipe" } else { "--socket" })
             .arg(endpoint)
@@ -119,4 +136,5 @@ async fn candidate_hosted_protocol_matrix() {
             .success());
         let _ = std::fs::remove_dir_all(runtime);
     }
+    let _ = std::fs::remove_dir_all(scratch);
 }

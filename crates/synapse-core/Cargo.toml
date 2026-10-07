@@ -21,6 +21,7 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 ahash = "0.8"
+syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
 serde_json = { workspace = true }
