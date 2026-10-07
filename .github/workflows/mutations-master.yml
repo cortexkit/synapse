@@ -1,0 +1,44 @@
+name: Master mutation catalogue
+
+on:
+  push:
+    branches: [master]
+
+concurrency:
+  group: mutations-master-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned mutation runner
+        shell: bash
+        run: |
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+          ckdev-mutate --version
+      # A full master replay catches regressions in helpers and fixtures that
+      # are neither an edit target nor the test_file selected by --diff.
+      - name: Replay full catalogue
+        shell: bash
+        run: |
+          ckdev-mutate check
+          ckdev-mutate run --all --report target/mutations/master.json
+      - name: Retain replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutations-master-${{ matrix.runner }}-${{ github.run_id }}
+          path: target/mutations/master.json
+          if-no-files-found: error

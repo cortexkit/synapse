@@ -5,7 +5,7 @@ on:
     # train/** branches are the CI-gated landing path: a train is pushed
     # there, CI runs on all platforms, and master fast-forwards only to a sha
     # that already carries a green check.
-    branches: ["train/**"]
+    branches: ["master", "train/**"]
   # The push gate asks whether a change is good. This run asks whether what
   # already landed is still good on the current runner images and toolchains.
   schedule:
@@ -65,6 +65,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: synapse
+          # Mutation selection compares committed origin/master to HEAD.
+          fetch-depth: 0
 
       # Validate the workflow before toolchain setup spends time.
       - name: Check train CI preconditions
@@ -270,6 +272,35 @@ jobs:
           # for missing mandatory e2e fixtures. Every test still runs only once.
           cargo nextest run $crates $profile --retries 0 -E 'not binary(skeleton_e2e)'
           cargo nextest run $crates $profile --retries 0 -E 'binary(skeleton_e2e)' --no-capture 2>&1 | tee skeleton-e2e.output
+
+      # Replay in the same train and master step list: a path-dependent guard
+      # here would make a train's green SHA prove less than the landed SHA.
+      - name: Install pinned mutation runner
+        working-directory: synapse
+        shell: bash
+        run: |
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+          ckdev-mutate --version
+
+      - name: Replay touched mutation controls
+        working-directory: synapse
+        shell: bash
+        # Match the release CRT used by native dependencies on Windows. The
+        # runner owns Cargo invocations, so these profiles also cover list mode.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          ckdev-mutate check
+          ckdev-mutate run --diff origin/master --report target/mutations/diff.json
+
+      - name: Retain touched mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutations-diff-${{ matrix.name }}-${{ github.run_id }}
+          path: synapse/target/mutations/diff.json
+          if-no-files-found: error
 
       - name: Linux llama CPU build gate
         if: matrix.name == 'linux'

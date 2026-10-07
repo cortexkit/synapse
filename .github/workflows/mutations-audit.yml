@@ -1,0 +1,44 @@
+name: Nightly mutation breadth audit
+
+# Broad replay changes source in place and runs all package targets. A separate
+# scheduled checkout keeps that expensive audit out of the train's critical path.
+on:
+  schedule:
+    - cron: "0 8 * * *"
+
+concurrency:
+  group: mutations-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned mutation runner
+        shell: bash
+        run: |
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+          ckdev-mutate --version
+      - name: Audit all package test targets
+        shell: bash
+        run: |
+          ckdev-mutate check
+          ckdev-mutate run --all --broad --report target/mutations/nightly.json
+      - name: Retain breadth evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutations-nightly-${{ matrix.runner }}-${{ github.run_id }}
+          path: target/mutations/nightly.json
+          if-no-files-found: error

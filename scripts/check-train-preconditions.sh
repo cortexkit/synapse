@@ -67,17 +67,10 @@ def check(workflow: object) -> list[str]:
         branches = [branches]
     if not isinstance(branches, list) or "train/**" not in branches:
         failures.append("train precondition failed: push trigger does not include branch train/**")
-    # master is deliberately NOT a push trigger: branch protection requires the
-    # linux and windows checks on any sha reaching master, and those checks
-    # attach to the sha from its train run. A master run would re-prove a
-    # checked sha and double CI per landing. This only holds while protection
-    # is on; if it is ever removed, the master trigger must come back as the
-    # sole observer of an off-train push.
-    if isinstance(branches, list) and "master" in branches:
-        failures.append(
-            "train precondition failed: push trigger includes master "
-            "(protected branch; trains carry the checks, a master run is redundant)"
-        )
+    # Master replays the catalogue as well as the ordinary platform gates. Keep
+    # the train's touched-row step identical so its green SHA proves the same checks.
+    if not isinstance(branches, list) or "master" not in branches:
+        failures.append("train precondition failed: push trigger does not include branch master")
 
     jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
     if not isinstance(jobs, dict):
@@ -130,6 +123,14 @@ def check(workflow: object) -> list[str]:
                 f"job '{job_id}' (expected if: {expected_condition})"
             )
 
+    steps = jobs.get("test", {}).get("steps", [])
+    touched = [s for s in steps if isinstance(s, dict) and s.get("name") == "Replay touched mutation controls"]
+    if len(touched) != 1 or touched[0].get("if") is not None or not any(
+        line.strip() == "ckdev-mutate run --diff origin/master --report target/mutations/diff.json"
+        for line in str(touched[0].get("run", "")).splitlines()
+    ):
+        failures.append("train precondition failed: touched mutation replay must be unconditional and compare origin/master")
+
     concurrency = workflow.get("concurrency") if isinstance(workflow, dict) else None
     group = concurrency.get("group") if isinstance(concurrency, dict) else None
     if not isinstance(group, str) or "github.ref" not in group:
@@ -142,11 +143,14 @@ def check(workflow: object) -> list[str]:
 
 def control_workflow() -> dict:
     """A minimal workflow that satisfies every precondition."""
-    jobs: dict = {"test": {"steps": [{"name": "build", "run": "true"}]}}
+    jobs: dict = {"test": {"steps": [
+        {"name": "build", "run": "true"},
+        {"name": "Replay touched mutation controls", "run": "ckdev-mutate run --diff origin/master --report target/mutations/diff.json"},
+    ]}}
     for job_id, (condition, _reason) in ALLOWED_JOB_CONDITIONS.items():
         jobs[job_id] = {"if": condition, "steps": [{"run": "true"}]}
     return {
-        True: {"push": {"branches": ["train/**"]}},
+        True: {"push": {"branches": ["master", "train/**"]}},
         "concurrency": {"group": "ci-${{ github.ref }}"},
         "jobs": jobs,
     }
@@ -162,10 +166,16 @@ def self_test() -> list[str]:
     manual_job = next(iter(ALLOWED_JOB_CONDITIONS))
 
     def no_train(w):
-        w[True]["push"]["branches"] = ["main"]
+        w[True]["push"]["branches"].remove("train/**")
 
-    def master(w):
-        w[True]["push"]["branches"].append("master")
+    def no_master(w):
+        w[True]["push"]["branches"].remove("master")
+
+    def no_mutations(w):
+        w["jobs"]["test"]["steps"][1]["run"] = "true"
+
+    def conditional_mutations(w):
+        w["jobs"]["test"]["steps"][1]["if"] = "matrix.name == 'linux'"
 
     def job_if(w):
         w["jobs"]["test"]["if"] = "github.ref == 'refs/heads/master'"
@@ -181,7 +191,9 @@ def self_test() -> list[str]:
 
     arms = [
         (no_train, "push trigger does not include branch train/**"),
-        (master, "push trigger includes master"),
+        (no_master, "push trigger does not include branch master"),
+        (no_mutations, "touched mutation replay must be unconditional"),
+        (conditional_mutations, "touched mutation replay must be unconditional"),
         (job_if, "path-dependent if at job 'test':"),
         (step_if, "path-dependent if at job 'test', step 'build'"),
         (gate_drift, f"manual gate allow-list drift at job '{manual_job}'"),
