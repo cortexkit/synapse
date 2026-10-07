@@ -19030,6 +19030,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // Exercise the routing precheck itself, not just the crash-budget predicate:
+    // a constant clock at this call site would otherwise leave expired bans in force.
+    #[test]
+    fn owned_decode_quarantine_routing_precheck_reads_wall_clock() {
+        use owned_decode_worker::budget::{BudgetPolicy, CrashBudget, FileBudgetStore};
+        use owned_decode_worker::error::FailureClassification;
+        use owned_decode_worker::identity::QuarantineKey;
+
+        let (root, descriptor) = test_storage_descriptor("quarantine-routing-clock");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("quarantine-test");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store, profile);
+        let mut spec = stuck_model_spec();
+        spec.worker_runtime_dir = Some(root.clone());
+        let fingerprint = Fingerprint("decode-fingerprint".into());
+        let config_digest = "config-digest";
+        let key = QuarantineKey::new(&state.machine_profile_hash, &fingerprint.0, config_digest);
+        let policy = BudgetPolicy::default();
+        let mut budget = CrashBudget::new(
+            FileBudgetStore::open(owned_decode_budget_store_path(&spec)).unwrap(),
+            policy,
+        );
+        let expired_at = now_ms()
+            .saturating_sub(policy.quarantine_duration_ms)
+            .saturating_sub(60_000);
+        for _ in 0..policy.max_strikes {
+            budget
+                .charge(&key, FailureClassification::Crash, expired_at)
+                .unwrap();
+        }
+        drop(budget);
+        assert!(
+            !owned_decode_quarantined(&state, &spec, &fingerprint, config_digest),
+            "routing must release an expired quarantine"
+        );
+
+        let mut budget = CrashBudget::new(
+            FileBudgetStore::open(owned_decode_budget_store_path(&spec)).unwrap(),
+            policy,
+        );
+        for _ in 0..policy.max_strikes {
+            budget
+                .charge(&key, FailureClassification::Crash, now_ms())
+                .unwrap();
+        }
+        drop(budget);
+        assert!(
+            owned_decode_quarantined(&state, &spec, &fingerprint, config_digest),
+            "routing must retain an active quarantine"
+        );
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn admission_status_reports_catalog_certification_health_without_resident_lanes() {
         let (root, descriptor) = test_storage_descriptor("admission-catalog-certification-health");
@@ -22652,6 +22707,33 @@ mod catalog_runtime_tests {
         // undeclared model or a fallback to Metal.
         assert_eq!(unknown.code, "backend_unavailable");
         assert!(state.runtime.catalog.lock().unwrap().is_empty());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_unavailable_backend_precedes_missing_install() {
+        let (root, state) = isolated_catalog_state("unavailable-before-install", false);
+        let error = select_catalog_lane(
+            &state,
+            Some("gte-modernbert-base-metal"),
+            ModelTask::Embed,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code, "backend_unavailable",
+            "backend refusal must precede missing installation"
+        );
+        let entry = state
+            .runtime
+            .release_catalog
+            .entry("gte-modernbert-base")
+            .unwrap();
+        assert!(current_catalog_install(&state, entry, "metal")
+            .unwrap()
+            .is_none());
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
