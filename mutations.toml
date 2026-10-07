@@ -132,3 +132,63 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "nonce-command-source-scan"
+guards = "Every shipped child command must use the credential-stripping helper"
+file = "crates/synapse-module/src/lib.rs"
+old = "synapse_core::without_launch_nonce(std::process::Command::new(&worker));"
+new = "std::process::Command::new(&worker); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/tests/it/launch_nonce_readers.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--test it"
+expect_red = ["launch_nonce_readers::every_shipped_command_strips_the_launch_nonce"]
+expect_message = "child commands must use without_launch_nonce"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "flow-refuses-mutations"
+guards = "Flow-stamped routes only receive declared queries, never owner mutations"
+file = "crates/synapse-module/src/lib.rs"
+old = "op.name == method && op.kind == ManagementOperationKind::Query"
+new = "op.name == method /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::flow_routes_get_queries_only_and_other_routes_are_unchanged"]
+expect_message = "must be refused on a flow route"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "flow-refuses-undeclared"
+guards = "An undeclared method cannot inherit owner authority on a flow route"
+file = "crates/synapse-module/src/lib.rs"
+old = """
+if declared_query {
+            return None;
+        }"""
+new = """
+if declared_query || !management_operations().iter().any(|op| op.name == method) { // NON-VACUITY BREAK
+            return None;
+        }"""
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::flow_routes_get_queries_only_and_other_routes_are_unchanged"]
+expect_message = "decode"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
