@@ -1,4 +1,12 @@
 
+# Deliberate breaks of silent safety and compatibility guards. Create rows with
+# the pinned runner's prove command; compilation errors and timeouts are not catches.
+# Integration tests launch this production entry point. Refresh its test-support
+# fixture after each mutant so an unchanged executable cannot hide a source break.
+prebuild = [
+    { name = "module-fixture", command = ["cargo", "build", "--locked", "-p", "synapse-module", "--bin", "ck-synapse", "--features", "test-support"], timeout_s = 1800 },
+]
+
 [[control]]
 id = "nonce-sync-child"
 guards = "Children cannot inherit the daemon credential through the synchronous production helper"
