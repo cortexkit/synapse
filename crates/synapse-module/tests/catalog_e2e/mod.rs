@@ -1424,16 +1424,21 @@ async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
 
 #[tokio::test]
 async fn catalog_no_body_byte_timeout_fails_and_cleans_download() {
-    let mut h = CatalogHarness::start("stall", None).await;
-    let accepted = h.download("gte-modernbert-base", "idle-timeout").await;
-    let job = accepted["job_id"].as_str().unwrap();
-    h.wait_state(job, &["downloading"]).await;
-    sleep(Duration::from_secs(61)).await;
-    let failed = h.wait_state(job, &["failed"]).await;
-    assert_eq!(failed["error"]["code"], "download_failed");
-    assert_eq!(failed["error"]["details"]["reason"], "network");
-    h.assert_clean();
-    h.server.assert_pinned_requests();
+    // Wait for the terminal outcome, not a guessed sleep past the worker's
+    // timeout. Bound the whole handshake so a stuck download fails by test name.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let mut h = CatalogHarness::start("stall", None).await;
+        let accepted = h.download("gte-modernbert-base", "idle-timeout").await;
+        let job = accepted["job_id"].as_str().unwrap();
+        h.wait_state(job, &["downloading"]).await;
+        let failed = h.wait_state(job, &["failed"]).await;
+        assert_eq!(failed["error"]["code"], "download_failed");
+        assert_eq!(failed["error"]["details"]["reason"], "network");
+        h.assert_clean();
+        h.server.assert_pinned_requests();
+    })
+    .await
+    .expect("idle download must fail and clean its state without hanging");
 }
 
 #[cfg(not(target_os = "macos"))]

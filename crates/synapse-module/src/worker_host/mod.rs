@@ -7312,12 +7312,17 @@ pub mod ane_residency {
                 let serving = serving.clone();
                 async move { serving.infer(vec![vec![1]], false).await }
             });
-            started.notified().await;
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .expect("inference must start before caller cancellation");
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
             release.notify_one();
             assert_eq!(
-                serving.infer(vec![vec![2]], false).await.unwrap(),
+                tokio::time::timeout(Duration::from_secs(2), serving.infer(vec![vec![2]], false))
+                    .await
+                    .expect("cancelled caller must not strand subsequent inference")
+                    .expect("caller cancellation must drain the reply without restarting"),
                 vec![vec![128.0]]
             );
             assert_eq!(serving.supervisor.stats().restarts, 0);
