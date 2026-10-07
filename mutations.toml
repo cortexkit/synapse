@@ -1,0 +1,116 @@
+
+[[control]]
+id = "nonce-sync-child"
+guards = "Children cannot inherit the daemon credential through the synchronous production helper"
+file = "crates/synapse-core/src/child_process.rs"
+old = "remove_launch_nonce(&mut command);"
+new = "// NON-VACUITY BREAK: credential stripping omitted"
+edits = []
+test_file = "crates/synapse-core/tests/child_process.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--test child_process"
+expect_red = ["stripped_child_environment_contains_neither_launch_nonce_variable"]
+expect_message = "child inherited"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "nonce-tokio-child"
+guards = "Asynchronous children cannot inherit the daemon credential"
+file = "crates/synapse-core/src/child_process.rs"
+old = "remove_launch_nonce(command.as_std_mut());"
+new = "// NON-VACUITY BREAK: credential stripping omitted"
+edits = []
+test_file = "crates/synapse-core/tests/child_process.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--test child_process"
+expect_red = ["stripped_tokio_child_environment_contains_neither_launch_nonce_variable"]
+expect_message = "child inherited"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "fingerprint-none-fields"
+guards = "Absent optional profile fields do not rotate the hashed bytes of existing vector spaces"
+file = "crates/synapse-core/src/fingerprint.rs"
+old = """
+#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,"""
+new = """
+#[serde(default)] // NON-VACUITY BREAK
+    pub operation: Option<String>,"""
+edits = []
+test_file = "crates/synapse-core/src/fingerprint.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["fingerprint::tests::legacy_coreml_bytes_and_hash_derivation_are_unchanged"]
+expect_message = "assertion `left == right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "fingerprint-production-pin"
+guards = "Production Metal vector-space fingerprints stay at their independently captured values"
+file = "crates/synapse-core/src/fingerprint.rs"
+old = """
+#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_revision: Option<String>,"""
+new = """
+#[serde(default)] // NON-VACUITY BREAK
+    pub kernel_revision: Option<String>,"""
+edits = []
+test_file = "crates/synapse-core/src/fingerprint.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["fingerprint::tests::legacy_production_metal_fingerprints_remain_pinned"]
+expect_message = "assertion `left == right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "profile-probe-fail-closed"
+guards = "A failed machine identity probe cannot become a placeholder profile carrying certification authority"
+file = "crates/synapse-core/src/machine_profile.rs"
+old = "let base = collector.collect_base_profile()?;"
+new = 'let base = collector.collect_base_profile().unwrap_or(MachineProfileBase { os_build: "unknown".into(), arch: "unknown".into(), chip_model: "unknown".into(), ram_class: "unknown".into(), ane_subtype: None }); // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-core/src/machine_profile.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["machine_profile::tests::a_probe_refusal_propagates_instead_of_yielding_a_profile"]
+expect_message = "a refused probe must not produce a profile"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "admission-submitted-text-hash"
+guards = "Truncation must not change the digest echo of the caller-submitted text"
+file = "crates/synapse-core/src/tokenizer.rs"
+old = "let submitted_sha256 = sha256_text(text);"
+new = "let submitted_sha256 = sha256_text(&embedded_text); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-core/src/tokenizer.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["tokenizer::tests::tokenizer_strips_padding_and_reports_our_truncation"]
+expect_message = "truncated items must hash the original submitted text before truncation"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
