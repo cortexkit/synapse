@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+import unittest
 
 
 def processes():
@@ -14,8 +15,39 @@ def processes():
     for row in rows.splitlines():
         pid, name = row.strip().split(maxsplit=1)
         images[int(pid)] = name
-    parents = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
-    return images, {int(pid): int(parent) for pid, parent in (row.split() for row in parents.splitlines())}
+    parents = subprocess.check_output(["ps", "-axo", "pid=,ppid=,lstart="], text=True)
+    identities = {}
+    for row in parents.splitlines():
+        pid, parent, birth = row.split(maxsplit=2)
+        identities[int(pid)] = (int(parent), " ".join(birth.split()))
+    return images, identities
+
+
+def descendants(owned, identities):
+    # PIDs are recycled on long builds. A retained PID alone can silently
+    # attribute another worktree's later process to this command.
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent, birth) in identities.items():
+            if (parent in owned and parent in identities
+                    and owned[parent] == identities[parent][1]
+                    and owned.get(pid) != birth):
+                owned[pid] = birth
+                changed = True
+    return {pid for pid, (_, birth) in identities.items() if owned.get(pid) == birth}
+
+
+class SamplingTests(unittest.TestCase):
+    def test_recycled_pid_is_not_a_descendant(self):
+        owned = {10: "cargo birth", 11: "compiler birth"}
+        identities = {10: (1, "cargo birth"), 11: (99, "unrelated birth"),
+                      12: (11, "other worker birth"), 13: (10, "test birth")}
+        self.assertEqual(descendants(owned, identities), {10, 13})
+
+    def test_orphan_with_same_birth_remains_owned(self):
+        owned = {10: "cargo birth", 11: "module birth"}
+        self.assertEqual(descendants(owned, {11: (1, "module birth")}), {11})
 
 
 def main():
@@ -23,34 +55,26 @@ def main():
     if not command:
         raise SystemExit("usage: sample-dev-images.py <command> [args...]")
     print("Python", sys.version.split()[0], "sampling ps -axo pid=,comm= every 0.5 s", flush=True)
-    baseline, _ = processes()
     child = subprocess.Popen(command)
-    owned = {child.pid}
+    _, identities = processes()
+    owned = {child.pid: identities[child.pid][1]}
     seen = {"ck": {}, "ckdev": {}}
     samples = 0
     observations = {"ck": 0, "ckdev": 0}
 
     def sample():
         nonlocal samples
-        images, parents = processes()
-        # Find grandchildren regardless of ps's ordering; retain observed PIDs
-        # so a child orphaned during shutdown remains attributable to this run.
-        changed = True
-        while changed:
-            changed = False
-            for pid, parent in parents.items():
-                if parent in owned and pid not in owned and pid not in baseline:
-                    owned.add(pid)
-                    changed = True
+        images, identities = processes()
+        live_owned = descendants(owned, identities)
         samples += 1
-        for pid in owned & images.keys():
+        for pid in live_owned & images.keys():
             name = images[pid]
             basename = os.path.basename(name)
             category = "ckdev" if basename.startswith("ckdev-") else "ck" if basename.startswith("ck-") else None
             if category:
-                seen[category][pid] = name
+                seen[category][f"{pid}:{owned[pid]}"] = name
                 observations[category] += 1
-        return images
+        return images, live_owned
 
     deadline = time.monotonic()
     while child.poll() is None:
@@ -61,8 +85,8 @@ def main():
     # rather than killing any process if cleanup failed.
     for _ in range(4):
         time.sleep(0.5)
-        images = sample()
-    remaining = {pid: images[pid] for pid in owned & images.keys()
+        images, live_owned = sample()
+    remaining = {pid: images[pid] for pid in live_owned & images.keys()
                  if os.path.basename(images[pid]).startswith(("ck-", "ckdev-"))}
     report = {"command": command, "interval_seconds": 0.5, "samples": samples,
               "unique_ck_images": len(seen["ck"]), "unique_ckdev_images": len(seen["ckdev"]),
@@ -74,4 +98,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if sys.argv[1:] == ["--self-test"]:
+        unittest.main(argv=[sys.argv[0]], verbosity=2)
+    else:
+        raise SystemExit(main())
