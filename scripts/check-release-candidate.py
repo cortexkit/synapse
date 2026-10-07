@@ -2,6 +2,8 @@
 """Release-candidate guards, shared by hosted builds and fixture self-tests."""
 
 import argparse
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +19,21 @@ import zipfile
 
 class Refused(ValueError):
     """An input cannot be used to build or certify a release candidate."""
+
+
+@contextmanager
+def ckdev_binary(worker):
+    """Smoke extracted images without impersonating an installed process."""
+    with tempfile.TemporaryDirectory() as scratch:
+        name = worker.name[3:] if worker.name.startswith("ck-") else worker.name
+        alias = Path(scratch) / ("ckdev-" + name)
+        try:
+            os.link(worker, alias)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copy2(worker, alias)
+        yield alias
 
 
 def require_source(source, head):
@@ -108,6 +125,17 @@ class GuardSelfTests(unittest.TestCase):
     def assert_refused(self, message, function, *args):
         with self.assertRaisesRegex(Refused, message):
             function(*args)
+
+    def test_development_image_alias_preserves_binary_and_exe_suffix(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            built = Path(scratch) / "ck-synapse-worker-vulkan.exe"
+            built.write_bytes(b"built image")
+            with ckdev_binary(built) as alias:
+                self.assertEqual(alias.name, "ckdev-synapse-worker-vulkan.exe")
+                self.assertEqual(alias.read_bytes(), b"built image")
+                self.assertTrue(os.path.samefile(built, alias))
+            self.assertFalse(alias.exists())
+            self.assertEqual(built.read_bytes(), b"built image")
 
     def test_source_commit_equality(self):
         source = "a" * 40
@@ -208,14 +236,16 @@ def main():
         elif args.command == "inventory":
             require_inventory(json.loads(args.inventory.read_text(encoding="utf-8")), json.loads(args.candidate.read_text(encoding="utf-8")))
         elif args.command == "spirv":
-            output = subprocess.check_output([str(args.worker), "--version"], text=True)
+            with ckdev_binary(args.worker) as alias:
+                output = subprocess.check_output([str(alias), "--version"], text=True)
             print(output)
             require_spirv(output, args.core.read_text(encoding="utf-8"))
         elif args.command == "cuda-elf":
             output = subprocess.check_output(["readelf", "-d", str(args.worker)], text=True)
             print(output)
             require_cuda_elf(output)
-            require_missing_runtime(args.worker)
+            with ckdev_binary(args.worker) as alias:
+                require_missing_runtime(alias)
         else:
             parser.error("a command or --self-test is required")
     except (Refused, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:

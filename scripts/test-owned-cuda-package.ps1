@@ -31,17 +31,21 @@ try {
     foreach ($entry in $manifest.runtime_files) {
         if ((Get-FileHash (Join-Path $package $entry.file) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.sha256) { throw "Hash mismatch: $($entry.file)" }
     }
+    # Keep DLL lookup beside the extracted package while distinguishing this
+    # smoke process from an installed worker. The attested file stays untouched.
+    $devExe = Join-Path $package 'ckdev-synapse-worker-cuda.exe'
+    New-Item -ItemType HardLink -Path $devExe -Target $exe | Out-Null
     $empty = Join-Path $root 'no-sidecars'
     New-Item -ItemType Directory $empty | Out-Null
-    Copy-Item $exe $empty
+    Copy-Item $exe (Join-Path $empty 'ckdev-synapse-worker-cuda.exe')
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-    $isolatedExe = Join-Path $empty 'ck-synapse-worker-cuda.exe'
+    $isolatedExe = Join-Path $empty 'ckdev-synapse-worker-cuda.exe'
     $version = Invoke-Worker $isolatedExe '--version'
     if ($version.Code -ne 0 -or $version.Out -notmatch '^ck-synapse-worker-cuda ') { throw "No-DLL version failed: $($version.Err)" }
     $missing = Invoke-Worker $isolatedExe '--probe-floor'
     $missingFloor = $missing.Out | ConvertFrom-Json
     if ($missing.Code -ne 2 -or $missingFloor.status -ne 'refused' -or $missingFloor.code -ne 'cuda_runtime_missing:cublasLt64_13.dll') { throw "Missing-DLL refusal failed: $($missing.Code) $($missing.Out) $($missing.Err)" }
-    $present = Invoke-Worker $exe '--probe-floor'
+    $present = Invoke-Worker $devExe '--probe-floor'
     if ($present.Code -eq 0) {
         $floor = $present.Out | ConvertFrom-Json
         if ($floor.status -ne 'ok' -or $floor.code -ne 'ok' -or $floor.required.driver_api -ne 13020 -or $floor.observed.driver_api -lt 13020 -or $floor.observed.compute_capability.major -lt 7 -or ($floor.observed.compute_capability.major -eq 7 -and $floor.observed.compute_capability.minor -lt 5)) {

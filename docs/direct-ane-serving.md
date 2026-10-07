@@ -102,16 +102,20 @@ declares its commit, then run:
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cargo build --release --locked -p synapse-module -p synapse-worker-ane-direct
 
+scratch="$(mktemp -d)"
+ln "$PWD/target/release/ck-synapse" "$scratch/ckdev-synapse"
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  target/release/ck-synapse certify run \
+  "$scratch/ckdev-synapse" certify run \
   --row ane-m5 --model gte-modernbert-base \
   --assets "$PWD/target/release" --checkout "$PWD" \
   --weights "${GTE_MODERNBERT_WEIGHTS:?set to the original pinned checkpoint directory}"
+rm -rf "$scratch"
 ```
 
 `--assets` must be the `target/release` directory of the same clean build: the
 record attests to the `ck-synapse` and `ck-synapse-worker-ane-direct` binaries
-it finds there. `TMPDIR` must be unset, because the private ANE compiler only
+it finds there. Execution uses `ckdev-*` hard links in the run's scratch tree;
+the record retains the original file names and hashes. `TMPDIR` must be unset, because the private ANE compiler only
 accepts the per-user temporary directory.
 
 Cold shape compiles dominate a first run: the 8192-token case spends most of

@@ -272,6 +272,20 @@ Commit attribution across steps:
 
 ### Direct `--probe-floor` execution and independent cross-check (Step 3)
 
+The commands and loader diagnostics below are historical evidence, not current
+launch instructions. To repeat a direct probe of a build output, execute a
+development-named hard link instead (keep packaged DLLs beside it on Windows):
+
+```sh
+scratch="$(mktemp -d)"
+ln "$PWD/target/release/ck-synapse-worker-cuda" "$scratch/ckdev-synapse-worker-cuda"
+"$scratch/ckdev-synapse-worker-cuda" --probe-floor
+rm -rf "$scratch"
+```
+
+The current module regression test creates its own development executable
+alias, so `SYNAPSE_TEST_CUDA_WORKER` may still identify the original build file.
+
 The worker binary was built from `10ec3fc80f0d`:
 
 ```text
