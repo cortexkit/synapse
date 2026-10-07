@@ -114,3 +114,21 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "nonce-source-scan"
+guards = "All shipped sources must obtain the launch nonce from the SDK rather than read the disappearing environment copy"
+file = "crates/synapse-module/src/lib.rs"
+old = "match subc_client_rs::launch_nonce() {"
+new = 'match std::env::var("SUBC_LAUNCH_NONCE").map(Some) { // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-module/tests/it/launch_nonce_readers.rs"
+runner = "cargo"
+package = "synapse-module"
+target = "--test it"
+expect_red = ["launch_nonce_readers::no_workspace_source_reads_the_launch_nonce_around_the_sdk"]
+expect_message = "read the launch nonce through subc_client_rs::launch_nonce()"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
