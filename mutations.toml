@@ -713,3 +713,28 @@ platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "download-idle-wait-is-bounded"
+guards = "An idle download must release its holder and staging state rather than hang forever"
+file = "crates/synapse-module/src/lib.rs"
+old = """
+let body = tokio::time::timeout(Duration::from_secs(60), response.chunk())
+                .await
+                .map_err(|_| download_error(&file.path, "network", None, "download idle timeout"))?
+                .map_err(|e| download_error(&file.path, "network", None, e.to_string()))?;"""
+new = """
+let body = response.chunk().await // NON-VACUITY BREAK
+                .map_err(|e| download_error(&file.path, "network", None, e.to_string()))?;"""
+edits = []
+test_file = "crates/synapse-module/tests/catalog_e2e/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--test skeleton_e2e"
+select = "expected"
+expect_red = ["catalog_e2e::catalog_no_body_byte_timeout_fails_and_cleans_download"]
+expect_message = "idle download must fail and clean its state without hanging"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
