@@ -572,8 +572,10 @@ mod supervisor_tests {
         );
         let cpu = process_cpu_seconds(child.id()) - before;
         eprintln!("supervisor {phase}: cumulative CPU {cpu:.6}s over 2s wall");
+        // A blocked watcher needs no periodic CPU budget. This bound is below
+        // the measured cost of a 10 ms timed poll, with slack for registration.
         assert!(
-            cpu < 0.05,
+            cpu < 0.001,
             "supervisor {phase} spun: {cpu:.6}s CPU over 2s wall"
         );
     }
