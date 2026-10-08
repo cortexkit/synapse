@@ -517,8 +517,9 @@ mod supervisor_tests {
         let mut stream = UnixStream::connect(path).unwrap();
         watch_supervisor(stream.try_clone().unwrap());
         stream.write_all(b"ready").unwrap();
-        // Keep the request thread busy independently of the socket, just as
-        // native compilation does. Only the watcher can terminate this child.
+        // Park this thread without ever reading the socket, as the real request
+        // loop is stuck inside a long ANE compile. The only way this child can
+        // exit is the watcher seeing the owner disconnect.
         loop {
             std::thread::park();
         }
@@ -549,8 +550,9 @@ mod supervisor_tests {
     }
 
     fn process_cpu_seconds(pid: u32) -> f64 {
-        // RUSAGE_INFO_V0 starts with a 16-byte UUID and user/system CPU ticks.
-        // CPU ticks use the Mach timebase, not nanoseconds on Apple Silicon.
+        // RUSAGE_INFO_V0 starts with a 16-byte UUID, then user and system CPU
+        // time in Mach ticks. Convert ticks to seconds with the Mach timebase;
+        // on Apple Silicon a tick is not one nanosecond.
         let mut info = [0_u64; 12];
         let mut timebase = Timebase { numer: 0, denom: 0 };
         unsafe {
