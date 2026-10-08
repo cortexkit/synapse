@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@cortexkit/anthropic-auth-core": "file:../../../anthropic-auth/packages/core"
+    "@cortexkit/anthropic-auth-core": "^1.23.0"
   },
   "scripts": {
     "start": "bun run src/cli.ts",
