@@ -12201,8 +12201,10 @@ async fn execute_embedding_with_catalog_guard(
         None
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
-    // A profile self-check already owns the lane lock. Acquire lanes before
-    // permits everywhere so a waiter cannot consume its last execution slot.
+    // Take the lane lock before an execution permit, in every execute_* path.
+    // A profile self-check holds the lane lock while it executes; if callers
+    // took a permit first, requests queued on that lane could hold every
+    // permit while waiting for the lock, and the self-check could never run.
     let permit = acquire_execution_permit(runtime, deadline).await?;
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
@@ -12631,9 +12633,9 @@ async fn execute_generate(
     deadline: Option<tokio::time::Instant>,
     job_id: Option<&str>,
 ) -> Result<GenerateOutput, WireOperationError> {
-    let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
+    // Lane lock before permit, the same order as execute_embedding.
     let catalog_guard = if catalog_lane {
         Some(
             catalog_lane_lock(runtime, &model.model_id)
@@ -12644,6 +12646,7 @@ async fn execute_generate(
         None
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     let result = match &model.backend {
         #[cfg(unix)]
         EmbedBackend::DirectAne(_) => Err(artifact_invalid_error(
