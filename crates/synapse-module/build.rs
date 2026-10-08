@@ -16,10 +16,29 @@ fn main() {
     let workspace = Path::new(&manifest_dir).join("../..");
     let git_dir = workspace.join(".git");
     if git_dir.exists() {
-        // HEAD and refs move on a commit or checkout; the index moves on add.
-        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-        println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
-        println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+        // A worktree's .git entry is a pointer file, not a directory. Resolve
+        // real metadata paths instead of registering always-stale missing files.
+        let mut names = vec![
+            "HEAD".to_string(),
+            "index".to_string(),
+            "packed-refs".to_string(),
+        ];
+        // Other branches moving do not change this checkout's provenance, so
+        // watch this branch's loose ref rather than the whole common refs tree.
+        // Switching branches or detaching rewrites the separately watched HEAD.
+        if let Some(reference) = git(&manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
+            names.push(reference);
+        }
+        for name in names {
+            if let Some(path) = git(&manifest_dir, &["rev-parse", "--git-path", &name]) {
+                let path = Path::new(&manifest_dir).join(path);
+                // Packed references and loose branch refs are optional. A
+                // missing watch would force a rebuild on every Cargo invocation.
+                if path.exists() {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+            }
+        }
         // An unstaged edit touches none of those, and a cached "clean" stamp
         // over edited sources would attest code HEAD does not describe. So the
         // source trees this binary is built from also rerun the script.
@@ -54,6 +73,9 @@ fn main() {
 
 fn git(dir: &str, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
+        // These queries must not refresh the watched index as a side effect,
+        // or observing provenance would invalidate Cargo's own fingerprint.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .current_dir(dir)
         .output()

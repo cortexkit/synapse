@@ -17830,6 +17830,13 @@ mod tests {
 
     #[test]
     fn manifest_provenance_declares_only_facts_this_binary_knows() {
+        // Report the compiled inputs so clean/dirty cache drills observe the
+        // artifact's stamp rather than the checkout's current git status.
+        println!(
+            "SYNAPSE_BUILD_REV={}; SYNAPSE_BUILD_TREE={}",
+            option_env!("SYNAPSE_BUILD_REV").unwrap_or("absent"),
+            option_env!("SYNAPSE_BUILD_TREE").unwrap_or("absent")
+        );
         let provenance = manifest("synapse")
             .provenance
             .expect("an SDK module always has at least one honest provenance fact");
