@@ -4,17 +4,14 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-# Deliberately outside the synapse workspace: this probe links an external
-# MIT-licensed crate from a local clone, and vendoring that path into the
-# workspace manifest would make every workspace build depend on a checkout
-# that is not part of this repository.
+# Keep the experimental probe in its own workspace so its build and lockfile
+# remain independent of the production workers.
 [workspace]
 
 [dependencies]
-# Relative rather than absolute: this file is tracked in a public repository,
-# so an absolute path would publish the operator's home directory. The clone is
-# expected as a sibling of the CortexKit projects directory.
-ane = { path = "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane" }
+# Use the production direct-ANE worker's vendored binding, including its local
+# compatibility and resource-management fixes, so offline builds need no clone.
+ane = { path = "../../../crates/synapse-worker-ane-direct/vendor/ane" }
 anyhow = "1.0"
 half = "2.7"
 libm = "0.2"
