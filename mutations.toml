@@ -573,3 +573,24 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "wire-registry-source-scan"
+guards = "Every production management operation must appear in the consumer wire inventory"
+file = "crates/synapse-module/src/lib.rs"
+old = 'op("models.catalog", Query),'
+new = """
+op("models.catalog", Query),
+        op("models.undocumented", Query), // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-module/tests/wire_contract.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--test wire_contract"
+select = "expected"
+expect_red = ["management_registry_matches_wire_contract"]
+expect_message = "assertion `left == right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
