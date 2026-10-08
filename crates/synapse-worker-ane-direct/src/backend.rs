@@ -1326,13 +1326,18 @@ mod fresh_process_hardware {
     #[ignore = "quiet-window Qwen capacity measurement with manifest-pinned packages"]
     fn fresh_process_qwen_single_shape_admission() {
         let mut load = [0.0; 3];
-        // Run this capacity measurement only when the one-minute system load
-        // average is below 16, as required for hardware certification. Refuse
-        // before creating Neural Engine programs so a busy-host result is not
-        // reported as evidence measured under those conditions.
+        // By default, run this capacity measurement only when the one-minute
+        // system load average is below 16, and refuse before creating Neural
+        // Engine programs so a busy-host result is not reported as quiet-host
+        // evidence. SYNAPSE_BENCH_ALLOW_LOAD=1 runs it anyway for a rough
+        // answer; the load is printed either way.
         assert_eq!(unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }, 3);
         println!("QWEN_SHAPE load_before={load:?}");
-        assert!(load[0] < 16.0, "quiet-window load gate refused");
+        let allow_load = std::env::var_os("SYNAPSE_BENCH_ALLOW_LOAD").is_some_and(|v| v == "1");
+        assert!(
+            allow_load || load[0] < 16.0,
+            "quiet-window load gate refused"
+        );
         let slug = std::env::var("ANE_TEST_MODEL").expect("ANE_TEST_MODEL");
         assert!(matches!(
             slug.as_str(),

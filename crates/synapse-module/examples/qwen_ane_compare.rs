@@ -31,10 +31,20 @@ fn quiet() -> Result<Vec<f64>> {
         .split_whitespace()
         .filter_map(|part| part.parse::<f64>().ok())
         .collect::<Vec<_>>();
-    ensure!(
-        quiet_load(&values),
-        "quiet-window load gate refused: {values:?}"
-    );
+    // A rough comparison on a busy shared Mac is still useful, since both
+    // arms run interleaved under the same load. SYNAPSE_BENCH_ALLOW_LOAD=1
+    // skips the gate; the load is still recorded in the report.
+    if std::env::var_os("SYNAPSE_BENCH_ALLOW_LOAD").is_some_and(|v| v == "1") {
+        ensure!(
+            values.len() == 3 && values.iter().all(|value| value.is_finite()),
+            "could not read the load average: {values:?}"
+        );
+    } else {
+        ensure!(
+            quiet_load(&values),
+            "quiet-window load gate refused: {values:?}"
+        );
+    }
     Ok(values)
 }
 
