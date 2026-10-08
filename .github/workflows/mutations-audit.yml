@@ -22,11 +22,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      # Windows runners check text out with CRLF by default; the mutation
-      # runner needs each target byte-identical to `git show HEAD:<file>`.
-      - name: Check out without line-ending conversion
-        shell: bash
-        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -49,7 +44,7 @@ jobs:
       - name: Install pinned mutation runner
         shell: bash
         run: |
-          cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
+          cargo install --locked --git https://github.com/cortexkit/commons --rev ac214583ad3613765dc1a2d81c744867382c4c2c cortexkit-mutate
           ckdev-mutate --version
       - name: Audit all package test targets
         shell: bash

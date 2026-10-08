@@ -61,13 +61,6 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
-      # Windows runners set core.autocrlf=true globally, which checks text out
-      # with CRLF. The mutation runner refuses any target whose bytes differ
-      # from `git show HEAD:<file>`, so the tree must match the index exactly.
-      - name: Check out without line-ending conversion
-        shell: bash
-        run: git config --global core.autocrlf false
-
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
@@ -293,7 +286,7 @@ jobs:
         working-directory: synapse
         shell: bash
         run: |
-          cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
+          cargo install --locked --git https://github.com/cortexkit/commons --rev ac214583ad3613765dc1a2d81c744867382c4c2c cortexkit-mutate
           ckdev-mutate --version
 
       - name: Replay touched mutation controls
@@ -306,6 +299,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
           ckdev-mutate check
+          mkdir -p target/mutations
           ckdev-mutate run --diff origin/master --report target/mutations/diff.json
 
       - name: Retain touched mutation evidence

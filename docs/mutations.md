@@ -14,8 +14,8 @@ Install `cortexkit-mutate` at the commit this catalogue was proved with (the sam
 one CI installs), not the latest release:
 
 ```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
-ckdev-mutate --version # 0.9.3
+cargo install --locked --git https://github.com/cortexkit/commons --rev ac214583ad3613765dc1a2d81c744867382c4c2c cortexkit-mutate
+ckdev-mutate --version # 0.9.6
 cargo nextest --version
 mkdir -p target/mutations
 ckdev-mutate check
@@ -87,7 +87,7 @@ selection the test actually needs. Declare fixture binary builds in a root
 so a stale executable cannot falsely defend a guard. An `equivalent` disposition
 requires an `equivalent_guard` explaining why behavior really cannot differ; a
 green test suite alone is not evidence of equivalence. See the [pinned runner
-README](https://github.com/cortexkit/commons/blob/c1591d4a76fa3d3a7367237922b0bca5214dbf11/crates/cortexkit-mutate/README.md)
+README](https://github.com/cortexkit/commons/blob/ac214583ad3613765dc1a2d81c744867382c4c2c/crates/cortexkit-mutate/README.md)
 for multi-edit anchors, command rows, platform selection, and HUB review.
 
 ## Mac replay and desktop-only rows
