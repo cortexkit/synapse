@@ -7,10 +7,10 @@
 {
   "machine": "m5-local",
   "harness_path": "bench/campaign/ane-direct-embed-harness.sh",
-  "harness_sha256": "a12d2e2fff1c470b7f8b2e5b879f54b98e47039869f36672db790de73c50399c",
+  "harness_sha256": "5559c4f37acfab7f15ffc01d57074bb1003ef2f1423f3929e05ac863e0a782a9",
   "parameters": {},
   "parity_command": {
-    "harness_sha256": "a12d2e2fff1c470b7f8b2e5b879f54b98e47039869f36672db790de73c50399c",
+    "harness_sha256": "5559c4f37acfab7f15ffc01d57074bb1003ef2f1423f3929e05ac863e0a782a9",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
@@ -20,8 +20,7 @@
       "SYNAPSE_CAMPAIGN_MODEL": "<RIG>/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22",
       "SYNAPSE_CAMPAIGN_MODEL_SHA256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
       "SYNAPSE_CAMPAIGN_ROWS_SHA256": "f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39",
-      "SYNAPSE_CAMPAIGN_ANE_BINDING": "<RIG>/OSS/siliconswarm-at-ensue-plugin",
-      "SYNAPSE_CAMPAIGN_ANE_BINDING_COMMIT": "ec54af9501d4bfd0cf3a4b162e59022dee2118cb",
+      "SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256": "5bdccf21d6a17a7f7028df00758b89bcd4d0d14c4c4d24cc16dd7fa4edc9c4df",
       "SYNAPSE_CAMPAIGN_CARGO": "<RIG>/.cargo/bin/cargo",
       "RUSTUP_HOME": "<RIG>/.rustup",
       "CARGO_HOME": "<RIG>/.cargo",
@@ -30,7 +29,7 @@
     }
   },
   "objective_command": {
-    "harness_sha256": "a12d2e2fff1c470b7f8b2e5b879f54b98e47039869f36672db790de73c50399c",
+    "harness_sha256": "5559c4f37acfab7f15ffc01d57074bb1003ef2f1423f3929e05ac863e0a782a9",
     "program": "{harness}",
     "args": ["{workspace}", "{candidate_runner}", "{result}"],
     "env": {
@@ -40,8 +39,7 @@
       "SYNAPSE_CAMPAIGN_MODEL": "<RIG>/.cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots/e7f32e3c00f91d699e8c43b53106206bcc72bb22",
       "SYNAPSE_CAMPAIGN_MODEL_SHA256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
       "SYNAPSE_CAMPAIGN_ROWS_SHA256": "f4889a38df77b9940ce973c4d9b82857d0c401987ae8e77b5ca25e6062808c39",
-      "SYNAPSE_CAMPAIGN_ANE_BINDING": "<RIG>/OSS/siliconswarm-at-ensue-plugin",
-      "SYNAPSE_CAMPAIGN_ANE_BINDING_COMMIT": "ec54af9501d4bfd0cf3a4b162e59022dee2118cb",
+      "SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256": "5bdccf21d6a17a7f7028df00758b89bcd4d0d14c4c4d24cc16dd7fa4edc9c4df",
       "SYNAPSE_CAMPAIGN_CARGO": "<RIG>/.cargo/bin/cargo",
       "RUSTUP_HOME": "<RIG>/.rustup",
       "CARGO_HOME": "<RIG>/.cargo",
@@ -67,7 +65,8 @@
     "bench/spikes/ane-direct-probe/rows.jsonl",
     "bench/spikes/ane-direct-probe/src/main.rs",
     "bench/spikes/ane-direct-probe/Cargo.toml",
-    "bench/spikes/ane-direct-probe/Cargo.lock"
+    "bench/spikes/ane-direct-probe/Cargo.lock",
+    "crates/synapse-worker-ane-direct/vendor/ane"
   ],
   "load_threshold_1m": 16,
   "action_timeout_seconds": 1800,

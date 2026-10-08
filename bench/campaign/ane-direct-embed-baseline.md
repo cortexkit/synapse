@@ -38,7 +38,10 @@ that buys speed with precision fails rather than scores.
 
 ## Pinned baseline
 
-Measured with this harness, on this machine, under the objective above.
+Measured with the external upstream binding at ec54af9, on this machine, under
+the objective above. These historical numbers remain pinned for reference, not
+as a re-measurement of the vendored binding now used by the harness; re-measure
+before the next campaign (see the [current binding contract and pins](README.md#ane-direct-api-embedding-campaign)).
 
 ```
 aggregate_tok_s @ 512   9222.454033809034

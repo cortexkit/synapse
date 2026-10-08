@@ -179,3 +179,35 @@ The result file had mode `0600`:
 
 The median is 0.08% above the frozen 40.55 tok/s reference and therefore within
 normal run noise.
+
+## ANE direct-API embedding campaign
+
+[`ane-direct-embed-harness.sh`](ane-direct-embed-harness.sh) builds the standalone
+probe against `crates/synapse-worker-ane-direct/vendor/ane`, the same binding used
+by the production direct-ANE worker, so the staged workspace needs no external
+clone or `SYNAPSE_CAMPAIGN_ANE_BINDING` setting. Its upstream provenance and local
+fixes are recorded in the binding's `VENDORED.md`; the local copy is not
+byte-identical to the upstream revision.
+
+The harness pins `.cargo-checksum.json` itself and verifies every listed file,
+the inventory, and the absence of symlinks before admission and again after
+staging, refusing changes by file name. The binding tree and probe manifest and
+lockfile are protected alongside the existing rows, comparator, and gate wiring.
+The registration template records the checksum manifest pin as
+`SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256`; the live lab registry must use the matching
+harness blob and pins before another campaign starts.
+
+| protected input | SHA-256 |
+|---|---|
+| harness | `5559c4f37acfab7f15ffc01d57074bb1003ef2f1423f3929e05ac863e0a782a9` |
+| probe `Cargo.toml` | `08fa29887f44c848dc65b0eaee1c20b851984d6d3bc2a70b5c8d0df953d34a71` |
+| probe `Cargo.lock` | `d538c5e8a902f6270c44115b289c9cc98cba75cfeee119300a95aa8257841566` |
+| vendor `.cargo-checksum.json` | `5bdccf21d6a17a7f7028df00758b89bcd4d0d14c4c4d24cc16dd7fa4edc9c4df` |
+
+Run `bash bench/campaign/ane-direct-embed-harness.sh --self-test .` without model
+weights to check the unchanged contract and load gate, named refusals for edited,
+missing, added, or symlinked binding files, the checksum manifest and dependency
+path, and acceptance of the unmodified workspace and staged copy.
+
+The throughput baseline must be re-measured before the next campaign because
+the binding is now the vendored copy rather than upstream ec54af9.

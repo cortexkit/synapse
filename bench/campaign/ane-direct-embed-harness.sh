@@ -30,15 +30,19 @@ MODEL_COMPONENT_SHA256 = {
     "config.json": "8ba54dc3d35d7194f5178a4194b649f146753e02dabd22bdca5c5cbac15069ed",
     "model.safetensors": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
 }
-BINDING_COMMIT = "ec54af9501d4bfd0cf3a4b162e59022dee2118cb"
+# Pin the checksum manifest itself so a candidate cannot bless edited binding
+# sources by recomputing their checksums. The vendored copy includes local fixes
+# and is not identified solely by its upstream revision.
+VENDOR_CHECKSUM_SHA256 = "5bdccf21d6a17a7f7028df00758b89bcd4d0d14c4c4d24cc16dd7fa4edc9c4df"
 PROBE_MAIN_SHA256 = "6fb9f3e6666501d3d721c538d13634ea48e38dd4c7baa80d07ea41e975118a1a"
-CARGO_TOML_SHA256 = "fb8879f32857ef99f7945a0ba728d9cd711d1455f513d7347a1a4a51ed7ddd47"
-CARGO_LOCK_SHA256 = "c1d21e074012193f57b8c5bde32e36d564fa77bd79ebb15080ac6e062086b89d"
+CARGO_TOML_SHA256 = "08fa29887f44c848dc65b0eaee1c20b851984d6d3bc2a70b5c8d0df953d34a71"
+CARGO_LOCK_SHA256 = "d538c5e8a902f6270c44115b289c9cc98cba75cfeee119300a95aa8257841566"
 PROTECTED_RUST_SHA256 = "d95d893622af6e266fb518847ccd92040374f48084ead5bf11b7981f8de4d5e5"
 EXPECTED_ANE_DEPENDENCY = (
-    'ane = { path = "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane" }'
+    'ane = { path = "../../../crates/synapse-worker-ane-direct/vendor/ane" }'
 )
 PROBE_DIR = Path("bench/spikes/ane-direct-probe")
+VENDOR_DIR = Path("crates/synapse-worker-ane-direct/vendor/ane")
 FULL_MODEL = PROBE_DIR / "src/bin/modernbert_full.rs"
 ROWS = PROBE_DIR / "rows.jsonl"
 SEQUENCES = (512, 1024, 2048)
@@ -182,7 +186,7 @@ def configured_constants() -> None:
     expected = {
         "SYNAPSE_CAMPAIGN_ROWS_SHA256": ROW_SET_SHA256,
         "SYNAPSE_CAMPAIGN_MODEL_SHA256": MODEL_COMPONENT_SHA256["model.safetensors"],
-        "SYNAPSE_CAMPAIGN_ANE_BINDING_COMMIT": BINDING_COMMIT,
+        "SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256": VENDOR_CHECKSUM_SHA256,
     }
     for name, pinned in expected.items():
         if os.environ.get(name, pinned) != pinned:
@@ -308,10 +312,67 @@ def protected_rust_digest(path: Path) -> str:
     return hashlib.sha256("\n\0\n".join(pieces).encode()).hexdigest()
 
 
+def verify_vendored_binding(workspace: Path) -> None:
+    root = workspace / VENDOR_DIR
+    try:
+        # Reject directory redirects as well as file symlinks: every binding
+        # byte must come from the protected, staged workspace, not a sibling.
+        directory = workspace
+        for part in VENDOR_DIR.parts:
+            directory = directory / part
+            if not stat.S_ISDIR(os.lstat(directory).st_mode):
+                raise CandidateRejected(f"protected vendored ANE directory changed: {directory}")
+        checksum = root / ".cargo-checksum.json"
+        verify_regular_file(checksum, "protected vendored ANE checksum manifest")
+        if sha256_file(checksum) != VENDOR_CHECKSUM_SHA256:
+            raise CandidateRejected(f"protected vendored ANE file changed: {checksum}")
+        expected = json.loads(checksum.read_text())["files"]
+        expected_directories = {
+            parent.as_posix()
+            for name in expected
+            for parent in Path(name).parents
+            if parent != Path(".")
+        }
+        observed = set()
+        for parent, directories, files in os.walk(root):
+            directories.sort()
+            for name in sorted(directories):
+                path = Path(parent) / name
+                if path.is_symlink():
+                    raise CandidateRejected(f"protected vendored ANE directory changed: {path}")
+                if path.relative_to(root).as_posix() not in expected_directories:
+                    raise CandidateRejected(f"unexpected protected vendored ANE directory: {path}")
+            for name in sorted(files):
+                path = Path(parent) / name
+                relative = path.relative_to(root).as_posix()
+                if relative == ".cargo-checksum.json":
+                    continue
+                if relative not in expected:
+                    raise CandidateRejected(f"unexpected protected vendored ANE file: {path}")
+                verify_regular_file(path, "protected vendored ANE file")
+                if sha256_file(path) != expected[relative]:
+                    raise CandidateRejected(f"protected vendored ANE file changed: {path}")
+                observed.add(relative)
+        missing = sorted(set(expected) - observed)
+        if missing:
+            raise CandidateRejected(f"protected vendored ANE file is missing: {root / missing[0]}")
+    except CandidateRejected:
+        raise
+    except (HarnessError, OSError, UnicodeDecodeError, ValueError) as error:
+        raise CandidateRejected(f"vendored ANE binding refused: {error}") from error
+
+
 def verify_candidate_contract(workspace: Path) -> None:
     probe = workspace / PROBE_DIR
     rows = workspace / ROWS
     model_source = workspace / FULL_MODEL
+    verify_regular_file(probe / "Cargo.toml", "standalone probe manifest")
+    manifest = (probe / "Cargo.toml").read_text()
+    # Name a dependency relocation before the broader manifest digest refusal
+    # so the operator can distinguish a binding swap from another manifest edit.
+    if manifest.count(EXPECTED_ANE_DEPENDENCY) != 1:
+        raise CandidateRejected("ANE path dependency changed; refusing an alternate binding location")
+    verify_vendored_binding(workspace)
     files = [
         (rows, "protected row set", ROW_SET_SHA256),
         (probe / "src/main.rs", "private-API identity probe", PROBE_MAIN_SHA256),
@@ -330,9 +391,6 @@ def verify_candidate_contract(workspace: Path) -> None:
             "protected CPU comparator or gate wiring changed: "
             f"expected {PROTECTED_RUST_SHA256}, got {actual_protected}"
         )
-    manifest = (probe / "Cargo.toml").read_text()
-    if manifest.count(EXPECTED_ANE_DEPENDENCY) != 1:
-        raise CandidateRejected("ANE path dependency changed; refusing an alternate binding location")
 
 
 def run_command(argv: Sequence[str], log_path: Path, cwd: Optional[Path] = None) -> int:
@@ -386,37 +444,6 @@ def runner_failure(status: int, log_path: Path) -> str:
     return f"exit status {status}; output: {output[-4096:] if output else '<runner wrote nothing>'}"
 
 
-def git_output(repo: Path, args: Sequence[str], label: str) -> str:
-    completed = subprocess.run(
-        ["/usr/bin/git", "-C", str(repo), *args],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stdout + completed.stderr).strip()
-        raise HarnessError(f"{label}: git {' '.join(args)} failed: {detail or '<empty>'}")
-    return completed.stdout.strip()
-
-
-def verify_binding_source(binding: Path) -> None:
-    if not binding.is_dir():
-        raise HarnessError(f"pinned ANE binding clone is missing: {binding}")
-    head = git_output(binding, ["rev-parse", "HEAD"], "ANE binding clone")
-    if head != BINDING_COMMIT:
-        raise HarnessError(
-            f"ANE binding clone commit mismatch: expected {BINDING_COMMIT}, got {head or '<empty>'}"
-        )
-    status = git_output(
-        binding,
-        ["status", "--porcelain", "--untracked-files=all", "--", "ane_kernel/crates/ane"],
-        "ANE binding crate",
-    )
-    if status:
-        raise HarnessError("ANE binding crate has local changes; refusing an unpinned dependency tree")
-
-
 def copy_tree(runner: Path, source: Path, destination: Path, log_path: Path) -> None:
     status = run_through_runner(runner, ["/bin/cp", "-cR", str(source), str(destination)], log_path)
     if status != 0:
@@ -430,23 +457,19 @@ def copy_tree(runner: Path, source: Path, destination: Path, log_path: Path) -> 
 
 
 def stage_sources(
-    workspace: Path, binding: Path, temp_root: Path, runner: Path
+    workspace: Path, temp_root: Path, runner: Path
 ) -> Tuple[Path, Path, Path]:
     stage_root = temp_root / "build"
-    workspace_parent = stage_root / "Projects/CortexKit"
-    binding_parent = stage_root / "OSS"
     mkdir_log = temp_root / "stage-mkdir.log"
     status = run_through_runner(
-        runner, ["/bin/mkdir", "-p", str(workspace_parent), str(binding_parent)], mkdir_log
+        runner, ["/bin/mkdir", "-p", str(stage_root)], mkdir_log
     )
     if status != 0:
         raise HarnessError(
             f"candidate runner could not create staging directories: {runner_failure(status, mkdir_log)}"
         )
-    staged_workspace = workspace_parent / "synapse"
-    staged_binding = binding_parent / "siliconswarm-at-ensue-plugin"
+    staged_workspace = stage_root / "synapse"
     copy_tree(runner, workspace, staged_workspace, temp_root / "workspace-copy.log")
-    copy_tree(runner, binding, staged_binding, temp_root / "binding-copy.log")
     # The copies are made as the candidate, so they carry the candidate's modes
     # (the workspace root is 700) and none of the controller read grant, which
     # the driver writes only on the candidate's own workspace directories. The
@@ -477,22 +500,12 @@ def stage_sources(
             f"candidate output directories are not writable: {runner_failure(status, output_chmod_log)}"
         )
     verify_candidate_contract(staged_workspace)
-    status, head, head_stderr = runner_stdout(
-        runner,
-        ["/usr/bin/git", "-c", f"safe.directory={staged_binding}", "-C", str(staged_binding), "rev-parse", "HEAD"],
-        temp_root / "staged-binding-head.log",
-    )
-    if status != 0 or head != BINDING_COMMIT:
-        raise HarnessError(
-            f"staged ANE binding clone is not at pinned commit {BINDING_COMMIT}: "
-            f"exit status {status}; stdout: {head or '<empty>'}; stderr: {head_stderr[-2048:] or '<empty>'}"
-        )
     resolved_dependency = (
-        staged_workspace / PROBE_DIR / "../../../../../../OSS/siliconswarm-at-ensue-plugin/ane_kernel/crates/ane"
+        staged_workspace / PROBE_DIR / "../../../crates/synapse-worker-ane-direct/vendor/ane"
     ).resolve()
-    expected_dependency = (staged_binding / "ane_kernel/crates/ane").resolve()
+    expected_dependency = (staged_workspace / VENDOR_DIR).resolve()
     if resolved_dependency != expected_dependency or not expected_dependency.is_dir():
-        raise HarnessError("staged ANE dependency does not resolve inside the pinned binding clone")
+        raise HarnessError("staged ANE dependency does not resolve to the protected vendored binding")
     return staged_workspace, target, output_root
 
 
@@ -787,13 +800,8 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
                 str(Path.home() / ".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots" / MODEL_REVISION),
             )
         ).expanduser().resolve()
-        binding_value = os.environ.get("SYNAPSE_CAMPAIGN_ANE_BINDING")
-        if not binding_value:
-            raise HarnessError("SYNAPSE_CAMPAIGN_ANE_BINDING is required for the pinned private-API clone")
-        binding = Path(binding_value).expanduser().resolve()
-        verify_binding_source(binding)
         model_components = verify_model_snapshot(model)
-        staged_workspace, target, output_root = stage_sources(workspace, binding, temp_root, runner)
+        staged_workspace, target, output_root = stage_sources(workspace, temp_root, runner)
         commit = workspace_commit(runner, staged_workspace, temp_root / "workspace-commit.log")
         environment = candidate_environment(target)
         cargo = os.environ.get("SYNAPSE_CAMPAIGN_CARGO") or shutil.which("cargo")
@@ -859,7 +867,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         objective = measurements[0]
         min_cosine = min(item["min_cosine"] for item in measurements)
         note = (
-            f"{baseline_note} Row set SHA-256={ROW_SET_SHA256}; binding commit={BINDING_COMMIT}; "
+            f"{baseline_note} Row set SHA-256={ROW_SET_SHA256}; vendored binding checksum manifest SHA-256={VENDOR_CHECKSUM_SHA256}; "
             f"minimum cosine across shapes={min_cosine:.9f}; one-minute load threshold={maximum_load:.2f}. "
             f"A threshold of {DEFAULT_MAX_LOAD_1M:g} admits this shared workstation's normal background load and therefore carries more "
             "absolute variance than a dedicated 2.5-load rig; every shape records admission, in-report, and completion load."
@@ -921,6 +929,72 @@ def self_test(workspace_arg: Optional[str]) -> int:
         assert "LOAD_PREFLIGHT_REFUSED" in str(error)
     else:
         raise AssertionError("load preflight did not refuse")
+    print("test existing comparator, report, and load checks ... ok")
+    print("test unmodified_tree_accepted ... ok")
+    failures = []
+
+    def expect_refusal(name: str, fixture: Path, detail: str) -> None:
+        try:
+            verify_candidate_contract(fixture)
+        except CandidateRejected as error:
+            if detail in str(error):
+                print(f"test {name} ... ok (refused: {error})")
+                return
+            failures.append(f"{name}: wrong refusal: {error}")
+        else:
+            failures.append(f"{name}: planted change was accepted")
+        print(f"test {name} ... FAIL ({failures[-1]})")
+
+    # Plant only in temporary copies. Checking the whole candidate contract
+    # proves these protections are wired into admission, not merely callable.
+    with tempfile.TemporaryDirectory(prefix="synapse-ane-contract-self-test-") as temporary:
+        temp_root = Path(temporary)
+        fixture = temp_root / "workspace"
+        shutil.copytree(workspace / PROBE_DIR, fixture / PROBE_DIR, ignore=shutil.ignore_patterns("target"))
+        shutil.copytree(workspace / VENDOR_DIR, fixture / VENDOR_DIR)
+        vendor_file = fixture / VENDOR_DIR / "src/lib.rs"
+        original = vendor_file.read_bytes()
+        vendor_file.write_bytes(original + b"\n// planted edited binding\n")
+        expect_refusal("edited_vendored_file_refused_by_name", fixture, str(VENDOR_DIR / "src/lib.rs"))
+        vendor_file.write_bytes(original)
+
+        checksum = fixture / VENDOR_DIR / ".cargo-checksum.json"
+        original_checksum = checksum.read_bytes()
+        checksum.write_bytes(original_checksum + b"\n")
+        expect_refusal("edited_vendor_checksum_manifest_refused", fixture, str(VENDOR_DIR / ".cargo-checksum.json"))
+        checksum.write_bytes(original_checksum)
+
+        vendor_file.unlink()
+        expect_refusal("missing_vendored_file_refused_by_name", fixture, str(VENDOR_DIR / "src/lib.rs"))
+        vendor_file.write_bytes(original)
+
+        added = fixture / VENDOR_DIR / "extra.rs"
+        added.write_text("// planted added binding file\n")
+        expect_refusal("added_vendored_file_refused_by_name", fixture, str(VENDOR_DIR / "extra.rs"))
+        added.unlink()
+
+        redirect = temp_root / "redirect.rs"
+        redirect.write_bytes(original)
+        vendor_file.unlink()
+        vendor_file.symlink_to(redirect)
+        expect_refusal("symlinked_vendored_file_refused_by_name", fixture, str(VENDOR_DIR / "src/lib.rs"))
+        vendor_file.unlink()
+        vendor_file.write_bytes(original)
+
+        manifest = fixture / PROBE_DIR / "Cargo.toml"
+        original_manifest = manifest.read_text()
+        manifest.write_text(original_manifest.replace(EXPECTED_ANE_DEPENDENCY, 'ane = { path = "../alternate-ane" }'))
+        expect_refusal("changed_probe_dependency_path_refused", fixture, "ANE path dependency changed")
+        manifest.write_text(original_manifest)
+
+        runner = temp_root / "runner.sh"
+        runner.write_text('#!/bin/sh\nexec "$@"\n')
+        runner.chmod(0o755)
+        stage_sources(fixture, temp_root, runner)
+        print("test unmodified_staged_tree_accepted ... ok")
+    if failures:
+        print(f"ane-direct-embed-harness self-test FAILED: {len(failures)} planted arms", file=sys.stderr)
+        return 1
     print("ane-direct-embed-harness self-test passed")
     return 0
 
