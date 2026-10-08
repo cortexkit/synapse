@@ -173,3 +173,77 @@ The direct ANE worker **runs rows one at a time**: its batch handler loops over
 the flattened row slices and calls `Model::run` once per row. Each row executes
 the layer chain separately. A 64-row call is not a multi-row ANE dispatch, and
 two concurrent calls do not make those layer executables batch-vectorized.
+
+## AFT head-to-head
+
+`aft_embed_headtohead` replays the 6,341 exported document chunks in the metadata's
+127-batch order, with two requests in flight and immediate replenishment on
+completion. Texts are sent as-is, with no query instruction prefix. Each arm
+warms the first batch once, then times the entire replay including that batch.
+The ANE decision bar is **wall time at most 2× Bionic**, freeing the GPU even if
+ANE is slower. Metal is a reference, not the decision baseline.
+
+This driver **does not refuse on load**: it records one-minute load at each
+arm's start and end, plus samples every 30 seconds during warmup/replay. Busy
+shared-machine results are rough measurements, not quiet-window certification.
+The Synapse arms verify the pinned original checkpoint and share the existing
+comparison's private daemon, production candidate, profiles, and `ckdev-*` hard
+links. They never discover or contact the production daemon. The aggregate
+inline token budget accommodates 64 full-context rows without changing the
+model's per-row limit. Any inline diversion, provider error/refusal, wrong row
+count/dimension, or non-finite vector fails the run; Synapse vectors must also
+be L2-normalized within 1e-3. Bionic normalization is recorded but not required.
+
+Build the candidate/worker as above and build the examples. Set
+`SYNAPSE_QWEN_WEIGHTS` to the pinned checkpoint directory from the setup above.
+Run from the checkout root:
+
+```sh
+env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  CARGO_BUILD_JOBS=1 cargo build --release --locked \
+  -p synapse-module -p synapse-worker-ane-direct
+env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  CARGO_BUILD_JOBS=1 cargo build --release --locked -p synapse-module --examples
+
+: "${SYNAPSE_QWEN_WEIGHTS:?set the pinned Qwen checkpoint directory}"
+export SYNAPSE_COMPARE_ASSETS="$PWD/target/release"
+export SYNAPSE_HEADTOHEAD_INPUT="$HOME/.local/share/cortexkit/synapse/aft-headtohead/engram.jsonl"
+export SYNAPSE_HEADTOHEAD_OUT="$HOME/Backups/synapse-cert-dev/aft-headtohead.json"
+
+# Pause AFT's own embedding fills before Bionic; the driver cannot verify this.
+env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  SYNAPSE_HEADTOHEAD_ARMS=bionic target/release/examples/aft_embed_headtohead
+
+env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  SYNAPSE_HEADTOHEAD_ARMS=ane target/release/examples/aft_embed_headtohead
+
+env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  SYNAPSE_HEADTOHEAD_ARMS=metal target/release/examples/aft_embed_headtohead
+```
+
+**AFT must pause its fills during the Bionic arm.** Bionic defaults to
+`http://localhost:1234/v1/embeddings`, using
+`text-embedding-qwen3-embedding-0.6b`; override the endpoint with
+`SYNAPSE_HEADTOHEAD_BIONIC_URL`. The input and its adjacent
+`engram.jsonl.meta.json` are both required. The plan must cover every chunk seq
+exactly once, in batches of 1–64 rows. There is no synthetic-workload fallback.
+
+All three commands update the same JSON file, retaining other arms only when
+the input and metadata SHA-256 hashes match. Run them sequentially, not
+concurrently against the same output. Use a fresh output filename for a new
+measurement window; rerunning an arm replaces only that arm. Alternatively set
+`SYNAPSE_HEADTOHEAD_ARMS=bionic,ane,metal` (the default) for one back-to-back run.
+Keep the output outside git. The stdout summary includes `ane_wall / bionic_wall`
+and the 2× decision when both arms succeeded. Errors/refusals are counted by
+code and cause a nonzero exit after writing the arm's report.
+
+The JSON retains vectors for 64 fixed seqs evenly spread across the file and
+reports their median/min cosine for ANE vs Metal and ANE vs Bionic once both
+arms are present. These are liveness sanity checks, **not quality gates**;
+expected cosines are above 0.999 and about 0.99 respectively. No hardware arms
+were run while developing the driver. Pure tests can be run without model
+assets or accelerator inference:
+
+```sh
+cargo test --locked -p synapse-module --example aft_embed_headtohead
+```

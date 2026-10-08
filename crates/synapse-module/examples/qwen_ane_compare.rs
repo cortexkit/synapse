@@ -2,26 +2,15 @@
 //! No request is sent to a discovered or already-running Synapse instance.
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
-use std::{
-    env,
-    path::PathBuf,
-    process::Command,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
-use subc_daemon::{
-    daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
-};
-use subc_protocol::{BindIdentity, RouteTarget};
-use subc_transport::{
-    generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
-};
-use synapse_core::{dev_binary::ckdev_binary_hard_link, SanitizedTokenizer, TokenizerConfig};
-use synapse_parity::{canonical::sha256_file, manifest::Manifest};
-use tokio::net::TcpListener;
+use std::{env, path::PathBuf, process::Command, time::Instant};
+use subc_client_rs::SubcConsumer;
+use subc_protocol::BindIdentity;
+use synapse_core::{SanitizedTokenizer, TokenizerConfig};
+use synapse_parity::canonical::sha256_file;
 
-const MODEL: &str = "qwen3-embedding-0.6b";
+#[path = "support/qwen_compare.rs"]
+mod qwen_compare;
+use qwen_compare::{call, Candidate, MODEL};
 const ARMS: [&str; 2] = ["ane", "metal"];
 
 fn quiet() -> Result<Vec<f64>> {
@@ -52,33 +41,6 @@ fn quiet_load(values: &[f64]) -> bool {
     values.len() == 3
         && values.iter().all(|value| value.is_finite())
         && (0.0..16.0).contains(&values[0])
-}
-
-async fn call(
-    consumer: &SubcConsumer,
-    identity: &BindIdentity,
-    method: &str,
-    params: Value,
-) -> Result<Value> {
-    let bytes = consumer
-        .call(
-            RouteTarget::ManagementSurface {
-                module_id: "synapse".into(),
-            },
-            identity.clone(),
-            serde_json::to_vec(&json!({"method":method,"params":params}))?,
-            CallOptions {
-                timeout: Duration::from_secs(600),
-                ..CallOptions::default()
-            },
-        )
-        .await?;
-    let response: Value = serde_json::from_slice(&bytes)?;
-    ensure!(
-        !response["error"].is_object() && !response["result"]["error"].is_object(),
-        "{method} refused: {response}"
-    );
-    Ok(response["result"].clone())
 }
 
 fn validate_vectors(response: &Value, rows: usize, tokens: Option<usize>) -> Result<()> {
@@ -198,14 +160,8 @@ async fn main() -> Result<()> {
         PathBuf::from(env::var_os("SYNAPSE_QWEN_WEIGHTS").context("SYNAPSE_QWEN_WEIGHTS")?)
             .canonicalize()?;
     let out = PathBuf::from(env::var_os("SYNAPSE_COMPARE_OUT").context("SYNAPSE_COMPARE_OUT")?);
-    let manifest = Manifest::from_slice(include_bytes!("../../../bench/parity/models.json"))?;
+    let manifest = qwen_compare::verify_checkpoint(&weights)?;
     let pinned = manifest.model(MODEL)?;
-    for (file, digest) in &pinned.files {
-        ensure!(
-            sha256_file(&weights.join(file))? == *digest,
-            "original checkpoint digest mismatch: {file}"
-        );
-    }
     let fixture_id = synapse_parity::evaluator::fixture_set_id(&manifest, MODEL);
     let index: Value =
         serde_json::from_slice(include_bytes!("../../../bench/parity/fixtures/index.json"))?;
@@ -229,91 +185,17 @@ async fn main() -> Result<()> {
         },
     )?;
     let chunks = code_chunks(&tokenizer, pinned.grammar.terminal_tokens[0].id)?;
-    let root = checkout
-        .join("target")
-        .join(format!("qwen-compare-{}", std::process::id()));
-    std::fs::create_dir_all(root.join("data"))?;
-    let package = root.join("qwen-ane.safetensors");
-    std::fs::write(
-        &package,
-        synapse_parity::convert::convert_profile_file(
-            &manifest,
-            &format!("{MODEL}.ane-direct-worker"),
-            &weights.join("model.safetensors"),
-        )?,
-    )?;
-    let module = ckdev_binary_hard_link(assets.join("ck-synapse"), &root)?;
-    let worker = ckdev_binary_hard_link(assets.join("ck-synapse-worker-ane-direct"), &root)?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let conn = ConnectionInfo {
-        schema: SCHEMA_VERSION,
-        endpoints: vec![Endpoint {
-            host: "127.0.0.1".into(),
-            port: listener.local_addr()?.port(),
-        }],
-        key: generate_key()?,
-        daemon_id: generate_daemon_id()?,
-        pid: std::process::id(),
-        daemon_ver: "qwen-compare".into(),
-        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
-    };
-    let conn_path = root.join("connection.json");
-    write_atomic(&conn_path, &conn)?;
-    let router = Arc::new(Router::with_control_handler(Arc::new(
-        ControlHandler::new(Arc::new(Registry::default())).with_storage_config(Some(
-            StorageConfig::Sqlite {
-                data_home: root.join("data"),
-            },
-        )),
-    )));
-    let daemon = tokio::spawn(serve_listener(
-        listener,
-        router,
-        ServerAuth::new(conn.key.clone(), conn.daemon_id, conn.daemon_ver.clone()),
-    ));
-    let config = root.join("config.json");
-    std::fs::write(
-        &config,
-        serde_json::to_vec(&json!({"preload_models":[
-        {"model_id":"compare-ane","engine":"ane-direct-worker","profile":format!("{MODEL}.ane-direct-worker"),"task":"embed","model_path":package,"tokenizer_path":weights.join("tokenizer.json"),"pooling":"last","normalize":true,"worker_bin":worker,"execution":"explicit","attention_units":8192*8192},
-        {"model_id":"compare-metal","engine":"owned-metal","profile":format!("{MODEL}.owned-metal"),"task":"embed","model_path":weights.join("model.safetensors"),"tokenizer_path":weights.join("tokenizer.json"),"pooling":"last","normalize":true,"execution":"explicit","attention_units":8192*8192}],
-        "inline":{"max_items":64,"max_tokens":8192,"deadline_ms":600000,"max_queue_ms":600000,"max_concurrent_workers":2}}))?,
-    )?;
-    let mut child = synapse_core::without_launch_nonce_tokio(tokio::process::Command::new(module))
-        .arg("--subc")
-        .arg(&conn_path)
-        .env("SUBC_MODULE_ID", "synapse")
-        .env("SYNAPSE_CONFIG_PATH", config)
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
-        .env("CORTEXKIT_STORE_ROOT", root.join("store"))
-        .kill_on_drop(true)
-        .spawn()?;
-    let consumer = SubcConsumer::connect(&conn_path, ConsumerOptions::default()).await?;
-    let identity = BindIdentity::new(
-        checkout.clone(),
+    let candidate = Candidate::start(
+        &checkout,
+        &assets,
+        &weights,
         "qwen-compare",
-        format!("qwen-compare-{}", std::process::id()),
-    );
-    // Registration is asynchronous. This only polls our own candidate, never
-    // daemon discovery, and the timeout bounds a candidate that cannot load.
-    tokio::time::timeout(Duration::from_secs(600), async {
-        loop {
-            if call(&consumer, &identity, "models.list", json!({}))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            ensure!(
-                child.try_wait()?.is_none(),
-                "candidate exited before registering"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
+        ["compare-ane", "compare-metal"],
+        8192,
+    )
+    .await?;
+    let consumer = &candidate.consumer;
+    let identity = &candidate.identity;
     let mut latency = Vec::new();
     for tokens in [128, 512] {
         let case = fixtures["cases"]
@@ -327,13 +209,13 @@ async fn main() -> Result<()> {
             })
             .context("exact-length fixture")?;
         for arm in ARMS {
-            timed(&consumer, &identity, "embed.query", json!({"model":format!("compare-{arm}"),"text":case["text"],"accept_declared":true}), 1, Some(tokens)).await?;
+            timed(consumer, identity, "embed.query", json!({"model":format!("compare-{arm}"),"text":case["text"],"accept_declared":true}), 1, Some(tokens)).await?;
         }
         let mut samples = [Vec::new(), Vec::new()];
         for repetition in 0..9 {
             for index in if repetition % 2 == 0 { [0, 1] } else { [1, 0] } {
                 let arm = ARMS[index];
-                samples[index].push(timed(&consumer, &identity, "embed.query", json!({"model":format!("compare-{arm}"),"text":case["text"],"accept_declared":true}), 1, Some(tokens)).await?);
+                samples[index].push(timed(consumer, identity, "embed.query", json!({"model":format!("compare-{arm}"),"text":case["text"],"accept_declared":true}), 1, Some(tokens)).await?);
             }
         }
         let medians = samples
@@ -352,8 +234,8 @@ async fn main() -> Result<()> {
     let mut throughput = Vec::new();
     for arm in ARMS {
         timed(
-            &consumer,
-            &identity,
+            consumer,
+            identity,
             "embed.batch",
             batch(arm, &chunks, &format!("warm-{}-{arm}", std::process::id())),
             64,
@@ -366,8 +248,8 @@ async fn main() -> Result<()> {
             let started = Instant::now();
             let (a, b) = tokio::join!(
                 timed(
-                    &consumer,
-                    &identity,
+                    consumer,
+                    identity,
                     "embed.batch",
                     batch(
                         arm,
@@ -378,8 +260,8 @@ async fn main() -> Result<()> {
                     None
                 ),
                 timed(
-                    &consumer,
-                    &identity,
+                    consumer,
+                    identity,
                     "embed.batch",
                     batch(
                         arm,
@@ -405,16 +287,14 @@ async fn main() -> Result<()> {
     }
     std::fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
-    consumer.close().await;
-    child.start_kill()?;
-    child.wait().await?;
-    daemon.abort();
+    candidate.shutdown().await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synapse_parity::manifest::Manifest;
 
     #[test]
     fn quiet_window_excludes_sixteen_and_missing_load() {
