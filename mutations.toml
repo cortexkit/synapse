@@ -806,3 +806,23 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "catalog-ctime-fences-restored-mtime"
+guards = "Restoring the mtime of same-sized corrupt bytes cannot reuse a verification because ctime is part of file identity"
+file = "crates/synapse-module/src/store.rs"
+old = "AND mtime_ns=?9 AND ctime_ns=?10)"
+new = "AND mtime_ns=?9 AND (?10 IS NOT NULL)) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["store::tests::catalog_verification_content_change_with_restored_mtime_is_refused"]
+expect_message = "corrupted artifact must be refused"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
