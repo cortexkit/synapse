@@ -8,8 +8,7 @@
 //! into a startup panic, and nothing in production notices because the daemon
 //! always injects the variable. These tests pin the two arms apart.
 
-#[path = "../common/mod.rs"]
-mod common;
+use super::common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +22,9 @@ fn launch(home: &Path, vars: &[(&str, &str)]) -> String {
 /// `launch`, with a hook that can adjust the command last, after every other
 /// setting, which is where the launch-nonce handoff must be installed.
 fn launch_command(home: &Path, vars: &[(&str, &str)], finish: impl FnOnce(&mut Command)) -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
+    let mut command = Command::new(
+        synapse_core::dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_ck-synapse"), home).unwrap(),
+    );
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

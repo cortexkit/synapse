@@ -33,10 +33,16 @@ fn runtime_dir(label: &str) -> PathBuf {
 
 #[test]
 fn fleet_binary_version_uses_decode_worker_name() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-decode"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let output = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-decode"),
+            std::env::temp_dir().join(format!("decode-transport-{}", std::process::id())),
+        )
+        .unwrap(),
+    )
+    .arg("--version")
+    .output()
+    .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("ck-synapse-worker-decode "));
 }
@@ -46,8 +52,14 @@ fn worker_completes_standard_nonce_handshake_and_ping() {
     let _worker_process_guard = worker_process_lock();
     let runtime_dir = runtime_dir("ping");
     std::fs::create_dir_all(&runtime_dir).unwrap();
-    let config =
-        WorkerHostConfig::new(env!("CARGO_BIN_EXE_ck-synapse-worker-decode"), &runtime_dir);
+    let config = WorkerHostConfig::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-decode"),
+            std::env::temp_dir().join(format!("decode-transport-{}", std::process::id())),
+        )
+        .unwrap(),
+        &runtime_dir,
+    );
     let engine = WorkerEngine::new(config).unwrap();
     let ping = engine.ping().unwrap();
     assert_eq!(ping.models_loaded, 0);
@@ -62,14 +74,20 @@ fn normal_requests_cannot_select_a_certification_forced_fault() {
     std::fs::create_dir_all(&runtime_dir).unwrap();
     let socket_path = runtime_dir.join("worker.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-decode"))
-        .arg("--socket")
-        .arg(&socket_path)
-        .arg("--nonce")
-        .arg("0123456789abcdef")
-        .env_remove("CK_ANE_PREFILL_CERTIFICATION_PROBE")
-        .spawn()
-        .unwrap();
+    let mut child = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-decode"),
+            std::env::temp_dir().join(format!("decode-transport-{}", std::process::id())),
+        )
+        .unwrap(),
+    )
+    .arg("--socket")
+    .arg(&socket_path)
+    .arg("--nonce")
+    .arg("0123456789abcdef")
+    .env_remove("CK_ANE_PREFILL_CERTIFICATION_PROBE")
+    .spawn()
+    .unwrap();
     let (mut stream, _) = listener.accept().unwrap();
     let hello: WorkerHello =
         serde_json::from_slice(&read_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES).unwrap()).unwrap();
@@ -274,8 +292,14 @@ fn supervised_dispatch(
 
     let runtime_dir = runtime_dir(label);
     std::fs::create_dir_all(&runtime_dir).unwrap();
-    let mut config =
-        WorkerHostConfig::new(env!("CARGO_BIN_EXE_ck-synapse-worker-decode"), &runtime_dir);
+    let mut config = WorkerHostConfig::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-decode"),
+            std::env::temp_dir().join(format!("decode-transport-{}", std::process::id())),
+        )
+        .unwrap(),
+        &runtime_dir,
+    );
     config.worker_id = label.to_string();
     config.request_timeout = Duration::from_secs(180);
     config.load_timeout = Duration::from_secs(180);

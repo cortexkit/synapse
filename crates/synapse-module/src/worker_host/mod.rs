@@ -5539,7 +5539,10 @@ pub mod ane_residency {
                     let id = worker_id.clone();
                     Box::pin(async move {
                         let binary = std::env::var_os("ANE_TEST_WORKER").expect("ANE_TEST_WORKER");
-                        let mut config = WorkerHostConfig::new(PathBuf::from(binary), root);
+                        let binary =
+                            synapse_core::dev_binary::ckdev_binary(PathBuf::from(binary), &root)
+                                .unwrap();
+                        let mut config = WorkerHostConfig::new(binary, root);
                         config.worker_id = id;
                         config.inherited_lane_lock = Some(lock);
                         let mut host = WorkerHost::new(config);

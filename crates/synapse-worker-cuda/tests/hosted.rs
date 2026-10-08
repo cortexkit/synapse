@@ -20,12 +20,18 @@ fn hosted_worker_hello_ping_unsupported_rerank_ping() {
     ));
     let listener = UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"))
-        .args(["--socket", path.to_str().unwrap(), "--nonce", "hosted-test"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+    let mut child = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"),
+            std::env::temp_dir().join(format!("cuda-hosted-{}", std::process::id())),
+        )
+        .unwrap(),
+    )
+    .args(["--socket", path.to_str().unwrap(), "--nonce", "hosted-test"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
     let start = Instant::now();
     let mut stream = loop {
         match listener.accept() {
@@ -118,10 +124,16 @@ fn hosted_worker_hello_ping_unsupported_rerank_ping() {
 
 #[test]
 fn probe_is_one_typed_envelope_without_artifact_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"))
-        .args(["--probe-floor", "--model", "gte-modernbert-base"])
-        .output()
-        .unwrap();
+    let output = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"),
+            std::env::temp_dir().join(format!("cuda-hosted-{}", std::process::id())),
+        )
+        .unwrap(),
+    )
+    .args(["--probe-floor", "--model", "gte-modernbert-base"])
+    .output()
+    .unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert_eq!(text.lines().count(), 1);
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();

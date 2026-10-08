@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+#[path = "../../synapse-core/src/dev_binary.rs"]
+#[allow(dead_code)]
+mod dev_binary;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -68,14 +72,16 @@ fn set_and_wrong_subc_connection_file_refuses_without_fallback() {
     let missing = root.0.join("operator-selected-missing.json");
     write_connection_file(&production);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-synapse-opctl"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["models", "list"])
-        .env("HOME", &home)
-        .env("SUBC_CONNECTION_FILE", &missing)
-        .env_remove("XDG_RUNTIME_DIR")
-        .output()
-        .expect("run ck-synapse-opctl");
+    let output = Command::new(
+        dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_ck-synapse-opctl"), &root.0).unwrap(),
+    )
+    .current_dir(env!("CARGO_MANIFEST_DIR"))
+    .args(["models", "list"])
+    .env("HOME", &home)
+    .env("SUBC_CONNECTION_FILE", &missing)
+    .env_remove("XDG_RUNTIME_DIR")
+    .output()
+    .expect("run ck-synapse-opctl");
 
     assert!(!output.status.success(), "a missing named path must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);

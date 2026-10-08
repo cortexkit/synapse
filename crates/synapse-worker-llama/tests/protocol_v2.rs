@@ -76,7 +76,13 @@ async fn llama_worker_speaks_protocol_v2_and_refuses_owned_worker_requests() {
     let (endpoint, listener) =
         prepare_listener(&runtime_dir, &format!("llama-protocol-v2-{suffix}")).unwrap();
     let nonce = suffix.clone();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-llama"));
+    let mut command = tokio::process::Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-llama"),
+            &runtime_dir,
+        )
+        .unwrap(),
+    );
     #[cfg(unix)]
     command.arg("--socket").arg(&endpoint);
     #[cfg(windows)]

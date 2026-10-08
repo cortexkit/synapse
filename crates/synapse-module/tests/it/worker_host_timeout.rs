@@ -15,7 +15,14 @@ async fn load_uses_long_timeout_but_embed_keeps_short_timeout() {
         .expect("system clock should be after the Unix epoch")
         .as_nanos();
     let mut config = WorkerHostConfig::new(
-        env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+            PathBuf::from(format!(
+                "/tmp/synapse-timeout-{}-{suffix}",
+                std::process::id()
+            )),
+        )
+        .unwrap(),
         PathBuf::from(format!(
             "/tmp/synapse-timeout-{}-{suffix}",
             std::process::id()

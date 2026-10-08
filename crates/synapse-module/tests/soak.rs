@@ -376,7 +376,13 @@ fn spawn_synapse_module_with_config(
     subc_connection_file: &Path,
     config_json: &str,
 ) -> ModuleProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
+    let mut command = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse"),
+            subc_connection_file.parent().unwrap(),
+        )
+        .unwrap(),
+    );
     command
         .arg("--subc")
         .arg(subc_connection_file)
@@ -709,10 +715,12 @@ fn short_worker_runtime_dir(temp_dir: &Path) -> PathBuf {
 }
 
 fn aborting_worker_wrapper(real_worker: &Path, temp_dir: &Path) -> PathBuf {
-    let wrapper = temp_dir.join("ck-synapse-worker-llama-abort.sh");
+    let wrapper = temp_dir.join("ckdev-synapse-worker-llama-abort.sh");
     let script = format!(
         "#!/bin/sh\nexec '{}' \"$@\" --test-abort\n",
-        real_worker.display()
+        synapse_core::dev_binary::ckdev_binary(real_worker, temp_dir)
+            .unwrap()
+            .display()
     );
     std::fs::write(&wrapper, script).unwrap();
     let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();

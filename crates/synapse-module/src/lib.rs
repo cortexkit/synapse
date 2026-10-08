@@ -17527,6 +17527,8 @@ mod tests {
             "stage CUDA worker at {}",
             worker.display()
         );
+        let scratch = env::temp_dir().join(format!("synapse-cuda-floor-{}", std::process::id()));
+        let worker = synapse_core::dev_binary::ckdev_binary(worker, &scratch).unwrap();
         let reading = run_owned_cuda_probe(
             std::process::Command::new(&worker).arg("--probe-floor"),
             Duration::from_secs(10),

@@ -339,7 +339,13 @@ fn synapse_module_command(
             serde_json::json!({ "preload_models": serde_json::from_str::<Value>(preload_models).unwrap_or_else(|_| serde_json::json!([])) }).to_string()
         })
     };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse"));
+    let mut command = Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse"),
+            subc_connection_file.parent().unwrap(),
+        )
+        .unwrap(),
+    );
     command
         .arg("--subc")
         .arg(subc_connection_file)
@@ -750,7 +756,7 @@ fn timeout_ane_probe_config(root: &Path) -> String {
             "format": "mock",
             "pooling": "mean",
             "normalize": true,
-            "worker_bin": env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+            "worker_bin": synapse_core::dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"), &worker_runtime_dir).unwrap(),
             "worker_runtime_dir": worker_runtime_dir
         }]
     })
@@ -3775,7 +3781,7 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
                 "tokenizer_path": tokenizer_path,
                 "format": "gguf",
                 "max_tokens": 512,
-                "worker_bin": env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+                "worker_bin": synapse_core::dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"), &llama_runtime).unwrap(),
                 "worker_runtime_dir": llama_runtime
             }
         ]
@@ -3909,7 +3915,7 @@ async fn certified_owned_checkpoint_lane(
         "family": family,
         "dtype": "f16",
         "execution": "supervised",
-        "worker_bin": worker_bin,
+        "worker_bin": synapse_core::dev_binary::ckdev_binary(&worker_bin, &worker_runtime).unwrap(),
         "worker_runtime_dir": worker_runtime
     });
     if let Some(derived_digest) = derived_digest {

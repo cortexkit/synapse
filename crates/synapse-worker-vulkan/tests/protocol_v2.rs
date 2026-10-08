@@ -22,7 +22,13 @@ async fn hosted_hello_ping_unsupported_rerank_then_ping() {
     #[cfg(windows)]
     let root = std::env::temp_dir().join(&nonce);
     let (endpoint, listener) = prepare_listener(&root, &nonce).unwrap();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"));
+    let mut command = tokio::process::Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"),
+            std::env::temp_dir().join(format!("vulkan-protocol-{}", std::process::id())),
+        )
+        .unwrap(),
+    );
     #[cfg(unix)]
     command.arg("--socket");
     #[cfg(windows)]
@@ -116,8 +122,13 @@ fn feature_disabled_probe_is_one_json_and_exit_two() {
         Some("gte-modernbert-base"),
         Some("qwen3-reranker-0.6b"),
     ] {
-        let mut command =
-            std::process::Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"));
+        let mut command = std::process::Command::new(
+            synapse_core::dev_binary::ckdev_binary(
+                env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"),
+                std::env::temp_dir().join(format!("vulkan-protocol-{}", std::process::id())),
+            )
+            .unwrap(),
+        );
         command.arg("--probe-floor");
         if let Some(slug) = model {
             command.args(["--model", slug]);
@@ -138,10 +149,16 @@ fn feature_disabled_probe_is_one_json_and_exit_two() {
 
 #[test]
 fn version_reports_embedded_bindings_and_feature() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let output = std::process::Command::new(
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-vulkan"),
+            std::env::temp_dir().join(format!("vulkan-protocol-{}", std::process::id())),
+        )
+        .unwrap(),
+    )
+    .arg("--version")
+    .output()
+    .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("vulkan"));

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use super::common;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -103,7 +105,8 @@ fn run_embedding_worker(
         })
         .collect::<Vec<_>>();
 
-    let mut config = WorkerHostConfig::new(worker_bin, temp_runtime_dir(label));
+    let runtime = temp_runtime_dir(label);
+    let mut config = WorkerHostConfig::new(development_worker(&worker_bin, &runtime), runtime);
     config.worker_id = format!("{label}-e2e-{}", std::process::id());
     config.pooling = WorkerPooling::Mean;
     config.normalize = true;
@@ -142,7 +145,8 @@ fn run_embedding_worker(
 }
 
 fn assert_worker_crash_is_quarantined(label: &str, worker_bin: PathBuf) {
-    let mut config = WorkerHostConfig::new(worker_bin, temp_runtime_dir(label));
+    let runtime = temp_runtime_dir(label);
+    let mut config = WorkerHostConfig::new(development_worker(&worker_bin, &runtime), runtime);
     config.worker_id = format!("{label}-crash-{}", std::process::id());
     config
         .extra_args
@@ -251,6 +255,29 @@ fn temp_runtime_dir(label: &str) -> PathBuf {
         "synapse-{label}-worker-test-{}",
         std::process::id()
     ))
+}
+
+fn development_worker(worker: &Path, scratch: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let launcher = synapse_core::dev_binary::ckdev_binary(worker, scratch).unwrap();
+    let swift =
+        common::swift_worker(worker.parent().unwrap()).expect("ANE Swift companion is required");
+    let swift = synapse_core::dev_binary::ckdev_binary(swift, scratch).unwrap();
+    // WorkerHost has no per-child environment hook. A private wrapper sets the
+    // launcher's existing override without changing the process-wide test env.
+    let wrapper = launcher.parent().unwrap().join("ckdev-ane-launch.sh");
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nSYNAPSE_ANE_SWIFT_WORKER={} exec {} \"$@\"\n",
+            quote(&swift),
+            quote(&launcher)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper
 }
 
 fn skip(reason: &str) {

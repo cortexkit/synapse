@@ -190,19 +190,28 @@ fn test_launches_use_development_images() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut failures = Vec::new();
     let mut count = 0;
-    for entry in fs::read_dir(root.join("crates")).unwrap() {
-        let crate_root = entry.unwrap().path();
-        let tests = crate_root.join("tests");
-        if tests.is_dir() {
-            rust_tests(&tests, &mut failures, &mut count);
-        }
-        let source = crate_root.join("src");
-        if source.is_dir() {
-            inline_tests(&source, &mut failures, &mut count);
-        }
-    }
+    // Workspace members can be nested (the owned decode worker lives inside
+    // the engine crate), so scanning only immediate crate children misses tests.
+    test_trees(&root.join("crates"), &mut failures, &mut count);
+    test_trees(&root.join("bench"), &mut failures, &mut count);
     println!("scanned {count} Rust sources (integration tests and inline test code)");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn test_trees(path: &Path, failures: &mut Vec<String>, count: &mut usize) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        match entry.file_name().to_string_lossy().as_ref() {
+            "target" | ".git" | ".live" | "node_modules" | ".venv" => {}
+            "tests" => rust_tests(&path, failures, count),
+            "src" => inline_tests(&path, failures, count),
+            _ => test_trees(&path, failures, count),
+        }
+    }
 }
 
 #[test]

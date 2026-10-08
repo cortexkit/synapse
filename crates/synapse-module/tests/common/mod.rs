@@ -119,6 +119,85 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
         .env("SYNAPSE_CONFIG_PATH", config_path)
         .env("CORTEXKIT_LEASE_ROOT", lease_root)
         .env("XDG_DATA_HOME", data_home);
+    // Moving the module removes its production-named siblings. Pin available
+    // companions explicitly so discovery still works without executing build
+    // outputs under names reserved for installed processes.
+    let built_dir = Path::new(env!("CARGO_BIN_EXE_ck-synapse"))
+        .parent()
+        .unwrap();
+    for engine in [
+        "llama",
+        "ane",
+        "owned-cuda",
+        "owned-metal-decode",
+        "owned-vulkan",
+        "ane-direct-worker",
+    ] {
+        let variable = synapse_core::worker_binary_env_var(engine);
+        let mut source = built_dir.join(synapse_core::worker_binary_file_name(engine).unwrap());
+        if cfg!(windows) {
+            source.set_extension("exe");
+        }
+        let source = std::env::var_os(&variable)
+            .map(PathBuf::from)
+            .unwrap_or(source);
+        if source.is_file() {
+            if engine == "ane" {
+                // The launcher can fall back to its compile-time Swift path.
+                // Pin that existing override before making the launcher runnable.
+                let swift = swift_worker(source.parent().unwrap())
+                    .or_else(|| swift_worker(built_dir))
+                    .expect("ANE launcher requires a development Swift companion");
+                command.env(
+                    "SYNAPSE_ANE_SWIFT_WORKER",
+                    synapse_core::dev_binary::ckdev_binary(swift, &test_root).unwrap(),
+                );
+            }
+            command.env(
+                variable,
+                synapse_core::dev_binary::ckdev_binary(source, &test_root).unwrap(),
+            );
+        } else {
+            command.env_remove(variable);
+        }
+    }
+    // Supervised owned generation also accepts a legacy explicit override,
+    // separate from the embedding companion's canonical engine variable.
+    let variable = "SYNAPSE_OWNED_DECODE_WORKER_BIN";
+    if let Some(source) = std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        command.env(
+            variable,
+            synapse_core::dev_binary::ckdev_binary(source, &test_root).unwrap(),
+        );
+    } else {
+        command.env_remove(variable);
+    }
+}
+
+pub fn swift_worker(built_dir: &Path) -> Option<PathBuf> {
+    let explicit = std::env::var_os("SYNAPSE_ANE_SWIFT_WORKER").map(PathBuf::from);
+    explicit
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let sibling = built_dir.join("ck-synapse-worker-ane-swift");
+            sibling.is_file().then_some(sibling)
+        })
+        .or_else(|| {
+            std::fs::read_dir(built_dir.join("build"))
+                .ok()?
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("synapse-worker-ane-")
+                })
+                .map(|entry| entry.path().join("out/ck-synapse-worker-ane-swift"))
+                .find(|path| path.is_file())
+        })
 }
 
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {

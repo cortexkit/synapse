@@ -58,7 +58,11 @@ async fn start_fixture_worker(
     final_delay_ms: Option<u64>,
 ) -> WorkerHost {
     let mut config = WorkerHostConfig::new(
-        env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
+            runtime_root(),
+        )
+        .unwrap(),
         runtime_root(),
     );
     config.worker_id = label.to_string();

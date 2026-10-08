@@ -126,7 +126,13 @@ impl WorkerClient {
             "{:016x}",
             stable_u64(format!("{}-{}", arm.id(), std::process::id()).as_bytes())
         );
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-decode"));
+        let mut command = Command::new(
+            synapse_core::dev_binary::ckdev_binary(
+                env!("CARGO_BIN_EXE_ck-synapse-worker-decode"),
+                &runtime_dir,
+            )
+            .unwrap(),
+        );
         command
             .arg("--socket")
             .arg(&socket_path)

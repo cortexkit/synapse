@@ -182,7 +182,11 @@ async fn host_classifies_crashes_and_quarantines_after_budget() {
 
 fn worker_config(worker_id: &str) -> WorkerHostConfig {
     let mut config = WorkerHostConfig::new(
-        env!("CARGO_BIN_EXE_ck-synapse-worker-llama"),
+        synapse_core::dev_binary::ckdev_binary(
+            env!("CARGO_BIN_EXE_ck-synapse-worker-llama"),
+            PathBuf::from(format!("/tmp/synw-{}", std::process::id())),
+        )
+        .unwrap(),
         PathBuf::from(format!("/tmp/synw-{}", std::process::id())),
     );
     config.worker_id = format!("{worker_id}-{}", short_suffix());

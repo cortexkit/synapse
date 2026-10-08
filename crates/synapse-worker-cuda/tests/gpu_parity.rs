@@ -35,15 +35,21 @@ fn converted_cuda_packages_match_padded_goldens_and_ignore_request_pooling() {
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut worker = Worker(
-        Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"))
-            .args([
-                "--socket",
-                socket.to_str().unwrap(),
-                "--nonce",
-                "gpu-parity",
-            ])
-            .spawn()
+        Command::new(
+            synapse_core::dev_binary::ckdev_binary(
+                env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"),
+                socket.with_extension("scratch"),
+            )
             .unwrap(),
+        )
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "--nonce",
+            "gpu-parity",
+        ])
+        .spawn()
+        .unwrap(),
     );
     let start = Instant::now();
     let mut stream = loop {

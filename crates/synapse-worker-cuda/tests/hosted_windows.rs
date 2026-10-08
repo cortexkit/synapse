@@ -61,10 +61,16 @@ fn windows_hosted_worker_hello_ping_unsupported_rerank_ping() {
     assert_ne!(raw as isize, -1, "{}", std::io::Error::last_os_error());
     let mut stream = unsafe { File::from_raw_handle(raw) };
     let mut worker = Worker(
-        Command::new(env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"))
-            .args(["--pipe", &name, "--nonce", "hosted-windows"])
-            .spawn()
+        Command::new(
+            synapse_core::dev_binary::ckdev_binary(
+                env!("CARGO_BIN_EXE_ck-synapse-worker-cuda"),
+                std::env::temp_dir().join(format!("cuda-hosted-windows-{}", std::process::id())),
+            )
             .unwrap(),
+        )
+        .args(["--pipe", &name, "--nonce", "hosted-windows"])
+        .spawn()
+        .unwrap(),
     );
     let start = Instant::now();
     loop {

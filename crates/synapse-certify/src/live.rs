@@ -81,10 +81,16 @@ impl Runner for LiveRunner {
         let output = self.runtime.block_on(async {
             timeout(
                 Duration::from_secs(60),
-                synapse_core::without_launch_nonce_tokio(Command::new(binary(
-                    &self.options.assets,
-                    role,
-                )))
+                synapse_core::without_launch_nonce_tokio(Command::new(
+                    synapse_core::dev_binary::ckdev_binary_hard_link(
+                        binary(&self.options.assets, role),
+                        self.options
+                            .checkout
+                            .join("crates/synapse-certify/.live")
+                            .join(format!("{}-{row}-floor", std::process::id())),
+                    )
+                    .map_err(err)?,
+                ))
                 .arg("--probe-floor")
                 .kill_on_drop(true)
                 .output(),
@@ -257,15 +263,22 @@ async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> R
         "execution": "explicit", "attention_units": 8192 * 8192,
     });
     if let Some(role) = worker(row) {
-        preload["worker_bin"] = json!(binary(&options.assets, role));
+        preload["worker_bin"] = json!(synapse_core::dev_binary::ckdev_binary_hard_link(
+            binary(&options.assets, role),
+            &root
+        )
+        .map_err(err)?);
         preload["worker_runtime_dir"] = json!(options.assets);
     }
     let config = root.join("config.json");
     std::fs::write(&config, serde_json::to_vec(&json!({"certify_observation": true, "preload_models": [preload], "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": INLINE_ITEMS, "max_tokens": INLINE_TOKENS}})).map_err(err)?).map_err(err)?;
-    let child = synapse_core::without_launch_nonce_tokio(Command::new(binary(
-        &options.assets,
-        "ck-synapse",
-    )))
+    let child = synapse_core::without_launch_nonce_tokio(Command::new(
+        synapse_core::dev_binary::ckdev_binary_hard_link(
+            binary(&options.assets, "ck-synapse"),
+            &root,
+        )
+        .map_err(err)?,
+    ))
     .arg("--subc")
     .arg(&conn_path)
     .env("SUBC_MODULE_ID", "synapse")
@@ -832,6 +845,51 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn development_aliases_preserve_attested_binary_identity() {
+        use sha2::{Digest, Sha256};
+        let root =
+            std::env::temp_dir().join(format!("synapse-certify-alias-{}", std::process::id()));
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        for role in [
+            "ck-synapse",
+            "ck-synapse-worker-cuda",
+            "ck-synapse-worker-vulkan",
+            "ck-synapse-worker-ane-direct",
+        ] {
+            let built = binary(&assets, role);
+            std::fs::write(&built, role.as_bytes()).unwrap();
+            let alias =
+                synapse_core::dev_binary::ckdev_binary_hard_link(&built, root.join("run")).unwrap();
+            assert_eq!(
+                alias.file_name().unwrap().to_string_lossy(),
+                format!(
+                    "ckdev-{}{}",
+                    role.strip_prefix("ck-").unwrap(),
+                    std::env::consts::EXE_SUFFIX
+                )
+            );
+            assert_eq!(
+                Sha256::digest(std::fs::read(&built).unwrap()),
+                Sha256::digest(std::fs::read(&alias).unwrap())
+            );
+            assert!(
+                built.is_file(),
+                "the attested production file name must remain available"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    std::fs::metadata(&built).unwrap().ino(),
+                    std::fs::metadata(alias).unwrap().ino()
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn decodes_flattened_wire_vectors_and_scores_in_item_order() {
