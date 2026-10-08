@@ -2138,7 +2138,13 @@ struct SystemClock;
 /// for the measurements.
 fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<RecommendedBatch> {
     match engine {
-        "owned-metal" | CUDA_WORKER_ENGINE => Some(RecommendedBatch {
+        // Every owned embed/rerank engine shares the module's batch planner,
+        // which clamps a batch to these limits; clients size their calls from
+        // this advice and refuse a lane that advertises none.
+        "owned-metal"
+        | CUDA_WORKER_ENGINE
+        | "owned-vulkan"
+        | synapse_core::ANE_DIRECT_WORKER_ENGINE => Some(RecommendedBatch {
             rows: MAX_ENGINE_BATCH_ITEMS,
             token_budget: DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
         }),
@@ -20360,6 +20366,16 @@ mod tests {
         let wire = serde_json::to_value(cuda).expect("serialize CUDA batch advice");
         assert_eq!(wire["rows"], MAX_ENGINE_BATCH_ITEMS);
         assert_eq!(wire["token_budget"], DEFAULT_ENGINE_BATCH_TOKEN_BUDGET);
+
+        for engine in ["owned-vulkan", synapse_core::ANE_DIRECT_WORKER_ENGINE] {
+            let advice = recommended_batch_for_engine(engine, 8192)
+                .unwrap_or_else(|| panic!("{engine} clients need usable batch advice"));
+            assert_eq!(advice.rows, MAX_ENGINE_BATCH_ITEMS, "{engine}");
+            assert_eq!(
+                advice.token_budget, DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
+                "{engine}"
+            );
+        }
 
         let ane = recommended_batch_for_engine("ane", 512).unwrap();
         assert_eq!(ane.rows, MAX_ENGINE_BATCH_ITEMS);
