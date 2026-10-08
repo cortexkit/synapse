@@ -862,3 +862,23 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "production-excludes-deterministic-engine"
+guards = "Normal production compilation refuses the test-only deterministic engine in the embed/rerank allow-list"
+file = "crates/synapse-module/src/store.rs"
+old = """
+#[cfg(feature = "test-support")]
+    "test-deterministic","""
+new = '"test-deterministic", // NON-VACUITY BREAK'
+edits = []
+test_file = "scripts/test_mutation_ci.py"
+runner = "command"
+command = ["python", "-m", "unittest", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["scripts.test_mutation_ci.ProductionEngineGuardTests.test_production_allow_list_compiles"]
+expect_message = "production embed/rerank allow-list contains test-deterministic"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
