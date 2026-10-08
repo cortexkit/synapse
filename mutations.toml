@@ -552,3 +552,24 @@ platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "development-name-source-scan"
+guards = "Rust test launches cannot bypass the development executable alias and masquerade as installed fleet processes"
+file = "crates/synapse-core/tests/child_process.rs"
+old = "fn environment_command() -> Command {"
+new = """
+fn environment_command() -> Command {
+    let _ = Command::new("ck-synapse"); // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-core/tests/dev_binary_guard.rs"
+runner = "cargo"
+package = "synapse-core"
+target = "--test dev_binary_guard"
+select = "expected"
+expect_red = ["test_launches_use_development_images"]
+expect_message = "production-named executable bypasses ckdev_binary"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
