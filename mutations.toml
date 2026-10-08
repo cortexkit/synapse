@@ -508,3 +508,27 @@ platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "residency-retirement-inside-grant"
+guards = "Retirement racing the outer precheck cannot acquire a phantom admission reservation"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """
+if state.retired.contains(worker.worker_id()) {
+                return Step::Retired;"""
+new = """
+if false && state.retired.contains(worker.worker_id()) { // NON-VACUITY BREAK
+                return Step::Retired;"""
+edits = []
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::retirement_between_precheck_and_grant_leaves_no_phantom_reservation"]
+expect_message = "retired owner must not acquire an Admitting reservation"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
