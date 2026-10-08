@@ -17,7 +17,7 @@ use subc_protocol::{BindIdentity, RouteTarget};
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
-use synapse_core::dev_binary::ckdev_binary_hard_link;
+use synapse_core::{dev_binary::ckdev_binary_hard_link, SanitizedTokenizer, TokenizerConfig};
 use synapse_parity::{canonical::sha256_file, manifest::Manifest};
 use tokio::net::TcpListener;
 
@@ -119,6 +119,12 @@ async fn timed(
     )
 }
 
+fn percentile(samples: &[f64], fraction: f64) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[((fraction * sorted.len() as f64).ceil() as usize).saturating_sub(1)]
+}
+
 fn median(samples: &[f64]) -> f64 {
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -128,6 +134,39 @@ fn median(samples: &[f64]) -> f64 {
     } else {
         sorted[middle]
     }
+}
+
+fn batch(arm: &str, chunks: &[String], key: &str) -> Value {
+    json!({"model":format!("compare-{arm}"),"input_type":"document","accept_declared":true,"request_key":key,
+        "items":chunks.iter().enumerate().map(|(id,text)| json!({"id":format!("row-{id}"),"text":text})).collect::<Vec<_>>()})
+}
+
+fn code_chunks(tokenizer: &SanitizedTokenizer, terminal: u32) -> Result<Vec<String>> {
+    let mut chunks = Vec::new();
+    for row in 0..64 {
+        let mut text = format!("fn chunk_{row}(input: &[u8]) -> usize {{\n");
+        loop {
+            text.push_str(
+                "    let value = input.iter().map(|byte| usize::from(*byte)).sum::<usize>();\n",
+            );
+            let ids = tokenizer
+                .tokenizer()
+                .encode(text.as_str(), true)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            // Include the manifest's terminal EOS in the request budget.
+            // Keeping rows at most 128 tokens keeps all 64 rows inline.
+            let composed = ids.len() + usize::from(ids.get_ids().last() != Some(&terminal));
+            if composed >= 100 {
+                ensure!(
+                    composed <= 128,
+                    "synthetic chunk overshot the inline budget: {composed}"
+                );
+                chunks.push(text);
+                break;
+            }
+        }
+    }
+    Ok(chunks)
 }
 
 #[tokio::main]
@@ -171,6 +210,13 @@ async fn main() -> Result<()> {
         "fixture digest mismatch"
     );
     let fixtures: Value = serde_json::from_slice(&std::fs::read(fixture_path)?)?;
+    let tokenizer = SanitizedTokenizer::from_file(
+        weights.join("tokenizer.json"),
+        TokenizerConfig {
+            max_tokens: usize::MAX,
+        },
+    )?;
+    let chunks = code_chunks(&tokenizer, pinned.grammar.terminal_tokens[0].id)?;
     let root = checkout
         .join("target")
         .join(format!("qwen-compare-{}", std::process::id()));
@@ -291,7 +337,57 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>();
         latency.push(json!({"tokens":tokens,"samples":{"ane":samples[0],"metal":samples[1]},"median_ms":{"ane":medians[0],"metal":medians[1]},"ane_over_metal":medians[0]/medians[1]}));
     }
-    let report = json!({"load_start":load_start,"load_end":quiet()?,"source_commit":String::from_utf8(Command::new("git").args(["rev-parse","HEAD"]).output()?.stdout)?.trim(),"candidate_sha256":sha256_file(&assets.join("ck-synapse"))?,"worker_sha256":sha256_file(&assets.join("ck-synapse-worker-ane-direct"))?,"latency":latency,"passes_3x_at_512":latency[1]["ane_over_metal"].as_f64().unwrap() <= 3.0});
+    let mut throughput = Vec::new();
+    for arm in ARMS {
+        timed(
+            &consumer,
+            &identity,
+            "embed.batch",
+            batch(arm, &chunks, &format!("warm-{}-{arm}", std::process::id())),
+            64,
+            None,
+        )
+        .await?;
+        let mut samples = Vec::new();
+        let mut total_seconds = 0.0;
+        for pair in 0..10 {
+            let started = Instant::now();
+            let (a, b) = tokio::join!(
+                timed(
+                    &consumer,
+                    &identity,
+                    "embed.batch",
+                    batch(
+                        arm,
+                        &chunks,
+                        &format!("{}-{arm}-{pair}-a", std::process::id())
+                    ),
+                    64,
+                    None
+                ),
+                timed(
+                    &consumer,
+                    &identity,
+                    "embed.batch",
+                    batch(
+                        arm,
+                        &chunks,
+                        &format!("{}-{arm}-{pair}-b", std::process::id())
+                    ),
+                    64,
+                    None
+                )
+            );
+            total_seconds += started.elapsed().as_secs_f64();
+            samples.extend([a?, b?]);
+        }
+        let times = samples
+            .iter()
+            .map(|sample| sample["elapsed_ms"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        throughput.push(json!({"arm":arm,"rows":1280,"calls":20,"calls_in_flight":2,"rows_per_minute":1280.0*60.0/total_seconds,"call_p50_ms":percentile(&times,0.5),"call_p90_ms":percentile(&times,0.9),"samples":samples}));
+    }
+    let report = json!({"load_start":load_start,"load_end":quiet()?,"source_commit":String::from_utf8(Command::new("git").args(["rev-parse","HEAD"]).output()?.stdout)?.trim(),"candidate_sha256":sha256_file(&assets.join("ck-synapse"))?,"worker_sha256":sha256_file(&assets.join("ck-synapse-worker-ane-direct"))?,"latency":latency,"passes_3x_at_512":latency[1]["ane_over_metal"].as_f64().unwrap() <= 3.0,"throughput":throughput,"ane_dispatch":"one row at a time; one executable evaluation per layer per row (worker.rs embed loop)"});
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -318,8 +414,42 @@ mod tests {
     }
 
     #[test]
+    fn call_percentiles_are_nearest_rank_not_mean() {
+        assert_eq!(percentile(&[10.0, 1.0, 9.0, 2.0], 0.5), 2.0);
+        assert_eq!(percentile(&[10.0, 1.0, 9.0, 2.0], 0.9), 10.0);
+    }
+
+    #[test]
     fn latency_medians_handle_odd_and_even_sample_counts() {
         assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
         assert_eq!(median(&[4.0, 1.0, 2.0, 8.0]), 3.0);
+    }
+
+    #[test]
+    #[ignore = "requires original Qwen tokenizer; no accelerator inference"]
+    fn synthetic_code_chunks_fit_the_aft_shape_and_inline_budget() {
+        let weights =
+            PathBuf::from(env::var_os("SYNAPSE_QWEN_WEIGHTS").expect("SYNAPSE_QWEN_WEIGHTS"));
+        let tokenizer = SanitizedTokenizer::from_file(
+            weights.join("tokenizer.json"),
+            TokenizerConfig {
+                max_tokens: usize::MAX,
+            },
+        )
+        .unwrap();
+        let manifest =
+            Manifest::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
+        let terminal = manifest.model(MODEL).unwrap().grammar.terminal_tokens[0].id;
+        let chunks = code_chunks(&tokenizer, terminal).unwrap();
+        assert_eq!(chunks.len(), 64);
+        let mut total = 0;
+        for text in &chunks {
+            let ids = tokenizer.tokenizer().encode(text.as_str(), true).unwrap();
+            let count = ids.len() + usize::from(ids.get_ids().last() != Some(&terminal));
+            assert!((100..=150).contains(&count));
+            total += count;
+        }
+        assert!(total <= 8192);
+        println!("verified 64 code-like rows, {total} composed tokens, <=8192 inline budget");
     }
 }

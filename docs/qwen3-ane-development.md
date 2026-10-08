@@ -13,7 +13,9 @@ backend when an unqualified catalog id is selected.
 
 This is **not a shipping certification**. During this development session the
 one-minute load was never below 16: observed values included 25.36, 33.39, 54.34,
-52.24, 36.06, and finally 39.23 (final 1/5/15-minute load: 39.23/49.04/47.30).
+52.24, 36.06, 39.23, and finally 41.20 (final 1/5/15-minute load:
+41.20/30.66/34.58). The actual comparison runner was invoked and refused at that
+last load before launching a daemon or worker.
 Hardware certification, Qwen 8192 shape admission, latency comparison, and
 throughput measurement were therefore not run. No accuracy, boundary,
 placement, latency ratio, or throughput pass is claimed. The original-weight
@@ -157,6 +159,9 @@ with two calls in flight. It reports sustained rows/minute over those pairs and
 nearest-rank per-call p50/p90, excluding the warmup. Every timed request records
 load before and after; a window that becomes busy fails rather than producing a
 claimed quiet result. Output goes to the private backup directory, not git.
+The generator was checked against the original pinned tokenizer without
+accelerator inference: its 64 rows compose to 7670 tokens, inside the 8192-token
+inline budget. This validates the workload, not its hardware throughput.
 
 The direct ANE worker **runs rows one at a time**: its batch handler loops over
 the flattened row slices and calls `Model::run` once per row. Each row executes
