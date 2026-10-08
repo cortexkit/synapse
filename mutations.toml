@@ -488,3 +488,23 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "residency-generation-qualified-recovery"
+guards = "One admission fault reaches the production serving path and restarts exactly once, not once at each recovery layer"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = ".recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))"
+new = ".recover_at_generation(&worker, worker.generation()) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::serving_admission_channel_fault_restarts_exactly_once"]
+expect_message = "assertion `left == right` failed"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
