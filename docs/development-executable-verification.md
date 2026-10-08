@@ -10,21 +10,29 @@ name instead. Cargo's own test harness binaries keep their usual
 
 ## How the code does it
 
-- `synapse_core::dev_binary::ckdev_binary(binary, scratch)` hard-links a built
-  executable into the caller's scratch directory as `ckdev-<name>` (the `ck-`
-  prefix is dropped, and `.exe` is kept). It copies instead only when the
-  scratch directory is on another volume. Every call gets its own directory,
-  so concurrent children never replace an executable that is still running,
-  which Windows would refuse.
+- `synapse_core::dev_binary::ckdev_binary(binary, scratch)` copies a built
+  executable beside its artifact into `ckdev-exec/<sha256-prefix>/ckdev-<name>`
+  (the `ck-` prefix is dropped, and `.exe` is kept). The scratch argument is
+  retained for callers but is no longer used. The first 16 hexadecimal
+  characters of the full SHA-256 select a content-addressed directory, so every
+  caller for the same bytes reuses one copy. A caller copies to a unique temporary
+  file in that directory and publishes it with an atomic rename; concurrent callers therefore only see a
+  complete copy. Unix copies have the executable bit set.
+- The copy is deliberate: under machine load, fresh hard links to Cargo build
+  outputs were observed to have spawned processes exit on macOS signal 9, while
+  a content-addressed copy beside the artifact was stable in the same
+  reproduction. macOS did not provide a reason for those signals, so the copy
+  is the tested remedy, not a proven explanation of the failure mechanism.
 - `ckdev_binary_hard_link` is the same helper with copying forbidden.
   `ck-synapse certify run` uses it because the certification record attests
   the SHA-256 of the built binaries: running a hard link executes those exact
-  bytes, and a layout that would need a copy is refused. The record keeps the
-  original role and file names.
+  bytes, and a layout that would need a copy is refused. This helper remains a
+  hard link in the caller's scratch directory and still rejects cross-volume
+  layouts. The record keeps the original role and file names.
 - The module finds an unconfigured worker by its `ck-synapse-worker-<engine>`
   name beside its own executable. Tests therefore set each engine's worker
   variable (and `SYNAPSE_ANE_SWIFT_WORKER` for the Core ML launcher) to a
-  `ckdev-` link, in `crates/synapse-module/tests/common/mod.rs`. Production
+  `ckdev-` copy, in `crates/synapse-module/tests/common/mod.rs`. Production
   resolution is unchanged.
 - `scripts/check-release-candidate.py` and
   `scripts/test-owned-cuda-package.ps1` smoke-test extracted release assets
