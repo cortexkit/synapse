@@ -594,3 +594,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "wire-stable-error-doc-scan"
+guards = "Every stable refusal code must be documented so consumers can recover by its wire name"
+file = "docs/wire-contract-v1.md"
+old = "`owned_cuda_unsupported`"
+new = "`owned_cuda_undocumented` <!-- NON-VACUITY BREAK -->"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::wire_contract_documents_every_stable_error_code"]
+expect_message = "wire contract is missing stable error codes"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
