@@ -22,6 +22,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
+      # Windows runners check text out with CRLF by default; the mutation
+      # runner needs each target byte-identical to `git show HEAD:<file>`.
+      - name: Check out without line-ending conversion
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

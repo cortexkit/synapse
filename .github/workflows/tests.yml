@@ -61,6 +61,13 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     steps:
+      # Windows runners set core.autocrlf=true globally, which checks text out
+      # with CRLF. The mutation runner refuses any target whose bytes differ
+      # from `git show HEAD:<file>`, so the tree must match the index exactly.
+      - name: Check out without line-ending conversion
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - name: Checkout synapse
         uses: actions/checkout@v4
         with:
