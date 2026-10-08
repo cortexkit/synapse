@@ -450,3 +450,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "certify-placement-count"
+guards = "Placement completeness is checked against an independent admission count, not the serialized inventory length"
+file = "crates/synapse-certify/src/lib.rs"
+old = "evidence.inventories.len() == evidence.admitted_count"
+new = "true /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-certify/tests/records.rs"
+runner = "cargo"
+package = "synapse-certify"
+target = "--test records"
+select = "expected"
+expect_red = ["serialized_inventory_omission_fails_placement_gate"]
+expect_message = "unwrap_err"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
