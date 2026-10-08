@@ -70,7 +70,9 @@ jobs:
       - name: Check train CI preconditions
         if: matrix.name == 'linux'
         shell: bash
-        run: bash synapse/scripts/check-train-preconditions.sh
+        run: |
+          bash synapse/scripts/check-train-preconditions.sh
+          python3 synapse/scripts/test-ci-e2e-output.py
 
       - name: Check release-candidate guards
         if: matrix.name == 'linux'
@@ -96,6 +98,13 @@ jobs:
       # bench/parity is its own workspace (kept out of the root lockfile), so the
       # workspace test run never reaches it. Its evaluator and manifest
       # validator gate releases, so test them here.
+      - name: Restore parity Rust cache
+        if: matrix.name == 'linux'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: synapse/bench/parity -> target
+          prefix-key: parity-v1
+
       - name: Parity manifest and evaluator tests
         if: matrix.name == 'linux'
         working-directory: synapse/bench/parity
@@ -251,12 +260,16 @@ jobs:
         working-directory: synapse
         shell: bash
         run: |
+          set -euo pipefail
           crates="$SYNAPSE_CRATES"
           profile=""
           if [ "${{ matrix.name }}" = "windows" ]; then
             profile="--release"
           fi
-          cargo nextest run $crates $profile --retries 0
+          # Partition the suite so optional worker checkpoints cannot be mistaken
+          # for missing mandatory e2e fixtures. Every test still runs only once.
+          cargo nextest run $crates $profile --retries 0 -E 'not binary(skeleton_e2e)'
+          cargo nextest run $crates $profile --retries 0 -E 'binary(skeleton_e2e)' --no-capture 2>&1 | tee skeleton-e2e.output
 
       - name: Linux llama CPU build gate
         if: matrix.name == 'linux'
@@ -335,11 +348,9 @@ jobs:
         working-directory: synapse
         shell: bash
         run: |
-          profile=""
-          if [ "${{ matrix.name }}" = "windows" ]; then
-            profile="--release"
-          fi
-          out=$(cargo nextest run -p synapse-module --test skeleton_e2e $profile --retries 0 --no-capture 2>&1 || true)
+          # Read the first run's transcript instead of loading every fixture again.
+          test -s skeleton-e2e.output
+          out=$(<skeleton-e2e.output)
           # Not `echo "$out" | grep -q`: this shell runs with pipefail, grep -q
           # closes the pipe on its first match, and a producer still writing a
           # multi-megabyte nextest transcript then dies with SIGPIPE (141), so
