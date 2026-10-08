@@ -5,13 +5,19 @@
     "": {
       "name": "@synapse-tools/gather-distill",
       "dependencies": {
-        "@cortexkit/anthropic-auth-core": "file:../../../anthropic-auth/packages/core",
+        "@cortexkit/anthropic-auth-core": "^1.23.0",
       },
     },
   },
   "packages": {
-    "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@file:../../../anthropic-auth/packages/core", { "dependencies": { "xxhash-wasm": "^1.1.0" } }],
+    "@cortexkit/anthropic-auth-core": ["@cortexkit/anthropic-auth-core@1.23.0", "", { "dependencies": { "@cortexkit/claustrum-client": "0.3.0", "@cortexkit/subc-client": "^0.11.1", "xxhash-wasm": "^1.1.0" } }, "sha512-bOwsVKP9mCmCdouCqabFQHD1whbHLjn26V4Eb9BBJg66eBuNgjo8J64OUKLNpnj9ykoUMbim4Le70Y2zfOIY0A=="],
+
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.3.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-vX28AlhG6vsk2PDNIQMkMmcP2gg+tcODuuz/xppVyLnveNL8aVZlZll1TkT1T9UMKeLDk/vvfOkeMSAC9ZaKGA=="],
+
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.11.1", "", {}, "sha512-+T2GzdIHMJKtvS5uPG3FydyGbdvREla7N3B3inLgnVWxsO8v77rzMbmPX63ZD9OcJtnkDZjO5eFbfeIF+RUFWA=="],
 
     "xxhash-wasm": ["xxhash-wasm@1.1.0", "", {}, "sha512-147y/6YNh+tlp6nd/2pWq38i9h6mz/EuQ6njIrmW8D1BS5nCqs0P6DG+m6zTGnNz5I+uhZ0SHxBs9BsPrwcKDA=="],
+
+    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
   }
 }

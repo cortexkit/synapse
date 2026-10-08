@@ -138,7 +138,7 @@ export async function sendMessage(credential: Credential, request: MessageReques
 
   let bodyText: string;
   if (credential.kind === "oauth") {
-    const identity = await resolveClaudeCodeIdentity(credential.secret, request.model);
+    const identity = await resolveClaudeCodeIdentity(credential.secret, request.model, undefined);
     const billingHeader = buildBillingHeaderValue(messages, undefined, CLAUDE_CODE_ENTRYPOINT);
     body.system = [
       { type: "text", text: billingHeader },
