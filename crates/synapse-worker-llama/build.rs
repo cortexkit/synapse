@@ -1,4 +1,7 @@
 fn main() {
+    // Backend selection is supplied by Cargo, not by package source files.
+    // Avoid rerunning this validation when an unrelated test or doc changes.
+    println!("cargo:rerun-if-changed=build.rs");
     let backends = [
         ("cpu", std::env::var_os("CARGO_FEATURE_CPU").is_some()),
         ("cuda", std::env::var_os("CARGO_FEATURE_CUDA").is_some()),

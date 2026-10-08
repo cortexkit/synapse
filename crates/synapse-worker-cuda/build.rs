@@ -1,4 +1,7 @@
 fn main() {
+    // The non-MSVC branches have no external inputs. An explicit watch keeps
+    // Cargo from falling back to watching every file in this package.
+    println!("cargo:rerun-if-changed=build.rs");
     if std::env::var_os("CARGO_FEATURE_CUDA").is_some()
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
     {
