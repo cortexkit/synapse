@@ -651,3 +651,27 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "certify-supervisor-admitted-counter"
+guards = "Certification counts admitted placements independently of the retained serialized inventory list"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """
+state.stats.admitted,
+                )"""
+new = """
+sink.len() as u64, // NON-VACUITY BREAK
+                )"""
+edits = []
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::dropping_retained_inventory_refuses_certify_placement_gate"]
+expect_message = "placement inventory failed"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
