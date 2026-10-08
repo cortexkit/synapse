@@ -2,7 +2,7 @@
 
 **Decision:** block-32 Q8_0 is the best of the measured compression schemes.
 It is **not numerically equivalent to f16**, but it changes less than ~1.3% of
-non-empty pools' top-10 membership relative to f16, with no observed Sol-quality
+non-empty pools' top-10 membership relative to f16, with no observed mean Sol-quality
 loss. Per-channel W8 is worse, and unconditioned dynamic W8A8 changes too many
 rankings to adopt on the promise of speed. **Do not design four speed kernels
 from this evidence:** no permitted quiet-window serving measurement ran.
@@ -13,8 +13,8 @@ queries, candidate text, identities, token IDs, vectors and logs stay private.
 
 ## Part A — protocol and interpretation
 
-Measured on Apple GPU via PyTorch MPS, sequentially, with CPU threads capped at
-four, batch 8, eager attention, no autocast. Versions are pinned in
+Measured on an **Apple M5 Max, 128 GiB unified memory, macOS 27.0.1**, via
+PyTorch MPS, sequentially, with CPU threads capped at four, batch 8, eager attention, no autocast. Versions are pinned in
 `requirements.txt`. This is a numerical experiment, **not** a serving throughput
 benchmark; `runs.elapsed_s` in the JSON is progress accounting only.
 

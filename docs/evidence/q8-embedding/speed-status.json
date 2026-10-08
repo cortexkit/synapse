@@ -3,9 +3,9 @@
   "os": "Darwin",
   "machine": "arm64",
   "load_gate": "1-minute load < 16 before every arm and request",
-  "observed_load_1m": 60.8662109375,
+  "observed_load_1m": 46.65673828125,
   "llama_commit": "680a036285273a3ff56032ec5d7f3352609eba4f",
   "arms": [],
   "status": "deferred-high-load",
-  "reason": "1-minute load 60.8662 is not below 16"
+  "reason": "1-minute load 46.6567 is not below 16"
 }

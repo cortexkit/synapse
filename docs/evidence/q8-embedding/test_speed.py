@@ -53,6 +53,12 @@ class SpeedTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             speed.memory_from_time("no high water mark")
 
+    def test_gpu_offload_cannot_be_partial(self):
+        speed.require_full_gpu_offload("offloaded 29/29 layers to GPU")
+        for text in ("offloaded 28/29 layers to GPU", "offloaded 0/0 layers to GPU", "CPU only"):
+            with self.assertRaises(RuntimeError):
+                speed.require_full_gpu_offload(text)
+
     def test_bad_vectors_fail(self):
         speed.valid_vectors([vector()], 1)
         for bad in ([], [[0.] * 1024], [[float("nan")] * 1024], [[1.] * 3]):

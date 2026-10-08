@@ -142,6 +142,12 @@ def valid_vectors(vectors, expected):
             raise ValueError("Embedding output was not L2-normalized")
 
 
+def require_full_gpu_offload(text):
+    match = re.search(r"offloaded (\d+)/(\d+) layers to GPU", text)
+    if match is None or int(match[1]) != int(match[2]) or int(match[1]) == 0:
+        raise RuntimeError("llama-server did not confirm full GPU layer offload")
+
+
 class Llama:
     def __init__(self, args, arm, directory, slots=64):
         self.url = f"http://127.0.0.1:{args.port}"
@@ -156,8 +162,7 @@ class Llama:
                 try:
                     http(self.url + "/health")
                     text = self.process.log.read_text()
-                    if not re.search(r"offloaded \d+/\d+ layers to GPU", text):
-                        raise RuntimeError("llama-server did not confirm GPU layer offload")
+                    require_full_gpu_offload(text)
                     return
                 except urllib.error.URLError:
                     if self.process.child.poll() is not None:
@@ -405,6 +410,8 @@ def main():
                             stats = sweep(client, tokenizer, length, batch, 1, f"{nonce}-{round_no}-{length}-{batch}-{arm}")
                         finally:
                             client.process.close()
+                        if isinstance(client, Synapse):
+                            stats["serving_fingerprint"] = client.fingerprint
                         report["arms"].append({"kind": "sweep", "arm": arm, "round": round_no,
                             "length": length, "batch": batch, "load_1m_before_arm": load, **stats,
                             "memory": memory_from_time(client.process.log.read_text())})
@@ -418,6 +425,8 @@ def main():
                     stats = fill(client, tokenizer, args.fill_seconds, f"{nonce}-fill-{round_no}-{arm}")
                 finally:
                     client.process.close()
+                if isinstance(client, Synapse):
+                    stats["serving_fingerprint"] = client.fingerprint
                 report["arms"].append({"kind": "aft-fill", "arm": arm, "round": round_no,
                     "load_1m_before_arm": load, **stats, "memory": memory_from_time(client.process.log.read_text())})
         groups = {}
