@@ -200,3 +200,133 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "store-schema-ahead"
+guards = "An older binary refuses a database written by a longer destructive schema chain"
+file = "crates/synapse-module/src/store.rs"
+old = "if outcome.store_ahead() {"
+new = "if false && outcome.store_ahead() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::open_refuses_a_store_written_by_a_longer_schema_chain"]
+expect_message = "a store ahead of the binary's chain must not open"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "restore-approvals-disabled"
+guards = "Restoring an old capture cannot resurrect revoked serving approvals"
+file = "crates/synapse-module/src/store.rs"
+old = "row.state = ServingApprovalState::Disabled;"
+new = "/* NON-VACUITY BREAK: retain captured approval state */"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::restore_import_forces_imported_approvals_disabled_preventing_resurrection"]
+expect_message = "disabled"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "restore-clears-catalog"
+guards = "Restore import clears live catalog authority and forces installation verification to be rebuilt"
+file = "crates/synapse-module/src/store.rs"
+old = 'transaction.execute(&format!("DELETE FROM \"{table}\""), [])?;'
+new = 'if !table.starts_with("catalog_") { transaction.execute(&format!("DELETE FROM \"{table}\""), [])?; } // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::restore_import_drops_resurrected_certification_and_all_untrusted_state"]
+expect_message = "catalog_"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "catalog-ceiling-production-path"
+guards = "An 8193-token embed is refused before durable-job diversion or worker I/O; 8192 still reaches the worker"
+file = "crates/synapse-module/src/lib.rs"
+old = ".find(|(_, ids)| ids.len() > 8192)"
+new = ".find(|(_, ids)| ids.len() > 8193) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::catalog_embed_ceiling_precedes_job_diversion_and_worker_call"]
+expect_message = "sequence_too_long"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "catalog-refusal-order"
+guards = "Unavailable backend is reported before missing installation, so clients do not download unusable models"
+file = "crates/synapse-module/src/lib.rs"
+old = "if catalog_backend_reason(&state.runtime, &backend.backend).is_some() {"
+new = "if false && catalog_backend_reason(&state.runtime, &backend.backend).is_some() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["catalog_runtime_tests::catalog_unavailable_backend_precedes_missing_install"]
+expect_message = "backend refusal must precede missing installation"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "catalog-pinned-url-before-redirect"
+guards = "Hugging Face resolve URLs must pin a revision before redirects can hide a moving branch"
+file = "crates/synapse-module/src/lib.rs"
+old = '.any(|pair| pair[0] == "resolve" && pinned_revision(pair[1]))'
+new = '.any(|pair| pair[0] == "resolve") /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["catalog_runtime_tests::catalog_endpoint_and_asset_guards_reject_unpinned_network_io"]
+expect_message = "validate_resolved_asset"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "catalog-quarantine-corrupt-blob"
+guards = "Quarantine unlinks corrupt bytes as well as removing their authority and pins"
+file = "crates/synapse-module/src/store.rs"
+old = """
+let freed = cache
+                .delete_blob(&digest)
+                .map_err(|error| cache_error("delete blob", &digest, error))?;"""
+new = "let freed = 0; // NON-VACUITY BREAK: corrupt bytes retained"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::quarantine_removes_the_blob_its_installs_members_and_pins_and_fails_holding_jobs"]
+expect_message = "assertion"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
