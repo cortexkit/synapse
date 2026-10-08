@@ -101,5 +101,36 @@ class E2eOutputTests(unittest.TestCase):
         self.assertNotEqual(cache["with"]["prefix-key"], root_cache["with"]["prefix-key"])
 
 
+class ReleaseTargetsTests(unittest.TestCase):
+    def test_release_build_selects_only_shipped_rust_binaries(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/release-candidate.yml").read_text())
+        job = workflow["jobs"]["build"]
+        build = next(s for s in job["steps"] if s.get("name") == "Build every release asset once")
+        for matrix in job["strategy"]["matrix"]["include"]:
+            with self.subTest(platform=matrix["os_arch"]), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                cargo = root / "cargo"
+                cargo.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                                 "from pathlib import Path\n"
+                                 "Path('args.json').write_text(json.dumps(sys.argv[1:]))\n")
+                cargo.chmod(0o755)
+                script = build["run"]
+                for key in ("packages", "features", "binaries"):
+                    script = script.replace("${{ matrix." + key + " }}", matrix[key])
+                env = dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}")
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                                        cwd=root, env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads((root / "args.json").read_text())
+                selected = {args[i + 1] for i, arg in enumerate(args) if arg == "--bin"}
+                self.assertIn("ck-synapse", selected)
+                self.assertIn("--release", args)
+                self.assertIn("--locked", args)
+                self.assertEqual(selected, set(matrix["binaries"].split()) - {"ck-synapse-worker-ane-swift"})
+                self.assertTrue(all(name.startswith("ck-") for name in selected))
+                self.assertTrue(selected.isdisjoint({"inline_embed_throughput", "subc_call",
+                                                      "synapse-worker-timeout-mock"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

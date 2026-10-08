@@ -177,7 +177,18 @@ jobs:
           "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
       - name: Build every release asset once
         shell: bash
-        run: cargo build --release --locked ${{ matrix.packages }} ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          bins=()
+          for bin in ${{ matrix.binaries }}; do
+            # Swift is emitted by the ANE build script, not a Cargo bin target.
+            if [ "$bin" != ck-synapse-worker-ane-swift ]; then
+              bins+=(--bin "$bin")
+            fi
+          done
+          # Package selection alone also builds local exercisers and mocks.
+          # Select shipped targets without hiding tools operators build locally.
+          cargo build --release --locked ${{ matrix.packages }} ${{ matrix.features }} "${bins[@]}"
       - name: Stage Swift Core ML worker
         if: runner.os == 'macOS'
         shell: bash
