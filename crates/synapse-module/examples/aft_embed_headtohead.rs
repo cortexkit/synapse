@@ -21,7 +21,15 @@ use qwen_compare::Candidate;
 const ROWS: usize = 6341;
 const BATCHES: usize = 127;
 const SAMPLE_COUNT: usize = 64;
-const DIMENSION: usize = 1024;
+/// Output width of the model under test: Qwen3-Embedding-0.6B is 1024,
+/// gte-modernbert-base is 768 (see `qwen_compare::model`).
+fn dimension() -> usize {
+    if qwen_compare::model().starts_with("gte-") {
+        768
+    } else {
+        1024
+    }
+}
 const IN_FLIGHT: usize = 2;
 
 #[derive(Deserialize)]
@@ -296,7 +304,7 @@ fn decode_vectors(
             return Err(Failure::error("duplicate_row_id"));
         }
         let values = vector(&entry[if bionic { "embedding" } else { "vector" }])?;
-        if values.len() != DIMENSION {
+        if values.len() != dimension() {
             return Err(Failure::error("dimension_mismatch"));
         }
         if !bionic && (values.iter().map(|v| v * v).sum::<f64>().sqrt() - 1.0).abs() > 1e-3 {
@@ -505,7 +513,7 @@ async fn run_arm(provider: Arc<Provider>, workload: Arc<Workload>) -> Result<Arm
                 Ok(vectors) => {
                     record.rows_returned = vectors.len();
                     result.rows_returned += vectors.len();
-                    result.vector_dimension = Some(DIMENSION);
+                    result.vector_dimension = Some(dimension());
                     for (offset, vector) in vectors.into_iter().enumerate() {
                         let norm = vector.iter().map(|v| v * v).sum::<f64>().sqrt();
                         if (norm - 1.0).abs() > 1e-3 {
@@ -868,7 +876,7 @@ mod tests {
     }
 
     fn unit_vector(scale: f64) -> Vec<f64> {
-        let mut values = vec![0.0; DIMENSION];
+        let mut values = vec![0.0; dimension()];
         values[0] = scale;
         values
     }

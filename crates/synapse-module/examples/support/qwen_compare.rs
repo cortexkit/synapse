@@ -16,9 +16,24 @@ use tokio::net::TcpListener;
 
 pub const MODEL: &str = "qwen3-embedding-0.6b";
 
+/// The embedding model under test. Defaults to Qwen3; set
+/// SYNAPSE_COMPARE_MODEL=gte-modernbert-base to run the same harness on gte.
+pub fn model() -> String {
+    std::env::var("SYNAPSE_COMPARE_MODEL").unwrap_or_else(|_| MODEL.into())
+}
+
+/// gte-modernbert is CLS-pooled; Qwen3-Embedding takes the last token.
+fn pooling(model: &str) -> &'static str {
+    if model.starts_with("gte-") {
+        "cls"
+    } else {
+        "last"
+    }
+}
+
 pub fn verify_checkpoint(weights: &Path) -> Result<Manifest> {
     let manifest = Manifest::from_slice(include_bytes!("../../../../bench/parity/models.json"))?;
-    for (file, digest) in &manifest.model(MODEL)?.files {
+    for (file, digest) in &manifest.model(&model())?.files {
         ensure!(
             sha256_file(&weights.join(file))? == *digest,
             "original checkpoint digest mismatch: {file}"
@@ -80,6 +95,8 @@ impl Candidate {
         inline_tokens: usize,
     ) -> Result<Self> {
         let manifest = verify_checkpoint(weights)?;
+        let model = model();
+        let pooling = pooling(&model);
         let root = checkout
             .join("target")
             .join(format!("{label}-{}", std::process::id()));
@@ -89,7 +106,7 @@ impl Candidate {
             &package,
             synapse_parity::convert::convert_profile_file(
                 &manifest,
-                &format!("{MODEL}.ane-direct-worker"),
+                &format!("{model}.ane-direct-worker"),
                 &weights.join("model.safetensors"),
             )?,
         )?;
@@ -121,8 +138,8 @@ impl Candidate {
         std::fs::write(
             &config,
             serde_json::to_vec(&json!({"preload_models":[
-            {"model_id":model_ids[0],"engine":"ane-direct-worker","profile":format!("{MODEL}.ane-direct-worker"),"task":"embed","model_path":package,"tokenizer_path":weights.join("tokenizer.json"),"pooling":"last","normalize":true,"worker_bin":worker,"execution":"explicit","attention_units":8192*8192},
-            {"model_id":model_ids[1],"engine":"owned-metal","profile":format!("{MODEL}.owned-metal"),"task":"embed","model_path":weights.join("model.safetensors"),"tokenizer_path":weights.join("tokenizer.json"),"pooling":"last","normalize":true,"execution":"explicit","attention_units":8192*8192}],
+            {"model_id":model_ids[0],"engine":"ane-direct-worker","profile":format!("{model}.ane-direct-worker"),"task":"embed","model_path":package,"tokenizer_path":weights.join("tokenizer.json"),"pooling":pooling,"normalize":true,"worker_bin":worker,"execution":"explicit","attention_units":8192*8192},
+            {"model_id":model_ids[1],"engine":"owned-metal","profile":format!("{model}.owned-metal"),"task":"embed","model_path":weights.join("model.safetensors"),"tokenizer_path":weights.join("tokenizer.json"),"pooling":pooling,"normalize":true,"execution":"explicit","attention_units":8192*8192}],
             "inline":{"max_items":64,"max_tokens":inline_tokens,"deadline_ms":600000,"max_queue_ms":600000,"max_concurrent_workers":2}}))?,
         )?;
         let child = synapse_core::without_launch_nonce_tokio(tokio::process::Command::new(module))
