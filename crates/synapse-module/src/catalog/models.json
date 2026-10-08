@@ -17,14 +17,14 @@
           "role": "model",
           "sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
           "size_bytes": 298041568,
-          "backends": ["metal"]
+          "backends": ["metal", "ane"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
           "size_bytes": 3583228,
-          "backends": ["metal"]
+          "backends": ["metal", "ane"]
         },
         {
           "path": "config.json",
@@ -47,6 +47,20 @@
           "normalize": true,
           "dims": 768,
           "fingerprint": "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+        },
+        {
+          "backend": "ane",
+          "engine": "ane-direct-worker",
+          "profile": "gte-modernbert-base.ane-direct-worker",
+          "family": "gte-modernbert",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "cls",
+          "normalize": true,
+          "dims": 768,
+          "fingerprint": "fa07e22359bfdff6deb529b64db81adf54ca0c6e23f146a0bc48ee3eadd08c5a"
         }
       ],
       "self_check": {
@@ -160,14 +174,14 @@
           "role": "model",
           "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
           "size_bytes": 1191586416,
-          "backends": ["metal"]
+          "backends": ["metal", "ane"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
           "size_bytes": 11423705,
-          "backends": ["metal"]
+          "backends": ["metal", "ane"]
         },
         {
           "path": "config.json",
@@ -190,6 +204,20 @@
           "normalize": true,
           "dims": 1024,
           "fingerprint": "62b20d3a03d6e17a6022925dc3c5da4766bc89b1e11233d8c5c10d146871b37c"
+        },
+        {
+          "backend": "ane",
+          "engine": "ane-direct-worker",
+          "profile": "qwen3-embedding-0.6b.ane-direct-worker",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "last",
+          "normalize": true,
+          "dims": 1024,
+          "fingerprint": "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b"
         }
       ],
       "self_check": {
@@ -214,14 +242,42 @@
       "id": "qwen3-reranker-0.6b",
       "task": "rerank",
       "name": "Qwen3 Reranker 0.6B",
-      "description": "Multilingual reranker that scores query and passage pairs. No backend serves it in this release.",
+      "description": "Multilingual reranker that scores query and passage pairs with an 8192-token context on the Neural Engine.",
       "default_for_task": false,
       "upstream": {
         "hf_repo": "Qwen/Qwen3-Reranker-0.6B",
         "revision": "e61197ed45024b0ed8a2d74b80b4d909f1255473"
       },
-      "files": [],
-      "backends": []
+      "files": [
+        {
+          "path": "model.safetensors",
+          "role": "model",
+          "sha256": "27cd75a405b9c1b46b59abfd88aaa209e6fed2a1972cde9b70e7659537c5e65b",
+          "size_bytes": 1191588280,
+          "backends": ["ane"]
+        },
+        {
+          "path": "tokenizer.json",
+          "role": "tokenizer",
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+          "size_bytes": 11422654,
+          "backends": ["ane"]
+        }
+      ],
+      "backends": [
+        {
+          "backend": "ane",
+          "engine": "ane-direct-worker",
+          "profile": "qwen3-reranker-0.6b.ane-direct-worker",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "rerank_abs_tolerance": 0.005,
+          "fingerprint": "afa50ba3e4c56f42c750d10751f91b700f812c73862bdec8977d3a3db169aef3"
+        }
+      ]
     }
   ]
 }
