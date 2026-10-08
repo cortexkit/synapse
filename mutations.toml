@@ -469,3 +469,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "certify-subset-provenance"
+guards = "Load-time reference subsets remain exact copies of the independently sealed parity corpus"
+file = "crates/synapse-certify/src/self_check/mod.rs"
+old = '"gte-modernbert-base" => Ok(include_bytes!("gte-modernbert-base.json")),'
+new = '"gte-modernbert-base" => Ok(include_bytes!("qwen3-embedding-0.6b.json")), // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-certify/src/self_check/mod.rs"
+runner = "cargo"
+package = "synapse-certify"
+target = "--lib"
+select = "expected"
+expect_red = ["self_check::tests::subsets_are_exact_copies_of_the_sealed_source_cases"]
+expect_message = "gte-modernbert-base: field"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
