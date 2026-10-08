@@ -23,7 +23,12 @@ class Refused(ValueError):
 
 @contextmanager
 def ckdev_binary(worker):
-    """Smoke extracted images without impersonating an installed process."""
+    """Yield a temporary `ckdev-` link to an extracted binary for a smoke run.
+
+    A `ck-` executable name is reserved for installed binaries, so smoke runs
+    of extracted release assets execute a `ckdev-` hard link (or a copy when
+    the scratch dir is on another volume) instead.
+    """
     with tempfile.TemporaryDirectory() as scratch:
         name = worker.name[3:] if worker.name.startswith("ck-") else worker.name
         alias = Path(scratch) / ("ckdev-" + name)

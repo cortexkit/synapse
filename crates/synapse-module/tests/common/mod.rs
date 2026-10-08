@@ -119,9 +119,11 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
         .env("SYNAPSE_CONFIG_PATH", config_path)
         .env("CORTEXKIT_LEASE_ROOT", lease_root)
         .env("XDG_DATA_HOME", data_home);
-    // Moving the module removes its production-named siblings. Pin available
-    // companions explicitly so discovery still works without executing build
-    // outputs under names reserved for installed processes.
+    // The module finds an unconfigured worker by its `ck-synapse-worker-<engine>`
+    // file name beside its own executable. Tests run the module as a `ckdev-`
+    // link in a scratch dir, where no such sibling exists, and a `ck-` name is
+    // reserved for installed binaries anyway. So point each engine's worker
+    // variable at a `ckdev-` link of the built worker instead.
     let built_dir = Path::new(env!("CARGO_BIN_EXE_ck-synapse"))
         .parent()
         .unwrap();
@@ -143,8 +145,9 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
             .unwrap_or(source);
         if source.is_file() {
             if engine == "ane" {
-                // The launcher can fall back to its compile-time Swift path.
-                // Pin that existing override before making the launcher runnable.
+                // Without SYNAPSE_ANE_SWIFT_WORKER the launcher would exec the
+                // Swift worker at the path baked in when it was compiled,
+                // under its `ck-` name, so point it at a `ckdev-` link.
                 let swift = swift_worker(source.parent().unwrap())
                     .or_else(|| swift_worker(built_dir))
                     .expect("ANE launcher requires a development Swift companion");
@@ -161,8 +164,9 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
             command.env_remove(variable);
         }
     }
-    // Supervised owned generation also accepts a legacy explicit override,
-    // separate from the embedding companion's canonical engine variable.
+    // Owned decode also reads SYNAPSE_OWNED_DECODE_WORKER_BIN, separate from
+    // the per-engine variable set above, so link that one too when a test sets
+    // it, and clear it otherwise.
     let variable = "SYNAPSE_OWNED_DECODE_WORKER_BIN";
     if let Some(source) = std::env::var_os(variable)
         .map(PathBuf::from)

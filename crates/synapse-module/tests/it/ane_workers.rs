@@ -263,8 +263,9 @@ fn development_worker(worker: &Path, scratch: &Path) -> PathBuf {
     let swift =
         common::swift_worker(worker.parent().unwrap()).expect("ANE Swift companion is required");
     let swift = synapse_core::dev_binary::ckdev_binary(swift, scratch).unwrap();
-    // WorkerHost has no per-child environment hook. A private wrapper sets the
-    // launcher's existing override without changing the process-wide test env.
+    // WorkerHost has no per-child environment hook, so a small wrapper script
+    // sets SYNAPSE_ANE_SWIFT_WORKER to the `ckdev-` Swift link for this child
+    // only, without changing the environment of the whole test process.
     let wrapper = launcher.parent().unwrap().join("ckdev-ane-launch.sh");
     let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
     std::fs::write(
