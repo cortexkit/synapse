@@ -347,3 +347,26 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "catalog-file-identity"
+guards = "A changed file identity forces cold-load hashing rather than reusing a stale verification"
+file = "crates/synapse-module/src/lib.rs"
+old = """
+if let Some(stamp) = &before {
+        if store"""
+new = """
+if let Some(stamp) = &before {
+        if true || store /* NON-VACUITY BREAK */"""
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::catalog_verification_touch_forces_rehash"]
+expect_message = "assertion `left == right` failed"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
