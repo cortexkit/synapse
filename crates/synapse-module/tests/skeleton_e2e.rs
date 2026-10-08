@@ -1711,6 +1711,14 @@ async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn owned_gte_inline_embed_batch_throughput_sweep() {
+    // Timing bounds need an intentionally quiet GPU, not merely a cached model
+    // on a shared developer machine. Correctness tests remain checkpoint-gated.
+    if std::env::var("SYNAPSE_RUN_HARDWARE_PERF").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping hardware performance sweep: set SYNAPSE_RUN_HARDWARE_PERF=1 to run owned_gte_inline_embed_batch_throughput_sweep on a quiet GPU"
+        );
+        return;
+    }
     let snapshot = gte_safetensors_snapshot().expect("local GTE ModernBERT snapshot is required");
     for required in ["model.safetensors", "tokenizer.json", "config.json"] {
         assert!(

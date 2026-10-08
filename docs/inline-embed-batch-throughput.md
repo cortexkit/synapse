@@ -46,6 +46,14 @@ with a timestamp-plus-process nonce because the request store replays identical
 idempotent requests. Job-shaped responses follow every `embed.result` page and
 assert the complete id set instead of timing only page zero.
 
+The hardware e2e sweep is opt-in: run
+`SYNAPSE_RUN_HARDWARE_PERF=1 cargo test -p synapse-module --test skeleton_e2e owned_gte_inline_embed_batch_throughput_sweep -- --nocapture`
+on a quiet macOS GPU with the local GTE checkpoint available. Without that exact
+env value it reports a skip before loading weights; its throughput and latency
+assertions are unchanged. The real-weight provenance, family-reference probe,
+and deterministic reranking tests remain checkpoint-gated correctness checks,
+not performance batteries, and do not require this flag.
+
 Measured run on the local M5, warm `gte-modernbert-base-f16`:
 
 | Batch | Tokens | Total ms | ms/item | tok/s |
