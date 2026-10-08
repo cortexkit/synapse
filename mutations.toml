@@ -930,3 +930,24 @@ build_timeout_s = 1800
 
 
 desk_only = "The owned-decode metallib source scanner is compiled only on macOS; CI has no Apple SDK runner. Replay the planted disk-loader spelling on a Mac."
+
+[[control]]
+id = "swift-protocol-source-scan"
+guards = "The Swift HELLO protocol version must agree with the shared Rust wire version"
+file = "crates/synapse-worker-ane/swift/ane_worker.swift"
+old = "private let protocolVersion = 2"
+new = """
+private let protocolVersion = 3
+// NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-worker-ane/src/main.rs"
+runner = "cargo"
+package = "synapse-worker-ane"
+target = "--bin ck-synapse-worker-ane"
+select = "expected"
+expect_red = ["tests::swift_protocol_version_matches_the_worker_protocol_version"]
+expect_message = "assertion `left == right` failed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
