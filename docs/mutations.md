@@ -40,7 +40,7 @@ The runner restores source bytes and verifies `Cargo.lock`, including on errors.
 CI replays touched rows unconditionally in the same Linux/Windows step list on
 trains and master. A separate master workflow replays the whole catalogue; a
 schedule-only workflow audits all package test targets with `--broad`. Both retain
-JSON evidence. Cargo/nextest rows use `select = "expected"` to keep portable
+JSON evidence. Most Cargo/nextest rows use `select = "expected"` to keep portable
 replay from executing unrelated folded hardware rigs. This selection stays narrow
 **even under `--broad`**, so the nightly workflow renders an otherwise identical
 copy with `select` removed before auditing it. The renderer verifies that no other
