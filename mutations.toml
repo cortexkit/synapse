@@ -632,3 +632,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "catalog-remove-derived-packages"
+guards = "Removing the last catalog root reclaims derived model packages and their compiled cache entries"
+file = "crates/synapse-module/src/lib.rs"
+old = "freed.saturating_add(reclaim_unrooted_owned_packages(tx, &state.model_cache)?);"
+new = "freed.saturating_add(0); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/tests/catalog_e2e/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--test skeleton_e2e"
+select = "expected"
+expect_red = ["catalog_e2e::catalog_shared_member_keeps_derived_packages_until_last_root_is_removed"]
+expect_message = "last root must reclaim both packages and their compiled entries"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
