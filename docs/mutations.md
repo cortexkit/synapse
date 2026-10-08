@@ -11,8 +11,8 @@ Compilation errors and timeouts are not catches.
 Use the reviewed runner, not a floating release:
 
 ```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev 0097d269a4c409db13306a11fc2c504057629791 cortexkit-mutate
-ckdev-mutate --version # 0.9.1
+cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
+ckdev-mutate --version # 0.9.3
 cargo nextest --version
 mkdir -p target/mutations
 ckdev-mutate check
@@ -61,13 +61,13 @@ ckdev-mutate prove --id example-refusal --guards 'explain the costly failure pre
   --file path/to/source.rs --old 'exact live anchor' --new 'deliberate break' \
   --test-file path/to/test.rs --package package-name --target=--lib \
   --expect-red module::tests::exact_full_name --expect-message 'property-specific failure' \
-  --report target/mutations/example.json
+  --select expected --report target/mutations/example.json
 ckdev-mutate check
 ```
 
-`prove` appends only a caught row. It currently has no CLI switch for `select`,
-so add `select = "expected"` to a proved Cargo/nextest row, then run `check` and
-replay it. If the break survives, add coverage through the
+`prove --select expected` runs the exact guarding names on both the baseline and
+mutant, then appends a caught row with `select = "expected"`. If the break survives,
+add coverage through the
 real production path and prove it again; testing the underlying predicate alone
 cannot prove that its caller uses it correctly. Exactly-once recovery needs a
 production-path row. Source scanners need planted violations in a scanned file,
@@ -80,7 +80,7 @@ selection the test actually needs. Declare fixture binary builds in a root
 so a stale executable cannot falsely defend a guard. An `equivalent` disposition
 requires an `equivalent_guard` explaining why behavior really cannot differ; a
 green test suite alone is not evidence of equivalence. See the [pinned runner
-README](https://github.com/cortexkit/commons/blob/0097d269a4c409db13306a11fc2c504057629791/crates/cortexkit-mutate/README.md)
+README](https://github.com/cortexkit/commons/blob/c1591d4a76fa3d3a7367237922b0bca5214dbf11/crates/cortexkit-mutate/README.md)
 for multi-edit anchors, command rows, platform selection, and HUB review.
 
 ## Mac replay and desktop-only rows
@@ -106,12 +106,17 @@ HOME="$portable_home" CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" \
   ckdev-mutate run --all --report target/mutations/portable.json
 ```
 
-`prove` prepares the **whole package** baseline even for a narrow target, because
-it can diagnose survivors package-wide. With a developer's cached weights that
-baseline reached
+Unselected `prove` and breadth audits prepare the **whole package** baseline,
+because they can diagnose survivors package-wide. With a developer's cached weights
+that baseline reached
 `catalog_e2e::catalog_real_metal_redirect_download_self_checks_and_serves_without_probe`
-and did not terminate before the runner's test deadline. An isolated HOME keeps
-optional hardware fixtures out of portable guard proofs; their absence/skip is
+and was still executing when an earlier test-phase deadline expired. Subsequent
+runner-equivalent diagnostics completed all portable package tests: missing Git
+watch paths in worktrees had forced Cargo recompilation inside the test phase,
+consuming the deadline before the last test finished. The build script now
+resolves per-worktree paths and the current branch ref, and its Git queries use
+`GIT_OPTIONAL_LOCKS=0` so observing the index does not rewrite it. An isolated HOME
+keeps optional hardware fixtures out of portable guard proofs; their absence/skip is
 not a hardware pass. Apply the same environment to `prove` and a portable `--broad`
 audit. Do not use this environment for a desk-only hardware proof: supply the real
 fixtures and report that proof separately.

@@ -44,7 +44,7 @@ jobs:
       - name: Install pinned mutation runner
         shell: bash
         run: |
-          cargo install --locked --git https://github.com/cortexkit/commons --rev 0097d269a4c409db13306a11fc2c504057629791 cortexkit-mutate
+          cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
           ckdev-mutate --version
       - name: Audit all package test targets
         shell: bash
