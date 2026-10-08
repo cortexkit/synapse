@@ -34,10 +34,15 @@ jobs:
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
           fi
           cargo nextest --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install mutation checker dependency
+        run: python -m pip install PyYAML==6.0.3
       - name: Install pinned mutation runner
         shell: bash
         run: |
-          cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 0097d269a4c409db13306a11fc2c504057629791 cortexkit-mutate
           ckdev-mutate --version
       # A full master replay catches regressions in helpers and fixtures that
       # are neither an edit target nor the test_file selected by --diff.

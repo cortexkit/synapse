@@ -11,22 +11,25 @@ Compilation errors and timeouts are not catches.
 Use the reviewed runner, not a floating release:
 
 ```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
-ckdev-mutate --version # 0.8.0
+cargo install --locked --git https://github.com/cortexkit/commons --rev 0097d269a4c409db13306a11fc2c504057629791 cortexkit-mutate
+ckdev-mutate --version # 0.9.1
 cargo nextest --version
 mkdir -p target/mutations
 ckdev-mutate check
 ckdev-mutate run --all --report target/mutations/all.json
 ckdev-mutate run --diff origin/master --report target/mutations/diff.json
 ckdev-mutate run --only nonce-sync-child --report target/mutations/one.json
-ckdev-mutate run --all --broad --report target/mutations/broad.json
+python3 scripts/prepare-mutation-audit.py mutations.toml target/mutations/broad.toml
+ckdev-mutate --catalogue target/mutations/broad.toml run --all --broad --report target/mutations/broad.json
 ```
 
 `--diff` compares **committed** changes to `HEAD`; uncommitted source, helper, and
 fixture edits are not a substitute for a full replay. `check` validates every
 anchor exactly once and lists guarding test names for this host. Nextest rows
-need cargo-nextest installed. Python command rows need Python 3; the CI workflow
-checker also needs PyYAML. The production allow-list row compiles a normal library
+need cargo-nextest installed. Python command rows and the audit renderer need
+Python 3.11 or newer; the CI workflow checker also needs PyYAML 6.0.3. CI provisions
+Python 3.13 and that pinned dependency; a Mac can use an ignored virtualenv under
+`target/mutations/` and put its `bin` directory first on PATH. The production allow-list row compiles a normal library
 because Cargo test builds enable `test-support` through a self dev dependency.
 
 Run from a clean checkout, one mutation process per checkout. Never check out a
@@ -37,9 +40,15 @@ The runner restores source bytes and verifies `Cargo.lock`, including on errors.
 CI replays touched rows unconditionally in the same Linux/Windows step list on
 trains and master. A separate master workflow replays the whole catalogue; a
 schedule-only workflow audits all package test targets with `--broad`. Both retain
-JSON evidence. A broad catch must be narrowed or marked `hub` with the shared
+JSON evidence. Cargo/nextest rows use `select = "expected"` to keep portable
+replay from executing unrelated folded hardware rigs. This selection stays narrow
+**even under `--broad`**, so the nightly workflow renders an otherwise identical
+copy with `select` removed before auditing it. The renderer verifies that no other
+field changed. A broad catch must be narrowed or marked `hub` with the shared
 property and the observed stable collateral target names, never executable hashes.
-Deadlines are hang bounds, not performance assertions. Tune budgets only with
+Deadlines are hang bounds, not performance assertions. A HUB row must omit
+`select` (the runner refuses a breadth claim on a filtered row).
+Tune budgets only with
 clean CI evidence, never timings from a busy developer machine.
 
 ## Add a control
@@ -56,7 +65,9 @@ ckdev-mutate prove --id example-refusal --guards 'explain the costly failure pre
 ckdev-mutate check
 ```
 
-`prove` appends only a caught row. If the break survives, add coverage through the
+`prove` appends only a caught row. It currently has no CLI switch for `select`,
+so add `select = "expected"` to a proved Cargo/nextest row, then run `check` and
+replay it. If the break survives, add coverage through the
 real production path and prove it again; testing the underlying predicate alone
 cannot prove that its caller uses it correctly. Exactly-once recovery needs a
 production-path row. Source scanners need planted violations in a scanned file,
@@ -69,7 +80,7 @@ selection the test actually needs. Declare fixture binary builds in a root
 so a stale executable cannot falsely defend a guard. An `equivalent` disposition
 requires an `equivalent_guard` explaining why behavior really cannot differ; a
 green test suite alone is not evidence of equivalence. See the [pinned runner
-README](https://github.com/cortexkit/commons/blob/46cc166b0df2edcfd14b3eb54ed6eeac588fed69/crates/cortexkit-mutate/README.md)
+README](https://github.com/cortexkit/commons/blob/0097d269a4c409db13306a11fc2c504057629791/crates/cortexkit-mutate/README.md)
 for multi-edit anchors, command rows, platform selection, and HUB review.
 
 ## Mac replay and desktop-only rows
@@ -83,8 +94,8 @@ removing only `desk_only`, and replaying with `--only` and a retained JSON repor
 Keep `platforms`, features, ignored selection, anchors and expectations unchanged.
 Install the required Apple developer tools/artifacts before a hardware proof.
 
-For the portable baseline on a Mac, isolate HOME from optional model snapshots
-while retaining the real Cargo and rustup installations:
+For `prove` and unselected breadth baselines on a Mac, isolate HOME from optional
+model snapshots while retaining the real Cargo and rustup installations:
 
 ```sh
 real_home="$HOME"
