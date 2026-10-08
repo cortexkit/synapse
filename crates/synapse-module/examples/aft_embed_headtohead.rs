@@ -714,7 +714,9 @@ async fn main() -> Result<()> {
                         &assets,
                         &weights,
                         "aft-headtohead",
-                        ["qwen3-embedding-0.6b-ane", "qwen3-embedding-0.6b-metal"],
+                        // Preload ids must not collide with catalog lane ids,
+                        // which the module reserves for models.download.
+                        ["headtohead-ane", "headtohead-metal"],
                         64 * 8192,
                     )
                     .await?,
@@ -722,7 +724,7 @@ async fn main() -> Result<()> {
             }
             Provider::Synapse {
                 candidate: candidate.as_ref().unwrap().clone(),
-                model: format!("qwen3-embedding-0.6b-{arm}"),
+                model: format!("headtohead-{arm}"),
             }
         };
         let result = run_arm(Arc::new(provider), workload.clone()).await?;

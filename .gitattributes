@@ -6,6 +6,9 @@ crates/synapse-module/owned-decode-manifests/** text eol=lf
 bench/campaign/*-fixtures/** text eol=lf
 bench/fixtures/** text eol=lf
 evidence/** text eol=lf
+bench/parity/models.json text eol=lf
+bench/parity/fixtures/** text eol=lf
+crates/synapse-certify/src/self_check/*.json text eol=lf
 
 # Parsed by structure at compile time (include_str!): the drift-guard tests
 # find the operation inventory by its blank-line paragraph break, which a CRLF
