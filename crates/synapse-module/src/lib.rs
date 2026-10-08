@@ -19037,8 +19037,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // Exercise the routing precheck itself, not just the crash-budget predicate:
-    // a constant clock at this call site would otherwise leave expired bans in force.
+    // Test the check that routing runs before using a decode lane
+    // (`owned_decode_quarantined`), not only `CrashBudget::is_quarantined`:
+    // if routing passed a constant time instead of the wall clock, an expired
+    // quarantine would keep blocking the lane forever.
     #[test]
     fn owned_decode_quarantine_routing_precheck_reads_wall_clock() {
         use owned_decode_worker::budget::{BudgetPolicy, CrashBudget, FileBudgetStore};

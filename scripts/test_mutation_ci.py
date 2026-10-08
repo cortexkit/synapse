@@ -22,8 +22,9 @@ class ProductionEngineGuardTests(unittest.TestCase):
 
 class MutationCiTests(unittest.TestCase):
     def test_touched_rows_are_required(self):
-        # Run the real checker over the real workflow; a fixture-only self-test
-        # would not prove that a removed CI replay is refused before landing.
+        # Run the real precondition checker over the real tests.yml. A fixture
+        # alone would not prove that deleting the CI step that replays the
+        # mutations touched by a change is refused before that change lands.
         result = subprocess.run(
             ["bash", "scripts/check-train-preconditions.sh"],
             env=dict(os.environ, PYTHON=sys.executable),

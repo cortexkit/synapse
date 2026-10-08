@@ -73,8 +73,9 @@ fn main() {
 
 fn git(dir: &str, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
-        // These queries must not refresh the watched index as a side effect,
-        // or observing provenance would invalidate Cargo's own fingerprint.
+        // Every git query in this script must not refresh the index as a side
+        // effect: the index is a watched file, so reading provenance would
+        // otherwise make Cargo rebuild this crate on the next run.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .current_dir(dir)

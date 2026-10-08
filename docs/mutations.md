@@ -10,7 +10,8 @@ Compilation errors and timeouts are not catches.
 
 ## Install and replay
 
-Use the reviewed runner, not a floating release:
+Install `cortexkit-mutate` at the commit this catalogue was proved with (the same
+one CI installs), not the latest release:
 
 ```sh
 cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
@@ -31,8 +32,10 @@ anchor exactly once and lists guarding test names for this host. Nextest rows
 need cargo-nextest installed. Python command rows and the audit renderer need
 Python 3.11 or newer; the CI workflow checker also needs PyYAML 6.0.3. CI provisions
 Python 3.13 and that pinned dependency; a Mac can use an ignored virtualenv under
-`target/mutations/` and put its `bin` directory first on PATH. The production allow-list row compiles a normal library
-because Cargo test builds enable `test-support` through a self dev dependency.
+`target/mutations/` and put its `bin` directory first on PATH. The row guarding
+the production engine allow-list (which must never include the test-only
+deterministic engine) builds the library without tests, because Cargo test
+builds always enable `test-support` through a self dev dependency.
 
 Run from a clean checkout, one mutation process per checkout. Never check out a
 source file while the runner is testing its mutant: that would remove the break
@@ -46,8 +49,10 @@ JSON evidence. Most Cargo/nextest rows use `select = "expected"` to keep portabl
 replay from executing unrelated folded hardware rigs. This selection stays narrow
 **even under `--broad`**, so the nightly workflow renders an otherwise identical
 copy with `select` removed before auditing it. The renderer verifies that no other
-field changed. A broad catch must be narrowed or marked `hub` with the shared
-property and the observed stable collateral target names, never executable hashes.
+field changed. A catch is broad when tests outside the row's expected list also
+fail. Narrow such a row, or mark it `hub`: a guard many tests legitimately
+depend on, recorded with the shared property and the names of the other test
+targets that fail (stable target names, never executable hashes).
 Deadlines are hang bounds, not performance assertions. A HUB row must omit
 `select` (the runner refuses a breadth claim on a filtered row).
 Tune budgets only with

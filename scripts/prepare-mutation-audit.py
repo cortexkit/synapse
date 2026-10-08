@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Remove exact-test selection without changing the mutation being audited."""
+"""Render mutations.toml for the nightly breadth audit.
+
+Most rows set `select = "expected"` so routine replays run only their listed
+tests. The nightly audit must run every test target to find unexpected
+collateral failures, so this removes `select` and verifies nothing else in any
+row changed.
+"""
 import re
 import sys
 import tomllib

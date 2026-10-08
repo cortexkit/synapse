@@ -1,8 +1,11 @@
 
-# Deliberate breaks of silent safety and compatibility guards. Create rows with
-# the pinned runner's prove command; compilation errors and timeouts are not catches.
-# Integration tests launch this production entry point. Refresh its test-support
-# fixture after each mutant so an unchanged executable cannot hide a source break.
+# Each row is a deliberate one-line break of a safety or compatibility guard that
+# would otherwise fail silently, plus the tests that must fail when it is applied.
+# Add rows with `ckdev-mutate prove` from the pinned runner (see docs/mutations.md);
+# a mutant that fails to compile or times out does not count as caught.
+# Integration tests launch the ck-synapse binary, so it is rebuilt with the
+# test-support feature after each mutant; otherwise a stale, unmutated binary
+# could pass the tests and hide the break.
 prebuild = [
     { name = "module-fixture", command = ["cargo", "build", "--locked", "-p", "synapse-module", "--bin", "ck-synapse", "--features", "test-support"], timeout_s = 1800 },
 ]
