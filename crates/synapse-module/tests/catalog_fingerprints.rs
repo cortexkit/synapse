@@ -14,8 +14,10 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
     let mut checked = 0;
     for entry in catalog["models"].as_array().unwrap() {
         for backend in entry["backends"].as_array().unwrap() {
-            // Preserve the legacy Metal profile calculation byte-for-byte;
-            // profile-tied ANE lanes have their own independent pins below.
+            // Keep the existing Metal fingerprint calculation unchanged so adding
+            // ANE entries does not change consumers' Metal model identities. The
+            // test below recomputes each ANE catalog fingerprint from the numeric
+            // settings in bench/parity/models.json and checks its recorded value.
             if backend["backend"] != "metal" {
                 continue;
             }

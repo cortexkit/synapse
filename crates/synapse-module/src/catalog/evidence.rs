@@ -220,8 +220,10 @@ fn verify_backend(
         .self_check
         .as_ref()
         .map(|check| check.fixture_revision.to_string())
-        // Profile-only entries started with the first sealed parity subset.
-        // Missing hardware records still fail closed before this comparison.
+        // Entries without their own self_check data use revision 1 of the
+        // load-time fp32 reference inputs and outputs copied from bench/parity
+        // and checked by SHA-256. This default does not replace hardware evidence:
+        // a missing hardware record has already been rejected above.
         .unwrap_or_else(|| "1".into());
     let keys: [(&'static str, String, String); 7] = [
         ("catalog_id", entry.id.clone(), record.catalog_id.clone()),
@@ -746,8 +748,11 @@ mod tests {
             .filter(|entry| !entry.backends.is_empty())
         {
             if entry.self_check.is_none() {
-                // Profile-only entries use the sealed parity corpus already
-                // embedded by the certifier, not a second legacy corpus file.
+                // These entries get their fp32 test inputs and expected outputs
+                // from bench/parity. The certifier embeds a small selection of
+                // those cases and verifies their SHA-256 checksums, so require
+                // that selection to load instead of a duplicate reference file
+                // under src/fixtures.
                 for backend in &entry.backends {
                     assert!(
                         synapse_certify::self_check::load(backend.profile.as_deref().unwrap())

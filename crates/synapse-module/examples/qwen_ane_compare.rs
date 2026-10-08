@@ -153,8 +153,10 @@ fn code_chunks(tokenizer: &SanitizedTokenizer, terminal: u32) -> Result<Vec<Stri
                 .tokenizer()
                 .encode(text.as_str(), true)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            // Include the manifest's terminal EOS in the request budget.
-            // Keeping rows at most 128 tokens keeps all 64 rows inline.
+            // Count the end-of-sequence token specified in bench/parity/models.json,
+            // since the model receives it even when it is not part of the text.
+            // Limit each row to 128 tokens so all 64 rows fit the 8192-token limit
+            // for a direct response instead of being diverted to a background job.
             let composed = ids.len() + usize::from(ids.get_ids().last() != Some(&terminal));
             if composed >= 100 {
                 ensure!(
