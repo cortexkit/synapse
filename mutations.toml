@@ -412,3 +412,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "certify-producer-drop-boundary"
+guards = "Only a slowdown strictly above 3x may drop a parity-passing ANE cell"
+file = "crates/synapse-certify/src/lib.rs"
+old = ".is_some_and(|ratio| ratio > 3.0)"
+new = ".is_some_and(|ratio| ratio >= 3.0) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-certify/tests/records.rs"
+runner = "cargo"
+package = "synapse-certify"
+target = "--test records"
+select = "expected"
+expect_red = ["producer_latency_drop_is_strictly_above_three"]
+expect_message = "at exactly 3x"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
