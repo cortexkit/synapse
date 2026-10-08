@@ -26,8 +26,11 @@ pub(crate) const EVIDENCE_DIR: &str = "docs/evidence/catalog-backends";
 /// this order, form a record's `engine_tree`. Tree hashes of these
 /// directories do not change when a record is committed elsewhere, so
 /// checking a record in does not invalidate it.
-pub(crate) const ENGINE_TREE_DIRS: [&str; 2] =
-    ["crates/synapse-engine-owned", "crates/synapse-worker-ane"];
+pub(crate) const ENGINE_TREE_DIRS: [&str; 3] = [
+    "crates/synapse-engine-owned",
+    "crates/synapse-worker-ane",
+    "crates/synapse-worker-ane-direct",
+];
 
 /// The minimum cosine against the fp32 reference an embed backend must
 /// reach over its whole evidence corpus.
@@ -36,7 +39,7 @@ pub(crate) const EMBED_MIN_COSINE: f64 = 0.999;
 /// The evidence corpus each catalog entry's backends are measured on. The
 /// corpus files live in `crates/synapse-module/src/fixtures/` under the same
 /// name with a `.json` suffix.
-const NAMED_CORPORA: [(&str, &str); 3] = [
+const NAMED_CORPORA: [(&str, &str); 4] = [
     (
         "gte-modernbert-base",
         "probe_corpus_gte_modernbert_ort_fp32",
@@ -45,6 +48,10 @@ const NAMED_CORPORA: [(&str, &str); 3] = [
     (
         "gte-reranker-modernbert-base",
         "catalog_rerank_gte_modernbert_fp32",
+    ),
+    (
+        "qwen3-reranker-0.6b",
+        "qwen3-reranker-0.6b.ref-v1.transformers-5.16.1.seed-0",
     ),
 ];
 
@@ -213,7 +220,9 @@ fn verify_backend(
         .self_check
         .as_ref()
         .map(|check| check.fixture_revision.to_string())
-        .unwrap_or_default();
+        // Profile-only entries started with the first sealed parity subset.
+        // Missing hardware records still fail closed before this comparison.
+        .unwrap_or_else(|| "1".into());
     let keys: [(&'static str, String, String); 7] = [
         ("catalog_id", entry.id.clone(), record.catalog_id.clone()),
         ("backend", backend.backend.clone(), record.backend.clone()),
@@ -410,7 +419,7 @@ mod tests {
                         "catalog_id": entry.id,
                         "backend": backend.backend,
                         "manifest_digest": entry.manifest_digest(),
-                        "fixture_revision": entry.self_check.as_ref().unwrap().fixture_revision,
+                        "fixture_revision": entry.self_check.as_ref().map_or(1, |check| check.fixture_revision),
                         "fingerprint": backend.fingerprint,
                         "engine_tree": ENGINE_TREE,
                         "machine": {"chip": "Apple M5", "os_build": "27A100"},
@@ -479,11 +488,14 @@ mod tests {
             verified,
             [
                 ("gte-modernbert-base".to_string(), "metal".to_string()),
+                ("gte-modernbert-base".to_string(), "ane".to_string()),
                 (
                     "gte-reranker-modernbert-base".to_string(),
                     "metal".to_string()
                 ),
                 ("qwen3-embedding-0.6b".to_string(), "metal".to_string()),
+                ("qwen3-embedding-0.6b".to_string(), "ane".to_string()),
+                ("qwen3-reranker-0.6b".to_string(), "ane".to_string()),
             ]
         );
     }
@@ -664,9 +676,14 @@ mod tests {
             .iter_mut()
             .find(|entry| entry["id"] == entry_id)
             .unwrap();
+        let from = entry["backends"][0]["backend"].clone();
         entry["backends"][0]["backend"] = json!(to);
         for file in entry["files"].as_array_mut().unwrap() {
-            file["backends"] = json!([to]);
+            for backend in file["backends"].as_array_mut().unwrap() {
+                if *backend == from {
+                    *backend = json!(to);
+                }
+            }
         }
         document.to_string()
     }
@@ -728,6 +745,17 @@ mod tests {
             .iter()
             .filter(|entry| !entry.backends.is_empty())
         {
+            if entry.self_check.is_none() {
+                // Profile-only entries use the sealed parity corpus already
+                // embedded by the certifier, not a second legacy corpus file.
+                for backend in &entry.backends {
+                    assert!(
+                        synapse_certify::self_check::load(backend.profile.as_deref().unwrap())
+                            .is_ok()
+                    );
+                }
+                continue;
+            }
             let corpus =
                 named_corpus(&entry.id).unwrap_or_else(|| panic!("{} has no corpus", entry.id));
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

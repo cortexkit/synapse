@@ -12170,25 +12170,40 @@ async fn execute_embedding(
     deadline: Option<tokio::time::Instant>,
     job_id: Option<&str>,
 ) -> Result<Vectors, WireOperationError> {
+    execute_embedding_with_catalog_guard(runtime, model, batch, deadline, job_id, None).await
+}
+
+async fn execute_embedding_with_catalog_guard(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    batch: TokenBatch,
+    deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
+    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
     let tokens = batch
         .items
         .iter()
         .map(|item| item.len().max(1) as u64)
         .sum::<u64>();
-    let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    let catalog_guard = if catalog_lane {
-        Some(
+    let catalog_guard = if held_guard.is_some() {
+        held_guard
+    } else if catalog_lane {
+        Some(Arc::new(
             catalog_lane_lock(runtime, &model.model_id)
                 .lock_owned()
                 .await,
-        )
+        ))
     } else {
         None
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
+    // A profile self-check already owns the lane lock. Acquire lanes before
+    // permits everywhere so a waiter cannot consume its last execution slot.
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(engine) => {
@@ -12350,24 +12365,39 @@ async fn execute_rerank(
     deadline: Option<tokio::time::Instant>,
     job_id: Option<&str>,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
+    execute_rerank_with_catalog_guard(runtime, model, request, owned_pairs, deadline, job_id, None)
+        .await
+}
+
+async fn execute_rerank_with_catalog_guard(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    request: RerankRequest,
+    owned_pairs: Option<Vec<Vec<u32>>>,
+    deadline: Option<tokio::time::Instant>,
+    job_id: Option<&str>,
+    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+) -> Result<synapse_core::RerankScores, WireOperationError> {
     let tokens = request
         .candidates
         .iter()
         .map(|candidate| request.query.len().saturating_add(candidate.len()) as u64)
         .sum();
-    let permit = acquire_execution_permit(runtime, deadline).await?;
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    let catalog_guard = if catalog_lane {
-        Some(
+    let catalog_guard = if held_guard.is_some() {
+        held_guard
+    } else if catalog_lane {
+        Some(Arc::new(
             catalog_lane_lock(runtime, &model.model_id)
                 .lock_owned()
                 .await,
-        )
+        ))
     } else {
         None
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
+    let permit = acquire_execution_permit(runtime, deadline).await?;
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(engine) => {
@@ -16890,6 +16920,64 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_catalog_execution_reuses_the_self_check_lane_guard() {
+        let (root, _) = test_storage_descriptor("ane-check-guard");
+        let mut spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+        spec.model_id = "gte-modernbert-base-ane".into();
+        let mut model = catalog_test_model(&root, &spec);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let engine = tokio::task::spawn_blocking({
+            let started = started.clone();
+            let release = release.clone();
+            move || worker_host::ane_residency::module_mock_engine(started, release)
+        })
+        .await
+        .unwrap();
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine);
+        let runtime =
+            Arc::new(RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap());
+        let guard = Arc::new(
+            catalog_lane_lock(&runtime, &model.model_id)
+                .lock_owned()
+                .await,
+        );
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let model = model.clone();
+            let guard = guard.clone();
+            async move {
+                execute_embedding_with_catalog_guard(
+                    &runtime,
+                    &model,
+                    TokenBatch {
+                        items: vec![vec![1]],
+                    },
+                    None,
+                    None,
+                    Some(guard),
+                )
+                .await
+            }
+        });
+        let dispatched = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+        release.notify_one();
+        drop(guard);
+        if dispatched.is_err() {
+            task.abort();
+        } else {
+            task.await.unwrap().unwrap();
+        }
+        drop(model);
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            dispatched.is_ok(),
+            "self-check must not reacquire its own catalog lane lock"
+        );
+    }
     #[tokio::test]
     async fn profile_less_preload_keeps_probe_required() {
         let (root, descriptor) = test_storage_descriptor("legacy-preload-gate");
@@ -22223,6 +22311,168 @@ mod catalog_runtime_tests {
         response_result, test_machine_profile, test_module_state, test_storage_descriptor,
     };
 
+    #[tokio::test]
+    async fn catalog_ane_without_direct_worker_refuses_before_install_or_load() {
+        let (root, state) = isolated_catalog_state("ane-unavailable", true);
+        assert!(!direct_ane_catalog_available(true, None));
+        assert!(!direct_ane_catalog_available(
+            false,
+            Some(&root.join("missing"))
+        ));
+        // Even an existing binary cannot advertise ANE off macOS.
+        assert!(!direct_ane_catalog_available(
+            false,
+            Some(&std::env::current_exe().unwrap())
+        ));
+        assert!(direct_ane_catalog_available(
+            true,
+            Some(&std::env::current_exe().unwrap())
+        ));
+        for (id, task) in [
+            ("gte-modernbert-base", ModelTask::Embed),
+            ("qwen3-embedding-0.6b", ModelTask::Embed),
+            ("qwen3-reranker-0.6b", ModelTask::Rerank),
+        ] {
+            let error = resolve_serving_model(
+                state.clone(),
+                Some(&catalog::lane_id(id, "ane")),
+                task,
+                None,
+                None,
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.code, "backend_unavailable", "{id}");
+        }
+        assert!(state.runtime.catalog.lock().unwrap().is_empty());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_ane_specs_use_manifest_preload_identity_and_package() {
+        let (root, state) = isolated_catalog_state("ane-specs", true);
+        for id in [
+            "gte-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ] {
+            let entry = state.runtime.release_catalog.entry(id).unwrap();
+            let backend = entry.backend("ane").unwrap();
+            let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+            let profile = CatalogProfile::load(backend.profile.as_deref().unwrap()).unwrap();
+            assert_eq!(spec.engine, "ane-direct-worker");
+            assert_eq!(spec.engine_identity.build_flags["profile"], profile.id);
+            assert_eq!(spec.artifact_digest, profile.artifact_digest());
+            assert_eq!(
+                spec.model_locator,
+                ModelAssetLocator::CacheDigest {
+                    digest: profile.artifact_digest()
+                }
+            );
+            assert_eq!(spec.max_tokens, 8192);
+            let (_, key) = catalog_self_check_key(&state, entry, backend).unwrap();
+            assert_eq!(
+                key["fixture_revision"],
+                synapse_certify::self_check::seal_digest(&profile.id).unwrap()
+            );
+            assert_eq!(
+                key["engine_identity"],
+                serde_json::to_value(&spec.engine_identity).unwrap()
+            );
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires original pinned HF snapshots; converts packages but does not run accelerators"]
+    fn catalog_original_snapshots_rebuild_ane_lane_pins() {
+        let hub =
+            PathBuf::from(env::var_os("SYNAPSE_PINNED_HF_CACHE").expect("SYNAPSE_PINNED_HF_CACHE"));
+        let (root, state) = isolated_catalog_state("ane-real-specs", true);
+        let packages = env::var_os("ANE_TEST_PACKAGES").map(PathBuf::from);
+        fs::create_dir_all(state.model_cache.blob_path("placeholder").parent().unwrap()).unwrap();
+        for id in [
+            "gte-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ] {
+            let entry = state.runtime.release_catalog.entry(id).unwrap();
+            let backend = entry.backend("ane").unwrap();
+            let snapshot = hub.join(format!(
+                "models--{}/snapshots/{}",
+                entry.upstream.hf_repo.replace('/', "--"),
+                entry.upstream.revision
+            ));
+            for file in entry.backend_files("ane").values() {
+                let original = snapshot.join(&file.path);
+                assert_eq!(
+                    sha256_file(&original).unwrap(),
+                    file.sha256,
+                    "{id} {}",
+                    file.path
+                );
+                fs::hard_link(
+                    original.canonicalize().unwrap(),
+                    state.model_cache.blob_path(&file.sha256),
+                )
+                .unwrap();
+            }
+            let package_digest = CatalogProfile::load(backend.profile.as_deref().unwrap())
+                .unwrap()
+                .artifact_digest();
+            if let Some(directory) = &packages {
+                let package = directory.join(format!("{id}.safetensors"));
+                if package.is_file() {
+                    state
+                        .model_cache
+                        .ingest(ModelCacheIngest {
+                            source_url: local_file_url(&package),
+                            expected_digest: Some(package_digest.clone()),
+                            format: "safetensors".into(),
+                            tokenizer_path: None,
+                            pin_module_id: None,
+                        })
+                        .unwrap();
+                }
+            }
+            let spec = catalog_lane_spec(&state, entry, backend, true).unwrap();
+            // Retain only digest-verified converter output for the later
+            // fresh-process capacity test, never a checkpoint approximation.
+            if let Some(directory) = &packages {
+                fs::create_dir_all(directory).unwrap();
+                fs::copy(
+                    state.model_cache.blob_path(&package_digest),
+                    directory.join(format!("{id}.safetensors")),
+                )
+                .unwrap();
+            }
+            assert_eq!(spec.fingerprint.0, backend.fingerprint, "{id}");
+            // The install's stored config must be identical to the public
+            // profile preload configuration used by hardware certification.
+            let preload: PreloadModelConfig = serde_json::from_value(json!({
+                "model_id": spec.model_id, "engine": spec.engine, "profile": backend.profile,
+                "task": spec.task, "pooling": spec.pooling, "normalize": spec.normalize,
+                "model_path": state.model_cache.blob_path(&spec.artifact_digest),
+                "tokenizer_path": state.model_cache.blob_path(&entry.backend_files("ane")["tokenizer"].sha256)
+            })).unwrap();
+            let rebuilt = build_preload_catalog_model(
+                0,
+                preload,
+                &InlineConfig::default(),
+                &JobConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(spec.fingerprint, rebuilt.fingerprint, "{id}");
+            assert_eq!(spec.engine_identity, rebuilt.engine_identity, "{id}");
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn isolated_catalog_state(label: &str, runnable: bool) -> (PathBuf, Arc<ModuleState>) {
         let (root, descriptor) = test_storage_descriptor(label);
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
@@ -22371,7 +22621,8 @@ mod catalog_runtime_tests {
         .await
         .err()
         .unwrap();
-        assert_eq!(unknown.code, "unknown_model");
+        // The lane is now declared, but this state has no direct worker.
+        assert_eq!(unknown.code, "backend_unavailable");
         assert!(state.runtime.catalog.lock().unwrap().is_empty());
         drop(state);
         fs::remove_dir_all(root).unwrap();
@@ -22647,11 +22898,26 @@ fn detected_catalog_backends() -> BTreeSet<String> {
         if metal::Device::system_default().is_some() {
             backends.insert("metal".into());
         }
+        if direct_ane_catalog_available(true, catalog_direct_ane_worker().as_deref()) {
+            backends.insert("ane".into());
+        }
         backends
     };
     #[cfg(not(target_os = "macos"))]
     let backends = BTreeSet::new();
     backends
+}
+#[cfg(target_os = "macos")]
+fn catalog_direct_ane_worker() -> Option<PathBuf> {
+    env::var_os(worker_binary_env_var("ane-direct-worker"))
+        .map(PathBuf::from)
+        .or_else(|| resolve_worker_binary_sibling("ane-direct-worker"))
+}
+// Availability is about the direct worker, not the unrelated Core ML lane.
+// Do not advertise an installable lane that cannot be loaded on this platform.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn direct_ane_catalog_available(macos: bool, worker: Option<&Path>) -> bool {
+    macos && worker.is_some_and(Path::is_file)
 }
 fn catalog_backend_reason(runtime: &RuntimeState, backend: &str) -> Option<&'static str> {
     if runtime.runnable_backends.contains(backend) {
@@ -23769,6 +24035,9 @@ fn catalog_lane_spec(
     backend: &catalog::CatalogBackend,
     verify: bool,
 ) -> Result<StoredModelConfig, WireOperationError> {
+    if let Some(profile) = backend.profile.as_deref() {
+        return catalog_profile_lane_spec(state, entry, backend, profile, verify);
+    }
     let files = entry.backend_files(&backend.backend);
     let model = files["model"];
     let tokenizer = files["tokenizer"];
@@ -23838,6 +24107,103 @@ fn catalog_lane_spec(
     )
     .map_err(|e| artifact_invalid_error(e.to_string()))
 }
+
+fn catalog_profile_lane_spec(
+    state: &ModuleState,
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    profile_id: &str,
+    verify: bool,
+) -> Result<StoredModelConfig, WireOperationError> {
+    let profile = CatalogProfile::load(profile_id)
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let files = entry.backend_files(&backend.backend);
+    let source = state.model_cache.blob_path(&files["model"].sha256);
+    let tokenizer_path = state.model_cache.blob_path(&files["tokenizer"].sha256);
+    let digest = profile.artifact_digest();
+    let package_path = state.model_cache.blob_path(&digest);
+    if verify
+        && sha256_file(&package_path).ok().as_deref() != Some(digest.trim_start_matches("sha256:"))
+    {
+        // Catalog downloads contain original pinned checkpoints. Use exactly
+        // the converter used by certification, then publish its digest-checked
+        // package in the normal cache so reload and GC see the same artifact.
+        let package =
+            synapse_parity::convert::convert_profile_file(&profile.typed, profile_id, &source)
+                .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        let temporary = state.model_cache.root().join(format!(
+            "catalog-convert-{}-{}.safetensors",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&temporary, package)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        let ingested = state.model_cache.ingest(synapse_core::ModelCacheIngest {
+            source_url: local_file_url(&temporary),
+            expected_digest: Some(digest.clone()),
+            format: "safetensors".into(),
+            tokenizer_path: None,
+            pin_module_id: None,
+        });
+        let _ = fs::remove_file(&temporary);
+        ingested.map_err(|error| artifact_invalid_error(error.to_string()))?;
+    }
+    let sanitized_digest = if verify {
+        // Profile grammar composes tokens before enforcing the 8192 boundary;
+        // tokenizer truncation would make the 8193 refusal impossible.
+        let tokenizer = SanitizedTokenizer::from_file(
+            &tokenizer_path,
+            TokenizerConfig {
+                max_tokens: usize::MAX,
+            },
+        )
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        profile
+            .validate_readout(&tokenizer)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        format!("sha256:{}", tokenizer.sanitized_sha256())
+    } else {
+        format!("sha256:{}", "0".repeat(64))
+    };
+    let pooling = match profile.model()["grammar"]["pooling"].as_str() {
+        Some("cls") => WorkerPooling::Cls,
+        Some("masked_mean") => WorkerPooling::Mean,
+        _ => WorkerPooling::Last,
+    };
+    let owned = profile
+        .owned_config(
+            backend.execution.as_deref(),
+            backend.attention_units.map(|units| units as usize),
+        )
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    build_stored_model_config(
+        catalog::lane_id(&entry.id, &backend.backend),
+        &backend.engine,
+        parse_model_task(Some(&entry.task), &backend.engine, &entry.id)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?,
+        digest.clone(),
+        "safetensors".into(),
+        sanitized_digest,
+        ModelAssetLocator::CacheDigest { digest },
+        ModelAssetLocator::CacheDigest {
+            digest: format!("sha256:{}", files["tokenizer"].sha256),
+        },
+        local_file_url(&package_path),
+        local_file_url(&tokenizer_path),
+        pooling,
+        profile.model()["output"]["normalization"] == "l2",
+        8192,
+        owned.dtype.as_str().into(),
+        false,
+        None,
+        None,
+        Vec::new(),
+        Some(owned),
+        &InlineConfig::default(),
+        &JobConfig::default(),
+    )
+    .map_err(|error| artifact_invalid_error(error.to_string()))
+}
 fn sync_installed_catalog_slots(state: &ModuleState) -> Result<(), WireOperationError> {
     for entry in &state.runtime.release_catalog.models {
         for backend in &entry.backends {
@@ -23865,12 +24231,20 @@ fn catalog_self_check_key(
     entry: &catalog::CatalogEntry,
     backend: &catalog::CatalogBackend,
 ) -> Result<(String, Value), WireOperationError> {
-    let identity = owned_engine_identity(
-        OwnedFamily::parse(backend.family.as_deref().expect("family"))
-            .map_err(|e| artifact_invalid_error(e.to_string()))?,
-        OwnedDType::parse(backend.dtype.as_deref().expect("dtype"))
-            .map_err(|e| artifact_invalid_error(e.to_string()))?,
-    );
+    let identity = if let Some(profile) = backend.profile.as_deref() {
+        CatalogProfile::load(profile)
+            .and_then(|profile| profile.owned_config(backend.execution.as_deref(), None))
+            .map_err(|error| artifact_invalid_error(error.to_string()))?
+            .identity_override
+            .expect("profile identity")
+    } else {
+        owned_engine_identity(
+            OwnedFamily::parse(backend.family.as_deref().expect("family"))
+                .map_err(|e| artifact_invalid_error(e.to_string()))?,
+            OwnedDType::parse(backend.dtype.as_deref().expect("dtype"))
+                .map_err(|e| artifact_invalid_error(e.to_string()))?,
+        )
+    };
     #[cfg(feature = "test-support")]
     let identity = {
         let mut identity = identity;
@@ -23879,7 +24253,18 @@ fn catalog_self_check_key(
         }
         identity
     };
-    let key = json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest(),"backend":backend.backend,"fingerprint":backend.fingerprint,"engine_identity":identity,"os_build":state.machine_profile.os_build,"fixture_revision":entry.self_check.as_ref().expect("self-check").fixture_revision.to_string()});
+    let fixture_revision = if let Some(profile) = backend.profile.as_deref() {
+        synapse_certify::self_check::seal_digest(profile)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?
+    } else {
+        entry
+            .self_check
+            .as_ref()
+            .expect("self-check")
+            .fixture_revision
+            .to_string()
+    };
+    let key = json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest(),"backend":backend.backend,"fingerprint":backend.fingerprint,"engine_identity":identity,"os_build":state.machine_profile.os_build,"fixture_revision":fixture_revision});
     let id = sha256_hex(catalog::jcs(&key).map_err(catalog_store_error)?.as_bytes());
     Ok((id, key))
 }
@@ -24203,6 +24588,7 @@ async fn numerical_profile_preload_check(
     model: &EmbeddingModel,
     profile: &str,
     references: synapse_certify::self_check::References,
+    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
 ) -> Result<synapse_parity::evaluator::SubsetEvaluation, WireOperationError> {
     use synapse_parity::evaluator::{ObservedCase, Output};
     let mut outputs = BTreeMap::new();
@@ -24217,8 +24603,15 @@ async fn numerical_profile_preload_check(
             compose_catalog_embed(model, &mut tokenized)?;
             apply_owned_tokenizer_policy(model, &mut tokenized);
             let input_ids = tokenized.batch.items[0].clone();
-            let vectors =
-                execute_embedding(&state.runtime, model, tokenized.batch, None, None).await?;
+            let vectors = execute_embedding_with_catalog_guard(
+                &state.runtime,
+                model,
+                tokenized.batch,
+                None,
+                None,
+                held_guard.clone(),
+            )
+            .await?;
             let vector = vectors
                 .into_iter()
                 .next()
@@ -24237,7 +24630,7 @@ async fn numerical_profile_preload_check(
             let pairs = owned_rerank_pairs(model, query, &candidates)?
                 .ok_or_else(|| profile_preload_check_error(profile, "missing composed pairs"))?;
             let input_ids = pairs[0].clone();
-            let scores = execute_rerank(
+            let scores = execute_rerank_with_catalog_guard(
                 &state.runtime,
                 model,
                 RerankRequest {
@@ -24247,6 +24640,7 @@ async fn numerical_profile_preload_check(
                 Some(pairs),
                 None,
                 None,
+                held_guard.clone(),
             )
             .await?;
             let score =
@@ -24299,23 +24693,38 @@ async fn ensure_profile_preload_ready(
     deadline_ms: Option<u64>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let lock = catalog_lane_lock(&state.runtime, model_id);
-    let _guard = lock.lock_owned().await;
+    let guard = Arc::new(lock.lock_owned().await);
     let model = ensure_model_loaded_for_control(state.clone(), model_id, deadline_ms).await?;
+    check_profile_model(&state, model, guard).await
+}
+
+// Both catalog installs and explicit preloads must grade the same sealed
+// subset through the production execution path, including worker placement.
+async fn check_profile_model(
+    state: &ModuleState,
+    model: Arc<EmbeddingModel>,
+    guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let profile = model
         .engine_identity
         .build_flags
         .get("profile")
         .expect("profile preload");
-    let (id, key) = profile_preload_check_key(&state, &model, profile)?;
+    let (id, key) =
+        if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &model.model_id) {
+            catalog_self_check_key(state, entry, backend)?
+        } else {
+            profile_preload_check_key(state, &model, profile)?
+        };
     let references = match synapse_certify::self_check::load(profile) {
         Ok(references) => references,
         Err(error) => {
-            let generation = catalog_check_generation(&state, &id, &key)?;
-            catalog_complete_check(&state, &id, generation, "failed", Some(&error.to_string()))?;
+            let generation = catalog_check_generation(state, &id, &key)?;
+            catalog_complete_check(state, &id, generation, "failed", Some(&error.to_string()))?;
             return Err(profile_preload_check_error(profile, &error.to_string()));
         }
     };
-    match profile_preload_check_status(&state, &id)?.as_str() {
+    match profile_preload_check_status(state, &id)?.as_str() {
         "passed" => return Ok(model),
         "failed" => {
             return Err(profile_preload_check_error(
@@ -24325,17 +24734,24 @@ async fn ensure_profile_preload_ready(
         }
         _ => {}
     }
-    let generation = catalog_check_generation(&state, &id, &key)?;
-    let evaluation =
-        match numerical_profile_preload_check(&state, &model, profile, references).await {
-            Ok(evaluation) => evaluation,
-            Err(error) => {
-                let reason = serde_json::to_string(&error).expect("wire error serializes");
-                catalog_complete_check(&state, &id, generation, "failed", Some(&reason))?;
-                return Err(profile_preload_check_error(profile, &reason));
-            }
-        };
-    complete_profile_preload_check(&state, profile, &id, generation, &evaluation)?;
+    let generation = catalog_check_generation(state, &id, &key)?;
+    let evaluation = match numerical_profile_preload_check(
+        state,
+        &model,
+        profile,
+        references,
+        Some(guard),
+    )
+    .await
+    {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            let reason = serde_json::to_string(&error).expect("wire error serializes");
+            catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
+            return Err(profile_preload_check_error(profile, &reason));
+        }
+    };
+    complete_profile_preload_check(state, profile, &id, generation, &evaluation)?;
     Ok(model)
 }
 
@@ -24349,10 +24765,12 @@ async fn resolve_serving_model(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     if let Some(model_id) = requested {
         if model_slot_snapshot(&state.runtime, model_id).is_some_and(|slot| {
-            slot.spec
-                .engine_identity
-                .build_flags
-                .contains_key("profile")
+            !state.runtime.release_catalog.is_reserved_id(model_id)
+                && slot
+                    .spec
+                    .engine_identity
+                    .build_flags
+                    .contains_key("profile")
         }) {
             return ensure_model_loaded_for_control(state, model_id, deadline_ms).await;
         }
@@ -24462,7 +24880,13 @@ async fn ensure_catalog_lane_ready(
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
-    ensure_catalog_lane_ready_owned(state, entry, backend, guard).await
+    let profile_backed = backend.profile.is_some();
+    let model = ensure_catalog_lane_ready_owned(state.clone(), entry, backend, guard).await?;
+    if profile_backed {
+        ensure_profile_preload_ready(state, &lane, None).await
+    } else {
+        Ok(model)
+    }
 }
 
 // Nanosecond ctime is essential: restoring mtime after an in-place write must
@@ -24637,6 +25061,11 @@ async fn ensure_catalog_lane_ready_owned(
         let loaded = load_catalog_model_task(load_state, load_lane).await?;
         loaded
     };
+    if backend.profile.is_some() {
+        // Serving validates composed length before the shared profile check.
+        // An oversized first request must not compile even a self-check shape.
+        return Ok(model);
+    }
     if projection["state"] == "passed" {
         return Ok(model);
     }

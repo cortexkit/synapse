@@ -1323,6 +1323,40 @@ mod fresh_process_hardware {
         assert!(success, "shape admission failed; see per-layer diagnostics");
     }
     #[test]
+    #[ignore = "quiet-window Qwen capacity measurement with manifest-pinned packages"]
+    fn fresh_process_qwen_single_shape_admission() {
+        let mut load = [0.0; 3];
+        // A compile on a busy host is not evidence that a catalog ceiling fits
+        // the owner's quiet serving workload. Refuse instead of timing it.
+        assert_eq!(unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }, 3);
+        println!("QWEN_SHAPE load_before={load:?}");
+        assert!(load[0] < 16.0, "quiet-window load gate refused");
+        let slug = std::env::var("ANE_TEST_MODEL").expect("ANE_TEST_MODEL");
+        assert!(matches!(
+            slug.as_str(),
+            "qwen3-embedding-0.6b" | "qwen3-reranker-0.6b"
+        ));
+        let mut model = model(&slug);
+        let shape: usize = std::env::var("ANE_TEST_SHAPE")
+            .expect("ANE_TEST_SHAPE")
+            .parse()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = model.admit(shape, "fresh-process-qwen-capacity");
+        println!("QWEN_SHAPE model={slug} shape={shape} prior_resident=[] compile_load_ms={:.3} resident={:?} outcome={}", started.elapsed().as_secs_f64() * 1000.0, model.resident.keys().collect::<Vec<_>>(), result.as_ref().map(|_| "ADMITTED".to_owned()).unwrap_or_else(|error| format!("{error:#}")));
+        let success = result.is_ok();
+        if let Ok(inventory) = &result {
+            assert_eq!(inventory.executables.len(), 28);
+        }
+        drop(result);
+        drop(model);
+        cleanup_diagnostic_artifacts();
+        assert!(
+            success,
+            "Qwen shape admission failed; do not lower the catalog ceiling"
+        );
+    }
+    #[test]
     #[ignore = "fresh-process single-layer diagnostic with real weights"]
     fn fresh_process_gte_single_layer_load() {
         let model = model("gte-modernbert-base");

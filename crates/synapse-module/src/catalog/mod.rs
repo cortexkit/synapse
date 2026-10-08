@@ -38,7 +38,7 @@ pub(crate) const COMPILED_CATALOG_JSON: &str = include_str!("models.json");
 pub(crate) const ALLOWED_BACKENDS: [&str; 4] = ["metal", "ane", "cuda", "vulkan"];
 
 /// Every engine value a catalog backend may name in this release.
-pub(crate) const ALLOWED_ENGINES: [&str; 1] = ["owned-metal"];
+pub(crate) const ALLOWED_ENGINES: [&str; 2] = ["owned-metal", "ane-direct-worker"];
 
 /// Every file role. Per backend there is exactly one `model` and one
 /// `tokenizer` file and at most one `config` file.
@@ -97,6 +97,10 @@ pub(crate) struct CatalogFile {
 pub(crate) struct CatalogBackend {
     pub backend: String,
     pub engine: String,
+    /// Profile-backed lanes use the manifest's package, grammar and sealed
+    /// parity references. Legacy Metal lanes keep their original identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -628,12 +632,53 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
     }
 
     match (&entry.self_check, entry.backends.is_empty()) {
+        (None, false)
+            if entry
+                .backends
+                .iter()
+                .all(|backend| backend.profile.is_some()) =>
+        {
+            Ok(())
+        }
         (None, false) => Err(CatalogError::SelfCheckMissing { id }),
         (Some(_), true) => Err(CatalogError::SelfCheckUnexpected { id }),
         (None, true) => Ok(()),
         (Some(check), false) => validate_self_check(entry, embed, check)
             .map_err(|reason| CatalogError::SelfCheckShape { id, reason }),
     }
+}
+
+fn validate_profile_files(entry: &CatalogEntry) -> Result<(), CatalogError> {
+    for backend in &entry.backends {
+        let Some(profile) = backend.profile.as_deref() else {
+            continue;
+        };
+        let references = synapse_certify::self_check::load(profile).map_err(|error| {
+            CatalogError::SelfCheckShape {
+                id: entry.id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let model = references
+            .manifest
+            .model(&entry.id)
+            .expect("profile model was validated");
+        for file in entry.backend_files(&backend.backend).values() {
+            if model.files.get(&file.path) != Some(&file.sha256) {
+                return Err(CatalogError::SelfCheckShape {
+                    id: entry.id.clone(),
+                    reason: format!("profile {profile} disagrees with pinned file {}", file.path),
+                });
+            }
+        }
+        if model.hf_repo != entry.upstream.hf_repo || model.hf_revision != entry.upstream.revision {
+            return Err(CatalogError::SelfCheckShape {
+                id: entry.id.clone(),
+                reason: format!("profile {profile} disagrees with upstream"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), CatalogError> {
@@ -656,6 +701,25 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
         field,
         value,
     };
+    if row.engine == "ane-direct-worker" {
+        let profile = row.profile.as_deref().ok_or_else(|| missing("profile"))?;
+        let references = synapse_certify::self_check::load(profile)
+            .map_err(|error| invalid("profile", error.to_string()))?;
+        let declared = &references.manifest.profiles[profile];
+        if row.backend != "ane"
+            || declared.model != id
+            || declared.lane.as_str() != row.engine
+            || serde_json::to_value(declared.storage_dtype).expect("dtype serializes")
+                != serde_json::json!(row.dtype)
+        {
+            return Err(invalid("profile", profile.into()));
+        }
+    } else if row.profile.is_some() {
+        return Err(invalid(
+            "profile",
+            "legacy lanes do not use a manifest profile".into(),
+        ));
+    }
     for (field, value) in [
         ("family", &row.family),
         ("dtype", &row.dtype),
@@ -771,7 +835,11 @@ fn validate_self_check(entry: &CatalogEntry, embed: bool, check: &SelfCheck) -> 
             ));
         }
         // Every embed backend declares dims; the vectors must match each.
-        for backend in &entry.backends {
+        for backend in entry
+            .backends
+            .iter()
+            .filter(|backend| backend.profile.is_none())
+        {
             let dims = backend.dims.unwrap_or_default();
             if let Some((index, vector)) = vectors
                 .iter()
@@ -842,6 +910,7 @@ fn validate_self_check(entry: &CatalogEntry, embed: bool, check: &SelfCheck) -> 
 struct FrozenBackend {
     backend: &'static str,
     engine: &'static str,
+    profile: Option<&'static str>,
     family: &'static str,
     dtype: &'static str,
     execution: &'static str,
@@ -874,19 +943,36 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
         hf_repo: "Alibaba-NLP/gte-modernbert-base",
         revision: "e7f32e3c00f91d699e8c43b53106206bcc72bb22",
         default_for_task: true,
-        backends: &[FrozenBackend {
-            backend: "metal",
-            engine: "owned-metal",
-            family: "gte-modernbert",
-            dtype: "f16",
-            execution: "explicit",
-            attention_units: FROZEN_ATTENTION_UNITS,
-            max_tokens: FROZEN_MAX_TOKENS,
-            pooling: Some("cls"),
-            normalize: Some(true),
-            dims: Some(768),
-            rerank_abs_tolerance: None,
-        }],
+        backends: &[
+            FrozenBackend {
+                backend: "metal",
+                engine: "owned-metal",
+                profile: None,
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("cls"),
+                normalize: Some(true),
+                dims: Some(768),
+                rerank_abs_tolerance: None,
+            },
+            FrozenBackend {
+                backend: "ane",
+                engine: "ane-direct-worker",
+                profile: Some("gte-modernbert-base.ane-direct-worker"),
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("cls"),
+                normalize: Some(true),
+                dims: Some(768),
+                rerank_abs_tolerance: None,
+            },
+        ],
     },
     FrozenEntry {
         id: "gte-reranker-modernbert-base",
@@ -896,6 +982,7 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
         backends: &[FrozenBackend {
             backend: "metal",
             engine: "owned-metal",
+            profile: None,
             family: "gte-modernbert",
             dtype: "f32",
             execution: "explicit",
@@ -912,26 +999,56 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
         hf_repo: "Qwen/Qwen3-Embedding-0.6B",
         revision: "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
         default_for_task: false,
-        backends: &[FrozenBackend {
-            backend: "metal",
-            engine: "owned-metal",
-            family: "qwen3-0.6b",
-            dtype: "f16",
-            execution: "explicit",
-            attention_units: FROZEN_ATTENTION_UNITS,
-            max_tokens: FROZEN_MAX_TOKENS,
-            pooling: Some("last"),
-            normalize: Some(true),
-            dims: Some(1024),
-            rerank_abs_tolerance: None,
-        }],
+        backends: &[
+            FrozenBackend {
+                backend: "metal",
+                engine: "owned-metal",
+                profile: None,
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("last"),
+                normalize: Some(true),
+                dims: Some(1024),
+                rerank_abs_tolerance: None,
+            },
+            FrozenBackend {
+                backend: "ane",
+                engine: "ane-direct-worker",
+                profile: Some("qwen3-embedding-0.6b.ane-direct-worker"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("last"),
+                normalize: Some(true),
+                dims: Some(1024),
+                rerank_abs_tolerance: None,
+            },
+        ],
     },
     FrozenEntry {
         id: "qwen3-reranker-0.6b",
         hf_repo: "Qwen/Qwen3-Reranker-0.6B",
         revision: "e61197ed45024b0ed8a2d74b80b4d909f1255473",
         default_for_task: false,
-        backends: &[],
+        backends: &[FrozenBackend {
+            backend: "ane",
+            engine: "ane-direct-worker",
+            profile: Some("qwen3-reranker-0.6b.ane-direct-worker"),
+            family: "qwen3-0.6b",
+            dtype: "f16",
+            execution: "explicit",
+            attention_units: FROZEN_ATTENTION_UNITS,
+            max_tokens: FROZEN_MAX_TOKENS,
+            pooling: None,
+            normalize: None,
+            dims: None,
+            rerank_abs_tolerance: Some(0.005),
+        }],
     },
 ];
 
@@ -999,8 +1116,13 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
             );
         }
         for (row, frozen_row) in entry.backends.iter().zip(frozen.backends) {
-            let literals: [(&str, String, String); 10] = [
+            let literals: [(&str, String, String); 11] = [
                 ("engine", frozen_row.engine.into(), row.engine.clone()),
+                (
+                    "profile",
+                    show(frozen_row.profile),
+                    show(row.profile.as_deref()),
+                ),
                 (
                     "family",
                     show(Some(frozen_row.family)),
@@ -1049,6 +1171,9 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
                 }
             }
         }
+    }
+    for entry in &catalog.models {
+        validate_profile_files(entry)?;
     }
     Ok(())
 }
@@ -1634,7 +1759,15 @@ mod tests {
             "qwen3-embedding-0.6b",
         ] {
             let entry = catalog.entry(id).unwrap();
-            assert_eq!(entry.backends.len(), 1, "{id}");
+            assert_eq!(
+                entry.backends.len(),
+                if id == "gte-reranker-modernbert-base" {
+                    1
+                } else {
+                    2
+                },
+                "{id}"
+            );
             let metal = entry.backend("metal").unwrap();
             assert_eq!(metal.engine, "owned-metal");
             assert_eq!(metal.attention_units, Some(67_108_864));
@@ -1660,9 +1793,27 @@ mod tests {
                 .contains("bench/parity/reference/generate_reference.py --catalog"));
         }
         let qwen_reranker = catalog.entry("qwen3-reranker-0.6b").unwrap();
-        assert!(qwen_reranker.backends.is_empty());
-        assert!(qwen_reranker.files.is_empty());
+        assert_eq!(qwen_reranker.backends.len(), 1);
+        assert_eq!(qwen_reranker.files.len(), 2);
         assert!(qwen_reranker.self_check.is_none());
+        // Profile-backed lanes reference the sealed corpus, not a duplicate
+        // list of scores or vectors in the browsing catalog.
+        for id in [
+            "gte-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
+        ] {
+            let entry = catalog.entry(id).unwrap();
+            let ane = entry.backend("ane").unwrap();
+            assert_eq!(lane_id(id, "ane"), format!("{id}-ane"));
+            assert_eq!(ane.engine, "ane-direct-worker");
+            assert_eq!(
+                ane.profile.as_deref(),
+                Some(format!("{id}.ane-direct-worker").as_str())
+            );
+            assert_eq!(ane.max_tokens, Some(8192));
+            assert!(synapse_certify::self_check::load(ane.profile.as_deref().unwrap()).is_ok());
+        }
         assert_eq!(
             qwen_reranker.upstream.revision,
             "e61197ed45024b0ed8a2d74b80b4d909f1255473"
@@ -1687,8 +1838,11 @@ mod tests {
             "{missing}"
         );
         let extra = release_error(|doc| {
-            let mut copy = doc["models"][3].clone();
+            // Keep the extra entry schema-valid so this exercises the frozen
+            // id set, rather than the model-specific profile grammar guard.
+            let mut copy = doc["models"][1].clone();
             copy["id"] = json!("minilm");
+            copy["default_for_task"] = json!(false);
             doc["models"].as_array_mut().unwrap().push(copy);
         });
         assert!(matches!(extra, CatalogError::FrozenIdSet { .. }), "{extra}");
@@ -1736,7 +1890,7 @@ mod tests {
             row["backend"] = json!("cuda");
             entry["backends"].as_array_mut().unwrap().push(row);
             for file in entry["files"].as_array_mut().unwrap() {
-                file["backends"] = json!(["metal", "cuda"]);
+                file["backends"].as_array_mut().unwrap().push(json!("cuda"));
             }
         });
         assert!(
@@ -1820,7 +1974,7 @@ mod tests {
         let expected = [
             (
                 "gte-modernbert-base",
-                "6c0959a4db05e22d96838f326cc98d70dc5caa7a4c70f0a7ff3eba2538319672",
+                "9efe05f1170baa48eb1bc6b44c84ff1ea2fbb2c0ae0778e7a9e3a0f493f35c19",
             ),
             (
                 "gte-reranker-modernbert-base",
@@ -1828,11 +1982,11 @@ mod tests {
             ),
             (
                 "qwen3-embedding-0.6b",
-                "3209ee0c53b1b2ab42602e31c43b0c369a71d5dbb8343e73b8000a30cd533994",
+                "ae666f103da54abdb6745b803fe49888aad0352fba2c708c449760fec043de30",
             ),
             (
                 "qwen3-reranker-0.6b",
-                "8132740ff0ac2b86c9d811661c0025db4cf3dc20283672314ffa6dfa673d863c",
+                "b832e032523d2e5b5d94dd5b18dc7af2085ca3d6948e6262fdc35a940c937b39",
             ),
         ];
         for (id, digest) in expected {

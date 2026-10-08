@@ -14,6 +14,11 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
     let mut checked = 0;
     for entry in catalog["models"].as_array().unwrap() {
         for backend in entry["backends"].as_array().unwrap() {
+            // Preserve the legacy Metal profile calculation byte-for-byte;
+            // profile-tied ANE lanes have their own independent pins below.
+            if backend["backend"] != "metal" {
+                continue;
+            }
             let roles: BTreeMap<String, String> = entry["files"]
                 .as_array()
                 .unwrap()
@@ -57,4 +62,90 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
         }
     }
     assert_eq!(checked, 3);
+}
+
+#[test]
+fn ane_catalog_fingerprints_bind_the_pinned_manifest_profiles() {
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let manifest = synapse_parity::manifest::Manifest::from_slice(include_bytes!(
+        "../../../bench/parity/models.json"
+    ))
+    .unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    let mut computed_pins = Vec::new();
+    for entry in catalog["models"].as_array().unwrap() {
+        for backend in entry["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|backend| backend["backend"] == "ane")
+        {
+            let id = backend["profile"].as_str().unwrap();
+            let declared = &manifest.profiles[id];
+            let model = manifest.model(&declared.model).unwrap();
+            let profile: NumericProfile = serde_json::from_value(json!({
+                "model_digest": model.checkpoint_digest,
+                "quant": declared.storage_dtype,
+                "engine": {"engine": "ane-direct-worker", "version": "protocol-v2", "build_flags": {
+                    "profile": id, "compute_dtype": declared.compute_dtype, "storage_dtype": declared.storage_dtype,
+                    "risk_class": "abort_capable"
+                }},
+                "sanitized_tokenizer_digest": tokenizers[&declared.model],
+                "pooling": if backend["pooling"] == "last" || entry["task"] == "rerank" { "last_token" } else { "cls" },
+                "normalization": model.output.normalization,
+                "dtype": declared.storage_dtype, "flash_attention": "disabled",
+                "certified_shape": {"max_context_tokens": 8192, "max_batch_tokens": 8192, "max_micro_batch_tokens": 3072, "max_sequences": 64},
+                "thread_policy": "balanced", "operation": model.operation,
+                "input_grammar": format!("synapse-input-grammar-v1:{}", manifest.grammar_digest(&declared.model).unwrap()),
+                "kernel_revision": synapse_core::ANE_DIRECT_KERNEL_REVISION,
+                "rotation": declared.rotation,
+                "converted_package_digest": declared.converted_package_digest,
+                "manifest_profile_digest": synapse_parity::canonical::sha256_hex(&synapse_parity::canonical::canonical_bytes(&manifest.profile_entry(id).unwrap()))
+            })).unwrap();
+            computed_pins.push((
+                entry["id"].clone(),
+                backend["fingerprint"].clone(),
+                profile.fingerprint().0,
+            ));
+        }
+    }
+    assert_eq!(computed_pins.len(), 3);
+    for (id, pinned, computed) in computed_pins {
+        assert_eq!(pinned, computed, "ANE catalog {id}");
+    }
+}
+
+#[test]
+#[ignore = "requires original pinned Hugging Face snapshots; no accelerator inference"]
+fn catalog_tokenizer_pins_match_original_snapshots() {
+    let hub = std::path::PathBuf::from(
+        std::env::var_os("SYNAPSE_PINNED_HF_CACHE").expect("SYNAPSE_PINNED_HF_CACHE"),
+    );
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    for entry in catalog["models"].as_array().unwrap() {
+        let repository = entry["upstream"]["hf_repo"]
+            .as_str()
+            .unwrap()
+            .replace('/', "--");
+        let path = hub.join(format!(
+            "models--{repository}/snapshots/{}/tokenizer.json",
+            entry["upstream"]["revision"].as_str().unwrap()
+        ));
+        let tokenizer = synapse_core::SanitizedTokenizer::from_file(
+            path,
+            synapse_core::TokenizerConfig {
+                max_tokens: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            format!("sha256:{}", tokenizer.sanitized_sha256()),
+            tokenizers[entry["id"].as_str().unwrap()],
+            "{}",
+            entry["id"]
+        );
+    }
 }
