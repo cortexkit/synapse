@@ -22367,6 +22367,8 @@ mod catalog_runtime_tests {
             let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
             let profile = CatalogProfile::load(backend.profile.as_deref().unwrap()).unwrap();
             assert_eq!(spec.engine, "ane-direct-worker");
+            // The direct worker refuses anything but a converted package.
+            assert_eq!(spec.artifact_format, "safetensors-package");
             assert_eq!(spec.engine_identity.build_flags["profile"], profile.id);
             assert_eq!(spec.artifact_digest, profile.artifact_digest());
             assert_eq!(
@@ -24198,7 +24200,9 @@ fn catalog_profile_lane_spec(
         parse_model_task(Some(&entry.task), &backend.engine, &entry.id)
             .map_err(|error| artifact_invalid_error(error.to_string()))?,
         digest.clone(),
-        "safetensors".into(),
+        // The worker receives the converted profile package, not the original
+        // checkpoint, so it must be labelled the way every owned engine expects.
+        default_artifact_format(&backend.engine),
         sanitized_digest,
         ModelAssetLocator::CacheDigest { digest },
         ModelAssetLocator::CacheDigest {
