@@ -882,3 +882,27 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "owned-engine-spike-source-scan"
+guards = "Production owned decode sources are self-contained and cannot refer to the read-only spike tree"
+file = "crates/synapse-engine-owned/owned-decode-engine/src/qwen3_decode_metal_step.rs"
+old = "use std::ffi::{c_char, c_void, CStr};"
+new = """
+use std::ffi::{c_char, c_void, CStr};
+const _: &str = "bench/spikes/forbidden"; // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-engine-owned/tests/it/owned_decode_engine_hygiene.rs"
+runner = "cargo"
+package = "synapse-engine-owned"
+target = "--test it"
+select = "expected"
+expect_red = ["owned_decode_engine_hygiene::no_production_path_references_bench_spikes"]
+expect_message = "production owned-decode-engine references the spike tree"
+only = false
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+desk_only = "The owned-decode source scanner is compiled only on macOS; CI has no Apple SDK runner. Replay the planted spike reference on a Mac."
