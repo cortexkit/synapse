@@ -51,11 +51,93 @@ WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
 # whether THIS PUSH is green, so the default is the push run; set the event to
 # watch a different trigger's run for the same sha.
 EVENT="${WATCH_CI_EVENT:-push}"
+BRANCH="${WATCH_CI_BRANCH:-}"
 # How long to wait for a run to appear for a sha: 40 tries, 15s apart, is ten
 # minutes of patience for a queue that normally produces a run in seconds. Both
 # knobs exist so tests can drive the resolver without waiting out that budget.
 RESOLVE_ATTEMPTS="${WATCH_CI_RESOLVE_ATTEMPTS:-40}"
 RESOLVE_SLEEP="${WATCH_CI_RESOLVE_SLEEP:-15}"
+POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
+HEARTBEAT="${WATCH_CI_HEARTBEAT:-}"
+WATCH_ATTEMPT="${WATCH_CI_ATTEMPT:-}"
+if [ -n "$WATCH_ATTEMPT" ]; then
+  if ! [[ "$WATCH_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "watch-ci: WATCH_CI_ATTEMPT must be a positive integer" >&2
+    exit 2
+  fi
+fi
+HEARTBEAT_TMP=""
+SLEEP_PID=""
+
+watcher_start_time() {
+  ps -p "$$" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
+}
+WATCHER_START="$(watcher_start_time)"
+
+cleanup_watch() {
+  if [ -n "$SLEEP_PID" ]; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+    wait "$SLEEP_PID" 2>/dev/null || true
+  fi
+  [ -z "$HEARTBEAT_TMP" ] || rm -f "$HEARTBEAT_TMP"
+  [ -z "$HEARTBEAT" ] || rm -f "$HEARTBEAT"
+}
+trap cleanup_watch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+write_heartbeat() {
+  [ -n "$HEARTBEAT" ] || return 0
+  HEARTBEAT_TMP="$HEARTBEAT.tmp.$$"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'start=%s\n' "$WATCHER_START"
+    printf 'updated=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$HEARTBEAT_TMP"
+  mv "$HEARTBEAT_TMP" "$HEARTBEAT"
+  HEARTBEAT_TMP=""
+}
+
+watch_sleep() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
+  sleep_rc=$?
+  SLEEP_PID=""
+  return "$sleep_rc"
+}
+
+watch_run_view() {
+  if [ -n "$WATCH_ATTEMPT" ]; then
+    "$OPERATOR_GH" run view "$@" --attempt "$WATCH_ATTEMPT"
+  else
+    "$OPERATOR_GH" run view "$@"
+  fi
+}
+
+# A completed run's verdict is read with queries that must succeed. A gh
+# failure (network, rate limit, auth) answers with empty output, and an empty
+# conclusion or job list would otherwise read as "nothing failed" and land an
+# unverified sha. Retry briefly, then fail closed with exit 3.
+verdict_query() {
+  local run="$1" out attempt
+  shift
+  for attempt in 1 2 3; do
+    if out=$(watch_run_view "$run" --repo "$REPO" "$@" 2>/dev/null) && [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    [ "$attempt" -lt 3 ] && watch_sleep "${WATCH_CI_VERDICT_RETRY_SLEEP:-5}"
+  done
+  return 1
+}
+
+undetermined() {
+  echo "CI_UNDETERMINED run=$RID reason='$1'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}" >&2
+  exit 3
+}
+
 ARG="${1:-}"
 RID=""
 WATCH_SHA=""
@@ -99,11 +181,17 @@ if [ -z "$RID" ]; then
     WATCH_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
   fi
   for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
-    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
-      --json databaseId,headSha \
-      --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
+    if [ -n "$BRANCH" ]; then
+      RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
+        --json databaseId,headSha,headBranch \
+        --jq ".[] | select(.headSha==\"$WATCH_SHA\" and .headBranch==\"$BRANCH\") | .databaseId" | head -1)
+    else
+      RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
+        --json databaseId,headSha \
+        --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
+    fi
     [ -n "$RID" ] && break
-    sleep "$RESOLVE_SLEEP"
+    watch_sleep "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then
     echo "no $WORKFLOW run (event=$EVENT) appeared for $WATCH_SHA" >&2
@@ -114,55 +202,67 @@ echo "watching run $RID (fail-fast)"
 
 # Print the URL on a machine-greppable line: callers that wrap this watch
 # (train-push.sh) report the run to the operator without a second gh query.
-RUN_URL=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json url --jq '.url' 2>/dev/null || echo "")
+RUN_URL=$(watch_run_view "$RID" --repo "$REPO" --json url --jq '.url' 2>/dev/null || echo "")
 if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "null" ]; then
   echo "CI_RUN_URL $RUN_URL"
 fi
 
 while true; do
-  STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
-  # Advisory (continue-on-error) jobs read 'failure' at the job level but do
-  # not gate the run: 'Bash permission e2e (Windows)' in PR mode
-  # (_unit-suite.yml strict=false) and 'OpenCode 2 (Linux Docker)' until its
-  # matrix is green and the check is required. Fail-fast must not fire on
-  # them; the run-level conclusion check below remains authoritative.
-  FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+  write_heartbeat
+  STATUS=$(watch_run_view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
+  # Every failing job fails the train, including 'Bash permission e2e
+  # (Windows)'. That job is continue-on-error in PR mode (_unit-suite.yml
+  # strict=false), but it is a required check on main, so a red there makes
+  # the landing refuse; treating it as advisory only hid the failure until
+  # the end of the run.
+  FAILED_JOB=$(watch_run_view "$RID" --repo "$REPO" --json jobs \
+    --jq '[.jobs[] | select(.conclusion=="failure")][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
     echo "CI_EARLY_FAIL job='$NAME' run=$RID"
-    "$OPERATOR_GH" run view --repo "$REPO" --job "$JID" --log-failed 2>/dev/null \
+    watch_run_view --repo "$REPO" --job "$JID" --log-failed 2>/dev/null \
       | grep -aE "FAIL \[|panicked at|error\[|bash startup failure" | head -8
     if [ "${WATCH_CI_SETTLE:-0}" = "1" ]; then
       echo "settling: waiting for run completion so a rerun is accepted"
-      while [ "$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
-        sleep 45
+      while [ "$(watch_run_view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
+        write_heartbeat
+        watch_sleep "$POLL_SLEEP"
       done
     fi
     exit 1
   fi
 
   if [ "$STATUS" = "completed" ]; then
-    CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
+    if ! CONC=$(verdict_query "$RID" --json conclusion --jq '.conclusion'); then
+      undetermined "could not read the run conclusion"
+    fi
     if [ "$CONC" = "success" ]; then
-      echo "CI_DONE run=$RID conclusion=$CONC"
+      echo "CI_DONE run=$RID conclusion=$CONC${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
     fi
-    # An advisory job cancelled at its own time cap makes the RUN read
-    # 'cancelled' while every gating job passed (train 114 round 2: only
-    # 'OpenCode 2 (Linux Docker)' was cancelled and main's 25 required checks
-    # were all green). The sha is landable then, so the verdict is the set of
-    # non-advisory jobs, not the run's summary conclusion.
-    GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not) | .name] | join("; ")')
+    # The run's summary conclusion can read non-success while every job
+    # passed or was skipped; judge the jobs, which are what main requires.
+    # Only a successful query that lists jobs may conclude "all passed": an
+    # empty answer from a failed or truncated query must not read as green.
+    if ! JOB_COUNT=$(verdict_query "$RID" --json jobs --jq '.jobs | length') \
+      || ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -eq 0 ]; then
+      undetermined "could not list the run's jobs (conclusion=$CONC)"
+    fi
+    # The "bad=" prefix keeps a legitimately empty list distinguishable from
+    # a query that printed nothing.
+    if ! GATING_BAD=$(verdict_query "$RID" --json jobs \
+      --jq '"bad=" + ([.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | .name] | join("; "))'); then
+      undetermined "could not read job conclusions (conclusion=$CONC)"
+    fi
+    GATING_BAD="${GATING_BAD#bad=}"
     if [ -z "$GATING_BAD" ]; then
-      echo "CI_DONE run=$RID conclusion=$CONC advisory_only=1"
+      echo "CI_DONE run=$RID conclusion=$CONC jobs_all_passed=1${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
     fi
-    echo "CI_DONE run=$RID conclusion=$CONC gating_failed='$GATING_BAD'"
+    echo "CI_DONE run=$RID conclusion=$CONC gating_failed='$GATING_BAD'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
     exit 1
   fi
 
-  sleep 45
+  watch_sleep "$POLL_SLEEP"
 done

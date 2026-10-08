@@ -29,6 +29,7 @@ DEFAULT_BRANCH="master"
 # aliases) out of the fixtures: a signing requirement in ~/.gitconfig would
 # otherwise fail every commit here for a reason that has nothing to do with the
 # script under test.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$TMP_ROOT/home"
 mkdir -p "$HOME"
 
@@ -59,6 +60,25 @@ cat > "$BIN_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 set -u
 STATE="${TRAIN_PUSH_TEST_STATE:?gh stub needs TRAIN_PUSH_TEST_STATE}"
+printf '%s\n' "$*" >> "$STATE/gh-calls"
+
+# A rerun changes the attempt number without changing the run id. The state
+# transition is controllable so recovery tests can prove they watched the new
+# attempt rather than accepting the completed result that prompted the rerun.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "rerun" ]; then
+  printf 'bypass=%s %s\n' "${GH_SHIM_BYPASS:-}" "$*" >> "$STATE/reruns"
+  attempt="$(cat "$STATE/attempt" 2>/dev/null || echo 1)"
+  printf '%s\n' "$((attempt + 1))" > "$STATE/attempt"
+  if [ -f "$STATE/rerun_conclusion" ]; then
+    cp "$STATE/rerun_conclusion" "$STATE/conclusion"
+  fi
+  if [ "$(cat "$STATE/conclusion")" = "success" ]; then
+    : > "$STATE/failed_job"
+    : > "$STATE/rerun_jobs"
+  fi
+  echo completed > "$STATE/recorded_status"
+  exit 0
+fi
 
 hook="$STATE/on-watch.sh"
 if [ -x "$hook" ]; then
@@ -88,14 +108,46 @@ if [ "$log_failed" -eq 1 ]; then
   exit 0
 fi
 
+# Job log (`run view --job <id> --log`): the fixture's log_tail file stands in
+# for the failing job's whole log; the script judges only its last lines.
+job_id=""
+for arg in "$@"; do
+  [ "$prev" = "--job" ] && job_id="$arg"
+  prev="$arg"
+done
+if [ -n "$job_id" ]; then
+  cat "$STATE/log_tail" 2>/dev/null || true
+  exit 0
+fi
+
+# The jobs API the skew check reads step names from.
+if [ "${1:-}" = "api" ]; then
+  cat "$STATE/job_steps" 2>/dev/null || true
+  exit 0
+fi
+
+# Fault injection: a field listed in fail_json makes every `run view` query
+# for it exit nonzero with no output, the way gh behaves on a network, rate
+# limit or auth error. The verdict path must fail closed on it.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ] && [ -f "$STATE/fail_json" ] &&
+  grep -qxF "$json" "$STATE/fail_json"; then
+  exit 1
+fi
+
 case "$json" in
   defaultBranchRef) cat "$STATE/default_branch" ;;
-  databaseId,headSha|databaseId,headSha,workflowName)
+  databaseId,headSha|databaseId,headSha,workflowName|databaseId,headSha,headBranch)
     # A green_shas file makes the stub sha-aware: shas listed there have a run,
     # any other sha has none yet (what a just-pushed commit looks like).
     if [ -f "$STATE/green_shas" ]; then
       sha="$(printf '%s' "$jq_arg" | sed -n 's/.*headSha=="\([0-9a-fA-F]*\)".*/\1/p')"
       grep -qx "$sha" "$STATE/green_shas" || exit 0
+    fi
+    if [ "$json" = "databaseId,headSha,headBranch" ]; then
+      branch="$(printf '%s' "$jq_arg" | sed -n 's/.*headBranch=="\([^"]*\)".*/\1/p')"
+      have_branch="$(cat "$STATE/run_branch" 2>/dev/null || true)"
+      [ -n "$have_branch" ] || have_branch="${TRAIN_PUSH_TEST_BRANCH:-${WATCH_CI_BRANCH:-}}"
+      [ -z "$branch" ] || [ "$branch" = "$have_branch" ] || exit 0
     fi
     # The probe matches its run by the workflow's display name. The stub's run
     # belongs to the workflow named in $STATE/workflow_name (default: the name
@@ -109,8 +161,24 @@ case "$json" in
     cat "$STATE/run_id"
     ;;
   url) echo "https://github.com/example/repo/actions/runs/$(cat "$STATE/run_id")" ;;
-  status) echo "completed" ;;
-  jobs) cat "$STATE/failed_job" ;;
+  status,conclusion)
+    printf '%s\t%s\n' "$(cat "$STATE/recorded_status" 2>/dev/null || echo completed)" "$(cat "$STATE/conclusion")"
+    ;;
+  status)
+    if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
+      cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
+    fi
+    cat "$STATE/watch_status" 2>/dev/null || echo "completed"
+    ;;
+  jobs)
+    case "$jq_arg" in
+      *'.conclusion + "|"'*) cat "$STATE/rerun_jobs" ;;
+      *'| length'*) cat "$STATE/job_count" 2>/dev/null || echo 3 ;;
+      *'"bad=" +'*) printf 'bad=%s\n' "$(sed 's/|.*//' "$STATE/failed_job")" ;;
+      *) cat "$STATE/failed_job" ;;
+    esac
+    ;;
+  attempt) cat "$STATE/attempt" 2>/dev/null || echo 1 ;;
   conclusion) cat "$STATE/conclusion" ;;
   *)
     echo "gh stub: unhandled query: $*" >&2
@@ -171,7 +239,12 @@ new_fixture() {
   # fixture carries a tests.yml shaped like the real one (a pull_request block
   # with its own lists above the push block the check has to read).
   write_tests_workflow "$dir/work" "      - $DEFAULT_BRANCH\n      - \"train/**\""
-  git -C "$dir/work" add base.txt .github/workflows/tests.yml
+  mkdir -p "$dir/work/scripts/lib"
+  cp "$SCRIPT_DIR/watch-ci.sh" "$dir/work/scripts/watch-ci.sh"
+  cp "$SCRIPT_DIR/check-path-deps.py" "$dir/work/scripts/check-path-deps.py"
+  cp "$SCRIPT_DIR/lib/operator-gh.sh" "$dir/work/scripts/lib/operator-gh.sh"
+  cp "$SCRIPT_DIR/lib/workflow-gates.py" "$dir/work/scripts/lib/workflow-gates.py"
+  git -C "$dir/work" add base.txt .github/workflows/tests.yml scripts
   git -C "$dir/work" commit -qm "base"
   git -C "$dir/work" remote add origin "$dir/origin.git"
   git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
@@ -181,8 +254,12 @@ new_fixture() {
   mkdir -p "$dir/ci-state"
   echo "4242" > "$dir/ci-state/run_id"
   echo "success" > "$dir/ci-state/conclusion"
+  echo "completed" > "$dir/ci-state/recorded_status"
+  echo "1" > "$dir/ci-state/attempt"
   echo "$DEFAULT_BRANCH" > "$dir/ci-state/default_branch"
+  : > "$dir/ci-state/run_branch"
   : > "$dir/ci-state/failed_job"
+  : > "$dir/ci-state/rerun_jobs"
 
   # The first-run trigger probe has its own rows; every other fixture starts
   # already proven so it does not pay for a probe it is not testing.
@@ -225,9 +302,10 @@ run_train() {
   shift
   set +e
   LAST_OUT="$(
-    cd "$dir/work" &&
+    cd "${TRAIN_PUSH_TEST_CWD:-$dir/work}" &&
       PATH="$BIN_DIR:$PATH" \
       REPO="${TRAIN_PUSH_TEST_REPO-example/repo}" \
+      TRAIN_PUSH_TEST_BRANCH="train/${1:-}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
@@ -297,6 +375,32 @@ write_gated_workflow() {
 }
 
 origin_ref() { git -C "$1/origin.git" rev-parse --verify -q "$2" || true; }
+
+# Isolated arm used to prove that the stale completed conclusion is rejected.
+# Keeping this one assertion selectable lets mutation checks distinguish the
+# old-run verdict from unrelated recovery assertions in the full suite.
+test_same_sha_failed_rerun_message() {
+  local dir
+  dir="$(new_fixture same-sha-failed-rerun-message)"
+  add_train_commit "$dir/work" "same-sha-failed-rerun-message"
+  git -C "$dir/work" push -q origin "HEAD:refs/heads/train/same-sha-failed-rerun-message"
+  echo "failure" > "$dir/ci-state/conclusion"
+  echo "Unit / runner unavailable|9199" > "$dir/ci-state/failed_job"
+  echo "failure|9199" > "$dir/ci-state/rerun_jobs"
+  echo "success" > "$dir/ci-state/rerun_conclusion"
+  run_train "$dir" same-sha-failed-rerun-message
+  expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+    "same-sha failed-run rerun result"
+}
+
+if [ "${TRAIN_PUSH_TEST_CASE:-}" = "same-sha-failed-rerun-message" ]; then
+  test_same_sha_failed_rerun_message
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+  echo "train-push.test.sh: isolated same-sha failed rerun passed"
+  exit 0
+fi
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
@@ -489,6 +593,18 @@ run_train "$dir" probe
 expect_rc 0 "the second train lands too"
 expect_no_out "first train in this repo" "second run skips the probe"
 
+# The proof is one fact per REPOSITORY. A linked worktree has its own git dir
+# (.git/worktrees/<name>), so a marker kept there made every fresh worktree
+# re-prove the trigger: one probe push and one extra CI run per train.
+git -C "$dir/work" worktree add -q -b wt-train "$dir/wt" HEAD
+add_train_commit "$dir/wt" "probe-from-worktree"
+TRAIN_PUSH_TEST_CWD="$dir/wt" run_train "$dir" probe-wt
+expect_rc 0 "a train from a linked worktree lands"
+expect_no_out "first train in this repo" \
+  "a linked worktree reads the repository's trigger proof"
+[ ! -e "$(git -C "$dir/wt" rev-parse --absolute-git-dir)/train-push-proven" ] ||
+  fail "the proof was written into the worktree's own git dir"
+
 # --- warning: a repo-local pre-push hook -----------------------------------
 # Such a hook would re-run the gate on every fix-and-repush and on the branch
 # deletion after a land, so it is reported - but never run, and never a refusal.
@@ -518,6 +634,18 @@ run_train "$dir" dispatcher
 expect_rc 0 "the managed dispatcher does not block a train"
 expect_no_out "pre-push hook" "the managed dispatcher alone is not warned about"
 
+# --- no warning: the shared content-addressed dispatcher set either --------
+dir="$(new_fixture keyed-dispatcher)"
+add_train_commit "$dir/work" "keyed-dispatcher"
+managed_hooks="$TMP_ROOT/fake-cache/aft/git-hooks/0123456789abcdef0123456789abcdef"
+mkdir -p "$managed_hooks"
+printf '#!/bin/sh\nexit 0\n' > "$managed_hooks/pre-push"
+chmod +x "$managed_hooks/pre-push"
+git -C "$dir/work" config core.hooksPath "$managed_hooks"
+run_train "$dir" keyed-dispatcher
+expect_rc 0 "the shared managed dispatcher does not block a train"
+expect_no_out "pre-push hook" "the shared managed dispatcher alone is not warned about"
+
 # --- red that is dependency skew: named, and never re-queued ---------------
 dir="$(new_fixture skew)"
 add_train_commit "$dir/work" "skew"
@@ -544,6 +672,60 @@ expect_no_out "rebased onto" "lock-skew red never rebases"
 expect_no_out "(round 2 of 3)" "lock-skew red never starts a second round"
 [ "$(git -C "$dir/work" rev-parse HEAD)" = "$skew_sha" ] ||
   fail "lock-skew red moved HEAD, so something rebased"
+
+# --- red that is skew by STEP name: named, on single-job CI ------------------
+# A seat whose CI is one job per platform names the job after the platform, so
+# the job-name arm can never match; the lock check is a step inside it.
+dir="$(new_fixture skew-step)"
+add_train_commit "$dir/work" "skew-step"
+echo "Build and test (macOS)|9003" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nCargo.lock drift check\n' > "$dir/ci-state/job_steps"
+run_train "$dir" skew-step
+expect_rc 1 "a step-named skew red exits 1"
+expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
+  "a failing step name matching the skew pattern is classed as skew"
+expect_out "Build and test (macOS)" "step-skew red still names the job"
+
+# --- red that is skew by LOG TAIL: a lock check that is one phase in a step --
+dir="$(new_fixture skew-log)"
+add_train_commit "$dir/work" "skew-log"
+echo "Build and test (macOS)|9004" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+printf 'compile ok\nunit tests ok\nerror: Cargo.lock has drifted from the committed manifests; run cargo update -w\n' > "$dir/ci-state/log_tail"
+run_train "$dir" skew-log
+expect_rc 1 "a log-tail skew red exits 1"
+expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
+  "a lockfile drift line in the failing log's tail is classed as skew"
+
+# --- red that is a plain test failure: never classed as skew ----------------
+dir="$(new_fixture skew-not)"
+add_train_commit "$dir/work" "skew-not"
+echo "Unit (ubuntu-latest)|9005" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+printf 'test write_ledger::tests::census ... FAILED\nerror: test failed, to rerun pass `-p agent-file-tools --lib`\n' > "$dir/ci-state/log_tail"
+run_train "$dir" skew-not
+expect_rc 1 "a plain test-failure red exits 1"
+expect_no_out "version/lock skew" "a plain test failure is never classed as skew"
+expect_out "Unit (ubuntu-latest)" "test-failure red still names the job"
+# An early Cargo.lock mention in the log (a build line) must not class a later
+# test failure as skew either: only the tail is judged.
+dir="$(new_fixture skew-early)"
+add_train_commit "$dir/work" "skew-early"
+echo "Unit (ubuntu-latest)|9006" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+{
+  printf 'checking Cargo.lock against manifests\n'
+  i=0
+  while [ "$i" -lt 60 ]; do printf 'Compiling crate%d v1.0.0\n' "$i"; i=$((i + 1)); done
+  printf 'test integration::watcher ... FAILED\n'
+} > "$dir/ci-state/log_tail"
+run_train "$dir" skew-early
+expect_rc 1 "an early lock mention with a failing tail exits 1"
+expect_no_out "version/lock skew" "a lockfile line scrolled out of the tail is not skew"
 
 # --- refusal: dirty tree ---------------------------------------------------
 dir="$(new_fixture dirty)"
@@ -763,16 +945,419 @@ expect_out "actions/runs/4242" "red CI prints the run url"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/work" rev-parse HEAD~1)" ] ||
   fail "red CI moved origin/main"
 
+# --- local path-dependency preflight refuses an external Cargo path ----------
+dir="$(new_fixture external-path-dependency)"
+mkdir -p "$dir/work/src" "$dir/outside/src"
+cat > "$dir/work/Cargo.toml" <<'TOML'
+[package]
+name = "fixture-root"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+escape = { path = "../outside" }
+TOML
+cat > "$dir/work/src/lib.rs" <<'RUST'
+pub fn fixture() {}
+RUST
+cat > "$dir/outside/Cargo.toml" <<'TOML'
+[package]
+name = "escape"
+version = "0.1.0"
+edition = "2021"
+TOML
+cat > "$dir/outside/src/lib.rs" <<'RUST'
+pub fn fixture() {}
+RUST
+cargo metadata --format-version 1 --offline --manifest-path "$dir/work/Cargo.toml" > /dev/null
+git -C "$dir/work" add Cargo.toml Cargo.lock src/lib.rs
+git -C "$dir/work" commit -qm "add external dependency path"
+git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
+add_train_commit "$dir/work" "external-path-dependency"
+run_train "$dir" external-path-dependency
+expect_rc 2 "external path dependency refuses before pushing"
+expect_out "package=escape" "the local gate names the escaping package"
+[ -z "$(origin_ref "$dir" refs/heads/train/external-path-dependency)" ] ||
+  fail "the external path dependency preflight pushed a train branch"
+
 # --- green: lands on main, train branch cleaned up -------------------------
 dir="$(new_fixture green)"
 add_train_commit "$dir/work" "green"
 train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+: > "$dir/ci-state/capture_heartbeat"
 run_train "$dir" green
 expect_rc 0 "green CI lands"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
   fail "green CI did not fast-forward origin/main to the tested sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/green)" ] ||
   fail "green CI left the train branch behind"
+if grep -q '^pid=[0-9][0-9]*$' "$dir/ci-state/heartbeat-snapshot" &&
+  grep -q '^start=.' "$dir/ci-state/heartbeat-snapshot" &&
+  grep -q '^updated=.' "$dir/ci-state/heartbeat-snapshot"; then
+  ok "the watcher heartbeat records pid, process start time, and poll time"
+else
+  fail "the watcher heartbeat did not record all liveness fields"
+fi
+[ ! -e "$dir/work/.git/train-push-green.watch" ] ||
+  fail "a clean watcher exit left its heartbeat behind"
+
+# A completed run whose verdict queries fail must not land. gh answers a
+# network, rate-limit or auth error with empty output; reading that as "no
+# failed jobs" fast-forwarded main on an unverified sha.
+dir="$(new_fixture verdict-query-fails)"
+add_train_commit "$dir/work" "verdict-query-fails"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'conclusion\njobs\n' > "$dir/ci-state/fail_json"
+WATCH_CI_VERDICT_RETRY_SLEEP=0 run_train "$dir" verdict-query-fails
+expect_rc 2 "a failed verdict query refuses to land"
+expect_out "CI_UNDETERMINED" "a failed verdict query names the undetermined verdict"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "a failed verdict query fast-forwarded main"
+
+# A completed run that lists no jobs is not a run in which every job passed.
+dir="$(new_fixture verdict-no-jobs)"
+add_train_commit "$dir/work" "verdict-no-jobs"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+echo "failure" > "$dir/ci-state/conclusion"
+echo 0 > "$dir/ci-state/job_count"
+WATCH_CI_VERDICT_RETRY_SLEEP=0 run_train "$dir" verdict-no-jobs
+expect_rc 2 "an empty job list refuses to land"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "an empty job list fast-forwarded main"
+
+# A completed push run for the same commit on another branch is not proof that
+# the train push started a run. The branch-qualified watch must fail plainly
+# rather than treating that stale result as the train's CI.
+dir="$(new_fixture no-train-run)"
+add_train_commit "$dir/work" "no-train-run"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+echo "$DEFAULT_BRANCH" > "$dir/ci-state/run_branch"
+run_train "$dir" norun
+expect_rc 2 "a stale run for the sha on another branch does not authorize landing"
+expect_out "no tests.yml run (event=push) appeared for $train_sha" \
+  "missing train run is stated plainly"
+expect_no_out "CI_DONE" "a completed run from another branch is never reported as this push result"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" != "$train_sha" ] ||
+  fail "a stale run from another branch landed the train sha"
+
+# A signalled watch kills its timer child and removes its heartbeat rather than
+# leaving descendants that make the watcher look alive.
+dir="$(new_fixture watch-signal)"
+echo "in_progress" > "$dir/ci-state/watch_status"
+heartbeat="$dir/work/.git/train-push-watch-signal.watch"
+(
+  cd "$dir/work"
+  exec env PATH="$BIN_DIR:$PATH" REPO=example/repo \
+    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
+    TRAIN_PUSH_TEST_STATE="$dir/ci-state" WATCH_CI_HEARTBEAT="$heartbeat" \
+    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 4242 > "$dir/watch-signal.out" 2>&1
+) &
+watcher_pid=$!
+sleep_child=""
+for _ in $(seq 1 100); do
+  sleep_child="$(pgrep -P "$watcher_pid" -x sleep 2>/dev/null | head -1 || true)"
+  [ -n "$sleep_child" ] && break
+  sleep 0.02
+done
+if [ -z "$sleep_child" ]; then
+  fail "the signalled-watch fixture never reached its timer sleep"
+else
+  kill -TERM "$watcher_pid" 2>/dev/null || true
+  set +e
+  wait "$watcher_pid"
+  watcher_rc=$?
+  set -e
+  [ "$watcher_rc" -eq 143 ] || fail "the signalled watch exited $watcher_rc instead of 143"
+  if kill -0 "$sleep_child" 2>/dev/null; then
+    fail "the signalled watch left sleep child $sleep_child running"
+    kill "$sleep_child" 2>/dev/null || true
+  else
+    ok "a signalled watch leaves no sleep child"
+  fi
+fi
+[ ! -e "$heartbeat" ] || fail "a signalled watch left its heartbeat behind"
+
+# --- the directory the process stands in may disappear during the watch ----
+dir="$(new_fixture deleted-cwd)"
+add_train_commit "$dir/work" "deleted-cwd"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+standing="$dir/work/standing"
+mkdir -p "$standing"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$standing"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+TRAIN_PUSH_TEST_CWD="$standing" run_train "$dir" deleted-cwd
+expect_rc 0 "a train lands after its starting directory is removed during the watch"
+expect_no_out "Unable to read current working directory" "landing does not ask git to rediscover a deleted cwd"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the deleted-cwd train did not land its verified sha"
+
+# Mutation control: remove the explicit checkout path from one post-watch git
+# command; after the current directory is deleted, Git must fail to read it.
+mutant_dir="$TMP_ROOT/cwd-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's/git -C "$REPO" fetch -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q '^  git fetch -q "$remote" "$default_branch"' "$mutant" ||
+  fail "cwd mutation did not restore a bare post-watch git call"
+dir="$(new_fixture deleted-cwd-mutant)"
+add_train_commit "$dir/work" "deleted-cwd-mutant"
+standing="$dir/work/standing"
+mkdir -p "$standing"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$standing"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+TRAIN_PUSH_TEST_CWD="$standing" run_train "$dir" deleted-cwd-mutant
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+expect_out "fatal: Unable to read current working directory: No such file or directory" \
+  "a bare post-watch git call reproduces the deleted-cwd fatal (proves the cwd arm bites)"
+
+# --- repository deletion after CI succeeds preserves a recoverable result ----
+dir="$(new_fixture removed-repo)"
+add_train_commit "$dir/work" "removed-repo"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$dir/work"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+run_train "$dir" removed-repo
+expect_rc 4 "a repository removed after green exits in the landing-failed state"
+expect_out "repository path" "a removed repository root is identified distinctly"
+expect_out "no longer exists" "a removed repository root says what disappeared"
+expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+  "removed-repository failure preserves the green run"
+expect_out "train sha: $train_sha" "removed-repository failure preserves the verified sha"
+expect_out "scripts/train-push.sh removed-repo --land" \
+  "removed-repository failure gives the no-retest recovery command"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "the removed-repository case moved the default branch"
+
+# --- existing train: recorded green lands without a push or a watch --------
+dir="$(new_fixture existing-green)"
+add_train_commit "$dir/work" "existing-green"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green"
+: > "$dir/ci-state/gh-calls"
+run_train "$dir" existing-green --land
+expect_rc 0 "--land finishes an existing green train"
+expect_out "landed previously-verified sha $train_sha" "the recovery names the exact CI-verified sha"
+expect_no_out "creating origin/train/existing-green" "recorded green skips creating the train branch"
+expect_no_out "updating origin/train/existing-green" "recorded green skips updating the train branch"
+expect_no_out "watching CI" "recorded green skips the watch"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  fail "recorded green invoked watch-ci instead of spending the verdict"
+else
+  ok "recorded green did not invoke watch-ci"
+fi
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "--land did not fast-forward the default branch to the recorded green sha"
+[ -z "$(origin_ref "$dir" refs/heads/train/existing-green)" ] ||
+  fail "--land left the recovered train branch behind"
+if [ -s "$dir/ci-state/reruns" ]; then
+  fail "an existing successful sha was rerun instead of landed"
+else
+  ok "an existing successful sha lands without a rerun"
+fi
+
+# --- recovery reports a dead watcher before updating the default branch -----
+dir="$(new_fixture stale-heartbeat)"
+add_train_commit "$dir/work" "stale-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/stale-heartbeat"
+cat > "$dir/work/.git/train-push-stale-heartbeat.watch" <<HEARTBEAT
+pid=2147483000
+start=Mon Jan  1 00:00:00 2001
+updated=2026-09-19T20:15:00Z
+HEARTBEAT
+run_train "$dir" stale-heartbeat --land
+expect_rc 0 "--land recovers a green sha from a dead watcher"
+expect_out "watcher 2147483000 died at 2026-09-19T20:15:00Z; landing its verified sha $train_sha" \
+  "recovery identifies the dead watcher and its last heartbeat"
+
+# A live pid with a different process start is recycled, not a live watcher.
+dir="$(new_fixture recycled-heartbeat)"
+add_train_commit "$dir/work" "recycled-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/recycled-heartbeat"
+cat > "$dir/work/.git/train-push-recycled-heartbeat.watch" <<HEARTBEAT
+pid=$$
+start=not-the-current-process-start
+updated=2026-09-19T20:16:00Z
+HEARTBEAT
+run_train "$dir" recycled-heartbeat --land
+expect_rc 0 "a recycled heartbeat pid does not masquerade as a live watcher"
+expect_out "watcher $$ died at 2026-09-19T20:16:00Z; landing its verified sha $train_sha" \
+  "watcher liveness compares pid and process start time"
+
+# The same pid and start time is a genuinely live watcher and must not be
+# duplicated by a second process.
+dir="$(new_fixture live-heartbeat)"
+add_train_commit "$dir/work" "live-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/live-heartbeat"
+live_start="$(ps -p "$$" -o lstart= | awk '{$1=$1; print}')"
+cat > "$dir/work/.git/train-push-live-heartbeat.watch" <<HEARTBEAT
+pid=$$
+start=$live_start
+updated=2026-09-19T20:17:00Z
+HEARTBEAT
+run_train "$dir" live-heartbeat --land
+expect_rc 2 "a matching heartbeat pid and process start refuses a duplicate watcher"
+expect_out "watcher $$ is still running" "live watcher refusal names its pid"
+
+# --- existing train: running attaches to its exact run ---------------------
+dir="$(new_fixture existing-running)"
+add_train_commit "$dir/work" "existing-running"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-running"
+echo "in_progress" > "$dir/ci-state/recorded_status"
+: > "$dir/ci-state/gh-calls"
+run_train "$dir" existing-running
+expect_rc 0 "an existing running train is watched and landed"
+expect_out "attaching to CI for existing origin/train/existing-running at $train_sha" \
+  "the running recovery attaches to the exact train tip"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  ok "running recovery invoked watch-ci"
+else
+  fail "running recovery landed without attaching watch-ci"
+fi
+
+# --- existing train: recorded red keeps the fix-and-repush contract --------
+dir="$(new_fixture existing-red)"
+add_train_commit "$dir/work" "existing-red"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-red"
+echo "failure" > "$dir/ci-state/conclusion"
+echo "Unit / failed job|9101" > "$dir/ci-state/failed_job"
+echo "failure|9101" > "$dir/ci-state/rerun_jobs"
+echo "failure" > "$dir/ci-state/rerun_conclusion"
+run_train "$dir" existing-red
+expect_rc 1 "an existing red train refuses to land"
+expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  "an existing failed sha announces the rerun and new attempt"
+expect_out "fix, commit, and re-run: scripts/train-push.sh existing-red" \
+  "recorded red preserves the fix-and-repush instruction"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+  fail "an existing failed run was not rerun through the operator gh bypass"
+grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
+  fail "an existing failed run was not watched at attempt 2"
+[ "$(origin_ref "$dir" refs/heads/train/existing-red)" = "$train_sha" ] ||
+  fail "existing red moved or deleted the train branch"
+
+# A failed old attempt is not the result of this push. Rerunning the failed
+# jobs must produce a higher attempt, and only that attempt's green result lands.
+dir="$(new_fixture existing-failed-rerun-green)"
+add_train_commit "$dir/work" "existing-failed-rerun-green"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-failed-rerun-green"
+echo "failure" > "$dir/ci-state/conclusion"
+echo "Unit / runner unavailable|9103" > "$dir/ci-state/failed_job"
+echo "failure|9103" > "$dir/ci-state/rerun_jobs"
+echo "success" > "$dir/ci-state/rerun_conclusion"
+run_train "$dir" existing-failed-rerun-green
+expect_rc 0 "a failed existing run reruns and lands when the new attempt passes"
+expect_out "(failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  "failed recovery identifies the new attempt"
+expect_out "CI_DONE run=4242 conclusion=success attempt=2" \
+  "recovery reports the new attempt's success"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+  fail "the failed existing run did not request a failed-jobs rerun"
+grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
+  fail "the successful retry was not watched at attempt 2"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the successful retry did not land the original verified sha"
+
+# A run-level cancellation can leave individual jobs cancelled. `--failed`
+# does not select those jobs, so recovery must request each cancelled job by id.
+dir="$(new_fixture existing-cancelled-job)"
+add_train_commit "$dir/work" "existing-cancelled-job"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-cancelled-job"
+echo "cancelled" > "$dir/ci-state/conclusion"
+printf 'cancelled|9102\ncancelled|9104\n' > "$dir/ci-state/rerun_jobs"
+echo "success" > "$dir/ci-state/rerun_conclusion"
+: > "$dir/ci-state/failed_job"
+run_train "$dir" existing-cancelled-job
+expect_rc 0 "a cancelled job is rerun and its new attempt lands"
+expect_out "(cancelled); rerunning its failed and cancelled jobs (attempt 3)" \
+  "cancelled recovery announces the new attempt"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --job 9102
+bypass=operator run rerun 4242 --job 9104" ] ||
+  fail "cancelled jobs were not rerun by job id through the operator gh bypass"
+grep -q -- '--attempt 3' "$dir/ci-state/gh-calls" ||
+  fail "the cancelled-job recovery did not watch attempt 3"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the cancelled-job recovery did not land the rerun sha"
+
+# --- existing green is not landable after the default branch diverges ------
+dir="$(new_fixture existing-diverged)"
+add_train_commit "$dir/work" "existing-diverged"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-diverged"
+advance_origin_main "$dir" "peer-landed-first"
+advanced_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+run_train "$dir" existing-diverged --land
+expect_rc 2 "--land refuses a green sha that is no longer a fast-forward"
+expect_out "not a fast-forward" "the divergent recovery names the sound refusal"
+expect_out "rebase and re-run" "the divergent recovery names the remedy without guessing why"
+expect_no_out "main moved" "the divergent recovery does not assert why it is not a fast-forward"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$advanced_sha" ] ||
+  fail "the non-fast-forward recovery moved the default branch"
+
+# Mutation control: ignoring the recorded green verdict must enter watch-ci.
+mutant_dir="$TMP_ROOT/verdict-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's/\[ "$run_status" != "completed" \]/[ 1 -eq 1 ]/' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q '\[ 1 -eq 1 \]' "$mutant" || fail "recorded-verdict mutation did not apply"
+dir="$(new_fixture existing-green-mutant)"
+add_train_commit "$dir/work" "existing-green-mutant"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green-mutant"
+: > "$dir/ci-state/gh-calls"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+run_train "$dir" existing-green-mutant --land
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  ok "ignoring the recorded verdict wrongly invokes watch-ci (proves the green recovery arm bites)"
+else
+  fail "the recorded-verdict mutant did not invoke watch-ci"
+fi
+
+# Mutation control: replacing the non-fast-forward refusal with a force push
+# must move the default branch backwards, which the real negative arm forbids.
+mutant_dir="$TMP_ROOT/force-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's|    refuse_non_fast_forward "$sha"|    git push --force-with-lease "$remote" "$sha:refs/heads/$default_branch"|' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q 'git push --force-with-lease "$remote" "$sha:refs/heads/$default_branch"' "$mutant" ||
+  fail "force-push mutation did not apply"
+dir="$(new_fixture existing-diverged-mutant)"
+add_train_commit "$dir/work" "existing-diverged-mutant"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-diverged-mutant"
+advance_origin_main "$dir" "peer-landed-before-mutant"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+run_train "$dir" existing-diverged-mutant --land
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ]; then
+  ok "force-push mutant moves the default branch backwards (proves the negative arm bites)"
+else
+  fail "force-push mutant did not violate the negative arm"
+fi
 
 # --- re-queue: main moves during CI, train rebases and lands on round 2 -----
 dir="$(new_fixture requeue)"
@@ -948,9 +1533,14 @@ exit 0
 HOOK
 chmod +x "$dir/origin.git/hooks/pre-receive"
 run_train "$dir" protected
-expect_rc 1 "a protection refusal exits 1"
+expect_rc 4 "a protection refusal after green exits in the landing-failed state"
 expect_out "refused: $protected_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
   "protection refusal prints the merge-as-a-train remedy"
+expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+  "post-CI failure names the green run"
+expect_out "train sha: $protected_sha" "post-CI failure names the verified train sha"
+expect_out "scripts/train-push.sh protected --land" \
+  "post-CI failure gives the no-retest recovery command"
 [ -n "$(origin_ref "$dir" refs/heads/train/protected)" ] ||
   fail "protection refusal deleted the train branch"
 
@@ -1083,6 +1673,10 @@ expect_out "example/derived" "the slug is derived from origin's configured URL"
 # (names mirror BROCA's suite so the two copies stay comparable) --------------
 lock_held() { printf '%s/work/.git/train-push-locks/held' "$1"; }
 plant_owner() { mkdir -p "$(lock_held "$1")"; printf '%s %s\n' "$2" "$3" > "$(lock_held "$1")/owner"; }
+# plant_owner_started DIR PID NAME START: an owner recorded with a start time.
+plant_owner_started() { mkdir -p "$(lock_held "$1")"; printf '%s %s\n%s\n' "$2" "$3" "$4" > "$(lock_held "$1")/owner"; }
+process_start() { ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}'; }
+owner_line() { head -1 "$(lock_held "$1")/owner" 2>/dev/null; }
 # test_clean_state_does_not_refuse_for_concurrency
 dir="$(new_fixture pidlock-clean)"
 add_train_commit "$dir/work" "clean"
@@ -1098,7 +1692,7 @@ echo "failure" > "$dir/ci-state/conclusion"
 echo "Unit / broken" > "$dir/ci-state/failed_job"
 run_train "$dir" lockorder
 expect_rc 1 "the CI-red run stops before landing"
-case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+case "$(owner_line "$dir")" in
   *" lockorder") ok "this train owns the lock after a run that never landed" ;;
   *) fail "the lock was not claimed before the push" ;;
 esac
@@ -1107,7 +1701,7 @@ dir="$(new_fixture live-lock)"
 add_train_commit "$dir/work" "live"
 sleep 60 &
 sleeper=$!
-plant_owner "$dir" "$sleeper" other
+plant_owner_started "$dir" "$sleeper" other "$(process_start "$sleeper")"
 run_train "$dir" live
 kill "$sleeper" 2>/dev/null || true
 expect_rc 2 "a live lock refuses the second train"
@@ -1124,10 +1718,61 @@ add_train_commit "$dir/work" "stale"
 plant_owner "$dir" 2147483000 gone
 run_train "$dir" stale
 expect_rc 0 "a stale lock (dead pid) does not refuse"
-case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+case "$(owner_line "$dir")" in
   *" gone") fail "the stale owner was obeyed instead of replaced" ;;
   *" stale") ok "the stale owner was replaced by this train" ;;
   *) fail "the owner file is neither the stale owner nor this train" ;;
+esac
+# test_a_stale_owner_recovered_by_another_train_is_not_dispossessed: two trains
+# read the same stale owner; the other one recovers first and takes a fresh,
+# live lock. This train must meet that live lock and refuse, never remove it.
+dir="$(new_fixture stale-race)"
+add_train_commit "$dir/work" "stale-race"
+plant_owner "$dir" 2147483000 gone
+sleep 60 &
+winner=$!
+winner_start="$(process_start "$winner")"
+cat > "$dir/race-hook.sh" <<HOOK
+#!/usr/bin/env bash
+held="$(lock_held "$dir")"
+rm -rf "\$held"
+mkdir "\$held"
+printf '%s %s\n%s\n' "$winner" winner "$winner_start" > "\$held/owner"
+HOOK
+chmod +x "$dir/race-hook.sh"
+TRAIN_PUSH_TEST_LOCK_RACE_HOOK="$dir/race-hook.sh" run_train "$dir" stale-race
+kill "$winner" 2>/dev/null || true
+expect_rc 2 "a train that lost the stale-lock recovery race refuses"
+case "$(owner_line "$dir")" in
+  *" winner") ok "the winner's fresh lock survived the losing recoverer" ;;
+  *) fail "the losing recoverer took the winner's fresh lock" ;;
+esac
+[ -z "$(origin_ref "$dir" refs/heads/train/stale-race)" ] ||
+  fail "the losing recoverer pushed a train ref"
+# test_a_recycled_pid_is_stale: the recorded pid is alive but is a different
+# process (its start time differs), as when macOS reuses a finished train's pid.
+dir="$(new_fixture recycled-pid)"
+add_train_commit "$dir/work" "recycled"
+sleep 60 &
+recycled=$!
+plant_owner_started "$dir" "$recycled" gone "Mon Jan  1 00:00:00 2001"
+run_train "$dir" recycled
+expect_rc 0 "a live pid with a different start time does not refuse"
+case "$(owner_line "$dir")" in
+  *" recycled") ok "the recycled pid's lock was replaced by this train" ;;
+  *) fail "the recycled pid's lock was obeyed" ;;
+esac
+# test_a_legacy_owner_on_a_non_train_pid_is_stale: a lock written before start
+# times were recorded, whose pid now runs something that is not a train.
+dir="$(new_fixture legacy-owner)"
+add_train_commit "$dir/work" "legacy"
+plant_owner "$dir" "$recycled" gone
+run_train "$dir" legacy
+kill "$recycled" 2>/dev/null || true
+expect_rc 0 "a legacy lock on a non-train pid does not refuse"
+case "$(owner_line "$dir")" in
+  *" legacy") ok "the legacy lock was replaced by this train" ;;
+  *) fail "the legacy lock on a non-train pid was obeyed" ;;
 esac
 # an unreadable owner (killed between mkdir and the owner write) is refused,
 # never dispossessed
@@ -1172,7 +1817,7 @@ racer_a=$!
 racer_b=$!
 wait "$racer_a" || true
 wait "$racer_b" || true
-race_owner="$(cat "$(lock_held "$dir")/owner" 2>/dev/null)"
+race_owner="$(owner_line "$dir")"
 case "$race_owner" in
   *" racer-a") race_loser="racer-b" ;;
   *" racer-b") race_loser="racer-a" ;;
