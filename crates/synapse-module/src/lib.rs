@@ -22443,8 +22443,10 @@ mod catalog_runtime_tests {
                 }
             }
             let spec = catalog_lane_spec(&state, entry, backend, true).unwrap();
-            // Retain only digest-verified converter output for the later
-            // fresh-process capacity test, never a checkpoint approximation.
+            // Save only converted weights whose SHA-256 matches the package
+            // checksum in bench/parity/models.json. The later capacity test must
+            // load those exact converted bytes, not weights from another model
+            // revision or conversion method that could have different resource use.
             if let Some(directory) = &packages {
                 fs::create_dir_all(directory).unwrap();
                 fs::copy(
@@ -22454,8 +22456,10 @@ mod catalog_runtime_tests {
                 .unwrap();
             }
             assert_eq!(spec.fingerprint.0, backend.fingerprint, "{id}");
-            // The install's stored config must be identical to the public
-            // profile preload configuration used by hardware certification.
+            // Compare catalog installation with a startup preload: a model loaded
+            // from configuration before requests arrive. Hardware certification
+            // uses that startup path, so both must produce the same fingerprint
+            // and engine identity for the same weights and tokenizer.
             let preload: PreloadModelConfig = serde_json::from_value(json!({
                 "model_id": spec.model_id, "engine": spec.engine, "profile": backend.profile,
                 "task": spec.task, "pooling": spec.pooling, "normalize": spec.normalize,
@@ -22624,7 +22628,10 @@ mod catalog_runtime_tests {
         .await
         .err()
         .unwrap();
-        // The lane is now declared, but this state has no direct worker.
+        // The catalog declares gte-modernbert-base-ane, but this test runtime
+        // advertises only Metal. A missing direct Neural Engine worker must
+        // return backend_unavailable, not the unknown_model error for an
+        // undeclared model or a fallback to Metal.
         assert_eq!(unknown.code, "backend_unavailable");
         assert!(state.runtime.catalog.lock().unwrap().is_empty());
         drop(state);
@@ -22916,8 +22923,10 @@ fn catalog_direct_ane_worker() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| resolve_worker_binary_sibling("ane-direct-worker"))
 }
-// Availability is about the direct worker, not the unrelated Core ML lane.
-// Do not advertise an installable lane that cannot be loaded on this platform.
+// These catalog models use ck-synapse-worker-ane-direct, which calls Apple's
+// Neural Engine API directly. The separate worker that accesses the Neural
+// Engine through Apple's Core ML framework does not satisfy this requirement.
+// Require macOS and the direct worker binary before offering this backend.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn direct_ane_catalog_available(macos: bool, worker: Option<&Path>) -> bool {
     macos && worker.is_some_and(Path::is_file)
@@ -24128,9 +24137,11 @@ fn catalog_profile_lane_spec(
     if verify
         && sha256_file(&package_path).ok().as_deref() != Some(digest.trim_start_matches("sha256:"))
     {
-        // Catalog downloads contain original pinned checkpoints. Use exactly
-        // the converter used by certification, then publish its digest-checked
-        // package in the normal cache so reload and GC see the same artifact.
+        // Downloads contain original Hugging Face model weights whose SHA-256
+        // checksums are recorded in bench/parity/models.json. Convert them with
+        // the same function used by hardware certification and verify the
+        // converted package's checksum before caching it. The normal model cache
+        // lets reloads and garbage collection manage those same bytes.
         let package =
             synapse_parity::convert::convert_profile_file(&profile.typed, profile_id, &source)
                 .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -24152,8 +24163,10 @@ fn catalog_profile_lane_spec(
         ingested.map_err(|error| artifact_invalid_error(error.to_string()))?;
     }
     let sanitized_digest = if verify {
-        // Profile grammar composes tokens before enforcing the 8192 boundary;
-        // tokenizer truncation would make the 8193 refusal impossible.
+        // Count the tokens actually sent to the model, including special tokens
+        // and any query/document template, before enforcing the 8192-token limit.
+        // Truncating during tokenization could hide an oversized input instead
+        // of producing the required refusal for an 8193-token sequence.
         let tokenizer = SanitizedTokenizer::from_file(
             &tokenizer_path,
             TokenizerConfig {
@@ -24701,8 +24714,11 @@ async fn ensure_profile_preload_ready(
     check_profile_model(&state, model, guard).await
 }
 
-// Both catalog installs and explicit preloads must grade the same sealed
-// subset through the production execution path, including worker placement.
+// Catalog installs and startup preloads must compare model output against the
+// same load-time fp32 reference inputs and expected outputs. These cases are
+// copied from bench/parity, checked by SHA-256 and embedded in synapse-certify.
+// Use the production execution path so validation exercises the same worker
+// and hardware routing as serving requests, not a separate implementation.
 async fn check_profile_model(
     state: &ModuleState,
     model: Arc<EmbeddingModel>,
@@ -25065,8 +25081,10 @@ async fn ensure_catalog_lane_ready_owned(
         loaded
     };
     if backend.profile.is_some() {
-        // Serving validates composed length before the shared profile check.
-        // An oversized first request must not compile even a self-check shape.
+        // Delay inference on the load-time reference cases until serving has
+        // counted the full model input, including special tokens. A request over
+        // 8192 tokens must be refused before compiling Neural Engine programs,
+        // even the programs for a short reference case.
         return Ok(model);
     }
     if projection["state"] == "passed" {

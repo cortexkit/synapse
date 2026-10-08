@@ -97,8 +97,10 @@ pub(crate) struct CatalogFile {
 pub(crate) struct CatalogBackend {
     pub backend: String,
     pub engine: String,
-    /// Profile-backed lanes use the manifest's package, grammar and sealed
-    /// parity references. Legacy Metal lanes keep their original identity.
+    /// A profile name selects the weight package and text-to-token rules in
+    /// bench/parity/models.json, plus fp32 reference inputs and expected outputs
+    /// checked by SHA-256. Metal entries without a profile keep their existing
+    /// fingerprint calculation to preserve consumers' model identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1796,8 +1798,10 @@ mod tests {
         assert_eq!(qwen_reranker.backends.len(), 1);
         assert_eq!(qwen_reranker.files.len(), 2);
         assert!(qwen_reranker.self_check.is_none());
-        // Profile-backed lanes reference the sealed corpus, not a duplicate
-        // list of scores or vectors in the browsing catalog.
+        // ANE backends check against fp32 reference inputs and expected outputs
+        // from bench/parity, using the SHA-256-checked selection embedded by the
+        // certifier. Require those references to load without keeping a second
+        // copy of their scores or vectors in the browsing catalog.
         for id in [
             "gte-modernbert-base",
             "qwen3-embedding-0.6b",
@@ -1838,8 +1842,10 @@ mod tests {
             "{missing}"
         );
         let extra = release_error(|doc| {
-            // Keep the extra entry schema-valid so this exercises the frozen
-            // id set, rather than the model-specific profile grammar guard.
+            // Copy an entry that passes the general catalog schema so this tests
+            // rejection of a model id outside the release's approved list. An
+            // entry with a manifest profile for another model would fail the
+            // profile-to-model consistency check before reaching that rejection.
             let mut copy = doc["models"][1].clone();
             copy["id"] = json!("minilm");
             copy["default_for_task"] = json!(false);

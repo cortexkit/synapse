@@ -1326,8 +1326,10 @@ mod fresh_process_hardware {
     #[ignore = "quiet-window Qwen capacity measurement with manifest-pinned packages"]
     fn fresh_process_qwen_single_shape_admission() {
         let mut load = [0.0; 3];
-        // A compile on a busy host is not evidence that a catalog ceiling fits
-        // the owner's quiet serving workload. Refuse instead of timing it.
+        // Run this capacity measurement only when the one-minute system load
+        // average is below 16, as required for hardware certification. Refuse
+        // before creating Neural Engine programs so a busy-host result is not
+        // reported as evidence measured under those conditions.
         assert_eq!(unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }, 3);
         println!("QWEN_SHAPE load_before={load:?}");
         assert!(load[0] < 16.0, "quiet-window load gate refused");

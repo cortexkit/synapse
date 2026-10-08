@@ -66,10 +66,13 @@ env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 ### 8192 capacity, before certification
 
-The configuration test can prepare digest-verified converted packages without
-using accelerators. It checks the original checkpoint and tokenizer pins and
-rebuilds each lane through both install configuration and certification preload
-configuration. The packages are ignored build artifacts, not alternate weights.
+The configuration test prepares the direct worker's converted weight packages
+without running inference on an accelerator. It checks SHA-256 checksums of the
+original model and tokenizer files, converts the weights using the rules in
+`bench/parity/models.json`, and checks each resulting package's recorded checksum.
+It also compares catalog installation settings with the startup-loading settings
+used for hardware certification. The saved packages are ignored build artifacts
+derived from those exact checkpoints, not replacement model checkpoints.
 
 ```sh
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -89,8 +92,11 @@ for model in qwen3-embedding-0.6b qwen3-reranker-0.6b; do
 done
 ```
 
-The probe records its starting load, compile/load milliseconds, final resident
-shape, and whether all 28 executables loaded. Each invocation is a fresh process.
+The probe records its starting load, time spent compiling and loading, which
+sequence length remains loaded, and whether all 28 Neural Engine programs can
+stay loaded together: one compiled program for each of Qwen's 28 transformer
+layers, for a single fixed sequence length. Each invocation starts a new process
+so it does not retain programs for sequence lengths tested earlier.
 If 8192 fails, stop the certification/benchmark sequence, and repeat the same
 probe separately with `ANE_TEST_SHAPE=4096`, then 2048, 1024, 512, 256, and 128
 as needed to identify the largest shape that loads. Keep the failure log as well
