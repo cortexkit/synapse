@@ -25,6 +25,22 @@ pub const MODULE_ID: &str = "synapse";
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Describe a child exit distinctly from a normal nonzero refusal status.
+pub fn describe_exit_status(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("killed by signal {signal}");
+        }
+    }
+
+    match status.code() {
+        Some(code) => format!("exited with status {code}"),
+        None => "terminated without an exit code".to_owned(),
+    }
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static TEST_ROOT_SWEEP: OnceLock<()> = OnceLock::new();
 
@@ -384,6 +400,22 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_status_description_distinguishes_exit_code_and_signal() {
+        let exited = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        assert_eq!(describe_exit_status(&exited), "exited with status 7");
+
+        let signaled = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -KILL $$"])
+            .status()
+            .unwrap();
+        assert_eq!(describe_exit_status(&signaled), "killed by signal 9");
+    }
 
     /// Open a directory handle that `set_times` can act on. On Windows a plain
     /// `File::open` of a directory fails with "Access is denied" twice over:

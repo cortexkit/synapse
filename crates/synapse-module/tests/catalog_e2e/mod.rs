@@ -1575,10 +1575,18 @@ async fn catalog_endpoint_with_path_refuses_module_start_by_name() {
         .await
         .expect("invalid endpoint must refuse startup")
         .unwrap();
-    assert!(!output.status.success());
+    let exit = super::common::describe_exit_status(&output.status);
+    assert!(
+        !output.status.success(),
+        "module unexpectedly accepted an invalid endpoint ({exit})"
+    );
+    assert!(
+        output.status.code().is_some(),
+        "invalid endpoint should be reported as a startup refusal, not {exit}"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("hf_endpoint"),
-        "{}",
+        "module startup refusal ({exit}); stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(server.paths().is_empty());

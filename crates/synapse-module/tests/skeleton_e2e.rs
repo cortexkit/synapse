@@ -16,9 +16,9 @@ use std::{
 
 use common::read_frame_timeout;
 use common::{
-    configure_test_module_command, connect_consumer, install_test_tracing, raw_route_frame,
-    route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute, MODULE_ID,
-    SETUP_TIMEOUT,
+    configure_test_module_command, connect_consumer, describe_exit_status, install_test_tracing,
+    raw_route_frame, route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute,
+    MODULE_ID, SETUP_TIMEOUT,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -434,10 +434,14 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
     drop(consumer);
     drop(daemon);
     daemon_runtime.shutdown_background();
-    let exited = tokio::time::timeout(Duration::from_secs(30), module.child.wait()).await;
+    let status = tokio::time::timeout(Duration::from_secs(30), module.child.wait())
+        .await
+        .expect("the module must exit once the daemon side of its connection is gone")
+        .expect("wait for module after daemon connection close");
     assert!(
-        exited.is_ok(),
-        "the module must exit once the daemon side of its connection is gone"
+        status.success(),
+        "module exited unexpectedly: {}",
+        describe_exit_status(&status)
     );
     let log = module_log_text(&data_home);
     assert!(
@@ -1004,7 +1008,12 @@ async fn job_resume_respawns_remote_job_and_pages_are_readable() {
         .kill()
         .await
         .expect("original module should stop");
-    let _ = module.child.wait().await;
+    let status = module.child.wait().await.expect("wait for stopped module");
+    assert!(
+        !status.success(),
+        "stopping the original module should terminate it: {}",
+        describe_exit_status(&status)
+    );
     sleep(Duration::from_millis(100)).await;
 
     let module = spawn_synapse_module_with_config(&daemon.connection_file_path, &config);
@@ -2670,7 +2679,12 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
     );
 
     let _ = module.child.start_kill();
-    let _ = module.child.wait().await;
+    let status = module.child.wait().await.expect("wait for stopped module");
+    assert!(
+        !status.success(),
+        "stopping the module should terminate it: {}",
+        describe_exit_status(&status)
+    );
     drop(consumer);
 
     // An omitted model routes to the catalog default, which this test expects to
@@ -2740,7 +2754,12 @@ async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
     certify_preloaded_models(&mut consumer, route, 130).await;
 
     let _ = module.child.start_kill();
-    let _ = module.child.wait().await;
+    let status = module.child.wait().await.expect("wait for stopped module");
+    assert!(
+        !status.success(),
+        "stopping the module should terminate it: {}",
+        describe_exit_status(&status)
+    );
     drop(consumer);
 
     let restarted = spawn_synapse_module_with_env(
@@ -3060,7 +3079,12 @@ async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succee
     }
 
     let _ = module.child.start_kill();
-    let _ = module.child.wait().await;
+    let status = module.child.wait().await.expect("wait for stopped module");
+    assert!(
+        !status.success(),
+        "stopping the module should terminate it: {}",
+        describe_exit_status(&status)
+    );
     drop(consumer);
 
     let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None, None, &[]);
