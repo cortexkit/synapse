@@ -4,6 +4,8 @@
 lose data, leak authority, or change a consumer's wire/vector-space contract.
 Each automated row names the exact test that must fail, and `expect_message`
 ties that failure to the intended property rather than an unrelated panic.
+Use a specific assertion message that is not also part of the test name: failure
+output includes the name, so matching the name can credit an unrelated error.
 Compilation errors and timeouts are not catches.
 
 ## Install and replay

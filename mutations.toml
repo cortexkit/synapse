@@ -232,10 +232,10 @@ build_timeout_s = 1800
 
 [[control]]
 id = "restore-approvals-disabled"
-guards = "Restoring an old capture cannot resurrect revoked serving approvals"
+guards = "Restore import cannot resurrect enabled approvals from a pre-revocation capture"
 file = "crates/synapse-module/src/store.rs"
-old = "row.state = ServingApprovalState::Disabled;"
-new = "/* NON-VACUITY BREAK: retain captured approval state */"
+old = "for mut row in approval_rows {"
+new = "for mut row in approval_rows.into_iter().take(0) { // NON-VACUITY BREAK: imported approvals retain captured authority"
 edits = []
 test_file = "crates/synapse-module/src/store.rs"
 runner = "nextest"
@@ -243,7 +243,7 @@ select = "expected"
 package = "synapse-module"
 target = "--lib"
 expect_red = ["store::tests::restore_import_forces_imported_approvals_disabled_preventing_resurrection"]
-expect_message = "disabled"
+expect_message = "approvals table row must be forced disabled on restore"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
@@ -343,7 +343,7 @@ hub_targets = ["synapse-module::skeleton_e2e"]
 package = "synapse-module"
 target = "--lib"
 expect_red = ["store::tests::quarantine_removes_the_blob_its_installs_members_and_pins_and_fails_holding_jobs"]
-expect_message = "assertion"
+expect_message = "freed_bytes: 4"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
