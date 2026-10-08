@@ -787,3 +787,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "wire-vector-field-doc-scan"
+guards = "Consumer documentation must retain every embed-vector field in the response contract"
+file = "docs/wire-contract-v1.md"
+old = "`vector`"
+new = "`retired_vector` <!-- NON-VACUITY BREAK -->"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::wire_contract_documents_every_embed_vector_field"]
+expect_message = "wire contract is missing embed vector field: vector"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
