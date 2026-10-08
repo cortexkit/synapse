@@ -906,3 +906,27 @@ build_timeout_s = 1800
 
 
 desk_only = "The owned-decode source scanner is compiled only on macOS; CI has no Apple SDK runner. Replay the planted spike reference on a Mac."
+
+[[control]]
+id = "owned-engine-metallib-path-source-scan"
+guards = "Owned decoder sources must embed their step metallibs rather than depend on a vanished build-tree path"
+file = "crates/synapse-engine-owned/owned-decode-engine/src/qwen3_decode_metal_step.rs"
+old = "use std::ffi::{c_char, c_void, CStr};"
+new = """
+use std::ffi::{c_char, c_void, CStr};
+const _: &str = "newLibraryWithFile"; // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-engine-owned/owned-decode-engine/src/qwen3_decode_metal_step.rs"
+runner = "cargo"
+package = "synapse-engine-owned"
+target = "--lib"
+select = "expected"
+expect_red = ["owned_decode_engine::qwen3_decode_metal_step::tests::engine_sources_do_not_load_a_metallib_from_a_path"]
+expect_message = "step metallibs must be embedded"
+only = false
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+
+desk_only = "The owned-decode metallib source scanner is compiled only on macOS; CI has no Apple SDK runner. Replay the planted disk-loader spelling on a Mac."
