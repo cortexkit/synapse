@@ -850,6 +850,9 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["scripts.test_mutation_ci.MutationCiTests.test_touched_rows_are_required"]
 expect_message = "touched mutation replay must be unconditional"
 only = false
+# The precondition checker is a bash script that CI runs only on Linux; on a
+# Windows runner the test's `bash` call does not reach it.
+platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
