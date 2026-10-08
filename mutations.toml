@@ -431,3 +431,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "certify-validator-drop-boundary"
+guards = "The offline validator recomputes the same strict latency boundary instead of trusting a drop status"
+file = "crates/synapse-certify/src/lib.rs"
+old = ".gt(&3.0)"
+new = ".ge(&3.0) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-certify/tests/records.rs"
+runner = "cargo"
+package = "synapse-certify"
+target = "--test records"
+select = "expected"
+expect_red = ["drop_recomputation_is_strict_and_cause_agnostic"]
+expect_message = "validate(&records, &assets.0).is_err()"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
