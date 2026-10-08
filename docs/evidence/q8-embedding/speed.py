@@ -168,8 +168,14 @@ class Llama:
             self.process.close()
             raise
 
+    def validate_fixture(self, fixtures):
+        for text, ids in fixtures:
+            observed = http(self.url + "/tokenize", {"content": text, "add_special": True})
+            if observed["tokens"] != ids:
+                raise ValueError("llama.cpp tokenizer/EOS policy differs from the common fixture")
+
     def request(self, texts, ids, key):
-        result = http(self.url + "/v1/embeddings", {"input": ids, "model": "qwen", "encoding_format": "float"})
+        result = http(self.url + "/v1/embeddings", {"input": texts, "model": "qwen", "encoding_format": "float"})
         data = sorted(result["data"], key=lambda x: x["index"])
         if [x["index"] for x in data] != list(range(len(texts))):
             raise ValueError("llama-server returned incomplete row indices")
@@ -278,6 +284,8 @@ def measure(client, fixtures, key):
 
 def sweep(client, tokenizer, length, batch, repeats, nonce):
     fixture = [synthetic(tokenizer, length, i) for i in range(batch)]
+    if isinstance(client, Llama):
+        client.validate_fixture(fixture)
     measure(client, fixture, nonce + "-warmup")
     samples = [measure(client, fixture, nonce + f"-{i}") for i in range(repeats)]
     return {"samples": samples, "median_rows_per_min": statistics.median(60 * x["rows"] / x["elapsed_s"] for x in samples),
@@ -289,6 +297,8 @@ def sweep(client, tokenizer, length, batch, repeats, nonce):
 def fill(client, tokenizer, seconds, nonce):
     # Two sustained callers, 64 rows/call. Build fixtures before starting timers.
     fixture = [synthetic(tokenizer, 100 + i % 51, i) for i in range(64)]
+    if isinstance(client, Llama):
+        client.validate_fixture(fixture)
     measure(client, fixture, nonce + "-warmup")
     stop = threading.Event()
     started = time.monotonic()
@@ -365,6 +375,8 @@ def main():
                                      ("llama_server", "synapse_binary", "subc_call", "f16_gguf", "q8_gguf")}
         if report["artifact_sha256"]["q8_gguf"] != "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439":
             raise ValueError("Not the consumer's exact Qwen Q8_0 GGUF")
+        if report["artifact_sha256"]["f16_gguf"] != "421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340":
+            raise ValueError("Not the pinned consumer-repository f16 GGUF")
         root = Path(__file__).resolve().parents[3]
         entry = json.loads((root / "bench/parity/models.json").read_text())["models"]["qwen3-embedding-0.6b"]
         for filename, expected in entry["files"].items():
@@ -416,7 +428,8 @@ def main():
             row.get("rows_per_min", row.get("median_rows_per_min")) for row in rows),
             "latency_p50_s": statistics.median(row["latency_p50_s"] for row in rows),
             "latency_p90_s": statistics.median(row["latency_p90_s"] for row in rows),
-            "max_rss_bytes": max(row["memory"]["max_rss_bytes"] for row in rows)} for k, rows in groups.items()}
+            "max_rss_bytes": max(row["memory"]["max_rss_bytes"] for row in rows),
+            "peak_footprint_bytes": max(row["memory"].get("peak_footprint_bytes", 0) for row in rows) or None} for k, rows in groups.items()}
         report["status"] = "completed"
     except NotQuiet as e:
         report["status"] = "deferred-high-load"

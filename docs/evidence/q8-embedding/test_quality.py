@@ -1,10 +1,11 @@
 """Small public controls: the expected results do not use the measured formulas."""
+import json
 import unittest
 
 import numpy as np
 import torch
 
-from quality import W8A8Linear, channel_int8, gguf_name, int8_dot, overlap, q8_0, rankings, tau
+from quality import W8A8Linear, aggregate, channel_int8, gguf_name, int8_dot, overlap, q8_0, rankings, tau
 
 
 class QuantizationTests(unittest.TestCase):
@@ -86,8 +87,23 @@ class MetricTests(unittest.TestCase):
 
     def test_tau_complete_orders_and_small_pools(self):
         self.assertEqual(tau([0, 1, 2], [2, 1, 0]), -1)
-        self.assertAlmostEqual(tau([0, 1, 2], [0, 2, 1]), 1 / 3)
+        value = tau([0, 1, 2], [0, 2, 1])
+        assert value is not None
+        self.assertAlmostEqual(value, 1 / 3)
         self.assertIsNone(tau([0], [0]))
+
+    def test_aggregate_exports_only_aggregates(self):
+        pools = [{"tool": tool, "query": "PRIVATE_QUERY_SENTINEL",
+                  "candidates": [{"id": "PRIVATE_ID_A", "text": "PRIVATE_DOCUMENT_SENTINEL"},
+                                 {"id": "PRIVATE_ID_B", "text": "PRIVATE_DOCUMENT_SENTINEL"}],
+                  "sol": [["PRIVATE_ID_A"], ["PRIVATE_ID_B"]],
+                  "presentations": [["a", "b"], ["b", "a"]]} for tool in ("aft", "ctx")]
+        vectors = np.array([[1., 0.], [1., 0.], [0., 1.]], dtype=np.float32)
+        result = aggregate({"fp32": vectors, "f16": vectors}, pools, [(0, [1, 2])] * 2)
+        self.assertNotIn("PRIVATE_", json.dumps(result))
+        self.assertEqual(result["aft"]["queries"], 1)
+        self.assertEqual(result["aft"]["schemes"]["f16"]["sol_overlap10"]["mean"], 1)
+        self.assertEqual(result["ctx"]["sol_repeat_queries"], 1)
 
     def test_tied_scores_preserve_baseline_identity_order(self):
         pools = [{"candidates": [{"id": "z"}, {"id": "a"}]}]

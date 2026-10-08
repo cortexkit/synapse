@@ -1,13 +1,9 @@
 """Serving-harness controls without calling the live or scratch inference service."""
-import argparse
-import json
-import os
 import platform
 import tempfile
-import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import speed
 
@@ -35,7 +31,7 @@ class SpeedTests(unittest.TestCase):
             self.assertEqual(speed.quiet_load(), 15.999)
 
     def test_busy_request_is_not_sent(self):
-        client = unittest.mock.Mock()
+        client = Mock()
         with patch("speed.os.getloadavg", return_value=(20., 1., 1.)):
             with self.assertRaises(speed.NotQuiet):
                 speed.measure(client, [("public", [1])], "public-key")
@@ -63,16 +59,24 @@ class SpeedTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 speed.valid_vectors(bad, 1)
 
-    def test_llama_ids_and_completed_tokens(self):
+    def test_llama_text_and_completed_tokens(self):
         client = speed.Llama.__new__(speed.Llama)
         client.url = "http://127.0.0.1:1"
         reply = {"data": [{"index": 0, "embedding": vector()}], "usage": {"prompt_tokens": 2}}
         with patch("speed.http", return_value=reply) as request:
             client.request(["public"], [[1, 2]], "unused")
-            self.assertEqual(request.call_args[0][1]["input"], [[1, 2]])
+            self.assertEqual(request.call_args[0][1]["input"], ["public"])
         reply["usage"]["prompt_tokens"] = 1
         with patch("speed.http", return_value=reply), self.assertRaises(ValueError):
             client.request(["public"], [[1, 2]], "unused")
+
+    def test_llama_tokenizer_matches_eos_grammar(self):
+        client = speed.Llama.__new__(speed.Llama)
+        client.url = "http://127.0.0.1:1"
+        with patch("speed.http", return_value={"tokens": [1, 2]}):
+            client.validate_fixture([("public", [1, 2])])
+            with self.assertRaises(ValueError):
+                client.validate_fixture([("public", [1, 3])])
 
     def test_synapse_reads_every_job_page_by_id(self):
         client = speed.Synapse.__new__(speed.Synapse)

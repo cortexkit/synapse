@@ -16,6 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -68,7 +69,7 @@ def int8_dot(a, b):
     This simulates integer arithmetic, not the speed of a native int8 kernel.
     """
     if a.device.type == "cpu":
-        return torch._int_mm(a.contiguous(), b.contiguous())
+        return a.to(torch.int32) @ b.to(torch.int32)
     acc = torch.zeros((a.shape[0], b.shape[1]), device=a.device, dtype=torch.int32)
     for start in range(0, a.shape[1], 512):
         partial = a[:, start:start + 512].float() @ b[start:start + 512].float()
@@ -123,6 +124,8 @@ def install_scheme(model, scheme, gguf_path=None):
     audit = {"matrix_parameters": 0, "linear_layers": 0}
     tensors = {}
     if scheme == "gguf":
+        if gguf_path is None:
+            raise ValueError("Real-GGUF arm requires the consumer artifact")
         from gguf import GGUFReader
         tensors = {t.name: t for t in GGUFReader(gguf_path).tensors}
     with torch.no_grad():
@@ -326,7 +329,8 @@ def aggregate(vectors, pools, indexes):
                        for j in (0, 1)] for i in selected]
         noise = [abs(base_judge[k][0] - base_judge[k][1]) for k in range(len(selected))]
         repeat = [overlap(pools[i]["sol"][1], pools[i]["sol"][0], len(pools[i]["candidates"]))
-                  for i in selected if pools[i]["presentations"][0] != pools[i]["presentations"][1]]
+                  for i in selected if not (len(pools[i]["candidates"]) == 2
+                      and pools[i]["presentations"][0] == pools[i]["presentations"][1])]
         group = {"queries": len(selected), "cosine_unique_vectors": len(unique),
                  "sol_B_vs_A_overlap": float(np.mean(repeat)), "sol_repeat_queries": len(repeat),
                  "f16_judge_mean_abs_A_B": float(np.mean(noise)), "schemes": {}}
@@ -334,7 +338,7 @@ def aggregate(vectors, pools, indexes):
             # Normalize again in float64 to avoid measuring f32 norm-roundoff as quantization loss.
             x, y = v[unique].astype(np.float64), vectors["fp32"][unique].astype(np.float64)
             cos = np.sum(x * y, axis=1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1))
-            stats = {"cosine_fp32": dict(zip(("min", "p1", "p50"), np.quantile(cos, [0, .01, .5]).tolist()))}
+            stats: dict[str, Any] = {"cosine_fp32": dict(zip(("min", "p1", "p50"), np.quantile(cos, [0, .01, .5]).tolist()))}
             for ref in ("fp32", "f16"):
                 ov = [overlap(orders[s][i], orders[ref][i], len(orders[s][i])) for i in selected]
                 ts = [tau(orders[s][i], orders[ref][i]) for i in selected]
@@ -374,7 +378,8 @@ def main():
     pools = load_pools(args.data_root)
     manifest = json.loads((ROOT / "bench/parity/models.json").read_text())["models"]
     from huggingface_hub import snapshot_download, hf_hub_download
-    report = {"versions": {p: importlib.metadata.version(p) for p in ("torch", "transformers", "numpy", "gguf")},
+    report = {"runner_sha256": digest(Path(__file__)),
+              "versions": {p: importlib.metadata.version(p) for p in ("torch", "transformers", "numpy", "gguf")},
               "device": args.device, "cpu_threads": 4, "max_length": args.max_length,
               "batch_size": args.batch_size, "task": args.task, "models": {}}
     for slug in args.models:
@@ -390,10 +395,21 @@ def main():
                                              "Qwen3-Embedding-0.6B-Q8_0.gguf",
                                              revision="370f27d7550e0def9b39c1f16d3fbaa13aa67728",
                                              local_files_only=not args.allow_download))
-        tokenizer = AutoTokenizer.from_pretrained(snapshot)
+        # The manifest, not optional tokenizer_config fields, owns the grammar.
+        # ModernBERT's pinned tokenizer has the specials in its vocabulary and
+        # postprocessor but does not name their Python tokenizer attributes.
+        grammar = entry["grammar"]
+        specials = {f"{name}_token": token["text"] for name, token in grammar["special_tokens"].items()}
+        tokenizer = AutoTokenizer.from_pretrained(snapshot, pad_token=grammar["pad"]["text"], **specials)
+        if tokenizer.pad_token_id != grammar["pad"]["id"] or any(
+            getattr(tokenizer, f"{name}_token_id") != token["id"]
+            for name, token in grammar["special_tokens"].items()
+        ):
+            raise ValueError("Tokenizer special IDs do not match the pinned grammar")
         seqs, indexes, counts = prepare(pools, tokenizer, slug, args.max_length, args.task)
         signature = hashlib.sha256(json.dumps([seqs, args.device, args.batch_size,
-                                               report["versions"], entry["hf_revision"]]).encode()).hexdigest()
+                                               report["versions"], entry["hf_revision"],
+                                               digest(Path(__file__))]).encode()).hexdigest()
         vectors, runs = {}, {}
         for scheme in args.schemes:
             if scheme == "gguf" and not slug.startswith("qwen"):
