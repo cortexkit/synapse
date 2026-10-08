@@ -532,3 +532,23 @@ platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "residency-no-refund-before-exit"
+guards = "An unconfirmed owner exit leaves reservations charged and forbids a replacement worker"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = 'tokio::time::timeout(self.owner_exit_timeout,old.confirm_exit).await.map_err(|_|AneResidencyError::Channel("owner exit confirmation deadline exceeded; ownership remains closed".into()))??;'
+new = "drop(old.confirm_exit); // NON-VACUITY BREAK: exit not confirmed"
+edits = []
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::exit_confirmation_timeout_retains_reservations_and_never_spawns_replacement"]
+expect_message = "assertion failed: !tokio::time::timeout"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
