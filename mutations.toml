@@ -613,3 +613,22 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "readme-production-inventory-scan"
+guards = "A newly shipped production crate cannot be silently omitted from the documented workspace inventory"
+file = "README.md"
+old = "- `synapse-opctl`:"
+new = "- synapse-opctl: <!-- NON-VACUITY BREAK -->"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::readme_lists_every_workspace_production_crate"]
+expect_message = "README production-crate list is missing workspace members"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
