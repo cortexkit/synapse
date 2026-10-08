@@ -22434,6 +22434,39 @@ mod catalog_runtime_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Every lane the release catalog can install must satisfy what its engine
+    /// and its clients require, on any host: the engine's artifact format, and
+    /// batch advice in `models.list` (clients size their calls from it and
+    /// refuse a lane without it). Both broke the first live install of the
+    /// direct-ANE lane, and no hardware test exercised that path.
+    #[test]
+    fn every_release_catalog_lane_meets_its_engine_and_client_contract() {
+        let (root, state) = isolated_catalog_state("catalog-client-contract", true);
+        let mut lanes = 0;
+        for entry in &state.runtime.release_catalog.models {
+            for backend in &entry.backends {
+                let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+                let lane = catalog::lane_id(&entry.id, &backend.backend);
+                assert_eq!(
+                    spec.artifact_format,
+                    default_artifact_format(&spec.engine),
+                    "{lane}: engine {} receives the wrong artifact format",
+                    spec.engine
+                );
+                let advice = recommended_batch_for_engine(&spec.engine, spec.max_tokens)
+                    .unwrap_or_else(|| {
+                        panic!("{lane}: engine {} has no batch advice", spec.engine)
+                    });
+                assert!(advice.rows > 0 && advice.token_budget > 0, "{lane}");
+                lanes += 1;
+            }
+        }
+        // Fails if the catalog shrinks to nothing and the loop proves nothing.
+        assert!(lanes >= 6, "only {lanes} catalog lanes checked");
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn catalog_ane_specs_use_manifest_preload_identity_and_package() {
         let (root, state) = isolated_catalog_state("ane-specs", true);
