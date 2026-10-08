@@ -588,7 +588,7 @@ async fn catalog_semantic_refusals_match_golden_and_never_fetch() {
     assert_eq!(unload["error"]["code"], "invalid_request");
     assert_eq!(
         unload["error"]["details"]["lane_ids"],
-        serde_json::json!(["gte-modernbert-base-metal"])
+        serde_json::json!(["gte-modernbert-base-metal", "gte-modernbert-base-ane"])
     );
     assert!(h.server.paths().is_empty());
     h.assert_clean();
@@ -692,32 +692,42 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
         );
         assert_eq!(row["install_state"], "not_installed");
         if row["id"] == "qwen3-reranker-0.6b" {
-            assert_eq!(row["backends"], serde_json::json!([]));
-            assert_eq!(row["download_bytes"], 0);
             assert_eq!(
                 row["upstream"]["revision"],
                 "e61197ed45024b0ed8a2d74b80b4d909f1255473"
             );
-        } else {
-            assert_eq!(row["backends"].as_array().unwrap().len(), 1);
-            let backend = &row["backends"][0];
-            assert_eq!(backend["backend"], "metal");
+        }
+        // Every declared backend is listed in catalog order. This module only
+        // declares Metal runnable, so Metal lanes are runnable and ANE lanes
+        // are listed with the reason they can't run here.
+        let listed = row["backends"].as_array().unwrap();
+        let declared = entry["backends"].as_array().unwrap();
+        assert_eq!(listed.len(), declared.len(), "{}", row["id"]);
+        for (backend, declared) in listed.iter().zip(declared) {
+            let name = declared["backend"].as_str().unwrap();
+            assert_eq!(backend["backend"], name);
             assert_eq!(
                 backend["lane_id"],
-                format!("{}-metal", row["id"].as_str().unwrap())
+                format!("{}-{name}", row["id"].as_str().unwrap())
             );
-            assert_eq!(backend["fingerprint"], entry["backends"][0]["fingerprint"]);
-            assert_eq!(backend["runnable"], true);
+            assert_eq!(backend["fingerprint"], declared["fingerprint"]);
+            assert_eq!(backend["runnable"], name == "metal");
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["self_check"], Value::Null);
-            let total: u64 = entry["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| f["size_bytes"].as_u64().unwrap())
-                .sum();
-            assert_eq!(row["download_bytes"], total);
         }
+        // Download bytes count only files a runnable backend would fetch.
+        let total: u64 = entry["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f["backends"]
+                    .as_array()
+                    .is_none_or(|backends| backends.iter().any(|b| b == "metal"))
+            })
+            .map(|f| f["size_bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(row["download_bytes"], total, "{}", row["id"]);
     }
     assert_eq!(
         rows[1]["upstream"]["revision"],
@@ -1052,6 +1062,25 @@ async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
         serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
     let mut entry = catalog["models"][0].clone();
     entry["id"] = "resolver-fixture".into();
+    // Start from the Metal lane alone. The real entry also declares an ANE
+    // lane whose profile names the real model id, which would not validate
+    // under this fixture's renamed id; the test adds its own synthetic ANE
+    // backend below.
+    entry["backends"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|backend| backend["backend"] == "metal");
+    let files = entry["files"].as_array_mut().unwrap();
+    files.retain(|file| {
+        file["backends"]
+            .as_array()
+            .is_none_or(|backends| backends.iter().any(|backend| backend == "metal"))
+    });
+    for file in files.iter_mut() {
+        if file["backends"].is_array() {
+            file["backends"] = serde_json::json!(["metal"]);
+        }
+    }
     for file in entry["files"].as_array_mut().unwrap() {
         file["sha256"] = catalog_sha256(BODY).into();
         file["size_bytes"] = BODY.len().into();
@@ -1768,14 +1797,14 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
         for backend in entry["backends"].as_array().unwrap() {
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["runnable"], false);
-            assert_eq!(
-                backend["reason"],
-                if cfg!(target_os = "macos") {
-                    "device_missing"
-                } else {
-                    "not_supported_on_platform"
-                }
-            );
+            // On macOS, Metal needs a GPU device; the ANE lane needs the
+            // direct Neural Engine worker binary.
+            let expected = match (cfg!(target_os = "macos"), backend["backend"].as_str()) {
+                (false, _) => "not_supported_on_platform",
+                (true, Some("ane")) => "worker_missing",
+                (true, _) => "device_missing",
+            };
+            assert_eq!(backend["reason"], expected, "{}", backend["lane_id"]);
         }
     }
     let refused = h.download("gte-modernbert-base", "unavailable").await;
@@ -1912,6 +1941,22 @@ async fn catalog_shared_member_keeps_derived_packages_until_last_root_is_removed
     let mut catalog: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let mut shared = catalog["models"][0].clone();
     shared["id"] = "shared-package".into();
+    // Share the Metal lane's files only. The real entry's ANE lane names the
+    // real model id in its profile, which won't validate under this new id.
+    shared["backends"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|backend| backend["backend"] == "metal");
+    shared["files"].as_array_mut().unwrap().retain(|file| {
+        file["backends"]
+            .as_array()
+            .is_none_or(|backends| backends.iter().any(|backend| backend == "metal"))
+    });
+    for file in shared["files"].as_array_mut().unwrap() {
+        if file["backends"].is_array() {
+            file["backends"] = serde_json::json!(["metal"]);
+        }
+    }
     shared["default_for_task"] = false.into();
     catalog["models"].as_array_mut().unwrap().push(shared);
     std::fs::write(&path, catalog.to_string()).unwrap();
