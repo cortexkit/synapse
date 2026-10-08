@@ -389,3 +389,26 @@ platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "admission-quarantine-wall-clock"
+guards = "The real routing precheck must release expired quarantine and retain active quarantine"
+file = "crates/synapse-module/src/lib.rs"
+old = """
+budget.is_quarantined(&key, now_ms())
+}"""
+new = """
+budget.is_quarantined(&key, 0) // NON-VACUITY BREAK
+}"""
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::owned_decode_quarantine_routing_precheck_reads_wall_clock"]
+expect_message = "routing must release an expired quarantine"
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
