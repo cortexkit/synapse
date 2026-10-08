@@ -602,9 +602,7 @@ async fn observe(
                 "processed"
             }
             .into(),
-            truncated: response["payload"]["truncation_disclosures"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| item["truncated"] == true)),
+            truncated: any_truncated(&response),
             diverted: !response["job_id"].is_null(),
             worker_requests: long_request_count,
         },
@@ -698,12 +696,25 @@ async fn observe(
         raw_series,
     })
 }
+// `Session::request` returns the unwrapped `result`, so an embed or rerank
+// reply carries `vectors` or `scores` and `truncation_disclosures` at its top
+// level; there is no `payload` envelope.
+fn inference_succeeded(response: &Value) -> bool {
+    response["error"].is_null() && (response["vectors"].is_array() || response["scores"].is_array())
+}
+
+fn any_truncated(response: &Value) -> bool {
+    response["truncation_disclosures"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["truncated"] == true))
+}
+
 async fn latency_series(session: &mut Session, method: &str, params: Value) -> Result<Vec<f64>> {
     let mut samples = Vec::with_capacity(23);
     for _ in 0..23 {
         let started = std::time::Instant::now();
         let response = session.request(method, params.clone()).await?;
-        if !response["error"].is_null() || response["payload"].is_null() {
+        if !inference_succeeded(&response) {
             return Err(refuse(format!("latency inference failed: {response}")));
         }
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
@@ -845,6 +856,25 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shapes copied from real module replies captured during an ane-m5 run.
+    #[test]
+    fn module_replies_are_read_at_their_top_level() {
+        let embed = json!({"dims": 2, "vectors": [[0.6, 0.8]],
+            "truncation_disclosures": [{"effective_tokens": 512, "submitted_tokens": 512, "truncated": false}]});
+        let rerank = json!({"dims": 1, "scores": [0.99],
+            "truncation_disclosures": [{"truncated": false}, {"truncated": false}]});
+        assert!(inference_succeeded(&embed));
+        assert!(inference_succeeded(&rerank));
+        assert!(!inference_succeeded(
+            &json!({"error": {"code": "sequence_too_long"}})
+        ));
+        assert!(!inference_succeeded(&json!({"dims": 2})));
+        assert!(!any_truncated(&embed));
+        let mut cut = rerank.clone();
+        cut["truncation_disclosures"][1]["truncated"] = json!(true);
+        assert!(any_truncated(&cut));
+    }
 
     #[test]
     fn development_aliases_preserve_attested_binary_identity() {
