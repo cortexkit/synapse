@@ -112,32 +112,57 @@ pub fn main() -> Result<()> {
     request_loop(&mut stream, ack.max_frame, private_api)
 }
 fn watch_supervisor(stream: std::os::unix::net::UnixStream) {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     // stdin is the inherited lane lock. Never replace or close it. A separate
     // socket watcher detects disconnects even while a graph is compiling/running.
-    std::thread::spawn(move || loop {
-        let mut byte = 0u8;
-        let n = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if n == 0 {
+    std::thread::spawn(move || {
+        let queue = unsafe { libc::kqueue() };
+        if queue < 0 {
             std::process::exit(0);
         }
-        if n < 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        let mut event = libc::kevent {
+            ident: stream.as_raw_fd() as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_ENABLE,
+            // Request bytes belong to the request loop. A high low-water mark
+            // suppresses data-ready wakeups; EV_EOF still arrives immediately,
+            // including when the owner dies with an unread request queued.
+            fflags: libc::NOTE_LOWAT,
+            data: libc::c_int::MAX as libc::intptr_t,
+            udata: std::ptr::null_mut(),
+        };
+        if unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            std::process::exit(0);
+        }
+        loop {
+            let ready = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    std::ptr::null(),
+                )
+            };
+            if ready > 0 && event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0 {
+                std::process::exit(0);
+            }
+            if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 std::process::exit(0);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     });
 }
 fn error(req_id: Option<String>, message: &str) -> WorkerResponse {
@@ -474,5 +499,145 @@ mod tests {
         assert!(
             matches!(response, WorkerResponse::Err { code, .. } if code == "ane_private_api_unavailable")
         );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::watch_supervisor;
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore = "subprocess helper for supervisor lifetime tests"]
+    fn supervisor_watch_child() {
+        let path = std::env::var_os("SYNAPSE_SUPERVISOR_TEST_SOCKET").unwrap();
+        let mut stream = UnixStream::connect(path).unwrap();
+        watch_supervisor(stream.try_clone().unwrap());
+        stream.write_all(b"ready").unwrap();
+        // Keep the request thread busy independently of the socket, just as
+        // native compilation does. Only the watcher can terminate this child.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            info: *mut libc::c_void,
+        ) -> libc::c_int;
+        fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
+    }
+
+    fn process_cpu_seconds(pid: u32) -> f64 {
+        // RUSAGE_INFO_V0 starts with a 16-byte UUID and user/system CPU ticks.
+        // CPU ticks use the Mach timebase, not nanoseconds on Apple Silicon.
+        let mut info = [0_u64; 12];
+        let mut timebase = Timebase { numer: 0, denom: 0 };
+        unsafe {
+            assert_eq!(
+                proc_pid_rusage(pid as libc::c_int, 0, info.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(mach_timebase_info(&mut timebase), 0);
+        }
+        (info[2] + info[3]) as f64 * timebase.numer as f64 / timebase.denom as f64 / 1e9
+    }
+
+    fn assert_idle_cpu(child: &mut Child, phase: &str) {
+        let before = process_cpu_seconds(child.id());
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "watcher exited while owner was alive"
+        );
+        let cpu = process_cpu_seconds(child.id()) - before;
+        eprintln!("supervisor {phase}: cumulative CPU {cpu:.6}s over 2s wall");
+        assert!(
+            cpu < 0.05,
+            "supervisor {phase} spun: {cpu:.6}s CPU over 2s wall"
+        );
+    }
+
+    #[test]
+    fn supervisor_wait_blocks_with_pending_bytes_and_detects_owner_death() {
+        // A short socket path also works when Cargo runs from a long worktree.
+        let path = std::env::temp_dir().join(format!("ane-supervisor-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "worker::supervisor_tests::supervisor_watch_child",
+                    "--ignored",
+                ])
+                .env("SYNAPSE_SUPERVISOR_TEST_SOCKET", &path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "watcher helper exited before connecting"
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "watcher helper did not connect"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept watcher helper: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut ready = [0; 5];
+        stream.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        assert_idle_cpu(&mut child.0, "idle");
+        stream.write_all(b"queued request while compiling").unwrap();
+        assert_idle_cpu(&mut child.0, "pending request");
+        let disconnected = Instant::now();
+        drop(stream);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                disconnected.elapsed() < Duration::from_secs(1),
+                "owner death did not interrupt busy worker promptly"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        eprintln!("supervisor owner-death exit: {:?}", disconnected.elapsed());
+        assert!(status.success(), "watcher helper failed: {status}");
+        std::fs::remove_file(path).unwrap();
     }
 }
