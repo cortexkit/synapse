@@ -151,10 +151,13 @@ message. A failed download carries `error` beside `state` in its flat status.
   sequence shape the first time it is used (tens of seconds) and cannot run any
   inference while it compiles. A request waits through a compile as long as its
   own deadline allows; this code is returned only when that deadline expires
-  while the request is blocked on a compile, either of the shape it needs
-  (several requests share one compile) or of another shape occupying the
-  lane's worker. `details`: `{lane_id, shape}`, where `shape` is the shape being
-  compiled. Waits that expire on anything else keep `deadline_exceeded`.
+  while the request is blocked on a compile: either the shape it needs is
+  being compiled (several requests share one compile), or it was waiting for
+  the lane's worker while another shape's compile occupied it at some point of
+  that wait. When the module can no longer tell (more than 16 compiles since
+  the wait began), it answers `shape_compiling`. `details`: `{lane_id, shape}`,
+  where `shape` is the shape being compiled. Waits that expire on anything else
+  keep `deadline_exceeded`.
   **Consumer disposition:** the model is loaded; retry after `retry_after_ms`.
   The compile continues without the request, so a retry joins it or finds the
   shape ready. A deadline that covers a first-time compile (about 30 s) avoids

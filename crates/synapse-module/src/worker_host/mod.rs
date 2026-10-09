@@ -3460,9 +3460,10 @@ pub mod ane_residency {
         /// request or by another one it joined; counted from the moment the
         /// shape's slot enters `Admitting`.
         Compile(usize),
-        /// Waiting for the worker stream; a compile only if an admit exchange
-        /// holds the stream when the wait expires.
-        Stream,
+        /// Waiting for the worker stream since the given instant. The wait was
+        /// on a compile if an admit exchange held the stream at any moment
+        /// between that instant and the deadline.
+        Stream(tokio::time::Instant),
         /// The deadline already expired; `Some(shape)` means on a compile.
         Expired(Option<usize>),
     }
@@ -3609,6 +3610,11 @@ pub mod ane_residency {
     pub trait AneShapeWorker: Send + Sync {
         /// Stable id of this worker; shapes are dropped per worker on restart.
         fn worker_id(&self) -> &str;
+        /// The test hold on expired-wait classification for this worker.
+        #[cfg(test)]
+        fn classify_gate(&self) -> Option<Arc<ClassifyGate>> {
+            None
+        }
         /// Identifies the owning process, not just the stable worker name.
         fn generation(&self) -> u64 {
             0
@@ -4165,6 +4171,8 @@ pub mod ane_residency {
             loop {
                 if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
+                    #[cfg(test)]
+                    pass_worker_gate(worker).await;
                     return Err(lease_deadline_expired());
                 }
                 // Register for wakeups before reading the state, so a change
@@ -4221,6 +4229,8 @@ pub mod ane_residency {
                             if request_deadline
                                 .is_some_and(|request| tokio::time::Instant::now() >= request)
                             {
+                                #[cfg(test)]
+                                pass_worker_gate(worker).await;
                                 return Err(deadline_expired(compiling));
                             }
                             return Err(resource_refusal(AneResidencyError::Channel(
@@ -4847,42 +4857,188 @@ pub mod ane_residency {
         }
     }
 
-    /// Which exchange holds the worker stream (an admission compiling a shape,
-    /// or anything else) and when the last holder released it. Used to tell
-    /// whether an expired stream wait was waiting behind a compile.
+    /// Where a test may hold an expired wait before it is classified.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum GateSite {
+        /// The caller of `infer_permitted`, after its own timer expired.
+        Caller,
+        /// The serving task's own lease, stream or permit wait.
+        Inner,
+    }
+
+    /// Holds expired waits at each `GateSite` until the test releases it, and
+    /// counts how many have arrived there.
+    #[cfg(test)]
+    struct ClassifyGate {
+        arrived: [AtomicU64; 2],
+        changed: Notify,
+        open: [tokio::sync::Semaphore; 2],
+    }
+
+    #[cfg(test)]
+    impl ClassifyGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                arrived: [AtomicU64::new(0), AtomicU64::new(0)],
+                changed: Notify::new(),
+                open: [
+                    tokio::sync::Semaphore::new(0),
+                    tokio::sync::Semaphore::new(0),
+                ],
+            })
+        }
+
+        fn index(site: GateSite) -> usize {
+            match site {
+                GateSite::Caller => 0,
+                GateSite::Inner => 1,
+            }
+        }
+
+        async fn pass(&self, site: GateSite) {
+            self.arrived[Self::index(site)].fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+            // Closed means released: every waiter at this site proceeds.
+            let _ = self.open[Self::index(site)].acquire().await;
+        }
+
+        /// Lets every wait held (now or later) at `site` be classified.
+        fn release(&self, site: GateSite) {
+            self.open[Self::index(site)].close();
+        }
+
+        /// Waits until at least `count` expired waits have reached `site`.
+        async fn reached(&self, site: GateSite, count: u64) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.arrived[Self::index(site)].load(Ordering::SeqCst) >= count {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn pass_worker_gate(worker: &Arc<dyn AneShapeWorker>) {
+        if let Some(gate) = worker.classify_gate() {
+            gate.pass(GateSite::Inner).await;
+        }
+    }
+
+    /// Admission exchanges kept in a channel's history. Admits are rare and
+    /// each holds the stream for a whole compile, so 16 covers far more than
+    /// any request's stream wait in practice.
+    const ADMIT_HISTORY: usize = 16;
+
+    /// One admission exchange's hold on the worker stream.
+    #[derive(Clone, Copy, Debug)]
+    struct AdmitHold {
+        id: u64,
+        shape: usize,
+        start: tokio::time::Instant,
+        /// `None` while the admit still holds the stream.
+        end: Option<tokio::time::Instant>,
+    }
+
+    /// When admission (compile) exchanges held the worker stream, so a stream
+    /// wait that expires can be classified by what it actually waited behind.
     #[derive(Default)]
     struct StreamHolder {
-        /// The shape an admission (compile) exchange holding the stream is
-        /// compiling.
+        /// The shape an admission exchange holding the stream now is compiling.
         compiling: Option<usize>,
-        /// When the last exchange released the stream, and the shape it was
-        /// compiling if it was an admission.
-        last_release: Option<(tokio::time::Instant, Option<usize>)>,
+        /// The most recent admit holds, oldest first; at most `ADMIT_HISTORY`.
+        admits: VecDeque<AdmitHold>,
+        /// The latest end, and its shape, among holds already dropped from
+        /// `admits`. A wait that began before this instant may have overlapped
+        /// a forgotten hold.
+        forgotten: Option<(tokio::time::Instant, usize)>,
+        next_id: u64,
+    }
+
+    impl StreamHolder {
+        /// Records an admit that took the stream at `start`.
+        fn begin_admit(&mut self, shape: usize, start: tokio::time::Instant) -> u64 {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.admits.push_back(AdmitHold {
+                id,
+                shape,
+                start,
+                end: None,
+            });
+            if self.admits.len() > ADMIT_HISTORY {
+                // Only the newest hold can still be open: the stream has one
+                // holder at a time, so the dropped hold has ended.
+                if let Some(old) = self.admits.pop_front() {
+                    let end = old.end.unwrap_or(old.start);
+                    if self.forgotten.is_none_or(|(latest, _)| end >= latest) {
+                        self.forgotten = Some((end, old.shape));
+                    }
+                }
+            }
+            id
+        }
+
+        fn end_admit(&mut self, id: u64, end: tokio::time::Instant) {
+            if let Some(hold) = self.admits.iter_mut().find(|hold| hold.id == id) {
+                hold.end = Some(end);
+            }
+        }
+
+        /// The shape of an admit that held the stream at some moment of
+        /// `[start, deadline]`, if any. When the history no longer reaches back
+        /// to `start`, the answer is unknown and errs towards a compile: that
+        /// answer (`shape_compiling`) is safe to retry.
+        fn compile_during(
+            &self,
+            start: tokio::time::Instant,
+            deadline: tokio::time::Instant,
+        ) -> Option<usize> {
+            let now = tokio::time::Instant::now();
+            self.admits
+                .iter()
+                .rev()
+                .find(|hold| hold.start <= deadline && hold.end.unwrap_or(now) >= start)
+                .map(|hold| hold.shape)
+                .or_else(|| {
+                    self.forgotten
+                        .filter(|(end, _)| *end >= start)
+                        .map(|(_, shape)| shape)
+                })
+        }
     }
 
     /// Marks one exchange as the stream holder for as long as it runs,
-    /// including when it is dropped part way through.
+    /// including when it is dropped part way through, and records admit holds.
     struct HolderMark<'a> {
         holder: &'a Mutex<StreamHolder>,
-        compiling: Option<usize>,
+        admit: Option<u64>,
     }
     impl<'a> HolderMark<'a> {
         fn hold(holder: &'a Mutex<StreamHolder>, compiling: Option<usize>) -> Self {
-            holder
+            let mut state = holder
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .compiling = compiling;
-            Self { holder, compiling }
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.compiling = compiling;
+            let admit =
+                compiling.map(|shape| state.begin_admit(shape, tokio::time::Instant::now()));
+            Self { holder, admit }
         }
     }
     impl Drop for HolderMark<'_> {
         fn drop(&mut self) {
-            let mut holder = self
+            let mut state = self
                 .holder
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            holder.compiling = None;
-            holder.last_release = Some((tokio::time::Instant::now(), self.compiling));
+            state.compiling = None;
+            if let Some(id) = self.admit {
+                state.end_admit(id, tokio::time::Instant::now());
+            }
         }
     }
 
@@ -4904,7 +5060,7 @@ pub mod ane_residency {
         owner_exit_timeout: std::time::Duration,
         holder: Mutex<StreamHolder>,
         #[cfg(test)]
-        classify_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        classify_gate: Mutex<Option<Arc<ClassifyGate>>>,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -5043,26 +5199,30 @@ pub mod ane_residency {
         /// Answers a caller whose deadline expired while its serving task was
         /// still waiting: the cause is that task's current wait, unless the
         /// task already classified its own expiry.
-        fn expired_wait(&self, waits: &RequestWaits) -> AneResidencyError {
+        fn expired_wait(
+            &self,
+            waits: &RequestWaits,
+            deadline: tokio::time::Instant,
+        ) -> AneResidencyError {
             let mut phase = waits.lock();
             let cause = match *phase {
                 WaitPhase::Expired(first) => first,
                 WaitPhase::Compile(shape) => Some(shape),
-                WaitPhase::Stream => self.compiling_shape(),
+                WaitPhase::Stream(start) => self.compile_during(start, deadline),
                 WaitPhase::Other => None,
             };
             *phase = WaitPhase::Expired(cause);
             deadline_cause_error(cause)
         }
 
-        /// Lets a test hold a caller between its deadline expiring and the
-        /// expiry being classified.
+        /// Lets a test hold an expired wait between its deadline expiring and
+        /// the expiry being classified, separately for the caller and for the
+        /// serving task's own waits.
         #[cfg(test)]
-        async fn pass_classify_gate(&self) {
-            let gate = self.classify_gate.lock().unwrap().take();
-            if let Some((reached, proceed)) = gate {
-                reached.notify_one();
-                proceed.notified().await;
+        async fn pass_classify_gate(&self, site: GateSite) {
+            let gate = self.classify_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.pass(site).await;
             }
         }
 
@@ -5077,15 +5237,14 @@ pub mod ane_residency {
             self.stream_holder().compiling
         }
 
-        /// For a stream lock granted at or after `deadline`: the shape being
-        /// compiled by the exchange that held the stream through the deadline,
-        /// if it was an admission. The stream is granted in arrival order, so
-        /// that holder is the last one to release it.
-        fn compile_held_stream_at(&self, deadline: tokio::time::Instant) -> Option<usize> {
-            match self.stream_holder().last_release {
-                Some((released, compiling)) if released >= deadline => compiling,
-                _ => None,
-            }
+        /// The shape of an admit that held this stream at some moment of a
+        /// stream wait `[start, deadline]` (see `StreamHolder::compile_during`).
+        fn compile_during(
+            &self,
+            start: tokio::time::Instant,
+            deadline: tokio::time::Instant,
+        ) -> Option<usize> {
+            self.stream_holder().compile_during(start, deadline)
         }
 
         /// One inference exchange. Waiting for the stream (which an admission
@@ -5110,26 +5269,40 @@ pub mod ane_residency {
             let expired = |deadline: Option<tokio::time::Instant>| {
                 deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
             };
-            enter_wait(WaitPhase::Stream);
+            let stream_wait = tokio::time::Instant::now();
+            enter_wait(WaitPhase::Stream(stream_wait));
             let mut guard = match deadline {
                 Some(deadline) => match tokio::time::timeout_at(deadline, self.stream.lock()).await
                 {
                     Ok(guard) => guard,
-                    Err(_) => return Err(deadline_expired(self.compiling_shape())),
+                    Err(_) => {
+                        #[cfg(test)]
+                        self.pass_classify_gate(GateSite::Inner).await;
+                        return Err(deadline_expired(self.compile_during(stream_wait, deadline)));
+                    }
                 },
                 None => self.stream.lock().await,
             };
             // A timer can expire in the same poll that grants the lock. Nothing
-            // may be written after the deadline; the holder at the deadline
-            // decides whether the request was blocked on a compile.
+            // may be written after the deadline, and the admits that held the
+            // stream during this wait decide whether it was blocked on a compile.
             if let Some(deadline) = deadline.filter(|_| expired(deadline)) {
-                return Err(deadline_expired(self.compile_held_stream_at(deadline)));
+                drop(guard);
+                #[cfg(test)]
+                self.pass_classify_gate(GateSite::Inner).await;
+                return Err(deadline_expired(self.compile_during(stream_wait, deadline)));
             }
             enter_wait(WaitPhase::Other);
             let _permit = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, permit)
-                    .await
-                    .map_err(|_| deadline_expired(None))??,
+                Some(deadline) => match tokio::time::timeout_at(deadline, permit).await {
+                    Ok(permit) => permit?,
+                    Err(_) => {
+                        drop(guard);
+                        #[cfg(test)]
+                        self.pass_classify_gate(GateSite::Inner).await;
+                        return Err(deadline_expired(None));
+                    }
+                },
                 None => permit.await?,
             };
             if expired(deadline) {
@@ -5239,6 +5412,10 @@ pub mod ane_residency {
     {
         fn worker_id(&self) -> &str {
             &self.worker_id
+        }
+        #[cfg(test)]
+        fn classify_gate(&self) -> Option<Arc<ClassifyGate>> {
+            self.classify_gate.lock().unwrap().clone()
         }
         fn generation(&self) -> u64 {
             self.generation.load(Ordering::Acquire)
@@ -5805,8 +5982,8 @@ pub mod ane_residency {
                     Ok(joined) => joined,
                     Err(_) => {
                         #[cfg(test)]
-                        self.channel.pass_classify_gate().await;
-                        return Err(self.channel.expired_wait(&waits));
+                        self.channel.pass_classify_gate(GateSite::Caller).await;
+                        return Err(self.channel.expired_wait(&waits, deadline));
                     }
                 },
                 None => task.await,
@@ -6942,6 +7119,8 @@ pub mod ane_residency {
             connects: HashMap<String, u32>,
             /// Inference requests (embed or rerank) the mock worker received.
             inference_frames: u64,
+            /// Their request ids, in arrival order.
+            inference_ids: Vec<String>,
         }
 
         type SharedLedger = Arc<Mutex<Ledger>>;
@@ -6978,7 +7157,13 @@ pub mod ane_residency {
                     request,
                     WorkerRequest::EmbedBatch { .. } | WorkerRequest::RerankSequences { .. }
                 ) {
-                    ledger.lock().unwrap().inference_frames += 1;
+                    {
+                        let mut ledger = ledger.lock().unwrap();
+                        ledger.inference_frames += 1;
+                        if let Some(id) = request.req_id() {
+                            ledger.inference_ids.push(id.to_owned());
+                        }
+                    }
                     let gate = ledger.lock().unwrap().inference_gate.take();
                     if let Some((started, release)) = gate {
                         started.notify_one();
@@ -7579,19 +7764,75 @@ pub mod ane_residency {
             .expect("condition never held");
         }
 
+        fn gate_classification(serving: &AneServing<DuplexStream>) -> Arc<ClassifyGate> {
+            let gate = ClassifyGate::new();
+            *serving.channel.classify_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+
+        async fn acknowledged(notify: &Notify) {
+            tokio::time::timeout(Duration::from_secs(2), notify.notified())
+                .await
+                .expect("acknowledgement never arrived");
+        }
+
+        /// Both the caller and the serving task have expired and are held
+        /// before classifying.
+        async fn both_expired(gate: &ClassifyGate) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                gate.reached(GateSite::Caller, 1).await;
+                gate.reached(GateSite::Inner, 1).await;
+            })
+            .await
+            .expect("the request never expired");
+        }
+
+        fn spawn_infer(
+            serving: &Arc<AneServing<DuplexStream>>,
+            tokens: usize,
+            deadline: Option<tokio::time::Instant>,
+        ) -> tokio::task::JoinHandle<Result<Vec<Vec<f32>>, AneResidencyError>> {
+            let serving = serving.clone();
+            tokio::spawn(async move {
+                serving
+                    .infer_permitted(vec![vec![1; tokens]], false, deadline, (), None)
+                    .await
+            })
+        }
+
+        fn in_150_ms() -> Option<tokio::time::Instant> {
+            Some(tokio::time::Instant::now() + Duration::from_millis(150))
+        }
+
+        fn embed_request(
+            serving: &AneServing<DuplexStream>,
+            tokens: usize,
+        ) -> (WorkerRequest, Vec<u8>) {
+            let request = WorkerRequest::EmbedBatch {
+                req_id: serving.channel.next_req_id("embed"),
+                model_ref: serving.metadata.model_ref.clone(),
+                pooling: synapse_core::WorkerPooling::Mean,
+                normalize: true,
+                items: vec![synapse_core::WorkerTokenItem {
+                    id: "0".into(),
+                    n_tokens: tokens,
+                }],
+            };
+            (request, encode_i32_frame(&vec![1; tokens]))
+        }
+
         /// A request holding the stream while it waits for an execution
         /// permit gives up at its deadline; a queued compile then takes the
-        /// stream before the caller's expiry is classified. The expired wait
-        /// was the permit, so the answer must not be shape_compiling.
+        /// stream before the caller's expiry is classified. The serving task's
+        /// own classification is held back, so the caller's is the one tested.
+        /// The expired wait was the permit, so the answer is deadline_exceeded.
         #[tokio::test]
         async fn expired_permit_wait_stays_deadline_exceeded_when_a_compile_starts_before_classification(
         ) {
             let ledger = SharedLedger::default();
             let serving = serving_fixture(&ledger).await;
             serving.infer(vec![vec![1]], false).await.unwrap();
-            let (reached, proceed) = notify_pair();
-            *serving.channel.classify_gate.lock().unwrap() =
-                Some((reached.clone(), proceed.clone()));
+            let gate = gate_classification(&serving);
             let (started, release) = notify_pair();
             ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
             let never: PermitSource = Arc::new(|_| {
@@ -7602,26 +7843,19 @@ pub mod ane_residency {
             let waiting = tokio::spawn({
                 let serving = serving.clone();
                 async move {
-                    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
                     serving
-                        .infer_permitted(vec![vec![1]], false, Some(deadline), (), Some(never))
+                        .infer_permitted(vec![vec![1]], false, in_150_ms(), (), Some(never))
                         .await
                 }
             });
             until(|| serving.channel.stream.try_lock().is_err()).await;
-            let compile = tokio::spawn({
-                let serving = serving.clone();
-                async move { serving.infer(vec![vec![1; 600]], false).await }
-            });
-            tokio::time::timeout(Duration::from_secs(2), reached.notified())
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), started.notified())
-                .await
-                .unwrap();
+            let compile = spawn_infer(&serving, 600, None);
+            both_expired(&gate).await;
+            acknowledged(&started).await;
             let compiling_at_classification = serving.channel.compiling_shape();
-            proceed.notify_one();
+            gate.release(GateSite::Caller);
             let answered = waiting.await.unwrap();
+            gate.release(GateSite::Inner);
             release.notify_one();
             compile.await.unwrap().unwrap();
             assert_eq!(compiling_at_classification, Some(1024));
@@ -7632,7 +7866,8 @@ pub mod ane_residency {
         }
 
         /// A request waiting for budget (no evictable shape) expires while an
-        /// admission holds the stream. It was not waiting for that compile.
+        /// admission holds the stream; the caller classifies first. It was not
+        /// waiting for that compile.
         #[tokio::test]
         async fn expired_budget_wait_stays_deadline_exceeded_while_an_admit_holds_the_stream() {
             let ledger = SharedLedger::default();
@@ -7645,27 +7880,21 @@ pub mod ane_residency {
                 .lease(&worker, &serving.metadata.model_ref, 128)
                 .await
                 .unwrap();
+            let gate = gate_classification(&serving);
             let (started, release) = notify_pair();
             ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
-            let compile = tokio::spawn({
-                let serving = serving.clone();
-                async move { serving.infer(vec![vec![1; 200]], false).await }
-            });
-            tokio::time::timeout(Duration::from_secs(2), started.notified())
-                .await
-                .unwrap();
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
-            let answered = tokio::time::timeout(
-                Duration::from_secs(2),
-                serving.infer_permitted(vec![vec![1; 400]], false, Some(deadline), (), None),
-            )
-            .await
-            .unwrap();
-            let compiling_at_expiry = serving.channel.compiling_shape();
+            let compile = spawn_infer(&serving, 200, None);
+            acknowledged(&started).await;
+            let waiting = spawn_infer(&serving, 400, in_150_ms());
+            both_expired(&gate).await;
+            let compiling_at_classification = serving.channel.compiling_shape();
+            gate.release(GateSite::Caller);
+            let answered = waiting.await.unwrap();
+            gate.release(GateSite::Inner);
             release.notify_one();
             compile.await.unwrap().unwrap();
             drop(held_128);
-            assert_eq!(compiling_at_expiry, Some(256));
+            assert_eq!(compiling_at_classification, Some(256));
             assert!(
                 matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
                 "{answered:?}"
@@ -7681,26 +7910,26 @@ pub mod ane_residency {
             let ledger = SharedLedger::default();
             let serving = serving_fixture(&ledger).await;
             serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
             let (started, release) = notify_pair();
             ledger.lock().unwrap().inference_gate = Some((started.clone(), release.clone()));
-            let inference = tokio::spawn({
-                let serving = serving.clone();
-                async move { serving.infer(vec![vec![1]], false).await }
-            });
-            tokio::time::timeout(Duration::from_secs(2), started.notified())
+            let inference = spawn_infer(&serving, 1, None);
+            acknowledged(&started).await;
+            let waiting = spawn_infer(&serving, 600, in_150_ms());
+            // Its own admit is not a deadline-bounded wait, so only the caller expires.
+            tokio::time::timeout(Duration::from_secs(2), gate.reached(GateSite::Caller, 1))
                 .await
-                .unwrap();
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
-            let answered = tokio::time::timeout(
-                Duration::from_secs(2),
-                serving.infer_permitted(vec![vec![1; 600]], false, Some(deadline), (), None),
-            )
-            .await
-            .unwrap();
-            let compiling_at_expiry = serving.channel.compiling_shape();
+                .expect("the request never expired");
+            let compiling_at_classification = serving.channel.compiling_shape();
+            gate.release(GateSite::Caller);
+            let answered = waiting.await.unwrap();
+            gate.release(GateSite::Inner);
             release.notify_one();
             inference.await.unwrap().unwrap();
-            assert_eq!(compiling_at_expiry, None, "the admit must still be queued");
+            assert_eq!(
+                compiling_at_classification, None,
+                "the admit must still be queued"
+            );
             assert!(
                 matches!(
                     answered,
@@ -7710,26 +7939,253 @@ pub mod ane_residency {
             );
         }
 
+        /// A request joins another request's compile of the same shape and its
+        /// deadline expires during that compile.
+        #[tokio::test]
+        async fn single_flight_joiner_expiring_during_the_compile_is_shape_compiling() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
+            let (started, release) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
+            let compile = spawn_infer(&serving, 600, None);
+            acknowledged(&started).await;
+            let joiner = spawn_infer(&serving, 600, in_150_ms());
+            both_expired(&gate).await;
+            gate.release(GateSite::Caller);
+            let answered = joiner.await.unwrap();
+            gate.release(GateSite::Inner);
+            release.notify_one();
+            compile.await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    answered,
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                ),
+                "{answered:?}"
+            );
+            let model_ref = serving.metadata.model_ref.clone();
+            assert_eq!(ledger.lock().unwrap().admit_attempts[&(model_ref, 1024)], 1);
+        }
+
+        /// A joiner whose shared admit fails waits on the Failed slot while
+        /// recovery restarts the worker; its deadline expires there. That is
+        /// not a compile in progress.
+        #[tokio::test]
+        async fn expiry_after_a_failed_admit_is_deadline_exceeded() {
+            let ledger = SharedLedger::default();
+            // A worker process captures the exit hold when it starts.
+            let (exiting, exit) = notify_pair();
+            ledger.lock().unwrap().exit_gate = Some((exiting.clone(), exit.clone()));
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let model_ref = serving.metadata.model_ref.clone();
+            let (started, release) = notify_pair();
+            {
+                let mut ledger = ledger.lock().unwrap();
+                ledger.fail_admit.insert((model_ref.clone(), 1024));
+                ledger.admit_gate = Some((started.clone(), release.clone()));
+            }
+            let failing = spawn_infer(&serving, 600, None);
+            acknowledged(&started).await;
+            let deadline = Some(tokio::time::Instant::now() + Duration::from_millis(400));
+            let joiner = spawn_infer(&serving, 600, deadline);
+            until(|| !serving.supervisor.inner.lock().waiters.is_empty()).await;
+            release.notify_one();
+            // Recovery is confirming the old worker's exit: the slot is Failed.
+            acknowledged(&exiting).await;
+            let slot_failed = serving
+                .supervisor
+                .inner
+                .lock()
+                .slots
+                .values()
+                .any(|slot| slot.state == SlotState::Failed);
+            let answered = tokio::time::timeout(Duration::from_secs(2), joiner)
+                .await
+                .unwrap()
+                .unwrap();
+            exit.notify_one();
+            let failed = tokio::time::timeout(Duration::from_secs(5), failing)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(slot_failed);
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+            assert!(failed.is_err(), "{failed:?}");
+        }
+
+        /// (a) An inference holds the stream through the deadline; after the
+        /// deadline a compile takes the stream, before classification. No
+        /// compile held the stream during the wait.
+        #[tokio::test]
+        async fn stream_wait_behind_inference_is_deadline_exceeded_even_if_a_compile_follows() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
+            let (inferring, finish_inference) = notify_pair();
+            ledger.lock().unwrap().inference_gate =
+                Some((inferring.clone(), finish_inference.clone()));
+            let inference = spawn_infer(&serving, 1, None);
+            acknowledged(&inferring).await;
+            let waiting = spawn_infer(&serving, 1, in_150_ms());
+            both_expired(&gate).await;
+            let (compiling, finish_compile) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((compiling.clone(), finish_compile.clone()));
+            let compile = spawn_infer(&serving, 600, None);
+            finish_inference.notify_one();
+            acknowledged(&compiling).await;
+            let compiling_at_classification = serving.channel.compiling_shape();
+            gate.release(GateSite::Caller);
+            gate.release(GateSite::Inner);
+            let answered = waiting.await.unwrap();
+            finish_compile.notify_one();
+            inference.await.unwrap().unwrap();
+            compile.await.unwrap().unwrap();
+            assert_eq!(compiling_at_classification, Some(1024));
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+        }
+
+        /// (b) A compile holds the stream through the deadline; after the
+        /// deadline an inference takes the stream, before classification.
+        #[tokio::test]
+        async fn stream_wait_behind_a_compile_is_shape_compiling_even_if_inference_follows() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
+            let (compiling, finish_compile) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((compiling.clone(), finish_compile.clone()));
+            let compile = spawn_infer(&serving, 600, None);
+            acknowledged(&compiling).await;
+            let waiting = spawn_infer(&serving, 1, in_150_ms());
+            both_expired(&gate).await;
+            let (inferring, finish_inference) = notify_pair();
+            ledger.lock().unwrap().inference_gate =
+                Some((inferring.clone(), finish_inference.clone()));
+            finish_compile.notify_one();
+            // The compiling request's own inference now holds the stream.
+            acknowledged(&inferring).await;
+            let compiling_at_classification = serving.channel.compiling_shape();
+            gate.release(GateSite::Caller);
+            gate.release(GateSite::Inner);
+            let answered = waiting.await.unwrap();
+            finish_inference.notify_one();
+            compile.await.unwrap().unwrap();
+            assert_eq!(compiling_at_classification, None);
+            assert!(
+                matches!(
+                    answered,
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                ),
+                "{answered:?}"
+            );
+        }
+
+        /// (c) A compile holds the stream through the deadline, then an
+        /// inference queued ahead of the request runs, and only then is the
+        /// request granted the stream (arrival order). The compile it waited
+        /// behind decides, not the inference that released the stream last.
+        #[tokio::test]
+        async fn stream_granted_after_a_compile_and_an_inference_is_shape_compiling() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let (compiling, finish_compile) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((compiling.clone(), finish_compile.clone()));
+            let compile = spawn_infer(&serving, 600, None);
+            acknowledged(&compiling).await;
+            let ready = || async { Ok(Box::new(()) as ExchangePermit) };
+            let (inference_request, inference_raw) = embed_request(&serving, 1);
+            let ahead = serving.channel.exchange_inference(
+                &inference_request,
+                Some(&inference_raw),
+                None,
+                Duration::from_secs(1),
+                ready(),
+            );
+            tokio::pin!(ahead);
+            assert!(tokio::time::timeout(Duration::ZERO, &mut ahead)
+                .await
+                .is_err());
+            let (request, raw) = embed_request(&serving, 1);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            let behind = serving.channel.exchange_inference(
+                &request,
+                Some(&raw),
+                Some(deadline),
+                Duration::from_secs(1),
+                ready(),
+            );
+            tokio::pin!(behind);
+            assert!(tokio::time::timeout(Duration::ZERO, &mut behind)
+                .await
+                .is_err());
+            tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+            finish_compile.notify_one();
+            ahead.await.unwrap();
+            let answered = behind.await;
+            compile.await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    answered,
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                ),
+                "{answered:?}"
+            );
+            let received = ledger.lock().unwrap().inference_ids.clone();
+            assert!(received
+                .iter()
+                .any(|id| Some(id.as_str()) == inference_request.req_id()));
+            assert!(!received
+                .iter()
+                .any(|id| Some(id.as_str()) == request.req_id()));
+        }
+
+        /// An expired stream wait that began before the oldest admit still in
+        /// the history cannot be decided; it counts as a compile, whose answer
+        /// is safe to retry.
+        #[test]
+        fn a_stream_wait_older_than_the_admit_history_counts_as_a_compile() {
+            let t0 = tokio::time::Instant::now();
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            let mut holder = StreamHolder::default();
+            let compile = holder.begin_admit(512, at(10));
+            holder.end_admit(compile, at(15));
+            // A wait from 0 to 20 overlapped the 512 compile; one from 30 to
+            // 40 overlapped nothing.
+            assert_eq!(holder.compile_during(at(0), at(20)), Some(512));
+            assert_eq!(holder.compile_during(at(30), at(40)), None);
+            for index in 0..ADMIT_HISTORY as u64 {
+                let later = holder.begin_admit(128, at(1_000 + index * 10));
+                holder.end_admit(later, at(1_005 + index * 10));
+            }
+            // The 512 hold has been forgotten, yet a wait that began before it
+            // ended still counts as a compile; the quiet wait stays clean.
+            assert!(holder.admits.iter().all(|hold| hold.shape == 128));
+            assert_eq!(holder.compile_during(at(0), at(20)), Some(512));
+            assert_eq!(holder.compile_during(at(30), at(40)), None);
+        }
+
         /// The stream is granted to a queued inference only after its deadline,
         /// in the same poll as the expired timer. It must give the stream back
-        /// without writing anything.
+        /// without even asking for an execution permit.
         #[tokio::test]
-        async fn inference_granted_the_stream_after_its_deadline_is_never_written() {
+        async fn inference_granted_the_stream_after_its_deadline_never_asks_for_a_permit() {
             let ledger = SharedLedger::default();
             let serving = serving_fixture(&ledger).await;
             serving.infer(vec![vec![1]], false).await.unwrap();
             let frames_before = ledger.lock().unwrap().inference_frames;
-            let request = WorkerRequest::EmbedBatch {
-                req_id: serving.channel.next_req_id("embed"),
-                model_ref: serving.metadata.model_ref.clone(),
-                pooling: synapse_core::WorkerPooling::Mean,
-                normalize: true,
-                items: vec![synapse_core::WorkerTokenItem {
-                    id: "0".into(),
-                    n_tokens: 1,
-                }],
-            };
-            let raw = encode_i32_frame(&[1]);
+            let (request, raw) = embed_request(&serving, 1);
+            let permits_asked = Arc::new(AtomicU64::new(0));
             let held = serving.channel.stream.lock().await;
             let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
             let exchange = serving.channel.exchange_inference(
@@ -7737,7 +8193,13 @@ pub mod ane_residency {
                 Some(&raw),
                 Some(deadline),
                 Duration::from_secs(1),
-                async { Ok(Box::new(()) as ExchangePermit) },
+                {
+                    let permits_asked = permits_asked.clone();
+                    async move {
+                        permits_asked.fetch_add(1, Ordering::SeqCst);
+                        Ok(Box::new(()) as ExchangePermit)
+                    }
+                },
             );
             tokio::pin!(exchange);
             // One poll queues the exchange for the stream.
@@ -7747,6 +8209,46 @@ pub mod ane_residency {
             tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
             // Released after the deadline: the lock goes to the queued exchange.
             drop(held);
+            let answered = exchange.await;
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+            assert_eq!(permits_asked.load(Ordering::SeqCst), 0);
+            assert_eq!(ledger.lock().unwrap().inference_frames, frames_before);
+            assert!(!serving.channel.faulted.load(Ordering::Relaxed));
+        }
+
+        /// The stream is free, but the execution permit is granted only after
+        /// the deadline, in the same poll as the expired timer. Nothing may be
+        /// written.
+        #[tokio::test]
+        async fn inference_granted_its_permit_after_its_deadline_is_never_written() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let frames_before = ledger.lock().unwrap().inference_frames;
+            let (request, raw) = embed_request(&serving, 1);
+            let (grant, granted) = tokio::sync::oneshot::channel::<()>();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            let exchange = serving.channel.exchange_inference(
+                &request,
+                Some(&raw),
+                Some(deadline),
+                Duration::from_secs(1),
+                async move {
+                    granted.await.unwrap();
+                    Ok(Box::new(()) as ExchangePermit)
+                },
+            );
+            tokio::pin!(exchange);
+            // One poll takes the free stream and waits for the permit.
+            assert!(tokio::time::timeout(Duration::ZERO, &mut exchange)
+                .await
+                .is_err());
+            assert!(serving.channel.stream.try_lock().is_err());
+            tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+            grant.send(()).unwrap();
             let answered = exchange.await;
             assert!(
                 matches!(answered, Err(AneResidencyError::DeadlineExceeded)),

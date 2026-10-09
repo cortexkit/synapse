@@ -119,9 +119,15 @@ task, so a request that started them can give up without cancelling them:
    write guard in place of a read guard: supervisor, stream, permit, I/O.
 4. Release the write guard, then the lane mutex.
 
-Every serving request that reaches certification, including the one that found
-the check pending and started it, waits for that task only until its own
-absolute request deadline and is then answered `model_loading`.
+At most one such task runs per lane. Every serving request that reaches
+certification, including the one that found the check pending and started it,
+subscribes to that task's outcome and waits only until its own absolute request
+deadline (the budget less resolution time, the inline default when none was
+given), then is answered `model_loading`; an outcome that arrives at or after
+the deadline is also answered `model_loading`. A caller that gives up leaves
+nothing queued. Once the check has passed, certification takes no lane lock
+and starts no task. The task never loads the model: lanes load through request
+resolution, so a check queued before an unload cannot bring the lane back.
 
 The non-profile 2000 ms check keeps both guards in `CatalogInvocation` until its
 blocking task ends.
@@ -235,9 +241,13 @@ is doing when the error is mapped. Blocked on a compile means one of:
    or it joined another request's compile of that shape (single-flight). This
    counts from the moment the slot enters `Admitting`, even while the admit is
    still queued for the worker stream.
-2. It is waiting for the worker stream and an admit exchange holds the stream
-   when the deadline expires. If the stream is granted in the same poll as the
-   expiry, the exchange that held it through the deadline decides.
+2. It is waiting for the worker stream, and an admit exchange held the stream
+   at some moment between the start of that wait and the deadline. What holds
+   the stream when the error is mapped does not matter. Each channel keeps the
+   start and end of its last 16 admit holds (still-open holds run to now). If
+   the wait began before the oldest hold still kept could have ended, the
+   history cannot rule a compile out, and the answer is `shape_compiling`,
+   which is safe to retry.
 
 A deadline that expires on any other wait (permit, budget queue, eviction,
 ordinary inference ahead of it) keeps `deadline_exceeded`. An inference that
