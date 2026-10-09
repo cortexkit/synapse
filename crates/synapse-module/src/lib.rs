@@ -18228,6 +18228,44 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
+    /// A catalog batch job's loading task queues for the lane's lifecycle lock.
+    /// If the job's budget runs out first, the task leaves the queue instead
+    /// of loading the lane later, possibly after an operator unloaded it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_catalog_job_whose_budget_expired_leaves_the_lane_lock_queue() {
+        let fixture = ane_lane_fixture("ane-job-budget", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = resolved_catalog_lane(&state.runtime, ANE_TEST_LANE)
+            .map(|(entry, backend)| (entry.clone(), backend.clone()))
+            .unwrap();
+        // The operator unloaded the lane; a load or self-check holds the lock.
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Unloaded);
+        let lifecycle = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let job = tokio::spawn({
+            let state = state.clone();
+            async move {
+                ensure_catalog_lane_ready(state, entry, backend, Some(deadline))
+                    .await
+                    .map(drop)
+            }
+        });
+        let answered = tokio::time::timeout(Duration::from_secs(2), job).await;
+        drop(lifecycle);
+        let lock_free = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_ok();
+        finish_ane_lane_fixture(fixture).await;
+        match answered {
+            Ok(Ok(Err(error))) => assert_eq!(error.code, "deadline_exceeded", "{error:?}"),
+            other => panic!("the expired job must leave the queue: {other:?}"),
+        }
+        assert!(lock_free, "nothing may stay queued on the lane lock");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {
@@ -26575,12 +26613,28 @@ async fn ensure_catalog_lane_ready(
     state: Arc<ModuleState>,
     entry: catalog::CatalogEntry,
     backend: catalog::CatalogBackend,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let lane = catalog::lane_id(&entry.id, &backend.backend);
     let lock = catalog_lane_lock(&state.runtime, &lane);
+    // A job whose budget has run out must leave the queue rather than load
+    // the lane later, possibly after an operator has unloaded it.
     let (guard, waited) = match lock.clone().try_lock_owned() {
         Ok(guard) => (guard, false),
-        Err(_) => (lock.lock_owned().await, true),
+        Err(_) => match deadline {
+            Some(deadline) => (
+                tokio::time::timeout_at(deadline, lock.lock_owned())
+                    .await
+                    .map_err(|_| {
+                        WireOperationError::from_stable(
+                            StableError::deadline_exceeded(),
+                            "catalog batch execution deadline expired",
+                        )
+                    })?,
+                true,
+            ),
+            None => (lock.lock_owned().await, true),
+        },
     };
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
@@ -26588,6 +26642,8 @@ async fn ensure_catalog_lane_ready(
     let profile_backed = backend.profile.is_some();
     let model = ensure_catalog_lane_ready_owned(state.clone(), entry, backend, guard).await?;
     if profile_backed {
+        // Never loads, and the job's own timer bounds this wait; a deadline
+        // here could fail an admitted job with model_loading.
         ensure_profile_preload_ready(state, &lane, None).await
     } else {
         Ok(model)
@@ -27013,8 +27069,9 @@ async fn submit_catalog_embed_job(
                     .unwrap_or(now_ms())
                     .saturating_sub(now_ms());
                 let task_state = state.clone();
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
                 let loading = tokio::spawn(async move {
-                    ensure_catalog_lane_ready(task_state, entry, backend).await
+                    ensure_catalog_lane_ready(task_state, entry, backend, Some(deadline)).await
                 });
                 let model = tokio::time::timeout(Duration::from_millis(budget), loading)
                     .await
