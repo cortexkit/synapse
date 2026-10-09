@@ -683,9 +683,23 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
             .find(|e| e["id"] == row["id"])
             .unwrap();
         assert_eq!(row["upstream"], entry["upstream"]);
-        // This manifest contains ASCII strings and integer sizes, so sorted compact JSON
+        // The digest covers each file's path, sha256 and size in manifest order,
+        // plus upstream; a file's role and backends describe usage, not bytes.
+        // These are ASCII strings and integer sizes, so sorted compact JSON
         // produces the canonical bytes required by the manifest digest contract.
-        let manifest = serde_json::json!({"upstream":entry["upstream"],"files":entry["files"]});
+        let files = entry["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file["path"],
+                    "sha256": file["sha256"],
+                    "size_bytes": file["size_bytes"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({"upstream":entry["upstream"],"files":files});
         assert_eq!(
             row["manifest_digest"],
             catalog_sha256(manifest.to_string().as_bytes())
