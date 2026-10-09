@@ -30,6 +30,9 @@ fn launch_command(home: &Path, vars: &[(&str, &str)], finish: impl FnOnce(&mut C
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
+        // Windows resolves the lease, cache and store roots from LOCALAPPDATA,
+        // never HOME or XDG, so the cleared environment needs it there too.
+        .env("LOCALAPPDATA", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"));
     for (key, value) in vars {
         command.env(key, value);
