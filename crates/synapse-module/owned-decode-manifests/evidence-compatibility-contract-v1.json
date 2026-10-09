@@ -4,16 +4,22 @@
   "contract_kind": "approval_evidence_revision_compatibility",
   "initial_revisions": {
     "approval_policy": "owned-decode-evidence-requirements-v1",
-    "cert_row_evidence_schema": "owned-decode-cert-evidence-v1",
+    "cert_row_evidence_schema": "owned-decode-cert-evidence-v2",
     "g_dec_manifest_family": "decode-fixture-registry-v1",
-    "g_dec_manifest_revision": "decode-fixture-registry-v1"
+    "g_dec_manifest_revision": "owned-decode-probe-gates-v1"
   },
   "compiled_compatibility_map": [
     {
       "approval_evidence_requirements_revision": "owned-decode-evidence-requirements-v1",
-      "accepted_cert_row_evidence_schema_revisions": ["owned-decode-cert-evidence-v1"],
-      "required_g_dec_manifest_families": ["decode-fixture-registry-v1"],
-      "accepted_g_dec_manifest_revisions": ["decode-fixture-registry-v1"],
+      "accepted_cert_row_evidence_schema_revisions": [
+        "owned-decode-cert-evidence-v2"
+      ],
+      "required_g_dec_manifest_families": [
+        "decode-fixture-registry-v1"
+      ],
+      "accepted_g_dec_manifest_revisions": [
+        "owned-decode-probe-gates-v1"
+      ],
       "current_certification_compatible": true
     }
   ],
@@ -21,9 +27,9 @@
     "requires": [
       "supported approval revision",
       "compatible evidence_schema_revision",
-      "exact accepted G-DEC manifest revision",
-      "exactly one passed entry for G-DEC-01 through G-DEC-12",
-      "no missing, duplicate, pending, failed, substring-only, foreign-manifest, unknown-manifest, or incompatible entry"
+      "exact accepted gate manifest revision",
+      "exactly one gates entry: id structural_band, status passed, matching manifest revision",
+      "no g_dec key in the evidence (records written before evidence schema v2 do not admit)"
     ],
     "unknown_approval_revision": "fail closed",
     "unknown_evidence_schema": "fail closed",
@@ -37,8 +43,11 @@
     "migration_seed": "uses the initial approval policy revision and does not carry concrete evidence"
   },
   "gate_completeness": {
-    "required_ids": ["G-DEC-01", "G-DEC-02", "G-DEC-03", "G-DEC-04", "G-DEC-05", "G-DEC-06", "G-DEC-07", "G-DEC-08", "G-DEC-09", "G-DEC-10", "G-DEC-11", "G-DEC-12"],
-    "multiplicity": "exactly one passed entry per exact ID",
-    "matching": "ID equality, status equality, manifest revision equality; substring-only matches are invalid"
+    "required_ids": [
+      "structural_band"
+    ],
+    "multiplicity": "exactly one entry",
+    "matching": "ID equality, status equality, manifest revision equality; substring-only matches are invalid",
+    "not_recorded": "G-DEC-01 to G-DEC-12; the probe does not run them, so no record names them"
   }
 }
