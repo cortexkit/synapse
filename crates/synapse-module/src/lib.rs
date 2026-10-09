@@ -1548,10 +1548,17 @@ impl ModelTask {
 }
 
 fn execution_lane(model: &EmbeddingModel) -> &'static str {
-    match model.engine_identity.engine.as_str() {
+    execution_lane_for_engine(&model.engine_identity.engine)
+}
+
+/// The lane name operators see in `job done` log lines for each engine.
+fn execution_lane_for_engine(engine: &str) -> &'static str {
+    match engine {
         "owned-metal" => "metal",
-        ANE_WORKER_ENGINE => "ane",
+        "ane" | ANE_WORKER_ENGINE => "ane",
+        synapse_core::ANE_DIRECT_WORKER_ENGINE => "ane-direct",
         CUDA_WORKER_ENGINE => "cuda",
+        synapse_core::VULKAN_WORKER_ENGINE => "vulkan",
         LLAMA_ENGINE | LLAMA_WORKER_ENGINE => "llama",
         DECODE_WORKER_ENGINE => "decode",
         _ => "unknown",
@@ -22439,6 +22446,23 @@ mod catalog_runtime_tests {
     /// batch advice in `models.list` (clients size their calls from it and
     /// refuse a lane without it). Both broke the first live install of the
     /// direct-ANE lane, and no hardware test exercised that path.
+    /// Every engine that may serve embedding or reranking needs a named lane
+    /// in the `job done` log line; the direct-ANE lane logged `lane=unknown`
+    /// because this table was not extended with it.
+    #[test]
+    fn every_serving_engine_logs_a_named_lane() {
+        for engine in store::OWNED_EMBED_RERANK_ENGINES {
+            if *engine == "test-deterministic" {
+                continue;
+            }
+            assert_ne!(
+                execution_lane_for_engine(engine),
+                "unknown",
+                "engine {engine} logs lane=unknown"
+            );
+        }
+    }
+
     #[test]
     fn every_release_catalog_lane_meets_its_engine_and_client_contract() {
         let (root, state) = isolated_catalog_state("catalog-client-contract", true);
