@@ -166,33 +166,46 @@ impl MultiRowShape {
     }
 }
 
-/// One dispatch of a planned call: either a multi-row pass over the listed
-/// input rows, or one row that the single-row path must run on its own.
+/// One dispatch of a planned call: a multi-row pass of program `program` (an
+/// index into the shapes given to [`plan_passes`]) over the listed input rows,
+/// or one row that the single-row path must run on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pass {
-    MultiRow(Vec<usize>),
+    MultiRow { program: usize, rows: Vec<usize> },
     Single(usize),
 }
 
-/// Split a call's rows into passes. Rows that fit a slot are taken in input
-/// order, `shape.rows` at a time; a final partial pass leaves its remaining
-/// slots empty. Longer rows run on the single-row path. Callers restore input
-/// order from the indices each pass carries.
-pub fn plan_passes(lengths: &[usize], shape: &MultiRowShape) -> Vec<Pass> {
+/// Split a call's rows into passes. Each row goes to the narrowest program
+/// whose slot fits it (ties go to the earlier program); rows are taken in
+/// input order, `rows` at a time per program, and a final partial pass leaves
+/// its remaining slots empty. Rows no slot fits run on the single-row path.
+/// Callers restore input order from the indices each pass carries.
+pub fn plan_passes(lengths: &[usize], shapes: &[MultiRowShape]) -> Vec<Pass> {
     let mut passes = Vec::new();
-    let mut pending = Vec::new();
+    let mut pending: Vec<Vec<usize>> = vec![Vec::new(); shapes.len()];
     for (index, &length) in lengths.iter().enumerate() {
-        if length == 0 || length > shape.width {
+        let program = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, shape)| length > 0 && length <= shape.width)
+            .min_by_key(|(program, shape)| (shape.width, *program))
+            .map(|(program, _)| program);
+        let Some(program) = program else {
             passes.push(Pass::Single(index));
             continue;
-        }
-        pending.push(index);
-        if pending.len() == shape.rows {
-            passes.push(Pass::MultiRow(std::mem::take(&mut pending)));
+        };
+        pending[program].push(index);
+        if pending[program].len() == shapes[program].rows {
+            passes.push(Pass::MultiRow {
+                program,
+                rows: std::mem::take(&mut pending[program]),
+            });
         }
     }
-    if !pending.is_empty() {
-        passes.push(Pass::MultiRow(pending));
+    for (program, rows) in pending.into_iter().enumerate() {
+        if !rows.is_empty() {
+            passes.push(Pass::MultiRow { program, rows });
+        }
     }
     passes
 }
@@ -778,30 +791,66 @@ mod tests {
     fn passes_keep_every_row_once_in_order_and_send_long_rows_alone() {
         let shape = MultiRowShape::new(RowLayout::WidthFolded, 4, 128).unwrap();
         let lengths = [10, 128, 129, 50, 1, 300, 7, 9, 11, 12, 0];
-        let passes = plan_passes(&lengths, &shape);
+        let passes = plan_passes(&lengths, &[shape]);
+        let multi = |rows: Vec<usize>| Pass::MultiRow { program: 0, rows };
         assert_eq!(
             passes,
             vec![
                 Pass::Single(2),
-                Pass::MultiRow(vec![0, 1, 3, 4]),
+                multi(vec![0, 1, 3, 4]),
                 Pass::Single(5),
-                Pass::MultiRow(vec![6, 7, 8, 9]),
+                multi(vec![6, 7, 8, 9]),
                 Pass::Single(10),
+            ]
+        );
+        assert_eq!(
+            plan_passes(&[3, 4, 5], &[shape]),
+            vec![multi(vec![0, 1, 2])]
+        );
+        assert_eq!(
+            plan_passes(&[3, 4], &[]),
+            vec![Pass::Single(0), Pass::Single(1)]
+        );
+    }
+
+    #[test]
+    fn each_row_takes_the_narrowest_slot_that_fits() {
+        let wide = MultiRowShape::new(RowLayout::WidthFolded, 4, 64).unwrap();
+        let narrow = MultiRowShape::new(RowLayout::WidthFolded, 2, 32).unwrap();
+        let lengths = [40, 20, 64, 32, 33, 65, 5, 1];
+        let passes = plan_passes(&lengths, &[wide, narrow]);
+        assert_eq!(
+            passes,
+            vec![
+                Pass::MultiRow {
+                    program: 1,
+                    rows: vec![1, 3]
+                },
+                Pass::Single(5),
+                Pass::MultiRow {
+                    program: 1,
+                    rows: vec![6, 7]
+                },
+                Pass::MultiRow {
+                    program: 0,
+                    rows: vec![0, 2, 4]
+                },
             ]
         );
         let mut covered: Vec<usize> = passes
             .iter()
             .flat_map(|pass| match pass {
-                Pass::MultiRow(rows) => rows.clone(),
+                Pass::MultiRow { program, rows } => {
+                    let shape = [wide, narrow][*program];
+                    assert!(rows.len() <= shape.rows);
+                    assert!(rows.iter().all(|&row| lengths[row] <= shape.width));
+                    rows.clone()
+                }
                 Pass::Single(row) => vec![*row],
             })
             .collect();
         covered.sort();
         assert_eq!(covered, (0..lengths.len()).collect::<Vec<_>>());
-        assert_eq!(
-            plan_passes(&[3, 4, 5], &shape),
-            vec![Pass::MultiRow(vec![0, 1, 2])]
-        );
     }
 
     #[test]
@@ -1087,6 +1136,10 @@ mod hardware {
             "export_sha256": sha(&std::fs::read(&input).unwrap()),
             "chunks": chunks.len(),
             "tokenizer_sha256": sha(&std::fs::read(&tokenizer_path).unwrap()),
+            "composed_tokens_at_most": ([16, 32, 64, 128, 256, 512, 1024].map(|limit| {
+                json!({"limit": limit, "chunks": chunks.iter().filter(|c| c.ids.len() <= limit).count()})
+            })),
+            "composed_tokens_total": chunks.iter().map(|c| c.ids.len()).sum::<usize>(),
         });
 
         // Fixture rows carry fp32 references; check the tokenizer composition
@@ -1212,7 +1265,10 @@ mod hardware {
         // Padding and neighbours must not reach a real row: the same row alone
         // (empty slots), surrounded by other rows, and in the last slot.
         let target = &rows[0].1;
-        let others: Vec<&[u32]> = rows[1..shape.rows].iter().map(|r| r.1.as_slice()).collect();
+        let others: Vec<&[u32]> = rows[1..shape.rows.min(rows.len())]
+            .iter()
+            .map(|r| r.1.as_slice())
+            .collect();
         let alone_in_pass = program.run(&model, &[target]).unwrap().remove(0);
         let mut first_slot = vec![target.as_slice()];
         first_slot.extend(&others);
@@ -1309,42 +1365,63 @@ mod hardware {
         );
 
         if replay {
-            report["replay"] = replay_first_batch(&mut model, &program, &chunks, repeats);
+            let extra: Vec<MultiRowShape> = std::env::var("ANE_MULTIROW_REPLAY_EXTRA")
+                .map(|specs| {
+                    specs
+                        .split(',')
+                        .map(|spec| MultiRowShape::parse(spec).unwrap())
+                        .collect()
+                })
+                .unwrap_or_default();
+            report["replay"] = replay_first_batch(&mut model, program, &extra, &chunks, repeats);
             write(&report);
         }
-        drop(program);
         drop(model);
         let failures = report["correctness_failures"].as_array().unwrap();
         assert!(failures.is_empty(), "{failures:?}");
     }
 
     /// Replay the export's first batch in its real order and lengths: today's
-    /// one-row-at-a-time path, then multi-row passes for rows that fit a slot
-    /// with the rest on the single-row path.
+    /// one-row-at-a-time path, then multi-row passes (each row in the
+    /// narrowest program slot that fits) with the rest on the single-row path.
     fn replay_first_batch(
         model: &mut Model,
-        program: &MultiRowProgram,
+        program: MultiRowProgram,
+        extra: &[MultiRowShape],
         chunks: &[Chunk],
         repeats: usize,
     ) -> Value {
-        let shape = program.shape();
         let batch: Vec<&Chunk> = chunks.iter().take(64).collect();
         let mut rungs: Vec<usize> = batch.iter().map(|c| rung(c.ids.len()).unwrap()).collect();
         rungs.sort();
         rungs.dedup();
         // Stay well under the ~115 executables one process can hold.
-        let held = 28 * (rungs.len() + 1);
+        let mut resident: std::collections::BTreeSet<usize> =
+            model.resident.keys().copied().collect();
+        resident.extend(&rungs);
+        let held = 28 * (resident.len() + 1 + extra.len());
         if held > 84 {
-            return json!({"skipped": format!("rungs {rungs:?} would hold {held} executables")});
+            return json!({"skipped": format!("shapes {resident:?} and {} programs would hold {held} executables", 1 + extra.len())});
         }
         let mut compiles = Vec::new();
         for &width in &rungs {
             let started = Instant::now();
             model.admit(width, "multirow-experiment").unwrap();
-            compiles.push(json!({"width": width, "ms": ms(started)}));
+            compiles.push(json!({"single_row_width": width, "ms": ms(started)}));
         }
+        let mut programs = vec![program];
+        for &shape in extra {
+            let load = load_average();
+            let started = Instant::now();
+            programs.push(model.compile_multirow(shape).unwrap());
+            compiles.push(json!({
+                "multi_row": shape.label(), "ms": ms(started), "executables": 28,
+                "load_before": load, "load_after": load_average(),
+            }));
+        }
+        let shapes: Vec<MultiRowShape> = programs.iter().map(|p| p.shape()).collect();
         let lengths: Vec<usize> = batch.iter().map(|c| c.ids.len()).collect();
-        let passes = plan_passes(&lengths, &shape);
+        let passes = plan_passes(&lengths, &shapes);
         let run_single = |model: &Model| -> Vec<Vec<f32>> {
             batch.iter().map(|c| model.run(&c.ids).unwrap()).collect()
         };
@@ -1353,12 +1430,11 @@ mod hardware {
             for pass in &passes {
                 match pass {
                     Pass::Single(index) => outputs[*index] = model.run(&batch[*index].ids).unwrap(),
-                    Pass::MultiRow(indices) => {
+                    Pass::MultiRow { program, rows } => {
                         let tokens: Vec<&[u32]> =
-                            indices.iter().map(|&i| batch[i].ids.as_slice()).collect();
-                        for (&index, vector) in
-                            indices.iter().zip(program.run(model, &tokens).unwrap())
-                        {
+                            rows.iter().map(|&i| batch[i].ids.as_slice()).collect();
+                        let vectors = programs[*program].run(model, &tokens).unwrap();
+                        for (&index, vector) in rows.iter().zip(vectors) {
                             outputs[index] = vector;
                         }
                     }
@@ -1373,6 +1449,11 @@ mod hardware {
             .zip(&candidate)
             .map(|(a, b)| cosine(a, b))
             .collect();
+        let identical = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(a, b)| a == b)
+            .count();
         let mut samples = Vec::new();
         for repeat in 0..repeats.max(3) {
             let order = if repeat % 2 == 0 {
@@ -1399,15 +1480,24 @@ mod hardware {
         }
         let mut token_counts = lengths.clone();
         token_counts.sort();
+        let pass_counts: Vec<Value> = (0..shapes.len())
+            .map(|program| {
+                json!({"program": shapes[program].label(), "passes": passes.iter().filter(|p| matches!(p, Pass::MultiRow { program: q, .. } if *q == program)).count()})
+            })
+            .collect();
+        drop(programs);
         json!({
             "rows": batch.len(),
             "export_seqs": [batch[0].seq, batch[batch.len() - 1].seq],
             "batch_text_sha256": sha(batch.iter().map(|c| c.text_sha256.as_str()).collect::<Vec<_>>().join("\n").as_bytes()),
             "token_counts_sorted": token_counts,
-            "rungs": rungs, "rung_compiles": compiles,
-            "multi_row_passes": passes.iter().filter(|p| matches!(p, Pass::MultiRow(_))).count(),
+            "rungs": rungs, "compiles": compiles,
+            "programs": shapes.iter().map(|s| s.label()).collect::<Vec<_>>(),
+            "multi_row_passes": pass_counts,
             "single_row_passes": passes.iter().filter(|p| matches!(p, Pass::Single(_))).count(),
+            "executables_held": held,
             "min_cosine_multi_vs_single": cosines.iter().copied().fold(f64::INFINITY, f64::min),
+            "identical_rows": identical,
             "samples": samples,
         })
     }
