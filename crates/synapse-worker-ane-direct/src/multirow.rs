@@ -1373,7 +1373,66 @@ mod hardware {
                         .collect()
                 })
                 .unwrap_or_default();
-            report["replay"] = replay_first_batch(&mut model, program, &extra, &chunks, repeats);
+            let first: Vec<&Chunk> = chunks.iter().take(64).collect();
+            // The export's own batch plan, for the whole-export replay.
+            let batches: Vec<Vec<&Chunk>> = if std::env::var_os("ANE_MULTIROW_REPLAY_ALL").is_some()
+            {
+                let meta: Value =
+                    serde_json::from_slice(&std::fs::read(format!("{input}.meta.json")).unwrap())
+                        .unwrap();
+                meta["batches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|batch| {
+                        let first = batch["first_chunk_seq"].as_u64().unwrap() as usize;
+                        let count = batch["chunk_count"].as_u64().unwrap() as usize;
+                        chunks[first..first + count].iter().collect()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut rungs: std::collections::BTreeSet<usize> =
+                model.resident.keys().copied().collect();
+            rungs.extend(
+                batches
+                    .iter()
+                    .flatten()
+                    .chain(&first)
+                    .map(|c| rung(c.ids.len()).unwrap()),
+            );
+            // Stay well under the ~115 executables one process can hold.
+            let held = 28 * (rungs.len() + 1 + extra.len());
+            if held > 84 {
+                report["replay"] = json!({"skipped": format!("shapes {rungs:?} and {} programs would hold {held} executables", 1 + extra.len())});
+            } else {
+                let mut compiles = Vec::new();
+                for &width in &rungs {
+                    let started = Instant::now();
+                    model.admit(width, "multirow-experiment").unwrap();
+                    compiles.push(json!({"single_row_width": width, "ms": ms(started)}));
+                }
+                let mut programs = vec![program];
+                for &shape in &extra {
+                    let load = load_average();
+                    let started = Instant::now();
+                    programs.push(model.compile_multirow(shape).unwrap());
+                    compiles.push(json!({
+                        "multi_row": shape.label(), "ms": ms(started), "executables": 28,
+                        "load_before": load, "load_after": load_average(),
+                    }));
+                }
+                report["replay_setup"] = json!({
+                    "programs": programs.iter().map(|p| p.shape().label()).collect::<Vec<_>>(),
+                    "single_row_widths": rungs, "executables_held": held, "compiles": compiles,
+                });
+                report["replay"] = replay_batches(&model, &programs, &[first], repeats);
+                write(&report);
+                if !batches.is_empty() {
+                    report["replay_all"] = replay_batches(&model, &programs, &batches, 3);
+                }
+            }
             write(&report);
         }
         drop(model);
@@ -1381,74 +1440,62 @@ mod hardware {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
-    /// Replay the export's first batch in its real order and lengths: today's
-    /// one-row-at-a-time path, then multi-row passes (each row in the
-    /// narrowest program slot that fits) with the rest on the single-row path.
-    fn replay_first_batch(
-        model: &mut Model,
-        program: MultiRowProgram,
-        extra: &[MultiRowShape],
-        chunks: &[Chunk],
+    /// Replay real batches in their order and lengths: today's one-row-at-a-
+    /// time path, then multi-row passes (each row in the narrowest program
+    /// slot that fits) with the rest on the single-row path. Passes are planned
+    /// within each batch, as a serving call would.
+    fn replay_batches(
+        model: &Model,
+        programs: &[MultiRowProgram],
+        batches: &[Vec<&Chunk>],
         repeats: usize,
     ) -> Value {
-        let batch: Vec<&Chunk> = chunks.iter().take(64).collect();
-        let mut rungs: Vec<usize> = batch.iter().map(|c| rung(c.ids.len()).unwrap()).collect();
-        rungs.sort();
-        rungs.dedup();
-        // Stay well under the ~115 executables one process can hold.
-        let mut resident: std::collections::BTreeSet<usize> =
-            model.resident.keys().copied().collect();
-        resident.extend(&rungs);
-        let held = 28 * (resident.len() + 1 + extra.len());
-        if held > 84 {
-            return json!({"skipped": format!("shapes {resident:?} and {} programs would hold {held} executables", 1 + extra.len())});
-        }
-        let mut compiles = Vec::new();
-        for &width in &rungs {
-            let started = Instant::now();
-            model.admit(width, "multirow-experiment").unwrap();
-            compiles.push(json!({"single_row_width": width, "ms": ms(started)}));
-        }
-        let mut programs = vec![program];
-        for &shape in extra {
-            let load = load_average();
-            let started = Instant::now();
-            programs.push(model.compile_multirow(shape).unwrap());
-            compiles.push(json!({
-                "multi_row": shape.label(), "ms": ms(started), "executables": 28,
-                "load_before": load, "load_after": load_average(),
-            }));
-        }
         let shapes: Vec<MultiRowShape> = programs.iter().map(|p| p.shape()).collect();
-        let lengths: Vec<usize> = batch.iter().map(|c| c.ids.len()).collect();
-        let passes = plan_passes(&lengths, &shapes);
-        let run_single = |model: &Model| -> Vec<Vec<f32>> {
-            batch.iter().map(|c| model.run(&c.ids).unwrap()).collect()
+        let plans: Vec<Vec<Pass>> = batches
+            .iter()
+            .map(|batch| {
+                let lengths: Vec<usize> = batch.iter().map(|c| c.ids.len()).collect();
+                plan_passes(&lengths, &shapes)
+            })
+            .collect();
+        let rows: usize = batches.iter().map(Vec::len).sum();
+        let run_single = || -> Vec<Vec<f32>> {
+            batches
+                .iter()
+                .flatten()
+                .map(|c| model.run(&c.ids).unwrap())
+                .collect()
         };
-        let run_multi = |model: &Model| -> Vec<Vec<f32>> {
-            let mut outputs = vec![Vec::new(); batch.len()];
-            for pass in &passes {
-                match pass {
-                    Pass::Single(index) => outputs[*index] = model.run(&batch[*index].ids).unwrap(),
-                    Pass::MultiRow { program, rows } => {
-                        let tokens: Vec<&[u32]> =
-                            rows.iter().map(|&i| batch[i].ids.as_slice()).collect();
-                        let vectors = programs[*program].run(model, &tokens).unwrap();
-                        for (&index, vector) in rows.iter().zip(vectors) {
-                            outputs[index] = vector;
+        let run_multi = || -> Vec<Vec<f32>> {
+            let mut all = Vec::with_capacity(rows);
+            for (batch, passes) in batches.iter().zip(&plans) {
+                let mut outputs = vec![Vec::new(); batch.len()];
+                for pass in passes {
+                    match pass {
+                        Pass::Single(index) => {
+                            outputs[*index] = model.run(&batch[*index].ids).unwrap()
+                        }
+                        Pass::MultiRow { program, rows } => {
+                            let tokens: Vec<&[u32]> =
+                                rows.iter().map(|&i| batch[i].ids.as_slice()).collect();
+                            let vectors = programs[*program].run(model, &tokens).unwrap();
+                            for (&index, vector) in rows.iter().zip(vectors) {
+                                outputs[index] = vector;
+                            }
                         }
                     }
                 }
+                all.extend(outputs);
             }
-            outputs
+            all
         };
-        let reference = run_single(model);
-        let candidate = run_multi(model);
-        let cosines: Vec<f64> = reference
+        let reference = run_single();
+        let candidate = run_multi();
+        let min_cosine = reference
             .iter()
             .zip(&candidate)
             .map(|(a, b)| cosine(a, b))
-            .collect();
+            .fold(f64::INFINITY, f64::min);
         let identical = reference
             .iter()
             .zip(&candidate)
@@ -1465,38 +1512,42 @@ mod hardware {
                 let load_before = load_average();
                 let started = Instant::now();
                 let outputs = if path == "single" {
-                    run_single(model)
+                    run_single()
                 } else {
-                    run_multi(model)
+                    run_multi()
                 };
                 let wall = ms(started);
-                assert_eq!(outputs.len(), 64);
+                assert_eq!(outputs.len(), rows);
                 samples.push(json!({
                     "repeat": repeat, "path": path, "wall_ms": wall,
-                    "rows_per_second": 64_000.0 / wall,
+                    "rows_per_second": rows as f64 * 1000.0 / wall,
                     "load_before": load_before, "load_after": load_average(),
                 }));
             }
         }
-        let mut token_counts = lengths.clone();
+        let mut token_counts: Vec<usize> = batches.iter().flatten().map(|c| c.ids.len()).collect();
         token_counts.sort();
+        let all_passes = || plans.iter().flatten();
         let pass_counts: Vec<Value> = (0..shapes.len())
             .map(|program| {
-                json!({"program": shapes[program].label(), "passes": passes.iter().filter(|p| matches!(p, Pass::MultiRow { program: q, .. } if *q == program)).count()})
+                json!({"program": shapes[program].label(), "passes": all_passes().filter(|p| matches!(p, Pass::MultiRow { program: q, .. } if *q == program)).count()})
             })
             .collect();
-        drop(programs);
+        let texts: Vec<&str> = batches
+            .iter()
+            .flatten()
+            .map(|c| c.text_sha256.as_str())
+            .collect();
+        let all_rows: Vec<&&Chunk> = batches.iter().flatten().collect();
         json!({
-            "rows": batch.len(),
-            "export_seqs": [batch[0].seq, batch[batch.len() - 1].seq],
-            "batch_text_sha256": sha(batch.iter().map(|c| c.text_sha256.as_str()).collect::<Vec<_>>().join("\n").as_bytes()),
-            "token_counts_sorted": token_counts,
-            "rungs": rungs, "compiles": compiles,
-            "programs": shapes.iter().map(|s| s.label()).collect::<Vec<_>>(),
+            "batches": batches.len(), "rows": rows,
+            "export_seqs": [all_rows[0].seq, all_rows[rows - 1].seq],
+            "text_sha256_list_sha256": sha(texts.join("\n").as_bytes()),
+            "token_counts_sorted": if batches.len() == 1 { json!(token_counts) } else { Value::Null },
+            "composed_tokens_total": token_counts.iter().sum::<usize>(),
             "multi_row_passes": pass_counts,
-            "single_row_passes": passes.iter().filter(|p| matches!(p, Pass::Single(_))).count(),
-            "executables_held": held,
-            "min_cosine_multi_vs_single": cosines.iter().copied().fold(f64::INFINITY, f64::min),
+            "single_row_passes": all_passes().filter(|p| matches!(p, Pass::Single(_))).count(),
+            "min_cosine_multi_vs_single": min_cosine,
             "identical_rows": identical,
             "samples": samples,
         })
