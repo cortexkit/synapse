@@ -695,8 +695,8 @@ old = """
                     Ok(joined) => joined,
                     Err(_) => {
                         #[cfg(test)]
-                        self.channel.pass_classify_gate().await;
-                        return Err(self.channel.expired_wait(&waits));
+                        self.channel.pass_classify_gate(GateSite::Caller).await;
+                        return Err(self.channel.expired_wait(&waits, deadline));
                     }
                 },
                 None => task.await,
@@ -713,8 +713,8 @@ new = """
                     Ok(joined) => joined,
                     Err(_) => {
                         #[cfg(test)]
-                        self.channel.pass_classify_gate().await;
-                        return Err(self.channel.expired_wait(&waits));
+                        self.channel.pass_classify_gate(GateSite::Caller).await;
+                        return Err(self.channel.expired_wait(&waits, deadline));
                     }
                 },
                 None => (&mut task.0).await,
