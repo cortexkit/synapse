@@ -2,23 +2,20 @@
 
 ## Status and decision
 
-**Not measured on this host: the global ANE lock is held by production.**
-No worker was started and no layer dispatch was measured in either attempted
-profiling arm. Do not interpret the refusal latencies below as embedding latency.
-The cold-shape live reproduction is **not run**: it never reached shape admission.
+Measured on an Apple M4 Mac mini on 2026-10-09 (Part A), with the cold-shape
+incident reproduced live (Part B). The production Mac could not be used: its
+running Synapse holds the machine-wide direct-ANE lock, and bypassing that lock
+could let a second compiler exhaust the Neural Engine's ~100 loaded-executable
+capacity and break production embedding.
 
-The task reviewer explicitly instructed us to preserve the global lock, deliver
-Part C and the code-level Part B analysis, and leave a runnable Part A harness for
-an otherwise idle second Mac. The lock must not be bypassed by changing `HOME`,
-using another lock path, or stopping a production worker. A second compiler could
-exhaust the Neural Engine's approximately 100 loaded-executable capacity and break
-production embedding. Production traffic would also contaminate timings.
+What the measurements say:
 
-The supplied prior measurements remain background, **not results of this run**:
-6,341 chunks / 121 s / 52 texts/s / call p50 2.06 s on direct ANE; Metal 30.5 s;
-llama.cpp Q8 79 s. The supplied one-row measurements were 100 vs 23 ms at 512
-tokens and 24.6 vs 16.8 ms at 128 tokens. These numbers have no paired load
-samples here and are not used to estimate dispatch overhead.
+1. A short row costs about 22 ms, almost all of it in the 28 layer dispatches,
+   and rows run strictly one after another, also inside a batch. The next
+   experiment is a graph that runs several rows per dispatch.
+2. A first-time shape compile holds the lane for 11-27 s, and other requests are
+   refused as `model_loading` meanwhile. The fix shape is in Part B.
+3. Module-side work adds about 240-370 ms to a 64-row call (15-20%).
 
 ## Method and runnable commands
 
@@ -170,20 +167,57 @@ For runtimes that provide nonzero hardware execution-time counters:
   serialization points below, but actual throughput and device idle gaps still
   need measurement. Two configured permits alone cannot provide ANE overlap.
 
-## Part A tables — measurement pending
+## Part A — where the time goes (M4 Mac mini, 2026-10-09)
 
-All cells below are **not measured on this host: the global ANE lock is held by
-production**. There is no defensible fixed dispatch cost, token slope or 64-row
-overhead/compute split yet.
+Measured on an Apple M4 (Mac16,10, 10 cores, 16 GB, macOS 26A428) at master
+847625b3 with the harness fix that reads vectors from `result.vectors`. No
+other Synapse ran; one-minute load stayed between 3.0 and 4.1. Both arms ran
+back to back; numbers are medians across them. Raw call records are in
+`m4-2026-10-09/` (no input texts, hashes only).
 
-| Probe | Padded shape | Module tokenize/admit/queue/locks | IPC residual | Gather/pack/readback/tail | ANE per-layer/row | Inter-row gaps | Load |
-| --- | ---: | --- | --- | --- | --- | --- | --- |
-| 32 composed tokens | 128 | not measured | not measured | not measured | not measured | n/a | not measured |
-| 128 composed tokens | 128 | not measured | not measured | not measured | not measured | n/a | not measured |
-| 256 composed tokens | 256 | not measured | not measured | not measured | not measured | n/a | not measured |
-| 512 composed tokens | 512 | not measured | not measured | not measured | not measured | n/a | not measured |
-| Actual AFT 64-row batch | per-row ladder | not measured | not measured | not measured | not measured | not measured | not measured |
-| Two AFT calls in flight | per-row ladder | not measured | not measured | not measured | not measured | not measured | not measured |
+**Single rows.** One row is 28 sequential layer programs. Host-side work
+(embedding gather, input and mask packing, readback, pooling) is about 0.2 ms
+of a 128-shape row; the rest is layer submit-and-wait.
+
+| Probe | Padded shape | Call wall ms | Worker row ms | Per layer ms | Host-side ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32 tokens | 128 | 23.2 | 21.9 | 0.77 | 0.2 |
+| 128 tokens | 128 | 23.8 | 21.9 | 0.77 | 0.2 |
+| 256 tokens | 256 | 39.0 | 40.9 | 1.42 | 0.5 |
+| 512 tokens | 512 | 103.9 | 100.9 | 3.55 | 1.4 |
+| 1,024 tokens | 1024 | (cold only) | 399.7 | 14.12 | 3.9 |
+
+Per-layer time grows faster than the token count past 256 (attention), but
+falls to only 0.77 ms at 128 tokens, so a short row is dominated by a cost that
+does not shrink with its length.
+
+**First-time shape compiles** (worker `admit`, cached=false): 128 in 10.7-11.9 s,
+256 in 17.4 s, 512 in 21.4 s, 1,024 in 26.8 s. Evictions took 18-20 ms.
+
+**AFT's real 64-row batch** (first batch of the engram export, about 120 tokens
+per row, all at shape 128):
+
+| Call | Wall ms | Engine dispatch ms | Module and IPC ms |
+| --- | ---: | ---: | ---: |
+| 64 rows, first | 1,778-1,814 | 1,436-1,446 | 340-370 |
+| 64 rows, repeat | 1,652-1,789 | 1,414-1,528 | 238-262 |
+| Two 64-row calls at once, each | 2,774-3,451 | 2,519-2,868 | 211-583 |
+
+The module splits each 64-row call into eight 8-row engine calls of 190-234 ms;
+inside one, rows run one after another with under 0.01 ms between them. Two
+concurrent calls serialise completely, so overlap buys no throughput. A row in
+a batch costs about the same 22-24 ms as a lone row: batching today saves only
+the per-call module cost, not Neural Engine time. Steady state is about 40 rows
+per second on the M4.
+
+**Hardware counters.** The hardware arm's `hardware_ms` was 0 for every layer
+on the M4: the private statistics call does not report device time there. The
+split between Neural Engine compute and per-dispatch or weight-read cost is
+therefore inferred, not measured. The flat ~0.6-0.8 ms per layer at short
+shapes fits re-reading each layer's weights for every row (about 0.9 GB of
+fp16 layer weights per row, roughly 40 GB/s at 22 ms). The direct test is a
+graph that runs several rows in one dispatch: if four rows take far less than
+four times 22 ms, per-row weight traffic is the cost.
 
 ### Attempted runs on the busy host
 
@@ -194,6 +228,107 @@ rest returned `model_loading` while the refused load was pending). No row ran,
 so those records hold no timings and are not kept here. The harness now fails
 fast on the first non-loading readiness error instead of labelling refusals as
 warm or cold calls.
+
+## Part B — incident explained from code
+
+### What the code establishes (high confidence)
+
+**Yes: a serving engine inference holds the catalog lane mutex, including a
+first-time shape compile.** The catalog mutex protects serving execution, not
+only model loading.
+
+| Serialization point | Exact source and lifetime |
+| --- | --- |
+| Catalog serving lane | `crates/synapse-module/src/lib.rs:12291–12303`: acquire the lane's owned mutex before execution; `:12308–12310`: acquire the execution permit afterwards; `:12387–12392`: pass `(permit, catalog_guard, _activity)` to direct-ANE `infer_guarded` |
+| Detached direct-ANE inference | `crates/synapse-module/src/worker_host/mod.rs:5331–5357`: spawn the inference task and retain the supplied guards; `:5363–5399`: inference exchanges are awaited within that task. A cancelled caller does not release the guard before the worker reply drains |
+| Residency before inference | `worker_host/mod.rs:4090–4148`, especially `:4123–4132`: obtain a shape lease before the inference callback and release it afterwards; `:3967–4049`: the lease path can wait/admit/evict; `:4394–4436`: the driver performs shape admission |
+| Worker stream | `worker_host/mod.rs:4644–4659`: one Tokio mutex protects the stream session; `:4775–4819`: `exchange_inner` holds it across writing request/raw frames and reading response/raw frames. Shape admission uses that same exchange (`:4867–4905`) |
+| Worker loop | `crates/synapse-worker-ane-direct/src/worker.rs:183–205,245–261`: one request at a time; admission calls `Model::admit` synchronously before replying. `:350–389`: sequences run rows one after another |
+| First-time compilation | `crates/synapse-worker-ane-direct/src/backend.rs:224–234`: `Model::admit` invokes graph compilation; `:251–254`: a resident shape returns immediately; `:259–307`: otherwise build/compile every layer before publishing the resident entry. Qwen has 28 layers |
+| Per-row layer work | `backend.rs:389–421`: execute the layer programs in order; no per-layer host copy between their IOSurfaces |
+| Machine-global owner fence | `worker_host/mod.rs:3429,3809–3829`: acquire the per-user direct-ANE advisory lock; `:5112` puts its inherited descriptor in worker configuration and `:971–972` supplies it as worker stdin (`:5031–5035` documents the duplicated descriptor lifetime). `lib.rs:6663–6666` uses the default lock; this is separate from the per-model catalog mutex |
+
+The residency supervisor controls admission, leases, budget and eviction; it is
+not by itself an inference-overlap guarantee. Its waiters do not hold the socket
+while waiting for admission, but the **compile RPC does hold the socket**. Even
+if the catalog mutex were shortened, the single stream and worker loop would
+still serialize calls. The configured two execution permits are a module-wide
+limit, not two independent hardware streams.
+
+**Important scope nuance:** an `embed.batch` logical call is not necessarily one
+continuous lock hold across all 64 rows. `lib.rs:11489–11596` schedules bounded
+engine batches; `:11557–11566` awaits each `execute_embedding`, and `:11581–11585`
+yields between them. Each engine batch acquires/retains the catalog guard. A cold
+compile blocks its entire engine inference, and resolver waiters for the same
+lane, even when the encompassing AFT call has multiple quanta.
+
+### Why a loaded lane can say “loading”
+
+`resolve_serving_model`, `lib.rs:25121–25127`, tries the **same catalog lane
+mutex** and waits at most `min(request_budget, 5000)` ms. A failure to acquire it
+calls `catalog_loading_response`. `lib.rs:25154–25164` returns
+`deadline_exceeded` for budgets at most five seconds, otherwise `model_loading`
+with `catalog lane '<lane>' is loading` and retry-after 250 ms. It does not check
+whether the owner is loading, compiling a shape, or doing ordinary inference.
+The lock owner's readiness task is also detached (`:25141–25150`), with a
+separate five-second readiness wait. The resolver guard is not transferred
+straight to serving: execution acquires the same lane lock again later.
+
+Therefore the supplied 09:02:56Z admission and the 09:03:31Z `model_loading`
+response are **consistent with** a cold-shape compile holding that lane mutex.
+A shape compile does not require a worker restart or loss of model residency.
+The request at 09:03:31Z can be rejected before its own admission, so no admitted
+closing line is owed for that refusal. Requests that already passed resolution
+can queue later on the execution lane lock as well.
+
+This is a code-supported mechanism, **not proof of the historical cause**.
+The missing closing event for `inline-154-456` does not identify its error, shape,
+or compile duration. No production logs/store were read for this task. The
+09:03:39Z recovery could also follow long inference, scheduling contention, or
+another failure/drain path. Part C closes returned-error paths going forward;
+it cannot retroactively classify that request.
+
+### Live reproduction (M4 Mac mini, 2026-10-09)
+
+Reproduced on an Apple M4 (Mac16,10, 16 GB, macOS 26A428) with no other Synapse
+running, at one-minute load 3.2-3.5. The lane was loaded and serving shapes
+128, 256 and 512 when `incident-cold-1024` started:
+
+- the 1,024 shape compiled for 26.8 s (worker `admit shape=1024 cached=false`),
+  and the call took 27.3-27.5 s;
+- `incident-concurrent-short`, sent one second later, was refused with
+  `model_loading` after 5.0 s in both runs, although the model was loaded and
+  nothing restarted;
+- `incident-short-after` waited 10.8 s: admitting 1,024 had evicted the
+  oldest unleased shape, 128, so this short request recompiled it (10.7 s).
+
+So a first-time shape compile holds the lane for its whole duration, other
+requests are mislabelled `model_loading`, and the eviction it forces can make
+the next short request pay a second compile.
+
+### Recommended fix shape — NOT implemented
+
+1. Separate lane **state/lifetime protection** from **execution serialization**.
+   Hold the catalog mutex only while inspecting/publishing load and self-check
+   state and selecting a live model generation; represent in-flight lifetime
+   separately so unload/reload cannot invalidate an inference. Do not merely
+   delete the guard: cancellation/drain and numerical self-check guarantees
+   must survive.
+2. Make first-time shape preparation single-flight in residency management,
+   with explicit `shape_compiling`/queue state and absolute-deadline accounting.
+   Do not hold the catalog metadata mutex through synchronous compilation or
+   worker inference. Preserve the machine-global ownership/capacity fence.
+3. Report loading only for actual loading. Report ordinary execution/residency
+   contention with an appropriate busy/queue/deadline classification rather
+   than the misleading model-loading message. Preserve distinct caller deadline
+   and detached worker-drain behavior.
+4. Add private-daemon tests for warm-lane contention, cold compile plus short
+   waiter, cancellation/drain, concurrent self-check, unload and generation
+   replacement before changing these lock scopes.
+
+This fixes head-of-line blocking/misreporting, not necessarily throughput: the
+socket and worker loop remain serial. Decide row batching, layer fusion or other
+compute changes only after obtaining the missing hardware/dispatch split.
 
 ## Part C — admitted-error closing events
 
@@ -255,36 +390,29 @@ that still passed while the closing event was removed.
 
 ## Conclusions ranked by confidence
 
-1. **High, source- and failure-evidence-backed:** the global advisory file lock
-   prevented the private worker from starting on this host. No device performance claim is valid.
-2. **High, source-backed:** serving retains the catalog lane mutex and execution
-   permit through direct-ANE shape admission/compile and inference/drain. Bulk
-   logical calls release/reacquire that guard between engine quanta.
-3. **High, source-backed:** a resolver lock timeout misclassifies ordinary serving
-   or cold-shape contention as `model_loading` for budgets greater than five
-   seconds. A worker restart is not necessary for this symptom.
-4. **High, source-backed:** requests/rows/layers are serial at the channel/worker;
-   two module permits do not imply overlapping Neural Engine execution.
-5. **High, tested and mutation-defended:** returned admitted embed/rerank errors
+1. **High, measured on M4:** a short row costs about 22 ms; host-side work is
+   about 0.2 ms of it, and the rest is 28 sequential layer dispatches. Rows run
+   one after another, also inside a batch, and concurrent calls serialise.
+2. **High, measured and source-backed:** a first-time shape compile holds the
+   catalog lane mutex for its full 11-27 s. Concurrent requests are refused as
+   `model_loading` after 5 s although the model is loaded, and the eviction the
+   compile forces can make the next short request recompile a shape.
+3. **High, tested and mutation-defended:** returned admitted embed/rerank errors
    now emit a closing perf event; success/error response contracts are preserved.
-6. **Unresolved, not ranked as a performance result:** relative dispatch versus
-   compute cost, token slope, CPU gather/readback/tail share and idle gaps.
+4. **Medium, measured:** module-side work adds 240-370 ms to a 64-row call.
+5. **Inferred, not measured:** the flat per-layer floor at short shapes is
+   per-row weight traffic or dispatch cost rather than arithmetic. The M4 does
+   not report device time through the private statistics call, so a multi-row
+   dispatch experiment is the test.
 
 ## Unresolved
 
-- The exact cause/shape/error of the historical 09:02:56Z admitted request remains
-  unknown. The code establishes a plausible failure mechanism, not attribution.
-- All requested timing tables and the live cold-compile reproduction await the
-  second Mac. Raw occupied-host refusals cannot be substituted for these results.
-- Runtime hardware stats may be zero, stale or perturb timing on another macOS
-  version. Compare the back-to-back arms and keep first-use samples separate.
-- The normal host layer timer combines submission and waiting; only valid hardware
-  counters permit a non-hardware/device split. The IPC residual also combines
-  host supervision, socket queueing, codecs and scheduling.
-- The actual AFT 64-row call can cause residency churn or multiple RPCs; capture
-  shape admissions/evictions and do not assume 64 identical padded rows.
-- Concurrent-window attribution in the summary is deliberately conservative;
-  analyze union occupancy and job-specific waits before claiming overlap.
-- The final fail-fast harness is compiler/test verified and its private catalog
-  installation path was exercised, but successful inference on an unoccupied Mac
-  was not available to validate the full measurement sequence end to end.
+- The exact cause of the historical 09:02:56Z stall on the production Mac is not
+  proven. The M4 reproduction shows the mechanism produces that symptom.
+- The M4 reports 0 for the private hardware statistics, so the split between
+  Neural Engine arithmetic and per-dispatch or weight-read cost is inferred.
+- The layer timer combines submission and waiting. The module-and-IPC residual
+  combines tokenization, socket transfer, vector encoding and scheduling; its
+  parts are not separated.
+- These are M4 numbers. The production Mac is an M5 Max; per-row costs there may
+  differ, though a 512-token row measured about 100 ms on both.

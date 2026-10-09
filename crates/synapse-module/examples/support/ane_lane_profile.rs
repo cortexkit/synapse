@@ -33,7 +33,7 @@ async fn measured(
         .as_micros();
     let error = sanitized_error(&body["result"]["error"]);
     if error.is_null() {
-        let vectors = body["result"]["payload"]["vectors"]
+        let vectors = body["result"]["vectors"]
             .as_array()
             .context("embedding vectors")?;
         ensure!(vectors.len() == texts.len(), "embedding row count mismatch");
@@ -53,7 +53,7 @@ async fn measured(
     }
     Ok(
         json!({"label":label,"load_1m":load,"load_end_1m":load_one_minute()?,"wall_ms":ms,
-        "rows":texts.len(),"counts":body["result"]["payload"]["real_token_counts"],
+        "rows":texts.len(),"counts":body["result"]["real_token_counts"],
         "error":error,"unix_us":unix_us}),
     )
 }

@@ -1,0 +1,676 @@
+{
+  "input_sha256": "1db27b7fd308b1e2d805f034b9f9f990cab5e321d04484f9d6b97980bd5ded4c",
+  "meta_sha256": "bfcef3e0035a9854b5bcc92bab3c500b566067885e9b33f02d1411199a83cfa4",
+  "records": [
+    {
+      "counts": null,
+      "error": {
+        "class": "transient",
+        "code": "model_loading",
+        "retry_after_ms": 250,
+        "safe_to_retry_same_request": true
+      },
+      "label": "initial-0",
+      "load_1m": 4.08,
+      "load_end_1m": 3.99,
+      "rows": 1,
+      "unix_us": 1791568898760961,
+      "wall_ms": 5004.643833
+    },
+    {
+      "counts": null,
+      "error": {
+        "class": "transient",
+        "code": "model_loading",
+        "retry_after_ms": 250,
+        "safe_to_retry_same_request": true
+      },
+      "label": "initial-1",
+      "load_1m": 3.99,
+      "load_end_1m": 3.83,
+      "rows": 1,
+      "unix_us": 1791568904054159,
+      "wall_ms": 5001.648833
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "initial-2",
+      "load_1m": 3.83,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934755006,
+      "wall_ms": 30435.874832999998
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "cold-32",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934842097,
+      "wall_ms": 81.238167
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "warm-32-0",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934869479,
+      "wall_ms": 24.420542
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "warm-32-1",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934896622,
+      "wall_ms": 24.316875000000003
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "warm-32-2",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934925089,
+      "wall_ms": 24.396666
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "warm-32-3",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934951431,
+      "wall_ms": 24.002875
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "warm-32-4",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568934977499,
+      "wall_ms": 24.024459
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "cold-128",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935006262,
+      "wall_ms": 26.397416
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "warm-128-0",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935034924,
+      "wall_ms": 26.138541
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "warm-128-1",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935062995,
+      "wall_ms": 25.671792
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "warm-128-2",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935088978,
+      "wall_ms": 23.92
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "warm-128-3",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935114116,
+      "wall_ms": 23.252959
+    },
+    {
+      "counts": [
+        128
+      ],
+      "error": null,
+      "label": "warm-128-4",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935140542,
+      "wall_ms": 24.007417
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "cold-256",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935183745,
+      "wall_ms": 40.981542000000005
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "warm-256-0",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935284980,
+      "wall_ms": 99.157041
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "warm-256-1",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935330219,
+      "wall_ms": 42.218667
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "warm-256-2",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935434127,
+      "wall_ms": 100.110959
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "warm-256-3",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935486185,
+      "wall_ms": 49.526624999999996
+    },
+    {
+      "counts": [
+        256
+      ],
+      "error": null,
+      "label": "warm-256-4",
+      "load_1m": 3.66,
+      "load_end_1m": 3.66,
+      "rows": 1,
+      "unix_us": 1791568935533389,
+      "wall_ms": 43.346500000000006
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "cold-512",
+      "load_1m": 3.66,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957165525,
+      "wall_ms": 21629.201292
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "warm-512-0",
+      "load_1m": 3.4,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957279914,
+      "wall_ms": 110.829375
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "warm-512-1",
+      "load_1m": 3.4,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957386490,
+      "wall_ms": 103.921708
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "warm-512-2",
+      "load_1m": 3.4,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957493233,
+      "wall_ms": 103.436334
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "warm-512-3",
+      "load_1m": 3.4,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957600130,
+      "wall_ms": 104.301292
+    },
+    {
+      "counts": [
+        512
+      ],
+      "error": null,
+      "label": "warm-512-4",
+      "load_1m": 3.4,
+      "load_end_1m": 3.4,
+      "rows": 1,
+      "unix_us": 1791568957705873,
+      "wall_ms": 103.41250000000001
+    },
+    {
+      "counts": [
+        1024
+      ],
+      "error": null,
+      "label": "incident-cold-1024",
+      "load_1m": 3.4,
+      "load_end_1m": 3.32,
+      "rows": 1,
+      "unix_us": 1791568984962815,
+      "wall_ms": 27253.72825
+    },
+    {
+      "counts": null,
+      "error": {
+        "class": "transient",
+        "code": "model_loading",
+        "retry_after_ms": 250,
+        "safe_to_retry_same_request": true
+      },
+      "label": "incident-concurrent-short",
+      "load_1m": 3.4,
+      "load_end_1m": 3.37,
+      "rows": 1,
+      "unix_us": 1791568963717891,
+      "wall_ms": 5003.937458
+    },
+    {
+      "counts": [
+        32
+      ],
+      "error": null,
+      "label": "incident-short-after",
+      "load_1m": 3.32,
+      "load_end_1m": 3.19,
+      "rows": 1,
+      "unix_us": 1791568995793033,
+      "wall_ms": 10826.837540999999
+    },
+    {
+      "counts": [
+        21,
+        98,
+        51,
+        101,
+        25,
+        36,
+        44,
+        19,
+        60,
+        22,
+        53,
+        60,
+        26,
+        25,
+        24,
+        31,
+        88,
+        39,
+        28,
+        49,
+        56,
+        54,
+        28,
+        28,
+        27,
+        34,
+        37,
+        33,
+        36,
+        36,
+        36,
+        32,
+        41,
+        35,
+        45,
+        55,
+        30,
+        28,
+        31,
+        25,
+        46,
+        22,
+        27,
+        30,
+        88,
+        22,
+        39,
+        24,
+        39,
+        24,
+        39,
+        24,
+        57,
+        24,
+        42,
+        24,
+        45,
+        24,
+        57,
+        24,
+        57,
+        24,
+        36,
+        24
+      ],
+      "error": null,
+      "label": "aft64-cold",
+      "load_1m": 3.19,
+      "load_end_1m": 3.19,
+      "rows": 64,
+      "unix_us": 1791568997611851,
+      "wall_ms": 1813.85475
+    },
+    {
+      "counts": [
+        21,
+        98,
+        51,
+        101,
+        25,
+        36,
+        44,
+        19,
+        60,
+        22,
+        53,
+        60,
+        26,
+        25,
+        24,
+        31,
+        88,
+        39,
+        28,
+        49,
+        56,
+        54,
+        28,
+        28,
+        27,
+        34,
+        37,
+        33,
+        36,
+        36,
+        36,
+        32,
+        41,
+        35,
+        45,
+        55,
+        30,
+        28,
+        31,
+        25,
+        46,
+        22,
+        27,
+        30,
+        88,
+        22,
+        39,
+        24,
+        39,
+        24,
+        39,
+        24,
+        57,
+        24,
+        42,
+        24,
+        45,
+        24,
+        57,
+        24,
+        57,
+        24,
+        36,
+        24
+      ],
+      "error": null,
+      "label": "aft64-warm",
+      "load_1m": 3.19,
+      "load_end_1m": 3.02,
+      "rows": 64,
+      "unix_us": 1791568999276440,
+      "wall_ms": 1652.185375
+    },
+    {
+      "counts": [
+        21,
+        98,
+        51,
+        101,
+        25,
+        36,
+        44,
+        19,
+        60,
+        22,
+        53,
+        60,
+        26,
+        25,
+        24,
+        31,
+        88,
+        39,
+        28,
+        49,
+        56,
+        54,
+        28,
+        28,
+        27,
+        34,
+        37,
+        33,
+        36,
+        36,
+        36,
+        32,
+        41,
+        35,
+        45,
+        55,
+        30,
+        28,
+        31,
+        25,
+        46,
+        22,
+        27,
+        30,
+        88,
+        22,
+        39,
+        24,
+        39,
+        24,
+        39,
+        24,
+        57,
+        24,
+        42,
+        24,
+        45,
+        24,
+        57,
+        24,
+        57,
+        24,
+        36,
+        24
+      ],
+      "error": null,
+      "label": "aft64-overlap-a",
+      "load_1m": 3.02,
+      "load_end_1m": 3.02,
+      "rows": 64,
+      "unix_us": 1791569002378566,
+      "wall_ms": 3098.8995830000003
+    },
+    {
+      "counts": [
+        21,
+        98,
+        51,
+        101,
+        25,
+        36,
+        44,
+        19,
+        60,
+        22,
+        53,
+        60,
+        26,
+        25,
+        24,
+        31,
+        88,
+        39,
+        28,
+        49,
+        56,
+        54,
+        28,
+        28,
+        27,
+        34,
+        37,
+        33,
+        36,
+        36,
+        36,
+        32,
+        41,
+        35,
+        45,
+        55,
+        30,
+        28,
+        31,
+        25,
+        46,
+        22,
+        27,
+        30,
+        88,
+        22,
+        39,
+        24,
+        39,
+        24,
+        39,
+        24,
+        57,
+        24,
+        42,
+        24,
+        45,
+        24,
+        57,
+        24,
+        57,
+        24,
+        36,
+        24
+      ],
+      "error": null,
+      "label": "aft64-overlap-b",
+      "load_1m": 3.02,
+      "load_end_1m": 3.02,
+      "rows": 64,
+      "unix_us": 1791569002732449,
+      "wall_ms": 3451.154667
+    }
+  ],
+  "schema": 1
+}
