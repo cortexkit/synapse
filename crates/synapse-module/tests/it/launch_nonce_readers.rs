@@ -234,6 +234,16 @@ fn helper_exception_allows_only_removals_in_the_helper_file() {
 // includes src directories, not tests/ fixtures, and this scan excludes bench/.
 // This intentionally enforces a spelling convention, not dataflow.
 fn unstripped_commands(path: &Path, source: &str) -> Vec<String> {
+    // A file whose first code line is `#![cfg(test)]` is compiled only for
+    // tests, the whole-file form of the `#[cfg(test)]` items skipped below.
+    if source
+        .lines()
+        .map(|line| code_part(line).trim())
+        .find(|code| !code.is_empty())
+        == Some("#![cfg(test)]")
+    {
+        return Vec::new();
+    }
     let mut offenders = Vec::new();
     let mut test_item = false;
     let mut depth = 0isize;
@@ -309,4 +319,18 @@ fn command_scan_control_reports_unstripped_constructor_by_file_and_line() {
         "#[cfg(test)]\nmod tests {\nlet command = Command::new(\"worker\");\n}\n"
     )
     .is_empty());
+    // A whole test-only file is skipped, but only when the attribute leads the
+    // file: the same attribute after production code skips nothing.
+    assert!(unstripped_commands(
+        path,
+        "// test file\n#![cfg(test)]\nlet command = Command::new(\"worker\");\n"
+    )
+    .is_empty());
+    assert_eq!(
+        unstripped_commands(
+            path,
+            "let command = Command::new(\"worker\");\n#![cfg(test)]\n"
+        ),
+        vec!["crates/control/src/lib.rs:1: let command = Command::new(\"worker\");"]
+    );
 }

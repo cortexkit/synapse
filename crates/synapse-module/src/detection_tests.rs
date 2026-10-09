@@ -1,3 +1,8 @@
+// Compiled only for tests. The launch-nonce source scan skips files marked this
+// way, so these tests can hand run_probe a bare command and prove it strips the
+// nonce itself.
+#![cfg(test)]
+
 use super::*;
 use catalog_probe::{cached_probe, run_probe, ProbeKind, PROBE_TIMEOUT};
 use std::process::{Command, Stdio};

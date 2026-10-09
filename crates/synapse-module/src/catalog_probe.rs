@@ -62,7 +62,7 @@ pub(crate) fn cached_probe(worker: &Path, kind: ProbeKind) -> ProbeResult {
     // with another potentially ten-second probe until the module restarts.
     entry
         .get_or_init(|| {
-            let mut command = Command::new(worker);
+            let mut command = synapse_core::without_launch_nonce(Command::new(worker));
             command.arg(kind.argument());
             run_probe(&mut command, PROBE_TIMEOUT)
         })
