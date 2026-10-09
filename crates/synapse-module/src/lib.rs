@@ -16,7 +16,9 @@ use std::{
 
 mod ane_artifact;
 mod catalog;
+mod catalog_migration;
 mod catalog_probe;
+use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
 // Provider adapters stay module-private so credentials and remote identity checks
@@ -2237,6 +2239,7 @@ impl SynapseHandler {
         validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
         let release_catalog = runtime_release_catalog()?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
+        migrate_compiled_catalog_digests(&store, &model_cache)?;
         let catalog_models =
             sync_and_load_catalog_models(&store, &config, &release_catalog, &model_cache)?;
         // A machine-identity probe that cannot be established refuses the boot
@@ -23088,6 +23091,43 @@ mod catalog_runtime_tests {
     }
 
     #[test]
+    fn catalog_self_check_id_matches_the_runtime_key_for_all_seven_fields() {
+        let (root, state) = isolated_catalog_state("self-check-pure-id", false);
+        for entry in &state.runtime.release_catalog.models {
+            for backend in &entry.backends {
+                let (id, key) = catalog_self_check_key(&state, entry, backend).unwrap();
+                let pure_id = catalog_self_check_id(
+                    key["catalog_id"].as_str().unwrap(),
+                    key["manifest_digest"].as_str().unwrap(),
+                    key["backend"].as_str().unwrap(),
+                    key["fingerprint"].as_str().unwrap(),
+                    &key["engine_identity"],
+                    key["os_build"].as_str().unwrap(),
+                    key["fixture_revision"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(pure_id, id);
+                assert_eq!(id, sha256_hex(catalog::jcs(&key).unwrap().as_bytes()));
+                for field in [
+                    "catalog_id",
+                    "manifest_digest",
+                    "backend",
+                    "fingerprint",
+                    "engine_identity",
+                    "os_build",
+                    "fixture_revision",
+                ] {
+                    let mut changed = key.clone();
+                    changed[field] = json!("different");
+                    assert_ne!(id, sha256_hex(catalog::jcs(&changed).unwrap().as_bytes()));
+                }
+            }
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn catalog_self_check_generation_fences_late_completion_and_projects_mirrors() {
         let (root, state) = isolated_catalog_state("self-check-generation", true);
         let entry = state
@@ -24735,6 +24775,27 @@ fn sync_installed_catalog_slots(state: &ModuleState) -> Result<(), WireOperation
     }
     Ok(())
 }
+pub(crate) fn catalog_self_check_id(
+    catalog_id: &str,
+    manifest_digest: &str,
+    backend: &str,
+    fingerprint: &str,
+    engine_identity: &Value,
+    os_build: &str,
+    fixture_revision: &str,
+) -> Result<String, String> {
+    let key = json!({
+        "catalog_id": catalog_id,
+        "manifest_digest": manifest_digest,
+        "backend": backend,
+        "fingerprint": fingerprint,
+        "engine_identity": engine_identity,
+        "os_build": os_build,
+        "fixture_revision": fixture_revision,
+    });
+    Ok(sha256_hex(catalog::jcs(&key)?.as_bytes()))
+}
+
 fn catalog_self_check_key(
     state: &ModuleState,
     entry: &catalog::CatalogEntry,
@@ -24774,7 +24835,16 @@ fn catalog_self_check_key(
             .to_string()
     };
     let key = json!({"catalog_id":entry.id,"manifest_digest":entry.manifest_digest(),"backend":backend.backend,"fingerprint":backend.fingerprint,"engine_identity":identity,"os_build":state.machine_profile.os_build,"fixture_revision":fixture_revision});
-    let id = sha256_hex(catalog::jcs(&key).map_err(catalog_store_error)?.as_bytes());
+    let id = catalog_self_check_id(
+        &entry.id,
+        &entry.manifest_digest(),
+        &backend.backend,
+        &backend.fingerprint,
+        &key["engine_identity"],
+        &state.machine_profile.os_build,
+        &fixture_revision,
+    )
+    .map_err(catalog_store_error)?;
     Ok((id, key))
 }
 fn catalog_self_check_projection(

@@ -6690,6 +6690,7 @@ dependencies = [
  "subc-os",
  "subc-protocol",
  "subc-transport",
+ "syn 2.0.118",
  "synapse-certify",
  "synapse-core",
  "synapse-engine-owned",

@@ -351,11 +351,16 @@ impl CatalogEntry {
     }
 
     /// The lowercase hex sha256 of the JCS serialization of
-    /// `{upstream, files}`: the identity of the bytes this entry installs.
+    /// `{files: [{path, sha256, size_bytes}], upstream}` in manifest file order.
+    /// Roles and backend membership describe usage, not the installed bytes.
     pub(crate) fn manifest_digest(&self) -> String {
         let manifest = serde_json::json!({
             "upstream": &self.upstream,
-            "files": &self.files,
+            "files": self.files.iter().map(|file| serde_json::json!({
+                "path": file.path,
+                "sha256": file.sha256,
+                "size_bytes": file.size_bytes,
+            })).collect::<Vec<_>>(),
         });
         let canonical = jcs(&manifest)
             .expect("catalog manifests hold only strings, integers, and arrays/objects of them");
@@ -1974,25 +1979,25 @@ mod tests {
     fn manifest_digest_is_the_sha256_of_the_jcs_manifest_and_is_stable() {
         // Expected values were computed independently in Python with
         // json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        // over {upstream, files}, which equals JCS for these ASCII-keyed,
-        // integer-only documents.
+        // over {files: [{path, sha256, size_bytes}], upstream}, preserving file
+        // order. This equals JCS for these ASCII-keyed, integer-only documents.
         let catalog = compiled_catalog().unwrap();
         let expected = [
             (
                 "gte-modernbert-base",
-                "9efe05f1170baa48eb1bc6b44c84ff1ea2fbb2c0ae0778e7a9e3a0f493f35c19",
+                "fcfcb22cb62a099048c6c99daac7bd745c56f8ece1260043df854f161d6a967f",
             ),
             (
                 "gte-reranker-modernbert-base",
-                "f0f4c8f6497d270dd11216be43606e2de0b35935f062c59d842ad220a311720b",
+                "7030a13bfd5dce8c6d1db3c93f5ebedad367823aaa0c44ca6541cca0d569a217",
             ),
             (
                 "qwen3-embedding-0.6b",
-                "ae666f103da54abdb6745b803fe49888aad0352fba2c708c449760fec043de30",
+                "4915a95f26bc97ed48d0176ab090f338b52f51c7b4ad502f717b455f04b0293f",
             ),
             (
                 "qwen3-reranker-0.6b",
-                "b832e032523d2e5b5d94dd5b18dc7af2085ca3d6948e6262fdc35a940c937b39",
+                "211130879bf19fc01d3aa497a412edb2a453a1eb435d87aaac06ec1c042cade6",
             ),
         ];
         for (id, digest) in expected {
@@ -2022,6 +2027,34 @@ mod tests {
             entry.manifest_digest(),
             "backends are not part of the manifest"
         );
+    }
+
+    #[test]
+    fn manifest_digest_tracks_file_identity_and_upstream_but_not_file_usage() {
+        let catalog = compiled_catalog().unwrap();
+        let entry = &catalog.models[0];
+        let digest = entry.manifest_digest();
+        let mut usage = entry.clone();
+        usage.files[0].backends.push("vulkan".into());
+        assert_eq!(usage.manifest_digest(), digest);
+        usage.files[0].backends.clear();
+        assert_eq!(usage.manifest_digest(), digest);
+        usage.files[0].role = "different-role".into();
+        assert_eq!(usage.manifest_digest(), digest);
+
+        for change in 0..6 {
+            let mut changed = entry.clone();
+            match change {
+                0 => changed.files[0].path.push_str(".renamed"),
+                1 => changed.files[0].size_bytes += 1,
+                2 => changed.files[0].sha256 = sha('9'),
+                3 => changed.upstream.revision.push('9'),
+                4 => changed.upstream.hf_repo.push_str("-other"),
+                5 => changed.files.swap(0, 1),
+                _ => unreachable!(),
+            }
+            assert_ne!(changed.manifest_digest(), digest, "change {change}");
+        }
     }
 
     #[test]

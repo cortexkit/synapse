@@ -60,6 +60,7 @@ cortexkit-log = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 rusqlite = { workspace = true }
 subc-daemon = { workspace = true }
 subc-os = { workspace = true }
