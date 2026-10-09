@@ -14,12 +14,18 @@
 //! positions and empty slots produce values that are never read back.
 use crate::backend::{rms_cpu, Model, LADDER};
 use crate::qwen::rms;
-use ane::{Executable, Graph, NSQualityOfService, Shape, Tensor, TensorData};
+use ane::{Executable, Graph, NSQualityOfService, Shape, Tensor, TensorData, MIN_SPATIAL_WIDTH};
 use anyhow::{ensure, Context, Result};
 
 /// The largest number of rows one pass may carry. Larger passes multiply the
 /// activation surfaces and attention work without a measured benefit.
 pub const MAX_ROWS: usize = 16;
+
+/// The narrowest slot a row may be padded to.
+pub const MIN_SLOT_WIDTH: usize = 16;
+
+/// The widest slot, and the widest packed tensor: the top single-row rung.
+pub const MAX_WIDTH: usize = LADDER[LADDER.len() - 1];
 
 /// The additive bias that removes a key from a query's softmax. It matches the
 /// value the single-row graph uses for causal and padding masks.
@@ -74,7 +80,9 @@ impl RowLayout {
 }
 
 /// A compiled multi-row program's identity: the layout, how many row slots one
-/// pass carries, and the padded width of each slot (a ladder rung).
+/// pass carries, and the padded width of each slot. Slots may be narrower than
+/// the smallest single-row rung: a pass's cost follows its total width, so
+/// short rows gain most from narrow slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MultiRowShape {
     pub layout: RowLayout,
@@ -85,7 +93,20 @@ pub struct MultiRowShape {
 impl MultiRowShape {
     pub fn new(layout: RowLayout, rows: usize, width: usize) -> Result<Self> {
         ensure!((2..=MAX_ROWS).contains(&rows), "invalid_row_count");
-        ensure!(LADDER.contains(&width), "invalid_shape");
+        ensure!(
+            width.is_power_of_two() && (MIN_SLOT_WIDTH..=MAX_WIDTH).contains(&width),
+            "invalid_shape"
+        );
+        let tensor_width = match layout {
+            RowLayout::BatchAxis => width,
+            _ => rows * width,
+        };
+        // The Neural Engine cannot run tensors narrower than this, and the
+        // packed width must stay within the longest single-row rung.
+        ensure!(
+            (MIN_SPATIAL_WIDTH..=MAX_WIDTH).contains(&tensor_width),
+            "invalid_shape"
+        );
         Ok(Self {
             layout,
             rows,
@@ -646,18 +667,29 @@ mod tests {
     fn shapes() -> Vec<MultiRowShape> {
         let mut all = Vec::new();
         for layout in RowLayout::ALL {
-            for (rows, width) in [(2, 128), (4, 128), (8, 128), (2, 256), (3, 512)] {
+            for (rows, width) in [(2, 128), (4, 128), (8, 128), (2, 256), (3, 512), (2, 64)] {
                 all.push(MultiRowShape::new(layout, rows, width).unwrap());
+            }
+            if layout != RowLayout::BatchAxis {
+                all.push(MultiRowShape::new(layout, 4, 32).unwrap());
             }
         }
         all
     }
 
     #[test]
-    fn shape_refuses_single_rows_oversized_passes_and_off_ladder_widths() {
+    fn shape_refuses_single_rows_oversized_passes_and_unrunnable_widths() {
         assert!(MultiRowShape::new(RowLayout::WidthFolded, 1, 128).is_err());
         assert!(MultiRowShape::new(RowLayout::WidthFolded, MAX_ROWS + 1, 128).is_err());
         assert!(MultiRowShape::new(RowLayout::BatchAxis, 2, 100).is_err());
+        // Narrow slots are fine while the tensor stays at least 64 wide.
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 16).is_err());
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 32).is_ok());
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 64).is_ok());
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 4, 16).is_ok());
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 4, 8).is_err());
+        assert!(MultiRowShape::new(RowLayout::BatchAxis, 4, 32).is_err());
+        assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 8192).is_err());
         for shape in shapes() {
             assert_eq!(MultiRowShape::parse(&shape.label()).unwrap(), shape);
         }
@@ -850,7 +882,7 @@ mod tests {
         let model = synthetic::qwen_model(&[0], 4);
         let hidden = model.profile.n("hidden_size");
         for layout in RowLayout::ALL {
-            for (rows, width) in [(2, 128), (2, 256)] {
+            for (rows, width) in [(2, 128), (2, 256), (2, 64)] {
                 let shape = MultiRowShape::new(layout, rows, width).unwrap();
                 let mut graph = Graph::new();
                 let input = graph.placeholder(shape.tensor_shape(hidden));
@@ -1084,13 +1116,21 @@ mod hardware {
         report["tokenizer_composition"] =
             json!({"fixture_cases_checked": composition_checked, "matching": composition_matches});
 
-        let load = load_average();
-        let started = Instant::now();
-        model.admit(shape.width, "multirow-experiment").unwrap();
-        report["single_row_compile"] = json!({
-            "width": shape.width, "ms": ms(started), "executables": 28,
-            "load_before": load, "load_after": load_average(),
-        });
+        // Single-row references run at each row's own rung, so every rung up
+        // to the slot width must be resident.
+        let mut admitted = Vec::new();
+        let top_rung = rung(shape.width).unwrap();
+        for &width in LADDER.iter().filter(|&&w| w <= top_rung) {
+            let load = load_average();
+            let started = Instant::now();
+            model.admit(width, "multirow-experiment").unwrap();
+            admitted.push(json!({
+                "width": width, "ms": ms(started), "executables": 28,
+                "load_before": load, "load_after": load_average(),
+            }));
+        }
+        report["single_row_compile"] = admitted.pop().unwrap();
+        report["other_single_row_compiles"] = json!(admitted);
         let load = load_average();
         let started = Instant::now();
         let program = model.compile_multirow(shape);
