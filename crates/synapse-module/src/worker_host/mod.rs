@@ -4870,7 +4870,7 @@ pub mod ane_residency {
     /// Holds expired waits at each `GateSite` until the test releases it, and
     /// counts how many have arrived there.
     #[cfg(test)]
-    struct ClassifyGate {
+    pub struct ClassifyGate {
         arrived: [AtomicU64; 2],
         changed: Notify,
         open: [tokio::sync::Semaphore; 2],
@@ -4991,8 +4991,10 @@ pub mod ane_residency {
 
         /// The shape of an admit that held the stream at some moment of
         /// `[start, deadline]`, if any. When the history no longer reaches back
-        /// to `start`, the answer is unknown and errs towards a compile: that
-        /// answer (`shape_compiling`) is safe to retry.
+        /// to `start`, the answer is unknown and errs towards a compile. Both
+        /// possible answers tell the client its request was not run; erring
+        /// this way gives it `shape_compiling`, which says the same request may
+        /// be sent again, instead of `deadline_exceeded`, which says it may not.
         fn compile_during(
             &self,
             start: tokio::time::Instant,
@@ -8151,8 +8153,8 @@ pub mod ane_residency {
         }
 
         /// An expired stream wait that began before the oldest admit still in
-        /// the history cannot be decided; it counts as a compile, whose answer
-        /// is safe to retry.
+        /// the history cannot be classified from that history, so it counts as
+        /// a compile.
         #[test]
         fn a_stream_wait_older_than_the_admit_history_counts_as_a_compile() {
             let t0 = tokio::time::Instant::now();

@@ -18034,6 +18034,7 @@ mod tests {
         assert!(served.is_ok(), "{served:?}");
     }
 
+    #[cfg(unix)]
     async fn until_lane_check_settles(state: &ModuleState) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !state.runtime.lane_checks.lock().unwrap().is_empty() {
@@ -26360,11 +26361,6 @@ async fn run_lane_check(
     check_profile_model(state, model, guard).await
 }
 
-// Catalog installs and startup preloads must compare model output against the
-// same load-time fp32 reference inputs and expected outputs. These cases are
-// copied from bench/parity, checked by SHA-256 and embedded in synapse-certify.
-// Use the production execution path so validation exercises the same worker
-// and hardware routing as serving requests, not a separate implementation.
 /// The numerical self-check's persisted id and key for a profile model.
 fn profile_check_identity(
     state: &ModuleState,
@@ -26382,6 +26378,11 @@ fn profile_check_identity(
     }
 }
 
+// Catalog installs and startup preloads must compare model output against the
+// same load-time fp32 reference inputs and expected outputs. These cases are
+// copied from bench/parity, checked by SHA-256 and embedded in synapse-certify.
+// Use the production execution path so validation exercises the same worker
+// and hardware routing as serving requests, not a separate implementation.
 async fn check_profile_model(
     state: &ModuleState,
     model: Arc<EmbeddingModel>,
