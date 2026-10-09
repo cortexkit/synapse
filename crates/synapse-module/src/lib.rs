@@ -17849,6 +17849,11 @@ mod tests {
             model_unload(state.clone(), json!({"model_id": ANE_TEST_LANE})).await,
             "model.unload",
         );
+        if refused["error"]["code"] != "model_in_use" {
+            release.notify_one();
+            finish_ane_lane_fixture(fixture).await;
+            panic!("unload must refuse while an inference reply drains: {refused}");
+        }
         let check = tokio::spawn({
             let state = state.clone();
             async move {
@@ -17886,7 +17891,6 @@ mod tests {
             "model.unload",
         );
         finish_ane_lane_fixture(fixture).await;
-        assert_eq!(refused["error"]["code"], "model_in_use", "{refused}");
         match behind_check {
             Ok(Err(error)) => assert_eq!(error.code, "deadline_exceeded", "{error:?}"),
             other => panic!("a request during the self-check must wait at its deadline: {other:?}"),
