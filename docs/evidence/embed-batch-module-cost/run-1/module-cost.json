@@ -1,0 +1,498 @@
+{
+  "dims": 1024,
+  "module_tokenizer": "fixture word-level, 120 words per row",
+  "qwen_tokenize": {
+    "summary": {
+      "max_ms": 5.5475840000000005,
+      "median_ms": 5.0246249999999995,
+      "min_ms": 4.463375
+    },
+    "tokens": 7330
+  },
+  "reply_bytes": [
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147,
+    1442147
+  ],
+  "rows": 64,
+  "runs": 15,
+  "samples": [
+    {
+      "client_reply_parse_ms": 1.68275,
+      "client_request_encode_ms": 0.013833,
+      "client_roundtrip_ms": 6.674333,
+      "client_vector_extract_ms": 0.039792,
+      "module_stages_ms": {
+        "batch_admission": 0.017374999999999998,
+        "batch_prepare": 0.065125,
+        "batch_resolve": 0.092208,
+        "batch_tokenize": 1.166334,
+        "bulk_engine_call": 1.148622,
+        "bulk_execution_total": 1.741375,
+        "bulk_scheduler_dispatch": 0.005376000000000001,
+        "execution_lane_wait": 0.0024590000000000002,
+        "execution_permit_wait": 0.005999000000000001,
+        "handle_total": 5.672375000000001,
+        "reply_build": 0.260708,
+        "reply_encode": 2.032083,
+        "request_decode": 0.032041,
+        "test_engine_compute": 0.220667
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.68975,
+      "client_request_encode_ms": 0.014208,
+      "client_roundtrip_ms": 6.929041000000001,
+      "client_vector_extract_ms": 0.038041,
+      "module_stages_ms": {
+        "batch_admission": 0.033041,
+        "batch_prepare": 0.065708,
+        "batch_resolve": 0.091292,
+        "batch_tokenize": 1.171416,
+        "bulk_engine_call": 1.221709,
+        "bulk_execution_total": 2.09,
+        "bulk_scheduler_dispatch": 0.006043,
+        "execution_lane_wait": 0.0032920000000000002,
+        "execution_permit_wait": 0.008084000000000001,
+        "handle_total": 5.990541,
+        "reply_build": 0.251958,
+        "reply_encode": 1.896458,
+        "request_decode": 0.016666,
+        "test_engine_compute": 0.21837499999999999
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.734083,
+      "client_request_encode_ms": 0.013125000000000001,
+      "client_roundtrip_ms": 6.722167000000001,
+      "client_vector_extract_ms": 0.062291000000000006,
+      "module_stages_ms": {
+        "batch_admission": 0.019833,
+        "batch_prepare": 0.071917,
+        "batch_resolve": 0.086291,
+        "batch_tokenize": 1.17825,
+        "bulk_engine_call": 1.005956,
+        "bulk_execution_total": 1.688375,
+        "bulk_scheduler_dispatch": 0.0059169999999999995,
+        "execution_lane_wait": 0.0024999999999999996,
+        "execution_permit_wait": 0.0057919999999999985,
+        "handle_total": 5.587583,
+        "reply_build": 0.259416,
+        "reply_encode": 2.0014999999999996,
+        "request_decode": 0.015708,
+        "test_engine_compute": 0.212667
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.634333,
+      "client_request_encode_ms": 0.013,
+      "client_roundtrip_ms": 6.216208,
+      "client_vector_extract_ms": 0.037042000000000005,
+      "module_stages_ms": {
+        "batch_admission": 0.026625,
+        "batch_prepare": 0.06787499999999999,
+        "batch_resolve": 0.08354199999999999,
+        "batch_tokenize": 1.080625,
+        "bulk_engine_call": 1.0229179999999998,
+        "bulk_execution_total": 1.479833,
+        "bulk_scheduler_dispatch": 0.007416,
+        "execution_lane_wait": 0.0021669999999999997,
+        "execution_permit_wait": 0.004708999999999999,
+        "handle_total": 5.201042,
+        "reply_build": 0.255209,
+        "reply_encode": 1.916834,
+        "request_decode": 0.014875,
+        "test_engine_compute": 0.191
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.879208,
+      "client_request_encode_ms": 0.013125000000000001,
+      "client_roundtrip_ms": 6.223291,
+      "client_vector_extract_ms": 0.037083,
+      "module_stages_ms": {
+        "batch_admission": 0.018333,
+        "batch_prepare": 0.06595799999999999,
+        "batch_resolve": 0.091042,
+        "batch_tokenize": 1.037834,
+        "bulk_engine_call": 1.099501,
+        "bulk_execution_total": 1.59325,
+        "bulk_scheduler_dispatch": 0.005459,
+        "execution_lane_wait": 0.002125,
+        "execution_permit_wait": 0.0052510000000000005,
+        "handle_total": 5.250209,
+        "reply_build": 0.25166700000000003,
+        "reply_encode": 1.924875,
+        "request_decode": 0.015959,
+        "test_engine_compute": 0.22120800000000004
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.679584,
+      "client_request_encode_ms": 0.013333,
+      "client_roundtrip_ms": 6.119916000000001,
+      "client_vector_extract_ms": 0.039458,
+      "module_stages_ms": {
+        "batch_admission": 0.019417,
+        "batch_prepare": 0.06595899999999999,
+        "batch_resolve": 0.08712500000000001,
+        "batch_tokenize": 1.026,
+        "bulk_engine_call": 1.017667,
+        "bulk_execution_total": 1.501208,
+        "bulk_scheduler_dispatch": 0.004209,
+        "execution_lane_wait": 0.010542000000000001,
+        "execution_permit_wait": 0.005581000000000001,
+        "handle_total": 5.109667,
+        "reply_build": 0.256334,
+        "reply_encode": 1.914834,
+        "request_decode": 0.01575,
+        "test_engine_compute": 0.173999
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.702709,
+      "client_request_encode_ms": 0.01675,
+      "client_roundtrip_ms": 6.392333,
+      "client_vector_extract_ms": 0.037209,
+      "module_stages_ms": {
+        "batch_admission": 0.019208,
+        "batch_prepare": 0.06770799999999999,
+        "batch_resolve": 0.090166,
+        "batch_tokenize": 1.139833,
+        "bulk_engine_call": 0.957375,
+        "bulk_execution_total": 1.411959,
+        "bulk_scheduler_dispatch": 0.003209,
+        "execution_lane_wait": 0.002333,
+        "execution_permit_wait": 0.004956,
+        "handle_total": 5.216417,
+        "reply_build": 0.26075000000000004,
+        "reply_encode": 1.955375,
+        "request_decode": 0.016625,
+        "test_engine_compute": 0.17974900000000002
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.720792,
+      "client_request_encode_ms": 0.012,
+      "client_roundtrip_ms": 5.970375,
+      "client_vector_extract_ms": 0.035709,
+      "module_stages_ms": {
+        "batch_admission": 0.016208,
+        "batch_prepare": 0.0655,
+        "batch_resolve": 0.082666,
+        "batch_tokenize": 1.0455,
+        "bulk_engine_call": 0.7936250000000001,
+        "bulk_execution_total": 1.170708,
+        "bulk_scheduler_dispatch": 0.003041,
+        "execution_lane_wait": 0.0020829999999999998,
+        "execution_permit_wait": 0.004541999999999999,
+        "handle_total": 4.826042,
+        "reply_build": 0.246666,
+        "reply_encode": 1.973541,
+        "request_decode": 0.014917,
+        "test_engine_compute": 0.17496
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.7336669999999998,
+      "client_request_encode_ms": 0.011916999999999999,
+      "client_roundtrip_ms": 6.500875,
+      "client_vector_extract_ms": 0.037208,
+      "module_stages_ms": {
+        "batch_admission": 0.017082999999999997,
+        "batch_prepare": 0.06741699999999999,
+        "batch_resolve": 0.07920899999999999,
+        "batch_tokenize": 1.208625,
+        "bulk_engine_call": 0.950042,
+        "bulk_execution_total": 1.438958,
+        "bulk_scheduler_dispatch": 0.0044989999999999995,
+        "execution_lane_wait": 0.001791,
+        "execution_permit_wait": 0.004334,
+        "handle_total": 5.376875,
+        "reply_build": 0.28725,
+        "reply_encode": 2.013167,
+        "request_decode": 0.015625,
+        "test_engine_compute": 0.23408399999999996
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.661958,
+      "client_request_encode_ms": 0.0125,
+      "client_roundtrip_ms": 6.00025,
+      "client_vector_extract_ms": 0.032833,
+      "module_stages_ms": {
+        "batch_admission": 0.018375,
+        "batch_prepare": 0.07308300000000001,
+        "batch_resolve": 0.08654099999999999,
+        "batch_tokenize": 1.117167,
+        "bulk_engine_call": 0.825751,
+        "bulk_execution_total": 1.288292,
+        "bulk_scheduler_dispatch": 0.0029590000000000003,
+        "execution_lane_wait": 0.001958,
+        "execution_permit_wait": 0.005502000000000001,
+        "handle_total": 5.046,
+        "reply_build": 0.24825,
+        "reply_encode": 1.897666,
+        "request_decode": 0.035583000000000004,
+        "test_engine_compute": 0.163752
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.659333,
+      "client_request_encode_ms": 0.011667,
+      "client_roundtrip_ms": 5.817625,
+      "client_vector_extract_ms": 0.037167,
+      "module_stages_ms": {
+        "batch_admission": 0.016084,
+        "batch_prepare": 0.065375,
+        "batch_resolve": 0.075625,
+        "batch_tokenize": 1.0554169999999998,
+        "bulk_engine_call": 0.8623369999999999,
+        "bulk_execution_total": 1.319666,
+        "bulk_scheduler_dispatch": 0.003666,
+        "execution_lane_wait": 0.001876,
+        "execution_permit_wait": 0.004751,
+        "handle_total": 4.965167,
+        "reply_build": 0.250875,
+        "reply_encode": 1.936917,
+        "request_decode": 0.014625,
+        "test_engine_compute": 0.186914
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.6533330000000002,
+      "client_request_encode_ms": 0.011708,
+      "client_roundtrip_ms": 5.753958,
+      "client_vector_extract_ms": 0.058875000000000004,
+      "module_stages_ms": {
+        "batch_admission": 0.014791,
+        "batch_prepare": 0.065208,
+        "batch_resolve": 0.073958,
+        "batch_tokenize": 1.044041,
+        "bulk_engine_call": 0.861335,
+        "bulk_execution_total": 1.288708,
+        "bulk_scheduler_dispatch": 0.003125,
+        "execution_lane_wait": 0.0019569999999999995,
+        "execution_permit_wait": 0.004543,
+        "handle_total": 4.922499999999999,
+        "reply_build": 0.248291,
+        "reply_encode": 1.939625,
+        "request_decode": 0.013958,
+        "test_engine_compute": 0.164001
+      }
+    },
+    {
+      "client_reply_parse_ms": 2.1091249999999997,
+      "client_request_encode_ms": 0.012625,
+      "client_roundtrip_ms": 7.470875,
+      "client_vector_extract_ms": 0.044416000000000004,
+      "module_stages_ms": {
+        "batch_admission": 0.01675,
+        "batch_prepare": 0.06774999999999999,
+        "batch_resolve": 0.078334,
+        "batch_tokenize": 1.238917,
+        "bulk_engine_call": 1.1824169999999998,
+        "bulk_execution_total": 1.873209,
+        "bulk_scheduler_dispatch": 0.005292000000000001,
+        "execution_lane_wait": 0.002417,
+        "execution_permit_wait": 0.0070810000000000005,
+        "handle_total": 6.44475,
+        "reply_build": 0.358666,
+        "reply_encode": 2.4998329999999997,
+        "request_decode": 0.016125,
+        "test_engine_compute": 0.21479099999999998
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.638666,
+      "client_request_encode_ms": 0.015417000000000002,
+      "client_roundtrip_ms": 6.5828750000000005,
+      "client_vector_extract_ms": 0.03875,
+      "module_stages_ms": {
+        "batch_admission": 0.030583000000000003,
+        "batch_prepare": 0.06625,
+        "batch_resolve": 0.104542,
+        "batch_tokenize": 1.49525,
+        "bulk_engine_call": 0.91079,
+        "bulk_execution_total": 1.329417,
+        "bulk_scheduler_dispatch": 0.003457,
+        "execution_lane_wait": 0.0025399999999999997,
+        "execution_permit_wait": 0.005833,
+        "handle_total": 5.604375,
+        "reply_build": 0.2495,
+        "reply_encode": 1.935083,
+        "request_decode": 0.020041,
+        "test_engine_compute": 0.171625
+      }
+    },
+    {
+      "client_reply_parse_ms": 1.645542,
+      "client_request_encode_ms": 0.012791,
+      "client_roundtrip_ms": 6.559,
+      "client_vector_extract_ms": 0.03725,
+      "module_stages_ms": {
+        "batch_admission": 0.032708,
+        "batch_prepare": 0.065917,
+        "batch_resolve": 0.103083,
+        "batch_tokenize": 0.999208,
+        "bulk_engine_call": 1.146958,
+        "bulk_execution_total": 1.766917,
+        "bulk_scheduler_dispatch": 0.011417,
+        "execution_lane_wait": 0.002542,
+        "execution_permit_wait": 0.00621,
+        "handle_total": 5.512708,
+        "reply_build": 0.24808300000000005,
+        "reply_encode": 1.918459,
+        "request_decode": 0.018791,
+        "test_engine_compute": 0.2565
+      }
+    }
+  ],
+  "stage_counts": {
+    "batch_admission": 1,
+    "batch_prepare": 1,
+    "batch_resolve": 1,
+    "batch_tokenize": 1,
+    "bulk_engine_call": 8,
+    "bulk_execution_total": 1,
+    "bulk_scheduler_dispatch": 8,
+    "execution_lane_wait": 8,
+    "execution_permit_wait": 8,
+    "handle_total": 1,
+    "reply_build": 1,
+    "reply_encode": 1,
+    "request_decode": 1,
+    "test_engine_compute": 8
+  },
+  "summary": {
+    "client_reply_parse": {
+      "max_ms": 2.1091249999999997,
+      "median_ms": 1.68275,
+      "min_ms": 1.634333
+    },
+    "client_request_encode": {
+      "max_ms": 0.01675,
+      "median_ms": 0.013,
+      "min_ms": 0.011667
+    },
+    "client_roundtrip": {
+      "max_ms": 7.470875,
+      "median_ms": 6.392333,
+      "min_ms": 5.753958
+    },
+    "client_total": {
+      "max_ms": 9.637041,
+      "median_ms": 8.152707,
+      "min_ms": 7.477873999999999
+    },
+    "client_vector_extract": {
+      "max_ms": 0.062291000000000006,
+      "median_ms": 0.03725,
+      "min_ms": 0.032833
+    },
+    "module_batch_admission": {
+      "max_ms": 0.033041,
+      "median_ms": 0.018375,
+      "min_ms": 0.014791
+    },
+    "module_batch_prepare": {
+      "max_ms": 0.07308300000000001,
+      "median_ms": 0.06595899999999999,
+      "min_ms": 0.065125
+    },
+    "module_batch_resolve": {
+      "max_ms": 0.104542,
+      "median_ms": 0.08654099999999999,
+      "min_ms": 0.073958
+    },
+    "module_batch_tokenize": {
+      "max_ms": 1.49525,
+      "median_ms": 1.117167,
+      "min_ms": 0.999208
+    },
+    "module_bulk_engine_call": {
+      "max_ms": 1.221709,
+      "median_ms": 1.005956,
+      "min_ms": 0.7936250000000001
+    },
+    "module_bulk_execution_total": {
+      "max_ms": 2.09,
+      "median_ms": 1.479833,
+      "min_ms": 1.170708
+    },
+    "module_bulk_scheduler_dispatch": {
+      "max_ms": 0.011417,
+      "median_ms": 0.0044989999999999995,
+      "min_ms": 0.0029590000000000003
+    },
+    "module_execution_lane_wait": {
+      "max_ms": 0.010542000000000001,
+      "median_ms": 0.002333,
+      "min_ms": 0.001791
+    },
+    "module_execution_permit_wait": {
+      "max_ms": 0.008084000000000001,
+      "median_ms": 0.005502000000000001,
+      "min_ms": 0.004334
+    },
+    "module_handle_total": {
+      "max_ms": 6.44475,
+      "median_ms": 5.250209,
+      "min_ms": 4.826042
+    },
+    "module_reply_build": {
+      "max_ms": 0.358666,
+      "median_ms": 0.251958,
+      "min_ms": 0.246666
+    },
+    "module_reply_encode": {
+      "max_ms": 2.4998329999999997,
+      "median_ms": 1.936917,
+      "min_ms": 1.896458
+    },
+    "module_request_decode": {
+      "max_ms": 0.035583000000000004,
+      "median_ms": 0.015959,
+      "min_ms": 0.013958
+    },
+    "module_test_engine_compute": {
+      "max_ms": 0.2565,
+      "median_ms": 0.191,
+      "min_ms": 0.163752
+    },
+    "transport_outside_handler": {
+      "max_ms": 1.175916,
+      "median_ms": 1.0102490000000008,
+      "min_ms": 0.8314580000000005
+    }
+  },
+  "total_tokens": [
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680,
+    7680
+  ]
+}

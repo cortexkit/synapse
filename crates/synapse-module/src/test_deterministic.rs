@@ -29,7 +29,10 @@ fn dense() -> bool {
 pub struct TestDeterministic;
 
 pub fn vector(ids: &[u32]) -> Vector {
-    let dims = dims();
+    vector_with(ids, dims(), dense())
+}
+
+fn vector_with(ids: &[u32], dims: usize, dense: bool) -> Vector {
     let mut vector = vec![0.0_f32; dims];
     // A seed component gives even an empty token sequence a unit-norm result.
     vector[0] = 1.0;
@@ -37,13 +40,13 @@ pub fn vector(ids: &[u32]) -> Vector {
         let bin = (id.wrapping_mul(2654435761) % (dims as u32 - 1)) as usize + 1;
         vector[bin] += 1.0;
     }
-    if dense() {
+    if dense {
         // Production vectors have no zero components, so a reply of mostly
         // zeros would understate the JSON reply size and its encode/decode
         // cost. Dense mode gives every empty bin a tiny value derived from the
-        // tokens: about 1e-6 per bin keeps the direction (and the probe's
-        // reference vectors) unchanged to within 1e-4 cosine, while every
-        // component prints with full precision like a real embedding.
+        // tokens. At most 1e-6 per bin leaves the direction, and so the
+        // probe's reference vectors, unchanged to within 1e-6 cosine, while
+        // every component prints with full precision like a real embedding.
         let mut state = ids.iter().fold(0x9e37_79b9_u32, |state, &id| {
             state.rotate_left(5) ^ id.wrapping_mul(0x85eb_ca6b)
         }) | 1; // xorshift never leaves the all-zero state
@@ -154,5 +157,29 @@ mod tests {
             .unwrap()
             .scores;
         assert!(scores[0] > scores[1]);
+    }
+
+    #[test]
+    fn dense_mode_fills_every_component_without_moving_the_direction() {
+        let ids = [1, 2, 3, 2];
+        let sparse = vector_with(&ids, 1_024, false);
+        let dense = vector_with(&ids, 1_024, true);
+        assert_eq!(dense.len(), 1_024);
+        assert!(sparse.iter().filter(|&&v| v == 0.0).count() > 1_000);
+        assert!(
+            dense.iter().all(|&v| v != 0.0 && v.is_finite()),
+            "dense mode left a zero component"
+        );
+        assert!((dense.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-6);
+        let cosine = sparse.iter().zip(&dense).map(|(a, b)| a * b).sum::<f32>();
+        assert!(
+            cosine > 1.0 - 1e-6,
+            "dense mode moved the direction: {cosine}"
+        );
+        assert_eq!(
+            dense,
+            vector_with(&ids, 1_024, true),
+            "dense mode is deterministic"
+        );
     }
 }

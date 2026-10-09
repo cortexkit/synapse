@@ -36,6 +36,9 @@ fn word_row(index: usize) -> String {
         .join(" ")
 }
 
+/// The Qwen3-Embedding-0.6B `tokenizer.json`: SYNAPSE_MODULE_COST_TOKENIZER if
+/// set, else the first local Hugging Face cache snapshot. Without one, the
+/// real-tokenizer timing is skipped and reported as null.
 fn qwen_tokenizer() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SYNAPSE_MODULE_COST_TOKENIZER") {
         return Some(PathBuf::from(path));
@@ -252,10 +255,6 @@ async fn embed_batch_module_cost_profile() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(9)
         .max(5);
-    let extra_params: Value = std::env::var("SYNAPSE_MODULE_COST_PARAMS")
-        .ok()
-        .map(|value| serde_json::from_str(&value).expect("SYNAPSE_MODULE_COST_PARAMS is JSON"))
-        .unwrap_or_else(|| serde_json::json!({}));
     let out_dir = std::env::var("SYNAPSE_MODULE_COST_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| unique_temp_dir("synapse-module-cost-out"));
@@ -284,15 +283,10 @@ async fn embed_batch_module_cost_profile() {
         open_route_for_started_module(daemon, module).await;
     certify_preloaded_models(&mut consumer, route, 70_000).await;
 
-    let mut params = serde_json::json!({
-        "model": "test-minilm",
-        "items": rows(),
-        "accept_declared": true,
+    let body = serde_json::json!({
+        "method": "embed.batch",
+        "params": { "model": "test-minilm", "items": rows() },
     });
-    for (key, value) in extra_params.as_object().unwrap() {
-        params[key] = value.clone();
-    }
-    let body = serde_json::json!({ "method": "embed.batch", "params": params });
 
     // The lane loads on first use; retry until it serves.
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -400,7 +394,6 @@ async fn embed_batch_module_cost_profile() {
         "runs": runs,
         "module_tokenizer": "fixture word-level, 120 words per row",
         "qwen_tokenize": qwen,
-        "extra_params": extra_params,
         "reply_bytes": samples.iter().map(|s| s.reply_bytes).collect::<Vec<_>>(),
         "total_tokens": samples.iter().map(|s| s.tokens).collect::<Vec<_>>(),
         "stage_counts": stage_names.iter().map(|stage| (stage.clone(), samples[0].stages.get(stage).map(|entry| entry.1).unwrap_or(0))).collect::<BTreeMap<_, _>>(),

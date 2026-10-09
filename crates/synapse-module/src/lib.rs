@@ -3812,9 +3812,11 @@ impl ModuleHandler for SynapseHandler {
         };
         // Only embedding batches are profiled here: the stage log describes the
         // embedding lane, and other methods would interleave unrelated rows.
-        let profiled_method = (envelope.method == "embed.batch").then(|| envelope.method.clone());
-        if let Some(method) = &profiled_method {
-            ane_lane_timing("request_decode", method, None, handle_started);
+        // The model is not resolved yet, so these two records carry the method
+        // name in their `model_id` field.
+        let profiled = envelope.method == "embed.batch";
+        if profiled {
+            ane_lane_timing("request_decode", "embed.batch", None, handle_started);
         }
 
         if let Some(refusal) = self
@@ -3830,8 +3832,8 @@ impl ModuleHandler for SynapseHandler {
             .ok()
             .and_then(|operators| operators.get(&ctx.route_handle()).cloned());
         let outcome = dispatch_request(state, envelope, approved_by.as_deref()).await;
-        if let Some(method) = &profiled_method {
-            ane_lane_timing("handle_total", method, None, handle_started);
+        if profiled {
+            ane_lane_timing("handle_total", "embed.batch", None, handle_started);
         }
         outcome
     }
