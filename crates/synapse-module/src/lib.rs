@@ -1286,6 +1286,8 @@ struct RuntimeState {
     catalog_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     serving_gates: Mutex<BTreeMap<String, Arc<tokio::sync::RwLock<()>>>>,
     lane_execution_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    profile_check_passes_for_test: Mutex<bool>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
     catalog_disk: Mutex<()>,
@@ -2381,6 +2383,8 @@ impl RuntimeState {
             catalog_locks: Mutex::new(BTreeMap::new()),
             serving_gates: Mutex::new(BTreeMap::new()),
             lane_execution_locks: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            profile_check_passes_for_test: Mutex::new(false),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
             catalog_disk: Mutex::new(()),
@@ -8119,6 +8123,11 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
+    // Absolute, so work done before certification (tokenization, admission)
+    // counts against the same budget.
+    let certify_deadline = params
+        .deadline_ms
+        .map(|budget| tokio::time::Instant::now() + Duration::from_millis(budget));
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -8180,7 +8189,7 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
     if let Err(error) =
-        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
     {
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
@@ -8511,6 +8520,11 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
+    // Absolute, so work done before certification (tokenization, admission)
+    // counts against the same budget.
+    let certify_deadline = params
+        .deadline_ms
+        .map(|budget| tokio::time::Instant::now() + Duration::from_millis(budget));
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -8558,7 +8572,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) =
-        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
     {
         return result_outcome(error_payload(&state, error));
     }
@@ -9157,6 +9171,11 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         params.deadline_ms =
             Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
     }
+    // Absolute, so work done before certification (tokenization, admission)
+    // counts against the same budget.
+    let certify_deadline = params
+        .deadline_ms
+        .map(|budget| tokio::time::Instant::now() + Duration::from_millis(budget));
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -9181,7 +9200,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
     if let Err(error) =
-        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
     {
         return result_outcome(error_payload(&state, error));
     }
@@ -13059,10 +13078,10 @@ fn ensure_pre_tokenization_certified(
 async fn ensure_profile_request_certified(
     state: Arc<ModuleState>,
     model: &EmbeddingModel,
-    deadline_ms: Option<u64>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), WireOperationError> {
     if model.engine_identity.build_flags.contains_key("profile") {
-        ensure_profile_preload_ready(state.clone(), &model.model_id, deadline_ms).await?;
+        ensure_profile_preload_ready(state.clone(), &model.model_id, deadline).await?;
         ensure_model_certified(
             &state,
             model,
@@ -17646,9 +17665,13 @@ mod tests {
     ) -> Result<(), WireOperationError> {
         let (guard, _) = catalog_resolution_guard(&state.runtime, ANE_TEST_LANE, 6000).await?;
         drop(guard);
-        ensure_profile_preload_ready(state.clone(), ANE_TEST_LANE, Some(6000))
-            .await
-            .map(drop)
+        ensure_profile_preload_ready(
+            state.clone(),
+            ANE_TEST_LANE,
+            Some(tokio::time::Instant::now() + Duration::from_secs(6)),
+        )
+        .await
+        .map(drop)
     }
 
     #[cfg(unix)]
@@ -17910,6 +17933,75 @@ mod tests {
         assert!(unloaded.get("error").is_none(), "{unloaded}");
     }
 
+    /// The request that finds the self-check pending starts it, but the check
+    /// is lane lifecycle work: it keeps running after that request's deadline
+    /// and lets later requests serve once it has passed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_request_that_starts_a_self_check_answers_model_loading_at_its_deadline() {
+        let fixture = ane_lane_fixture("ane-check-starter", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        // The check's first reference case compiles shape 128; hold that compile.
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let model = ane_lane_model(&state);
+        let began = Instant::now();
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            ensure_profile_request_certified(
+                state.clone(),
+                &model,
+                Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            ),
+        )
+        .await;
+        let waited = began.elapsed();
+        let compile_reached =
+            tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+        let check_running = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_err();
+        release.notify_one();
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            while catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+                .try_lock()
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let later = tokio::time::Instant::now() + Duration::from_secs(5);
+        let second = ensure_profile_request_certified(state.clone(), &model, Some(later)).await;
+        let served = embed_on_ane_lane(&state, 1, Some(later)).await;
+        drop(model);
+        finish_ane_lane_fixture(fixture).await;
+        match first {
+            Ok(Err(error)) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            other => panic!("the starting request must answer at its deadline: {other:?}"),
+        }
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(
+            compile_reached.is_ok(),
+            "the check never ran its reference case"
+        );
+        assert!(check_running, "the check stopped with its starting request");
+        assert!(finished.is_ok(), "the check never completed");
+        assert!(second.is_ok(), "{second:?}");
+        assert!(served.is_ok(), "{served:?}");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {
@@ -17923,7 +18015,11 @@ mod tests {
         let started = Instant::now();
         let waited = tokio::time::timeout(
             Duration::from_secs(2),
-            ensure_profile_preload_ready(state.clone(), ANE_TEST_LANE, Some(150)),
+            ensure_profile_preload_ready(
+                state.clone(),
+                ANE_TEST_LANE,
+                Some(tokio::time::Instant::now() + Duration::from_millis(150)),
+            ),
         )
         .await
         .map(|result| result.map(drop));
@@ -25911,14 +26007,27 @@ async fn numerical_profile_preload_check(
 async fn ensure_profile_preload_ready(
     state: Arc<ModuleState>,
     model_id: &str,
-    deadline_ms: Option<u64>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
-    let lock = catalog_lane_lock(&state.runtime, model_id);
-    // A serving request waits here only while the lane runs its load-time
-    // self-check, and never past its own deadline; like request resolution, it
-    // answers model_loading when that deadline expires.
-    let guard = match deadline_ms {
-        Some(budget) => tokio::time::timeout(Duration::from_millis(budget), lock.lock_owned())
+    // Loading and the numerical self-check are lane lifecycle work. They run
+    // to completion in their own task, holding the lane lock (and, for the
+    // check, the serving gate's write guard), so a caller that stops waiting
+    // neither cancels nor shortens them. Every caller, including the one whose
+    // request started the check, waits only until its own deadline and is
+    // then answered model_loading, as request resolution does.
+    let lifecycle = tokio::spawn({
+        let state = state.clone();
+        let model_id = model_id.to_string();
+        async move {
+            let guard = catalog_lane_lock(&state.runtime, &model_id)
+                .lock_owned()
+                .await;
+            let model = ensure_model_loaded_for_control(state.clone(), &model_id, None).await?;
+            check_profile_model(&state, model, guard).await
+        }
+    });
+    let joined = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, lifecycle)
             .await
             .map_err(|_| {
                 WireOperationError::from_stable(
@@ -25926,10 +26035,14 @@ async fn ensure_profile_preload_ready(
                     format!("catalog lane '{model_id}' is running its numerical self-check"),
                 )
             })?,
-        None => lock.lock_owned().await,
+        None => lifecycle.await,
     };
-    let model = ensure_model_loaded_for_control(state.clone(), model_id, deadline_ms).await?;
-    check_profile_model(&state, model, guard).await
+    joined.map_err(|error| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(250)),
+            format!("catalog lane self-check task failed: {error}"),
+        )
+    })?
 }
 
 // Catalog installs and startup preloads must compare model output against the
@@ -25989,6 +26102,18 @@ async fn check_profile_model(
                 return Err(profile_preload_check_error(profile, &reason));
             }
         };
+    // A mock worker cannot reproduce the reference outputs, so tests that need
+    // a passing check run every reference case and then override the verdict.
+    #[cfg(test)]
+    if *state
+        .runtime
+        .profile_check_passes_for_test
+        .lock()
+        .expect("verdict override")
+    {
+        catalog_complete_check(state, &id, generation, "passed", None)?;
+        return Ok(model);
+    }
     complete_profile_preload_check(state, profile, &id, generation, &evaluation)?;
     Ok(model)
 }

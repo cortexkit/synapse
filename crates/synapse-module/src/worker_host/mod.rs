@@ -3449,6 +3449,92 @@ pub mod ane_residency {
             + Sync,
     >;
 
+    /// What a serving request is waiting for right now. When its deadline
+    /// expires, the answer is decided by the wait that actually expired, not
+    /// by whatever the worker happens to be doing when the error is mapped.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WaitPhase {
+        /// Budget queue, eviction, execution permit or inference I/O.
+        Other,
+        /// The request's own shape is being admitted (compiled), by this
+        /// request or by another one it joined; counted from the moment the
+        /// shape's slot enters `Admitting`.
+        Compile(usize),
+        /// Waiting for the worker stream; a compile only if an admit exchange
+        /// holds the stream when the wait expires.
+        Stream,
+        /// The deadline already expired; `Some(shape)` means on a compile.
+        Expired(Option<usize>),
+    }
+
+    #[derive(Debug)]
+    struct RequestWaits(Mutex<WaitPhase>);
+
+    impl RequestWaits {
+        fn new() -> Self {
+            Self(Mutex::new(WaitPhase::Other))
+        }
+
+        fn lock(&self) -> MutexGuard<'_, WaitPhase> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    tokio::task_local! {
+        /// The wait phase of the serving request whose task this is.
+        static REQUEST_WAITS: Arc<RequestWaits>;
+    }
+
+    fn deadline_cause_error(cause: Option<usize>) -> AneResidencyError {
+        match cause {
+            Some(shape) => AneResidencyError::ShapeCompiling { shape },
+            None => AneResidencyError::DeadlineExceeded,
+        }
+    }
+
+    /// Records the current wait of this task's serving request, unless its
+    /// deadline has already been classified.
+    fn enter_wait(phase: WaitPhase) {
+        let _ = REQUEST_WAITS.try_with(|waits| {
+            let mut current = waits.lock();
+            if !matches!(*current, WaitPhase::Expired(_)) {
+                *current = phase;
+            }
+        });
+    }
+
+    /// The deadline expired during a wait whose cause is `cause`. The first
+    /// classification recorded for the request wins.
+    fn deadline_expired(cause: Option<usize>) -> AneResidencyError {
+        let recorded = REQUEST_WAITS
+            .try_with(|waits| {
+                let mut current = waits.lock();
+                match *current {
+                    WaitPhase::Expired(first) => first,
+                    _ => {
+                        *current = WaitPhase::Expired(cause);
+                        cause
+                    }
+                }
+            })
+            .unwrap_or(cause);
+        deadline_cause_error(recorded)
+    }
+
+    /// The deadline expired during the last recorded lease wait.
+    fn lease_deadline_expired() -> AneResidencyError {
+        let cause = REQUEST_WAITS
+            .try_with(|waits| match *waits.lock() {
+                WaitPhase::Compile(shape) => Some(shape),
+                WaitPhase::Expired(first) => first,
+                _ => None,
+            })
+            .unwrap_or(None);
+        deadline_expired(cause)
+    }
+
     /// The smallest ladder rung that holds `n_tokens`, or `None` above 8192.
     pub fn ladder_rung(n_tokens: usize) -> Option<usize> {
         ANE_SHAPE_LADDER
@@ -3837,7 +3923,8 @@ pub mod ane_residency {
             slot_id: u64,
             owner: Arc<dyn AneShapeWorker>,
         },
-        Wait,
+        /// `Some(shape)`: the request's own shape is being admitted (compiled).
+        Wait(Option<usize>),
         Retired,
     }
 
@@ -4077,7 +4164,7 @@ pub mod ane_residency {
             loop {
                 if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
-                    return Err(AneResidencyError::DeadlineExceeded);
+                    return Err(lease_deadline_expired());
                 }
                 // Register for wakeups before reading the state, so a change
                 // between the check and the wait is not missed.
@@ -4101,12 +4188,16 @@ pub mod ane_residency {
                     }
                     Step::Leased(lease) => return Ok(lease),
                     Step::Admit(slot_id) => {
+                        // The slot is Admitting from here on: a deadline that
+                        // expires now expires on this shape's compile.
+                        enter_wait(WaitPhase::Compile(key.shape));
+                        let shape = key.shape;
                         let lease = self.admit(worker.clone(), key, slot_id).await?;
                         if request_deadline
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
                             drop(lease);
-                            return Err(AneResidencyError::DeadlineExceeded);
+                            return Err(deadline_expired(Some(shape)));
                         }
                         return Ok(lease);
                     }
@@ -4115,9 +4206,11 @@ pub mod ane_residency {
                         slot_id,
                         owner,
                     } => {
+                        enter_wait(WaitPhase::Other);
                         self.evict(owner, key, slot_id).await;
                     }
-                    Step::Wait => {
+                    Step::Wait(compiling) => {
+                        enter_wait(compiling.map_or(WaitPhase::Other, WaitPhase::Compile));
                         let wait_deadline =
                             request_deadline.map_or(deadline, |request| request.min(deadline));
                         if tokio::time::timeout_at(wait_deadline, notified)
@@ -4127,7 +4220,7 @@ pub mod ane_residency {
                             if request_deadline
                                 .is_some_and(|request| tokio::time::Instant::now() >= request)
                             {
-                                return Err(AneResidencyError::DeadlineExceeded);
+                                return Err(deadline_expired(compiling));
                             }
                             return Err(resource_refusal(AneResidencyError::Channel(
                                 "admission budget wait deadline exceeded".into(),
@@ -4219,7 +4312,7 @@ pub mod ane_residency {
                 let lease = self.lease_until(worker, model_ref, rung, deadline).await?;
                 if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                     drop(lease);
-                    return Err(AneResidencyError::DeadlineExceeded);
+                    return Err(lease_deadline_expired());
                 }
                 let results = run(rung, indices.clone()).await;
                 drop(lease);
@@ -4257,15 +4350,18 @@ pub mod ane_residency {
                 .entry(ticket)
                 .or_insert_with(|| key.clone());
             if state.recovering.contains(worker.worker_id()) {
-                return Step::Wait;
+                return Step::Wait(None);
             }
             if let Some(slot_state) = state.slots.get(key).map(|slot| slot.state) {
                 // A shape with a slot needs no budget, so this request waits
                 // outside the FIFO order: for the admission or eviction in
                 // flight to settle (one compile per shape), or, if resident,
                 // leases it at once so it cannot be evicted while it waits.
+                if slot_state == SlotState::Admitting {
+                    return Step::Wait(Some(key.shape));
+                }
                 if slot_state != SlotState::Resident || state.behind_starved_head(ticket) {
-                    return Step::Wait;
+                    return Step::Wait(None);
                 }
                 let now = state.tick();
                 let slot = state.slots.get_mut(key).expect("slot checked above");
@@ -4282,7 +4378,7 @@ pub mod ane_residency {
                 return Step::Leased(lease);
             }
             if state.budget_head() != Some(ticket) {
-                return Step::Wait;
+                return Step::Wait(None);
             }
             let now = state.tick();
             let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
@@ -4325,7 +4421,7 @@ pub mod ane_residency {
                 .map(|(candidate, slot)| (candidate.clone(), slot.id, slot.worker.clone()));
             let Some((victim, slot_id, owner)) = victim else {
                 state.starved_head = Some(ticket);
-                return Step::Wait;
+                return Step::Wait(None);
             };
             if state.starved_head == Some(ticket) {
                 state.starved_head = None;
@@ -4750,21 +4846,40 @@ pub mod ane_residency {
         }
     }
 
-    /// Records the shape an admission exchange is compiling for as long as
-    /// that exchange holds the worker stream, including when it is dropped.
-    struct CompilingMarker<'a>(&'a Mutex<Option<usize>>);
-    impl<'a> CompilingMarker<'a> {
-        fn set(slot: &'a Mutex<Option<usize>>, shape: usize) -> Self {
-            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(shape);
-            Self(slot)
+    /// Who holds the worker stream, as far as deadline classification needs.
+    #[derive(Default)]
+    struct StreamHolder {
+        /// The shape an admission (compile) exchange holding the stream is
+        /// compiling.
+        compiling: Option<usize>,
+        /// When the last exchange released the stream, and the shape it was
+        /// compiling if it was an admission.
+        last_release: Option<(tokio::time::Instant, Option<usize>)>,
+    }
+
+    /// Marks one exchange as the stream holder for as long as it runs,
+    /// including when it is dropped part way through.
+    struct HolderMark<'a> {
+        holder: &'a Mutex<StreamHolder>,
+        compiling: Option<usize>,
+    }
+    impl<'a> HolderMark<'a> {
+        fn hold(holder: &'a Mutex<StreamHolder>, compiling: Option<usize>) -> Self {
+            holder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .compiling = compiling;
+            Self { holder, compiling }
         }
     }
-    impl Drop for CompilingMarker<'_> {
+    impl Drop for HolderMark<'_> {
         fn drop(&mut self) {
-            *self
-                .0
+            let mut holder = self
+                .holder
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            holder.compiling = None;
+            holder.last_release = Some((tokio::time::Instant::now(), self.compiling));
         }
     }
 
@@ -4784,8 +4899,9 @@ pub mod ane_residency {
         generation: AtomicU64,
         shape_rpc_timeout: std::time::Duration,
         owner_exit_timeout: std::time::Duration,
-        /// The shape whose admission (compile) exchange holds the stream now.
-        compiling_shape: Mutex<Option<usize>>,
+        holder: Mutex<StreamHolder>,
+        #[cfg(test)]
+        classify_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -4816,7 +4932,9 @@ pub mod ane_residency {
                 // serialized cost (~462s) plus headroom, but bounds a silent worker.
                 shape_rpc_timeout: std::time::Duration::from_secs(600),
                 owner_exit_timeout: std::time::Duration::from_secs(30),
-                compiling_shape: Mutex::new(None),
+                holder: Mutex::new(StreamHolder::default()),
+                #[cfg(test)]
+                classify_gate: Mutex::new(None),
             })
         }
 
@@ -4880,11 +4998,16 @@ pub mod ane_residency {
             raw: Option<&[u8]>,
             generation: u64,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
-            let operation = self.exchange_inner(request, raw, generation);
             if matches!(
                 request,
                 WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneEvictShape { .. }
             ) {
+                // Queueing for the stream is not part of the shape RPC: a long
+                // compile or inference ahead of it must not use up the RPC's
+                // watchdog, whose expiry faults the channel and restarts the
+                // worker. The watchdog starts once the stream is held.
+                let mut guard = self.stream.lock().await;
+                let operation = self.exchange_locked(&mut guard, request, raw, generation);
                 match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
                     Ok(result) => result,
                     Err(_) => {
@@ -4898,7 +5021,7 @@ pub mod ane_residency {
                     }
                 }
             } else {
-                operation.await
+                self.exchange_inner(request, raw, generation).await
             }
         }
 
@@ -4913,20 +5036,51 @@ pub mod ane_residency {
                 .await
         }
 
-        /// The shape being compiled while an admission exchange holds the stream.
-        pub fn compiling_shape(&self) -> Option<usize> {
-            *self
-                .compiling_shape
+        /// Answers a caller whose deadline expired while its serving task was
+        /// still waiting: the cause is that task's current wait, unless the
+        /// task already classified its own expiry.
+        fn expired_wait(&self, waits: &RequestWaits) -> AneResidencyError {
+            let mut phase = waits.lock();
+            let cause = match *phase {
+                WaitPhase::Expired(first) => first,
+                WaitPhase::Compile(shape) => Some(shape),
+                WaitPhase::Stream => self.compiling_shape(),
+                WaitPhase::Other => None,
+            };
+            *phase = WaitPhase::Expired(cause);
+            deadline_cause_error(cause)
+        }
+
+        /// Lets a test hold a caller between its deadline expiring and the
+        /// expiry being classified.
+        #[cfg(test)]
+        async fn pass_classify_gate(&self) {
+            let gate = self.classify_gate.lock().unwrap().take();
+            if let Some((reached, proceed)) = gate {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+        }
+
+        fn stream_holder(&self) -> MutexGuard<'_, StreamHolder> {
+            self.holder
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
 
-        /// Classifies a request deadline that expired while waiting on this
-        /// worker: a compile in progress makes it `ShapeCompiling`.
-        pub fn deadline_error(&self) -> AneResidencyError {
-            match self.compiling_shape() {
-                Some(shape) => AneResidencyError::ShapeCompiling { shape },
-                None => AneResidencyError::DeadlineExceeded,
+        /// The shape being compiled while an admission exchange holds the stream.
+        pub fn compiling_shape(&self) -> Option<usize> {
+            self.stream_holder().compiling
+        }
+
+        /// For a stream lock granted at or after `deadline`: the shape being
+        /// compiled by the exchange that held the stream through the deadline,
+        /// if it was an admission. The stream is granted in arrival order, so
+        /// that holder is the last one to release it.
+        fn compile_held_stream_at(&self, deadline: tokio::time::Instant) -> Option<usize> {
+            match self.stream_holder().last_release {
+                Some((released, compiling)) if released >= deadline => compiling,
+                _ => None,
             }
         }
 
@@ -4949,18 +5103,34 @@ pub mod ane_residency {
             P: Future<Output = Result<ExchangePermit, AneResidencyError>>,
         {
             let generation = self.generation();
+            let expired = |deadline: Option<tokio::time::Instant>| {
+                deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            };
+            enter_wait(WaitPhase::Stream);
             let mut guard = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, self.stream.lock())
-                    .await
-                    .map_err(|_| self.deadline_error())?,
+                Some(deadline) => match tokio::time::timeout_at(deadline, self.stream.lock()).await
+                {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(deadline_expired(self.compiling_shape())),
+                },
                 None => self.stream.lock().await,
             };
+            // A timer can expire in the same poll that grants the lock. Nothing
+            // may be written after the deadline; the holder at the deadline
+            // decides whether the request was blocked on a compile.
+            if let Some(deadline) = deadline.filter(|_| expired(deadline)) {
+                return Err(deadline_expired(self.compile_held_stream_at(deadline)));
+            }
+            enter_wait(WaitPhase::Other);
             let _permit = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, permit)
                     .await
-                    .map_err(|_| AneResidencyError::DeadlineExceeded)??,
+                    .map_err(|_| deadline_expired(None))??,
                 None => permit.await?,
             };
+            if expired(deadline) {
+                return Err(deadline_expired(None));
+            }
             tokio::time::timeout(
                 io_timeout,
                 self.exchange_locked(&mut guard, request, raw, generation),
@@ -4978,6 +5148,13 @@ pub mod ane_residency {
             raw: Option<&[u8]>,
             generation: u64,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            let _holder = HolderMark::hold(
+                &self.holder,
+                match request {
+                    WorkerRequest::AneAdmitShape { shape, .. } => Some(*shape),
+                    _ => None,
+                },
+            );
             if self.generation() != generation {
                 return Err(AneResidencyError::Channel("stale worker generation".into()));
             }
@@ -4997,12 +5174,6 @@ pub mod ane_residency {
             let mut exchange_guard = ExchangeFaultGuard {
                 faulted: &self.faulted,
                 completed: false,
-            };
-            let _compiling = match request {
-                WorkerRequest::AneAdmitShape { shape, .. } => {
-                    Some(CompilingMarker::set(&self.compiling_shape, *shape))
-                }
-                _ => None,
             };
             #[cfg(test)]
             let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
@@ -5587,7 +5758,8 @@ pub mod ane_residency {
                 });
             }
             let serving = self.clone();
-            let task = tokio::spawn(async move {
+            let waits = Arc::new(RequestWaits::new());
+            let task = tokio::spawn(REQUEST_WAITS.scope(waits.clone(), async move {
                 let _guards = guards;
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
@@ -5623,21 +5795,21 @@ pub mod ane_residency {
                         .await;
                 }
                 result
-            });
+            }));
             let joined = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, task)
-                    .await
-                    .map_err(|_| self.channel.deadline_error())?,
+                Some(deadline) => match tokio::time::timeout_at(deadline, task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        #[cfg(test)]
+                        self.channel.pass_classify_gate().await;
+                        return Err(self.channel.expired_wait(&waits));
+                    }
+                },
                 None => task.await,
             };
-            joined
-                .map_err(|error| {
-                    AneResidencyError::Channel(format!("inference task failed: {error}"))
-                })?
-                .map_err(|error| match error {
-                    AneResidencyError::DeadlineExceeded => self.channel.deadline_error(),
-                    other => other,
-                })
+            joined.map_err(|error| {
+                AneResidencyError::Channel(format!("inference task failed: {error}"))
+            })?
         }
 
         async fn exchange_sequences(
@@ -5648,7 +5820,7 @@ pub mod ane_residency {
             permits: Option<PermitSource>,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                return Err(AneResidencyError::DeadlineExceeded);
+                return Err(lease_deadline_expired());
             }
             use synapse_core::{
                 decode_f32_frame, encode_i32_frame, WorkerSequence, WorkerTokenItem,
@@ -5739,7 +5911,7 @@ pub mod ane_residency {
                 ));
             }
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                return Err(AneResidencyError::DeadlineExceeded);
+                return Err(deadline_expired(None));
             }
             Ok(values.chunks_exact(dims).map(<[f32]>::to_vec).collect())
         }
@@ -6764,6 +6936,8 @@ pub mod ane_residency {
             admit_attempts: HashMap<(String, usize), usize>,
             admit_delay: Duration,
             connects: HashMap<String, u32>,
+            /// Inference requests (embed or rerank) the mock worker received.
+            inference_frames: u64,
         }
 
         type SharedLedger = Arc<Mutex<Ledger>>;
@@ -6800,6 +6974,7 @@ pub mod ane_residency {
                     request,
                     WorkerRequest::EmbedBatch { .. } | WorkerRequest::RerankSequences { .. }
                 ) {
+                    ledger.lock().unwrap().inference_frames += 1;
                     let gate = ledger.lock().unwrap().inference_gate.take();
                     if let Some((started, release)) = gate {
                         started.notify_one();
@@ -7246,7 +7421,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     supervisor.next_step(second_ticket.id, &second, &worker, 4),
-                    Step::Wait
+                    Step::Wait(_)
                 ),
                 "pending compile's four layers must prevent another four-layer reservation"
             );
@@ -7384,6 +7559,241 @@ pub mod ane_residency {
             assert_eq!(serving.supervisor.stats().restarts, 0);
             assert!(!serving.channel.faulted.load(Ordering::Relaxed));
             assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
+        }
+
+        fn notify_pair() -> (Arc<Notify>, Arc<Notify>) {
+            (Arc::new(Notify::new()), Arc::new(Notify::new()))
+        }
+
+        async fn until(mut condition: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("condition never held");
+        }
+
+        /// A request holding the stream while it waits for an execution
+        /// permit gives up at its deadline; a queued compile then takes the
+        /// stream before the caller's expiry is classified. The expired wait
+        /// was the permit, so the answer must not be shape_compiling.
+        #[tokio::test]
+        async fn expired_permit_wait_stays_deadline_exceeded_when_a_compile_starts_before_classification(
+        ) {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let (reached, proceed) = notify_pair();
+            *serving.channel.classify_gate.lock().unwrap() =
+                Some((reached.clone(), proceed.clone()));
+            let (started, release) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
+            let never: PermitSource = Arc::new(|_| {
+                Box::pin(std::future::pending::<
+                    Result<ExchangePermit, AneResidencyError>,
+                >())
+            });
+            let waiting = tokio::spawn({
+                let serving = serving.clone();
+                async move {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+                    serving
+                        .infer_permitted(vec![vec![1]], false, Some(deadline), (), Some(never))
+                        .await
+                }
+            });
+            until(|| serving.channel.stream.try_lock().is_err()).await;
+            let compile = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.infer(vec![vec![1; 600]], false).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), reached.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            let compiling_at_classification = serving.channel.compiling_shape();
+            proceed.notify_one();
+            let answered = waiting.await.unwrap();
+            release.notify_one();
+            compile.await.unwrap().unwrap();
+            assert_eq!(compiling_at_classification, Some(1024));
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+        }
+
+        /// A request waiting for budget (no evictable shape) expires while an
+        /// admission holds the stream. It was not waiting for that compile.
+        #[tokio::test]
+        async fn expired_budget_wait_stays_deadline_exceeded_while_an_admit_holds_the_stream() {
+            let ledger = SharedLedger::default();
+            // Room for two shapes of the fixture's 22-layer model.
+            let supervisor = budget_supervisor(44, Duration::from_secs(5));
+            let serving = serving_fixture_for(&ledger, "serving", supervisor.clone()).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+            let held_128 = supervisor
+                .lease(&worker, &serving.metadata.model_ref, 128)
+                .await
+                .unwrap();
+            let (started, release) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
+            let compile = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.infer(vec![vec![1; 200]], false).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let answered = tokio::time::timeout(
+                Duration::from_secs(2),
+                serving.infer_permitted(vec![vec![1; 400]], false, Some(deadline), (), None),
+            )
+            .await
+            .unwrap();
+            let compiling_at_expiry = serving.channel.compiling_shape();
+            release.notify_one();
+            compile.await.unwrap().unwrap();
+            drop(held_128);
+            assert_eq!(compiling_at_expiry, Some(256));
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+        }
+
+        /// The request's own shape is Admitting, but its admit is still queued
+        /// behind an inference holding the stream when the deadline expires.
+        /// The request is blocked on that compile even though no admit holds
+        /// the stream yet.
+        #[tokio::test]
+        async fn deadline_on_an_own_admit_queued_behind_inference_is_shape_compiling() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let (started, release) = notify_pair();
+            ledger.lock().unwrap().inference_gate = Some((started.clone(), release.clone()));
+            let inference = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.infer(vec![vec![1]], false).await }
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let answered = tokio::time::timeout(
+                Duration::from_secs(2),
+                serving.infer_permitted(vec![vec![1; 600]], false, Some(deadline), (), None),
+            )
+            .await
+            .unwrap();
+            let compiling_at_expiry = serving.channel.compiling_shape();
+            release.notify_one();
+            inference.await.unwrap().unwrap();
+            assert_eq!(compiling_at_expiry, None, "the admit must still be queued");
+            assert!(
+                matches!(
+                    answered,
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                ),
+                "{answered:?}"
+            );
+        }
+
+        /// The stream is granted to a queued inference only after its deadline,
+        /// in the same poll as the expired timer. It must give the stream back
+        /// without writing anything.
+        #[tokio::test]
+        async fn inference_granted_the_stream_after_its_deadline_is_never_written() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let frames_before = ledger.lock().unwrap().inference_frames;
+            let request = WorkerRequest::EmbedBatch {
+                req_id: serving.channel.next_req_id("embed"),
+                model_ref: serving.metadata.model_ref.clone(),
+                pooling: synapse_core::WorkerPooling::Mean,
+                normalize: true,
+                items: vec![synapse_core::WorkerTokenItem {
+                    id: "0".into(),
+                    n_tokens: 1,
+                }],
+            };
+            let raw = encode_i32_frame(&[1]);
+            let held = serving.channel.stream.lock().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            let exchange = serving.channel.exchange_inference(
+                &request,
+                Some(&raw),
+                Some(deadline),
+                Duration::from_secs(1),
+                async { Ok(Box::new(()) as ExchangePermit) },
+            );
+            tokio::pin!(exchange);
+            // One poll queues the exchange for the stream.
+            assert!(tokio::time::timeout(Duration::ZERO, &mut exchange)
+                .await
+                .is_err());
+            tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+            // Released after the deadline: the lock goes to the queued exchange.
+            drop(held);
+            let answered = exchange.await;
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+            assert_eq!(ledger.lock().unwrap().inference_frames, frames_before);
+            assert!(!serving.channel.faulted.load(Ordering::Relaxed));
+        }
+
+        /// An admit or evict that queues for the stream longer than its RPC
+        /// watchdog, but whose RPC alone is short, must not fault the channel
+        /// or restart the worker.
+        #[tokio::test]
+        async fn queued_admit_and_evict_do_not_spend_their_rpc_watchdog_waiting_for_the_stream() {
+            let ledger = SharedLedger::default();
+            ledger.lock().unwrap().admit_delay = Duration::from_millis(50);
+            let mut channel = mock_channel("worker", &ledger).await;
+            Arc::get_mut(&mut channel).unwrap().0.shape_rpc_timeout = Duration::from_millis(200);
+            let worker: Arc<dyn AneShapeWorker> = channel.clone();
+            let supervisor = AneResidencySupervisor::new(Default::default());
+            let held = channel.0.stream.lock().await;
+            let admitted = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 128).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(held);
+            let lease = tokio::time::timeout(Duration::from_secs(2), admitted)
+                .await
+                .unwrap()
+                .unwrap();
+            let admit_faulted = channel.0.faulted.load(Ordering::Relaxed);
+            assert!(lease.is_ok(), "the queued admit failed");
+            drop(lease);
+            let held = channel.0.stream.lock().await;
+            let evicted = tokio::spawn({
+                let channel = channel.clone();
+                async move { channel.evict_shape("model", 128).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(held);
+            let evicted = tokio::time::timeout(Duration::from_secs(2), evicted)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!admit_faulted);
+            assert!(evicted.is_ok(), "{evicted:?}");
+            assert!(!channel.0.faulted.load(Ordering::Relaxed));
+            assert_eq!(supervisor.stats().restarts, 0);
+            assert_eq!(ledger.lock().unwrap().connects["worker"], 1);
         }
 
         async fn run_rung(supervisor: &AneResidencySupervisor, worker: &Channel, tokens: usize) {
