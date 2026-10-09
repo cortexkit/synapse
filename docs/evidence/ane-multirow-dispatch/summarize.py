@@ -59,6 +59,42 @@ def fmt(value, digits=3):
     return str(value)
 
 
+def replay_lines(path):
+    """One line per replay path (single, multi) of a report, if it has one."""
+    report = json.load(open(path))
+    setup = report.get("replay_setup")
+    lines = []
+    for key in ("replay", "replay_all"):
+        replay = report.get(key)
+        if not replay or "skipped" in replay:
+            continue
+        for path_name in ("single", "multi"):
+            samples = [s for s in replay["samples"] if s["path"] == path_name]
+            walls = [s["wall_ms"] for s in samples]
+            loads = [s["load_before"] for s in samples] + [s["load_after"] for s in samples]
+            median = statistics.median(walls)
+            lines.append(
+                {
+                    "report": report["arm"],
+                    "replay": key,
+                    "programs": setup["programs"] if path_name == "multi" else [],
+                    "executables_held": setup["executables_held"],
+                    "path": path_name,
+                    "batches": replay["batches"],
+                    "rows": replay["rows"],
+                    "wall_ms": walls,
+                    "median_wall_s": median / 1000.0,
+                    "rows_per_second": replay["rows"] * 1000.0 / median,
+                    "load_range": [min(loads), max(loads)],
+                    "multi_row_passes": replay["multi_row_passes"],
+                    "single_row_passes": replay["single_row_passes"],
+                    "min_cosine_multi_vs_single": replay["min_cosine_multi_vs_single"],
+                    "identical_rows": replay["identical_rows"],
+                }
+            )
+    return lines
+
+
 def main(argv):
     out = None
     if "--json" in argv:
@@ -88,9 +124,30 @@ def main(argv):
                 ]
             )
         )
+    replays = [line for path in argv for line in replay_lines(path)]
+    if replays:
+        print()
+        print("replay | path | programs | rows | median s | rows/s | walls ms | min cos | identical | load")
+        for r in replays:
+            print(
+                " | ".join(
+                    [
+                        r["replay"],
+                        r["path"],
+                        "+".join(r["programs"]) or "single-row",
+                        str(r["rows"]),
+                        fmt(r["median_wall_s"], 2),
+                        fmt(r["rows_per_second"], 1),
+                        ", ".join(f"{w:.0f}" for w in r["wall_ms"]),
+                        fmt(r["min_cosine_multi_vs_single"], 7),
+                        f"{r['identical_rows']}/{r['rows']}",
+                        f"{r['load_range'][0]:.2f}-{r['load_range'][1]:.2f}",
+                    ]
+                )
+            )
     if out:
         with open(out, "w") as handle:
-            json.dump(rows, handle, indent=1)
+            json.dump({"arms": rows, "replays": replays}, handle, indent=1)
 
 
 if __name__ == "__main__":
