@@ -323,20 +323,22 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-lease"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd9e3ef6e6a961a66a62b57ed9c6670501236b14114e3bf8a3810623c2604ff7"
+checksum = "d02256247fecd266c7d853cf63d85270367abce9925e52c9ee01ac4994ed2293"
 dependencies = [
  "fs2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d75f333ade3e19da329eecd3aafb0af8ffab2ae3f915242f0d3216c31c0a248"
+checksum = "0c237e3dbd3b9bc5b7bd77e4899c660d8f5773192a0b98a35bab9f68307feffe"
 dependencies = [
  "chrono",
+ "cortexkit-lease",
  "cortexkit-store-types",
  "regex",
  "tracing",
@@ -351,9 +353,9 @@ checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 
 [[package]]
 name = "cortexkit-store"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5249d38a9260c6e175039989d1538ccceb7c3274fb809c99184891e7e139c3ff"
+checksum = "df7beeeeaf1f244870ff160eff79a6f6b2eb8f2d234da9a1f6aa2c60a8a93c93"
 dependencies = [
  "cortexkit-lease",
  "cortexkit-store-types",

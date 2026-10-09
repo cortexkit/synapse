@@ -85,9 +85,9 @@ subc-transport = "=0.10.0"
 # already resolves, so the lock keeps one version of it.
 subc-os = "=0.1.4"
 # The commons crates are published on crates.io too.
-cortexkit-lease = "0.1.0"
-cortexkit-store = "0.2.0"
+cortexkit-lease = "0.1.2"
+cortexkit-store = "0.2.4"
 cortexkit-store-types = "0.2.2"
-cortexkit-log = "0.3.3"
+cortexkit-log = "0.3.5"
 tracing = "0.1"
 
