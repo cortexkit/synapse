@@ -506,9 +506,11 @@ impl Model {
     }
 
     /// Like [`Model::compile_multirow`], but also compiles
-    /// [`RowLayout::BatchAxis`], so the hardware measurement test can show
-    /// its wrong rows. Returns the first compile error; executables compiled
-    /// before it are released.
+    /// [`RowLayout::BatchAxis`]. That layout compiles and runs but returns
+    /// wrong vectors for some rows, which [`Model::compile_multirow`] refuses;
+    /// only the hardware measurement test calls this, to record that defect.
+    /// Returns the first compile error; executables compiled before it are
+    /// released.
     pub(crate) fn compile_multirow_unchecked(
         &self,
         shape: MultiRowShape,
@@ -719,7 +721,9 @@ mod tests {
         assert!(MultiRowShape::new(RowLayout::WidthFolded, 1, 128).is_err());
         assert!(MultiRowShape::new(RowLayout::WidthFolded, MAX_ROWS + 1, 128).is_err());
         assert!(MultiRowShape::new(RowLayout::BatchAxis, 2, 100).is_err());
-        // Narrow slots are fine while the tensor stays at least 64 wide.
+        // Slots narrower than 128 are allowed as long as the whole packed
+        // width (rows times slot width) stays at least 64 columns, the
+        // binding's minimum spatial width.
         assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 16).is_err());
         assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 32).is_ok());
         assert!(MultiRowShape::new(RowLayout::WidthFolded, 2, 64).is_ok());
@@ -788,7 +792,8 @@ mod tests {
 
     #[test]
     fn attention_bias_is_causal_and_never_crosses_rows() {
-        // One row: exactly the single-row graph's causal constant.
+        // One row: the bias must equal the causal mask the single-row graph
+        // builds (each query sees itself and earlier keys only).
         for (start, count, key_count) in [(0, 128, 128), (128, 128, 256), (384, 128, 512)] {
             let mut single = vec![0.0; count * key_count];
             for q in 0..count {
@@ -1028,7 +1033,10 @@ mod tests {
 /// path, in one process. Ignored by default; the "Reproduce on the Mac mini"
 /// section of `docs/evidence/ane-multirow-dispatch/README.md` has the full
 /// procedure. Never run it on a machine whose production Synapse serves from
-/// the Neural Engine: it compiles 56 or more executables.
+/// the Neural Engine: it compiles 56 or more executables (28 per Qwen3 shape,
+/// single-row plus multi-row), and the Neural Engine holds a limited number
+/// of compiled programs, so a second compiling process can leave production
+/// unable to admit shapes.
 ///
 /// Required environment:
 /// - `ANE_MULTIROW_ARM`: the shape, `layout:rows:width` (for example
