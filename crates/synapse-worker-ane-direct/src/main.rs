@@ -2,8 +2,9 @@
 mod backend;
 #[cfg(target_os = "macos")]
 mod modernbert;
-// Multi-row passes are an opt-in prototype: the request loop does not call
-// them yet, because their executables sit outside the supervisor's budget.
+// Multi-row passes are an opt-in prototype. The request loop does not call
+// them: the module's supervisor counts 28 executables per admitted shape
+// against the Neural Engine's capacity, and multi-row programs are not counted.
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod multirow;

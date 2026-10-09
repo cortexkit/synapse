@@ -25,7 +25,8 @@ libm = "0.2"
 serde_json.workspace = true
 sha2.workspace = true
 
-# Tokenizes real exported chunks for the ignored multi-row hardware experiment.
+# Tokenizes exported AFT chunks for `multirow::hardware::multirow_experiment`,
+# a Neural Engine test that only builds and runs on macOS.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 tokenizers.workspace = true
 

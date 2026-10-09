@@ -505,9 +505,10 @@ impl Model {
         self.compile_multirow_unchecked(shape)
     }
 
-    /// [`Model::compile_multirow`] without the layout refusal, so the hardware
-    /// experiment can reproduce the batch-axis failure. Returns the first
-    /// compile error; executables compiled before it are released.
+    /// Like [`Model::compile_multirow`], but also compiles
+    /// [`RowLayout::BatchAxis`], so the hardware measurement test can show
+    /// its wrong rows. Returns the first compile error; executables compiled
+    /// before it are released.
     pub(crate) fn compile_multirow_unchecked(
         &self,
         shape: MultiRowShape,
@@ -1024,8 +1025,10 @@ mod tests {
 }
 
 /// Neural Engine measurement of one multi-row shape against the single-row
-/// path, in one process. Ignored by default; see the module README section in
-/// `docs/evidence/ane-multirow-dispatch/README.md` for the full procedure.
+/// path, in one process. Ignored by default; the "Reproduce on the Mac mini"
+/// section of `docs/evidence/ane-multirow-dispatch/README.md` has the full
+/// procedure. Never run it on a machine whose production Synapse serves from
+/// the Neural Engine: it compiles 56 or more executables.
 ///
 /// Required environment:
 /// - `ANE_MULTIROW_ARM`: the shape, `layout:rows:width` (for example
@@ -1037,8 +1040,11 @@ mod tests {
 /// - `ANE_MULTIROW_TOKENIZER`: the checkpoint's `tokenizer.json`.
 /// - `ANE_MULTIROW_OUT`: where to write the JSON report.
 ///
-/// Optional: `ANE_MULTIROW_REPEATS` (timing repetitions, default 5) and
-/// `ANE_MULTIROW_REPLAY=1` (also replay the export's first 64-row batch).
+/// Optional: `ANE_MULTIROW_REPEATS` (timing repetitions, default 5);
+/// `ANE_MULTIROW_REPLAY=1` (also replay the export's first 64-row batch);
+/// `ANE_MULTIROW_REPLAY_EXTRA` (comma-separated extra shapes for the replay);
+/// `ANE_MULTIROW_REPLAY_ALL=1` (also replay every batch in the export's
+/// `.meta.json` plan).
 #[cfg(test)]
 mod hardware {
     use super::*;
@@ -1170,8 +1176,10 @@ mod hardware {
             "composed_tokens_total": chunks.iter().map(|c| c.ids.len()).sum::<usize>(),
         });
 
-        // Fixture rows carry fp32 references; check the tokenizer composition
-        // against them too, so the replay rows are composed like the catalog's.
+        // The parity fixture holds, per case, the text, the token ids the
+        // catalog composed for it, and the fp32 reference vector. Re-tokenize
+        // each text here and count exact id matches, so the export rows below
+        // are known to be composed the way the catalog composes them.
         let fixture: Value = serde_json::from_slice(
             &std::fs::read(format!(
                 "../../bench/parity/fixtures/{SLUG}/{SLUG}.ref-v1.transformers-5.16.1.seed-0.json"
