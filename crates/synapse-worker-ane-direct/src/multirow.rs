@@ -1,12 +1,18 @@
 //! Experimental multi-row Neural Engine passes for the Qwen3 embedding lane.
 //!
-//! The single-row path in `backend.rs` runs one padded row through every layer
-//! program, so each row re-reads all layer weights. This module builds layer
-//! programs that carry several rows in one pass, so one weight read serves all
-//! of them. Nothing in serving calls it: a caller opts in by naming a
-//! [`MultiRowShape`], compiling a [`MultiRowProgram`] and running rows through
-//! it. The program owns its executables, so the shared executable budget stays
-//! the caller's responsibility (28 extra executables per Qwen3 shape).
+//! The single-row path in `backend.rs` runs one row per pass, padded to a
+//! ladder rung of at least 128 tokens. This module builds layer programs that
+//! carry several rows per pass. Nothing in serving calls it: a caller opts in
+//! by naming a [`MultiRowShape`], compiling a [`MultiRowProgram`] with
+//! [`Model::compile_multirow`] and running rows through it. The program owns
+//! its executables, so the shared executable budget stays the caller's
+//! responsibility (28 extra executables per Qwen3 shape).
+//!
+//! Measured on an Apple M4 (`docs/evidence/ane-multirow-dispatch`), a pass
+//! costs roughly what its total width costs, with 256 columns the cheapest per
+//! column. Rows gain most when they are much shorter than their rung and are
+//! packed into narrow slots; [`RowLayout::WidthFolded`] was the fastest layout
+//! and its outputs were bit-identical to the single-row path.
 //!
 //! Every layout keeps each row's attention inside that row. Qwen3 attention is
 //! causal and rows are right-padded, so a real token never sees a padding
@@ -39,7 +45,10 @@ const QUERY_TILE: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RowLayout {
     /// Rows on the batch axis: `[rows, hidden, 1, width]`. Attention is one
-    /// batched matrix multiplication per query tile.
+    /// batched matrix multiplication per query tile. Measured unsafe: with
+    /// three or more rows of width 128 it compiles and runs but returns wrong
+    /// vectors for rows after the second, so [`Model::compile_multirow`]
+    /// refuses it. Only the hardware experiment compiles it.
     BatchAxis,
     /// Rows side by side on width: `[1, hidden, 1, rows * width]`. Attention
     /// slices each row's own segment and runs it separately.
@@ -486,9 +495,23 @@ fn supported(model: &Model) -> Result<()> {
 }
 
 impl Model {
-    /// Compile one program per layer for `shape`. Returns the first compile
-    /// error unchanged in context; executables compiled before it are released.
+    /// Compile one program per layer for `shape`. Refuses
+    /// [`RowLayout::BatchAxis`], which returned wrong rows on hardware.
     pub fn compile_multirow(&self, shape: MultiRowShape) -> Result<MultiRowProgram> {
+        ensure!(
+            shape.layout != RowLayout::BatchAxis,
+            "layout_unsafe: batch-axis passes returned wrong rows on the Neural Engine"
+        );
+        self.compile_multirow_unchecked(shape)
+    }
+
+    /// [`Model::compile_multirow`] without the layout refusal, so the hardware
+    /// experiment can reproduce the batch-axis failure. Returns the first
+    /// compile error; executables compiled before it are released.
+    pub(crate) fn compile_multirow_unchecked(
+        &self,
+        shape: MultiRowShape,
+    ) -> Result<MultiRowProgram> {
         supported(self)?;
         let hidden = self.profile.n("hidden_size");
         ane::autoreleasepool(|_| {
@@ -975,7 +998,12 @@ mod tests {
         };
         let error = program.run(&gte, &[&[1]]).unwrap_err().to_string();
         assert!(error.starts_with("model_unsupported"), "{error}");
-        assert!(gte.compile_multirow(shape).is_err());
+        let error = gte.compile_multirow(shape).err().unwrap().to_string();
+        assert!(error.starts_with("model_unsupported"), "{error}");
+        // The batch axis is refused before any graph is built or compiled.
+        let batch = MultiRowShape::new(RowLayout::BatchAxis, 2, 128).unwrap();
+        let error = model.compile_multirow(batch).err().unwrap().to_string();
+        assert!(error.starts_with("layout_unsafe"), "{error}");
     }
 
     #[test]
@@ -1186,7 +1214,7 @@ mod hardware {
         report["other_single_row_compiles"] = json!(admitted);
         let load = load_average();
         let started = Instant::now();
-        let program = model.compile_multirow(shape);
+        let program = model.compile_multirow_unchecked(shape);
         report["multi_row_compile"] = json!({
             "ms": ms(started), "load_before": load, "load_after": load_average(),
             "ok": program.is_ok(),
@@ -1417,7 +1445,7 @@ mod hardware {
                 for &shape in &extra {
                     let load = load_average();
                     let started = Instant::now();
-                    programs.push(model.compile_multirow(shape).unwrap());
+                    programs.push(model.compile_multirow_unchecked(shape).unwrap());
                     compiles.push(json!({
                         "multi_row": shape.label(), "ms": ms(started), "executables": 28,
                         "load_before": load, "load_after": load_average(),
