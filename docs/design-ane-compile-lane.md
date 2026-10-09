@@ -110,13 +110,18 @@ Permit count and holding time are the same as today.
 Before: lane mutex (no time limit). The reference cases then execute through
 the serving path, reusing that mutex guard: permit, supervisor lease or admit,
 stream, then release.
-After:
+After (profile check). The load and the check run to completion in their own
+task, so a request that started them can give up without cancelling them:
 1. Lane mutex.
 2. Gate WRITE guard. This waits for in-flight readers to drain. Tokio's
    `RwLock` is fair, so new readers queue behind it.
 3. The reference cases execute through the serving path, passing the held
    write guard in place of a read guard: supervisor, stream, permit, I/O.
 4. Release the write guard, then the lane mutex.
+
+Every serving request that reaches certification, including the one that found
+the check pending and started it, waits for that task only until its own
+absolute request deadline and is then answered `model_loading`.
 
 The non-profile 2000 ms check keeps both guards in `CatalogInvocation` until its
 blocking task ends.
@@ -146,6 +151,14 @@ gate guard. A lane with no loaded model has no readers, because the unload that
 removed the model only proceeded after `try_write` succeeded. Every in-flight
 task, including those of cancelled callers, holds its read guard until its
 reply drains.
+
+### Admit and evict exchanges
+
+Before: the 600 s shape-RPC watchdog covered the wait for the worker stream
+too, so an admit or evict queued behind long work could expire it, fault the
+channel and restart the worker. After: the exchange waits for the stream
+without a timer (each holder is bounded by its own I/O timeout or watchdog),
+and the 600 s watchdog starts once the stream is held.
 
 ## Why the direct-ANE permit after the stream lock cannot deadlock
 
@@ -215,14 +228,21 @@ there is no core `StableErrorCode` change.
 **When a request waits and when it gets the error.** A request never fails
 early because a compile is running. It waits as long as its own deadline
 allows, and it is answered `shape_compiling` only if that deadline expires
-while it is blocked on a compile. Blocked on a compile means one of:
-1. It is the request whose miss started the compile.
-2. It is waiting for another request's in-flight compile of the same shape
-   (single-flight).
-3. It is waiting for the worker stream while an admit exchange holds it.
+while it is blocked on a compile. Each serving request records which wait it is
+in, and the answer comes from the wait that expired, not from what the worker
+is doing when the error is mapped. Blocked on a compile means one of:
+1. Its own shape is `Admitting`: it reserved the slot and started the compile,
+   or it joined another request's compile of that shape (single-flight). This
+   counts from the moment the slot enters `Admitting`, even while the admit is
+   still queued for the worker stream.
+2. It is waiting for the worker stream and an admit exchange holds the stream
+   when the deadline expires. If the stream is granted in the same poll as the
+   expiry, the exchange that held it through the deadline decides.
 
-A deadline that expires on any other wait (permit, ordinary inference ahead of
-it, eviction) keeps `deadline_exceeded`. On expiry, the compile continues in its
+A deadline that expires on any other wait (permit, budget queue, eviction,
+ordinary inference ahead of it) keeps `deadline_exceeded`. An inference that
+is granted the stream or its permit at or after its deadline returns without
+writing anything to the worker. On expiry, the compile continues in its
 own task: the shape becomes resident, the budget is accounted, and no inference
 is dispatched for the expired request. A retry finds the shape resident, or
 joins the same compile. It never starts a second compile.
