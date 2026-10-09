@@ -693,7 +693,7 @@ old = """
             let joined = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, task)
                     .await
-                    .map_err(|_| AneResidencyError::DeadlineExceeded)?,
+                    .map_err(|_| self.channel.deadline_error())?,
                 None => task.await,
             };"""
 new = """
@@ -706,7 +706,7 @@ new = """
             let joined = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, &mut task.0)
                     .await
-                    .map_err(|_| AneResidencyError::DeadlineExceeded)?,
+                    .map_err(|_| self.channel.deadline_error())?,
                 None => (&mut task.0).await,
             };"""
 edits = []
