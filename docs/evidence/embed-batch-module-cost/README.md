@@ -71,8 +71,10 @@ numbers only mean something in a release build.
 
 All values are in milliseconds over the 45 measured calls. Per-set medians are
 listed so drift between sets is visible. Stages are listed in the order they
-run. Each stage is one record per call, except the four engine-call stages,
-which sum 8 records per call.
+run. Each stage is one record per call, except the five per-engine-call stages
+(`bulk_scheduler_dispatch`, `execution_lane_wait`, `execution_permit_wait`,
+`bulk_engine_call` and `test_engine_compute`). Each of those writes 8 records
+per call, and the table shows their sum.
 
 | Stage | What it covers | Median | Min | Max | Set medians |
 | --- | --- | ---: | ---: | ---: | --- |
