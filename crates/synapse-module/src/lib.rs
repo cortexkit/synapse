@@ -17947,7 +17947,8 @@ mod tests {
             .lock()
             .unwrap() = true;
         let state = fixture.state.clone();
-        // The check's first reference case compiles shape 128; hold that compile.
+        // The self-check's first reference input pads to the 128-token shape,
+        // which the mock worker must compile first; hold that compile open.
         let (started, release) = ane_gate();
         fixture
             .control
@@ -26103,7 +26104,8 @@ async fn check_profile_model(
             }
         };
     // A mock worker cannot reproduce the reference outputs, so tests that need
-    // a passing check run every reference case and then override the verdict.
+    // a passing numerical self-check still run every reference case and then
+    // record the check as passed instead of evaluating the outputs.
     #[cfg(test)]
     if *state
         .runtime

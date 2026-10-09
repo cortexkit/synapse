@@ -3923,7 +3923,8 @@ pub mod ane_residency {
             slot_id: u64,
             owner: Arc<dyn AneShapeWorker>,
         },
-        /// `Some(shape)`: the request's own shape is being admitted (compiled).
+        /// `Some(shape)`: the shape this request needs has a slot in
+        /// `Admitting`, i.e. its executables are being compiled.
         Wait(Option<usize>),
         Retired,
     }
@@ -4846,7 +4847,9 @@ pub mod ane_residency {
         }
     }
 
-    /// Who holds the worker stream, as far as deadline classification needs.
+    /// Which exchange holds the worker stream (an admission compiling a shape,
+    /// or anything else) and when the last holder released it. Used to tell
+    /// whether an expired stream wait was waiting behind a compile.
     #[derive(Default)]
     struct StreamHolder {
         /// The shape an admission (compile) exchange holding the stream is
@@ -5002,10 +5005,11 @@ pub mod ane_residency {
                 request,
                 WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneEvictShape { .. }
             ) {
-                // Queueing for the stream is not part of the shape RPC: a long
-                // compile or inference ahead of it must not use up the RPC's
-                // watchdog, whose expiry faults the channel and restarts the
-                // worker. The watchdog starts once the stream is held.
+                // `shape_rpc_timeout` bounds a silent worker during an admit
+                // (compile) or evict request. Its expiry faults the channel,
+                // which restarts the worker. Time spent queueing for the stream
+                // behind other work is not the worker being silent, so the
+                // timer starts only once this exchange holds the stream.
                 let mut guard = self.stream.lock().await;
                 let operation = self.exchange_locked(&mut guard, request, raw, generation);
                 match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
