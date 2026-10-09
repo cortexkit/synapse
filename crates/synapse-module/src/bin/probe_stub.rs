@@ -12,6 +12,12 @@ use std::{
 };
 
 fn main() {
+    // Tests launch each fresh copy once with --warm before timing it: macOS
+    // assesses a new executable on its first launch, which under load can take
+    // longer than the probe deadlines under test. Warming logs nothing.
+    if std::env::args().nth(1).as_deref() == Some("--warm") {
+        return;
+    }
     let path = std::env::current_exe().unwrap();
     let config: Value =
         serde_json::from_slice(&fs::read(path.with_extension("json")).unwrap()).unwrap();

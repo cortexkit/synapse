@@ -49,6 +49,10 @@ impl Stub {
             .expect("build synapse-probe-stub before running isolated --lib tests");
         let worker = synapse_core::dev_binary::ckdev_binary(&source, &root).unwrap();
         fs::write(worker.with_extension("json"), config.to_string()).unwrap();
+        // Pay macOS's first-launch assessment of this new executable here, not
+        // inside a probe deadline the test is timing.
+        let warmed = Command::new(&worker).arg("--warm").status().unwrap();
+        assert!(warmed.success(), "probe stub warm-up failed: {warmed}");
         Self { root, worker }
     }
 
