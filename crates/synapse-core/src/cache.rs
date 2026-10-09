@@ -123,20 +123,8 @@ impl ModelCache {
     }
 
     pub fn default_root() -> Result<PathBuf, ModelCacheError> {
-        if let Ok(root) = std::env::var("CORTEXKIT_MODEL_CACHE") {
-            return Ok(PathBuf::from(root));
-        }
-        if let Ok(root) = std::env::var("SYNAPSE_MODEL_CACHE_DIR") {
-            return Ok(PathBuf::from(root));
-        }
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            ModelCacheError::InvalidSource("HOME is unset; cannot resolve model cache".to_string())
-        })?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("cortexkit")
-            .join("models"))
+        crate::resolve_data_root_from_process(crate::DataRoot::ModelCache)
+            .map_err(|error| ModelCacheError::InvalidSource(error.to_string()))
     }
 
     #[must_use]

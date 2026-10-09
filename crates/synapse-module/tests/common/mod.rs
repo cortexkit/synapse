@@ -134,7 +134,8 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
     command
         .env("SYNAPSE_CONFIG_PATH", config_path)
         .env("CORTEXKIT_LEASE_ROOT", lease_root)
-        .env("XDG_DATA_HOME", data_home);
+        .env("XDG_DATA_HOME", &data_home)
+        .env("LOCALAPPDATA", data_home);
     // The module finds an unconfigured worker by its `ck-synapse-worker-<engine>`
     // file name beside its own executable. Tests run the module as a `ckdev-`
     // link in a scratch dir, where no such sibling exists, and a `ck-` name is
@@ -400,6 +401,113 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn whole_process_without_home_holds_lease_at_native_data_home() {
+        use cortexkit_lease::{FileLeaseStore, LeaseError, LeaseKey, LeaseStore};
+        use subc_transport::{
+            generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
+            SCHEMA_VERSION,
+        };
+        use tokio::{io::AsyncReadExt, net::TcpListener};
+
+        let root = unique_temp_dir("native-data-home");
+        let data_home = root.join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let config_path = root.join("synapse.jsonc");
+        std::fs::write(&config_path, "{}").unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let connection_path = root.join("subc-conn.json");
+        write_atomic(
+            &connection_path,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: process::id(),
+                daemon_ver: "test-native-data-home".to_string(),
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+            },
+        )
+        .unwrap();
+        let binary =
+            synapse_core::dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_ck-synapse"), &root)
+                .unwrap();
+        let mut command = Command::new(binary);
+        command
+            .arg("--subc")
+            .arg(&connection_path)
+            .env_remove("HOME")
+            .env_remove("CORTEXKIT_LEASE_ROOT")
+            .env("SUBC_MODULE_ID", MODULE_ID)
+            .env("SYNAPSE_CONFIG_PATH", config_path)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("LOCALAPPDATA", &data_home)
+            .env("APPDATA", root.join("roaming"))
+            .env("USERPROFILE", root.join("profile"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = synapse_core::without_launch_nonce_tokio(command)
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+
+        // Connecting happens after lease acquisition. Hold the TCP connection
+        // without authentication or HELLO_ACK so profile and store boot stay out
+        // of this root test, and check the actual lease while the child is alive.
+        let connected = timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                connection = listener.accept() => connection.map_err(|error| error.to_string()),
+                status = child.wait() => Err(format!("module exited before connecting: {status:?}")),
+            }
+        }).await;
+        let lease_root = data_home.join("cortexkit").join("leases");
+        let lease = if matches!(&connected, Ok(Ok(_))) {
+            match FileLeaseStore::new(&lease_root).acquire(&LeaseKey::new(
+                MODULE_ID,
+                "file",
+                "singleton",
+            )) {
+                Err(LeaseError::Held { .. }) => Ok(()),
+                Err(error) => Err(format!("lease check refused: {error}")),
+                Ok(_handle) => Err("native data-home lease was not held".to_string()),
+            }
+        } else {
+            Err(format!("module did not connect: {connected:?}"))
+        };
+
+        // Reap before asserting, including on a startup refusal or timeout.
+        let _ = child.start_kill();
+        timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::new();
+        timeout(Duration::from_secs(10), stdout.read_to_end(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(10), stderr.read_to_end(&mut output))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(connected);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            lease.is_ok(),
+            "{lease:?}; module output: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

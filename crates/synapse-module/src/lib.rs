@@ -400,17 +400,8 @@ fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLe
 }
 
 fn synapse_lease_root() -> Result<PathBuf, ModuleError> {
-    if let Ok(root) = env::var("CORTEXKIT_LEASE_ROOT") {
-        return Ok(PathBuf::from(root));
-    }
-    let home = env::var_os("HOME").ok_or_else(|| {
-        ModuleError::Config("HOME is unset; cannot resolve cortexkit lease root".to_string())
-    })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("cortexkit")
-        .join("leases"))
+    synapse_core::resolve_data_root_from_process(synapse_core::DataRoot::Lease)
+        .map_err(|error| ModuleError::Config(error.to_string()))
 }
 
 #[derive(Debug, Error)]
@@ -16491,22 +16482,14 @@ fn resolve_storage_descriptor(
 
 fn default_storage_descriptor_with_environment(
     module_id: &str,
-    mut env_var: impl FnMut(&str) -> Option<OsString>,
+    env_var: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<StorageDescriptor, ModuleError> {
-    let data_home = env_var("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env_var("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .map(|home| home.join(".local").join("share"))
-        })
-        .ok_or_else(|| {
-            ModuleError::Config(
-                "XDG_DATA_HOME and HOME are unset; cannot resolve Synapse store".to_string(),
-            )
-        })?;
+    let data_home = synapse_core::resolve_data_root(
+        synapse_core::DataRoot::Store,
+        synapse_core::Platform::current(),
+        env_var,
+    )
+    .map_err(|error| ModuleError::Config(error.to_string()))?;
     let path = sqlite_store_path(&data_home.to_string_lossy(), module_id);
     Ok(StorageDescriptor {
         module_id: module_id.to_string(),
@@ -20017,6 +20000,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn default_store_resolver_uses_xdg_then_home_data_directory() {
         let from_xdg =
             default_storage_descriptor_with_environment(DEFAULT_MODULE_ID, |key| match key {
@@ -20036,8 +20020,6 @@ mod tests {
             (key == "HOME").then(|| OsString::from("/home/operator"))
         })
         .unwrap();
-        // The HOME arm joins path segments, so on Windows the separators come out
-        // mixed; compare components rather than the rendered string.
         let StorageBackend::Sqlite { path } = &from_home.backend else {
             panic!("expected a sqlite backend, got {:?}", from_home.backend);
         };
@@ -20063,6 +20045,45 @@ mod tests {
             ),
             "unexpected store path components: {components:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_store_resolver_uses_localappdata_not_home_or_xdg() {
+        let descriptor =
+            default_storage_descriptor_with_environment(DEFAULT_MODULE_ID, |key| match key {
+                "LOCALAPPDATA" => Some(OsString::from(r"C:\native-data")),
+                "HOME" => Some(OsString::from(r"D:\home")),
+                "XDG_DATA_HOME" => Some(OsString::from(r"E:\xdg")),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            descriptor.backend,
+            StorageBackend::Sqlite {
+                path: sqlite_store_path(r"C:\native-data", DEFAULT_MODULE_ID),
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_storage_takes_precedence_over_native_store_default() {
+        let supplied = StorageDescriptor {
+            module_id: DEFAULT_MODULE_ID.to_string(),
+            storage_namespace: "daemon".to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: "daemon-selected-store.db".to_string(),
+            },
+        };
+        let resolved = resolve_storage_descriptor(
+            &Some(serde_json::to_value(&supplied).unwrap()),
+            DEFAULT_MODULE_ID,
+        )
+        .unwrap();
+        assert_eq!(resolved.module_id, supplied.module_id);
+        assert_eq!(resolved.storage_namespace, supplied.storage_namespace);
+        assert_eq!(resolved.backend, supplied.backend);
     }
 
     #[test]
