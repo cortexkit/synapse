@@ -21,9 +21,9 @@ fn stub_binary() -> PathBuf {
         .parent()
         .unwrap()
         .join(if cfg!(windows) {
-            "ck-synapse-probe-stub.exe"
+            "synapse-probe-stub.exe"
         } else {
-            "ck-synapse-probe-stub"
+            "synapse-probe-stub"
         })
 }
 
@@ -36,12 +36,12 @@ impl Stub {
         ));
         fs::create_dir_all(&root).unwrap();
         let source = root.join(if cfg!(windows) {
-            "ck-synapse-probe-stub.exe"
+            "synapse-probe-stub.exe"
         } else {
-            "ck-synapse-probe-stub"
+            "synapse-probe-stub"
         });
         fs::copy(stub_binary(), &source)
-            .expect("build ck-synapse-probe-stub before running isolated --lib tests");
+            .expect("build synapse-probe-stub before running isolated --lib tests");
         let worker = synapse_core::dev_binary::ckdev_binary(&source, &root).unwrap();
         fs::write(worker.with_extension("json"), config.to_string()).unwrap();
         Self { root, worker }

@@ -23,7 +23,7 @@ path = "src/bin/timeout_worker.rs"
 test = false
 
 [[bin]]
-name = "ck-synapse-probe-stub"
+name = "synapse-probe-stub"
 path = "src/bin/probe_stub.rs"
 test = false
 required-features = ["test-support"]
