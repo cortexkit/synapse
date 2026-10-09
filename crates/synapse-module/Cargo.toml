@@ -22,6 +22,12 @@ name = "synapse-worker-timeout-mock"
 path = "src/bin/timeout_worker.rs"
 test = false
 
+[[bin]]
+name = "ck-synapse-probe-stub"
+path = "src/bin/probe_stub.rs"
+test = false
+required-features = ["test-support"]
+
 [features]
 default = []
 test-support = ["synapse-engine-owned/test-support"]

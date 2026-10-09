@@ -16,6 +16,9 @@ use std::{
 
 mod ane_artifact;
 mod catalog;
+mod catalog_probe;
+#[cfg(test)]
+mod detection_tests;
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
 /// Certification probes, immutable fixture batteries and oracles,
@@ -461,6 +464,9 @@ struct SynapseHandlerInner {
     module_id: String,
     connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
+    initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+    #[cfg(feature = "test-support")]
+    initialize_count: std::sync::atomic::AtomicUsize,
     approval_operators: Mutex<HashMap<RouteHandle, String>>,
     /// The `flow_id` from each bound route's scope, for routes the daemon
     /// opened on behalf of a flow (an automation acting for its owner).
@@ -1262,6 +1268,7 @@ struct RuntimeState {
     hf_endpoint: String,
     release_catalog: catalog::Catalog,
     runnable_backends: BTreeSet<String>,
+    backend_reasons: BTreeMap<String, &'static str>,
     catalog_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
@@ -2170,6 +2177,9 @@ impl SynapseHandler {
                 module_id,
                 connection_file,
                 state: OnceLock::new(),
+                initialization: OnceLock::new(),
+                #[cfg(feature = "test-support")]
+                initialize_count: std::sync::atomic::AtomicUsize::new(0),
                 approval_operators: Mutex::new(HashMap::new()),
                 flow_routes: Mutex::new(HashMap::new()),
                 connection_end: Arc::new(OnceLock::new()),
@@ -2182,6 +2192,8 @@ impl SynapseHandler {
     }
 
     fn initialize(&self, ack: &ModuleHelloAckBody) -> Result<Arc<ModuleState>, ModuleError> {
+        #[cfg(feature = "test-support")]
+        self.inner.initialize_count.fetch_add(1, Ordering::SeqCst);
         let descriptor = resolve_storage_descriptor(&ack.storage, &self.inner.module_id)?;
         let store = Arc::new(SynapseStore::open(&descriptor)?);
         let module_generation = store.next_module_generation()?;
@@ -2281,7 +2293,7 @@ impl RuntimeState {
     ) -> Result<Self, ModuleError> {
         validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
         let release_catalog = runtime_release_catalog()?;
-        let runnable_backends = detected_catalog_backends();
+        let (runnable_backends, backend_reasons) = detected_catalog_backends(&config);
         let hf_endpoint = config.hf_endpoint;
         let inline = config.inline;
         let jobs = config.jobs;
@@ -2327,6 +2339,7 @@ impl RuntimeState {
             hf_endpoint,
             release_catalog,
             runnable_backends,
+            backend_reasons,
             catalog_locks: Mutex::new(BTreeMap::new()),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
@@ -3639,14 +3652,39 @@ fn run_background_maintenance_at(state: &ModuleState, now: u64) {
 #[async_trait]
 impl ModuleHandler for SynapseHandler {
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        if self.state().is_some() {
-            return;
+        let mut completion = self
+            .inner
+            .initialization
+            .get_or_init(|| {
+                let handler = self.clone();
+                let ack = ack.clone();
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                // The task owns initialization independently of any HELLO_ACK waiter;
+                // cancelling a callback must not start a second blocking boot.
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let state = handler
+                            .initialize(&ack)
+                            .map_err(|error| error.to_string())?;
+                        let _ = handler.inner.state.set(Arc::clone(&state));
+                        let _ = start_perf_sampler(state);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    let _ = tx.send(Some(result));
+                });
+                rx
+            })
+            .clone();
+        let result = completion
+            .wait_for(Option::is_some)
+            .await
+            .map(|result| result.as_ref().expect("completed boot").clone())
+            .unwrap_or_else(|error| Err(error.to_string()));
+        if let Err(error) = result {
+            panic!("synapse boot failed after HELLO_ACK: {error}");
         }
-        let state = self
-            .initialize(ack)
-            .unwrap_or_else(|error| panic!("synapse boot failed after HELLO_ACK: {error}"));
-        let _ = self.inner.state.set(Arc::clone(&state));
-        let _ = start_perf_sampler(state);
     }
 
     async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
@@ -7020,7 +7058,7 @@ fn locator_path(
     }
 }
 
-fn owned_cuda_floor_decision(worker: Option<&Path>) -> CudaFloorDecision {
+fn cuda_floor_override() -> Option<(u32, u32, u32)> {
     let driver_api = ["SYNAPSE_CUDA_DRIVER_API", "CUDA_DRIVER_API"]
         .into_iter()
         .find_map(|name| {
@@ -7035,8 +7073,13 @@ fn owned_cuda_floor_decision(worker: Option<&Path>) -> CudaFloorDecision {
                 .ok()
                 .and_then(|value| parse_compute_capability(&value))
         });
+    let (driver_api, (major, minor)) = (driver_api?, compute?);
+    Some((driver_api, major, minor))
+}
+
+fn owned_cuda_floor_decision(worker: Option<&Path>) -> CudaFloorDecision {
     let packaging_driver = env::var("SYNAPSE_CUDA_PACKAGING_DRIVER").ok();
-    let (Some(driver_api), Some((major, minor))) = (driver_api, compute) else {
+    let Some((driver_api, major, minor)) = cuda_floor_override() else {
         // The environment is the override; when it is silent, ask the worker.
         // The module deliberately does not link the CUDA driver, so the probe
         // has to run in the worker process and report its numbers back.
@@ -7064,130 +7107,68 @@ struct OwnedCudaFloorReading {
     compute_minor: u32,
 }
 
-type OwnedCudaProbeEntry = Arc<OnceLock<Result<OwnedCudaFloorReading, String>>>;
-
-static OWNED_CUDA_PROBE: std::sync::LazyLock<Mutex<HashMap<PathBuf, OwnedCudaProbeEntry>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Cache successes and failures per worker; a complete environment override skips it.
-fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading, String> {
-    let worker = worker
+fn resolve_catalog_worker(engine: &str, configured: Option<&Path>) -> Option<PathBuf> {
+    configured
         .map(Path::to_path_buf)
-        .or_else(|| env::var_os(worker_binary_env_var(CUDA_WORKER_ENGINE)).map(PathBuf::from))
-        .or_else(|| resolve_worker_binary_sibling(CUDA_WORKER_ENGINE))
-        .ok_or_else(|| "CUDA floor probe worker binary not found".to_string())?;
-    let worker = fs::canonicalize(&worker).unwrap_or(worker);
-    let entry = OWNED_CUDA_PROBE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .entry(worker.clone())
-        .or_default()
-        .clone();
-    // Only callers for this worker wait; unrelated workers can probe concurrently.
-    // Failed probes stay cached deliberately until module restart.
-    entry
-        .get_or_init(|| {
-            let mut command =
-                synapse_core::without_launch_nonce(std::process::Command::new(&worker));
-            command.arg("--probe-floor");
-            run_owned_cuda_probe(&mut command, Duration::from_secs(10))
-        })
-        .clone()
+        .or_else(|| env::var_os(worker_binary_env_var(engine)).map(PathBuf::from))
+        .or_else(|| resolve_worker_binary_sibling(engine))
 }
 
+/// Catalog detection and CUDA loading reuse the worker's cached hardware-floor
+/// probe. Refusals are cached as well, so loading cannot repeatedly stall on a
+/// missing driver or an unsupported device until the module restarts.
+fn owned_cuda_probe_floor(worker: Option<&Path>) -> Result<OwnedCudaFloorReading, String> {
+    let worker = resolve_catalog_worker(CUDA_WORKER_ENGINE, worker)
+        .ok_or_else(|| "worker_missing".to_string())?;
+    let output = catalog_probe::cached_probe(&worker, catalog_probe::ProbeKind::Floor)
+        .map_err(|error| format!("{}: {}", error.reason, error.detail))?;
+    cuda_reading_from_output(output)
+}
+
+fn cuda_reading_from_output(
+    output: catalog_probe::ProbeOutput,
+) -> Result<OwnedCudaFloorReading, String> {
+    let stderr = output.stderr.clone();
+    if !output.status.success() && output.status.code() != Some(2) {
+        return Err(format!(
+            "CUDA floor probe exited {}; stderr: {stderr}",
+            output.status
+        ));
+    }
+    let parsed = catalog_probe::floor_result(output).map_err(|reason| {
+        format!("invalid CUDA floor probe JSON or refusal: {reason}; stderr: {stderr}")
+    })?;
+    cuda_reading(&parsed).ok_or_else(|| "invalid CUDA floor probe hardware fields".to_string())
+}
+
+fn cuda_reading(parsed: &Value) -> Option<OwnedCudaFloorReading> {
+    let observed = parsed.get("observed")?;
+    Some(OwnedCudaFloorReading {
+        driver_api: observed.get("driver_api")?.as_u64()?.try_into().ok()?,
+        compute_major: observed
+            .get("compute_capability")?
+            .get("major")?
+            .as_u64()?
+            .try_into()
+            .ok()?,
+        compute_minor: observed
+            .get("compute_capability")?
+            .get("minor")?
+            .as_u64()?
+            .try_into()
+            .ok()?,
+    })
+}
+
+#[cfg(test)]
 fn run_owned_cuda_probe(
     command: &mut std::process::Command,
     timeout: Duration,
 ) -> Result<OwnedCudaFloorReading, String> {
-    let deadline = std::time::Instant::now() + timeout;
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn CUDA floor probe: {error}"))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1);
-    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.take(4097).read_to_end(&mut bytes).map(|_| bytes);
-        let _ = stdout_tx.send(result);
-    });
-    std::thread::spawn(move || {
-        let mut tail = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        while let Ok(count) = stderr.read(&mut chunk) {
-            if count == 0 {
-                break;
-            }
-            let discard = (tail.len() + count).saturating_sub(4096);
-            tail.drain(..discard);
-            tail.extend_from_slice(&chunk[..count]);
-        }
-        let _ = stderr_tx.send(String::from_utf8_lossy(&tail).into_owned());
-    });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(
-                    Duration::from_millis(20)
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                );
-            }
-            other => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(match other {
-                    Err(error) => format!("wait for CUDA floor probe: {error}"),
-                    _ => "CUDA floor probe timed out".to_string(),
-                });
-            }
-        }
-    };
-    // Bound pipe completion too: a descendant may still hold an inherited pipe.
-    let stderr = stderr_rx
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .unwrap_or_default();
-    let fail = |reason: String| format!("{reason}; stderr: {stderr}");
-    let status = status.map_err(fail)?;
-    if !status.success() {
-        return Err(fail(format!("CUDA floor probe exited {status}")));
-    }
-    let stdout = stdout_rx
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        .map_err(|error| fail(format!("CUDA floor probe stdout: {error}")))?
-        .map_err(|error| fail(format!("read CUDA floor probe stdout: {error}")))?;
-    if stdout.len() > 4096 {
-        return Err(fail(
-            "CUDA floor probe stdout exceeds 4096 bytes".to_string(),
-        ));
-    }
-    let parsed: Value = serde_json::from_slice(&stdout)
-        .map_err(|error| fail(format!("invalid CUDA floor probe JSON: {error}")))?;
-    let reading = || {
-        Some(OwnedCudaFloorReading {
-            driver_api: parsed.get("driver_api")?.as_u64()?.try_into().ok()?,
-            compute_major: parsed
-                .get("compute_capability")?
-                .get("major")?
-                .as_u64()?
-                .try_into()
-                .ok()?,
-            compute_minor: parsed
-                .get("compute_capability")?
-                .get("minor")?
-                .as_u64()?
-                .try_into()
-                .ok()?,
-        })
-    };
-    reading().ok_or_else(|| fail("invalid CUDA floor probe hardware fields".to_string()))
+    let output = catalog_probe::run_probe(command, timeout)
+        .map_err(|error| format!("{}: {}", error.reason, error.detail))?;
+    cuda_reading_from_output(output)
 }
-
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
     let mut parts = value.trim().split('.');
     let major = parts.next()?.parse().ok()?;
@@ -17476,14 +17457,22 @@ mod tests {
             TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let good = root.join(if cfg!(windows) { "good.cmd" } else { "good.sh" });
-        let bad = root.join(if cfg!(windows) { "bad.cmd" } else { "bad.sh" });
+        let good = root.join(if cfg!(windows) {
+            "ckdev-good.cmd"
+        } else {
+            "ckdev-good.sh"
+        });
+        let bad = root.join(if cfg!(windows) {
+            "ckdev-bad.cmd"
+        } else {
+            "ckdev-bad.sh"
+        });
         let header = if cfg!(windows) {
             "@echo off\r\n"
         } else {
             "#!/bin/sh\n"
         };
-        let json = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let json = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
         let success = if cfg!(windows) {
             format!("{header}echo {json}\r\n")
         } else {
@@ -17536,13 +17525,17 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let ready = root.join("ready");
         let release = root.join("release");
-        let slow = root.join(if cfg!(windows) { "slow.cmd" } else { "slow.sh" });
-        let quick = root.join(if cfg!(windows) {
-            "quick.cmd"
+        let slow = root.join(if cfg!(windows) {
+            "ckdev-slow.cmd"
         } else {
-            "quick.sh"
+            "ckdev-slow.sh"
         });
-        let json = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let quick = root.join(if cfg!(windows) {
+            "ckdev-quick.cmd"
+        } else {
+            "ckdev-quick.sh"
+        });
+        let json = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
         let stalled = if cfg!(windows) {
             format!(
                 "@echo off\r\necho ready >\"{}\"\r\n:wait\r\nif exist \"{}\" goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:done\r\necho {json}\r\n",
@@ -21408,7 +21401,7 @@ mod tests {
         } else {
             "probe.sh"
         });
-        let output = r#"{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}"#;
+        let output = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
         let script = if cfg!(windows) {
             format!("@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho {output}\r\n")
         } else {
@@ -23079,15 +23072,20 @@ fn runtime_release_catalog() -> Result<catalog::Catalog, ModuleError> {
         .cloned()
         .map_err(|e| ModuleError::Config(e.to_string()))
 }
-fn detected_catalog_backends() -> BTreeSet<String> {
+fn detected_catalog_backends(
+    config: &ModuleConfig,
+) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
     #[cfg(feature = "test-support")]
     if let Ok(value) = env::var("SYNAPSE_TEST_RUNNABLE_BACKENDS") {
-        return value
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+        return (
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            BTreeMap::new(),
+        );
     }
     #[cfg(target_os = "macos")]
     let backends = {
@@ -23100,9 +23098,74 @@ fn detected_catalog_backends() -> BTreeSet<String> {
         }
         backends
     };
+    #[cfg(target_os = "macos")]
+    {
+        let _ = config;
+        (backends, BTreeMap::new())
+    }
     #[cfg(not(target_os = "macos"))]
-    let backends = BTreeSet::new();
-    backends
+    {
+        let configured = |engine: &str| {
+            config
+                .preload_models
+                .iter()
+                .find(|model| model.engine == engine && model.worker_bin.is_some())
+                .and_then(|model| model.worker_bin.as_deref())
+        };
+        detect_gpu_backends(
+            resolve_catalog_worker(CUDA_WORKER_ENGINE, configured(CUDA_WORKER_ENGINE)),
+            resolve_catalog_worker("owned-vulkan", configured("owned-vulkan")),
+        )
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn detect_gpu_backends(
+    cuda: Option<PathBuf>,
+    vulkan: Option<PathBuf>,
+) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
+    let outcomes = std::thread::scope(|scope| {
+        let cuda = scope.spawn(|| detect_worker_backend("cuda", cuda.as_deref()));
+        let vulkan = scope.spawn(|| detect_worker_backend("vulkan", vulkan.as_deref()));
+        [
+            ("cuda", cuda.join().expect("CUDA detection thread")),
+            ("vulkan", vulkan.join().expect("Vulkan detection thread")),
+        ]
+    });
+    let mut runnable = BTreeSet::new();
+    let mut reasons = BTreeMap::new();
+    for (backend, outcome) in outcomes {
+        match outcome {
+            Ok(()) => {
+                runnable.insert(backend.to_string());
+            }
+            Err(reason) => {
+                reasons.insert(backend.to_string(), reason);
+            }
+        }
+    }
+    (runnable, reasons)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn detect_worker_backend(backend: &str, worker: Option<&Path>) -> Result<(), &'static str> {
+    use catalog_probe::{cached_probe, floor_result, version_result, ProbeKind};
+    let worker = worker.ok_or("worker_missing")?;
+    version_result(
+        cached_probe(worker, ProbeKind::Version).map_err(|error| error.reason)?,
+        backend,
+    )?;
+    if backend != "cuda" || cuda_floor_override().is_none() {
+        let envelope =
+            floor_result(cached_probe(worker, ProbeKind::Floor).map_err(|error| error.reason)?)?;
+        if backend == "cuda" && cuda_reading(&envelope).is_none() {
+            return Err("probe_failed");
+        }
+    }
+    if backend == "cuda" && !owned_cuda_floor_decision(Some(worker)).is_supported() {
+        return Err("device_below_floor");
+    }
+    Ok(())
 }
 #[cfg(target_os = "macos")]
 fn catalog_direct_ane_worker() -> Option<PathBuf> {
@@ -23118,11 +23181,20 @@ fn catalog_direct_ane_worker() -> Option<PathBuf> {
 fn direct_ane_catalog_available(macos: bool, worker: Option<&Path>) -> bool {
     macos && worker.is_some_and(Path::is_file)
 }
-fn catalog_backend_reason(runtime: &RuntimeState, backend: &str) -> Option<&'static str> {
-    if runtime.runnable_backends.contains(backend) {
-        None
-    } else if !cfg!(target_os = "macos") && matches!(backend, "metal" | "ane") {
+fn catalog_backend_reason(
+    runtime: &RuntimeState,
+    backend: &str,
+    platform: synapse_core::Platform,
+) -> Option<&'static str> {
+    let macos = platform == synapse_core::Platform::MacOs;
+    if (macos && matches!(backend, "cuda" | "vulkan"))
+        || (!macos && matches!(backend, "metal" | "ane"))
+    {
         Some("not_supported_on_platform")
+    } else if runtime.runnable_backends.contains(backend) {
+        None
+    } else if let Some(reason) = runtime.backend_reasons.get(backend) {
+        Some(*reason)
     } else if backend == "metal" {
         Some("device_missing")
     } else {
@@ -23502,7 +23574,7 @@ async fn models_catalog(state: Arc<ModuleState>, params: Value) -> HandlerOutcom
                 } else {
                     Value::Null
                 };
-                backends.push(json!({"backend":b.backend,"lane_id":catalog::lane_id(&entry.id,&b.backend),"fingerprint":b.fingerprint,"runnable":catalog_backend_reason(&state.runtime,&b.backend).is_none(),"reason":catalog_backend_reason(&state.runtime,&b.backend),"installed":installed,"self_check":check}));
+                backends.push(json!({"backend":b.backend,"lane_id":catalog::lane_id(&entry.id,&b.backend),"fingerprint":b.fingerprint,"runnable":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current()).is_none(),"reason":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current()),"installed":installed,"self_check":check}));
             }
             rows.push(json!({"id":entry.id,"task":entry.task,"name":entry.name,"description":entry.description,"default_for_task":entry.default_for_task,"upstream":entry.upstream,"manifest_digest":manifest,"download_bytes":entry.download_bytes(&runnable),"install_state":install_state,"backends":backends}));
         }
@@ -23616,7 +23688,7 @@ fn catalog_backend_unavailable(
     entry: &catalog::CatalogEntry,
     selected: Option<&catalog::CatalogBackend>,
 ) -> WireOperationError {
-    let backends = entry.backends.iter().filter(|b| selected.is_none_or(|s| s.backend == b.backend)).map(|b| json!({"backend":b.backend,"reason":catalog_backend_reason(&state.runtime,&b.backend)})).collect::<Vec<_>>();
+    let backends = entry.backends.iter().filter(|b| selected.is_none_or(|s| s.backend == b.backend)).map(|b| json!({"backend":b.backend,"reason":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current())})).collect::<Vec<_>>();
     catalog_wire_error(
         "backend_unavailable",
         json!({"catalog_id":entry.id,"lane_id":selected.map(|b| catalog::lane_id(&entry.id,&b.backend)),"backends":backends}),
@@ -24691,7 +24763,13 @@ fn select_catalog_lane(
             .find(|b| state.runtime.runnable_backends.contains(&b.backend))
     });
     let backend = selected.ok_or_else(|| catalog_backend_unavailable(state, entry, None))?;
-    if catalog_backend_reason(&state.runtime, &backend.backend).is_some() {
+    if catalog_backend_reason(
+        &state.runtime,
+        &backend.backend,
+        synapse_core::Platform::current(),
+    )
+    .is_some()
+    {
         return Err(catalog_backend_unavailable(state, entry, Some(backend)));
     }
     if current_catalog_install(state, entry, &backend.backend)?.is_none() {
