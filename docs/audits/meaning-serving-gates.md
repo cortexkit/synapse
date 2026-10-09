@@ -21,7 +21,7 @@ Claims I could not support are labelled *suspicion*, not finding.
 | # | Value | Confidence | Where its meaning comes from | Anything break? |
 |---|---|---|---|---|
 | 1 | `certified` in `models.list` | High | Doc **contradicts** code | Yes — documented guarantee is false |
-| 2 | `evidence["g_dec"]` → `gates_complete` | High | Inferred from the one producer | Yes — 12 names, 1 measurement |
+| 2 | `evidence["g_dec"]` → `gates_complete` | High | Inferred from the one producer | **Resolved** — the record now names its one gate |
 | 3 | `serving_admission` (`probe.report`) | High | Inferred from two disjoint tables | Yes — reports a gate it does not read |
 | 4 | `certification_stale` on owned lanes | High | Inferred; contradicted by aliasing | Yes — constant `false` |
 | 5 | `SYNAPSE_OS_BUILD_OVERRIDE` | High | Nowhere; inferred from one test | Yes — can re-open a fail-closed lane |
@@ -103,6 +103,30 @@ I have not executed the reproduction.
 ---
 
 ## 2. `evidence["g_dec"]`, consumed as `gates_complete`
+
+**Status: resolved.** The probe no longer writes `evidence.g_dec`. It records
+one entry under `evidence.gates`: `id` `structural_band`
+(`store::PROBE_GATE_ID`), `status` `passed` or `failed` from the probe's own
+verdict, the manifest revision `owned-decode-probe-gates-v1`, and a `measures`
+list naming the three checks the verdict combines
+(`owned_decode_probe_gate_evidence` in `crates/synapse-module/src/lib.rs`). It
+is attached on both outcomes, not only inside `if passed`. G-DEC-01 to
+G-DEC-12 are left out of the record entirely rather than marked
+`not_evaluated`: the probe never runs them, and an id that appears with any
+status invites a consumer keyed on the id to read it as evidence. Admission
+(`probe_gate_evidence_passed` in `crates/synapse-module/src/store.rs`, behind
+all three fenced admission reads) requires exactly that one entry, passed, at
+the current manifest revision, and refuses any evidence that still has a
+`g_dec` key. `CERT_EVIDENCE_SCHEMA_REVISION` moved to
+`owned-decode-cert-evidence-v2` and the row's manifest revision to
+`owned-decode-probe-gates-v1`; every certification lookup filters on the
+schema revision, so rows written under v1 no longer certify anything, and
+storage health reports them as `evidence_schema_incompatible`. Approvals are
+unchanged. A lane certified under v1 must be probed again. The twelve-gate
+runner remains unwired. Tests: `generate_probe_records_only_its_own_gate`
+(`lib.rs`) and `pre_v2_certification_rows_do_not_admit_and_v2_rows_do`
+(`store.rs`). The rest of this section is the finding as originally written;
+its line numbers are from that time.
 
 **What it is.** A JSON array of twelve objects `{id, status, manifest_revision}`
 with `id` in `G-DEC-01 … G-DEC-12` and `status` the literal string `"passed"` —
@@ -704,6 +728,10 @@ running that is not.
 
 ### The `"gates"` key accepted by `complete_g_dec_evidence`
 
+*Since resolved with #2: `complete_g_dec_evidence` is gone. The probe now
+writes its one gate under `"gates"`, `"g_dec"` is refused, and v1 rows of
+either shape no longer match the evidence schema revision.*
+
 ```
 evidence.get("g_dec").or_else(|| evidence.get("gates"))
 ```
@@ -868,7 +896,7 @@ This document changes no code. For the record, in confidence order:
 or be renamed to say which one it reads (#3); `models.list`'s `certified` should
 either call the serving predicate as its contract claims or the contract should
 be rewritten (#1); `evidence["g_dec"]` should carry the gate outcomes it names,
-or carry one honest field (#2); `certification_stale` on the decode branch is a
+or carry one honest field (#2, done: it now carries the one gate it measures); `certification_stale` on the decode branch is a
 one-line contradiction (#4); `identities_installed` should be wired or removed,
 and someone who knows which should say so (unresolved section);
 `SYNAPSE_OS_BUILD_OVERRIDE` needs a doc comment stating whether it is supported

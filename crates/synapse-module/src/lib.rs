@@ -10503,18 +10503,25 @@ fn owned_decode_worker_path_identity() -> Value {
     })
 }
 
-fn owned_decode_gate_evidence() -> Value {
-    Value::Array(
-        (1..=12)
-            .map(|number| {
-                json!({
-                    "id": format!("G-DEC-{number:02}"),
-                    "status": "passed",
-                    "manifest_revision": store::G_DEC_MANIFEST_REVISION,
-                })
-            })
-            .collect(),
-    )
+/// The gate record a generate probe writes into its certification evidence.
+///
+/// The probe makes one measurement with one verdict (see
+/// `store::PROBE_GATE_ID` for what it covers), so the record names exactly
+/// one gate, passed or failed. The twelve G-DEC acceptance gates are left out
+/// rather than listed as `not_evaluated`: the probe never runs them, and a
+/// G-DEC id in the record, whatever its status, invites a reader or a
+/// consumer keyed on the id to treat the row as evidence about that gate.
+fn owned_decode_probe_gate_evidence(passed: bool) -> Value {
+    json!([{
+        "id": store::PROBE_GATE_ID,
+        "status": if passed { "passed" } else { "failed" },
+        "manifest_revision": store::G_DEC_MANIFEST_REVISION,
+        "measures": [
+            "fixture_tokens_within_structural_band",
+            "configured_chain_shape_matches_k1",
+            "constrained_worker_path_emits_null",
+        ],
+    }])
 }
 
 fn owned_decode_probe_match_inputs(
@@ -14231,9 +14238,9 @@ async fn execute_generate_probe_for_model(
         && mismatches.is_empty()
         && chain_shape_mismatches.is_empty();
     let passed = fixture_passed && constrained_schema_valid;
-    let certification_evidence = json!({
+    let mut certification_evidence = json!({
         "task": "generate",
-        "gate": "structural_band",
+        "gate": store::PROBE_GATE_ID,
         "blocking_reason": if passed {
             Value::Null
         } else if !chain_shape_mismatches.is_empty() {
@@ -14266,13 +14273,7 @@ async fn execute_generate_probe_for_model(
             },
         },
     });
-    let certification_evidence = if passed {
-        let mut evidence = certification_evidence;
-        evidence["g_dec"] = owned_decode_gate_evidence();
-        evidence
-    } else {
-        certification_evidence
-    };
+    certification_evidence["gates"] = owned_decode_probe_gate_evidence(passed);
     store_owned_probe_outcome(
         state,
         &model,
@@ -20027,6 +20028,44 @@ mod tests {
         assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_some());
         accepted[17] = 524;
         assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_none());
+    }
+
+    /// A generate probe makes one measurement. Its certification evidence must
+    /// name that one gate with the probe's own verdict, and nothing about the
+    /// twelve G-DEC acceptance gates the probe does not run.
+    #[test]
+    fn generate_probe_records_only_its_own_gate() {
+        let passed = owned_decode_probe_gate_evidence(true);
+        assert_eq!(
+            passed,
+            json!([{
+                "id": "structural_band",
+                "status": "passed",
+                "manifest_revision": "owned-decode-probe-gates-v1",
+                "measures": [
+                    "fixture_tokens_within_structural_band",
+                    "configured_chain_shape_matches_k1",
+                    "constrained_worker_path_emits_null",
+                ],
+            }])
+        );
+        assert!(
+            !passed.to_string().contains("G-DEC"),
+            "the probe must not record any G-DEC gate: {passed}"
+        );
+        assert!(store::probe_gate_evidence_passed(
+            &json!({ "gates": passed }),
+            store::G_DEC_MANIFEST_REVISION
+        ));
+
+        let failed = owned_decode_probe_gate_evidence(false);
+        assert_eq!(failed[0]["id"], "structural_band");
+        assert_eq!(failed[0]["status"], "failed");
+        assert_eq!(failed.as_array().map(Vec::len), Some(1));
+        assert!(!store::probe_gate_evidence_passed(
+            &json!({ "gates": failed }),
+            store::G_DEC_MANIFEST_REVISION
+        ));
     }
 
     #[test]

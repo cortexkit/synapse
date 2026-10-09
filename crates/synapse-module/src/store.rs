@@ -1264,12 +1264,38 @@ pub const APPROVAL_EVIDENCE_REQUIREMENTS_REVISION: &str = "owned-decode-evidence
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
 pub const APPROVAL_DIGEST_DOMAIN: &str = "owned-decode-approval-row-v1\0";
+/// Schema of the `evidence` JSON on a `measured_owned_decode` certification
+/// row.
+///
+/// v2 records the one gate the generate probe measures (see
+/// [`PROBE_GATE_ID`]) under `evidence.gates`, passed or failed. v1 rows
+/// listed G-DEC-01 to G-DEC-12 as passed whenever that single measurement
+/// passed, which claimed eleven gates nobody ran. Every certification lookup
+/// filters on this revision, so v1 rows no longer certify anything and a
+/// lane certified under v1 must be probed again.
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
-pub const CERT_EVIDENCE_SCHEMA_REVISION: &str = "owned-decode-cert-evidence-v1";
+pub const CERT_EVIDENCE_SCHEMA_REVISION: &str = "owned-decode-cert-evidence-v2";
+/// Revision stamped on a certification row (column `g_dec_manifest_revision`)
+/// and on each gate entry in its evidence, naming the gate set the probe
+/// records.
+///
+/// The column and constant names predate v2 evidence and are kept so the
+/// stored schema does not change; the value no longer refers to the G-DEC
+/// acceptance gates. v1 rows carried `decode-fixture-registry-v1` here.
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
-pub const G_DEC_MANIFEST_REVISION: &str = "decode-fixture-registry-v1";
+pub const G_DEC_MANIFEST_REVISION: &str = "owned-decode-probe-gates-v1";
+/// Identifier of the one gate the generate probe measures and records.
+///
+/// The probe passes it when every fixture prompt reproduces its expected
+/// tokens exactly or within the fixture's structural band, the configured
+/// chain shape reproduces the k=1 output, and the constrained worker path
+/// emits the JSON literal `null`. Admission requires exactly this gate,
+/// passed; the G-DEC acceptance gates are evaluated by
+/// `owned_decode_certification::gates::GateRunner`, which the serving path
+/// does not run, so a certification row makes no claim about them.
+pub const PROBE_GATE_ID: &str = "structural_band";
 
 /// The only derivation identifier accepted for an ingest-time Q8 repack.
 pub const Q8_INGEST_DERIVATION_CONTRACT: &str = "q8-ingest-v1";
@@ -4650,7 +4676,7 @@ impl SynapseStore {
             || row.constraint_runtime_identities != inputs.constraint_runtime_identities
             || row.worker_path_evidence != inputs.worker_path_evidence
             || row.g_dec_manifest_revision != inputs.g_dec_manifest_revision
-            || !complete_g_dec_evidence(&row.evidence, &inputs.g_dec_manifest_revision)
+            || !probe_gate_evidence_passed(&row.evidence, &inputs.g_dec_manifest_revision)
         {
             return Ok(None);
         }
@@ -4766,7 +4792,7 @@ impl SynapseStore {
             let Some(raw) = raw else { return Ok(None) };
             let certification = decode_owned_decode_cert_row(raw).map_err(to_sql_error)?;
             validate_owned_decode_cert_row(&certification).map_err(to_sql_error)?;
-            if !complete_g_dec_evidence(&certification.evidence, G_DEC_MANIFEST_REVISION) {
+            if !probe_gate_evidence_passed(&certification.evidence, G_DEC_MANIFEST_REVISION) {
                 return Ok(None);
             }
             Ok(Some(OwnedDecodeAdmission {
@@ -4909,7 +4935,7 @@ impl SynapseStore {
                 || certification.worker_path_evidence != inputs.worker_path_evidence
                 || certification.evidence_schema_revision != inputs.evidence_schema_revision
                 || certification.g_dec_manifest_revision != inputs.g_dec_manifest_revision
-                || !complete_g_dec_evidence(
+                || !probe_gate_evidence_passed(
                     &certification.evidence,
                     &inputs.g_dec_manifest_revision,
                 )
@@ -9010,35 +9036,26 @@ fn validate_owned_decode_cert_row(
     Ok(())
 }
 
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
-#[allow(dead_code)]
-fn complete_g_dec_evidence(evidence: &Value, manifest_revision: &str) -> bool {
-    let Some(entries) = evidence
-        .get("g_dec")
-        .or_else(|| evidence.get("gates"))
+/// Whether certification evidence records the probe's gate as passed.
+///
+/// `evidence.gates` must hold exactly one entry: [`PROBE_GATE_ID`] with status
+/// `passed` and the given manifest revision. Any other entry, including a
+/// G-DEC id, means the evidence claims something the probe does not measure,
+/// and a `g_dec` key is the v1 shape; both fail closed.
+pub(crate) fn probe_gate_evidence_passed(evidence: &Value, manifest_revision: &str) -> bool {
+    if evidence.get("g_dec").is_some() {
+        return false;
+    }
+    let Some([entry]) = evidence
+        .get("gates")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
     else {
         return false;
     };
-    let required = (1..=12)
-        .map(|number| format!("G-DEC-{number:02}"))
-        .collect::<BTreeSet<_>>();
-    let mut passed = BTreeSet::new();
-    for entry in entries {
-        let Some(object) = entry.as_object() else {
-            return false;
-        };
-        let Some(id) = object.get("id").and_then(Value::as_str) else {
-            return false;
-        };
-        if object.get("status").and_then(Value::as_str) != Some("passed")
-            || object.get("manifest_revision").and_then(Value::as_str) != Some(manifest_revision)
-            || !passed.insert(id.to_string())
-        {
-            return false;
-        }
-    }
-    passed == required
+    entry.get("id").and_then(Value::as_str) == Some(PROBE_GATE_ID)
+        && entry.get("status").and_then(Value::as_str) == Some("passed")
+        && entry.get("manifest_revision").and_then(Value::as_str) == Some(manifest_revision)
 }
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -9532,6 +9549,19 @@ mod tests {
     };
     use cortexkit_store_types::{Isolation, StorageBackend};
     use synapse_core::MachineProfile;
+
+    /// Evidence of the shape a passed generate probe writes under the current
+    /// schema, spelled out literally rather than taken from the probe's own
+    /// builder so a change to either side shows up as a disagreement.
+    fn passed_probe_gate_evidence() -> serde_json::Value {
+        serde_json::json!({
+            "gates": [{
+                "id": "structural_band",
+                "status": "passed",
+                "manifest_revision": "owned-decode-probe-gates-v1",
+            }],
+        })
+    }
 
     fn owned_seed_model_config(model_id: &str) -> StoredModelConfig {
         let (family, quant, artifact_digest, derived_digest) = match model_id {
@@ -11603,15 +11633,7 @@ mod tests {
         let store = SynapseStore::open(&descriptor).unwrap();
         let profile_hash = "b".repeat(64);
         let decode_fingerprint = "c".repeat(64);
-        let evidence = serde_json::json!({
-            "g_dec": (1..=12)
-                .map(|number| serde_json::json!({
-                    "id": format!("G-DEC-{number:02}"),
-                    "status": "passed",
-                    "manifest_revision": G_DEC_MANIFEST_REVISION,
-                }))
-                .collect::<Vec<_>>(),
-        });
+        let evidence = passed_probe_gate_evidence();
         let mut row = OwnedDecodeCertificationRow {
             status: CertificationStatus::Certified,
             revisioned_machine_profile_hash: profile_hash.clone(),
@@ -12001,15 +12023,7 @@ mod tests {
         let mut profile_b = profile_a.clone();
         profile_b.os_build = "os-b".to_string();
         store.observe_profile(&profile_a, 1, 1).unwrap();
-        let evidence = serde_json::json!({
-            "g_dec": (1..=12)
-                .map(|number| serde_json::json!({
-                    "id": format!("G-DEC-{number:02}"),
-                    "status": "passed",
-                    "manifest_revision": G_DEC_MANIFEST_REVISION,
-                }))
-                .collect::<Vec<_>>(),
-        });
+        let evidence = passed_probe_gate_evidence();
         let row = |epoch, hash: String| OwnedDecodeCertificationRow {
             status: CertificationStatus::Certified,
             revisioned_machine_profile_hash: hash,
@@ -12171,12 +12185,12 @@ mod tests {
             "certification writes and serving reads must not mutate approvals"
         );
         let mut incomplete_constrained = row_b;
-        incomplete_constrained.evidence = serde_json::json!({"g_dec": []});
+        incomplete_constrained.evidence = serde_json::json!({"gates": []});
         store
             .store_owned_decode_cert_row(&incomplete_constrained)
             .unwrap();
         let mut incomplete = unconstrained_row_b;
-        incomplete.evidence = serde_json::json!({"g_dec": []});
+        incomplete.evidence = serde_json::json!({"gates": []});
         store.store_owned_decode_cert_row(&incomplete).unwrap();
         let incomplete_inputs = OwnedDecodeMatchInputs {
             revisioned_machine_profile_hash: incomplete.revisioned_machine_profile_hash.clone(),
@@ -12201,6 +12215,182 @@ mod tests {
             .find(|outcome| outcome.model_id == "owned-model")
             .unwrap();
         assert_eq!(approval_health.admission, "no_current_evidence");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A row written before the evidence schema moved to v2 claimed twelve
+    /// G-DEC gates from one measurement. It must stop certifying the lane the
+    /// moment the module upgrades, while a v2 row recording the probe's own
+    /// gate admits the same lane under the same approval.
+    #[test]
+    fn pre_v2_certification_rows_do_not_admit_and_v2_rows_do() {
+        let (root, descriptor) = temp_descriptor("cert-evidence-v2");
+        let store = SynapseStore::open(&descriptor).unwrap();
+        store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO models (
+                         model_id, engine, task, fingerprint, config_json,
+                         created_ms, updated_ms
+                     ) VALUES ('owned-model', 'owned-metal-decode', 'generate', 'model-fp', '{}', 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let decode_fingerprint = "e".repeat(64);
+        let approval = store
+            .create_approval("owned-model", &decode_fingerprint, true, "operator", 1, 1)
+            .unwrap();
+        let profile = MachineProfile {
+            os_build: "os-a".to_string(),
+            arch: "aarch64".to_string(),
+            chip_model: "chip-a".to_string(),
+            ram_class: "le_32_gib".to_string(),
+            ane_subtype: None,
+            engine_identities: Vec::new(),
+        };
+        store.observe_profile(&profile, 1, 1).unwrap();
+        let inputs = OwnedDecodeMatchInputs {
+            revisioned_machine_profile_hash: profile.revisioned_hash(),
+            profile_activation_epoch: 1,
+            model_id: "owned-model".to_string(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: "processing".to_string(),
+            runtime_config_digest: "runtime".to_string(),
+            constraint_runtime_identities: Vec::new(),
+            worker_path_evidence: serde_json::json!({}),
+            evidence_schema_revision: CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
+            g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
+        };
+        // Exactly what a v1 module persisted for a passed probe. The current
+        // writer refuses these revisions, so it goes in through the raw upsert
+        // the way an older module left it in the store.
+        let v1_row = OwnedDecodeCertificationRow {
+            status: CertificationStatus::Certified,
+            revisioned_machine_profile_hash: inputs.revisioned_machine_profile_hash.clone(),
+            profile_activation_epoch: 1,
+            model_id: inputs.model_id.clone(),
+            decode_fingerprint: decode_fingerprint.clone(),
+            processing_fingerprint: inputs.processing_fingerprint.clone(),
+            runtime_config_digest: inputs.runtime_config_digest.clone(),
+            constraint_runtime_identities: Vec::new(),
+            worker_path_evidence: inputs.worker_path_evidence.clone(),
+            evidence_schema_revision: "owned-decode-cert-evidence-v1".to_string(),
+            g_dec_manifest_revision: "decode-fixture-registry-v1".to_string(),
+            numeric_profile_id: None,
+            fingerprint: Fingerprint(decode_fingerprint.clone()),
+            certified_at_ms: 1,
+            os_build: "os-a".to_string(),
+            module_generation: 1,
+            evidence: serde_json::json!({
+                "g_dec": (1..=12)
+                    .map(|number| serde_json::json!({
+                        "id": format!("G-DEC-{number:02}"),
+                        "status": "passed",
+                        "manifest_revision": "decode-fixture-registry-v1",
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        };
+        assert!(
+            store.store_owned_decode_cert_row(&v1_row).is_err(),
+            "the current writer must refuse v1 revisions"
+        );
+        store
+            .store
+            .with_conn_fenced(|tx| upsert_owned_decode_cert_row_tx(tx, &v1_row))
+            .unwrap();
+
+        let evaluation = store.owned_decode_admission_evaluation(&inputs).unwrap();
+        assert!(evaluation.admission().is_none(), "a v1 row must not admit");
+        assert_eq!(
+            evaluation.refusal(),
+            Some(&OwnedDecodeAdmissionRefusal::NotCertified)
+        );
+        assert!(store
+            .owned_decode_admission(
+                "owned-model",
+                &decode_fingerprint,
+                &inputs.revisioned_machine_profile_hash,
+                1
+            )
+            .unwrap()
+            .is_none());
+        let mut v1_inputs = inputs.clone();
+        v1_inputs.evidence_schema_revision = v1_row.evidence_schema_revision.clone();
+        v1_inputs.g_dec_manifest_revision = v1_row.g_dec_manifest_revision.clone();
+        assert!(
+            store
+                .owned_decode_admission_evaluation(&v1_inputs)
+                .unwrap()
+                .admission()
+                .is_none(),
+            "asking for the v1 revisions by name must not admit either"
+        );
+        let divergence = store
+            .storage_health_inputs()
+            .unwrap()
+            .evidence_requirements_divergence;
+        assert!(divergence.iter().any(|entry| entry.model_id == "owned-model"
+            && entry.result == "evidence_schema_incompatible"));
+
+        let mut v2_row = v1_row.clone();
+        v2_row.evidence_schema_revision = CERT_EVIDENCE_SCHEMA_REVISION.to_string();
+        v2_row.g_dec_manifest_revision = G_DEC_MANIFEST_REVISION.to_string();
+        v2_row.evidence = passed_probe_gate_evidence();
+        v2_row.certified_at_ms = 2;
+        store.store_owned_decode_cert_row(&v2_row).unwrap();
+        let admission = store
+            .owned_decode_admission_evaluation(&inputs)
+            .unwrap()
+            .admission()
+            .cloned()
+            .expect("a v2 row recording the probe gate as passed must admit");
+        assert_eq!(admission.certification.evidence, passed_probe_gate_evidence());
+        assert_eq!(
+            store
+                .get_approval("owned-model", &decode_fingerprint)
+                .unwrap(),
+            Some(approval),
+            "the schema change must leave the approval untouched"
+        );
+
+        // The same v2 row with the gate recorded as failed, or with a G-DEC
+        // claim beside it, certifies nothing.
+        for evidence in [
+            serde_json::json!({"gates": [{
+                "id": "structural_band",
+                "status": "failed",
+                "manifest_revision": "owned-decode-probe-gates-v1",
+            }]}),
+            serde_json::json!({"gates": [
+                {
+                    "id": "structural_band",
+                    "status": "passed",
+                    "manifest_revision": "owned-decode-probe-gates-v1",
+                },
+                {
+                    "id": "G-DEC-01",
+                    "status": "passed",
+                    "manifest_revision": "owned-decode-probe-gates-v1",
+                },
+            ]}),
+        ] {
+            let mut row = v2_row.clone();
+            row.evidence = evidence.clone();
+            row.certified_at_ms = 3;
+            store.store_owned_decode_cert_row(&row).unwrap();
+            assert!(
+                store
+                    .owned_decode_admission_evaluation(&inputs)
+                    .unwrap()
+                    .admission()
+                    .is_none(),
+                "{evidence} must not admit"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12306,15 +12496,7 @@ mod tests {
                         certified_at_ms: 1,
                         os_build: "test-os".to_string(),
                         module_generation: 1,
-                        evidence: serde_json::json!({
-                            "g_dec": (1..=12)
-                                .map(|number| serde_json::json!({
-                                    "id": format!("G-DEC-{number:02}"),
-                                    "status": "passed",
-                                    "manifest_revision": G_DEC_MANIFEST_REVISION,
-                                }))
-                                .collect::<Vec<_>>(),
-                        }),
+                        evidence: passed_probe_gate_evidence(),
                     })
                     .unwrap();
             }
