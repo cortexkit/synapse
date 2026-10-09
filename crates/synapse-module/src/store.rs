@@ -12265,8 +12265,8 @@ mod tests {
             g_dec_manifest_revision: G_DEC_MANIFEST_REVISION.to_string(),
         };
         // Exactly what a v1 module persisted for a passed probe. The current
-        // writer refuses these revisions, so it goes in through the raw upsert
-        // the way an older module left it in the store.
+        // writer refuses the v1 schema and manifest revisions, so the row goes
+        // in through the raw upsert, as an older module would have left it.
         let v1_row = OwnedDecodeCertificationRow {
             status: CertificationStatus::Certified,
             revisioned_machine_profile_hash: inputs.revisioned_machine_profile_hash.clone(),
