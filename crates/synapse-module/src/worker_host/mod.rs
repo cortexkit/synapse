@@ -7404,12 +7404,14 @@ pub mod ane_residency {
         async fn admitting_a_larger_shape_evicts_the_smallest_rung_last() {
             let ledger = SharedLedger::default();
             let worker = mock_channel("worker", &ledger).await;
-            // Room for three four-layer shapes.
+            // The mock worker charges 4 executables per shape, so a budget of
+            // 12 holds three shapes.
             let supervisor = budget_supervisor(12, Duration::from_secs(1));
             for tokens in [100, 200, 400] {
                 run_rung(&supervisor, &worker, tokens).await;
             }
-            // 128 is now the least recently used shape.
+            // Shapes 128, 256 and 512 are resident; 128 was used first, so it
+            // is the least recently used.
             run_rung(&supervisor, &worker, 1000).await;
             let events = ledger.lock().unwrap().events.clone();
             assert!(events.contains(&"evict model 256".into()), "{events:?}");

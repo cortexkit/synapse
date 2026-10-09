@@ -6697,7 +6697,9 @@ fn ane_residency_error_to_wire(
     wire
 }
 
-/// Maps a direct-ANE serving error and names the lane in `shape_compiling`.
+/// Maps a direct Neural Engine serving error to the wire. For
+/// `shape_compiling` it also adds the lane id to `details` and names the lane
+/// and the compiling shape in the message.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn ane_lane_error_to_wire(
     error: worker_host::ane_residency::AneResidencyError,
@@ -12887,7 +12889,8 @@ async fn execute_generate(
 ) -> Result<GenerateOutput, WireOperationError> {
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    // Same guards and order as execute_embedding.
+    // Serving-gate read guard, then the lane execution lock, then the
+    // execution permit (see `lane_serving_gate`).
     let (catalog_guard, lane_execution) =
         lane_execution_guards(runtime, model, catalog_lane, None, deadline).await?;
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
@@ -17821,7 +17824,8 @@ mod tests {
             resident.values().flatten().copied().collect::<Vec<_>>(),
             vec![128, 1024]
         );
-        // Two 22-layer shapes reserved, nothing else; no lease left behind.
+        // The budget holds exactly the two resident shapes (22 layer programs
+        // each for this model) and no request still holds a lease on either.
         assert_eq!(reservation, (44, 0));
     }
 
@@ -17911,7 +17915,8 @@ mod tests {
     async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {
         let fixture = ane_lane_fixture("ane-certify-deadline", true).await;
         let state = fixture.state.clone();
-        // Stands in for a load or self-check holding the lane.
+        // Holding the lane's lifecycle lock simulates a load or self-check in
+        // progress.
         let lifecycle = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
             .lock_owned()
             .await;
@@ -24126,8 +24131,9 @@ fn lane_execution_lock(runtime: &RuntimeState, id: &str) -> Arc<tokio::sync::Mut
         .clone()
 }
 
-/// The exclusive serving-gate guard a self-check holds; its reference
-/// executions reuse it instead of waiting for a read guard behind themselves.
+/// The exclusive serving-gate guard a self-check holds. The check runs its
+/// reference inputs through the normal execution path, which reuses this guard
+/// instead of waiting for a shared one that the check itself blocks.
 type HeldLaneGate = Arc<tokio::sync::OwnedRwLockWriteGuard<()>>;
 
 /// What one catalog-lane execution holds on its lane's serving gate.
@@ -25909,7 +25915,8 @@ async fn ensure_profile_preload_ready(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let lock = catalog_lane_lock(&state.runtime, model_id);
     // A serving request waits here only while the lane runs its load-time
-    // self-check, and never past its own deadline (the resolver's rule).
+    // self-check, and never past its own deadline; like request resolution, it
+    // answers model_loading when that deadline expires.
     let guard = match deadline_ms {
         Some(budget) => tokio::time::timeout(Duration::from_millis(budget), lock.lock_owned())
             .await
