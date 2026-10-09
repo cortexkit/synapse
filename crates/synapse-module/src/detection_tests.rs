@@ -325,16 +325,22 @@ fn each_probe_kind_is_deadlined_killed_reaped_and_stdout_capped() {
             .arg(kind)
             .env(subc_os::launch_nonce::LAUNCH_NONCE_ENV, "nonce")
             .env(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV, "123");
+        // The deadline must outlast process start-up even on a loaded host:
+        // the kill-and-reap check below means nothing if the child never ran.
         let started = Instant::now();
         assert_eq!(
-            run_probe(&mut command, Duration::from_millis(150))
+            run_probe(&mut command, Duration::from_secs(1))
                 .unwrap_err()
                 .reason,
             "probe_failed"
         );
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
         let logs = stub.logs();
-        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs.len(),
+            1,
+            "the probe child must start before its deadline expires"
+        );
         stub.assert_reaped(logs[0]["pid"].as_u64().unwrap() as u32);
         let big = Stub::new(
             json!({"version":{"stdout":"x".repeat(4097)},"floor":{"stdout":"x".repeat(4097)}}),

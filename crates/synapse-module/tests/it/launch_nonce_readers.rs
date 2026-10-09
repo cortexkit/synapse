@@ -192,10 +192,28 @@ fn the_tree_scan_finds_a_read_planted_in_a_nested_member() {
     assert_eq!(offenders, vec![format!("{}:1: {read}", planted.display())]);
 }
 
+/// The probe test stub reports whether a child inherited the nonce variables,
+/// so reading them is its whole job. It builds only with `test-support` and is
+/// never shipped.
+const PROBE_STUB: &str = "crates/synapse-module/src/bin/probe_stub.rs";
+
+/// A file whose first code line is `#![cfg(test)]` is compiled only for tests,
+/// the whole-file form of the `#[cfg(test)]` items the command scan skips.
+fn test_only_file(source: &str) -> bool {
+    source
+        .lines()
+        .map(|line| code_part(line).trim())
+        .find(|code| !code.is_empty())
+        == Some("#![cfg(test)]")
+}
+
 // Only child_process.rs's remove_launch_nonce helper may name the SDK constants,
 // and only in these exact removal statements. Reads in that file must still go
-// through the SDK.
+// through the SDK. Test-only files and the probe test stub are skipped.
 fn nonce_reads_in_file(path: &Path, source: &str) -> Vec<(usize, String)> {
+    if test_only_file(source) || path == Path::new(PROBE_STUB) {
+        return Vec::new();
+    }
     direct_nonce_reads(source)
         .into_iter()
         .filter(|(_, text)| {
@@ -228,20 +246,42 @@ fn helper_exception_allows_only_removals_in_the_helper_file() {
     );
 }
 
+#[test]
+fn only_the_probe_stub_and_test_only_files_may_read_the_nonce_variables() {
+    let read = "std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV);";
+    assert!(nonce_reads_in_file(Path::new(PROBE_STUB), read).is_empty());
+    // The exemption is the exact stub path, not every test binary.
+    assert_eq!(
+        nonce_reads_in_file(
+            Path::new("crates/synapse-module/src/bin/timeout_worker.rs"),
+            read
+        )
+        .len(),
+        1
+    );
+    assert!(nonce_reads_in_file(
+        Path::new("crates/control/src/lib.rs"),
+        &format!("#![cfg(test)]\n{read}")
+    )
+    .is_empty());
+    // The attribute counts only when it leads the file.
+    assert_eq!(
+        nonce_reads_in_file(
+            Path::new("crates/control/src/lib.rs"),
+            &format!("{read}\n#![cfg(test)]")
+        )
+        .len(),
+        1
+    );
+}
+
 // Production constructors must be wrapped in without_launch_nonce (or its tokio
 // counterpart) on the same or immediately preceding line (rustfmt wraps long
 // initializers). Skip #[cfg(test)] items by balanced braces. The inventory only
 // includes src directories, not tests/ fixtures, and this scan excludes bench/.
 // This intentionally enforces a spelling convention, not dataflow.
 fn unstripped_commands(path: &Path, source: &str) -> Vec<String> {
-    // A file whose first code line is `#![cfg(test)]` is compiled only for
-    // tests, the whole-file form of the `#[cfg(test)]` items skipped below.
-    if source
-        .lines()
-        .map(|line| code_part(line).trim())
-        .find(|code| !code.is_empty())
-        == Some("#![cfg(test)]")
-    {
+    if test_only_file(source) {
         return Vec::new();
     }
     let mut offenders = Vec::new();
