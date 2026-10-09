@@ -18,6 +18,9 @@ use tokio::task::JoinSet;
 mod qwen_compare;
 use qwen_compare::Candidate;
 
+#[path = "support/ane_lane_profile.rs"]
+mod ane_lane_profile;
+
 const ROWS: usize = 6341;
 const BATCHES: usize = 127;
 const SAMPLE_COUNT: usize = 64;
@@ -681,6 +684,9 @@ async fn main() -> Result<()> {
     ensure!(cfg!(target_os = "macos"), "load recording requires macOS");
     let workload = Arc::new(Workload::load(&required_path("SYNAPSE_HEADTOHEAD_INPUT")?)?);
     let out = required_path("SYNAPSE_HEADTOHEAD_OUT")?;
+    if env::var_os("SYNAPSE_ANE_PROFILE_CATALOG").is_some() {
+        return ane_lane_profile::run(&workload, &out).await;
+    }
     let arms = env::var("SYNAPSE_HEADTOHEAD_ARMS").unwrap_or_else(|_| "bionic,ane,metal".into());
     let arms = arms.split(',').map(str::trim).collect::<Vec<_>>();
     let mut seen = BTreeSet::new();

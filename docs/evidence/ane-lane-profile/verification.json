@@ -1,0 +1,76 @@
+{
+  "cargo_version": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "clippy_version": "clippy 0.1.99 (b940084d7e 2026-09-28)",
+  "checks": [
+    {
+      "command": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo clippy --locked -p synapse-module --all-targets -- -D warnings",
+      "platform": "linux",
+      "result": "passed",
+      "scope": "all module targets"
+    },
+    {
+      "command": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --locked -p synapse-module --lib",
+      "platform": "linux",
+      "result": "passed",
+      "passed": 622,
+      "failed": 0,
+      "ignored": 5
+    },
+    {
+      "command": "env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --release --locked -p synapse-module --lib",
+      "platform": "macos",
+      "result": "passed",
+      "passed": 626,
+      "failed": 0,
+      "ignored": 10
+    },
+    {
+      "command": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --locked -p synapse-module --example aft_embed_headtohead",
+      "platform": "linux",
+      "result": "passed",
+      "passed": 7,
+      "failed": 0
+    },
+    {
+      "command": "env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --release --locked -p synapse-module --example aft_embed_headtohead",
+      "platform": "macos",
+      "result": "passed",
+      "passed": 7,
+      "failed": 0
+    },
+    {
+      "command": "env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build --release --locked -p synapse-module -p synapse-worker-ane-direct --example aft_embed_headtohead --bins --features synapse-module/test-support",
+      "platform": "macos",
+      "result": "passed",
+      "scope": "native final module, direct-ANE worker and profiling driver"
+    },
+    {
+      "command": "python3 docs/evidence/ane-lane-profile/summarize.py docs/evidence/ane-lane-profile/normal docs/evidence/ane-lane-profile/hardware",
+      "platform": "linux",
+      "tool_version": "Python 3.14.4",
+      "result": "passed",
+      "scope": "262 raw call records accounted for; both arms correctly reported zero inferred rows and not_measured"
+    }
+  ],
+  "mutation": {
+    "control": "Neutralize the central log_job_failed tracing call with NON-VACUITY BREAK",
+    "path": "crates/synapse-module/src/lib.rs",
+    "index_baseline": "Specific implementation paths staged; git diff --stat empty before mutation",
+    "mutated_diff_stat": "crates/synapse-module/src/lib.rs | 3 ++-; 1 file changed, 2 insertions(+), 1 deletion(-)",
+    "command": "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --locked -p synapse-module --lib",
+    "platform": "linux",
+    "expected_red": "tests::failing_admitted_embed_and_rerank_log_closing_perf_lines",
+    "captured_output": "tests::failing_admitted_embed_and_rerank_log_closing_perf_lines ... FAILED\nassertion left == right failed: embed.query: missing or duplicate closing line: INFO admission: job admitted model_id=\"catalog-sequence-test\" job_id=\"inline-1-0\"\nleft: 0, right: 1\ntest result: FAILED. 621 passed; 1 failed; 5 ignored",
+    "other_failures": [],
+    "unaffected_examples": [
+      "catalog_runtime_tests::every_serving_engine_logs_a_named_lane",
+      "tests::execution_permit_timeout_fires_when_all_permits_are_held",
+      "tests::cancelled_direct_ane_keeps_module_permit_and_inflight_until_reply_drains"
+    ],
+    "restoration": "git checkout -- crates/synapse-module/src/lib.rs && touch crates/synapse-module/src/lib.rs; git diff --stat empty after restore",
+    "restored_result": "Linux 622 passed/5 ignored; macOS 626 passed/10 ignored",
+    "outcome": "reddened"
+  },
+  "measurement_status": "Not measured on this host: production holds the global ANE lock; private cold-compile reproduction not run"
+}

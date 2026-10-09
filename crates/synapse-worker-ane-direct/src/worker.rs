@@ -202,6 +202,7 @@ fn request_loop<S: Read + Write>(
             return Ok(());
         }
         let req_id = request.req_id().map(str::to_owned);
+        let profile = crate::profile::LaneProfile::new();
         let result: Result<(WorkerResponse, Option<Vec<f32>>)> = (|| {
             Ok(match request {
                 WorkerRequest::Load {
@@ -338,14 +339,16 @@ fn request_loop<S: Read + Write>(
                 ref other => (WorkerResponse::unsupported_request(other), None),
             })
         })();
-        let (response, output) = result.unwrap_or_else(|e| (error(req_id, &e.to_string()), None));
+        let (response, output) = result.unwrap_or_else(|e| (error(req_id.clone(), &e.to_string()), None));
         write_json_frame(stream, &response, max)?;
         if let Some(output) = output {
             write_frame(stream, &encode_f32_frame(&output), max)?;
         }
+        profile.finish(serde_json::json!({"kind":"request", "req_id":req_id}));
     }
 }
 fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
+    let mut profile = crate::profile::LaneProfile::new();
     let tokens = decode_i32_frame(raw)?;
     let total = sizes
         .iter()
@@ -361,10 +364,24 @@ fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
         .collect::<Result<_, _>>()?;
     let mut output = Vec::new();
     let mut offset = 0;
+    profile.phase("decode_tokens");
+    let mut gaps_ms = Vec::new();
+    let mut envelopes_ms = Vec::new();
+    let mut previous = Instant::now();
     for &size in sizes {
-        output.extend(model.run(&tokens[offset..offset + size])?);
+        let row_started = Instant::now();
+        if profile.enabled() {
+            gaps_ms.push(row_started.duration_since(previous).as_secs_f64() * 1000.0);
+        }
+        let vector = model.run(&tokens[offset..offset + size])?;
+        previous = Instant::now();
+        if profile.enabled() {
+            envelopes_ms.push(previous.duration_since(row_started).as_secs_f64() * 1000.0);
+        }
+        output.extend(vector);
         offset += size;
     }
+    profile.finish(serde_json::json!({"kind":"sequences", "rows":sizes.len(), "gaps_ms":gaps_ms, "row_envelopes_ms":envelopes_ms}));
     Ok(output)
 }
 

@@ -222,12 +222,16 @@ impl Model {
             .with_context(|| format!("tensor_missing:{name}"))
     }
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
+        let profile = crate::profile::LaneProfile::new();
+        let cached = self.resident.contains_key(&shape);
         // Compile temporaries retain ANE programs until the autorelease pool drains.
-        ane::autoreleasepool(|_| {
+        let result = ane::autoreleasepool(|_| {
             self.admit_with_compiler(shape, os, |graph, _| {
                 graph.compile(NSQualityOfService::UserInteractive)
             })
-        })
+        });
+        profile.finish(serde_json::json!({"kind":"admit", "shape":shape, "cached":cached, "ok":result.is_ok()}));
+        result
     }
     fn admit_with_compiler(
         &mut self,
@@ -316,7 +320,9 @@ impl Model {
         Ok(inventory)
     }
     pub fn evict(&mut self, shape: usize) {
+        let profile = crate::profile::LaneProfile::new();
         ane::autoreleasepool(|_| drop(self.resident.remove(&shape)));
+        profile.finish(serde_json::json!({"kind":"evict", "shape":shape}));
     }
 
     pub fn run(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -324,6 +330,7 @@ impl Model {
     }
     fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
         let mut stages = StageClock::new(traced);
+        let mut profile = crate::profile::LaneProfile::new();
         let shape = rung(tokens.len())?;
         let resident = self.resident.get(&shape).context("shape_not_admitted")?;
         let hidden = self.profile.n("hidden_size");
@@ -351,8 +358,10 @@ impl Model {
             }
         }
         stages.emit("host_prologue");
+        profile.phase("embedding_gather");
         resident.a.copy_from_f32(&input);
         stages.emit("initial_input_copy_fp32_to_fp16");
+        profile.phase("input_pack");
         if self.profile.modern() {
             let matrix = self.tensor("rotation_in.weight")?;
             // The converted residual projection is a dense fp32 matrix, not
@@ -376,6 +385,7 @@ impl Model {
             .mask
             .copy_from_f32(&padding_mask(tokens, pad, shape));
         stages.emit("mask_copy_fp32_to_fp16");
+        profile.phase("mask_pack");
         for (layer, executable) in resident.executables.iter().enumerate() {
             let (src, dst) = if layer % 2 == 0 {
                 (&resident.a, &resident.b)
@@ -387,10 +397,20 @@ impl Model {
             } else {
                 &[src, &resident.mask]
             };
-            if traced {
+            if profile.enabled() && std::env::var_os("SYNAPSE_ANE_PROFILE_HW").is_some() {
+                let started = std::time::Instant::now();
+                let hw_ns = executable.run_cached_with_stats(inputs, &[dst])?;
+                profile.hardware_layer(layer, started.elapsed(), hw_ns);
+                stages.restart();
+            } else if traced || profile.enabled() {
                 let (prepare, evaluate, created) =
                     executable.run_cached_profiled(inputs, &[dst])?;
-                println!("FORWARD_LAYER layer={layer} request_prepare_ms={:.6} sync_submit_and_wait_ms={:.6} request_created={created} interlayer_host_copy_bytes=0 iosurface_allocations=0", prepare.as_secs_f64()*1000.0, evaluate.as_secs_f64()*1000.0);
+                if traced {
+                    println!("FORWARD_LAYER layer={layer} request_prepare_ms={:.6} sync_submit_and_wait_ms={:.6} request_created={created} interlayer_host_copy_bytes=0 iosurface_allocations=0", prepare.as_secs_f64()*1000.0, evaluate.as_secs_f64()*1000.0);
+                }
+                if profile.enabled() {
+                    profile.layer(layer, prepare, evaluate, created);
+                }
                 stages.restart();
             } else {
                 executable.run_cached(inputs, &[dst])?;
@@ -403,6 +423,7 @@ impl Model {
         };
         let raw = surface.read_f32();
         stages.emit("final_readback_fp16_to_fp32");
+        profile.phase("output_readback");
         // CLS pooling and last-token readout consume only one row. The
         // ModernBERT classifier needs every unpadded row for mean pooling.
         let positions: Vec<usize> = if self.profile.modern() && self.profile.operation() == "rerank"
@@ -457,6 +478,8 @@ impl Model {
                 *value /= norm;
             }
             stages.emit("cpu_head");
+            profile.phase("cpu_tail");
+            profile.finish(serde_json::json!({"kind":"row", "tokens":tokens.len(), "shape":shape}));
             return Ok(vector);
         }
         let score = if self.profile.modern() {
@@ -500,6 +523,8 @@ impl Model {
             1.0 / (1.0 + (dot(no) - dot(yes)).exp())
         };
         stages.emit("cpu_head");
+        profile.phase("cpu_tail");
+        profile.finish(serde_json::json!({"kind":"row", "tokens":tokens.len(), "shape":shape}));
         Ok(vec![score])
     }
 }

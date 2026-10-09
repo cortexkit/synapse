@@ -135,13 +135,15 @@ impl Candidate {
             )),
         )));
         let config = root.join("config.json");
-        std::fs::write(
-            &config,
-            serde_json::to_vec(&json!({"preload_models":[
+        let mut settings = json!({"preload_models":[
             {"model_id":model_ids[0],"engine":"ane-direct-worker","profile":format!("{model}.ane-direct-worker"),"task":"embed","model_path":package,"tokenizer_path":weights.join("tokenizer.json"),"pooling":pooling,"normalize":true,"worker_bin":worker,"execution":"explicit","attention_units":8192*8192},
             {"model_id":model_ids[1],"engine":"owned-metal","profile":format!("{model}.owned-metal"),"task":"embed","model_path":weights.join("model.safetensors"),"tokenizer_path":weights.join("tokenizer.json"),"pooling":pooling,"normalize":true,"execution":"explicit","attention_units":8192*8192}],
-            "inline":{"max_items":64,"max_tokens":inline_tokens,"deadline_ms":600000,"max_queue_ms":600000,"max_concurrent_workers":2}}))?,
-        )?;
+            "inline":{"max_items":64,"max_tokens":inline_tokens,"deadline_ms":600000,"max_queue_ms":600000,"max_concurrent_workers":2}});
+        if std::env::var_os("SYNAPSE_ANE_PROFILE_CATALOG").is_some() {
+            settings["preload_models"] = json!([]);
+            settings["hf_endpoint"] = json!(std::env::var("SYNAPSE_ANE_PROFILE_ENDPOINT")?);
+        }
+        std::fs::write(&config, serde_json::to_vec(&settings)?)?;
         let child = synapse_core::without_launch_nonce_tokio(tokio::process::Command::new(module))
             .arg("--subc")
             .arg(&conn_path)
@@ -150,6 +152,7 @@ impl Candidate {
             .env("XDG_DATA_HOME", root.join("data"))
             .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
             .env("CORTEXKIT_STORE_ROOT", root.join("store"))
+            .env(synapse_core::worker_binary_env_var("ane-direct-worker"), &worker)
             .kill_on_drop(true)
             .spawn()?;
         let daemon = tokio::spawn(async move {

@@ -905,6 +905,18 @@ fn embedding_profile_enabled() -> bool {
     env::var_os(SYNAPSE_EMBED_PROFILE_ENV).is_some_and(|value| value.to_string_lossy() != "0")
 }
 
+fn ane_lane_timing(stage: &str, model_id: &str, job_id: Option<&str>, started: Instant) {
+    if let Some(dir) = env::var_os("SYNAPSE_ANE_PROFILE_DIR") {
+        use std::io::Write;
+        let record = json!({"stage":stage, "model_id":model_id, "job_id":job_id,
+            "ms":started.elapsed().as_secs_f64()*1000.0, "unix_us":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros()});
+        let path = PathBuf::from(dir).join(format!("module-{}.jsonl", std::process::id()));
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(format!("{record}\n").as_bytes());
+        }
+    }
+}
+
 fn default_microllm_max_tokens() -> u32 {
     DEFAULT_MICROLLM_MAX_TOKENS
 }
@@ -1598,6 +1610,27 @@ fn log_job_done(model_id: &str, job_id: &str, lane: &str, tokens: u64, started: 
         wall_ms,
         "job done"
     );
+}
+
+fn log_job_failed(model_id: &str, job_id: &str, lane: &str, code: &str, wall_ms: u64) {
+    tracing::info!(target: "perf", model_id, job_id, lane, code, wall_ms, "job failed");
+}
+
+fn failed_admitted_outcome(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+    job_id: &str,
+    started: Instant,
+    error: WireOperationError,
+) -> HandlerOutcome {
+    log_job_failed(
+        &model.model_id,
+        job_id,
+        execution_lane(model),
+        &error.code,
+        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    );
+    result_outcome(error_payload(state, error))
 }
 
 #[derive(Clone)]
@@ -8079,20 +8112,24 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let mut tokenized = match model.tokenizer.tokenize_batch([params.text.as_str()]) {
         Ok(tokenized) => tokenized,
         Err(error) => {
-            return result_outcome(error_payload(
+            return failed_admitted_outcome(
                 &state,
+                &model,
+                &job_id,
+                started,
                 WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string()),
-            ))
+            )
         }
     };
+    ane_lane_timing("query_admission_and_tokenize", &model.model_id, Some(&job_id), started);
     if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
         if let Some(details) = error.details.as_mut() {
             details["item_id"] = json!(params.id.as_deref().unwrap_or("query"));
         }
-        return result_outcome(error_payload(&state, error));
+        return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
     if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
-        return result_outcome(error_payload(&state, error));
+        return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
     let ids = vec![params.id.unwrap_or_else(|| "query".to_string())];
@@ -8212,7 +8249,11 @@ async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -
             &job_id,
             started,
         ),
-        Err(error) => remote_error_outcome(&state, error),
+        Err(error) => {
+            log_job_failed(&profile.synapse_model_id, &job_id, "remote", &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
+                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+            remote_error_outcome(&state, error)
+        }
     }
 }
 
@@ -8436,6 +8477,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>();
     let request_bytes = request_bytes_for_texts(text_refs.iter().copied());
+    let tokenize_started = Instant::now();
     let mut tokenized = match model.tokenizer.tokenize_batch(text_refs) {
         Ok(tokenized) => tokenized,
         Err(error) => {
@@ -8445,6 +8487,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ))
         }
     };
+    ane_lane_timing("batch_tokenize", &model.model_id, None, tokenize_started);
     if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
         if let Some(details) = error.details.as_mut() {
             if let Some(index) = details["item_id"]
@@ -8519,6 +8562,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(admission) => admission,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    ane_lane_timing("batch_admission", &model.model_id, Some(&job_id), started);
     embed_tokenized(
         state,
         model,
@@ -8671,7 +8715,11 @@ async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -
         .await
     {
         Ok(result) => remote_embed_success(&state, &profile, ids, counts, result, &job_id, started),
-        Err(error) => remote_error_outcome(&state, error),
+        Err(error) => {
+            log_job_failed(&profile.synapse_model_id, &job_id, "remote", &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
+                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+            remote_error_outcome(&state, error)
+        }
     }
 }
 
@@ -8747,7 +8795,11 @@ async fn execute_remote_embed_batch_job(
         .claim_job_attempt(&job_id, state.module_generation, now_ms())
     {
         Ok(JobAttemptClaim::Claimed(record)) => record,
-        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) | Err(_) => return,
+        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) => return,
+        Err(_) => {
+            log_stored_embed_failure(&state, &job_id, "store_failure");
+            return;
+        }
     };
     if let Err(error) = state.remote_gateway.ensure_certified(&work.profile).await {
         fail_job_with_wire_error(
@@ -8811,6 +8863,7 @@ async fn execute_remote_embed_batch_job(
                         now_ms(),
                         state.runtime.jobs.resume_deadline_ms,
                     );
+                    log_stored_embed_failure(&state, &job_id, "needs_reauth");
                 } else {
                     fail_job_with_wire_error(
                         &state,
@@ -9154,11 +9207,14 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     .await
     {
         Ok(scores) => scores,
-        Err(error) => return result_outcome(error_payload(&state, error)),
+        Err(error) => return failed_admitted_outcome(&state, &model, &job_id, started, error),
     };
     if scores.scores.len() != params.candidates.len() {
-        return result_outcome(error_payload(
+        return failed_admitted_outcome(
             &state,
+            &model,
+            &job_id,
+            started,
             WireOperationError::from_stable(
                 StableError::engine_crashed(None),
                 format!(
@@ -9167,7 +9223,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
                     params.candidates.len()
                 ),
             ),
-        ));
+        );
     }
     let equivalent_to = equivalent_fingerprints(&alias_table, &model);
     let payload = RerankScorePayload {
@@ -11137,7 +11193,11 @@ async fn execute_embed_batch_job(
         .claim_job_attempt(&job_id, state.module_generation, now_ms())
     {
         Ok(JobAttemptClaim::Claimed(record)) => record,
-        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) | Err(_) => return,
+        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) => return,
+        Err(_) => {
+            log_stored_embed_failure(&state, &job_id, "store_failure");
+            return;
+        }
     };
 
     if !enforce_checkpoint_continuity(
@@ -11378,6 +11438,7 @@ async fn enforce_checkpoint_continuity(
     {
         Ok(allowed) => {
             if !allowed {
+                log_stored_embed_failure(state, job_id, "remote_identity_drift");
                 state.runtime.admission_telemetry.record_job_failed();
             }
             allowed
@@ -11451,6 +11512,7 @@ async fn execute_embedding_quanta(
             continue;
         };
         scheduler_wait_ms += wait_started.elapsed().as_secs_f64() * 1_000.0;
+        ane_lane_timing("bulk_scheduler_dispatch", &model.model_id, job_id, wait_started);
         dispatch_count += 1;
         let indices = &engine_batches[batch_cursor];
         batch_cursor += 1;
@@ -11689,6 +11751,7 @@ fn fail_job_with_wire_error(
     transient: bool,
     error: WireOperationError,
 ) {
+    log_stored_embed_failure(state, job_id, &error.code);
     let _ = state.store.fail_job(
         job_id,
         transient,
@@ -11696,6 +11759,25 @@ fn fail_job_with_wire_error(
         now_ms(),
     );
     state.runtime.admission_telemetry.record_job_failed();
+}
+
+fn log_stored_embed_failure(state: &ModuleState, job_id: &str, code: &str) {
+    let record = state.store.get_job(job_id).ok().flatten();
+    // Emit a closing perf event only for embedding jobs, including failures
+    // before an execution attempt claims the durable job record.
+    if record.as_ref().is_some_and(|r| r.kind != "embed.batch") {
+        return;
+    }
+    let model_id = record.as_ref().and_then(|r| r.params_json.as_ref())
+        .and_then(|p| p["model"].as_str()).unwrap_or("unknown");
+    let lane = if state.remote_gateway.is_remote(model_id) {
+        "remote"
+    } else {
+        model_slot_snapshot(&state.runtime, model_id)
+            .map(|s| execution_lane_for_engine(&s.spec.engine)).unwrap_or("unknown")
+    };
+    let wall_ms = record.as_ref().map(|r| now_ms().saturating_sub(r.created_ms)).unwrap_or(0);
+    log_job_failed(model_id, job_id, lane, code, wall_ms);
 }
 
 fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
@@ -11991,11 +12073,14 @@ async fn embed_tokenized(
         .await
     } {
         Ok(vectors) => vectors,
-        Err(error) => return result_outcome(error_payload(&state, error)),
+        Err(error) => return failed_admitted_outcome(&state, &model, &job_id, started, error),
     };
     if vectors.len() != ids.len() {
-        return result_outcome(error_payload(
+        return failed_admitted_outcome(
             &state,
+            &model,
+            &job_id,
+            started,
             WireOperationError::from_stable(
                 StableError::engine_crashed(None),
                 format!(
@@ -12004,7 +12089,7 @@ async fn embed_tokenized(
                     ids.len()
                 ),
             ),
-        ));
+        );
     }
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
     let equivalent_to = equivalent_fingerprints(&alias_table, &model);
@@ -12173,6 +12258,7 @@ async fn execute_embedding_with_catalog_guard(
         .map(|item| item.len().max(1) as u64)
         .sum::<u64>();
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
+    let lane_started = Instant::now();
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
     let catalog_guard = if held_guard.is_some() {
         held_guard
@@ -12186,11 +12272,14 @@ async fn execute_embedding_with_catalog_guard(
         None
     };
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
+    ane_lane_timing("execution_lane_wait", &model.model_id, job_id, lane_started);
     // Take the lane lock before an execution permit, in every execute_* path.
     // A profile self-check holds the lane lock while it executes; if callers
     // took a permit first, requests queued on that lane could hold every
     // permit while waiting for the lock, and the self-check could never run.
+    let permit_started = Instant::now();
     let permit = acquire_execution_permit(runtime, deadline).await?;
+    ane_lane_timing("execution_permit_wait", &model.model_id, job_id, permit_started);
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(engine) => {
@@ -12265,16 +12354,17 @@ async fn execute_embedding_with_catalog_guard(
             if let Some(id) = fault_lane.as_deref() {
                 catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
             }
-            let values = engine
+            let roundtrip_started = Instant::now();
+            let result = engine
                 .infer_guarded(
                     batch.items,
                     false,
                     deadline,
                     (permit, catalog_guard, _activity),
                 )
-                .await
-                .map_err(ane_residency_error_to_wire)?;
-            Ok(values)
+                .await;
+            ane_lane_timing("direct_ane_roundtrip", &model.model_id, job_id, roundtrip_started);
+            result.map_err(ane_residency_error_to_wire)
         }
         EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -16900,6 +16990,60 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_admitted_embed_and_rerank_log_closing_perf_lines() {
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        for (method, profile_id, params) in [
+            ("embed.query", "qwen3-embedding-0.6b.owned-metal", json!({"text":"a"})),
+            ("embed.batch", "qwen3-embedding-0.6b.owned-metal", json!({"texts":["a","a"]})),
+            ("rerank.score", "qwen3-reranker-0.6b.owned-metal", json!({"query":"a","candidates":["a"]})),
+        ] {
+            let (root, descriptor) = test_storage_descriptor("failed-closing-log");
+            let state = catalog_test_state(&root, &descriptor, profile_id);
+            // The fixture already has a measured certification row. Remove the
+            // profile flag so serving uses that row instead of running model
+            // inference to check numerical accuracy before admission.
+            {
+                let mut slots = state.runtime.catalog.lock().unwrap();
+                let slot = slots.get_mut("catalog-sequence-test").unwrap();
+                slot.spec.engine_identity.build_flags.remove("profile");
+                Arc::get_mut(slot.loaded.as_mut().unwrap()).unwrap()
+                    .engine_identity.build_flags.remove("profile");
+            }
+            state.runtime.execution.close();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer(bytes.clone());
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_target(true).with_writer(move || writer.clone()).finish();
+            let mut params = params;
+            params["model"] = json!("catalog-sequence-test");
+            let outcome = dispatch_request(state.clone(), MethodEnvelope { method: method.into(), params }, None)
+                .with_subscriber(subscriber).await;
+            let result = response_result(outcome, method);
+            assert_eq!(result["error"]["code"], "queue_full", "{method}: {result}");
+            let captured = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            let admitted = captured.lines().find(|line| line.contains("job admitted")).unwrap_or_else(|| panic!("{method} never admitted: {captured}"));
+            let failed = captured.lines().filter(|line| line.contains("job failed")).collect::<Vec<_>>();
+            assert_eq!(failed.len(), 1, "{method}: missing or duplicate closing line: {captured}");
+            let job = admitted.split_whitespace().find(|s| s.starts_with("job_id=")).unwrap();
+            for field in [job, "perf:", "lane=\"metal\"", "code=\"queue_full\"", "wall_ms="] {
+                assert!(failed[0].contains(field), "{method}: missing {field}: {captured}");
+            }
+            assert!(!captured.contains("job done"), "{method}: {captured}");
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn profile_catalog_execution_reuses_the_self_check_lane_guard() {
@@ -25083,6 +25227,7 @@ async fn resolve_serving_model(
             true,
         ),
     };
+    ane_lane_timing("resolver_lane_wait", &lane, None, started);
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
