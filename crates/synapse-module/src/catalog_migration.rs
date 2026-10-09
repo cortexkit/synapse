@@ -17,7 +17,7 @@ use crate::{
 // Older releases included roles and backend membership in the manifest digest.
 // These fixed keys identify their persisted rows. Recalculating from the live
 // catalog would lose those rows as soon as its backend membership changes.
-pub(crate) const PRE_RULING_MANIFEST_DIGESTS: [(&str, &str); 4] = [
+pub(crate) const LEGACY_MANIFEST_DIGESTS: [(&str, &str); 4] = [
     (
         "gte-modernbert-base",
         "9efe05f1170baa48eb1bc6b44c84ff1ea2fbb2c0ae0778e7a9e3a0f493f35c19",
@@ -57,8 +57,7 @@ pub(crate) fn migrate_compiled_catalog_digests(
     let entries = &catalog::compiled_catalog()
         .map_err(|error| ModuleError::Config(error.to_string()))?
         .models;
-    let results =
-        migrate_pre_ruling_manifest_digests(store, cache, entries, &PRE_RULING_MANIFEST_DIGESTS)?;
+    let results = migrate_legacy_manifest_digests(store, cache, entries, &LEGACY_MANIFEST_DIGESTS)?;
     for result in &results {
         tracing::info!(
             catalog_id = result.catalog_id,
@@ -70,7 +69,7 @@ pub(crate) fn migrate_compiled_catalog_digests(
     Ok(results)
 }
 
-pub(crate) fn migrate_pre_ruling_manifest_digests(
+pub(crate) fn migrate_legacy_manifest_digests(
     store: &SynapseStore,
     cache: &ModelCache,
     entries: &[CatalogEntry],

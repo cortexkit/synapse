@@ -91,7 +91,7 @@ impl Fixture {
             .zip(&self.old_digests)
             .map(|(entry, digest)| (entry.id.as_str(), digest.as_str()))
             .collect::<Vec<_>>();
-        migrate_pre_ruling_manifest_digests(&self.store, &self.cache, &self.entries, &keys)
+        migrate_legacy_manifest_digests(&self.store, &self.cache, &self.entries, &keys)
     }
 
     fn group(&self, index: usize, digest: &str, backend: &str) -> BTreeMap<String, Rows> {
@@ -394,7 +394,7 @@ fn migration_quarantine_orphan_does_not_synthesize_an_install() {
 }
 
 #[test]
-fn migration_post_ruling_install_replaces_only_its_pre_ruling_group() {
+fn migration_current_install_replaces_only_its_legacy_group() {
     let fixture = Fixture::new("migration-install-collision", 1);
     let entry = &fixture.entries[0];
     let new = entry.manifest_digest();
@@ -477,7 +477,7 @@ fn migration_cache_io_error_rolls_back_already_rekeyed_groups() {
 }
 
 #[test]
-fn compiled_migration_empty_cache_reports_ae666f10_miss_and_preserves_all_rows() {
+fn compiled_migration_empty_cache_reports_qwen3_miss_and_preserves_all_rows() {
     let (root, descriptor) = crate::tests::test_storage_descriptor("compiled-migration-miss");
     let cleanup = TempRoot(root.clone());
     let store = SynapseStore::open(&descriptor).unwrap();
