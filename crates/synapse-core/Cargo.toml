@@ -20,7 +20,7 @@ cortexkit-lease = { workspace = true }
 reqwest = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "=1.1.4", default-features = false, features = ["std", "system"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "system"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 synapse-native-probe = { path = "../synapse-native-probe" }

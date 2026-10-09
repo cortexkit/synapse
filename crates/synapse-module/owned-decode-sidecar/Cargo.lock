@@ -1414,13 +1414,22 @@ dependencies = [
  "cortexkit-lease",
  "hex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
  "subc-os",
+ "synapse-native-probe",
  "thiserror 1.0.69",
  "tokenizers",
  "tokio",
+]
+
+[[package]]
+name = "synapse-native-probe"
+version = "0.0.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
