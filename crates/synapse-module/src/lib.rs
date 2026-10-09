@@ -1510,7 +1510,7 @@ impl EmbeddingModel {
             },
             #[cfg(feature = "test-support")]
             EmbedBackend::TestDeterministic(_) => ExecutionModelInfo {
-                dims: Some(test_deterministic::DIMS),
+                dims: Some(test_deterministic::dims()),
                 ..Default::default()
             },
             EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
@@ -3800,6 +3800,7 @@ impl ModuleHandler for SynapseHandler {
             );
         };
 
+        let handle_started = Instant::now();
         let envelope: MethodEnvelope = match serde_json::from_slice(&body) {
             Ok(envelope) => envelope,
             Err(error) => {
@@ -3809,6 +3810,12 @@ impl ModuleHandler for SynapseHandler {
                 )
             }
         };
+        // Only embedding batches are profiled here: the stage log describes the
+        // embedding lane, and other methods would interleave unrelated rows.
+        let profiled_method = (envelope.method == "embed.batch").then(|| envelope.method.clone());
+        if let Some(method) = &profiled_method {
+            ane_lane_timing("request_decode", method, None, handle_started);
+        }
 
         if let Some(refusal) = self
             .inner
@@ -3822,7 +3829,11 @@ impl ModuleHandler for SynapseHandler {
             .lock()
             .ok()
             .and_then(|operators| operators.get(&ctx.route_handle()).cloned());
-        dispatch_request(state, envelope, approved_by.as_deref()).await
+        let outcome = dispatch_request(state, envelope, approved_by.as_deref()).await;
+        if let Some(method) = &profiled_method {
+            ane_lane_timing("handle_total", method, None, handle_started);
+        }
+        outcome
     }
 }
 
@@ -8490,6 +8501,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .map(|item| item.text.as_str())
         .collect::<Vec<_>>();
     let request_bytes = request_bytes_for_texts(text_refs.iter().copied());
+    ane_lane_timing("batch_resolve", &model.model_id, None, resolution_started);
     let tokenize_started = Instant::now();
     let mut tokenized = match model.tokenizer.tokenize_batch(text_refs) {
         Ok(tokenized) => tokenized,
@@ -8501,6 +8513,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     };
     ane_lane_timing("batch_tokenize", &model.model_id, None, tokenize_started);
+    let prepare_started = Instant::now();
     if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
         if let Some(details) = error.details.as_mut() {
             if let Some(index) = details["item_id"]
@@ -8540,6 +8553,8 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         &digest_items,
     );
     let ids = items.into_iter().map(|item| item.id).collect::<Vec<_>>();
+    // Composition, tokenizer policy and the request digest, after tokenization.
+    ane_lane_timing("batch_prepare", &model.model_id, None, prepare_started);
 
     if ids.len() > state.runtime.inline.max_items || total_tokens > state.runtime.inline.max_tokens
     {
@@ -11566,6 +11581,7 @@ async fn execute_embedding_quanta(
             job_id,
         )
         .await?;
+        ane_lane_timing("bulk_engine_call", &model.model_id, job_id, call_started);
         if profile {
             tracing::debug!(
                 target: "perf",
@@ -11585,6 +11601,7 @@ async fn execute_embedding_quanta(
         // scheduler remains the source of class ordering and quantum fairness.
         tokio::task::yield_now().await;
     }
+    ane_lane_timing("bulk_execution_total", &model.model_id, job_id, started);
     if profile {
         tracing::debug!(
             target: "perf",
@@ -12128,6 +12145,7 @@ async fn embed_tokenized(
             ),
         );
     }
+    let reply_started = Instant::now();
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
     let equivalent_to = equivalent_fingerprints(&alias_table, &model);
     let response_vectors = ids
@@ -12169,7 +12187,18 @@ async fn embed_tokenized(
     );
     let mut response = serde_json::to_value(envelope).expect("embed envelope should serialize");
     attach_certify_observation(&mut response, observation);
-    result_outcome(response)
+    // Building the reply value (row hashes, envelope, JSON value tree) and
+    // encoding it to bytes are timed separately: the second is pure codec cost.
+    ane_lane_timing("reply_build", &model.model_id, Some(&job_id), reply_started);
+    let encode_started = Instant::now();
+    let outcome = result_outcome(response);
+    ane_lane_timing(
+        "reply_encode",
+        &model.model_id,
+        Some(&job_id),
+        encode_started,
+    );
+    outcome
 }
 
 fn apply_owned_tokenizer_policy(model: &EmbeddingModel, tokenized: &mut TokenizedBatch) {
@@ -12327,10 +12356,22 @@ async fn execute_embedding_with_catalog_guard(
         EmbedBackend::TestDeterministic(engine) => {
             let engine = Arc::clone(engine);
             let loaded = model.loaded_model.clone();
+            let model_id = model.model_id.clone();
+            let job_id = job_id.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
-                engine.embed_batch(&loaded, batch)
+                // The test engine's own compute, so profiles can separate it
+                // from the module's dispatch overhead around each engine call.
+                let compute_started = Instant::now();
+                let result = engine.embed_batch(&loaded, batch);
+                ane_lane_timing(
+                    "test_engine_compute",
+                    &model_id,
+                    job_id.as_deref(),
+                    compute_started,
+                );
+                result
             })
             .await
             .map_err(|error| artifact_invalid_error(error.to_string()))?
@@ -14964,10 +15005,10 @@ fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
 fn test_deterministic_probe_fixtures() -> Vec<ProbeFixture> {
     // Fixed reference values for one and two unknown tokens (ID 0) from
     // the fixture tokenizer, independent of the engine's inference implementation.
-    let mut one = vec![0.0_f32; test_deterministic::DIMS];
+    let mut one = vec![0.0_f32; test_deterministic::dims()];
     one[0] = std::f32::consts::FRAC_1_SQRT_2;
     one[1] = std::f32::consts::FRAC_1_SQRT_2;
-    let mut two = vec![0.0_f32; test_deterministic::DIMS];
+    let mut two = vec![0.0_f32; test_deterministic::dims()];
     two[0] = 1.0 / 5.0_f32.sqrt();
     two[1] = 2.0 / 5.0_f32.sqrt();
     [
@@ -14980,7 +15021,7 @@ fn test_deterministic_probe_fixtures() -> Vec<ProbeFixture> {
     .map(|id| {
         serde_json::from_value(json!({
             "family": test_deterministic::NAME, "reference_model": id,
-            "dims": test_deterministic::DIMS,
+            "dims": test_deterministic::dims(),
             "items": [
                 {"id": "one", "text": "probe", "vector": one},
                 {"id": "two", "text": "probe probe", "vector": two}

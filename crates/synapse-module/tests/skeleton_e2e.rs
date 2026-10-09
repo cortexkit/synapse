@@ -2,6 +2,7 @@
 
 mod catalog_e2e;
 mod common;
+mod embed_batch_module_cost;
 
 use std::{
     net::Ipv4Addr,
