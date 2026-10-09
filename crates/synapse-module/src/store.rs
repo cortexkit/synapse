@@ -12333,8 +12333,10 @@ mod tests {
             .storage_health_inputs()
             .unwrap()
             .evidence_requirements_divergence;
-        assert!(divergence.iter().any(|entry| entry.model_id == "owned-model"
-            && entry.result == "evidence_schema_incompatible"));
+        assert!(divergence
+            .iter()
+            .any(|entry| entry.model_id == "owned-model"
+                && entry.result == "evidence_schema_incompatible"));
 
         let mut v2_row = v1_row.clone();
         v2_row.evidence_schema_revision = CERT_EVIDENCE_SCHEMA_REVISION.to_string();
@@ -12348,7 +12350,10 @@ mod tests {
             .admission()
             .cloned()
             .expect("a v2 row recording the probe gate as passed must admit");
-        assert_eq!(admission.certification.evidence, passed_probe_gate_evidence());
+        assert_eq!(
+            admission.certification.evidence,
+            passed_probe_gate_evidence()
+        );
         assert_eq!(
             store
                 .get_approval("owned-model", &decode_fingerprint)

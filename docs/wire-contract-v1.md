@@ -963,5 +963,10 @@ launching workers or writing a record. Enabling those rows requires capture of
 every worker `ADMITTED` inventory, a sent-request count getter, and the independent
 `stats()` admission count. An unavailable observation stream is never interpreted
 as an empty, complete inventory. The checked-in Metal development evidence lives
-under `crates/synapse-certify/tests/evidence/`; it is labelled development, omits
-the private machine UUID, and is not a release-candidate certification record.
+under `crates/synapse-certify/tests/evidence/`; it is labelled development, is a
+record-schema-1 record with the raw machine UUID it was produced with removed,
+and is not a release-candidate certification record. Current (schema-2)
+records never hold a hardware UUID, only its salted SHA-256 digest
+(`machine.platform_uuid_sha256` on Apple rows, `machine.gpu.uuid_sha256` on
+CUDA and Vulkan rows); `crates/synapse-certify/README.md` gives the exact
+construction.

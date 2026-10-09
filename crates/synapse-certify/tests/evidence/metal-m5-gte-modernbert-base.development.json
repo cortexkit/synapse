@@ -10,6 +10,7 @@
     "certified_binary": 35732816
   },
   "redactions": ["machine.platform_uuid"],
+  "redaction_note": "Produced under record schema 1, which stored the raw hardware UUID in machine.platform_uuid; that value was removed before commit. Schema 2 records store only machine.platform_uuid_sha256, a salted SHA-256 of the UUID. This record cannot be given that digest without the original value, so it carries neither and stays a schema-1 development record.",
   "record_evidence": {
     "schema": 1,
     "row_id": "metal-m5",

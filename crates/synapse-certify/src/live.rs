@@ -741,17 +741,18 @@ fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
                 "machine does not match the requested M5 certification row",
             ));
         }
-        if hardware["machine_model"].as_str().is_none()
-            || hardware["platform_UUID"].as_str().is_none()
-        {
+        let (Some(_), Some(platform_uuid)) = (
+            hardware["machine_model"].as_str(),
+            hardware["platform_UUID"].as_str(),
+        ) else {
             return Err(refuse("Apple machine identifiers missing"));
-        }
+        };
         let os = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
             .arg("-productVersion")
             .output()
             .map_err(err)?;
         Ok(
-            json!({"model_identifier": hardware["machine_model"], "platform_uuid": hardware["platform_UUID"], "os": String::from_utf8_lossy(&os.stdout).trim(), "driver": if row == "metal-m5" { json!(format!("Metal on macOS {}", String::from_utf8_lossy(&os.stdout).trim())) } else { floor.cloned().unwrap_or(Value::Null) }}),
+            json!({"model_identifier": hardware["machine_model"], "platform_uuid_sha256": crate::platform_uuid_sha256(platform_uuid), "os": String::from_utf8_lossy(&os.stdout).trim(), "driver": if row == "metal-m5" { json!(format!("Metal on macOS {}", String::from_utf8_lossy(&os.stdout).trim())) } else { floor.cloned().unwrap_or(Value::Null) }}),
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -808,7 +809,7 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
         }
         let pci = u32::from_str_radix(fields[0].trim_start_matches("0x"), 16).map_err(err)?;
         (
-            json!({"vendor_id": pci & 0xffff, "device_id": pci >> 16, "name": fields[1], "uuid": fields[2]}),
+            json!({"vendor_id": pci & 0xffff, "device_id": pci >> 16, "name": fields[1], "uuid_sha256": crate::gpu_uuid_sha256(fields[2])}),
             fields[3].to_string(),
         )
     } else {
@@ -836,7 +837,7 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
                 .ok_or_else(|| refuse(format!("Vulkan machine identifier missing: {key}")))
         };
         (
-            json!({"vendor_id": get("vendorID")?, "device_id": get("deviceID")?, "name": get("deviceName")?, "uuid": get("deviceUUID")?}),
+            json!({"vendor_id": get("vendorID")?, "device_id": get("deviceID")?, "name": get("deviceName")?, "uuid_sha256": crate::gpu_uuid_sha256(get("deviceUUID")?)}),
             format!("{} {}", get("driverName")?, get("driverInfo")?),
         )
     };

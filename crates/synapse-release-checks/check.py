@@ -153,6 +153,7 @@ def cuda_driver_floor(root):
 
 
 def stress_evidence(stress):
+    require('platform_uuid' not in stress.get('machine', {}), 'raw hardware UUID in ANE stress evidence')
     require(stress['request_count'] > 0 and stress['completed_count'] == stress['request_count'],
             'incomplete ANE stress requests')
     require(stress['request_errors'] == [], 'ANE stress request errors')
@@ -174,6 +175,11 @@ def evidence(root, s, assets, entries):
             require(obj['source_commit'] == s, 'foreign record source')
     for r, (row, model) in zip(records, ((r, m) for r in ROWS for m in MODELS)):
         require(r['source_commit'] == s and r['row_id'] == row and r['model'] == model, 'record path mismatch')
+        # Records store hardware UUIDs only as salted digests (record schema 2);
+        # a raw value means the record came from an older or altered producer.
+        machine = r.get('machine') or {}
+        require('platform_uuid' not in machine and 'uuid' not in (machine.get('gpu') or {}),
+                'raw hardware UUID in certification record')
     inventory(entries, assets, records)
     driver_floor = cuda_driver_floor(root)
     for model in MODELS:

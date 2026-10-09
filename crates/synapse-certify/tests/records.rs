@@ -63,7 +63,8 @@ fn evidence(model: &str) -> RunEvidence {
     let p = parity(model);
     RunEvidence {
         source_commit: "a".repeat(40),
-        machine: serde_json::json!({"model_identifier": "Mac17,6", "platform_uuid": "machine"}),
+        // Filled per row by `Mock::observe`; a test that sets it keeps its value.
+        machine: serde_json::Value::Null,
         artifacts: vec![
             ArtifactFile {
                 role: "ck-synapse".into(),
@@ -102,6 +103,23 @@ fn evidence(model: &str) -> RunEvidence {
         raw_series: None,
     }
 }
+/// The machine block the live collector writes for `row`, built from fixed
+/// fixture UUIDs.
+fn machine(row: &str) -> serde_json::Value {
+    if matches!(row, "metal-m5" | "ane-m5") {
+        serde_json::json!({
+            "model_identifier": "Mac17,6",
+            "platform_uuid_sha256": platform_uuid_sha256(APPLE_UUID),
+        })
+    } else {
+        serde_json::json!({
+            "system_product_name": "fixture",
+            "gpu": {"name": "fixture", "uuid_sha256": gpu_uuid_sha256(GPU_UUID)},
+        })
+    }
+}
+const APPLE_UUID: &str = "4F3A2B1C-0D9E-4A7B-8C6D-5E4F3A2B1C0D";
+const GPU_UUID: &str = "GPU-7D1C9E2A-3B4F-4C5D-8E6F-0A1B2C3D4E5F";
 struct Mock {
     evidence: RunEvidence,
     floor: String,
@@ -112,8 +130,12 @@ impl Runner for Mock {
         self.probes += 1;
         Ok(self.floor.clone())
     }
-    fn observe(&mut self, _: &str, _: &str) -> Result<RunEvidence> {
-        Ok(self.evidence.clone())
+    fn observe(&mut self, row: &str, _: &str) -> Result<RunEvidence> {
+        let mut evidence = self.evidence.clone();
+        if evidence.machine.is_null() {
+            evidence.machine = machine(row);
+        }
+        Ok(evidence)
     }
 }
 fn runner(model: &str) -> Mock {
@@ -475,4 +497,89 @@ fn serialized_inventory_omission_fails_placement_gate() {
         error.to_string().contains("placement inventory failed"),
         "{error}"
     );
+}
+
+// The expected digests were computed outside this crate, with
+// `printf 'synapse-certify/machine/v1\0%s' <uuid> | shasum -a 256` and the
+// `gpu/v1` equivalent, so a change to either prefix or to how the bytes are
+// joined fails here rather than silently starting a new, unlinkable series.
+#[test]
+fn machine_uuid_digests_are_pinned_and_stable() {
+    assert_eq!(
+        platform_uuid_sha256(APPLE_UUID),
+        "2909c561b627ba9c561fdc2a46e81e8003bba789f4af2569b3f198326f2010ef"
+    );
+    assert_eq!(
+        gpu_uuid_sha256(GPU_UUID),
+        "86b9be077c7820aa8554ac2f0e65ad7e227781fd74f768f3feee9fbf59523030"
+    );
+    let first = platform_uuid_sha256(APPLE_UUID);
+    let again = platform_uuid_sha256(APPLE_UUID);
+    assert_eq!(first, again);
+    assert_ne!(
+        platform_uuid_sha256(APPLE_UUID),
+        platform_uuid_sha256("4F3A2B1C-0D9E-4A7B-8C6D-5E4F3A2B1C0E")
+    );
+    assert_ne!(platform_uuid_sha256(GPU_UUID), gpu_uuid_sha256(GPU_UUID));
+}
+
+#[test]
+fn records_with_a_raw_hardware_uuid_or_no_digest_are_refused() {
+    let assets = Assets::new();
+    let records = matrix(&assets);
+    assert!(records.iter().all(|record| record.schema == RECORD_SCHEMA));
+    assert!(validate(&records, &assets.0).is_ok());
+    let apple = records
+        .iter()
+        .position(|record| record.row_id == "metal-m5")
+        .unwrap();
+    let gpu = records
+        .iter()
+        .position(|record| record.row_id == "cuda-linux-nvidia")
+        .unwrap();
+    type MachineEdit = (usize, fn(&mut serde_json::Value));
+    let edits: [MachineEdit; 5] = [
+        (apple, |machine| {
+            machine["platform_uuid"] = APPLE_UUID.into();
+        }),
+        (apple, |machine| {
+            machine
+                .as_object_mut()
+                .unwrap()
+                .remove("platform_uuid_sha256");
+        }),
+        (apple, |machine| {
+            machine["platform_uuid_sha256"] = APPLE_UUID.into();
+        }),
+        (gpu, |machine| {
+            machine["gpu"]["uuid"] = GPU_UUID.into();
+        }),
+        (gpu, |machine| {
+            machine["gpu"]
+                .as_object_mut()
+                .unwrap()
+                .remove("uuid_sha256");
+        }),
+    ];
+    for (index, edit) in edits {
+        let mut changed = records.clone();
+        edit(&mut changed[index].machine);
+        assert!(
+            validate(&changed, &assets.0).is_err(),
+            "{}",
+            changed[index].machine
+        );
+    }
+    let mut old_schema = records.clone();
+    old_schema[0].schema = 1;
+    assert!(validate(&old_schema, &assets.0).is_err());
+
+    let mut mock = runner(MODELS[0]);
+    mock.evidence.machine = serde_json::json!({
+        "model_identifier": "Mac17,6",
+        "platform_uuid": APPLE_UUID,
+        "platform_uuid_sha256": platform_uuid_sha256(APPLE_UUID),
+    });
+    assert!(produce(&mut mock, &assets.0, "metal-m5", MODELS[0]).is_err());
+    assert!(!assets.0.join("docs").exists());
 }

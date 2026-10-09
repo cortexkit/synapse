@@ -167,7 +167,7 @@ class ReleaseChecks(unittest.TestCase):
 
     def stress_fixture(self) -> dict[str, Any]:
         return dict(schema=1, kind='development', harness_profile='release', source_commit='a' * 40,
-                    machine={'model_identifier': 'Mac17,2', 'platform_uuid': 'fixture'},
+                    machine={'model_identifier': 'Mac17,2'},
                     os={'version': '26.0', 'build': 'fixture'}, load_1_5_15_start=[0, 0, 0],
                     load_1_5_15_end=[0, 0, 0], request_count=37, completed_count=37,
                     request_errors=[], sample_count=2, samples=[{'model': [128]}, {}],
@@ -242,6 +242,26 @@ class ReleaseChecks(unittest.TestCase):
         transition = dict(session_id='same-session', coreml=[100] * 23, direct=[105] * 23, machine_load=[0.1] * 23, coreml_median=100, direct_median=105, bar_met=True)
         (report_dir / 'ane-transition.json').write_text(json.dumps(transition))
         return entries, records, assets, cert, report_dir
+
+    def test_raw_hardware_uuid_refused(self):
+        stress = self.stress_fixture()
+        check.stress_evidence(stress)
+        stress['machine']['platform_uuid'] = '4F3A2B1C-0D9E-4A7B-8C6D-5E4F3A2B1C0D'
+        self.rejects(check.stress_evidence, stress)
+        entries, records, assets, cert, _ = self.evidence_fixture()
+        check.evidence(self.root, 'a' * 40, assets, entries)
+        for row, edit in (('metal-m5', {'platform_uuid': '4F3A2B1C-0D9E-4A7B-8C6D-5E4F3A2B1C0D'}),
+                          ('cuda-linux-nvidia', {'gpu': {'uuid': 'GPU-7D1C9E2A-3B4F-4C5D-8E6F-0A1B2C3D4E5F'}})):
+            r = next(r for r in records if r['row_id'] == row and r['model'] == check.MODELS[0])
+            path = cert / row / (r['model'] + '.json')
+            original = path.read_text()
+            changed = copy.deepcopy(r)
+            changed['machine'].update(edit)
+            path.write_text(json.dumps(changed))
+            with self.subTest(row=row):
+                self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
+            path.write_text(original)
+        check.evidence(self.root, 'a' * 40, assets, entries)
 
     def test_driver_boundary_and_foreign_source_fail(self):
         entries, records, assets, cert, _ = self.evidence_fixture()

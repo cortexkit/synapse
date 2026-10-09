@@ -1,6 +1,6 @@
 # Certification records
 
-This normal workspace crate implements the schema-1 record, producer decisions,
+This normal workspace crate implements the schema-2 record, producer decisions,
 and the offline validator for matrix coverage, status, drop evidence, artifact
 digests and parity identity. `ck-synapse certify validate --assets <dir>
 <checkout-root>` validates the 32 canonical records under
@@ -38,11 +38,19 @@ Qwen ANE drop cases. Records are written atomically at their canonical paths.
 Non-Apple machine identification uses `nvidia-smi` for CUDA or the selected
 adapter in `vulkaninfo --summary` for Vulkan. Rented-machine operators must set
 `SYNAPSE_CERTIFY_INSTANCE_ID`. Missing identifiers refuse rather than invent
-identity. Generated run state and hardware-test output live in ignored `.live/`.
+identity. Hardware UUIDs never enter a record: Apple records carry
+`machine.platform_uuid_sha256`, the lowercase hex SHA-256 of
+`synapse-certify/machine/v1` plus one NUL byte followed by the
+`system_profiler` platform UUID, and CUDA and Vulkan records carry
+`machine.gpu.uuid_sha256`, the same over `synapse-certify/gpu/v1` plus NUL and
+the GPU UUID. The same machine always produces the same digest, so its records
+still link. The validator refuses a record with a raw `machine.platform_uuid`
+or `machine.gpu.uuid`, or without the digest for its platform.
+Generated run state and hardware-test output live in ignored `.live/`.
 The ignored Mac hardware test accepts `SYNAPSE_CERTIFY_CANDIDATE`, the release
 candidate `ck-synapse` path, and prints the canonical record verbatim.
 
-Records carry only the specified schema-1 fields. Parity is the evaluator's JSON output, with
+Records carry only the specified schema-2 fields. Parity is the evaluator's JSON output, with
 its identity, fixture set, metrics and boolean gate results. Admission outcomes
 are `tokens_8192` and `tokens_8193`, each holding `outcome`, `truncated`,
 `diverted`, and the number of `worker_requests`. Artifact roles use the binary

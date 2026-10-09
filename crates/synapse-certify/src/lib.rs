@@ -40,6 +40,69 @@ pub const GATES: [&str; 10] = [
     "semantics",
 ];
 
+/// Record schema version written by the producer and the only one the
+/// validator accepts. Version 2 replaced the raw hardware UUIDs in `machine`
+/// with salted SHA-256 digests (see [`platform_uuid_sha256`] and
+/// [`gpu_uuid_sha256`]).
+pub const RECORD_SCHEMA: u32 = 2;
+
+/// Domain-separation prefix hashed in front of an Apple platform UUID: the
+/// bytes `synapse-certify/machine/v1` followed by one NUL byte.
+pub const PLATFORM_UUID_HASH_PREFIX: &str = "synapse-certify/machine/v1\0";
+/// Domain-separation prefix hashed in front of a GPU UUID: the bytes
+/// `synapse-certify/gpu/v1` followed by one NUL byte.
+pub const GPU_UUID_HASH_PREFIX: &str = "synapse-certify/gpu/v1\0";
+
+fn prefixed_sha256(prefix: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// `machine.platform_uuid_sha256` on Apple records: lowercase hex SHA-256 of
+/// `"synapse-certify/machine/v1\0"` followed by the platform UUID exactly as
+/// `system_profiler SPHardwareDataType` reports it.
+///
+/// The raw UUID is a stable hardware identifier and never enters a record.
+/// The digest still links records from one machine, because the same UUID
+/// always hashes to the same value, and the versioned prefix keeps it from
+/// matching a plain SHA-256 of the UUID computed anywhere else.
+pub fn platform_uuid_sha256(uuid: &str) -> String {
+    prefixed_sha256(PLATFORM_UUID_HASH_PREFIX, uuid)
+}
+
+/// `machine.gpu.uuid_sha256` on CUDA and Vulkan records: lowercase hex
+/// SHA-256 of `"synapse-certify/gpu/v1\0"` followed by the GPU UUID exactly as
+/// `nvidia-smi` or `vulkaninfo` reports it. Same reasoning as
+/// [`platform_uuid_sha256`]; the separate prefix keeps a GPU digest from ever
+/// equalling a platform digest.
+pub fn gpu_uuid_sha256(uuid: &str) -> String {
+    prefixed_sha256(GPU_UUID_HASH_PREFIX, uuid)
+}
+
+fn apple_row(row: &str) -> bool {
+    matches!(row, "metal-m5" | "ane-m5")
+}
+
+/// Refuses a raw hardware UUID anywhere the collector used to put one, and
+/// requires the digest that replaced it for the record's platform.
+fn machine_identity(record: &Record) -> Result<()> {
+    let machine = &record.machine;
+    if machine.get("platform_uuid").is_some() || machine["gpu"].get("uuid").is_some() {
+        return Err(refuse("machine carries a raw hardware UUID"));
+    }
+    let digest = if apple_row(&record.row_id) {
+        &machine["platform_uuid_sha256"]
+    } else {
+        &machine["gpu"]["uuid_sha256"]
+    };
+    if !digest.as_str().is_some_and(|digest| hex(digest, 64)) {
+        return Err(refuse("machine identity digest missing or malformed"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("certification_refused: {0}")]
 pub struct Error(pub String);
@@ -283,10 +346,11 @@ pub fn digest(assets: &Path, file: &str) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 fn identity(record: &Record) -> Result<()> {
-    if record.schema != 1 || !hex(&record.source_commit, 40) {
+    if record.schema != RECORD_SCHEMA || !hex(&record.source_commit, 40) {
         return Err(refuse("invalid schema or source commit"));
     }
     combination(&record.row_id, &record.model)?;
+    machine_identity(record)?;
     let p = &record.parity;
     if p.model != record.model
         || p.operation != record.operation
@@ -381,7 +445,7 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
         })
         .collect::<Result<Vec<_>>>()?;
     let record = Record {
-        schema: 1,
+        schema: RECORD_SCHEMA,
         row_id: row.into(),
         source_commit: evidence.source_commit,
         machine: evidence.machine,
