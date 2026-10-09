@@ -3,6 +3,8 @@ mod backend;
 #[cfg(target_os = "macos")]
 mod modernbert;
 #[cfg(target_os = "macos")]
+mod multirow;
+#[cfg(target_os = "macos")]
 mod profile;
 #[cfg(target_os = "macos")]
 mod qwen;

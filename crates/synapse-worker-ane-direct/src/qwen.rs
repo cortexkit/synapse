@@ -6,7 +6,7 @@ use crate::{
 use ane::{Graph, Shape, Tensor};
 use anyhow::Result;
 
-fn rms(graph: &mut Graph, input: Tensor, weight: &[f32], axis: i64, eps: f32) -> Tensor {
+pub(crate) fn rms(graph: &mut Graph, input: Tensor, weight: &[f32], axis: i64, eps: f32) -> Tensor {
     let scalar = Shape::channels(1);
     let magnitude = graph.absolute(input);
     let scale = graph.reduce_max(magnitude, axis);
