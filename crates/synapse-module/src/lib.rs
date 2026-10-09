@@ -23187,12 +23187,12 @@ fn catalog_backend_reason(
     platform: synapse_core::Platform,
 ) -> Option<&'static str> {
     let macos = platform == synapse_core::Platform::MacOs;
-    if (macos && matches!(backend, "cuda" | "vulkan"))
-        || (!macos && matches!(backend, "metal" | "ane"))
-    {
+    if macos && matches!(backend, "cuda" | "vulkan") {
         Some("not_supported_on_platform")
     } else if runtime.runnable_backends.contains(backend) {
         None
+    } else if !macos && matches!(backend, "metal" | "ane") {
+        Some("not_supported_on_platform")
     } else if let Some(reason) = runtime.backend_reasons.get(backend) {
         Some(*reason)
     } else if backend == "metal" {

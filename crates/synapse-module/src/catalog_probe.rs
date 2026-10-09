@@ -186,6 +186,13 @@ pub(crate) fn version_result(output: ProbeOutput, backend: &str) -> Result<(), &
 
 pub(crate) fn floor_result(output: ProbeOutput) -> Result<Value, &'static str> {
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| "probe_failed")?;
+    if !value["required"].is_object()
+        || !value
+            .get("observed")
+            .is_some_and(|observed| observed.is_null() || observed.is_object())
+    {
+        return Err("probe_failed");
+    }
     match (
         output.status.success(),
         output.status.code(),
@@ -195,7 +202,7 @@ pub(crate) fn floor_result(output: ProbeOutput) -> Result<Value, &'static str> {
             if matches!(value.get("code"), Some(Value::Null))
                 || value.get("code").and_then(Value::as_str) == Some("ok") =>
         {
-            if value["observed"].is_object() && value["required"].is_object() {
+            if value["observed"].is_object() {
                 Ok(value)
             } else {
                 Err("probe_failed")

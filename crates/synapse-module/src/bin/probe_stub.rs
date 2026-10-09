@@ -21,7 +21,7 @@ fn main() {
         .append(true)
         .open(path.with_extension("log"))
         .unwrap();
-    writeln!(log, "{}", json!({"args": args, "nonce": std::env::var_os(subc_protocol::LAUNCH_NONCE_ENV).is_some(), "nonce_fd": std::env::var_os(subc_protocol::LAUNCH_NONCE_FD_ENV).is_some(), "pid": std::process::id()})).unwrap();
+    writeln!(log, "{}", json!({"args": args, "nonce": std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV).is_some(), "nonce_fd": std::env::var_os("SUBC_LAUNCH_NONCE_FD").is_some(), "pid": std::process::id()})).unwrap();
     drop(log);
     if args == ["--assert-reaped"] {
         // Parents send this fixture its probe PID after the bounded runner returns.

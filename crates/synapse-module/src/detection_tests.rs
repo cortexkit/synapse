@@ -35,8 +35,14 @@ impl Stub {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
-        let worker = synapse_core::dev_binary::ckdev_binary_hard_link(stub_binary(), &root)
+        let source = root.join(if cfg!(windows) {
+            "ck-synapse-probe-stub.exe"
+        } else {
+            "ck-synapse-probe-stub"
+        });
+        fs::copy(stub_binary(), &source)
             .expect("build ck-synapse-probe-stub before running isolated --lib tests");
+        let worker = synapse_core::dev_binary::ckdev_binary(&source, &root).unwrap();
         fs::write(worker.with_extension("json"), config.to_string()).unwrap();
         Self { root, worker }
     }
@@ -115,8 +121,8 @@ fn isolated_test(name: &str, extra_env: &[(&str, &str)]) {
     command
         .args(["--exact", name, "--ignored", "--nocapture"])
         .env("SYNAPSE_PROBE_STUB_BINARY", stub_binary())
-        .env(subc_protocol::LAUNCH_NONCE_ENV, "probe-test-nonce")
-        .env(subc_protocol::LAUNCH_NONCE_FD_ENV, "123");
+        .env(subc_os::launch_nonce::LAUNCH_NONCE_ENV, "probe-test-nonce")
+        .env(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV, "123");
     for key in [
         "SYNAPSE_TEST_RUNNABLE_BACKENDS",
         "SYNAPSE_TEST_CATALOG",
@@ -132,8 +138,13 @@ fn isolated_test(name: &str, extra_env: &[(&str, &str)]) {
         command.env(key, value);
     }
     let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
+        stdout.contains("running 1 test"),
+        "isolated fixture did not run: {stdout}"
+    );
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -220,6 +231,7 @@ fn detection_contract_fixture() {
     }
     for behavior in [
         json!({"stdout":"malformed"}),
+        json!({"exit":2,"envelope":{"status":"refused","code":"cuda_no_driver"}}),
         json!({"exit":7}),
         json!({"stdout":"x".repeat(4097)}),
         json!({"envelope":{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{}}}}),
@@ -306,8 +318,8 @@ fn each_probe_kind_is_deadlined_killed_reaped_and_stdout_capped() {
         let mut command = Command::new(&stub.worker);
         command
             .arg(kind)
-            .env(subc_protocol::LAUNCH_NONCE_ENV, "nonce")
-            .env(subc_protocol::LAUNCH_NONCE_FD_ENV, "123");
+            .env(subc_os::launch_nonce::LAUNCH_NONCE_ENV, "nonce")
+            .env(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV, "123");
         let started = Instant::now();
         assert_eq!(
             run_probe(&mut command, Duration::from_millis(150))
@@ -440,9 +452,10 @@ async fn management_fixture() {
         detect_gpu_backends(Some(cuda.worker.clone()), Some(vulkan.worker.clone()));
     runtime.runnable_backends = runnable;
     runtime.backend_reasons = reasons;
-    // Supply missing CUDA/Vulkan names on the compiled entries for models.catalog
-    // and the no-runnable-backend branch of models.download. These branches read
-    // backend metadata only; cloned rows are never validated or used to load lanes.
+    // This fixture has no runnable GPU. Add any missing CUDA/Vulkan metadata so
+    // catalog-list and download-refusal responses can expose the recorded reasons.
+    // Cloned fingerprints and profiles are irrelevant here: download admission
+    // refuses before installation or loading, and no serving lane is created.
     for entry in &mut runtime.release_catalog.models {
         for backend in ["cuda", "vulkan"] {
             if !entry.backends.iter().any(|row| row.backend == backend) {
