@@ -1,6 +1,9 @@
 use std::fmt;
+#[cfg(any(target_os = "macos", test))]
 use std::io::Read;
+#[cfg(any(target_os = "macos", test))]
 use std::process::{Command, Stdio};
+#[cfg(any(target_os = "macos", test))]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -8,10 +11,12 @@ use sha2::{Digest, Sha256};
 
 use crate::EngineIdentity;
 
-/// How long one identity probe may take before it is abandoned. `sw_vers`,
-/// `uname` and `sysctl` answer in single-digit milliseconds on a healthy host,
+/// How long one command probe may take before it is abandoned. `sw_vers`
+/// and `sysctl` answer in single-digit milliseconds on a healthy host,
 /// so this is a generous ceiling rather than a tuning knob.
+#[cfg(any(target_os = "macos", test))]
 const PROBE_BUDGET: Duration = Duration::from_millis(2_000);
+#[cfg(any(target_os = "macos", test))]
 const PROBE_POLL: Duration = Duration::from_millis(10);
 
 /// A machine-identity input that could not be established.
@@ -75,14 +80,38 @@ pub struct SystemMachineProfileCollector;
 /// collector stays trivially copyable, and an internal seam rather than a
 /// configuration knob: production always passes `command_stdout`, and only
 /// tests substitute a failing prober to prove the refusal is real.
+#[cfg(target_os = "macos")]
 type Prober = fn(&str, &[&str]) -> Result<String, ProfileProbeError>;
 
 impl MachineProfileCollector for SystemMachineProfileCollector {
     fn collect_base_profile(&self) -> Result<MachineProfileBase, ProfileProbeError> {
-        collect_base_profile_with(command_stdout)
+        #[cfg(target_os = "macos")]
+        {
+            collect_base_profile_with(command_stdout)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            collect_linux_profile_with(native_uname, native_sysinfo)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            collect_windows_profile_with(
+                native_windows_version,
+                native_windows_arch,
+                native_windows_memory,
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            Err(ProfileProbeError::new(
+                "native platform",
+                "cannot establish os_build, chip_model and ram_class on this unsupported platform",
+            ))
+        }
     }
 }
 
+#[cfg(target_os = "macos")]
 fn collect_base_profile_with(probe: Prober) -> Result<MachineProfileBase, ProfileProbeError> {
     let chip_model = chip_model(probe)?;
     Ok(MachineProfileBase {
@@ -96,6 +125,180 @@ fn collect_base_profile_with(probe: Prober) -> Result<MachineProfileBase, Profil
         // absent on hardware without a Neural Engine.
         ane_subtype: ane_subtype(&chip_model),
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn native_source_error(source: &str, fields: &str, reason: impl fmt::Display) -> ProfileProbeError {
+    ProfileProbeError::new(source, format!("could not establish {fields}: {reason}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn native_profile(os_build: String, chip_model: String, ram_class: String) -> MachineProfileBase {
+    MachineProfileBase {
+        os_build,
+        arch: std::env::consts::ARCH.to_string(),
+        chip_model,
+        ram_class,
+        ane_subtype: None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct UnameReading {
+    sysname: String,
+    release: String,
+    machine: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct SysinfoReading {
+    totalram: u64,
+    mem_unit: u32,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_identity(reading: UnameReading) -> Result<(String, String), ProfileProbeError> {
+    if reading.sysname.is_empty() || reading.release.is_empty() || reading.machine.is_empty() {
+        return Err(native_source_error(
+            "uname(2)",
+            "os_build and chip_model",
+            "returned an empty identity",
+        ));
+    }
+    Ok((
+        format!("{} {}", reading.sysname, reading.release),
+        reading.machine,
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_ram_class(reading: SysinfoReading) -> Result<String, ProfileProbeError> {
+    let bytes = reading
+        .totalram
+        .checked_mul(u64::from(reading.mem_unit))
+        .ok_or_else(|| {
+            native_source_error("sysinfo(2)", "ram_class", "totalram * mem_unit overflowed")
+        })?;
+    native_ram_class("sysinfo(2)", bytes)
+}
+
+/// Each function supplies one source, so a refusal can be injected without
+/// invoking the OS or starving an unrelated identity field.
+#[cfg(any(target_os = "linux", test))]
+fn collect_linux_profile_with(
+    uname: impl FnOnce() -> Result<UnameReading, String>,
+    sysinfo: impl FnOnce() -> Result<SysinfoReading, String>,
+) -> Result<MachineProfileBase, ProfileProbeError> {
+    // One reading feeds both fields, and a refusal must name both consumers.
+    let reading = uname()
+        .map_err(|reason| native_source_error("uname(2)", "os_build and chip_model", reason))?;
+    let (os_build, chip_model) = linux_identity(reading)?;
+    let memory =
+        sysinfo().map_err(|reason| native_source_error("sysinfo(2)", "ram_class", reason))?;
+    Ok(native_profile(
+        os_build,
+        chip_model,
+        linux_ram_class(memory)?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn native_uname() -> Result<UnameReading, String> {
+    let reading = rustix::system::uname();
+    Ok(UnameReading {
+        sysname: reading
+            .sysname()
+            .to_str()
+            .map_err(|error| error.to_string())?
+            .to_string(),
+        release: reading
+            .release()
+            .to_str()
+            .map_err(|error| error.to_string())?
+            .to_string(),
+        machine: reading
+            .machine()
+            .to_str()
+            .map_err(|error| error.to_string())?
+            .to_string(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_sysinfo() -> Result<SysinfoReading, String> {
+    let reading = rustix::system::sysinfo();
+    #[cfg(target_pointer_width = "64")]
+    let totalram = reading.totalram;
+    #[cfg(not(target_pointer_width = "64"))]
+    let totalram = u64::from(reading.totalram);
+    Ok(SysinfoReading {
+        totalram,
+        mem_unit: reading.mem_unit,
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_os_build((major, minor, build): (u32, u32, u32)) -> String {
+    format!("Windows {major}.{minor}.{build}")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_chip_model(architecture: u16) -> Result<String, ProfileProbeError> {
+    match architecture {
+        9 => Ok("x86_64".to_string()),
+        12 => Ok("aarch64".to_string()),
+        other => Err(native_source_error(
+            "GetNativeSystemInfo",
+            "chip_model",
+            format!("unsupported architecture {other}"),
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn native_ram_class(source: &str, bytes: u64) -> Result<String, ProfileProbeError> {
+    if bytes == 0 {
+        return Err(native_source_error(
+            source,
+            "ram_class",
+            "returned zero physical memory",
+        ));
+    }
+    Ok(ram_class_from_bytes(bytes))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn collect_windows_profile_with(
+    version: impl FnOnce() -> Result<(u32, u32, u32), String>,
+    architecture: impl FnOnce() -> Result<u16, String>,
+    memory: impl FnOnce() -> Result<u64, String>,
+) -> Result<MachineProfileBase, ProfileProbeError> {
+    let version =
+        version().map_err(|reason| native_source_error("RtlGetVersion", "os_build", reason))?;
+    let architecture = architecture()
+        .map_err(|reason| native_source_error("GetNativeSystemInfo", "chip_model", reason))?;
+    let bytes = memory()
+        .map_err(|reason| native_source_error("GlobalMemoryStatusEx", "ram_class", reason))?;
+    Ok(native_profile(
+        windows_os_build(version),
+        windows_chip_model(architecture)?,
+        native_ram_class("GlobalMemoryStatusEx", bytes)?,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn native_windows_version() -> Result<(u32, u32, u32), String> {
+    synapse_native_probe::windows::version().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn native_windows_arch() -> Result<u16, String> {
+    synapse_native_probe::windows::processor_architecture().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn native_windows_memory() -> Result<u64, String> {
+    synapse_native_probe::windows::total_physical_memory().map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,17 +357,15 @@ impl MachineProfile {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn os_build(probe: Prober) -> Result<String, ProfileProbeError> {
     #[cfg(target_os = "macos")]
     {
         probe("sw_vers", &["-buildVersion"])
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        probe("uname", &["-sr"])
-    }
 }
 
+#[cfg(target_os = "macos")]
 fn chip_model(probe: Prober) -> Result<String, ProfileProbeError> {
     #[cfg(target_os = "macos")]
     {
@@ -175,12 +376,9 @@ fn chip_model(probe: Prober) -> Result<String, ProfileProbeError> {
             Err(_) => sysctl_value(probe, "hw.model"),
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        probe("uname", &["-m"])
-    }
 }
 
+#[cfg(target_os = "macos")]
 fn ram_class(probe: Prober) -> Result<String, ProfileProbeError> {
     #[cfg(target_os = "macos")]
     {
@@ -192,13 +390,6 @@ fn ram_class(probe: Prober) -> Result<String, ProfileProbeError> {
             )
         })?;
         Ok(ram_class_from_bytes(bytes))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // A constant on this platform rather than a probed value, so it is
-        // identical on every run and cannot rotate the profile.
-        let _ = probe;
-        Ok("unknown".to_string())
     }
 }
 
@@ -221,6 +412,7 @@ fn ram_class(probe: Prober) -> Result<String, ProfileProbeError> {
 ///
 /// Whoever adds the probe owns that call and should record it here rather than
 /// letting the string comparison decide silently.
+#[cfg(target_os = "macos")]
 fn ane_subtype(chip_model: &str) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -252,7 +444,6 @@ fn mapped_ane_subtype(chip_model: &str) -> Option<String> {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn ram_class_from_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     let gib = bytes.div_ceil(GIB).max(1);
@@ -277,6 +468,7 @@ fn sysctl_value(probe: Prober, name: &str) -> Result<String, ProfileProbeError> 
 /// ABANDONED rather than waited on: a process blocked in the kernel does not
 /// answer a signal either, so reaping it would restore the very hang the
 /// deadline exists to escape.
+#[cfg(any(target_os = "macos", test))]
 fn command_stdout(program: &str, args: &[&str]) -> Result<String, ProfileProbeError> {
     command_stdout_within(program, args, PROBE_BUDGET)
 }
@@ -284,6 +476,7 @@ fn command_stdout(program: &str, args: &[&str]) -> Result<String, ProfileProbeEr
 /// The budget is a parameter so the deadline path can be exercised in a test
 /// without a two-second wait. It is not a configuration knob: the only
 /// production caller passes `PROBE_BUDGET`.
+#[cfg(any(target_os = "macos", test))]
 fn command_stdout_within(
     program: &str,
     args: &[&str],
@@ -352,11 +545,13 @@ fn command_stdout_within(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use super::*;
 
+    #[cfg(target_os = "macos")]
     thread_local! {
         /// Which probes the current case starves: a program, and the specific
         /// arguments to starve (empty means every call to it). Thread-local
@@ -411,12 +606,18 @@ mod tests {
     /// a program touching a path under policy evaluation blocks in the kernel.
     #[test]
     fn a_hanging_probe_refuses_within_its_budget() {
+        #[cfg(not(target_os = "windows"))]
+        let (program, args): (&str, &[&str]) = ("sleep", &["30"]);
+        // Windows ping sends one request per second. Invoke it directly so the
+        // deadline test owns its only child rather than a shell's grandchild.
+        #[cfg(target_os = "windows")]
+        let (program, args): (&str, &[&str]) = ("ping", &["-n", "31", "127.0.0.1"]);
         let started = Instant::now();
-        let error = command_stdout_within("sleep", &["30"], Duration::from_millis(150))
+        let error = command_stdout_within(program, args, Duration::from_millis(150))
             .expect_err("a hanging probe must refuse");
         let elapsed = started.elapsed();
 
-        assert_eq!(error.program(), "sleep");
+        assert_eq!(error.program(), program);
         assert!(
             error.to_string().contains("did not answer within 150ms"),
             "the refusal must name the budget it exceeded: {error}"
@@ -434,15 +635,21 @@ mod tests {
         assert_eq!(missing.program(), "synapse-no-such-identity-probe");
         assert!(missing.to_string().contains("could not be spawned"));
 
-        // `false` exits non-zero with no output: the program answered, but not
-        // with an identity, which is still not a value we may hash.
-        let failed = command_stdout("false", &[]).expect_err("a failing probe must refuse");
-        assert_eq!(failed.program(), "false");
+        #[cfg(not(target_os = "windows"))]
+        let (program, args): (&str, &[&str]) = ("false", &[]);
+        #[cfg(target_os = "windows")]
+        let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/C", "exit /B 1"]);
+        let failed = command_stdout(program, args).expect_err("a failing probe must refuse");
+        assert_eq!(failed.program(), program);
         assert!(failed.to_string().contains("exited with"));
 
         // An empty answer is the subtle one: it is well-formed and useless, and
         // the old code turned it into a placeholder.
-        let empty = command_stdout("true", &[]).expect_err("an empty answer must refuse");
+        #[cfg(not(target_os = "windows"))]
+        let (program, args): (&str, &[&str]) = ("true", &[]);
+        #[cfg(target_os = "windows")]
+        let (program, args): (&str, &[&str]) = ("cmd", &["/D", "/C", "exit /B 0"]);
+        let empty = command_stdout(program, args).expect_err("an empty answer must refuse");
         assert!(empty.to_string().contains("returned an empty value"));
     }
 
@@ -488,6 +695,7 @@ mod tests {
     /// `machdep.cpu.brand_string` and falls back to `hw.model`, which is
     /// deliberate (the brand string is absent on some hosts), so starving only
     /// the first exercises the fallback rather than the refusal.
+    #[cfg(target_os = "macos")]
     #[test]
     fn every_probed_identity_field_refuses_rather_than_substituting() {
         fn answer_for(program: &str, args: &[&str]) -> String {
@@ -513,8 +721,6 @@ mod tests {
                 "chip_model",
             ),
         ];
-        #[cfg(not(target_os = "macos"))]
-        let cases: &[(&str, &[&str], &str)] = &[("uname", &[], "os_build and chip_model")];
 
         for (starved_program, starved_args, field) in cases {
             // A thread-local rather than a capture, because Prober is a plain
@@ -596,6 +802,7 @@ mod tests {
 
     /// And the converse: a prober that answers yields a profile, so the refusal
     /// above is the probe failing rather than the seam being broken.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_system_collector_accepts_answers_from_its_prober() {
         fn answers(program: &str, args: &[&str]) -> Result<String, ProfileProbeError> {
@@ -671,5 +878,220 @@ mod tests {
     fn ram_class_buckets_to_stable_labels() {
         assert_eq!(ram_class_from_bytes(7 * 1024 * 1024 * 1024), "le_8_gib");
         assert_eq!(ram_class_from_bytes(300 * 1024 * 1024 * 1024), "gt_256_gib");
+    }
+
+    fn uname_answer() -> Result<UnameReading, String> {
+        Ok(UnameReading {
+            sysname: "Linux".to_string(),
+            release: "6.8.0-test".to_string(),
+            machine: "x86_64".to_string(),
+        })
+    }
+
+    fn sysinfo_answer() -> Result<SysinfoReading, String> {
+        Ok(SysinfoReading {
+            totalram: 4,
+            mem_unit: 1 << 30,
+        })
+    }
+
+    #[test]
+    fn native_formatting_and_mapping_are_host_independent() {
+        assert_eq!(
+            linux_identity(uname_answer().unwrap()).unwrap(),
+            ("Linux 6.8.0-test".to_string(), "x86_64".to_string())
+        );
+        assert_eq!(
+            linux_ram_class(sysinfo_answer().unwrap()).unwrap(),
+            "le_4_gib"
+        );
+        assert_eq!(windows_os_build((10, 0, 22631)), "Windows 10.0.22631");
+        assert_eq!(windows_chip_model(9).unwrap(), "x86_64");
+        assert_eq!(windows_chip_model(12).unwrap(), "aarch64");
+        for architecture in [0, 0xFFFF] {
+            let error =
+                windows_chip_model(architecture).expect_err("unsupported native architecture");
+            assert!(error.to_string().contains("GetNativeSystemInfo"));
+            assert!(error.to_string().contains("chip_model"));
+        }
+    }
+
+    #[test]
+    fn invalid_native_readings_refuse_with_field_attribution() {
+        let mut uname = uname_answer().unwrap();
+        uname.machine.clear();
+        let error = linux_identity(uname).unwrap_err().to_string();
+        assert!(
+            error.contains("uname(2)")
+                && error.contains("os_build")
+                && error.contains("chip_model")
+        );
+        for reading in [
+            SysinfoReading {
+                totalram: 0,
+                mem_unit: 1,
+            },
+            SysinfoReading {
+                totalram: 4,
+                mem_unit: 0,
+            },
+            SysinfoReading {
+                totalram: u64::MAX,
+                mem_unit: 2,
+            },
+        ] {
+            let error = linux_ram_class(reading).unwrap_err().to_string();
+            assert!(error.contains("sysinfo(2)") && error.contains("ram_class"));
+        }
+        let error = native_ram_class("GlobalMemoryStatusEx", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GlobalMemoryStatusEx") && error.contains("ram_class"));
+    }
+
+    /// Starve one source at a time and answer all others. Both platforms' seams
+    /// run on every non-macOS host, without touching any native provider.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_probed_identity_field_refuses_rather_than_substituting() {
+        for source in ["uname(2)", "sysinfo(2)"] {
+            let error = collect_linux_profile_with(
+                || {
+                    if source == "uname(2)" {
+                        Err("starved".to_string())
+                    } else {
+                        uname_answer()
+                    }
+                },
+                || {
+                    if source == "sysinfo(2)" {
+                        Err("starved".to_string())
+                    } else {
+                        sysinfo_answer()
+                    }
+                },
+            )
+            .expect_err("a starved native source must refuse");
+            assert_eq!(error.program(), source);
+            assert!(
+                error.to_string().contains(source),
+                "refusal must name {source}: {error}"
+            );
+            let fields: &[&str] = if source == "uname(2)" {
+                &["os_build", "chip_model"]
+            } else {
+                &["ram_class"]
+            };
+            for field in fields {
+                assert!(
+                    error.to_string().contains(field),
+                    "{source} must name {field}: {error}"
+                );
+            }
+        }
+        for (source, field) in [
+            ("RtlGetVersion", "os_build"),
+            ("GetNativeSystemInfo", "chip_model"),
+            ("GlobalMemoryStatusEx", "ram_class"),
+        ] {
+            let error = collect_windows_profile_with(
+                || {
+                    if source == "RtlGetVersion" {
+                        Err("starved".to_string())
+                    } else {
+                        Ok((10, 0, 22631))
+                    }
+                },
+                || {
+                    if source == "GetNativeSystemInfo" {
+                        Err("starved".to_string())
+                    } else {
+                        Ok(9)
+                    }
+                },
+                || {
+                    if source == "GlobalMemoryStatusEx" {
+                        Err("starved".to_string())
+                    } else {
+                        Ok(4 << 30)
+                    }
+                },
+            )
+            .expect_err("a starved native source must refuse");
+            assert_eq!(error.program(), source);
+            assert!(
+                error.to_string().contains(source),
+                "refusal must name {source}: {error}"
+            );
+            assert!(
+                error.to_string().contains(field),
+                "{source} must name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_collectors_accept_answers_from_each_source() {
+        let linux = collect_linux_profile_with(uname_answer, sysinfo_answer).unwrap();
+        assert_eq!(linux.os_build, "Linux 6.8.0-test");
+        assert_eq!(linux.chip_model, "x86_64");
+        assert_eq!(linux.ram_class, "le_4_gib");
+        let windows =
+            collect_windows_profile_with(|| Ok((10, 0, 22631)), || Ok(9), || Ok(4 << 30)).unwrap();
+        assert_eq!(windows.os_build, "Windows 10.0.22631");
+        assert_eq!(windows.chip_model, "x86_64");
+        assert_eq!(windows.ram_class, "le_4_gib");
+        for base in [linux, windows] {
+            assert_eq!(base.arch, std::env::consts::ARCH);
+            assert_eq!(base.ane_subtype, None);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn native_collection_succeeds_and_matches_native_identity() {
+        let base = SystemMachineProfileCollector
+            .collect_base_profile()
+            .expect("native collection");
+        assert_eq!(base.arch, std::env::consts::ARCH);
+        assert_eq!(base.ane_subtype, None);
+        assert!([
+            "le_4_gib",
+            "le_8_gib",
+            "le_16_gib",
+            "le_32_gib",
+            "le_64_gib",
+            "le_128_gib",
+            "le_256_gib",
+            "gt_256_gib"
+        ]
+        .contains(&base.ram_class.as_str()));
+        #[cfg(target_os = "linux")]
+        {
+            let reading = rustix::system::uname();
+            assert_eq!(
+                base.os_build,
+                format!(
+                    "{} {}",
+                    reading.sysname().to_str().unwrap(),
+                    reading.release().to_str().unwrap()
+                )
+            );
+            assert_eq!(base.chip_model, reading.machine().to_str().unwrap());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let (major, minor, build) = synapse_native_probe::windows::version().unwrap();
+            assert_eq!(base.os_build, format!("Windows {major}.{minor}.{build}"));
+            let architecture = synapse_native_probe::windows::processor_architecture().unwrap();
+            assert_eq!(
+                base.chip_model,
+                match architecture {
+                    9 => "x86_64",
+                    12 => "aarch64",
+                    _ => panic!("unsupported native architecture"),
+                }
+            );
+        }
     }
 }

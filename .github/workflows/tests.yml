@@ -40,7 +40,7 @@ env:
   # macOS- and CUDA-only engines cannot build here, but anything portable left
   # out is simply unbuilt and untested: the operator CLI shipped for weeks with
   # its tests never once running in CI.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
+  SYNAPSE_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
 
 jobs:
   test:

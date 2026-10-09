@@ -6618,11 +6618,13 @@ dependencies = [
  "cortexkit-lease",
  "hex",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
  "subc-os",
  "syn 2.0.118",
+ "synapse-native-probe",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",
@@ -6697,6 +6699,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "synapse-native-probe"
+version = "0.0.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
