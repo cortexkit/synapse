@@ -3995,7 +3995,7 @@ pub mod ane_residency {
         }
 
         /// Executables reserved against the budget, and leases currently held.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(crate) fn reservation_snapshot(&self) -> (usize, u32) {
             let state = self.inner.lock();
             (
