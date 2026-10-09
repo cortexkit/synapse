@@ -339,7 +339,8 @@ fn request_loop<S: Read + Write>(
                 ref other => (WorkerResponse::unsupported_request(other), None),
             })
         })();
-        let (response, output) = result.unwrap_or_else(|e| (error(req_id.clone(), &e.to_string()), None));
+        let (response, output) =
+            result.unwrap_or_else(|e| (error(req_id.clone(), &e.to_string()), None));
         write_json_frame(stream, &response, max)?;
         if let Some(output) = output {
             write_frame(stream, &encode_f32_frame(&output), max)?;

@@ -8121,7 +8121,12 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    ane_lane_timing("query_admission_and_tokenize", &model.model_id, Some(&job_id), started);
+    ane_lane_timing(
+        "query_admission_and_tokenize",
+        &model.model_id,
+        Some(&job_id),
+        started,
+    );
     if let Err(mut error) = compose_catalog_embed(&model, &mut tokenized) {
         if let Some(details) = error.details.as_mut() {
             details["item_id"] = json!(params.id.as_deref().unwrap_or("query"));
@@ -8250,8 +8255,13 @@ async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -
             started,
         ),
         Err(error) => {
-            log_job_failed(&profile.synapse_model_id, &job_id, "remote", &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
-                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+            log_job_failed(
+                &profile.synapse_model_id,
+                &job_id,
+                "remote",
+                &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
+                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            );
             remote_error_outcome(&state, error)
         }
     }
@@ -8716,8 +8726,13 @@ async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -
     {
         Ok(result) => remote_embed_success(&state, &profile, ids, counts, result, &job_id, started),
         Err(error) => {
-            log_job_failed(&profile.synapse_model_id, &job_id, "remote", &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
-                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+            log_job_failed(
+                &profile.synapse_model_id,
+                &job_id,
+                "remote",
+                &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
+                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            );
             remote_error_outcome(&state, error)
         }
     }
@@ -11512,7 +11527,12 @@ async fn execute_embedding_quanta(
             continue;
         };
         scheduler_wait_ms += wait_started.elapsed().as_secs_f64() * 1_000.0;
-        ane_lane_timing("bulk_scheduler_dispatch", &model.model_id, job_id, wait_started);
+        ane_lane_timing(
+            "bulk_scheduler_dispatch",
+            &model.model_id,
+            job_id,
+            wait_started,
+        );
         dispatch_count += 1;
         let indices = &engine_batches[batch_cursor];
         batch_cursor += 1;
@@ -11768,15 +11788,22 @@ fn log_stored_embed_failure(state: &ModuleState, job_id: &str, code: &str) {
     if record.as_ref().is_some_and(|r| r.kind != "embed.batch") {
         return;
     }
-    let model_id = record.as_ref().and_then(|r| r.params_json.as_ref())
-        .and_then(|p| p["model"].as_str()).unwrap_or("unknown");
+    let model_id = record
+        .as_ref()
+        .and_then(|r| r.params_json.as_ref())
+        .and_then(|p| p["model"].as_str())
+        .unwrap_or("unknown");
     let lane = if state.remote_gateway.is_remote(model_id) {
         "remote"
     } else {
         model_slot_snapshot(&state.runtime, model_id)
-            .map(|s| execution_lane_for_engine(&s.spec.engine)).unwrap_or("unknown")
+            .map(|s| execution_lane_for_engine(&s.spec.engine))
+            .unwrap_or("unknown")
     };
-    let wall_ms = record.as_ref().map(|r| now_ms().saturating_sub(r.created_ms)).unwrap_or(0);
+    let wall_ms = record
+        .as_ref()
+        .map(|r| now_ms().saturating_sub(r.created_ms))
+        .unwrap_or(0);
     log_job_failed(model_id, job_id, lane, code, wall_ms);
 }
 
@@ -12279,7 +12306,12 @@ async fn execute_embedding_with_catalog_guard(
     // permit while waiting for the lock, and the self-check could never run.
     let permit_started = Instant::now();
     let permit = acquire_execution_permit(runtime, deadline).await?;
-    ane_lane_timing("execution_permit_wait", &model.model_id, job_id, permit_started);
+    ane_lane_timing(
+        "execution_permit_wait",
+        &model.model_id,
+        job_id,
+        permit_started,
+    );
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(engine) => {
@@ -12363,7 +12395,12 @@ async fn execute_embedding_with_catalog_guard(
                     (permit, catalog_guard, _activity),
                 )
                 .await;
-            ane_lane_timing("direct_ane_roundtrip", &model.model_id, job_id, roundtrip_started);
+            ane_lane_timing(
+                "direct_ane_roundtrip",
+                &model.model_id,
+                job_id,
+                roundtrip_started,
+            );
             result.map_err(ane_residency_error_to_wire)
         }
         EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
@@ -17001,12 +17038,26 @@ mod tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         for (method, profile_id, params) in [
-            ("embed.query", "qwen3-embedding-0.6b.owned-metal", json!({"text":"a"})),
-            ("embed.batch", "qwen3-embedding-0.6b.owned-metal", json!({"texts":["a","a"]})),
-            ("rerank.score", "qwen3-reranker-0.6b.owned-metal", json!({"query":"a","candidates":["a"]})),
+            (
+                "embed.query",
+                "qwen3-embedding-0.6b.owned-metal",
+                json!({"text":"a"}),
+            ),
+            (
+                "embed.batch",
+                "qwen3-embedding-0.6b.owned-metal",
+                json!({"texts":["a","a"]}),
+            ),
+            (
+                "rerank.score",
+                "qwen3-reranker-0.6b.owned-metal",
+                json!({"query":"a","candidates":["a"]}),
+            ),
         ] {
             let (root, descriptor) = test_storage_descriptor("failed-closing-log");
             let state = catalog_test_state(&root, &descriptor, profile_id);
@@ -17017,27 +17068,64 @@ mod tests {
                 let mut slots = state.runtime.catalog.lock().unwrap();
                 let slot = slots.get_mut("catalog-sequence-test").unwrap();
                 slot.spec.engine_identity.build_flags.remove("profile");
-                Arc::get_mut(slot.loaded.as_mut().unwrap()).unwrap()
-                    .engine_identity.build_flags.remove("profile");
+                Arc::get_mut(slot.loaded.as_mut().unwrap())
+                    .unwrap()
+                    .engine_identity
+                    .build_flags
+                    .remove("profile");
             }
             state.runtime.execution.close();
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let writer = Writer(bytes.clone());
-            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
-                .with_target(true).with_writer(move || writer.clone()).finish();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(true)
+                .with_writer(move || writer.clone())
+                .finish();
             let mut params = params;
             params["model"] = json!("catalog-sequence-test");
-            let outcome = dispatch_request(state.clone(), MethodEnvelope { method: method.into(), params }, None)
-                .with_subscriber(subscriber).await;
+            let outcome = dispatch_request(
+                state.clone(),
+                MethodEnvelope {
+                    method: method.into(),
+                    params,
+                },
+                None,
+            )
+            .with_subscriber(subscriber)
+            .await;
             let result = response_result(outcome, method);
             assert_eq!(result["error"]["code"], "queue_full", "{method}: {result}");
             let captured = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-            let admitted = captured.lines().find(|line| line.contains("job admitted")).unwrap_or_else(|| panic!("{method} never admitted: {captured}"));
-            let failed = captured.lines().filter(|line| line.contains("job failed")).collect::<Vec<_>>();
-            assert_eq!(failed.len(), 1, "{method}: missing or duplicate closing line: {captured}");
-            let job = admitted.split_whitespace().find(|s| s.starts_with("job_id=")).unwrap();
-            for field in [job, "perf:", "lane=\"metal\"", "code=\"queue_full\"", "wall_ms="] {
-                assert!(failed[0].contains(field), "{method}: missing {field}: {captured}");
+            let admitted = captured
+                .lines()
+                .find(|line| line.contains("job admitted"))
+                .unwrap_or_else(|| panic!("{method} never admitted: {captured}"));
+            let failed = captured
+                .lines()
+                .filter(|line| line.contains("job failed"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                failed.len(),
+                1,
+                "{method}: missing or duplicate closing line: {captured}"
+            );
+            let job = admitted
+                .split_whitespace()
+                .find(|s| s.starts_with("job_id="))
+                .unwrap();
+            for field in [
+                job,
+                "perf:",
+                "lane=\"metal\"",
+                "code=\"queue_full\"",
+                "wall_ms=",
+            ] {
+                assert!(
+                    failed[0].contains(field),
+                    "{method}: missing {field}: {captured}"
+                );
             }
             assert!(!captured.contains("job done"), "{method}: {captured}");
             drop(state);

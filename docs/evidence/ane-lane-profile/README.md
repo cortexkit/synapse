@@ -185,140 +185,15 @@ overhead/compute split yet.
 | Actual AFT 64-row batch | per-row ladder | not measured | not measured | not measured | not measured | not measured | not measured |
 | Two AFT calls in flight | per-row ladder | not measured | not measured | not measured | not measured | not measured | not measured |
 
-### Raw attempted runs, NOT performance measurements
+### Attempted runs on the busy host
 
-The native private catalog installer and original-checkpoint conversion completed,
-but every serving attempt failed before worker startup. The earlier harness
-revision retried readiness 100 times and then continued labeling further failed
-calls as warm/cold. The final harness fixes that behavior: it fails fast on the
-first non-loading readiness error. Preserve the old attempts as refusal evidence,
-not successful measurements. Free-form messages/details were removed from the
-raw files to eliminate machine paths; `cause=ane_lane_busy` preserves the reason.
-
-| Attempted arm | Calls | `model_loading` | `engine_crashed` with `ane_lane_busy` | Executed rows | Load range (1 min) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Normal cached timing | 131 | 2 | 129 | 0 | 10.22–14.74 |
-| Hardware stats (next arm) | 131 | 7 | 124 | 0 | 12.42–22.90 |
-
-Selected raw refusals (wall ms, **not inference ms**):
-
-| Label | Normal wall ms | Normal load | Hardware wall ms | Hardware load |
-| --- | ---: | ---: | ---: | ---: |
-| initial-0 (`model_loading`) | 5008.160 | 14.49 | 5003.854 | 15.29 |
-| initial-1 (`ane_lane_busy`) | 1307.982 | 14.45 | 1388.220 | 14.47 |
-| warm-32-0 | 1.162 | 14.36 | 10.892 | 21.30 |
-| warm-128-0 | 1.062 | 14.14 | 12.556 | 21.37 |
-| warm-256-0 | 1.242 | 13.76 | 9.278 | 19.61 |
-| warm-512-0 | 1.206 | 13.69 | 3336.474 | 21.09 |
-| incident-cold-1024 | 4301.513 | 13.50 | 10.985 | 20.71 |
-| incident-concurrent-short | 3297.580 | 13.50 | 4311.309 | 20.71 |
-| aft64-warm | 1.553 | 13.38 | 1.212 | 20.41 |
-
-The initial five-second `model_loading` lines concern **load attempts whose
-background task continues after the requesting caller stops waiting**,
-not the requested cold-shape incident reproduction. No worker JSONL exists in
-these occupied-host runs. `normal/` and `hardware/` contain their raw driver and
-module records only; generated summaries are not committed.
-
-## Part B — incident explained from code
-
-### What the code establishes (high confidence)
-
-**Yes: a serving engine inference holds the catalog lane mutex, including a
-first-time shape compile.** The catalog mutex protects serving execution, not
-only model loading.
-
-| Serialization point | Exact source and lifetime |
-| --- | --- |
-| Catalog serving lane | `crates/synapse-module/src/lib.rs:12291–12303`: acquire the lane's owned mutex before execution; `:12308–12310`: acquire the execution permit afterwards; `:12387–12392`: pass `(permit, catalog_guard, _activity)` to direct-ANE `infer_guarded` |
-| Detached direct-ANE inference | `crates/synapse-module/src/worker_host/mod.rs:5331–5357`: spawn the inference task and retain the supplied guards; `:5363–5399`: inference exchanges are awaited within that task. A cancelled caller does not release the guard before the worker reply drains |
-| Residency before inference | `worker_host/mod.rs:4090–4148`, especially `:4123–4132`: obtain a shape lease before the inference callback and release it afterwards; `:3967–4049`: the lease path can wait/admit/evict; `:4394–4436`: the driver performs shape admission |
-| Worker stream | `worker_host/mod.rs:4644–4659`: one Tokio mutex protects the stream session; `:4775–4819`: `exchange_inner` holds it across writing request/raw frames and reading response/raw frames. Shape admission uses that same exchange (`:4867–4905`) |
-| Worker loop | `crates/synapse-worker-ane-direct/src/worker.rs:183–205,245–261`: one request at a time; admission calls `Model::admit` synchronously before replying. `:350–389`: sequences run rows one after another |
-| First-time compilation | `crates/synapse-worker-ane-direct/src/backend.rs:224–234`: `Model::admit` invokes graph compilation; `:251–254`: a resident shape returns immediately; `:259–307`: otherwise build/compile every layer before publishing the resident entry. Qwen has 28 layers |
-| Per-row layer work | `backend.rs:389–421`: execute the layer programs in order; no per-layer host copy between their IOSurfaces |
-| Machine-global owner fence | `worker_host/mod.rs:3429,3809–3829`: acquire the per-user direct-ANE advisory lock; `:5112` puts its inherited descriptor in worker configuration and `:971–972` supplies it as worker stdin (`:5031–5035` documents the duplicated descriptor lifetime). `lib.rs:6663–6666` uses the default lock; this is separate from the per-model catalog mutex |
-
-The residency supervisor controls admission, leases, budget and eviction; it is
-not by itself an inference-overlap guarantee. Its waiters do not hold the socket
-while waiting for admission, but the **compile RPC does hold the socket**. Even
-if the catalog mutex were shortened, the single stream and worker loop would
-still serialize calls. The configured two execution permits are a module-wide
-limit, not two independent hardware streams.
-
-**Important scope nuance:** an `embed.batch` logical call is not necessarily one
-continuous lock hold across all 64 rows. `lib.rs:11489–11596` schedules bounded
-engine batches; `:11557–11566` awaits each `execute_embedding`, and `:11581–11585`
-yields between them. Each engine batch acquires/retains the catalog guard. A cold
-compile blocks its entire engine inference, and resolver waiters for the same
-lane, even when the encompassing AFT call has multiple quanta.
-
-### Why a loaded lane can say “loading”
-
-`resolve_serving_model`, `lib.rs:25121–25127`, tries the **same catalog lane
-mutex** and waits at most `min(request_budget, 5000)` ms. A failure to acquire it
-calls `catalog_loading_response`. `lib.rs:25154–25164` returns
-`deadline_exceeded` for budgets at most five seconds, otherwise `model_loading`
-with `catalog lane '<lane>' is loading` and retry-after 250 ms. It does not check
-whether the owner is loading, compiling a shape, or doing ordinary inference.
-The lock owner's readiness task is also detached (`:25141–25150`), with a
-separate five-second readiness wait. The resolver guard is not transferred
-straight to serving: execution acquires the same lane lock again later.
-
-Therefore the supplied 09:02:56Z admission and the 09:03:31Z `model_loading`
-response are **consistent with** a cold-shape compile holding that lane mutex.
-A shape compile does not require a worker restart or loss of model residency.
-The request at 09:03:31Z can be rejected before its own admission, so no admitted
-closing line is owed for that refusal. Requests that already passed resolution
-can queue later on the execution lane lock as well.
-
-This is a code-supported mechanism, **not proof of the historical cause**.
-The missing closing event for `inline-154-456` does not identify its error, shape,
-or compile duration. No production logs/store were read for this task. The
-09:03:39Z recovery could also follow long inference, scheduling contention, or
-another failure/drain path. Part C closes returned-error paths going forward;
-it cannot retroactively classify that request.
-
-### Live reproduction status and expected observation
-
-**Not run: no worker or cold compile could start while production owned the
-global ANE lock.** The occupied-host attempts in the raw files are not a
-substitute reproduction. On the second Mac, inspect the `incident-*` records:
-
-- `incident-cold-1024` should cause an uncached 1,024-shape admission after the
-  lane is already loaded; worker admission evidence must establish that fact.
-- A short call starts one second later. If compilation holds the mutex longer
-  than another five seconds, it should return `model_loading` after about five
-  seconds, despite a loaded model and no restart.
-- The long call should eventually complete (600 s request budget), followed by
-  a successful `incident-short-after`. Record actual compile time and load.
-- If compilation finishes in less than six seconds, the short request may instead
-  succeed: that does not disprove the locking mechanism; it does not reproduce
-  the incident's long hold. Report that outcome explicitly.
-
-### Recommended fix shape — NOT implemented
-
-1. Separate lane **state/lifetime protection** from **execution serialization**.
-   Hold the catalog mutex only while inspecting/publishing load and self-check
-   state and selecting a live model generation; represent in-flight lifetime
-   separately so unload/reload cannot invalidate an inference. Do not merely
-   delete the guard: cancellation/drain and numerical self-check guarantees
-   must survive.
-2. Make first-time shape preparation single-flight in residency management,
-   with explicit `shape_compiling`/queue state and absolute-deadline accounting.
-   Do not hold the catalog metadata mutex through synchronous compilation or
-   worker inference. Preserve the machine-global ownership/capacity fence.
-3. Report loading only for actual loading. Report ordinary execution/residency
-   contention with an appropriate busy/queue/deadline classification rather
-   than the misleading model-loading message. Preserve distinct caller deadline
-   and detached worker-drain behavior.
-4. Add private-daemon tests for warm-lane contention, cold compile plus short
-   waiter, cancellation/drain, concurrent self-check, unload and generation
-   replacement before changing these lock scopes.
-
-This fixes head-of-line blocking/misreporting, not necessarily throughput: the
-socket and worker loop remain serial. Decide row batching, layer fusion or other
-compute changes only after obtaining the missing hardware/dispatch split.
+The private catalog installer and checkpoint conversion completed, but every
+serving attempt was refused before a worker started: production Synapse held
+the machine-wide direct-ANE lock (`cause=ane_lane_busy`, 253 of 262 calls; the
+rest returned `model_loading` while the refused load was pending). No row ran,
+so those records hold no timings and are not kept here. The harness now fails
+fast on the first non-loading readiness error instead of labelling refusals as
+warm or cold calls.
 
 ## Part C — admitted-error closing events
 

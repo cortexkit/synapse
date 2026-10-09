@@ -152,7 +152,10 @@ impl Candidate {
             .env("XDG_DATA_HOME", root.join("data"))
             .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
             .env("CORTEXKIT_STORE_ROOT", root.join("store"))
-            .env(synapse_core::worker_binary_env_var("ane-direct-worker"), &worker)
+            .env(
+                synapse_core::worker_binary_env_var("ane-direct-worker"),
+                &worker,
+            )
             .kill_on_drop(true)
             .spawn()?;
         let daemon = tokio::spawn(async move {

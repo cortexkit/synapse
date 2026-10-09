@@ -1,9 +1,9 @@
 #[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
-mod profile;
-#[cfg(target_os = "macos")]
 mod modernbert;
+#[cfg(target_os = "macos")]
+mod profile;
 #[cfg(target_os = "macos")]
 mod qwen;
 #[cfg(target_os = "macos")]
