@@ -8177,7 +8177,9 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+    {
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -8553,7 +8555,9 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         return result_outcome(error_payload(&state, error));
     }
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+    {
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -9174,7 +9178,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(pairs) => pairs,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, params.deadline_ms).await
+    {
         return result_outcome(error_payload(&state, error));
     }
     let mut texts = Vec::with_capacity(params.candidates.len() + 1);
@@ -12252,9 +12258,7 @@ async fn acquire_execution_permit(
 /// takes per inference exchange once it holds the worker stream (see
 /// `lane_serving_gate` for the lock order).
 #[cfg(unix)]
-fn direct_ane_permit_source(
-    runtime: &RuntimeState,
-) -> worker_host::ane_residency::PermitSource {
+fn direct_ane_permit_source(runtime: &RuntimeState) -> worker_host::ane_residency::PermitSource {
     use worker_host::ane_residency::{AneResidencyError, ExchangePermit};
     let execution = runtime.execution.clone();
     let stats = Arc::clone(&runtime.execution_stats);
@@ -17634,7 +17638,9 @@ mod tests {
     /// What a short request does before it executes: the resolver's wait for
     /// the lane lock, then profile certification, both with a 6 s budget.
     #[cfg(unix)]
-    async fn resolve_and_certify_ane_lane(state: &Arc<ModuleState>) -> Result<(), WireOperationError> {
+    async fn resolve_and_certify_ane_lane(
+        state: &Arc<ModuleState>,
+    ) -> Result<(), WireOperationError> {
         let (guard, _) = catalog_resolution_guard(&state.runtime, ANE_TEST_LANE, 6000).await?;
         drop(guard);
         ensure_profile_preload_ready(state.clone(), ANE_TEST_LANE, Some(6000))
@@ -17658,8 +17664,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn resident_shape_request_is_not_refused_as_model_loading_while_another_shape_compiles()
-    {
+    async fn resident_shape_request_is_not_refused_as_model_loading_while_another_shape_compiles() {
         let fixture = ane_lane_fixture("ane-compile-resident", true).await;
         let state = fixture.state.clone();
         embed_on_ane_lane(&state, 1, None).await.unwrap();
@@ -17753,7 +17758,10 @@ mod tests {
         );
         assert!(first.is_ok(), "{first:?}");
         assert!(later.is_ok(), "{later:?}");
-        assert_eq!(compiles, 1, "one compile serves every request for the shape");
+        assert_eq!(
+            compiles, 1,
+            "one compile serves every request for the shape"
+        );
     }
 
     #[tokio::test]
@@ -17856,8 +17864,10 @@ mod tests {
         })
         .await
         .expect("the self-check never queued for the lane");
-        // The self-check is waiting for the in-flight reply; a new request must
-        // wait behind it rather than run alongside the check.
+        // The self-check is waiting for the in-flight reply; a request that
+        // passed certification earlier must wait behind it, not reach the
+        // worker alongside the check.
+        let exchanges_before = fixture.engine.serving.channel.request_count();
         let behind_check = tokio::time::timeout(
             Duration::from_secs(2),
             embed_on_ane_lane(
@@ -17867,6 +17877,8 @@ mod tests {
             ),
         )
         .await;
+        let exchanges_during_check =
+            fixture.engine.serving.channel.request_count() - exchanges_before;
         release.notify_one();
         let checked = tokio::time::timeout(Duration::from_secs(10), check).await;
         let unloaded = response_result(
@@ -17876,9 +17888,13 @@ mod tests {
         finish_ane_lane_fixture(fixture).await;
         assert_eq!(refused["error"]["code"], "model_in_use", "{refused}");
         match behind_check {
-            Ok(Err(error)) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            Ok(Err(error)) => assert_eq!(error.code, "deadline_exceeded", "{error:?}"),
             other => panic!("a request during the self-check must wait at its deadline: {other:?}"),
         }
+        assert_eq!(
+            exchanges_during_check, 0,
+            "a request reached the worker while the self-check held the lane"
+        );
         assert!(
             matches!(checked, Ok(Ok(_))),
             "the self-check never ran: {checked:?}"
@@ -24127,10 +24143,13 @@ async fn acquire_lane_serving(
         Some(deadline) => tokio::time::timeout_at(deadline, gate.read_owned())
             .await
             .map_err(|_| {
-                // Only a self-check or an unload holds the write guard.
+                // Only a self-check or an unload holds the write guard. Inline
+                // requests meet a self-check earlier, in certification, and are
+                // answered model_loading there; admitted jobs must never fail
+                // with model_loading, so this wait reports the budget instead.
                 WireOperationError::from_stable(
-                    StableError::model_loading(Some(250)),
-                    format!("catalog lane '{lane}' is being self-checked or unloaded"),
+                    StableError::deadline_exceeded(),
+                    format!("deadline exceeded waiting for catalog lane '{lane}'"),
                 )
             })?,
         None => gate.read_owned().await,
@@ -25949,22 +25968,16 @@ async fn check_profile_model(
             .write_owned()
             .await,
     );
-    let evaluation = match numerical_profile_preload_check(
-        state,
-        &model,
-        profile,
-        references,
-        Some(gate),
-    )
-    .await
-    {
-        Ok(evaluation) => evaluation,
-        Err(error) => {
-            let reason = serde_json::to_string(&error).expect("wire error serializes");
-            catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
-            return Err(profile_preload_check_error(profile, &reason));
-        }
-    };
+    let evaluation =
+        match numerical_profile_preload_check(state, &model, profile, references, Some(gate)).await
+        {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let reason = serde_json::to_string(&error).expect("wire error serializes");
+                catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
+                return Err(profile_preload_check_error(profile, &reason));
+            }
+        };
     complete_profile_preload_check(state, profile, &id, generation, &evaluation)?;
     Ok(model)
 }

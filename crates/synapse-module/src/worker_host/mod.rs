@@ -3442,7 +3442,9 @@ pub mod ane_residency {
     /// task calls it once per inference exchange, after taking the worker
     /// stream, never while waiting for admission.
     pub type PermitSource = Arc<
-        dyn Fn(Option<tokio::time::Instant>) -> BoxFuture<'static, Result<ExchangePermit, AneResidencyError>>
+        dyn Fn(
+                Option<tokio::time::Instant>,
+            ) -> BoxFuture<'static, Result<ExchangePermit, AneResidencyError>>
             + Send
             + Sync,
     >;
@@ -4759,7 +4761,10 @@ pub mod ane_residency {
     }
     impl Drop for CompilingMarker<'_> {
         fn drop(&mut self) {
-            *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
 
@@ -4961,7 +4966,9 @@ pub mod ane_residency {
                 self.exchange_locked(&mut guard, request, raw, generation),
             )
             .await
-            .map_err(|_| AneResidencyError::Channel("inference exchange deadline exceeded".into()))?
+            .map_err(|_| {
+                AneResidencyError::Channel("inference exchange deadline exceeded".into())
+            })?
         }
 
         async fn exchange_locked(
@@ -5585,31 +5592,30 @@ pub mod ane_residency {
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
-                let result =
-                    serving
-                        .supervisor
-                        .run_by_published_rung_until(
-                            &worker,
-                            &serving.metadata.model_ref,
-                            &lengths,
-                            &serving.metadata.buckets,
-                            deadline,
-                            |_, indices| {
-                                fault_generation.store(worker.generation(), Ordering::Release);
-                                let serving = serving.clone();
-                                let permits = permits.clone();
-                                let selected: Vec<_> = indices
-                                    .iter()
-                                    .map(|&index| sequences[index].clone())
-                                    .collect();
-                                async move {
-                                    serving
-                                        .exchange_sequences(selected, rerank, deadline, permits)
-                                        .await
-                                }
-                            },
-                        )
-                        .await;
+                let result = serving
+                    .supervisor
+                    .run_by_published_rung_until(
+                        &worker,
+                        &serving.metadata.model_ref,
+                        &lengths,
+                        &serving.metadata.buckets,
+                        deadline,
+                        |_, indices| {
+                            fault_generation.store(worker.generation(), Ordering::Release);
+                            let serving = serving.clone();
+                            let permits = permits.clone();
+                            let selected: Vec<_> = indices
+                                .iter()
+                                .map(|&index| sequences[index].clone())
+                                .collect();
+                            async move {
+                                serving
+                                    .exchange_sequences(selected, rerank, deadline, permits)
+                                    .await
+                            }
+                        },
+                    )
+                    .await;
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
                     serving
                         .supervisor
@@ -7467,9 +7473,11 @@ pub mod ane_residency {
             })
             .await
             .unwrap();
-            let resident =
-                tokio::time::timeout(Duration::from_secs(1), supervisor.lease(&worker, "model", 128))
-                    .await;
+            let resident = tokio::time::timeout(
+                Duration::from_secs(1),
+                supervisor.lease(&worker, "model", 128),
+            )
+            .await;
             release.notify_one();
             let compiled = compiling.await.unwrap().unwrap();
             let joined = joining.await.unwrap().unwrap();
@@ -7589,7 +7597,10 @@ pub mod ane_residency {
         #[cfg(unix)]
         pub(crate) fn module_mock_engine_controlled() -> (Arc<DirectAneEngine>, ModuleMockControl) {
             let ledger = SharedLedger::default();
-            (module_mock_engine_for(ledger.clone()), ModuleMockControl(ledger))
+            (
+                module_mock_engine_for(ledger.clone()),
+                ModuleMockControl(ledger),
+            )
         }
 
         #[cfg(unix)]

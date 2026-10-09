@@ -76,8 +76,11 @@ Before:
 After:
 1. Resolver: unchanged. The lane mutex is now contended only by real lifecycle
    work, so `model_loading` means "loading or self-checking".
-2. Profile certification: unchanged. The lane mutex is now held only briefly.
-3. Serving-gate READ guard *(deadline)*. No lane mutex. No permit yet.
+2. Profile certification: lane mutex, waited for only until the request
+   deadline (answered `model_loading` when it expires, as the resolver does).
+   It is held only briefly unless the self-check itself runs.
+3. Serving-gate READ guard *(deadline; `deadline_exceeded` when it expires)*.
+   No lane mutex. No permit yet.
 4. Detached task (owns the read guard), for each rung:
    1. Supervisor step *(deadline)*. A resident shape is leased at once, or the
       request joins the in-flight admission of its shape (single-flight), or it
@@ -289,23 +292,26 @@ What it asserts, on a mock direct-ANE lane with the worker reply held open by
 the mock's inference gate and the caller cancelled (only the detached task
 holds guards):
 1. `model.unload` returns `model_in_use` while the reply has not drained. The
-   worker channel is not retired, and the engine's unload is not called.
-2. A self-check started at the same time does not dispatch its reference
-   inference until the held reply drains. The mock ledger records no second
-   inference exchange before the first reply.
-3. Once the reply drains, unload succeeds, and a later load (reload) gets a
-   fresh worker.
+   engine's unload is not called.
+2. A self-check started at the same time queues for the serving gate. A
+   request that passed certification earlier then waits at the gate, is
+   answered `deadline_exceeded` at its deadline, and never reaches the worker
+   (no exchange is issued while the check holds the lane).
+3. Once the reply drains, the self-check runs and unload succeeds.
 
-**Today's code already passes this test**, because today's lane mutex
-serialises unload and the self-check against inference. So it cannot fail
-first. It is written and run first against the base commit to record that, and
-its non-vacuity is then shown by mutation on the new code. Each mutation
-staged, applied, run and restored per the repository's mutation procedure:
-- **Serving takes no gate read guard.** Expected red: assertion 1 (unload
-  succeeds while the reply is open).
-- **The detached task gets `()` instead of the guard tuple**, so cancellation
-  drops the guard. Expected red: assertion 1 after cancellation.
+Reload needs no separate assertion: it only runs on a lane whose model was
+unloaded or failed to load, and assertion 1 shows unload cannot proceed while
+any inference is in flight.
+
+A serving request that waits at the gate gets `deadline_exceeded`, not
+`model_loading`, because admitted batch jobs must never fail with
+`model_loading`. Inline requests meet a running self-check earlier, in
+certification, which answers `model_loading` at their deadline.
+
+**On the base commit this test fails at assertion 2** (the request waits on
+the lane mutex past its deadline). Assertion 1 already holds there, because
+today's lane mutex serialises unload against inference. Its non-vacuity on
+the new code is shown by mutation. Each mutation is staged, applied, run and
+restored per the repository's mutation procedure:
+- **Unload skips the serving-gate `try_write`.** Expected red: assertion 1.
 - **The self-check skips the write guard.** Expected red: assertion 2.
-
-The test names that went red and those that stayed green are recorded in the
-delivery.
