@@ -15,7 +15,8 @@ What the measurements say:
    experiment is a graph that runs several rows per dispatch.
 2. A first-time shape compile holds the lane for 11-27 s, and other requests are
    refused as `model_loading` meanwhile. The fix shape is in Part B.
-3. Module-side work adds about 240-370 ms to a 64-row call (15-20%).
+3. The module itself adds only 18-98 ms to a 64-row call, tokenization
+   included. Nearly all of the call is Neural Engine time.
 
 ## Method and runnable commands
 
@@ -197,17 +198,25 @@ does not shrink with its length.
 **AFT's real 64-row batch** (first batch of the engram export, about 120 tokens
 per row, all at shape 128):
 
-| Call | Wall ms | Engine dispatch ms | Module and IPC ms |
-| --- | ---: | ---: | ---: |
-| 64 rows, first | 1,778-1,814 | 1,436-1,446 | 340-370 |
-| 64 rows, repeat | 1,652-1,789 | 1,414-1,528 | 238-262 |
-| Two 64-row calls at once, each | 2,774-3,451 | 2,519-2,868 | 211-583 |
+| Call | Wall ms | Neural Engine rows ms | Rest of the worker ms | Module and transport ms |
+| --- | ---: | ---: | ---: | ---: |
+| 64 rows, first (normal arm) | 1,814 | 1,493 | 223 | 98 |
+| 64 rows, repeat (normal arm) | 1,652 | 1,430 | 143 | 79 |
+| 64 rows, first (hardware arm) | 1,779 | 1,704 | 42 | 33 |
+| 64 rows, repeat (hardware arm) | 1,789 | 1,545 | 226 | 18 |
+
+"Neural Engine rows" sums the worker's per-row timings: all 64 rows padded to
+shape 128. "Rest of the worker" is the worker's request time outside those rows;
+it includes the profiler writing its own per-row evidence lines, so part of it
+is the measurement itself. "Module and transport" is wall time minus the eight
+worker round trips, tokenization included (2-7 ms). Two 64-row calls at once took
+2,774-3,451 ms each.
 
 The module splits each 64-row call into eight 8-row engine calls of 190-234 ms;
 inside one, rows run one after another with under 0.01 ms between them. Two
 concurrent calls serialise completely, so overlap buys no throughput. A row in
-a batch costs about the same 22-24 ms as a lone row: batching today saves only
-the per-call module cost, not Neural Engine time. Steady state is about 40 rows
+a batch costs about the same 22-27 ms as a lone row: batching today saves only
+the small per-call module cost, not Neural Engine time. Steady state is about 40 rows
 per second on the M4.
 
 **Hardware counters.** The hardware arm's `hardware_ms` was 0 for every layer
@@ -399,7 +408,9 @@ that still passed while the closing event was removed.
    compile forces can make the next short request recompile a shape.
 3. **High, tested and mutation-defended:** returned admitted embed/rerank errors
    now emit a closing perf event; success/error response contracts are preserved.
-4. **Medium, measured:** module-side work adds 240-370 ms to a 64-row call.
+4. **Medium, measured:** module and transport add 18-98 ms to a 64-row call
+   (1-5%). An earlier revision of this report said 240-370 ms; that misread a
+   summary column that leaves out part of the worker's own time.
 5. **Inferred, not measured:** the flat per-layer floor at short shapes is
    per-row weight traffic or dispatch cost rather than arithmetic. The M4 does
    not report device time through the private statistics call, so a multi-row
