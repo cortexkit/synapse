@@ -522,7 +522,7 @@ impl MultiRowProgram {
             };
             executable.run_cached(&[src], &[dst])?;
         }
-        let surface = if self.executables.len() % 2 == 0 {
+        let surface = if self.executables.len().is_multiple_of(2) {
             &self.a
         } else {
             &self.b
@@ -911,5 +911,464 @@ mod tests {
             .max(1e-12);
         let expected: Vec<f32> = expected.into_iter().map(|v| v / norm).collect();
         assert_eq!(embedding_tail(hidden_state, &weight, 1e-6), expected);
+    }
+}
+
+/// Neural Engine measurement of one multi-row shape against the single-row
+/// path, in one process. Ignored by default; see the module README section in
+/// `docs/evidence/ane-multirow-dispatch/README.md` for the full procedure.
+///
+/// Required environment:
+/// - `ANE_MULTIROW_ARM`: the shape, `layout:rows:width` (for example
+///   `width-folded:4:128`). Setting it is what enables the experiment.
+/// - `ANE_TEST_PACKAGES`: directory holding `qwen3-embedding-0.6b.safetensors`,
+///   the converted package pinned in `bench/parity/models.json`.
+/// - `ANE_MULTIROW_INPUT`: an AFT `engram.jsonl` export (text is hashed, never
+///   written out).
+/// - `ANE_MULTIROW_TOKENIZER`: the checkpoint's `tokenizer.json`.
+/// - `ANE_MULTIROW_OUT`: where to write the JSON report.
+///
+/// Optional: `ANE_MULTIROW_REPEATS` (timing repetitions, default 5) and
+/// `ANE_MULTIROW_REPLAY=1` (also replay the export's first 64-row batch).
+#[cfg(test)]
+mod hardware {
+    use super::*;
+    use crate::backend::{rung, Profile};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::time::Instant;
+
+    const SLUG: &str = "qwen3-embedding-0.6b";
+    const SINGLE_ROW_GATE: f64 = 0.999;
+    const MULTI_ROW_GATE: f64 = 0.9999;
+
+    fn load_average() -> f64 {
+        let mut load = [0.0f64; 3];
+        assert_eq!(unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }, 3);
+        load[0]
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (norm(a) * norm(b))
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64 - *y as f64).abs())
+            .fold(0.0, f64::max)
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn ids_digest(ids: &[u32]) -> String {
+        sha(&ids
+            .iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect::<Vec<_>>())
+    }
+
+    fn ms(started: Instant) -> f64 {
+        started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    struct Chunk {
+        seq: u64,
+        text_sha256: String,
+        ids: Vec<u32>,
+    }
+
+    fn tokenize_export(path: &str, tokenizer: &str, eos: u32) -> Vec<Chunk> {
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer).unwrap();
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                let text = record["text"].as_str().unwrap();
+                Chunk {
+                    seq: record["seq"].as_u64().unwrap(),
+                    text_sha256: sha(text.as_bytes()),
+                    ids: compose(&tokenizer, text, eos),
+                }
+            })
+            .collect()
+    }
+
+    /// The catalog's Qwen3 document composition: the tokenizer's own special
+    /// tokens, then exactly one terminal end-of-text token.
+    fn compose(tokenizer: &tokenizers::Tokenizer, text: &str, eos: u32) -> Vec<u32> {
+        let mut ids = tokenizer.encode(text, true).unwrap().get_ids().to_vec();
+        if ids.last() == Some(&eos) {
+            ids.pop();
+        }
+        ids.push(eos);
+        ids
+    }
+
+    fn single(model: &Model, ids: &[u32]) -> (Vec<f32>, f64) {
+        let started = Instant::now();
+        let vector = model.run(ids).unwrap();
+        (vector, ms(started))
+    }
+
+    #[test]
+    #[ignore = "Neural Engine experiment; set ANE_MULTIROW_ARM and the inputs documented above"]
+    fn multirow_experiment() {
+        let Ok(arm) = std::env::var("ANE_MULTIROW_ARM") else {
+            panic!("ANE_MULTIROW_ARM is required");
+        };
+        let shape = MultiRowShape::parse(&arm).unwrap();
+        let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+        let out = env("ANE_MULTIROW_OUT");
+        let repeats: usize = std::env::var("ANE_MULTIROW_REPEATS")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(5);
+        let replay = std::env::var_os("ANE_MULTIROW_REPLAY").is_some();
+        crate::worker::test_private_api().unwrap();
+        let mut report = json!({
+            "arm": shape.label(), "layout": shape.layout.name(), "rows": shape.rows,
+            "width": shape.width, "repeats": repeats, "pid": std::process::id(),
+            "release": !cfg!(debug_assertions),
+        });
+        let write = |report: &Value| {
+            std::fs::write(&out, serde_json::to_vec_pretty(report).unwrap()).unwrap();
+        };
+
+        let profile = Profile::select(&format!("{SLUG}.ane-direct-worker"), "embed").unwrap();
+        let digest = profile.numeric["converted_package_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let eos = profile.n("eos_token_id") as u32;
+        let root = std::path::PathBuf::from(env("ANE_TEST_PACKAGES"));
+        let mut model =
+            Model::load(profile, &root.join(format!("{SLUG}.safetensors")), &digest).unwrap();
+        let input = env("ANE_MULTIROW_INPUT");
+        let tokenizer_path = env("ANE_MULTIROW_TOKENIZER");
+        let chunks = tokenize_export(&input, &tokenizer_path, eos);
+        report["input"] = json!({
+            "export_sha256": sha(&std::fs::read(&input).unwrap()),
+            "chunks": chunks.len(),
+            "tokenizer_sha256": sha(&std::fs::read(&tokenizer_path).unwrap()),
+        });
+
+        // Fixture rows carry fp32 references; check the tokenizer composition
+        // against them too, so the replay rows are composed like the catalog's.
+        let fixture: Value = serde_json::from_slice(
+            &std::fs::read(format!(
+                "../../bench/parity/fixtures/{SLUG}/{SLUG}.ref-v1.transformers-5.16.1.seed-0.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).unwrap();
+        let mut composition_matches = 0;
+        let mut composition_checked = 0;
+        let mut references = Vec::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            let ids: Vec<u32> = serde_json::from_value(case["input_ids"].clone()).unwrap();
+            if let Some(text) = case["text"].as_str() {
+                composition_checked += 1;
+                composition_matches += usize::from(compose(&tokenizer, text, eos) == ids);
+            }
+            if ids.len() <= shape.width {
+                let output: Vec<f32> = serde_json::from_value(case["output"].clone()).unwrap();
+                references.push((case["id"].as_str().unwrap().to_owned(), ids, output));
+            }
+        }
+        report["tokenizer_composition"] =
+            json!({"fixture_cases_checked": composition_checked, "matching": composition_matches});
+
+        let load = load_average();
+        let started = Instant::now();
+        model.admit(shape.width, "multirow-experiment").unwrap();
+        report["single_row_compile"] = json!({
+            "width": shape.width, "ms": ms(started), "executables": 28,
+            "load_before": load, "load_after": load_average(),
+        });
+        let load = load_average();
+        let started = Instant::now();
+        let program = model.compile_multirow(shape);
+        report["multi_row_compile"] = json!({
+            "ms": ms(started), "load_before": load, "load_after": load_average(),
+            "ok": program.is_ok(),
+            "error": program.as_ref().err().map(|e| format!("{e:#}")),
+            "executables": program.as_ref().map(|p| p.executable_count()).unwrap_or(0),
+        });
+        let mut graph = Graph::new();
+        let hidden = model.profile.n("hidden_size");
+        let placeholder = graph.placeholder(shape.tensor_shape(hidden));
+        layer_graph(&mut graph, placeholder, &model, 0, &shape).unwrap();
+        let (mil, weights) = graph.source_payload();
+        report["multi_row_program"] = json!({
+            "layer0_operations": mil.lines().filter(|l| l.contains("[name = string(")).count(),
+            "layer0_mil_bytes": mil.len(), "layer0_weight_bytes": weights.len(),
+        });
+        let program = match program {
+            Ok(program) => program,
+            Err(error) => {
+                write(&report);
+                println!("MULTIROW arm={} compile refused: {error:#}", shape.label());
+                return;
+            }
+        };
+
+        // Correctness before timing: single rows against fp32, then every
+        // multi-row slot against the same row run alone.
+        let mut failures = Vec::new();
+        let mut gate = Vec::new();
+        let mut rows: Vec<(String, Vec<u32>, Option<Vec<f32>>)> = Vec::new();
+        for (id, ids, expected) in &references {
+            let (vector, _) = single(&model, ids);
+            let value = cosine(&vector, expected);
+            if value < SINGLE_ROW_GATE {
+                failures.push(format!("single {id} fp32 cosine {value}"));
+            }
+            gate.push(json!({"case": id, "tokens": ids.len(), "cosine_vs_fp32": value}));
+            rows.push((format!("fixture:{id}"), ids.clone(), Some(expected.clone())));
+        }
+        report["single_row_fp32_gate"] = json!(gate);
+        for chunk in chunks
+            .iter()
+            .filter(|c| c.ids.len() <= shape.width)
+            .take(4 * shape.rows)
+        {
+            rows.push((format!("engram:{}", chunk.seq), chunk.ids.clone(), None));
+        }
+        let alone: Vec<Vec<f32>> = rows
+            .iter()
+            .map(|(_, ids, _)| single(&model, ids).0)
+            .collect();
+        let mut parity = Vec::new();
+        let mut min_cosine = f64::INFINITY;
+        for (group, members) in rows.chunks(shape.rows).enumerate() {
+            let tokens: Vec<&[u32]> = members.iter().map(|(_, ids, _)| ids.as_slice()).collect();
+            let outputs = program.run(&model, &tokens).unwrap();
+            for (slot, ((name, ids, expected), output)) in members.iter().zip(outputs).enumerate() {
+                let reference = &alone[group * shape.rows + slot];
+                let value = cosine(&output, reference);
+                min_cosine = min_cosine.min(value);
+                if value < MULTI_ROW_GATE || output.len() != reference.len() {
+                    failures.push(format!(
+                        "{name} slot {slot}: cosine {value} len {}",
+                        output.len()
+                    ));
+                }
+                parity.push(json!({
+                    "row": name, "group": group, "slot": slot, "tokens": ids.len(),
+                    "cosine_vs_single": value, "max_abs_vs_single": max_abs(&output, reference),
+                    "identical_to_single": &output == reference, "dims": output.len(),
+                    "cosine_vs_fp32": expected.as_ref().map(|e| cosine(&output, e)),
+                }));
+            }
+        }
+        report["multi_row_parity"] = json!({"min_cosine_vs_single": min_cosine, "rows": parity});
+
+        // Padding and neighbours must not reach a real row: the same row alone
+        // (empty slots), surrounded by other rows, and in the last slot.
+        let target = &rows[0].1;
+        let others: Vec<&[u32]> = rows[1..shape.rows].iter().map(|r| r.1.as_slice()).collect();
+        let alone_in_pass = program.run(&model, &[target]).unwrap().remove(0);
+        let mut first_slot = vec![target.as_slice()];
+        first_slot.extend(&others);
+        let with_neighbours = program.run(&model, &first_slot).unwrap().remove(0);
+        let mut last_slot = others.clone();
+        last_slot.push(target);
+        let in_last_slot = program.run(&model, &last_slot).unwrap().pop().unwrap();
+        let isolation = json!({
+            "row": rows[0].0,
+            "empty_slots_vs_neighbours_max_abs": max_abs(&alone_in_pass, &with_neighbours),
+            "empty_slots_vs_neighbours_identical": alone_in_pass == with_neighbours,
+            "first_vs_last_slot_max_abs": max_abs(&with_neighbours, &in_last_slot),
+            "first_vs_last_slot_cosine": cosine(&with_neighbours, &in_last_slot),
+            "alone_in_pass_vs_single_cosine": cosine(&alone_in_pass, &alone[0]),
+        });
+        if cosine(&alone_in_pass, &with_neighbours) < MULTI_ROW_GATE
+            || cosine(&with_neighbours, &in_last_slot) < MULTI_ROW_GATE
+        {
+            failures.push(format!("padding or neighbour leak: {isolation}"));
+        }
+        report["isolation"] = isolation;
+        report["correctness_failures"] = json!(failures);
+        write(&report);
+
+        // Timing: the same N rows through N single-row runs and one multi-row
+        // pass, alternating which goes first. Rows fill the rung exactly so
+        // the single-row path runs at the same width.
+        let floor = LADDER
+            .iter()
+            .rev()
+            .find(|&&w| w < shape.width)
+            .copied()
+            .unwrap_or(0);
+        let timed: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|c| c.ids.len() > floor && c.ids.len() <= shape.width)
+            .take(shape.rows)
+            .collect();
+        assert_eq!(timed.len(), shape.rows, "not enough rows for the rung");
+        let tokens: Vec<&[u32]> = timed.iter().map(|c| c.ids.as_slice()).collect();
+        for ids in &tokens {
+            model.run(ids).unwrap();
+        }
+        program.run(&model, &tokens).unwrap();
+        let mut samples = Vec::new();
+        for repeat in 0..repeats {
+            let order = if repeat % 2 == 0 {
+                ["single", "multi"]
+            } else {
+                ["multi", "single"]
+            };
+            for path in order {
+                let load_before = load_average();
+                let started = Instant::now();
+                if path == "single" {
+                    for ids in &tokens {
+                        model.run(ids).unwrap();
+                    }
+                } else {
+                    program.run(&model, &tokens).unwrap();
+                }
+                let wall = ms(started);
+                samples.push(json!({
+                    "repeat": repeat, "path": path, "wall_ms": wall,
+                    "per_row_ms": wall / shape.rows as f64,
+                    "load_before": load_before, "load_after": load_average(),
+                }));
+            }
+        }
+        let median = |path: &str| {
+            let mut values: Vec<f64> = samples
+                .iter()
+                .filter(|s| s["path"] == path)
+                .map(|s| s["per_row_ms"].as_f64().unwrap())
+                .collect();
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let (single_ms, multi_ms) = (median("single"), median("multi"));
+        report["timing"] = json!({
+            "rows": timed.iter().map(|c| json!({"seq": c.seq, "tokens": c.ids.len(),
+                "text_sha256": c.text_sha256, "ids_sha256": ids_digest(&c.ids)})).collect::<Vec<_>>(),
+            "samples": samples,
+            "median_single_per_row_ms": single_ms,
+            "median_multi_per_row_ms": multi_ms,
+            "speedup": single_ms / multi_ms,
+        });
+        write(&report);
+        println!(
+            "MULTIROW arm={} single_per_row_ms={single_ms:.3} multi_per_row_ms={multi_ms:.3} speedup={:.3} min_cosine={min_cosine:.7} failures={}",
+            shape.label(),
+            single_ms / multi_ms,
+            report["correctness_failures"].as_array().unwrap().len()
+        );
+
+        if replay {
+            report["replay"] = replay_first_batch(&mut model, &program, &chunks, repeats);
+            write(&report);
+        }
+        drop(program);
+        drop(model);
+        let failures = report["correctness_failures"].as_array().unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Replay the export's first batch in its real order and lengths: today's
+    /// one-row-at-a-time path, then multi-row passes for rows that fit a slot
+    /// with the rest on the single-row path.
+    fn replay_first_batch(
+        model: &mut Model,
+        program: &MultiRowProgram,
+        chunks: &[Chunk],
+        repeats: usize,
+    ) -> Value {
+        let shape = program.shape();
+        let batch: Vec<&Chunk> = chunks.iter().take(64).collect();
+        let mut rungs: Vec<usize> = batch.iter().map(|c| rung(c.ids.len()).unwrap()).collect();
+        rungs.sort();
+        rungs.dedup();
+        // Stay well under the ~115 executables one process can hold.
+        let held = 28 * (rungs.len() + 1);
+        if held > 84 {
+            return json!({"skipped": format!("rungs {rungs:?} would hold {held} executables")});
+        }
+        let mut compiles = Vec::new();
+        for &width in &rungs {
+            let started = Instant::now();
+            model.admit(width, "multirow-experiment").unwrap();
+            compiles.push(json!({"width": width, "ms": ms(started)}));
+        }
+        let lengths: Vec<usize> = batch.iter().map(|c| c.ids.len()).collect();
+        let passes = plan_passes(&lengths, &shape);
+        let run_single = |model: &Model| -> Vec<Vec<f32>> {
+            batch.iter().map(|c| model.run(&c.ids).unwrap()).collect()
+        };
+        let run_multi = |model: &Model| -> Vec<Vec<f32>> {
+            let mut outputs = vec![Vec::new(); batch.len()];
+            for pass in &passes {
+                match pass {
+                    Pass::Single(index) => outputs[*index] = model.run(&batch[*index].ids).unwrap(),
+                    Pass::MultiRow(indices) => {
+                        let tokens: Vec<&[u32]> =
+                            indices.iter().map(|&i| batch[i].ids.as_slice()).collect();
+                        for (&index, vector) in
+                            indices.iter().zip(program.run(model, &tokens).unwrap())
+                        {
+                            outputs[index] = vector;
+                        }
+                    }
+                }
+            }
+            outputs
+        };
+        let reference = run_single(model);
+        let candidate = run_multi(model);
+        let cosines: Vec<f64> = reference
+            .iter()
+            .zip(&candidate)
+            .map(|(a, b)| cosine(a, b))
+            .collect();
+        let mut samples = Vec::new();
+        for repeat in 0..repeats.max(3) {
+            let order = if repeat % 2 == 0 {
+                ["single", "multi"]
+            } else {
+                ["multi", "single"]
+            };
+            for path in order {
+                let load_before = load_average();
+                let started = Instant::now();
+                let outputs = if path == "single" {
+                    run_single(model)
+                } else {
+                    run_multi(model)
+                };
+                let wall = ms(started);
+                assert_eq!(outputs.len(), 64);
+                samples.push(json!({
+                    "repeat": repeat, "path": path, "wall_ms": wall,
+                    "rows_per_second": 64_000.0 / wall,
+                    "load_before": load_before, "load_after": load_average(),
+                }));
+            }
+        }
+        let mut token_counts = lengths.clone();
+        token_counts.sort();
+        json!({
+            "rows": batch.len(),
+            "export_seqs": [batch[0].seq, batch[batch.len() - 1].seq],
+            "batch_text_sha256": sha(batch.iter().map(|c| c.text_sha256.as_str()).collect::<Vec<_>>().join("\n").as_bytes()),
+            "token_counts_sorted": token_counts,
+            "rungs": rungs, "rung_compiles": compiles,
+            "multi_row_passes": passes.iter().filter(|p| matches!(p, Pass::MultiRow(_))).count(),
+            "single_row_passes": passes.iter().filter(|p| matches!(p, Pass::Single(_))).count(),
+            "min_cosine_multi_vs_single": cosines.iter().copied().fold(f64::INFINITY, f64::min),
+            "samples": samples,
+        })
     }
 }

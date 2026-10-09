@@ -2,7 +2,10 @@
 mod backend;
 #[cfg(target_os = "macos")]
 mod modernbert;
+// Multi-row passes are an opt-in prototype: the request loop does not call
+// them yet, because their executables sit outside the supervisor's budget.
 #[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
 mod multirow;
 #[cfg(target_os = "macos")]
 mod profile;

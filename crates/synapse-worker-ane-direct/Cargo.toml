@@ -25,6 +25,10 @@ libm = "0.2"
 serde_json.workspace = true
 sha2.workspace = true
 
+# Tokenizes real exported chunks for the ignored multi-row hardware experiment.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tokenizers.workspace = true
+
 [build-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
