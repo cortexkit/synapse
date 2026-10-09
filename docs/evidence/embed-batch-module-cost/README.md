@@ -58,14 +58,14 @@ Reproduce from the checkout root:
 
 ```sh
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-SYNAPSE_RUN_MODULE_COST_PROFILE=1 SYNAPSE_MODULE_COST_RUNS=15 \
+SYNAPSE_MODULE_COST_RUNS=15 \
   SYNAPSE_MODULE_COST_OUT="$PWD/docs/evidence/embed-batch-module-cost/run-N" \
   cargo test --release --locked -p synapse-module --features test-support \
-  --test skeleton_e2e embed_batch_module_cost_profile -- --nocapture
+  --test skeleton_e2e embed_batch_module_cost_profile -- --ignored --nocapture
 ```
 
-Without `SYNAPSE_RUN_MODULE_COST_PROFILE=1`, the test returns at once. Its
-numbers only mean something in a release build.
+The test is ignored by default; `--ignored` runs it. Its numbers only mean
+something in a release build.
 
 ## Stage table
 

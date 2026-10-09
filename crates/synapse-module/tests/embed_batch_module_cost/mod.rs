@@ -3,8 +3,8 @@
 //!
 //! The deterministic test engine replaces the Neural Engine, so whatever time
 //! remains is module, transport and client codec cost. The profiling run is
-//! opt-in (`SYNAPSE_RUN_MODULE_COST_PROFILE=1`) because its numbers only mean
-//! something in a release build on a quiet machine; see
+//! an ignored test because its numbers only mean something in a release build
+//! on a quiet machine; see
 //! docs/evidence/embed-batch-module-cost/README.md for the method.
 
 use super::*;
@@ -242,14 +242,12 @@ fn summarize(label: &str, mut values: Vec<f64>) -> Value {
     serde_json::json!({"median_ms": median, "min_ms": values[0], "max_ms": values[values.len() - 1]})
 }
 
+// Ignored rather than skipped at run time: CI fails the e2e lane on any
+// "skipping" line, and the numbers only mean something in a release build on a
+// quiet machine. Run it with `--ignored` as the evidence README describes.
 #[tokio::test]
+#[ignore = "profiling run: release build on a quiet machine, see docs/evidence/embed-batch-module-cost"]
 async fn embed_batch_module_cost_profile() {
-    if std::env::var("SYNAPSE_RUN_MODULE_COST_PROFILE").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping module cost profile: set SYNAPSE_RUN_MODULE_COST_PROFILE=1 (release build, quiet machine)"
-        );
-        return;
-    }
     let runs = std::env::var("SYNAPSE_MODULE_COST_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
