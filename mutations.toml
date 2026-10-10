@@ -691,9 +691,14 @@ guards = "Caller cancellation cannot cancel worker I/O, misread a stale reply, o
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = """
             let joined = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, task)
-                    .await
-                    .map_err(|_| AneResidencyError::DeadlineExceeded)?,
+                Some(deadline) => match tokio::time::timeout_at(deadline, task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        #[cfg(test)]
+                        self.channel.pass_classify_gate(GateSite::Caller).await;
+                        return Err(self.channel.expired_wait(&waits, deadline));
+                    }
+                },
                 None => task.await,
             };"""
 new = """
@@ -704,9 +709,14 @@ new = """
             }
             let mut task = CancelOnDrop(task);
             let joined = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, &mut task.0)
-                    .await
-                    .map_err(|_| AneResidencyError::DeadlineExceeded)?,
+                Some(deadline) => match tokio::time::timeout_at(deadline, &mut task.0).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        #[cfg(test)]
+                        self.channel.pass_classify_gate(GateSite::Caller).await;
+                        return Err(self.channel.expired_wait(&waits, deadline));
+                    }
+                },
                 None => (&mut task.0).await,
             };"""
 edits = []

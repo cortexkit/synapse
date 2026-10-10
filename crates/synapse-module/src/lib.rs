@@ -1284,6 +1284,18 @@ struct RuntimeState {
     runnable_backends: BTreeSet<String>,
     backend_reasons: BTreeMap<String, &'static str>,
     catalog_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    serving_gates: Mutex<BTreeMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    lane_execution_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Each lane's in-flight numerical self-check, for callers to join.
+    lane_checks: Mutex<BTreeMap<String, tokio::sync::watch::Receiver<LaneCheckOutcome>>>,
+    #[cfg(test)]
+    profile_check_passes_for_test: Mutex<bool>,
+    #[cfg(test)]
+    lane_check_tasks: std::sync::atomic::AtomicUsize,
+    /// Holds a certification caller between its fast-path miss and joining
+    /// the lane's check.
+    #[cfg(test)]
+    fast_path_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
     catalog_disk: Mutex<()>,
@@ -2377,6 +2389,15 @@ impl RuntimeState {
             runnable_backends,
             backend_reasons,
             catalog_locks: Mutex::new(BTreeMap::new()),
+            serving_gates: Mutex::new(BTreeMap::new()),
+            lane_execution_locks: Mutex::new(BTreeMap::new()),
+            lane_checks: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            profile_check_passes_for_test: Mutex::new(false),
+            #[cfg(test)]
+            lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fast_path_gate: Mutex::new(None),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
             catalog_disk: Mutex::new(()),
@@ -5842,10 +5863,17 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     }
     let lane_lock = catalog_lane_lock(&state.runtime, &params.model_id);
     let catalog_lane = resolved_catalog_lane(&state.runtime, &params.model_id).is_some();
-    let mut catalog_guard = if catalog_lane {
-        match lane_lock.try_lock_owned() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
+    // Unload never waits: an in-flight inference (including one whose caller
+    // has gone but whose reply is still draining) holds the serving gate.
+    let catalog_guards = if catalog_lane {
+        match lane_lock.try_lock_owned().ok().and_then(|guard| {
+            lane_serving_gate(&state.runtime, &params.model_id)
+                .try_write_owned()
+                .ok()
+                .map(|gate| (guard, gate))
+        }) {
+            Some(guards) => Some(guards),
+            None => {
                 return result_outcome(error_payload(
                     &state,
                     catalog_wire_error(
@@ -5897,9 +5925,9 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
                 ModelRuntimeState::Unloaded,
             );
         }
-        let invocation_guard = catalog_guard.take();
+        let invocation_guards = catalog_guards;
         let unload = tokio::task::spawn_blocking(move || {
-            let _invocation_guard = invocation_guard;
+            let _invocation_guards = invocation_guards;
             unload_embedding_model_blocking(loaded)
         })
         .await
@@ -6665,6 +6693,19 @@ fn ane_residency_error_to_wire(
             error.to_string(),
         );
     }
+    if let AneResidencyError::PermitUnavailable(message) = &error {
+        return WireOperationError::from_stable(StableError::queue_full(Some(100)), message);
+    }
+    if let AneResidencyError::ShapeCompiling { shape } = &error {
+        return WireOperationError {
+            code: worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING.to_owned(),
+            class: ErrorClass::Transient,
+            retry_after_ms: Some(worker_host::ane_residency::ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
+            safe_to_retry_same_request: true,
+            message: error.to_string(),
+            details: Some(json!({ "shape": shape })),
+        };
+    }
     let engine_error = error.to_engine_error(EngineErrorStage::Inference);
     let safe_to_retry = engine_error.safe_to_retry_same_request;
     let mut wire = engine_error_to_wire(engine_error);
@@ -6682,6 +6723,25 @@ fn ane_residency_error_to_wire(
     }
     if matches!(error, AneResidencyError::ResourcesExhausted { .. }) {
         wire.safe_to_retry_same_request = true;
+    }
+    wire
+}
+
+/// Maps a direct Neural Engine serving error to the wire. For
+/// `shape_compiling` it also adds the lane id to `details` and names the lane
+/// and the compiling shape in the message.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn ane_lane_error_to_wire(
+    error: worker_host::ane_residency::AneResidencyError,
+    lane: &str,
+) -> WireOperationError {
+    let mut wire = ane_residency_error_to_wire(error);
+    if wire.code == worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING {
+        if let Some(Value::Object(details)) = wire.details.as_mut() {
+            details.insert("lane_id".into(), json!(lane));
+            let shape = details.get("shape").cloned().unwrap_or(Value::Null);
+            wire.message = format!("lane '{lane}' is compiling Neural Engine shape {shape}");
+        }
     }
     wire
 }
@@ -8082,6 +8142,19 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    // The request's absolute deadline, for profile certification: the budget
+    // (the inline default when none was given) less the time resolution took.
+    // Everything after this point, including tokenization and admission,
+    // counts against it.
+    let certify_deadline = Some(
+        tokio::time::Instant::now()
+            + Duration::from_millis(
+                params
+                    .deadline_ms
+                    .unwrap_or(state.runtime.inline.deadline_ms),
+            )
+            .saturating_sub(resolution_started.elapsed()),
+    );
     if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
         let budget = params
             .deadline_ms
@@ -8149,7 +8222,9 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
+    {
         return failed_admitted_outcome(&state, &model, &job_id, started, error);
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -8472,6 +8547,19 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
+    // The request's absolute deadline, for profile certification: the budget
+    // (the inline default when none was given) less the time resolution took.
+    // Everything after this point, including tokenization and admission,
+    // counts against it.
+    let certify_deadline = Some(
+        tokio::time::Instant::now()
+            + Duration::from_millis(
+                params
+                    .deadline_ms
+                    .unwrap_or(state.runtime.inline.deadline_ms),
+            )
+            .saturating_sub(resolution_started.elapsed()),
+    );
     if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
         let budget = params
             .deadline_ms
@@ -8527,7 +8615,9 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         return result_outcome(error_payload(&state, error));
     }
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
+    {
         return result_outcome(error_payload(&state, error));
     }
     apply_owned_tokenizer_policy(&model, &mut tokenized);
@@ -9120,6 +9210,19 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         ));
     }
+    // The request's absolute deadline, for profile certification: the budget
+    // (the inline default when none was given) less the time resolution took.
+    // Everything after this point, including tokenization and admission,
+    // counts against it.
+    let certify_deadline = Some(
+        tokio::time::Instant::now()
+            + Duration::from_millis(
+                params
+                    .deadline_ms
+                    .unwrap_or(state.runtime.inline.deadline_ms),
+            )
+            .saturating_sub(resolution_started.elapsed()),
+    );
     if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
         let budget = params
             .deadline_ms
@@ -9150,7 +9253,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(pairs) => pairs,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    if let Err(error) = ensure_profile_request_certified(state.clone(), &model).await {
+    if let Err(error) =
+        ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
+    {
         return result_outcome(error_payload(&state, error));
     }
     let mut texts = Vec::with_capacity(params.candidates.len() + 1);
@@ -12237,21 +12342,60 @@ async fn acquire_execution_permit(
     runtime: &RuntimeState,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<InlineExecutionPermit, WireOperationError> {
-    if let Ok(mut stats) = runtime.execution_stats.lock() {
+    acquire_execution_permit_from(
+        runtime.execution.clone(),
+        Arc::clone(&runtime.execution_stats),
+        deadline,
+    )
+    .await
+}
+
+/// Hands a direct-ANE serving task the module's execution permits, which it
+/// takes per inference exchange once it holds the worker stream (see
+/// `lane_serving_gate` for the lock order).
+#[cfg(unix)]
+fn direct_ane_permit_source(runtime: &RuntimeState) -> worker_host::ane_residency::PermitSource {
+    use worker_host::ane_residency::{AneResidencyError, ExchangePermit};
+    let execution = runtime.execution.clone();
+    let stats = Arc::clone(&runtime.execution_stats);
+    Arc::new(move |deadline| {
+        let execution = execution.clone();
+        let stats = Arc::clone(&stats);
+        Box::pin(async move {
+            acquire_execution_permit_from(execution, stats, deadline)
+                .await
+                .map(|permit| Box::new(permit) as ExchangePermit)
+                .map_err(|error| {
+                    if error.code == "deadline_exceeded" {
+                        AneResidencyError::DeadlineExceeded
+                    } else {
+                        AneResidencyError::PermitUnavailable(error.message)
+                    }
+                })
+        })
+    })
+}
+
+async fn acquire_execution_permit_from(
+    execution: Arc<Semaphore>,
+    execution_stats: Arc<Mutex<InlineExecutionStats>>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<InlineExecutionPermit, WireOperationError> {
+    if let Ok(mut stats) = execution_stats.lock() {
         stats.waiters = stats.waiters.saturating_add(1);
     }
     let started = Instant::now();
     let permit_result = match deadline {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::time::timeout(remaining, runtime.execution.clone().acquire_owned()).await
+            tokio::time::timeout(remaining, execution.acquire_owned()).await
         }
-        None => Ok(runtime.execution.clone().acquire_owned().await),
+        None => Ok(execution.acquire_owned().await),
     };
     let wait_ms = started.elapsed().as_secs_f64() * 1_000.0;
     match permit_result {
         Ok(Ok(permit)) => {
-            let mut stats = runtime.execution_stats.lock().map_err(|_| {
+            let mut stats = execution_stats.lock().map_err(|_| {
                 WireOperationError::from_stable(
                     StableError::queue_full(Some(100)),
                     "inline execution statistics are unavailable",
@@ -12265,11 +12409,11 @@ async fn acquire_execution_permit(
             stats.wait_samples_ms.push_back(wait_ms);
             Ok(InlineExecutionPermit {
                 _permit: permit,
-                stats: Arc::clone(&runtime.execution_stats),
+                stats: Arc::clone(&execution_stats),
             })
         }
         Err(_) => {
-            if let Ok(mut stats) = runtime.execution_stats.lock() {
+            if let Ok(mut stats) = execution_stats.lock() {
                 stats.waiters = stats.waiters.saturating_sub(1);
             }
             Err(WireOperationError::from_stable(
@@ -12278,7 +12422,7 @@ async fn acquire_execution_permit(
             ))
         }
         Ok(Err(_)) => {
-            if let Ok(mut stats) = runtime.execution_stats.lock() {
+            if let Ok(mut stats) = execution_stats.lock() {
                 stats.waiters = stats.waiters.saturating_sub(1);
             }
             Err(WireOperationError::from_stable(
@@ -12311,13 +12455,71 @@ async fn execute_embedding(
     execute_embedding_with_catalog_guard(runtime, model, batch, deadline, job_id, None).await
 }
 
+fn is_direct_ane(model: &EmbeddingModel) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(model.backend, EmbedBackend::DirectAne(_))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = model;
+        false
+    }
+}
+
+/// Takes a catalog lane's serving-gate guard (or reuses a self-check's held
+/// one) and, for engines that serve one call at a time, the lane execution
+/// lock. Both come before the execution permit; see `lane_serving_gate`.
+async fn lane_execution_guards(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    catalog_lane: bool,
+    held_guard: Option<HeldLaneGate>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<
+    (
+        Option<LaneServingGuard>,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ),
+    WireOperationError,
+> {
+    let serving = match held_guard {
+        Some(held) => Some(LaneServingGuard::Exclusive(held)),
+        None if catalog_lane => {
+            Some(acquire_lane_serving(runtime, &model.model_id, deadline).await?)
+        }
+        None => None,
+    };
+    let execution = if catalog_lane && !is_direct_ane(model) {
+        Some(acquire_lane_execution(runtime, &model.model_id, deadline).await?)
+    } else {
+        None
+    };
+    Ok((serving, execution))
+}
+
+/// Direct-ANE takes its permit per inference exchange, after the worker
+/// stream, so a request waiting behind a shape compile holds none. Every
+/// other engine takes it here, before the engine call.
+async fn upfront_execution_permit(
+    runtime: &RuntimeState,
+    model: &EmbeddingModel,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Option<InlineExecutionPermit>, WireOperationError> {
+    if is_direct_ane(model) {
+        Ok(None)
+    } else {
+        acquire_execution_permit(runtime, deadline).await.map(Some)
+    }
+}
+
 async fn execute_embedding_with_catalog_guard(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
     batch: TokenBatch,
     deadline: Option<tokio::time::Instant>,
     job_id: Option<&str>,
-    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    held_guard: Option<HeldLaneGate>,
 ) -> Result<Vectors, WireOperationError> {
     let profile = embedding_profile_enabled();
     let tokens = batch
@@ -12328,25 +12530,12 @@ async fn execute_embedding_with_catalog_guard(
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let lane_started = Instant::now();
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    let catalog_guard = if held_guard.is_some() {
-        held_guard
-    } else if catalog_lane {
-        Some(Arc::new(
-            catalog_lane_lock(runtime, &model.model_id)
-                .lock_owned()
-                .await,
-        ))
-    } else {
-        None
-    };
+    let (catalog_guard, lane_execution) =
+        lane_execution_guards(runtime, model, catalog_lane, held_guard, deadline).await?;
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     ane_lane_timing("execution_lane_wait", &model.model_id, job_id, lane_started);
-    // Take the lane lock before an execution permit, in every execute_* path.
-    // A profile self-check holds the lane lock while it executes; if callers
-    // took a permit first, requests queued on that lane could hold every
-    // permit while waiting for the lock, and the self-check could never run.
     let permit_started = Instant::now();
-    let permit = acquire_execution_permit(runtime, deadline).await?;
+    let permit = upfront_execution_permit(runtime, model, deadline).await?;
     ane_lane_timing(
         "execution_permit_wait",
         &model.model_id,
@@ -12363,6 +12552,7 @@ async fn execute_embedding_with_catalog_guard(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 // The test engine's own compute, so profiles can separate it
                 // from the module's dispatch overhead around each engine call.
                 let compute_started = Instant::now();
@@ -12395,6 +12585,7 @@ async fn execute_embedding_with_catalog_guard(
                 }
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
@@ -12440,12 +12631,14 @@ async fn execute_embedding_with_catalog_guard(
                 catalog_engine_fault(id, "serve").map_err(engine_error_to_wire)?;
             }
             let roundtrip_started = Instant::now();
+            let _ = (permit, lane_execution);
             let result = engine
-                .infer_guarded(
+                .infer_permitted(
                     batch.items,
                     false,
                     deadline,
-                    (permit, catalog_guard, _activity),
+                    (catalog_guard, _activity),
+                    Some(direct_ane_permit_source(runtime)),
                 )
                 .await;
             ane_lane_timing(
@@ -12454,7 +12647,7 @@ async fn execute_embedding_with_catalog_guard(
                 job_id,
                 roundtrip_started,
             );
-            result.map_err(ane_residency_error_to_wire)
+            result.map_err(|error| ane_lane_error_to_wire(error, &model.model_id))
         }
         EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -12477,6 +12670,7 @@ async fn execute_embedding_with_catalog_guard(
                 }
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
@@ -12543,7 +12737,7 @@ async fn execute_rerank_with_catalog_guard(
     owned_pairs: Option<Vec<Vec<u32>>>,
     deadline: Option<tokio::time::Instant>,
     job_id: Option<&str>,
-    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    held_guard: Option<HeldLaneGate>,
 ) -> Result<synapse_core::RerankScores, WireOperationError> {
     let tokens = request
         .candidates
@@ -12552,24 +12746,16 @@ async fn execute_rerank_with_catalog_guard(
         .sum();
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    let catalog_guard = if held_guard.is_some() {
-        held_guard
-    } else if catalog_lane {
-        Some(Arc::new(
-            catalog_lane_lock(runtime, &model.model_id)
-                .lock_owned()
-                .await,
-        ))
-    } else {
-        None
-    };
+    let (catalog_guard, lane_execution) =
+        lane_execution_guards(runtime, model, catalog_lane, held_guard, deadline).await?;
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
-    let permit = acquire_execution_permit(runtime, deadline).await?;
+    let permit = upfront_execution_permit(runtime, model, deadline).await?;
     let result = match &model.backend {
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(engine) => {
             let _permit = permit;
             let _catalog_guard = catalog_guard;
+            let _lane_execution = lane_execution;
             synapse_core::RerankEngine::rerank(&**engine, &model.loaded_model, request)
                 .map_err(engine_error_to_wire)
         }
@@ -12581,10 +12767,17 @@ async fn execute_rerank_with_catalog_guard(
             let pairs = owned_pairs.ok_or_else(|| {
                 artifact_invalid_error("direct-ANE rerank requires composed pairs")
             })?;
+            let _ = (permit, lane_execution);
             let values = engine
-                .infer_guarded(pairs, true, deadline, (permit, catalog_guard, _activity))
+                .infer_permitted(
+                    pairs,
+                    true,
+                    deadline,
+                    (catalog_guard, _activity),
+                    Some(direct_ane_permit_source(runtime)),
+                )
                 .await
-                .map_err(ane_residency_error_to_wire)?;
+                .map_err(|error| ane_lane_error_to_wire(error, &model.model_id))?;
             Ok(synapse_core::RerankScores {
                 scores: values.into_iter().map(|v| v[0]).collect(),
             })
@@ -12608,6 +12801,7 @@ async fn execute_rerank_with_catalog_guard(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 if let Some(id) = fault_lane.as_deref() {
                     catalog_engine_fault(id, "serve")?;
                 }
@@ -12636,6 +12830,7 @@ async fn execute_rerank_with_catalog_guard(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 if let Some(id) = fault_lane.as_deref() {
                     catalog_engine_fault(id, "serve")?;
                 }
@@ -12800,16 +12995,10 @@ async fn execute_generate(
 ) -> Result<GenerateOutput, WireOperationError> {
     let _activity = runtime.activity_telemetry.begin(&model.model_id);
     let catalog_lane = resolved_catalog_lane(runtime, &model.model_id).is_some();
-    // Lane lock before permit, the same order as execute_embedding.
-    let catalog_guard = if catalog_lane {
-        Some(
-            catalog_lane_lock(runtime, &model.model_id)
-                .lock_owned()
-                .await,
-        )
-    } else {
-        None
-    };
+    // Serving-gate read guard, then the lane execution lock, then the
+    // execution permit (see `lane_serving_gate`).
+    let (catalog_guard, lane_execution) =
+        lane_execution_guards(runtime, model, catalog_lane, None, deadline).await?;
     let fault_lane = catalog_lane.then(|| model.model_id.clone());
     let permit = acquire_execution_permit(runtime, deadline).await?;
     let result = match &model.backend {
@@ -12835,6 +13024,7 @@ async fn execute_generate(
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
+                let _lane_execution = lane_execution;
                 if let Some(id) = fault_lane.as_deref() {
                     catalog_engine_fault(id, "serve")?;
                 }
@@ -12975,9 +13165,10 @@ fn ensure_pre_tokenization_certified(
 async fn ensure_profile_request_certified(
     state: Arc<ModuleState>,
     model: &EmbeddingModel,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), WireOperationError> {
     if model.engine_identity.build_flags.contains_key("profile") {
-        ensure_profile_preload_ready(state.clone(), &model.model_id, None).await?;
+        ensure_profile_preload_ready(state.clone(), &model.model_id, deadline).await?;
         ensure_model_certified(
             &state,
             model,
@@ -17199,8 +17390,8 @@ mod tests {
         let runtime =
             Arc::new(RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap());
         let guard = Arc::new(
-            catalog_lane_lock(&runtime, &model.model_id)
-                .lock_owned()
+            lane_serving_gate(&runtime, &model.model_id)
+                .write_owned()
                 .await,
         );
         let task = tokio::spawn({
@@ -17234,7 +17425,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
         assert!(
             dispatched.is_ok(),
-            "self-check must not reacquire its own catalog lane lock"
+            "self-check must not reacquire its own serving-gate guard"
         );
     }
     #[tokio::test]
@@ -17338,7 +17529,9 @@ mod tests {
     #[cfg(unix)]
     async fn assert_direct_ane_absolute_deadline(cold: bool) {
         let (root, _) = test_storage_descriptor("ane-deadline");
-        let spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+        let mut spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+        // A catalog lane id, so execution also takes the lane's serving gate.
+        spec.model_id = "gte-modernbert-base-ane".into();
         let mut model = catalog_test_model(&root, &spec);
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -17393,6 +17586,9 @@ mod tests {
         tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
         let finished_before_reply = task.is_finished();
         let in_flight = runtime.execution_stats.lock().unwrap().in_flight;
+        let gate_held = lane_serving_gate(&runtime, &model.model_id)
+            .try_write()
+            .is_err();
         release.notify_one();
         let result = task.await.unwrap();
         tokio::task::spawn_blocking({
@@ -17402,14 +17598,33 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(result.unwrap_err().code, "deadline_exceeded");
+        // A deadline that expires during the request's own first-time compile
+        // is reported as shape_compiling; one that expires during ordinary
+        // inference stays deadline_exceeded.
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code,
+            if cold {
+                "shape_compiling"
+            } else {
+                "deadline_exceeded"
+            },
+            "{error:?}"
+        );
         assert!(
             finished_before_reply,
             "caller deadline must bound the result wait"
         );
+        assert!(
+            gate_held,
+            "expired work must retain its serving-gate guard while its reply drains"
+        );
+        // An execution permit is held only around the inference exchange,
+        // so a compile (cold) holds none and an inference (warm) holds one.
         assert_eq!(
-            in_flight, 1,
-            "expired work must retain guards while its reply drains"
+            in_flight,
+            if cold { 0 } else { 1 },
+            "expired work must retain its permit while an inference reply drains"
         );
         assert_eq!(engine.serving.supervisor.stats().restarts, 0);
         assert_eq!(
@@ -17431,6 +17646,889 @@ mod tests {
     #[cfg(unix)]
     async fn direct_ane_cold_admission_after_absolute_deadline_is_drained_without_inference() {
         assert_direct_ane_absolute_deadline(true).await;
+    }
+
+    #[cfg(unix)]
+    const ANE_TEST_LANE: &str = "gte-modernbert-base-ane";
+
+    #[cfg(unix)]
+    struct AneLaneFixture {
+        root: PathBuf,
+        state: Arc<ModuleState>,
+        engine: Arc<worker_host::ane_residency::DirectAneEngine>,
+        control: worker_host::ane_residency::ModuleMockControl,
+    }
+
+    /// A loaded direct-ANE catalog lane served by the mock worker, optionally
+    /// with its numerical self-check already recorded as passed.
+    #[cfg(unix)]
+    async fn ane_lane_fixture(label: &str, self_check_passed: bool) -> AneLaneFixture {
+        let (root, descriptor) = test_storage_descriptor(label);
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile(&format!("{label}-os"));
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store, profile);
+        let mut spec = catalog_fixture_config("gte-modernbert-base.ane-direct-worker");
+        spec.model_id = ANE_TEST_LANE.into();
+        let mut model = catalog_test_model(&root, &spec);
+        let (engine, control) =
+            tokio::task::spawn_blocking(worker_host::ane_residency::module_mock_engine_controlled)
+                .await
+                .unwrap();
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+        if self_check_passed {
+            let (entry, backend) = resolved_catalog_lane(&state.runtime, ANE_TEST_LANE).unwrap();
+            let (id, key) = catalog_self_check_key(&state, entry, backend).unwrap();
+            let generation = catalog_check_generation(&state, &id, &key).unwrap();
+            assert!(catalog_complete_check(&state, &id, generation, "passed", None).unwrap());
+        }
+        state.runtime.catalog.lock().unwrap().insert(
+            ANE_TEST_LANE.into(),
+            ModelSlot {
+                spec,
+                loaded: Some(model),
+                state: ModelRuntimeState::Ready,
+                notify: Arc::new(Notify::new()),
+                last_cold_load_ms: None,
+            },
+        );
+        AneLaneFixture {
+            root,
+            state,
+            engine,
+            control,
+        }
+    }
+
+    #[cfg(unix)]
+    fn ane_lane_model(state: &ModuleState) -> Arc<EmbeddingModel> {
+        model_slot_snapshot(&state.runtime, ANE_TEST_LANE)
+            .and_then(|slot| slot.loaded)
+            .expect("loaded test lane")
+    }
+
+    #[cfg(unix)]
+    async fn embed_on_ane_lane(
+        state: &ModuleState,
+        tokens: usize,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vectors, WireOperationError> {
+        execute_embedding(
+            &state.runtime,
+            &ane_lane_model(state),
+            TokenBatch {
+                items: vec![vec![1; tokens]],
+            },
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn finish_ane_lane_fixture(fixture: AneLaneFixture) {
+        let AneLaneFixture {
+            root,
+            state,
+            engine,
+            control,
+        } = fixture;
+        drop((state, control));
+        let _ = tokio::task::spawn_blocking(move || engine.unload()).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// What a short request does before it executes: the resolver's wait for
+    /// the lane lock, then profile certification, both with a 6 s budget.
+    #[cfg(unix)]
+    async fn resolve_and_certify_ane_lane(
+        state: &Arc<ModuleState>,
+    ) -> Result<(), WireOperationError> {
+        let (guard, _) = catalog_resolution_guard(&state.runtime, ANE_TEST_LANE, 6000).await?;
+        drop(guard);
+        ensure_profile_preload_ready(
+            state.clone(),
+            ANE_TEST_LANE,
+            Some(tokio::time::Instant::now() + Duration::from_secs(6)),
+        )
+        .await
+        .map(drop)
+    }
+
+    #[cfg(unix)]
+    fn ane_gate() -> (Arc<Notify>, Arc<Notify>) {
+        (Arc::new(Notify::new()), Arc::new(Notify::new()))
+    }
+
+    /// Whether a self-check (or unload) holds or is queued for the lane's
+    /// serving gate: once a writer is queued, new readers cannot enter.
+    #[cfg(unix)]
+    fn ane_lane_writer_waiting(state: &ModuleState) -> bool {
+        lane_serving_gate(&state.runtime, ANE_TEST_LANE)
+            .try_read()
+            .is_err()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn resident_shape_request_is_not_refused_as_model_loading_while_another_shape_compiles() {
+        let fixture = ane_lane_fixture("ane-compile-resident", true).await;
+        let state = fixture.state.clone();
+        embed_on_ane_lane(&state, 1, None).await.unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let compile = tokio::spawn({
+            let state = state.clone();
+            async move { embed_on_ane_lane(&state, 600, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let resolved = resolve_and_certify_ane_lane(&state).await;
+        let short = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                embed_on_ane_lane(&state, 1, Some(deadline)).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let answered_during_compile = short.is_finished();
+        release.notify_one();
+        let short = short.await.unwrap();
+        let compiled = compile.await.unwrap();
+        let restarts = fixture.engine.serving.supervisor.stats().restarts;
+        let compiles = fixture.control.compiles(1024);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            resolved.is_ok(),
+            "a loaded lane must resolve while a shape compiles: {resolved:?}"
+        );
+        assert!(
+            !answered_during_compile,
+            "the worker is serial: the short request runs after the compile"
+        );
+        assert!(short.is_ok(), "{short:?}");
+        assert!(compiled.is_ok(), "{compiled:?}");
+        assert_eq!(restarts, 0);
+        assert_eq!(compiles, 1);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn concurrent_requests_for_one_uncompiled_shape_compile_once_and_waiters_keep_their_deadline(
+    ) {
+        let fixture = ane_lane_fixture("ane-single-flight", true).await;
+        let state = fixture.state.clone();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move { embed_on_ane_lane(&state, 600, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+                embed_on_ane_lane(&state, 600, Some(deadline)).await
+            }
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        release.notify_one();
+        let first = first.await.unwrap();
+        let later = embed_on_ane_lane(
+            &state,
+            600,
+            Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+        )
+        .await;
+        let compiles = fixture.control.compiles(1024);
+        finish_ane_lane_fixture(fixture).await;
+        let error = match waited {
+            Ok(Ok(Err(error))) => error,
+            other => panic!("the waiter must answer at its own deadline: {other:?}"),
+        };
+        assert_eq!(error.code, "shape_compiling", "{error:?}");
+        assert_eq!(error.class, ErrorClass::Transient);
+        assert_eq!(error.retry_after_ms, Some(1000));
+        assert!(error.safe_to_retry_same_request);
+        assert_eq!(
+            error.details,
+            Some(json!({"lane_id": ANE_TEST_LANE, "shape": 1024}))
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert!(later.is_ok(), "{later:?}");
+        assert_eq!(
+            compiles, 1,
+            "one compile serves every request for the shape"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancelled_compile_neither_restarts_the_worker_nor_leaks_budget() {
+        let fixture = ane_lane_fixture("ane-cancel-compile", true).await;
+        let state = fixture.state.clone();
+        embed_on_ane_lane(&state, 1, None).await.unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let compile = tokio::spawn({
+            let state = state.clone();
+            async move { embed_on_ane_lane(&state, 600, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        compile.abort();
+        assert!(compile.await.unwrap_err().is_cancelled());
+        let resolved = resolve_and_certify_ane_lane(&state).await;
+        let short = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                embed_on_ane_lane(&state, 1, Some(deadline)).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_one();
+        let short = short.await.unwrap();
+        let supervisor = fixture.engine.serving.supervisor.clone();
+        // The abandoned compile finishes in its detached task; wait for it to
+        // release everything it held.
+        let gate = lane_serving_gate(&state.runtime, ANE_TEST_LANE);
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.reservation_snapshot().1 != 0 || gate.try_write().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let reservation = supervisor.reservation_snapshot();
+        let resident = supervisor.resident_shapes();
+        let restarts = supervisor.stats().restarts;
+        let compiles = fixture.control.compiles(1024);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            resolved.is_ok(),
+            "a loaded lane must resolve while a cancelled compile drains: {resolved:?}"
+        );
+        assert!(short.is_ok(), "{short:?}");
+        assert!(drained.is_ok(), "the cancelled compile never drained");
+        assert_eq!(restarts, 0);
+        assert_eq!(compiles, 1);
+        assert_eq!(
+            resident.values().flatten().copied().collect::<Vec<_>>(),
+            vec![128, 1024]
+        );
+        // The budget holds exactly the two resident shapes (22 layer programs
+        // each for this model) and no request still holds a lease on either.
+        assert_eq!(reservation, (44, 0));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unload_and_self_check_never_overlap_an_in_flight_inference() {
+        let fixture = ane_lane_fixture("ane-unload-in-flight", false).await;
+        let state = fixture.state.clone();
+        embed_on_ane_lane(&state, 1, None).await.unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_inference(started.clone(), release.clone());
+        let in_flight = tokio::spawn({
+            let state = state.clone();
+            async move { embed_on_ane_lane(&state, 1, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        // Cancel the caller: only the detached task still holds the inference.
+        in_flight.abort();
+        assert!(in_flight.await.unwrap_err().is_cancelled());
+        let refused = response_result(
+            model_unload(state.clone(), json!({"model_id": ANE_TEST_LANE})).await,
+            "model.unload",
+        );
+        if refused["error"]["code"] != "model_in_use" {
+            release.notify_one();
+            finish_ane_lane_fixture(fixture).await;
+            panic!("unload must refuse while an inference reply drains: {refused}");
+        }
+        let check = tokio::spawn({
+            let state = state.clone();
+            async move {
+                ensure_profile_preload_ready(state, ANE_TEST_LANE, None)
+                    .await
+                    .map(drop)
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ane_lane_writer_waiting(&state) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the self-check never queued for the lane");
+        // The self-check is waiting for the in-flight reply; a request that
+        // passed certification earlier must wait behind it, not reach the
+        // worker alongside the check.
+        let exchanges_before = fixture.engine.serving.channel.request_count();
+        let behind_check = tokio::time::timeout(
+            Duration::from_secs(2),
+            embed_on_ane_lane(
+                &state,
+                1,
+                Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+            ),
+        )
+        .await;
+        let exchanges_during_check =
+            fixture.engine.serving.channel.request_count() - exchanges_before;
+        release.notify_one();
+        let checked = tokio::time::timeout(Duration::from_secs(10), check).await;
+        let unloaded = response_result(
+            model_unload(state.clone(), json!({"model_id": ANE_TEST_LANE})).await,
+            "model.unload",
+        );
+        finish_ane_lane_fixture(fixture).await;
+        match behind_check {
+            Ok(Err(error)) => assert_eq!(error.code, "deadline_exceeded", "{error:?}"),
+            other => panic!("a request during the self-check must wait at its deadline: {other:?}"),
+        }
+        assert_eq!(
+            exchanges_during_check, 0,
+            "a request reached the worker while the self-check held the lane"
+        );
+        assert!(
+            matches!(checked, Ok(Ok(_))),
+            "the self-check never ran: {checked:?}"
+        );
+        assert!(unloaded.get("error").is_none(), "{unloaded}");
+    }
+
+    /// The request that finds the self-check pending starts it, but the check
+    /// is lane lifecycle work: it keeps running after that request's deadline
+    /// and lets later requests serve once it has passed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_request_that_starts_a_self_check_answers_model_loading_at_its_deadline() {
+        let fixture = ane_lane_fixture("ane-check-starter", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        // The self-check's first reference input pads to the 128-token shape,
+        // which the mock worker must compile first; hold that compile open.
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let model = ane_lane_model(&state);
+        let began = Instant::now();
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            ensure_profile_request_certified(
+                state.clone(),
+                &model,
+                Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            ),
+        )
+        .await;
+        let waited = began.elapsed();
+        let compile_reached =
+            tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+        let check_running = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_err();
+        release.notify_one();
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            while catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+                .try_lock()
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let later = tokio::time::Instant::now() + Duration::from_secs(5);
+        let second = ensure_profile_request_certified(state.clone(), &model, Some(later)).await;
+        let served = embed_on_ane_lane(&state, 1, Some(later)).await;
+        drop(model);
+        finish_ane_lane_fixture(fixture).await;
+        match first {
+            Ok(Err(error)) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            other => panic!("the starting request must answer at its deadline: {other:?}"),
+        }
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+        assert!(
+            compile_reached.is_ok(),
+            "the check never ran its reference case"
+        );
+        assert!(check_running, "the check stopped with its starting request");
+        assert!(finished.is_ok(), "the check never completed");
+        assert!(second.is_ok(), "{second:?}");
+        assert!(served.is_ok(), "{served:?}");
+    }
+
+    #[cfg(unix)]
+    async fn until_lane_check_settles(state: &ModuleState) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !state.runtime.lane_checks.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the lane's self-check never finished");
+    }
+
+    /// Many short requests arrive while a self-check runs. They share the one
+    /// check instead of each queueing their own task on the lane lock, so once
+    /// the check passes nothing is left to run: the next request serves at
+    /// once and unload is not refused.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn concurrent_requests_during_a_self_check_share_it_and_leave_no_backlog() {
+        let fixture = ane_lane_fixture("ane-check-single-flight", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let requests = (0..10)
+            .map(|_| {
+                let state = state.clone();
+                let model = ane_lane_model(&state);
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                    ensure_profile_request_certified(state, &model, Some(deadline)).await
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(request.await.unwrap());
+        }
+        let compile_reached =
+            tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+        let tasks_during_check = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        release.notify_one();
+        until_lane_check_settles(&state).await;
+        let began = Instant::now();
+        let next = {
+            let model = ane_lane_model(&state);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            ensure_profile_request_certified(state.clone(), &model, Some(deadline)).await
+        };
+        let certified_in = began.elapsed();
+        let served = embed_on_ane_lane(
+            &state,
+            1,
+            Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .await;
+        let tasks_after = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let unloaded = response_result(
+            model_unload(state.clone(), json!({"model_id": ANE_TEST_LANE})).await,
+            "model.unload",
+        );
+        finish_ane_lane_fixture(fixture).await;
+        for answer in &answers {
+            match answer {
+                Err(error) => assert_eq!(error.code, "model_loading", "{error:?}"),
+                Ok(()) => panic!("a request certified while the check was held"),
+            }
+        }
+        assert!(compile_reached.is_ok(), "the check never ran");
+        assert_eq!(tasks_during_check, 1, "one check task per lane");
+        assert!(next.is_ok(), "{next:?}");
+        assert!(certified_in < Duration::from_millis(50), "{certified_in:?}");
+        assert!(served.is_ok(), "{served:?}");
+        assert_eq!(tasks_after, 1, "a passed check is served without a task");
+        assert!(unloaded.get("error").is_none(), "{unloaded}");
+    }
+
+    /// The joined check finishes after the caller's deadline while the caller
+    /// is not running; when it resumes, both the outcome and its timer are
+    /// ready. The request is still expired.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_self_check_finishing_after_the_deadline_still_answers_model_loading() {
+        let fixture = ane_lane_fixture("ane-check-late-join", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(started.clone(), release.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let certify = ensure_profile_preload_ready(state.clone(), ANE_TEST_LANE, Some(deadline));
+        tokio::pin!(certify);
+        // One poll starts the check and subscribes to it.
+        assert!(tokio::time::timeout(Duration::ZERO, &mut certify)
+            .await
+            .is_err());
+        let mut outcome = state
+            .runtime
+            .lane_checks
+            .lock()
+            .unwrap()
+            .get(ANE_TEST_LANE)
+            .cloned()
+            .expect("a check is in flight");
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+        release.notify_one();
+        let published =
+            tokio::time::timeout(Duration::from_secs(10), outcome.wait_for(Option::is_some))
+                .await
+                .map(|outcome| outcome.map(|outcome| outcome.clone().unwrap().is_ok()));
+        let answered = certify.await.map(drop);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            matches!(published, Ok(Ok(true))),
+            "the check must pass: {published:?}"
+        );
+        match answered {
+            Err(error) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            Ok(()) => panic!("a check finished after the deadline answered success"),
+        }
+    }
+
+    /// A profile model that is not a catalog lane, requested without a
+    /// deadline, still waits on its self-check only until the request's
+    /// default inline deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_catalog_profile_request_waits_on_certification_only_until_its_deadline() {
+        let (dir, descriptor) = test_storage_descriptor("profile-certify-deadline");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("profile-certify-deadline-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let mut config = ModuleConfig::default();
+        config.inline.deadline_ms = 300;
+        let state = test_module_state_with_config(store, profile, config);
+        let mut spec = catalog_fixture_config("gte-modernbert-base.owned-vulkan");
+        spec.model_id = "profile-certify-deadline".into();
+        let model = catalog_test_model(&dir, &spec);
+        state.runtime.catalog.lock().unwrap().insert(
+            spec.model_id.clone(),
+            ModelSlot {
+                spec,
+                loaded: Some(model),
+                state: ModelRuntimeState::Ready,
+                notify: Arc::new(Notify::new()),
+                last_cold_load_ms: None,
+            },
+        );
+        // Stands in for a self-check holding the model's lifecycle lock.
+        let lifecycle = catalog_lane_lock(&state.runtime, "profile-certify-deadline")
+            .lock_owned()
+            .await;
+        let began = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            embed_query(
+                state.clone(),
+                json!({"model": "profile-certify-deadline", "text": "a"}),
+            ),
+        )
+        .await;
+        let elapsed = began.elapsed();
+        drop(lifecycle);
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+        let result = response_result(
+            outcome.expect("certification ignored the deadline"),
+            "embed.query",
+        );
+        assert_eq!(result["error"]["code"], "model_loading", "{result}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// A catalog batch job's loading task queues for the lane's lifecycle lock.
+    /// If the job's budget runs out first, the task leaves the queue instead
+    /// of loading the lane later, possibly after an operator unloaded it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_catalog_job_whose_budget_expired_leaves_the_lane_lock_queue() {
+        let fixture = ane_lane_fixture("ane-job-budget", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = resolved_catalog_lane(&state.runtime, ANE_TEST_LANE)
+            .map(|(entry, backend)| (entry.clone(), backend.clone()))
+            .unwrap();
+        // The operator unloaded the lane; a load or self-check holds the lock.
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Unloaded);
+        let lifecycle = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let job = tokio::spawn({
+            let state = state.clone();
+            async move {
+                ensure_catalog_lane_ready(state, entry, backend, Some(deadline))
+                    .await
+                    .map(drop)
+            }
+        });
+        let answered = tokio::time::timeout(Duration::from_secs(2), job).await;
+        drop(lifecycle);
+        let lock_free = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_ok();
+        finish_ane_lane_fixture(fixture).await;
+        match answered {
+            Ok(Ok(Err(error))) => assert_eq!(error.code, "deadline_exceeded", "{error:?}"),
+            other => panic!("the expired job must leave the queue: {other:?}"),
+        }
+        assert!(lock_free, "nothing may stay queued on the lane lock");
+    }
+
+    #[cfg(unix)]
+    fn ane_lane_entry(state: &ModuleState) -> (catalog::CatalogEntry, catalog::CatalogBackend) {
+        resolved_catalog_lane(&state.runtime, ANE_TEST_LANE)
+            .map(|(entry, backend)| (entry.clone(), backend.clone()))
+            .expect("test lane is a catalog lane")
+    }
+
+    /// An expired catalog job must not load the lane, whether the lane lock is
+    /// granted to it in the same poll as its expired timer or is simply free.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_expired_catalog_job_never_loads_the_lane_once_it_holds_the_lock() {
+        let fixture = ane_lane_fixture("ane-job-late-grant", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = ane_lane_entry(&state);
+        // The operator unloaded the lane and still holds its lifecycle lock.
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Unloaded);
+        let unload = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let job = ensure_catalog_lane_ready(
+            state.clone(),
+            entry.clone(),
+            backend.clone(),
+            Some(deadline),
+        );
+        tokio::pin!(job);
+        // One poll queues the job for the lane lock.
+        assert!(tokio::time::timeout(Duration::ZERO, &mut job)
+            .await
+            .is_err());
+        tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+        // Released after the deadline: the lock goes to the queued job.
+        drop(unload);
+        let granted = job.await.map(drop);
+        let after_grant = model_slot_snapshot(&state.runtime, ANE_TEST_LANE).unwrap();
+        // A job already out of budget that finds the lock free.
+        let expired_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let free = ensure_catalog_lane_ready(state.clone(), entry, backend, Some(expired_at))
+            .await
+            .map(drop);
+        let after_free = model_slot_snapshot(&state.runtime, ANE_TEST_LANE).unwrap();
+        let lock_free = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_ok();
+        finish_ane_lane_fixture(fixture).await;
+        for (case, answer) in [("late grant", &granted), ("free lock", &free)] {
+            match answer {
+                Err(error) => assert_eq!(error.code, "deadline_exceeded", "{case}: {error:?}"),
+                Ok(()) => panic!("{case}: an expired job readied the lane"),
+            }
+        }
+        for (case, slot) in [("late grant", &after_grant), ("free lock", &after_free)] {
+            assert!(
+                matches!(slot.state, ModelRuntimeState::Unloaded) && slot.loaded.is_none(),
+                "{case}: an expired job touched the unloaded lane: {:?}",
+                slot.state
+            );
+        }
+        assert!(lock_free);
+    }
+
+    /// An admitted catalog job that is already out of budget is still failed
+    /// with deadline_exceeded and removed from the catalog job registry.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_expired_catalog_job_is_failed_and_unregistered() {
+        let fixture = ane_lane_fixture("ane-job-finalize", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = ane_lane_entry(&state);
+        let params = json!({"request_key": "expired-catalog-job", "texts": ["a"]});
+        // Admitted long enough ago that its one-millisecond budget has run out.
+        let admission = state
+            .store
+            .admit_job(
+                "expired-catalog-job",
+                "sha256:expired-catalog-job",
+                "embed.batch",
+                state.module_generation,
+                None,
+                &params,
+                now_ms() - 10_000,
+                1,
+                60_000,
+            )
+            .unwrap();
+        let JobAdmission::Admitted(record) = admission else {
+            panic!("the job was not admitted")
+        };
+        state
+            .runtime
+            .catalog_jobs
+            .lock()
+            .unwrap()
+            .insert(record.job_id.clone(), entry.id.clone());
+        run_catalog_embed_job(
+            state.clone(),
+            record.clone(),
+            entry,
+            backend,
+            params,
+            "sha256:expired-catalog-job".into(),
+        )
+        .await;
+        let stored = state.store.get_job(&record.job_id).unwrap().unwrap();
+        let registered = state
+            .runtime
+            .catalog_jobs
+            .lock()
+            .unwrap()
+            .contains_key(&record.job_id);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(stored.is_terminal_failed(), "{}", stored.state);
+        assert_eq!(
+            stored
+                .error_json
+                .as_ref()
+                .map(|error| error["code"].clone()),
+            Some(json!("deadline_exceeded"))
+        );
+        assert!(!registered, "the expired job stayed registered");
+    }
+
+    /// A caller sees the check pending, then the check passes and leaves the
+    /// in-flight map before the caller joins. Joining must find the passed
+    /// check rather than start a second one.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_caller_that_joins_after_the_check_passed_does_not_start_another() {
+        let fixture = ane_lane_fixture("ane-check-stale-fast-path", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        let (compiling, finish_compile) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(compiling.clone(), finish_compile.clone());
+        let later = || Some(tokio::time::Instant::now() + Duration::from_secs(10));
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let model = ane_lane_model(&state);
+                ensure_profile_request_certified(state, &model, later()).await
+            }
+        });
+        // The check is running its first reference case.
+        tokio::time::timeout(Duration::from_secs(2), compiling.notified())
+            .await
+            .unwrap();
+        let (missed, join) = ane_gate();
+        *state.runtime.fast_path_gate.lock().unwrap() = Some((missed.clone(), join.clone()));
+        let second = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let model = ane_lane_model(&state);
+                ensure_profile_request_certified(state, &model, later()).await
+            }
+        });
+        // The second caller saw the check pending and is about to join it.
+        tokio::time::timeout(Duration::from_secs(2), missed.notified())
+            .await
+            .unwrap();
+        finish_compile.notify_one();
+        let first = first.await.unwrap();
+        until_lane_check_settles(&state).await;
+        join.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(2), second).await;
+        let tasks = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert!(matches!(second, Ok(Ok(Ok(())))), "{second:?}");
+        assert_eq!(tasks, 1, "a passed check was started again");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {
+        // A pending check, so the request must wait for the lane.
+        let fixture = ane_lane_fixture("ane-certify-deadline", false).await;
+        let state = fixture.state.clone();
+        // Holding the lane's lifecycle lock simulates a load or self-check in
+        // progress.
+        let lifecycle = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let started = Instant::now();
+        let waited = tokio::time::timeout(
+            Duration::from_secs(2),
+            ensure_profile_preload_ready(
+                state.clone(),
+                ANE_TEST_LANE,
+                Some(tokio::time::Instant::now() + Duration::from_millis(150)),
+            ),
+        )
+        .await
+        .map(|result| result.map(drop));
+        let elapsed = started.elapsed();
+        drop(lifecycle);
+        finish_ane_lane_fixture(fixture).await;
+        match waited {
+            Ok(Err(error)) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            other => panic!("certification must answer at the request deadline: {other:?}"),
+        }
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 
     #[tokio::test]
@@ -23631,6 +24729,94 @@ fn catalog_lane_lock(runtime: &RuntimeState, id: &str) -> Arc<tokio::sync::Mutex
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
+
+// A catalog lane uses three locks, always taken in this order:
+// 1. `catalog_lane_lock`: lane lifecycle (verify and load, numerical self-check,
+//    unload, failed-load acknowledgement). Serving inference never takes it, so
+//    request resolution waits on it only for real lifecycle work.
+// 2. `lane_serving_gate`: in-flight lifetime. Serving holds a read guard until
+//    the engine reply has drained (a cancelled caller's detached direct-ANE task
+//    keeps it). The self-check holds the write guard while it runs, and unload
+//    needs `try_write`, so neither overlaps an inference.
+// 3. `lane_execution_lock`: same-lane serialisation for engines that run one
+//    call at a time, taken before the execution permit so a queued request
+//    does not hold a permit. Direct-ANE lanes skip it: their worker stream
+//    serialises calls, and they take the permit after that stream.
+// No path takes the lane lock while it holds a serving-gate guard.
+fn lane_serving_gate(runtime: &RuntimeState, id: &str) -> Arc<tokio::sync::RwLock<()>> {
+    runtime
+        .serving_gates
+        .lock()
+        .expect("serving gate map")
+        .entry(id.into())
+        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+        .clone()
+}
+
+fn lane_execution_lock(runtime: &RuntimeState, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    runtime
+        .lane_execution_locks
+        .lock()
+        .expect("lane execution lock map")
+        .entry(id.into())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// The exclusive serving-gate guard a self-check holds. The check runs its
+/// reference inputs through the normal execution path, which reuses this guard
+/// instead of waiting for a shared one that the check itself blocks.
+type HeldLaneGate = Arc<tokio::sync::OwnedRwLockWriteGuard<()>>;
+
+/// What one catalog-lane execution holds on its lane's serving gate.
+#[allow(dead_code)] // Held only for its drop; never read.
+enum LaneServingGuard {
+    Shared(tokio::sync::OwnedRwLockReadGuard<()>),
+    Exclusive(HeldLaneGate),
+}
+
+async fn acquire_lane_serving(
+    runtime: &RuntimeState,
+    lane: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<LaneServingGuard, WireOperationError> {
+    let gate = lane_serving_gate(runtime, lane);
+    let guard = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, gate.read_owned())
+            .await
+            .map_err(|_| {
+                // Only a self-check or an unload holds the write guard. Inline
+                // requests meet a self-check earlier, in certification, and are
+                // answered model_loading there; admitted jobs must never fail
+                // with model_loading, so this wait reports the budget instead.
+                WireOperationError::from_stable(
+                    StableError::deadline_exceeded(),
+                    format!("deadline exceeded waiting for catalog lane '{lane}'"),
+                )
+            })?,
+        None => gate.read_owned().await,
+    };
+    Ok(LaneServingGuard::Shared(guard))
+}
+
+async fn acquire_lane_execution(
+    runtime: &RuntimeState,
+    lane: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, WireOperationError> {
+    let lock = lane_execution_lock(runtime, lane);
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::deadline_exceeded(),
+                    format!("deadline exceeded waiting for catalog lane '{lane}'"),
+                )
+            }),
+        None => Ok(lock.lock_owned().await),
+    }
+}
 fn download_publish_lock(runtime: &RuntimeState, id: &str) -> Arc<Mutex<()>> {
     runtime
         .download_locks
@@ -25255,7 +26441,7 @@ async fn numerical_profile_preload_check(
     model: &EmbeddingModel,
     profile: &str,
     references: synapse_certify::self_check::References,
-    held_guard: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    held_guard: Option<HeldLaneGate>,
 ) -> Result<synapse_parity::evaluator::SubsetEvaluation, WireOperationError> {
     use synapse_parity::evaluator::{ObservedCase, Output};
     let mut outputs = BTreeMap::new();
@@ -25357,12 +26543,164 @@ async fn numerical_profile_preload_check(
 async fn ensure_profile_preload_ready(
     state: Arc<ModuleState>,
     model_id: &str,
-    deadline_ms: Option<u64>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
-    let lock = catalog_lane_lock(&state.runtime, model_id);
-    let guard = Arc::new(lock.lock_owned().await);
-    let model = ensure_model_loaded_for_control(state.clone(), model_id, deadline_ms).await?;
-    check_profile_model(&state, model, guard).await
+    // Once the check has passed, serving takes no lane lock and starts nothing.
+    if let Some(model) = profile_check_passed(&state, model_id)? {
+        return Ok(model);
+    }
+    let loading = || {
+        WireOperationError::from_stable(
+            StableError::model_loading(Some(250)),
+            format!("catalog lane '{model_id}' is running its numerical self-check"),
+        )
+    };
+    #[cfg(test)]
+    {
+        let gate = state.runtime.fast_path_gate.lock().unwrap().take();
+        if let Some((reached, proceed)) = gate {
+            reached.notify_one();
+            proceed.notified().await;
+        }
+    }
+    let mut outcome = join_lane_check(&state, model_id);
+    let finished = async move {
+        outcome
+            .wait_for(Option::is_some)
+            .await
+            .map(|outcome| outcome.clone().expect("waited for an outcome"))
+    };
+    let joined = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, finished)
+            .await
+            .map_err(|_| loading())?,
+        None => finished.await,
+    };
+    // The check and the timer can both be ready in the same poll; a check that
+    // finished after the deadline still leaves this request expired.
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(loading());
+    }
+    joined.map_err(|_| {
+        WireOperationError::from_stable(
+            StableError::engine_crashed(Some(250)),
+            format!("catalog lane '{model_id}' self-check task ended without an outcome"),
+        )
+    })?
+}
+
+/// The loaded model when its numerical self-check has already passed.
+fn profile_check_passed(
+    state: &ModuleState,
+    model_id: &str,
+) -> Result<Option<Arc<EmbeddingModel>>, WireOperationError> {
+    let Some(model) = model_slot_snapshot(&state.runtime, model_id)
+        .filter(|slot| matches!(slot.state, ModelRuntimeState::Ready))
+        .and_then(|slot| slot.loaded)
+    else {
+        return Ok(None);
+    };
+    let (id, _) = profile_check_identity(state, &model)?;
+    Ok((profile_preload_check_status(state, &id)? == "passed").then_some(model))
+}
+
+type LaneCheckOutcome = Option<Result<Arc<EmbeddingModel>, WireOperationError>>;
+
+/// Removes a lane's in-flight check entry when its task ends, even by panic.
+struct LaneCheckEntry {
+    runtime: Arc<RuntimeState>,
+    lane: String,
+}
+
+impl Drop for LaneCheckEntry {
+    fn drop(&mut self) {
+        if let Ok(mut checks) = self.runtime.lane_checks.lock() {
+            checks.remove(&self.lane);
+        }
+    }
+}
+
+/// Subscribes to the lane's in-flight lifecycle check, starting it if none
+/// is running. At most one check task runs per lane: callers that give up
+/// leave nothing queued behind it.
+fn join_lane_check(
+    state: &Arc<ModuleState>,
+    model_id: &str,
+) -> tokio::sync::watch::Receiver<LaneCheckOutcome> {
+    let mut checks = state.runtime.lane_checks.lock().expect("lane checks");
+    if let Some(outcome) = checks.get(model_id) {
+        return outcome.clone();
+    }
+    // The caller's fast path may have seen the check pending just before it
+    // passed and left this map. Decide again here, where no new check can
+    // start concurrently, so a passed check is never run a second time.
+    match profile_check_passed(state, model_id) {
+        Ok(Some(model)) => return tokio::sync::watch::channel(Some(Ok(model))).1,
+        Ok(None) => {}
+        Err(error) => return tokio::sync::watch::channel(Some(Err(error))).1,
+    }
+    let (publish, outcome) = tokio::sync::watch::channel(None);
+    checks.insert(model_id.to_string(), outcome.clone());
+    drop(checks);
+    #[cfg(test)]
+    state
+        .runtime
+        .lane_check_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let entry = LaneCheckEntry {
+        runtime: state.runtime.clone(),
+        lane: model_id.to_string(),
+    };
+    let state = state.clone();
+    let model_id = model_id.to_string();
+    tokio::spawn(async move {
+        let result = run_lane_check(&state, &model_id).await;
+        // Leave the map before publishing, so a caller that sees this outcome
+        // and asks again takes the fast path or starts a fresh check.
+        drop(entry);
+        let _ = publish.send(Some(result));
+    });
+    outcome
+}
+
+/// The lane lifecycle work behind certification: under the lane lock, run the
+/// numerical self-check unless it has already been decided.
+async fn run_lane_check(
+    state: &Arc<ModuleState>,
+    model_id: &str,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let guard = catalog_lane_lock(&state.runtime, model_id)
+        .lock_owned()
+        .await;
+    // Never load here. Requests load lanes through resolution; a check that
+    // was queued before an unload must not bring the lane back.
+    let model = model_slot_snapshot(&state.runtime, model_id)
+        .filter(|slot| matches!(slot.state, ModelRuntimeState::Ready))
+        .and_then(|slot| slot.loaded)
+        .ok_or_else(|| {
+            WireOperationError::from_stable(
+                StableError::model_loading(Some(250)),
+                format!("model '{model_id}' is not loaded"),
+            )
+        })?;
+    check_profile_model(state, model, guard).await
+}
+
+/// The numerical self-check's persisted id and key for a profile model.
+fn profile_check_identity(
+    state: &ModuleState,
+    model: &EmbeddingModel,
+) -> Result<(String, Value), WireOperationError> {
+    let profile = model
+        .engine_identity
+        .build_flags
+        .get("profile")
+        .expect("profile preload");
+    if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &model.model_id) {
+        catalog_self_check_key(state, entry, backend)
+    } else {
+        profile_preload_check_key(state, model, profile)
+    }
 }
 
 // Catalog installs and startup preloads must compare model output against the
@@ -25373,19 +26711,14 @@ async fn ensure_profile_preload_ready(
 async fn check_profile_model(
     state: &ModuleState,
     model: Arc<EmbeddingModel>,
-    guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    _lane: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let profile = model
         .engine_identity
         .build_flags
         .get("profile")
         .expect("profile preload");
-    let (id, key) =
-        if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &model.model_id) {
-            catalog_self_check_key(state, entry, backend)?
-        } else {
-            profile_preload_check_key(state, &model, profile)?
-        };
+    let (id, key) = profile_check_identity(state, &model)?;
     let references = match synapse_certify::self_check::load(profile) {
         Ok(references) => references,
         Err(error) => {
@@ -25405,22 +26738,36 @@ async fn check_profile_model(
         _ => {}
     }
     let generation = catalog_check_generation(state, &id, &key)?;
-    let evaluation = match numerical_profile_preload_check(
-        state,
-        &model,
-        profile,
-        references,
-        Some(guard),
-    )
-    .await
+    // Exclusive for the whole check: waits for in-flight inference to drain
+    // and keeps new requests out until the reference cases have run.
+    let gate = Arc::new(
+        lane_serving_gate(&state.runtime, &model.model_id)
+            .write_owned()
+            .await,
+    );
+    let evaluation =
+        match numerical_profile_preload_check(state, &model, profile, references, Some(gate)).await
+        {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                let reason = serde_json::to_string(&error).expect("wire error serializes");
+                catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
+                return Err(profile_preload_check_error(profile, &reason));
+            }
+        };
+    // A mock worker cannot reproduce the reference outputs, so tests that need
+    // a passing numerical self-check still run every reference case and then
+    // record the check as passed instead of evaluating the outputs.
+    #[cfg(test)]
+    if *state
+        .runtime
+        .profile_check_passes_for_test
+        .lock()
+        .expect("verdict override")
     {
-        Ok(evaluation) => evaluation,
-        Err(error) => {
-            let reason = serde_json::to_string(&error).expect("wire error serializes");
-            catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
-            return Err(profile_preload_check_error(profile, &reason));
-        }
-    };
+        catalog_complete_check(state, &id, generation, "passed", None)?;
+        return Ok(model);
+    }
     complete_profile_preload_check(state, profile, &id, generation, &evaluation)?;
     Ok(model)
 }
@@ -25457,16 +26804,7 @@ async fn resolve_serving_model(
         return Err(catalog_loading_response(&lane, budget));
     }
     let started = std::time::Instant::now();
-    let lock = catalog_lane_lock(&state.runtime, &lane);
-    let (guard, waited) = match lock.clone().try_lock_owned() {
-        Ok(guard) => (guard, false),
-        Err(_) => (
-            tokio::time::timeout(Duration::from_millis(budget.min(5000)), lock.lock_owned())
-                .await
-                .map_err(|_| catalog_loading_response(&lane, budget))?,
-            true,
-        ),
-    };
+    let (guard, waited) = catalog_resolution_guard(&state.runtime, &lane, budget).await?;
     ane_lane_timing("resolver_lane_wait", &lane, None, started);
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
@@ -25487,6 +26825,26 @@ async fn resolve_serving_model(
             format!("catalog load task failed: {e}"),
         )),
         Err(_) => Err(catalog_loading_response(&lane, budget)),
+    }
+}
+
+/// The resolver's wait for a catalog lane's lifecycle lock: at most
+/// min(budget, 5 s), answered `model_loading` (or `deadline_exceeded` for short
+/// budgets) when it expires. Returns whether the caller had to wait.
+async fn catalog_resolution_guard(
+    runtime: &RuntimeState,
+    lane: &str,
+    budget: u64,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), WireOperationError> {
+    let lock = catalog_lane_lock(runtime, lane);
+    match lock.clone().try_lock_owned() {
+        Ok(guard) => Ok((guard, false)),
+        Err(_) => Ok((
+            tokio::time::timeout(Duration::from_millis(budget.min(5000)), lock.lock_owned())
+                .await
+                .map_err(|_| catalog_loading_response(lane, budget))?,
+            true,
+        )),
     }
 }
 
@@ -25527,6 +26885,7 @@ struct CatalogInvocation {
     runtime: Arc<RuntimeState>,
     lane: String,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    _gate: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 impl Drop for CatalogInvocation {
     fn drop(&mut self) {
@@ -25541,19 +26900,47 @@ async fn ensure_catalog_lane_ready(
     state: Arc<ModuleState>,
     entry: catalog::CatalogEntry,
     backend: catalog::CatalogBackend,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let lane = catalog::lane_id(&entry.id, &backend.backend);
     let lock = catalog_lane_lock(&state.runtime, &lane);
+    // A job whose budget has run out must leave the queue rather than load
+    // the lane later, possibly after an operator has unloaded it.
     let (guard, waited) = match lock.clone().try_lock_owned() {
         Ok(guard) => (guard, false),
-        Err(_) => (lock.lock_owned().await, true),
+        Err(_) => match deadline {
+            Some(deadline) => (
+                tokio::time::timeout_at(deadline, lock.lock_owned())
+                    .await
+                    .map_err(|_| {
+                        WireOperationError::from_stable(
+                            StableError::deadline_exceeded(),
+                            "catalog batch execution deadline expired",
+                        )
+                    })?,
+                true,
+            ),
+            None => (lock.lock_owned().await, true),
+        },
     };
+    // The lock can be granted in the same poll as the expired timer, or be
+    // free for a job that was already out of budget. Either way the job must
+    // not go on to load the lane.
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        drop(guard);
+        return Err(WireOperationError::from_stable(
+            StableError::deadline_exceeded(),
+            "catalog batch execution deadline expired",
+        ));
+    }
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
     let profile_backed = backend.profile.is_some();
     let model = ensure_catalog_lane_ready_owned(state.clone(), entry, backend, guard).await?;
     if profile_backed {
+        // Never loads, and the job's own timer bounds this wait; a deadline
+        // here could fail an admitted job with model_loading.
         ensure_profile_preload_ready(state, &lane, None).await
     } else {
         Ok(model)
@@ -25743,6 +27130,8 @@ async fn ensure_catalog_lane_ready_owned(
         return Ok(model);
     }
     let generation = catalog_check_generation(&state, &check_id, &key)?;
+    // No serving inference may overlap the check; see `lane_serving_gate`.
+    let gate = lane_serving_gate(&state.runtime, &lane).write_owned().await;
     state
         .runtime
         .self_check_holders
@@ -25753,6 +27142,7 @@ async fn ensure_catalog_lane_ready_owned(
         runtime: state.runtime.clone(),
         lane: lane.clone(),
         _guard: guard,
+        _gate: gate,
     };
     let call_model = model.clone();
     let call_entry = entry.clone();
@@ -25892,6 +27282,89 @@ fn catalog_cache_roots(state: &ModuleState) -> Result<Vec<String>, SynapseStoreE
     Ok(roots)
 }
 
+/// Runs an admitted catalog embed job: readies its lane within the job's
+/// execution budget, executes it, and always finalizes the job record and its
+/// `catalog_jobs` registration, whatever the outcome.
+async fn run_catalog_embed_job(
+    state: Arc<ModuleState>,
+    record: store::JobRecord,
+    entry: catalog::CatalogEntry,
+    backend: catalog::CatalogBackend,
+    params: Value,
+    digest: String,
+) {
+    let job = record.job_id.clone();
+    let prepared = async {
+        let budget = record
+            .execution_expires_ms
+            .unwrap_or(now_ms())
+            .saturating_sub(now_ms());
+        let task_state = state.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+        let loading = tokio::spawn(async move {
+            ensure_catalog_lane_ready(task_state, entry, backend, Some(deadline)).await
+        });
+        let model = tokio::time::timeout(Duration::from_millis(budget), loading)
+            .await
+            .map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::deadline_exceeded(),
+                    "catalog batch execution deadline expired",
+                )
+            })?
+            .map_err(|e| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(250)),
+                    e.to_string(),
+                )
+            })??;
+        let parsed: EmbedBatchParams =
+            serde_json::from_value(params).map_err(|e| artifact_invalid_error(e.to_string()))?;
+        let items = batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
+        let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
+        let mut tokenized = model
+            .tokenizer
+            .tokenize_batch(items.iter().map(|i| i.text.as_str()))
+            .map_err(|e| artifact_invalid_error(e.to_string()))?;
+        compose_catalog_embed(&model, &mut tokenized)?;
+        apply_owned_tokenizer_policy(&model, &mut tokenized);
+        let total_tokens = tokenized
+            .real_token_counts
+            .iter()
+            .map(|n| u64::from(*n))
+            .sum();
+        let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
+        check_fingerprint_constraints(
+            &model,
+            &alias_table,
+            parsed.target_fingerprint.as_deref(),
+            parsed.required_fingerprint.as_deref(),
+            false,
+            parsed.required_epoch,
+        )?;
+        Ok::<_, WireOperationError>(EmbedBatchJobWork {
+            model,
+            request_digest: digest,
+            ids: items.into_iter().map(|i| i.id).collect(),
+            tokenized,
+            alias_table,
+            request_bytes,
+            total_tokens,
+        })
+    }
+    .await;
+    match prepared {
+        Ok(work) => execute_embed_batch_job(state.clone(), job.clone(), work).await,
+        Err(e) => fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e),
+    }
+    state
+        .runtime
+        .catalog_jobs
+        .lock()
+        .expect("catalog jobs")
+        .remove(&job);
+}
+
 async fn submit_catalog_embed_job(
     state: Arc<ModuleState>,
     entry: catalog::CatalogEntry,
@@ -25968,80 +27441,9 @@ async fn submit_catalog_embed_job(
     let response = job_status_payload(&state, &record);
     if matches!(admission, JobAdmission::Admitted(_)) {
         state.runtime.admission_telemetry.record_job_minted();
-        tokio::spawn(async move {
-            let job = record.job_id.clone();
-            let prepared = async {
-                let budget = record
-                    .execution_expires_ms
-                    .unwrap_or(now_ms())
-                    .saturating_sub(now_ms());
-                let task_state = state.clone();
-                let loading = tokio::spawn(async move {
-                    ensure_catalog_lane_ready(task_state, entry, backend).await
-                });
-                let model = tokio::time::timeout(Duration::from_millis(budget), loading)
-                    .await
-                    .map_err(|_| {
-                        WireOperationError::from_stable(
-                            StableError::deadline_exceeded(),
-                            "catalog batch execution deadline expired",
-                        )
-                    })?
-                    .map_err(|e| {
-                        WireOperationError::from_stable(
-                            StableError::engine_crashed(Some(250)),
-                            e.to_string(),
-                        )
-                    })??;
-                let parsed: EmbedBatchParams = serde_json::from_value(params)
-                    .map_err(|e| artifact_invalid_error(e.to_string()))?;
-                let items =
-                    batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
-                let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
-                let mut tokenized = model
-                    .tokenizer
-                    .tokenize_batch(items.iter().map(|i| i.text.as_str()))
-                    .map_err(|e| artifact_invalid_error(e.to_string()))?;
-                compose_catalog_embed(&model, &mut tokenized)?;
-                apply_owned_tokenizer_policy(&model, &mut tokenized);
-                let total_tokens = tokenized
-                    .real_token_counts
-                    .iter()
-                    .map(|n| u64::from(*n))
-                    .sum();
-                let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
-                check_fingerprint_constraints(
-                    &model,
-                    &alias_table,
-                    parsed.target_fingerprint.as_deref(),
-                    parsed.required_fingerprint.as_deref(),
-                    false,
-                    parsed.required_epoch,
-                )?;
-                Ok::<_, WireOperationError>(EmbedBatchJobWork {
-                    model,
-                    request_digest: digest,
-                    ids: items.into_iter().map(|i| i.id).collect(),
-                    tokenized,
-                    alias_table,
-                    request_bytes,
-                    total_tokens,
-                })
-            }
-            .await;
-            match prepared {
-                Ok(work) => execute_embed_batch_job(state.clone(), job.clone(), work).await,
-                Err(e) => {
-                    fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e)
-                }
-            }
-            state
-                .runtime
-                .catalog_jobs
-                .lock()
-                .expect("catalog jobs")
-                .remove(&job);
-        });
+        tokio::spawn(run_catalog_embed_job(
+            state, record, entry, backend, params, digest,
+        ));
     }
     result_outcome(response)
 }

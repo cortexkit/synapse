@@ -140,8 +140,28 @@ message. A failed download carries `error` beside `state` in its flat status.
   retry; includes load/runtime failure or the 2000 ms self-check ceiling.
 - `model_loading` — transient, `retry_after_ms: 250`, safe to retry. Inline
   serving waits up to `min(remaining deadline, 5000 ms)` for load/self-check;
-  this code is used only when that cap expires with deadline remaining.
+  this code is used only when that cap expires with deadline remaining. A
+  request that reaches a lane while its load-time numerical self-check runs
+  waits for it until its own deadline and is then answered `model_loading`.
+  Never returned because another request is executing or a Neural Engine
+  shape is compiling.
   Admitted batch jobs wait within their execution budget and never fail with it.
+- `shape_compiling` — transient, `retry_after_ms: 1000`, safe to retry the same
+  request. Direct Neural Engine lanes only. The worker compiles each padded
+  sequence shape the first time it is used (tens of seconds) and cannot run any
+  inference while it compiles. A request waits through a compile as long as its
+  own deadline allows; this code is returned only when that deadline expires
+  while the request is blocked on a compile: either the shape it needs is
+  being compiled (several requests share one compile), or it was waiting for
+  the lane's worker while another shape's compile occupied it at some point of
+  that wait. When the module can no longer tell (more than 16 compiles since
+  the wait began), it answers `shape_compiling`. `details`: `{lane_id, shape}`,
+  where `shape` is the shape being compiled. Waits that expire on anything else
+  keep `deadline_exceeded`.
+  **Consumer disposition:** the model is loaded; retry after `retry_after_ms`.
+  The compile continues without the request, so a retry joins it or finds the
+  shape ready. A deadline that covers a first-time compile (about 30 s) avoids
+  this code.
 - `idempotency_conflict` — permanent, not safe to retry unchanged; replace a
   download key bound to a different digest.
 
