@@ -329,9 +329,16 @@ impl Model {
         ane::autoreleasepool(|_| self.run_stages(tokens, false))
     }
     fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
+        self.run_stages_at_rung(tokens, traced, rung(tokens.len())?)
+    }
+    pub(crate) fn run_stages_at_rung(
+        &self,
+        tokens: &[u32],
+        traced: bool,
+        shape: usize,
+    ) -> Result<Vec<f32>> {
         let mut stages = StageClock::new(traced);
         let mut profile = crate::profile::LaneProfile::new();
-        let shape = rung(tokens.len())?;
         let resident = self.resident.get(&shape).context("shape_not_admitted")?;
         let hidden = self.profile.n("hidden_size");
         let pad = self.profile.n("pad_token_id") as u32;
