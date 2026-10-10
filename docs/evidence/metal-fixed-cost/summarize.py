@@ -80,6 +80,7 @@ def summarize(run_dir, family):
     real_tokens = computed_tokens = padded_rows = 0
     run_points = []
     gpu_points = []
+    shape_runs = defaultdict(list)
     for call in calls:
         totals["engine_call"] += sum(float(v["total_ms"]) for v in call["lines"]["bucket_total"])
     for p in passes:
@@ -112,6 +113,7 @@ def summarize(run_dir, family):
         totals["pool"] += ms(host, "pool_ms")
         totals["pass_total"] += ms(host, "total_ms")
         run_points.append((batch * seq, ms(native, "run_ms")))
+        shape_runs[(batch, seq)].append(ms(native, "run_ms"))
         if native.get("cached") != "1":
             totals["uncached_passes"] += 1
     replay = output["replays"][0]
@@ -130,6 +132,10 @@ def summarize(run_dir, family):
         "padded_rows": padded_rows // replays,
         "shapes": {k: v // replays for k, v in sorted(shapes.items(), key=lambda kv: tuple(map(int, kv[0].split("x"))))},
         "totals_ms": {k: v / replays for k, v in totals.items()},
+        "run_ms_median_by_shape": {
+            f"{batch}x{seq}": round(statistics.median(values), 2)
+            for (batch, seq), values in sorted(shape_runs.items())
+        },
         "run_fit": fit(*zip(*run_points)) if run_points else None,
         "gpu_fit": fit(*zip(*gpu_points)) if gpu_points else None,
         "vectors_sha256": output["vectors_sha256"],
