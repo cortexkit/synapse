@@ -55,6 +55,108 @@ void cooperative_linear() {
     }
 }
 #endif
+#ifdef ATTENTION
+// Tiled attention with an online softmax; no sequence-squared buffer exists.
+// One workgroup owns a tile of consecutive query positions for one query head
+// and walks the keys a tile at a time. Each key/value tile is read from global
+// memory once into shared memory and then serves every query of the tile.
+// `p.inner` threads share one query: each owns eight vec4 slices of the head,
+// interleaved so that neighbouring threads touch neighbouring shared words.
+// The head is zero-padded to `p.inner`*32 channels; padding adds zeros only.
+shared vec4 key_tile[512];
+shared vec4 value_tile[512];
+shared float partial_score[2048];
+float key_score(uint key, uint query, uint lanes, float scale) {
+    float s=0.0;
+    for(uint l=0;l<lanes;l++) s+=partial_score[key*64+query*lanes+l];
+    return s*scale;
+}
+void main() {
+    uint t=gl_LocalInvocationID.x;
+    uint lanes=p.inner, width=lanes*8;     // threads per query; padded head width in vec4
+    uint queries=64/lanes, keys=512/width; // query positions per workgroup; keys per tile
+    uint tiles=(p.seq+queries-1)/queries;
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    if(group>=(p.rows/p.seq)*p.heads*tiles) return; // uniform across the workgroup
+    uint tile=group%tiles, head=(group/tiles)%p.heads, batch=group/tiles/p.heads;
+    uint kh=head/(p.heads/p.kv_heads);
+    uint lane=t%lanes, query=t/lanes;
+    uint first=tile*queries, pos=first+query, last=min(first+queries,p.seq)-1;
+    bool live=pos<p.seq;
+    uint qbase=(batch*p.seq+min(pos,p.seq-1))*p.heads*p.dim+head*p.dim;
+    bool causal=(p.flags&1)!=0;
+    vec4 q[8], acc[8];
+    [[unroll]] for(uint j=0;j<8;j++) {
+        uint d=(lane+lanes*j)*4;
+        vec4 a=vec4(0.0);
+        [[unroll]] for(uint c=0;c<4;c++) if(live && d+c<p.dim) a[c]=x[qbase+d+c];
+        q[j]=a; acc[j]=vec4(0.0);
+    }
+    // Key range any query of this tile can see; per-query limits are applied below.
+    uint lo=0, hi=p.seq;
+    if(causal) hi=last+1;
+    if(p.window!=0) { lo=(first>p.window)?first-p.window:0; hi=min(hi,last+p.window+1); }
+    float scale=inversesqrt(float(p.dim));
+    float maximum=-3.402823466e+38, denominator=0.0;
+    for(uint start=lo;start<hi;start+=keys) {
+        barrier(); // every thread has finished reading the previous tile
+        for(uint e=t;e<keys*width;e+=64) {
+            uint key=start+e/width, d=(e%width)*4;
+            vec4 kv=vec4(0.0), vv=vec4(0.0);
+            if(key<hi) {
+                uint kr=batch*p.seq+key;
+                [[unroll]] for(uint c=0;c<4;c++) if(d+c<p.dim) {
+                    kv[c]=z[kr*p.kv_heads*p.dim+kh*p.dim+d+c];
+                    vv[c]=v[kr*p.stride+p.offset+kh*p.dim+d+c];
+                }
+            }
+            key_tile[e]=kv; value_tile[e]=vv;
+        }
+        memoryBarrierShared(); barrier();
+        // Four keys per step give the compiler independent dot-product chains.
+        for(uint k=0;k<keys;k+=4) {
+            vec4 s=vec4(0.0);
+            [[unroll]] for(uint j=0;j<8;j++) {
+                uint slot=lane+lanes*j;
+                s.x+=dot(q[j],key_tile[k*width+slot]);
+                s.y+=dot(q[j],key_tile[(k+1)*width+slot]);
+                s.z+=dot(q[j],key_tile[(k+2)*width+slot]);
+                s.w+=dot(q[j],key_tile[(k+3)*width+slot]);
+            }
+            partial_score[k*64+t]=s.x;
+            partial_score[(k+1)*64+t]=s.y;
+            partial_score[(k+2)*64+t]=s.z;
+            partial_score[(k+3)*64+t]=s.w;
+        }
+        memoryBarrierShared(); barrier();
+        uint count=min(keys,hi-start);
+        float next=maximum;
+        for(uint k=0;k<count;k++) {
+            uint key=start+k;
+            if(!live || mask[batch*p.seq+key]==0 || (causal && key>pos)) continue;
+            if(p.window!=0 && abs(int(key)-int(pos))>int(p.window)) continue;
+            next=max(next,key_score(k,query,lanes,scale));
+        }
+        float correction=exp(maximum-next);
+        denominator*=correction;
+        [[unroll]] for(uint j=0;j<8;j++) acc[j]*=correction;
+        for(uint k=0;k<count;k++) {
+            uint key=start+k;
+            if(!live || mask[batch*p.seq+key]==0 || (causal && key>pos)) continue;
+            if(p.window!=0 && abs(int(key)-int(pos))>int(p.window)) continue;
+            float probability=exp(key_score(k,query,lanes,scale)-next);
+            denominator+=probability;
+            [[unroll]] for(uint j=0;j<8;j++) acc[j]+=probability*value_tile[k*width+lane+lanes*j];
+        }
+        maximum=next;
+    }
+    if(!live) return;
+    [[unroll]] for(uint j=0;j<8;j++) {
+        uint d=(lane+lanes*j)*4;
+        [[unroll]] for(uint c=0;c<4;c++) if(d+c<p.dim) y[qbase+d+c]=acc[j][c]/max(denominator,1e-30);
+    }
+}
+#else
 void main() {
 #ifdef COOPERATIVE
     if(p.op==1 && p.inner%16==0 && p.cols%16==0) { cooperative_linear(); return; }
@@ -92,25 +194,6 @@ void main() {
         float angle=float(row%p.seq)*pow(p.theta,-float(d%(p.dim/2))*2.0/float(p.dim));
         y[i]=x[row*p.stride+p.offset+channel]*cos(angle)
             +x[row*p.stride+p.offset+mate]*sin(angle)*((d<p.dim/2)?-1.0:1.0);
-    } else if(p.op==6) { // online softmax: no sequence-squared allocation
-        if(i>=p.rows*p.heads) return;
-        uint row=i/p.heads, head=i%p.heads, pos=row%p.seq, batch=row/p.seq;
-        uint kh=head/(p.heads/p.kv_heads);
-        float acc[256]; for(uint d=0;d<p.dim;d++) acc[d]=0.0;
-        float maximum=-3.402823466e+38, denominator=0.0;
-        for(uint key=0;key<p.seq;key++) {
-            uint kr=batch*p.seq+key;
-            if(mask[kr]==0 || ((p.flags&1)!=0 && key>pos)) continue;
-            if(p.window!=0 && abs(int(key)-int(pos))>int(p.window)) continue;
-            float score=0.0;
-            for(uint d=0;d<p.dim;d++) score+=x[row*p.heads*p.dim+head*p.dim+d]*z[kr*p.kv_heads*p.dim+kh*p.dim+d];
-            score*=inversesqrt(float(p.dim));
-            float next=max(maximum,score), correction=exp(maximum-next), probability=exp(score-next);
-            denominator=denominator*correction+probability;
-            for(uint d=0;d<p.dim;d++) acc[d]=acc[d]*correction+probability*v[kr*p.stride+p.offset+kh*p.dim+d];
-            maximum=next;
-        }
-        for(uint d=0;d<p.dim;d++) y[row*p.heads*p.dim+head*p.dim+d]=acc[d]/max(denominator,1e-30);
     } else if(p.op==7) { // manifest-defined pooling
         if(i>=p.rows*p.cols) return;
         uint batch=i/p.cols, channel=i%p.cols;
@@ -142,3 +225,4 @@ void main() {
         if(i<p.rows) y[i]=1.0/(1.0+exp(-x[i]-float(w[0])));
     }
 }
+#endif
