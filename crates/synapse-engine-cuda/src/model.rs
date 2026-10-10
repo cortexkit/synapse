@@ -136,7 +136,10 @@ pub(crate) fn resolve_model_root(path: &Path) -> Result<PathBuf> {
     if path.is_dir() {
         return Ok(path.to_path_buf());
     }
-    if path.extension().and_then(|value| value.to_str()) == Some("safetensors") {
+    // Any regular file is one safetensors file. The extension cannot be
+    // required: the module passes catalog packages by their content-addressed
+    // cache path, which has none.
+    if path.is_file() {
         return path
             .parent()
             .map(Path::to_path_buf)
@@ -149,7 +152,7 @@ pub(crate) fn resolve_model_root(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_safetensor_map(root: &Path, original: &Path) -> Result<HashMap<String, Tensor>> {
-    if original.is_file() && original.extension().and_then(|v| v.to_str()) == Some("safetensors") {
+    if original.is_file() {
         return load_safetensors_file(original);
     }
     let single = root.join("model.safetensors");
@@ -861,8 +864,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        family_layer_tensor_name, tensor_candidates, MODERNBERT_EMBEDDINGS,
-        MODERNBERT_EMBEDDING_NORM, MODERNBERT_FINAL_NORM, QWEN3_EMBEDDINGS, QWEN3_FINAL_NORM,
+        family_layer_tensor_name, load_safetensor_map, resolve_model_root, tensor_candidates,
+        MODERNBERT_EMBEDDINGS, MODERNBERT_EMBEDDING_NORM, MODERNBERT_FINAL_NORM, QWEN3_EMBEDDINGS,
+        QWEN3_FINAL_NORM,
     };
 
     const GTE_HEADER: &[u8] =
@@ -882,6 +886,30 @@ mod tests {
             .filter(|name| name.as_str() != "__metadata__")
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn a_package_file_without_a_safetensors_extension_loads_as_one_file() {
+        // The module hands catalog lanes their converted package by its
+        // content-addressed cache path, which has no file extension.
+        let dir = std::env::temp_dir().join(format!(
+            "synapse-engine-cuda-blob-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = dir.join("9259f3b731a35f260d74df99b618231a4d68f5dce9d75c6e4f039e1dbad646cd");
+        let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        std::fs::write(&blob, bytes).unwrap();
+
+        let root = resolve_model_root(&blob).unwrap();
+        assert_eq!(root, dir);
+        let tensors = load_safetensor_map(&root, &blob).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert!(tensors.contains_key("w"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn assert_resolves(names: &HashSet<String>, base: &str) {
