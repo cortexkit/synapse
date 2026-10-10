@@ -172,6 +172,7 @@ struct Device {
     pipeline_layout: vk::PipelineLayout,
     plain: vk::Pipeline,
     cooperative: Option<vk::Pipeline>,
+    attention: vk::Pipeline,
     heap_index: u32,
 }
 impl Drop for Device {
@@ -182,6 +183,7 @@ impl Drop for Device {
                 self.raw.destroy_pipeline(p, None);
             }
             self.raw.destroy_pipeline(self.plain, None);
+            self.raw.destroy_pipeline(self.attention, None);
             self.raw.destroy_pipeline_layout(self.pipeline_layout, None);
             self.raw.destroy_descriptor_pool(self.descriptor_pool, None);
             self.raw
@@ -332,6 +334,7 @@ impl Device {
             pipeline_layout: vk::PipelineLayout::null(),
             plain: vk::Pipeline::null(),
             cooperative: None,
+            attention: vk::Pipeline::null(),
         };
         let raw = &device.raw;
         let pool = unsafe {
@@ -415,6 +418,7 @@ impl Device {
             })
         };
         device.plain = make_pipeline("plain")?;
+        device.attention = make_pipeline("attention")?;
         device.cooperative = if coop_enabled {
             Some(make_pipeline("cooperative")?)
         } else {
@@ -736,7 +740,9 @@ impl Arena {
             device.raw.cmd_bind_pipeline(
                 command,
                 vk::PipelineBindPoint::COMPUTE,
-                if cooperative {
+                if params.op == ATTENTION_OP {
+                    device.attention
+                } else if cooperative {
                     device.cooperative.unwrap()
                 } else {
                     device.plain
@@ -774,6 +780,19 @@ impl Arena {
             );
         })
     }
+}
+
+/// Push-constant operation code for self-attention. Only the attention
+/// pipeline (shaders/attention.comp) implements it; it is kept out of the
+/// plain shader because its shared-memory tiles would lower the occupancy of
+/// every other kernel there.
+const ATTENTION_OP: u32 = 6;
+
+/// Threads that share one query in the attention shader, which pads the head
+/// to this many 32-channel slices. Two is the floor so that a workgroup never
+/// holds more than 32 queries and its score scratch stays within 2048 floats.
+fn attention_lanes(dim: u32) -> u32 {
+    dim.div_ceil(32).next_power_of_two().max(2)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1225,10 +1244,13 @@ impl Engine {
             } else {
                 "activation:attention_out"
             };
+            let lanes = attention_lanes(dim);
+            let workgroups = batch * heads * seq.div_ceil(64 / lanes);
             self.run(
                 Params {
-                    op: 6,
+                    op: ATTENTION_OP,
                     rows,
+                    inner: lanes,
                     seq,
                     heads,
                     kv_heads,
@@ -1248,7 +1270,7 @@ impl Engine {
                 attention_output,
                 if modern { "activation:mlp_in" } else { "qkv:k" },
                 if modern { "activation:qkv" } else { "qkv:v" },
-                rows * heads,
+                workgroups * 64,
             )?;
             self.linear(
                 rows,
@@ -1559,5 +1581,31 @@ impl Engine {
             input,
             count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attention_lanes;
+
+    /// The attention shader sizes its tiles from the lane count alone; every
+    /// supported head width must fit its registers and shared arrays.
+    #[test]
+    fn attention_geometry_fits_shader_arrays_for_every_head_width() {
+        for dim in 1..=256 {
+            let lanes = attention_lanes(dim);
+            assert!([2, 4, 8].contains(&lanes), "{dim}");
+            // Each thread holds eight vec4 slices of the head.
+            assert!(lanes * 32 >= dim, "{dim}");
+            let width = lanes * 8;
+            let keys = 512 / width;
+            // Key and value tiles hold 512 vec4; keys advance four at a time;
+            // partial scores hold 64 per key in 2048 floats.
+            assert_eq!(keys * width, 512, "{dim}");
+            assert_eq!(keys % 4, 0, "{dim}");
+            assert!(keys * 64 <= 2048, "{dim}");
+        }
+        assert_eq!(attention_lanes(64), 2);
+        assert_eq!(attention_lanes(128), 4);
     }
 }

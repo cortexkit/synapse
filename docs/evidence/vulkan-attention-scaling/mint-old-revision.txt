@@ -1,0 +1,9 @@
+gte-modernbert-base-cuda 5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010
+gte-modernbert-base-vulkan 885776108d3fd5be2e9e3f17cc02df97d8d3ec83fcbd7978913093e1fdee4bad
+gte-reranker-modernbert-base-cuda 829c20af3757ecd5bb53ab89507ff64d4382225688f5888d6236ffc1670f2d4d
+gte-reranker-modernbert-base-vulkan 084f55877211334b1a11354668afd243637d9897747a539c74281fa43f298205
+qwen3-embedding-0.6b-cuda 9628e6a8b0f30e9eb459f09cfb985306bbbaf2440579d38660e9795c4353554b
+qwen3-embedding-0.6b-vulkan 62e7abe5dacb0c8f8932a057f39c04e7b7a1f8994897b138cabe88ce9461eed5
+qwen3-reranker-0.6b-cuda 28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688
+qwen3-reranker-0.6b-vulkan e892cb51a90e2ccb87a4a88d6fab5237ecb48959ee50da69cd7fee2a1111764a
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 700 filtered out; finished in 7.65s

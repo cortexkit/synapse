@@ -14,10 +14,11 @@ ck-synapse-worker-vulkan --probe-floor
 ck-synapse-worker-vulkan --probe-floor --model qwen3-embedding-0.6b
 ```
 
-The build checks the SDK path and compiler version. Both owned shaders use `-O`
-and a fixed target environment: Vulkan 1.2 for plain kernels, Vulkan 1.3 for
-cooperative matrices. Embedded SPIR-V is checked for source/debug instructions.
-The kernel revision hashes the plain and cooperative binaries in that order;
+The build checks the SDK path and compiler version. All three owned shaders use
+`-O` and a fixed target environment: Vulkan 1.2 for plain and attention kernels,
+Vulkan 1.3 for cooperative matrices. Embedded SPIR-V is checked for source/debug
+instructions. The kernel revision hashes the plain, cooperative and attention
+binaries in that order;
 the feature-disabled worker hashes an empty shader set. The manifest binding
 hashes its embedded canonical JSON, not the pretty-printed source file.
 
@@ -30,8 +31,11 @@ reading tensor data. A replacement LOAD releases the previous model arena first.
 
 All transformer and readout stages run in owned GLSL. ModernBERT uses LayerNorm,
 global/local RoPE and GEGLU; Qwen3 uses RMSNorm, per-head Q/K normalization,
-causal grouped-query attention and SwiGLU. Online attention softmax avoids a
-sequence-squared buffer. GTE rerank returns the classifier sigmoid; Qwen3 reads
+causal grouped-query attention and SwiGLU. Attention has its own pipeline: a
+workgroup owns a tile of query positions for one head, stages each key/value
+tile in shared memory once for all of them and keeps an online softmax, so no
+sequence-squared buffer exists. Keeping it out of the plain shader keeps its
+24 KiB of shared memory from lowering every other kernel's occupancy. GTE rerank returns the classifier sigmoid; Qwen3 reads
 only the manifest's yes/no rows. No request is truncated or given extra tokens.
 
 One device-local arena contains the weights, reusable activations and results.
@@ -75,23 +79,38 @@ cargo test -p synapse-worker-vulkan --features moltenvk-diagnostic \
 
 The ignored test executes the production Engine and shaders against CPU-fp32
 fixtures, including 129/200-token rows, batch-longest padding and a ten-candidate
-pool. It requires cosine >= 0.999, unit norm within 1e-3, fp16 score error <= 0.02,
+pool, then runs the remaining 127-513-token boundary rows and the 8192-token row
+one per request. Setting `SYNAPSE_VULKAN_PARITY_OUTPUTS=<file>` also writes every
+output vector, so two kernel revisions can be compared element by element.
+It requires cosine >= 0.999, unit norm within 1e-3, fp16 score error <= 0.02,
 gap-gated top-10 order and Kendall tau >= 0.99. Package directories must not
 contain config.json. AMD/NVIDIA release certification remains separate.
+`--test gpu_scaling`, run in the same environment, times one row at each length
+from 512 to 8192 tokens.
 
 Measured on MoltenVK plain compute (API 1.3; float16, 16-bit storage and subgroup
 arithmetic supported; cooperative matrices unavailable):
 
 ```text
-GPU_PARITY gte-modernbert-base min_cosine=0.999997843 rows=11 padded_width=200
-GPU_PARITY gte-reranker-modernbert-base max_score_error=0.001476765 min_kendall_tau=1.000000000 rows=19
-GPU_PARITY qwen3-embedding-0.6b min_cosine=0.999999780 rows=11 padded_width=200
-GPU_PARITY qwen3-reranker-0.6b max_score_error=0.000006936 min_kendall_tau=1.000000000 rows=19
+GPU_PARITY gte-modernbert-base min_cosine=0.999997855 rows=11 padded_width=200
+GPU_PARITY gte-modernbert-base long-8192 tokens=8192 cosine=0.999999949
+GPU_PARITY gte-reranker-modernbert-base max_score_error=0.001288861 min_kendall_tau=1.000000000 rows=19
+GPU_PARITY gte-reranker-modernbert-base long-8192 tokens=8192 score_error=0.000060856
+GPU_PARITY qwen3-embedding-0.6b min_cosine=0.999999755 rows=11 padded_width=200
+GPU_PARITY qwen3-embedding-0.6b long-8192 tokens=8192 cosine=0.999999884
+GPU_PARITY qwen3-reranker-0.6b max_score_error=0.000005623 min_kendall_tau=1.000000000 rows=19
+GPU_PARITY qwen3-reranker-0.6b long-8192 tokens=8192 score_error=0.000013232
 ```
 
+`docs/evidence/vulkan-attention-scaling/` has every length row, the outputs
+compared with those of the previous attention kernel, and the time per row at
+512-8192 tokens.
+
 As a hardware regression control, disabling the shader's local-attention window
-lowered the GTE embedding minimum cosine to `0.952105393`; the named GPU parity
-test failed against the `0.999` gate. The shader was restored before subsequent
+lowered the GTE embedding minimum cosine to `0.952105393` (`0.952105542` with the
+tiled attention kernel); the named GPU parity test failed against the `0.999`
+gate. Ignoring the causal mask lowered the Qwen3 embedding minimum cosine to
+`0.100344844`. The shader was restored before subsequent
 verification. This exercises the math itself, not merely its SPIR-V digest.
 
 Linux `x86_64-unknown-linux-gnu` all-target Clippy passes with `-D warnings` for

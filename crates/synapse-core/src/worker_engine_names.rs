@@ -40,7 +40,7 @@ pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
 pub const CUDA_KERNEL_REVISION: &str = "4d0ded67c30286fe2be37cc7413359ad745dd751";
 /// SHA-256 of the Vulkan worker's embedded SPIR-V set.
 pub const VULKAN_KERNEL_REVISION: &str =
-    "7351dbef33cda19b4b20e8427ba71497580d9b401d023fdcc7db01456cfc9b4a";
+    "7a5621d965123c2661ad6a795774d07b81f44a86db4d68167893ad4023e87730";
 /// Revision identifying the computations compiled for the direct Neural Engine worker.
 pub const ANE_DIRECT_KERNEL_REVISION: &str = "ane-direct-graph-v1";
 /// Revision identifying owned Metal computations and the policy that pads inputs

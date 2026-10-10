@@ -1,0 +1,20 @@
+gte-modernbert-base/boundary-511 max_abs_diff=5.74e-05 cos=0.9999998744
+gte-modernbert-base/boundary-512 max_abs_diff=0.000116 cos=0.9999998403
+gte-modernbert-base/boundary-513 max_abs_diff=6.56e-05 cos=0.9999998464
+gte-modernbert-base/long-8192 max_abs_diff=4.65e-05 cos=0.9999999282
+gte-reranker-modernbert-base/boundary-511 max_abs_diff=1.73e-05 cos=-
+gte-reranker-modernbert-base/boundary-512 max_abs_diff=8.04e-06 cos=-
+gte-reranker-modernbert-base/boundary-513 max_abs_diff=2.58e-05 cos=-
+gte-reranker-modernbert-base/long-8192 max_abs_diff=2.79e-05 cos=-
+qwen3-embedding-0.6b/boundary-511 max_abs_diff=7.35e-05 cos=0.9999998201
+qwen3-embedding-0.6b/boundary-512 max_abs_diff=8.04e-05 cos=0.9999998422
+qwen3-embedding-0.6b/boundary-513 max_abs_diff=8.15e-05 cos=0.9999998074
+qwen3-embedding-0.6b/long-8192 max_abs_diff=7.08e-05 cos=0.9999998456
+qwen3-reranker-0.6b/boundary-511 max_abs_diff=4.7e-06 cos=-
+qwen3-reranker-0.6b/boundary-512 max_abs_diff=2.77e-06 cos=-
+qwen3-reranker-0.6b/boundary-513 max_abs_diff=2.17e-06 cos=-
+qwen3-reranker-0.6b/long-8192 max_abs_diff=1.99e-05 cos=-
+WORST gte-modernbert-base max_abs_diff=0.000176 at gte-modernbert-base/short-0 min_cos_old_vs_new=0.9999988463
+WORST gte-reranker-modernbert-base max_abs_diff=0.000348 at gte-reranker-modernbert-base/batch-3 min_cos_old_vs_new=1.0000000000
+WORST qwen3-embedding-0.6b max_abs_diff=0.000145 at qwen3-embedding-0.6b/short-2 min_cos_old_vs_new=0.9999996400
+WORST qwen3-reranker-0.6b max_abs_diff=1.99e-05 at qwen3-reranker-0.6b/long-8192 min_cos_old_vs_new=1.0000000000

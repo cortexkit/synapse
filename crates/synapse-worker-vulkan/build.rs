@@ -1,7 +1,13 @@
 use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf, process::Command};
 
-const SHADERS: [(&str, &str); 2] = [("plain", "vulkan1.2"), ("cooperative", "vulkan1.3")];
+// Attention has its own pipeline because its shared-memory tiles would
+// otherwise be reserved by every other kernel and lower their occupancy.
+const SHADERS: [(&str, &str); 3] = [
+    ("plain", "vulkan1.2"),
+    ("cooperative", "vulkan1.3"),
+    ("attention", "vulkan1.2"),
+];
 
 fn verify_spirv(bytes: &[u8]) {
     assert_eq!(bytes.len() % 4, 0, "SPIR-V word alignment");
