@@ -892,10 +892,8 @@ mod tests {
     fn a_package_file_without_a_safetensors_extension_loads_as_one_file() {
         // The module hands catalog lanes their converted package by its
         // content-addressed cache path, which has no file extension.
-        let dir = std::env::temp_dir().join(format!(
-            "synapse-engine-cuda-blob-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("synapse-engine-cuda-blob-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let blob = dir.join("9259f3b731a35f260d74df99b618231a4d68f5dce9d75c6e4f039e1dbad646cd");
         let header = br#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
