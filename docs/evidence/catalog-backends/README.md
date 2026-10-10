@@ -16,8 +16,8 @@ Commits named below:
   `https://github.com/cortexkit/synapse` when the box was set up. It was the
   starting point for every run.
 - **`76bf4cd1` and `dd7412b0`**: the two fix commits described next. They
-  were committed on top of `ff24e671` on the branch that also adds this
-  evidence (`alfonso/task/bg_b173cdb59264cfff-...`).
+  were committed on top of `ff24e671`, together with this evidence, and
+  merged into master with it.
 
 At `ff24e671`, every CUDA lane failed to load. Two bugs were fixed, each with
 a test that fails without the fix:
