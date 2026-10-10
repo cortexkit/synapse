@@ -1375,6 +1375,75 @@ fn directory_bytes(path: &Path) -> u64 {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn catalog_cold_install_load_continues_after_five_seconds_and_checks_on_first_request() {
+    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
+        return;
+    };
+    let pin = catalog["models"][0]["backends"][0]["fingerprint"].clone();
+    let mut h =
+        CatalogHarness::start_catalog("ok", None, catalog, files, "metal", Some("load:stall"))
+            .await;
+    let request = serde_json::json!({
+        "model":"gte-modernbert-base-metal", "text":"hello", "deadline_ms":30000
+    });
+    let missing = h.call("embed.query", request.clone()).await;
+    assert_eq!(missing["error"]["code"], "model_not_installed", "{missing}");
+    assert!(h.server.paths().is_empty());
+    assert_eq!(
+        h.call("models.list", serde_json::json!({})).await["models"],
+        serde_json::json!([])
+    );
+    let accepted = h.download("gte-modernbert-base", "cold-install").await;
+    let done = h
+        .wait_state(
+            accepted["job_id"].as_str().unwrap(),
+            &["committed", "failed"],
+        )
+        .await;
+    assert_eq!(done["state"], "committed", "{done}");
+    let before = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(before["models"][0]["self_check"]["state"], "pending");
+    assert!(before["models"][0]["self_check"]["checked_at_ms"].is_null());
+    assert_eq!(before["models"][0]["certified"], false);
+    let status = h
+        .call(
+            "model.status",
+            serde_json::json!({"model_id":"gte-modernbert-base-metal"}),
+        )
+        .await;
+    assert_eq!(
+        status["state"], "unloaded",
+        "download must not load the lane: {status}"
+    );
+    let started = Instant::now();
+    let loading = h.call("embed.query", request.clone()).await;
+    assert_eq!(loading["error"]["code"], "model_loading", "{loading}");
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert_eq!(loading["error"]["retry_after_ms"], 250);
+    let during = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(during["models"][0]["self_check"]["state"], "pending");
+    let status = h
+        .call(
+            "model.status",
+            serde_json::json!({"model_id":"gte-modernbert-base-metal"}),
+        )
+        .await;
+    assert_eq!(
+        status["state"], "loading",
+        "the timed-out request must leave the load running: {status}"
+    );
+    let served = h.serve_when_ready("embed.query", request).await;
+    assert!(served.get("error").is_none(), "{served}");
+    assert_eq!(served["fingerprint"], pin);
+    assert_eq!(served["dims"], 768);
+    let after = h.call("models.list", serde_json::json!({})).await;
+    assert_eq!(after["models"][0]["self_check"]["state"], "passed");
+    assert_eq!(after["models"][0]["fingerprints"], serde_json::json!([pin]));
+    assert_eq!(after["models"][0]["certified"], true);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
     let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
         return;
@@ -1407,6 +1476,10 @@ async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
         "stall override must time out the numerical check: {served}"
     );
     assert_eq!(served["error"]["retry_after_ms"], 250);
+    assert_eq!(
+        served["error"]["message"],
+        "catalog self-check exceeded 2000 ms"
+    );
     let listed = h.call("models.list", serde_json::json!({})).await;
     assert_eq!(listed["models"][0]["self_check"]["state"], "pending");
     let unload = h
@@ -1719,6 +1792,10 @@ async fn catalog_real_numerical_failure_persists_and_pinned_requests_fail_closed
     assert_eq!(
         refused["error"]["code"], "self_check_failed",
         "perturbed reference must fail: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        "catalog numerical self-check failed"
     );
     assert_eq!(
         refused["error"]["details"]["check_id"]

@@ -262,6 +262,25 @@ pub fn ranking(reference: &[f64], actual: &[f64]) -> Result<Ranking> {
     })
 }
 
+/// Maximum absolute rerank score error for a profile's numeric class.
+pub fn rerank_tolerance(class: ToleranceClass) -> f64 {
+    match class {
+        ToleranceClass::Fp32 => 0.005,
+        ToleranceClass::Fp16 => 0.02,
+    }
+}
+
+#[cfg(test)]
+mod tolerance_tests {
+    use super::*;
+
+    #[test]
+    fn rerank_tolerance_is_keyed_by_numeric_class() {
+        assert_eq!(rerank_tolerance(ToleranceClass::Fp32), 0.005);
+        assert_eq!(rerank_tolerance(ToleranceClass::Fp16), 0.02);
+    }
+}
+
 pub fn evaluate(
     manifest: &Manifest,
     profile_id: &str,
@@ -389,11 +408,7 @@ pub fn evaluate(
         result.metrics.max_norm_error = Some(max_norm);
     } else {
         result.metrics.max_absolute_error = Some(max_error);
-        gates.score &= max_error
-            <= match profile.rerank_tolerance_class {
-                ToleranceClass::Fp32 => 0.005,
-                ToleranceClass::Fp16 => 0.02,
-            };
+        gates.score &= max_error <= rerank_tolerance(profile.rerank_tolerance_class);
         for (id, (refs, scores)) in pools {
             let metric = ranking(&refs, &scores)?;
             gates.ranking &= metric.passed;

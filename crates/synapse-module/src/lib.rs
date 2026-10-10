@@ -22351,6 +22351,103 @@ mod tests {
     }
 
     #[test]
+    fn certification_catalog_derives_only_compiled_lanes_and_keeps_their_pins() {
+        let compiled = catalog::compiled_catalog().unwrap();
+        let declared = certification_catalog().unwrap();
+        let cells = synapse_certify::derive_cells(&declared.lanes);
+        assert_eq!(cells.len(), 30);
+        for cell in &cells {
+            let backend = compiled
+                .entry(&cell.model)
+                .unwrap()
+                .backend(synapse_certify::row_backend(&cell.row_id).unwrap())
+                .unwrap();
+            assert_eq!(cell.engine, backend.engine);
+            assert_eq!(cell.fingerprint, backend.fingerprint);
+        }
+        assert!(!cells.iter().any(|cell| {
+            (cell.row_id == "metal-m5" && cell.model == "qwen3-reranker-0.6b")
+                || (cell.row_id == "ane-m5" && cell.model == "gte-reranker-modernbert-base")
+        }));
+    }
+
+    fn catalog_rerank_numeric_result(reference: [f64; 2], scores: [f64; 2]) -> (bool, f64, f64) {
+        let (dir, _) = test_storage_descriptor("catalog-rerank-tolerance");
+        let mut spec = catalog_fixture_config("gte-reranker-modernbert-base.owned-metal");
+        spec.model_id = "gte-reranker-modernbert-base-metal".into();
+        let model = catalog_test_model(&dir, &spec);
+        let mut entry = catalog::compiled_catalog()
+            .unwrap()
+            .entry("gte-reranker-modernbert-base")
+            .unwrap()
+            .clone();
+        let backend = entry.backend("metal").unwrap().clone();
+        assert!(backend.profile.is_none());
+        let profile = CatalogProfile::load("gte-reranker-modernbert-base.owned-metal").unwrap();
+        assert_eq!(
+            profile.typed.profiles[&profile.id].rerank_tolerance_class,
+            synapse_parity::manifest::ToleranceClass::Fp32
+        );
+        let check = entry.self_check.as_mut().unwrap();
+        check.inputs = vec![
+            catalog::SelfCheckInput::Rerank(catalog::RerankSelfCheckInput {
+                query: "query".into(),
+                candidates: vec!["first".into(), "second".into()],
+            });
+            4
+        ];
+        check.reference.scores = Some(vec![reference.to_vec(); 4]);
+        let result = numerical_catalog_check(
+            &model,
+            &entry,
+            &backend,
+            |_| panic!("rerank must not call embedding inference"),
+            |pairs| {
+                assert_eq!(pairs.len(), 2);
+                Ok(synapse_core::RerankScores {
+                    scores: scores.iter().map(|p| (p / (1.0 - p)).ln() as f32).collect(),
+                })
+            },
+        )
+        .unwrap();
+        drop(model);
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn catalog_rerank_fp32_score_bound_is_005() {
+        let (passed, error, tolerance) = catalog_rerank_numeric_result([0.504, 0.5], [0.5, 0.5]);
+        assert!(passed);
+        assert!((error - 0.004).abs() < 1e-7);
+        assert_eq!(tolerance, 0.005);
+        let (passed, error, tolerance) = catalog_rerank_numeric_result([0.506, 0.5], [0.5, 0.5]);
+        assert!(
+            !passed,
+            "an fp16 bound would incorrectly admit a 0.006 score error"
+        );
+        assert!((error - 0.006).abs() < 1e-7);
+        assert_eq!(tolerance, 0.005);
+    }
+
+    #[test]
+    fn catalog_rerank_fp32_order_gap_is_005() {
+        let (passed, error, tolerance) =
+            catalog_rerank_numeric_result([0.502, 0.498], [0.499, 0.501]);
+        assert!(passed, "a reversed pair below the class gap is tolerated");
+        assert!(error < 0.005);
+        assert_eq!(tolerance, 0.005);
+        let (passed, error, tolerance) =
+            catalog_rerank_numeric_result([0.503, 0.497], [0.499, 0.501]);
+        assert!(
+            !passed,
+            "a reversed pair above the class gap must refuse even within the score bound"
+        );
+        assert!(error < 0.005);
+        assert_eq!(tolerance, 0.005);
+    }
+
+    #[test]
     fn profile_preload_attention_budget_covers_the_8192_token_ceiling() {
         let catalog = CatalogProfile::load("gte-modernbert-base.owned-metal").unwrap();
         assert_eq!(
@@ -24739,6 +24836,115 @@ mod catalog_runtime_tests {
         (root, state)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_catalog_lane_load_executes_environment_hard_link_without_preload() {
+        let original = env::current_exe().unwrap();
+        let built_dir = original.parent().unwrap().parent().unwrap();
+        let source = built_dir.join("synapse-worker-timeout-mock");
+        assert!(
+            source.is_file(),
+            "build synapse-worker-timeout-mock before module lib tests"
+        );
+        let scratch = built_dir.join(format!("synapse-env-worker-{}", std::process::id()));
+        let executable =
+            synapse_core::dev_binary::ckdev_binary_hard_link(&original, &scratch).unwrap();
+        let mut command =
+            synapse_core::without_launch_nonce(std::process::Command::new(executable));
+        command.args([
+            "--exact",
+            "catalog_runtime_tests::startup_environment_worker_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        command.env("SYNAPSE_TEST_STARTUP_WORKER", source);
+        for key in [
+            "SYNAPSE_TEST_CATALOG",
+            "SYNAPSE_TEST_RUNNABLE_BACKENDS",
+            "SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS",
+            "SYNAPSE_TIMEOUT_WORKER_EMBED_N",
+            "SYNAPSE_TIMEOUT_WORKER_NO_BUCKETS",
+            "SYNAPSE_TIMEOUT_WORKER_BUCKETS",
+            "SYNAPSE_TIMEOUT_WORKER_ABORT_ON_EMBED",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run in an isolated process by startup_catalog_lane_load_executes_environment_hard_link_without_preload"]
+    fn startup_environment_worker_fixture() {
+        use std::os::unix::fs::MetadataExt;
+        assert!(ModuleConfig::default().preload_models.is_empty());
+        let (root, state) = isolated_catalog_state("startup-env-worker", false);
+        assert!(state.runtime.loaded_models().is_empty());
+        let source = PathBuf::from(env::var_os("SYNAPSE_TEST_STARTUP_WORKER").unwrap());
+        let aliases = source
+            .parent()
+            .unwrap()
+            .join(format!("startup-worker-alias-{}", std::process::id()));
+        let worker = synapse_core::dev_binary::ckdev_binary_hard_link(&source, &aliases).unwrap();
+        let source_meta = fs::metadata(&source).unwrap();
+        let alias_meta = fs::metadata(&worker).unwrap();
+        assert_eq!(
+            (source_meta.dev(), source_meta.ino()),
+            (alias_meta.dev(), alias_meta.ino())
+        );
+        let log = root.join("worker-started");
+        env::set_var("SYNAPSE_TIMEOUT_WORKER_START_LOG", &log);
+        env::set_var(worker_binary_env_var("owned-vulkan"), &worker);
+        let entry = state
+            .runtime
+            .release_catalog
+            .entry("gte-modernbert-base")
+            .unwrap();
+        let backend = entry.backend("vulkan").unwrap();
+        let mut spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+        assert!(spec.worker_bin.is_none());
+        let fixture_dir = root.join("model");
+        let fixture = catalog_test_model(&fixture_dir, &spec);
+        spec.tokenizer_locator = ModelAssetLocator::LocalPath {
+            path: fixture_dir.join("catalog-tokenizer.json"),
+        };
+        spec.tokenizer_sanitized_digest =
+            format!("sha256:{}", fixture.tokenizer.sanitized_sha256());
+        let package = fixture_dir.join("package.safetensors");
+        fs::write(&package, b"mock worker does not interpret package bytes").unwrap();
+        spec.model_locator = ModelAssetLocator::LocalPath { path: package };
+        spec.worker_runtime_dir = Some(root.join("runtime"));
+        drop(fixture);
+        let model = load_catalog_model_blocking(
+            spec,
+            state.model_cache.clone(),
+            8192,
+            Duration::from_secs(10),
+            0,
+            Arc::new(Mutex::new(
+                owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(model.model_id, "gte-modernbert-base-vulkan");
+        let executed = PathBuf::from(fs::read_to_string(&log).unwrap())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(executed, worker.canonicalize().unwrap());
+        drop(model);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(aliases).unwrap();
+    }
+
     #[test]
     fn catalog_endpoint_and_asset_guards_reject_unpinned_network_io() {
         for value in [
@@ -27012,7 +27218,7 @@ fn catalog_complete_check(
         }
     }).map_err(catalog_store_error)
 }
-fn numerical_catalog_check(
+fn owned_numerical_catalog_check(
     model: &EmbeddingModel,
     entry: &catalog::CatalogEntry,
     backend: &catalog::CatalogBackend,
@@ -27026,6 +27232,22 @@ fn numerical_catalog_check(
     let engine = engine
         .lock()
         .map_err(|_| transient_model_load_error("owned engine mutex poisoned"))?;
+    numerical_catalog_check(
+        model,
+        entry,
+        backend,
+        |batch| engine.embed_batch(&model.loaded_model, batch),
+        |pairs| engine.rerank_pairs(&model.loaded_model, pairs),
+    )
+}
+
+fn numerical_catalog_check(
+    model: &EmbeddingModel,
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    embed_batch: impl Fn(TokenBatch) -> Result<Vec<Vec<f32>>, EngineError>,
+    rerank_pairs: impl Fn(Vec<Vec<u32>>) -> Result<synapse_core::RerankScores, EngineError>,
+) -> Result<(bool, f64, f64), WireOperationError> {
     let check = entry.self_check.as_ref().expect("self-check");
     if entry.task == "embed" {
         let texts = check
@@ -27041,9 +27263,7 @@ fn numerical_catalog_check(
             .tokenize_batch(texts)
             .map_err(|e| artifact_invalid_error(e.to_string()))?;
         apply_owned_tokenizer_policy(model, &mut tokenized);
-        let vectors = engine
-            .embed_batch(&model.loaded_model, tokenized.batch)
-            .map_err(engine_error_to_wire)?;
+        let vectors = embed_batch(tokenized.batch).map_err(engine_error_to_wire)?;
         let references = check.reference.vectors.as_ref().expect("embed references");
         let shape = vectors.len() == 8
             && vectors.iter().all(|v| {
@@ -27060,7 +27280,12 @@ fn numerical_catalog_check(
         };
         Ok((shape && min.is_finite() && min >= 0.999, min, 0.999))
     } else {
-        let tolerance = backend.rerank_abs_tolerance.expect("tolerance");
+        let profile_id = format!("{}.{}", entry.id, backend.engine);
+        let profile = CatalogProfile::load(&profile_id)
+            .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        let tolerance = synapse_parity::evaluator::rerank_tolerance(
+            profile.typed.profiles[&profile_id].rerank_tolerance_class,
+        );
         let mut max = 0.0f64;
         let mut passed = true;
         for (input, reference) in check
@@ -27073,9 +27298,7 @@ fn numerical_catalog_check(
             };
             let pairs =
                 owned_rerank_pairs(model, &input.query, &input.candidates)?.expect("owned pairs");
-            let raw = engine
-                .rerank_pairs(&model.loaded_model, pairs)
-                .map_err(engine_error_to_wire)?;
+            let raw = rerank_pairs(pairs).map_err(engine_error_to_wire)?;
             let scores = raw
                 .scores
                 .iter()
@@ -27978,7 +28201,7 @@ async fn ensure_catalog_lane_ready_owned(
     let call_backend = backend.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let _invocation = invocation;
-        let result = numerical_catalog_check(&call_model, &call_entry, &call_backend);
+        let result = owned_numerical_catalog_check(&call_model, &call_entry, &call_backend);
         (result, _invocation)
     });
     match tokio::time::timeout(Duration::from_millis(2000), handle).await {

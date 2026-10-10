@@ -85,6 +85,10 @@ fn run_worker<S: Read + Write>(
     load_sleep_ms: u64,
     embed_sleep_ms: u64,
 ) -> Result<()> {
+    if let Some(path) = std::env::var_os("SYNAPSE_TIMEOUT_WORKER_START_LOG") {
+        std::fs::write(path, std::env::current_exe()?.to_string_lossy().as_bytes())
+            .context("record mock worker executable")?;
+    }
     let embed_dims = std::env::var("SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

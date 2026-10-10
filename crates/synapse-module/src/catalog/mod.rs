@@ -20,8 +20,6 @@
 // build sees some of these items unused.
 #![cfg_attr(not(test), allow(dead_code))]
 
-pub(crate) mod evidence;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -124,8 +122,6 @@ pub(crate) struct CatalogBackend {
     pub normalize: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rerank_abs_tolerance: Option<f64>,
     pub fingerprint: String,
 }
 
@@ -230,10 +226,6 @@ pub(crate) enum CatalogError {
         backend: String,
         field: &'static str,
     },
-    #[error(
-        "embed entry '{id}' backend '{backend}' declares rerank-only field rerank_abs_tolerance"
-    )]
-    RerankFieldOnEmbed { id: String, backend: String },
     #[error("catalog entry '{id}' backend '{backend}' has fingerprint '{fingerprint}', expected 64 lowercase hex")]
     InvalidFingerprint {
         id: String,
@@ -775,12 +767,6 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
             Some(0) => return Err(invalid("dims", "0".to_string())),
             Some(_) => {}
         }
-        if row.rerank_abs_tolerance.is_some() {
-            return Err(CatalogError::RerankFieldOnEmbed {
-                id: id.to_string(),
-                backend,
-            });
-        }
     } else {
         for (field, present) in [
             ("pooling", row.pooling.is_some()),
@@ -794,13 +780,6 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
                     field,
                 });
             }
-        }
-        match row.rerank_abs_tolerance {
-            None => return Err(missing("rerank_abs_tolerance")),
-            Some(tolerance) if !(tolerance.is_finite() && tolerance > 0.0) => {
-                return Err(invalid("rerank_abs_tolerance", tolerance.to_string()))
-            }
-            Some(_) => {}
         }
     }
     if !is_lower_hex(&row.fingerprint, 64) {
@@ -937,7 +916,6 @@ struct FrozenBackend {
     pooling: Option<&'static str>,
     normalize: Option<bool>,
     dims: Option<u64>,
-    rerank_abs_tolerance: Option<f64>,
 }
 
 /// The frozen identity of one compiled catalog entry in this release.
@@ -974,7 +952,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "ane",
@@ -988,7 +965,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "cuda",
@@ -1002,7 +978,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "vulkan",
@@ -1016,7 +991,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
-                rerank_abs_tolerance: None,
             },
         ],
     },
@@ -1038,7 +1012,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
             FrozenBackend {
                 backend: "cuda",
@@ -1052,7 +1025,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
             FrozenBackend {
                 backend: "vulkan",
@@ -1066,7 +1038,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
         ],
     },
@@ -1088,7 +1059,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "ane",
@@ -1102,7 +1072,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "cuda",
@@ -1116,7 +1085,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
-                rerank_abs_tolerance: None,
             },
             FrozenBackend {
                 backend: "vulkan",
@@ -1130,7 +1098,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
-                rerank_abs_tolerance: None,
             },
         ],
     },
@@ -1152,7 +1119,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
             FrozenBackend {
                 backend: "cuda",
@@ -1166,7 +1132,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
             FrozenBackend {
                 backend: "vulkan",
@@ -1180,7 +1145,6 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 pooling: None,
                 normalize: None,
                 dims: None,
-                rerank_abs_tolerance: Some(0.005),
             },
         ],
     },
@@ -1250,7 +1214,7 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
             );
         }
         for (row, frozen_row) in entry.backends.iter().zip(frozen.backends) {
-            let literals: [(&str, String, String); 11] = [
+            let literals: [(&str, String, String); 10] = [
                 ("engine", frozen_row.engine.into(), row.engine.clone()),
                 (
                     "profile",
@@ -1289,11 +1253,6 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
                 ),
                 ("normalize", show(frozen_row.normalize), show(row.normalize)),
                 ("dims", show(frozen_row.dims), show(row.dims)),
-                (
-                    "rerank_abs_tolerance",
-                    show(frozen_row.rerank_abs_tolerance),
-                    show(row.rerank_abs_tolerance),
-                ),
             ];
             for (field, expected, actual) in literals {
                 if expected != actual {
@@ -1366,7 +1325,7 @@ mod tests {
                         {"path": "tokenizer.json", "role": "tokenizer", "sha256": sha('2'), "size_bytes": 20, "backends": ["metal"]}
                     ],
                     "backends": [
-                        {"backend": "metal", "engine": "owned-metal", "family": "gte-modernbert", "dtype": "f32", "execution": "explicit", "attention_units": 256, "max_tokens": 16, "rerank_abs_tolerance": 0.005, "fingerprint": sha('e')}
+                        {"backend": "metal", "engine": "owned-metal", "family": "gte-modernbert", "dtype": "f32", "execution": "explicit", "attention_units": 256, "max_tokens": 16, "fingerprint": sha('e')}
                     ],
                     "self_check": {
                         "fixture_revision": 1,
@@ -1672,51 +1631,6 @@ mod tests {
             assert!(
                 matches!(&error, CatalogError::MissingBackendField { field: found, .. } if *found == field),
                 "{field}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn schema_rejects_rerank_tolerance_on_embed_backends() {
-        let error =
-            schema_error(|doc| embed(doc)["backends"][0]["rerank_abs_tolerance"] = json!(0.01));
-        assert!(
-            matches!(error, CatalogError::RerankFieldOnEmbed { .. }),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn schema_rejects_rerank_backends_without_a_finite_positive_tolerance() {
-        let missing = schema_error(|doc| {
-            rerank(doc)["backends"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove("rerank_abs_tolerance");
-        });
-        assert!(
-            matches!(
-                &missing,
-                CatalogError::MissingBackendField {
-                    field: "rerank_abs_tolerance",
-                    ..
-                }
-            ),
-            "{missing}"
-        );
-        for value in [0.0, -0.005] {
-            let error = schema_error(|doc| {
-                rerank(doc)["backends"][0]["rerank_abs_tolerance"] = json!(value)
-            });
-            assert!(
-                matches!(
-                    &error,
-                    CatalogError::InvalidBackendField {
-                        field: "rerank_abs_tolerance",
-                        ..
-                    }
-                ),
-                "{value}: {error}"
             );
         }
     }
@@ -2202,15 +2116,10 @@ mod tests {
 
     #[test]
     fn release_rejects_load_literals_outside_the_frozen_set() {
-        let cases: [(&str, &str, Value); 7] = [
+        let cases: [(&str, &str, Value); 6] = [
             ("gte-modernbert-base", "dtype", json!("f32")),
             ("gte-modernbert-base", "pooling", json!("mean")),
             ("gte-modernbert-base", "execution", json!("lazy")),
-            (
-                "gte-reranker-modernbert-base",
-                "rerank_abs_tolerance",
-                json!(0.01),
-            ),
             ("gte-reranker-modernbert-base", "max_tokens", json!(4096)),
             ("qwen3-embedding-0.6b", "family", json!("gte-modernbert")),
             ("qwen3-embedding-0.6b", "dims", json!(768)),

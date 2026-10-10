@@ -151,7 +151,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9"
         },
         {
@@ -163,7 +162,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "829c20af3757ecd5bb53ab89507ff64d4382225688f5888d6236ffc1670f2d4d"
         },
         {
@@ -175,7 +173,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "160e6ae78d2bad1aa4b5a8a4125dc0f2e820e2aea5509057d7ac7cd656426c99"
         }
       ],
@@ -354,7 +351,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "afa50ba3e4c56f42c750d10751f91b700f812c73862bdec8977d3a3db169aef3"
         },
         {
@@ -366,7 +362,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688"
         },
         {
@@ -378,7 +373,6 @@
           "execution": "explicit",
           "attention_units": 67108864,
           "max_tokens": 8192,
-          "rerank_abs_tolerance": 0.005,
           "fingerprint": "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7"
         }
       ]
