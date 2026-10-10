@@ -22338,7 +22338,10 @@ mod tests {
             let expected = [
                 "c0f400f352d41b549b864b9cbe59bc7c401e820c48c0585b98d1bc7d7c6eecd0",
                 "27166bbf06d295c10dad348a8df8bf6774e209791bef402fc4847b24f96b1b39",
-                "3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2",
+                // gte-modernbert-base.owned-metal: the f16 ModernBERT graph moved to
+                // revision 5 (kernel revision owned-metal-graph-5-bucket-2), rotating
+                // this profile from 3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2.
+                "00cc3677488368ec06008388fcbaa60952faed7442a9d973d5e01f8af577b16f",
                 "7808303bba4061bbd0ee205c22a0a53d039c12b61a380dc7d2c2bf6f240a0934",
                 "a006367b6adb645e44c82c9a56e973f3423fb4f9be2461ff80a38df68aa9c543",
                 "510721ab2b99d667e5461764ac3c129e0244b4f1b32370a269608aa8e56bba20",
@@ -22373,51 +22376,76 @@ mod tests {
             let fixture: Value = serde_json::from_slice(bytes).unwrap();
             let inline: InlineConfig = serde_json::from_value(fixture["inline"].clone()).unwrap();
             let jobs: JobConfig = serde_json::from_value(fixture["jobs"].clone()).unwrap();
-            let owned = OwnedCatalogConfig {
-                family: OwnedFamily::parse(fixture["owned_family"].as_str().unwrap()).unwrap(),
-                dtype: OwnedDType::parse(fixture["owned_dtype"].as_str().unwrap()).unwrap(),
-                execution: "explicit".into(),
-                attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
-                config_locator: None,
-                extra_locators: Vec::new(),
-                identity_override: None,
+            let build = |identity_override: Option<EngineIdentity>| {
+                let owned = OwnedCatalogConfig {
+                    family: OwnedFamily::parse(fixture["owned_family"].as_str().unwrap()).unwrap(),
+                    dtype: OwnedDType::parse(fixture["owned_dtype"].as_str().unwrap()).unwrap(),
+                    execution: "explicit".into(),
+                    attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
+                    config_locator: None,
+                    extra_locators: Vec::new(),
+                    identity_override,
+                };
+                build_stored_model_config(
+                    fixture["model_id"].as_str().unwrap().into(),
+                    "owned-metal",
+                    parse_model_task(fixture["task"].as_str(), "owned-metal", "fixture").unwrap(),
+                    fixture["artifact_digest"].as_str().unwrap().into(),
+                    "safetensors".into(),
+                    fixture["sanitized_tokenizer_digest"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    ModelAssetLocator::LocalPath {
+                        path: "unused".into(),
+                    },
+                    ModelAssetLocator::LocalPath {
+                        path: "unused".into(),
+                    },
+                    String::new(),
+                    String::new(),
+                    parse_pooling(fixture["pooling"].as_str().unwrap()).unwrap(),
+                    fixture["normalize"].as_bool().unwrap(),
+                    fixture["max_tokens"].as_u64().unwrap() as usize,
+                    fixture["quant"].as_str().unwrap().into(),
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(owned),
+                    &inline,
+                    &jobs,
+                )
+                .unwrap()
             };
-            let spec = build_stored_model_config(
-                fixture["model_id"].as_str().unwrap().into(),
-                "owned-metal",
-                parse_model_task(fixture["task"].as_str(), "owned-metal", "fixture").unwrap(),
-                fixture["artifact_digest"].as_str().unwrap().into(),
-                "safetensors".into(),
-                fixture["sanitized_tokenizer_digest"]
-                    .as_str()
-                    .unwrap()
-                    .into(),
-                ModelAssetLocator::LocalPath {
-                    path: "unused".into(),
-                },
-                ModelAssetLocator::LocalPath {
-                    path: "unused".into(),
-                },
-                String::new(),
-                String::new(),
-                parse_pooling(fixture["pooling"].as_str().unwrap()).unwrap(),
-                fixture["normalize"].as_bool().unwrap(),
-                fixture["max_tokens"].as_u64().unwrap() as usize,
-                fixture["quant"].as_str().unwrap().into(),
-                false,
-                None,
-                None,
-                Vec::new(),
-                Some(owned),
-                &inline,
-                &jobs,
-            )
-            .unwrap();
             let expected = fixture["expected_fingerprint"]
                 .as_str()
                 .expect("preload fixture must pin expected_fingerprint");
-            assert_eq!(spec.fingerprint.0, expected);
+            let captured: EngineIdentity =
+                serde_json::from_value(fixture["captured"]["engine_identity"].clone()).unwrap();
+            // The captured production identity still rebuilds the captured fingerprint.
+            let replayed = build(Some(captured.clone()));
+            assert_eq!(replayed.fingerprint.0, expected);
+            assert!(!replayed.engine_identity.build_flags.contains_key("profile"));
+            let spec = build(None);
             assert!(!spec.engine_identity.build_flags.contains_key("profile"));
+            if fixture["model_id"] == "gte-modernbert-base-f16" {
+                // The f16 ModernBERT graph moved to revision 5 on purpose, so this
+                // lane's fingerprint rotates when the module is redeployed. The
+                // graph revision is the only identity field that changed.
+                let mut moved = captured.clone();
+                moved
+                    .build_flags
+                    .insert("graph_revision".into(), "5".into());
+                assert_eq!(spec.engine_identity, moved);
+                assert_eq!(
+                    spec.fingerprint.0,
+                    "050c8db66c5f7fd5e33a8b5872a5b28512674e3e8e57ed673d88d4e6fa4b72cf"
+                );
+            } else {
+                assert_eq!(spec.engine_identity, captured);
+                assert_eq!(spec.fingerprint.0, expected);
+            }
         }
     }
 
