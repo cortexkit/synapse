@@ -35,7 +35,10 @@ impl Guard {
         impl<'ast> Visit<'ast> for Raw<'_> {
             fn visit_expr_call(&mut self, call: &'ast ExprCall) {
                 let name = call_name(call);
-                if name.ends_with("ckdev_binary") || name.ends_with("ckdev_binary_hard_link") {
+                if name.ends_with("ckdev_binary")
+                    || name.ends_with("ckdev_binary_hard_link")
+                    || name.ends_with("ckdev_script")
+                {
                     return;
                 }
                 visit::visit_expr_call(self, call);

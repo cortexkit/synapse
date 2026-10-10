@@ -20,11 +20,67 @@ pub fn ckdev_binary(binary: impl AsRef<Path>, _scratch: impl AsRef<Path>) -> io:
 
 /// Certification must execute the same inode that was hashed, not a copy.
 /// Refuse a cross-volume layout rather than weakening that attestation.
+/// Hard links now reuse a content-addressed directory; certification still gets
+/// a hard link to the exact candidate bytes, so attestation is unchanged.
 pub fn ckdev_binary_hard_link(
     binary: impl AsRef<Path>,
     scratch: impl AsRef<Path>,
 ) -> io::Result<PathBuf> {
     hard_link_alias(binary.as_ref(), scratch.as_ref())
+}
+
+/// Publish a script to a stable content-addressed path under a development name.
+/// The script bytes are written once per unique content and published via `ckdev_binary`.
+/// Subsequent calls with identical bytes return the existing executable without rewriting.
+pub fn ckdev_script(name: impl AsRef<Path>, bytes: &[u8]) -> io::Result<PathBuf> {
+    let name_ref = name.as_ref();
+    let file_name = name_ref
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "script needs a UTF-8 file name",
+            )
+        })?;
+    let digest = hex::encode(Sha256::digest(bytes));
+    let dir = test_script_dir().join(&digest[..16]);
+    fs::create_dir_all(&dir)?;
+    let source = dir.join(file_name);
+    if !source.is_file() {
+        let temporary = dir.join(format!(
+            ".{file_name}-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&temporary, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
+        }
+        match fs::rename(&temporary, &source) {
+            Ok(()) => {}
+            Err(_) if source.is_file() => {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    ckdev_binary(&source, &dir)
+}
+
+/// Directory used to publish stable development test scripts across test runs.
+pub fn test_script_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("SYNAPSE_DEV_SCRIPTS_DIR") {
+        return PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dir = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    if dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+        dir.pop();
+    }
+    dir.join("ckdev-scripts")
 }
 
 fn development_name(binary: &Path) -> io::Result<&str> {
@@ -156,17 +212,62 @@ fn set_executable_permissions(_binary: &Path, _copy: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn destination_is_hard_link(destination: &Path, binary: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dest_meta = match fs::metadata(destination) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let bin_meta = fs::metadata(binary)?;
+        Ok(dest_meta.ino() == bin_meta.ino() && dest_meta.dev() == bin_meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::metadata(destination) {
+            Ok(m) => {
+                let bin_meta = fs::metadata(binary)?;
+                Ok(m.is_file() && m.len() == bin_meta.len())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn hard_link_alias(binary: &Path, scratch: &Path) -> io::Result<PathBuf> {
     let name = development_name(binary)?;
-    let dir = scratch.join(format!(
-        "dev-bin-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let mut source = File::open(binary)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hex::encode(hasher.finalize());
+    let dir = scratch.join(&digest[..16]);
     fs::create_dir_all(&dir)?;
     let destination = dir.join(format!("ckdev-{name}"));
-    fs::hard_link(binary, &destination)?;
-    Ok(destination)
+    if destination_is_hard_link(&destination, binary)? {
+        return Ok(destination);
+    }
+    let _ = fs::remove_file(&destination);
+    match fs::hard_link(binary, &destination) {
+        Ok(()) => Ok(destination),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if destination_is_hard_link(&destination, binary)? {
+                Ok(destination)
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +417,65 @@ mod tests {
             fs::metadata(alias).unwrap().ino()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_hard_link_aliases_reuse_one_link() {
+        let root = test_root("hard-link-reuse");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("ck-synapse");
+        fs::write(&source, b"hard link test image").unwrap();
+
+        let first = ckdev_binary_hard_link(&source, &root).unwrap();
+        let second = ckdev_binary_hard_link(&source, &root).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"hard link test image");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ckdev_script_publishes_and_reuses_stable_path() {
+        let script = b"#!/bin/sh\necho test\n";
+        let first = ckdev_script("ck-test-script.sh", script).unwrap();
+        let second = ckdev_script("ck-test-script.sh", script).unwrap();
+        assert_eq!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ckdev-"));
+        assert_eq!(fs::read(&first).unwrap(), script);
+    }
+
+    #[test]
+    fn ckdev_script_publishes_distinct_paths_for_different_contents_under_same_name() {
+        let first_bytes = if cfg!(windows) {
+            b"@echo off\r\necho first\r\n" as &[u8]
+        } else {
+            b"#!/bin/sh\necho first\n"
+        };
+        let second_bytes = if cfg!(windows) {
+            b"@echo off\r\necho second\r\n" as &[u8]
+        } else {
+            b"#!/bin/sh\necho second\n"
+        };
+        let script_name = if cfg!(windows) {
+            "ck-same-name.cmd"
+        } else {
+            "ck-same-name.sh"
+        };
+        let first = ckdev_script(script_name, first_bytes).unwrap();
+        let second = ckdev_script(script_name, second_bytes).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), first_bytes);
+        assert_eq!(fs::read(&second).unwrap(), second_bytes);
+
+        let first_out = std::process::Command::new(&first).output().unwrap();
+        assert!(String::from_utf8_lossy(&first_out.stdout).contains("first"));
+        let second_out = std::process::Command::new(&second).output().unwrap();
+        assert!(String::from_utf8_lossy(&second_out.stdout).contains("second"));
     }
 
     fn test_root(label: &str) -> PathBuf {
