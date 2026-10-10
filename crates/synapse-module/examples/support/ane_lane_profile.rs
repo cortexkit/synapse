@@ -310,8 +310,9 @@ pub(super) async fn run(workload: &Workload, out: &Path) -> Result<()> {
     records.push(a?);
     records.push(b?);
     records.push(measured(&candidate, "incident-short-after", &inputs[..1]).await?);
-    // Opt-in idle time before the 64-row calls, so they can be measured with
-    // or without the after-effects of the incident's first-time compile.
+    // Opt-in idle time before the 64-row calls (SYNAPSE_ANE_PROFILE_SETTLE_MS),
+    // so they can be timed with or without whatever the 1,024-token compile in
+    // the step above leaves behind.
     if let Some(settle) = std::env::var("SYNAPSE_ANE_PROFILE_SETTLE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())

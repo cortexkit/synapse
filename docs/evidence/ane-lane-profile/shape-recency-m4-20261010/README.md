@@ -22,3 +22,23 @@ phase b matches a and d. What does change is the first use of the older shape af
 the larger compiles: about one second (834–1088 ms) instead of about 40 ms, after
 which rows are back to about 21 ms. A recompile (phase c) avoids that first-row cost
 but takes 11–17 s itself.
+
+## Paired A/B: shape-compile lane change against master
+
+This experiment followed two single runs of the profile harness in which the 64-row
+calls looked slower with the compile-lane change than without it. Four alternating
+rounds of the same harness (`crates/synapse-module/examples/aft_embed_headtohead.rs`
+with `SYNAPSE_ANE_PROFILE_CATALOG=1` and `SYNAPSE_ANE_PROFILE_SETTLE_MS=20000`), with
+master and the change built from the same tree apart from the change, gave these
+wall times in ms:
+
+| Call | Master (4 rounds) | Median | With the change (4 rounds) | Median |
+| --- | --- | --- | --- | --- |
+| 64 rows, after the incident compiles | 2018, 1844, 1833, 4366 | 1931 | 1688, 1837, 4092, 2170 | 2004 |
+| 64 rows, warm | 1532, 1501, 1412, 1724 | 1517 | 1511, 1411, 1362, 3063 | 1461 |
+| two concurrent 64-row calls, first | 2873, 3261, 2483, 2948 | 2911 | 2613, 2602, 2633, 3098 | 2623 |
+| two concurrent 64-row calls, second | 3364, 3528, 2942, 3149 | 3257 | 2784, 2771, 2801, 3291 | 2793 |
+
+Both sides have occasional runs near twice the median, so the earlier single-run
+slowdown was run-to-run variance on the Neural Engine, not the change. With the
+change, concurrent calls finish about 10–14% sooner and single calls are unchanged.

@@ -18561,7 +18561,8 @@ mod tests {
             checks_after_batches, 1,
             "the self-check ran again after passing"
         );
-        // Every row of a batch pads to the 128-token shape: one exchange each.
+        // Every row pads to the same 128-token shape, so each batch is exactly
+        // one engine inference and no extra (self-check) inference ran.
         assert_eq!(inferences_for_batches, BATCHES);
         assert_eq!(worker_starts, 1, "a second worker process was started");
         assert_eq!(restarts, 0);

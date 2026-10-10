@@ -152,8 +152,9 @@ mod experiment {
             .context("profile has no converted package digest")?
             .to_owned();
         let mut model = Model::load(profile, &package, &digest)?;
-        // Identical rows of ordinary vocabulary ids; the last is the profile's
-        // terminal token, as serving composes it.
+        // Identical rows of ordinary vocabulary ids ending in the profile's
+        // terminal token, the same shape of input the module sends a worker
+        // after tokenizing (the embedding is read at the terminal token).
         let terminal = model.profile.model["grammar"]["terminal_tokens"][0]["id"]
             .as_u64()
             .context("profile has no terminal token")? as u32;
