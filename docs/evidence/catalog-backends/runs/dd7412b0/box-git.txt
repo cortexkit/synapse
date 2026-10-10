@@ -1,0 +1,4 @@
+dd7412b mason: let the CUDA engine load a package file without an extension
+76bf4cd mason: load owned-cuda catalog profiles with supervised execution
+078698a mason: record the replacement vast.ai rental
+227e027 mason: record vast.ai rental for the CUDA and Vulkan catalog lane proof

@@ -1,0 +1,4 @@
+5d9198edefa64fbf64ab7a0f483ceb0a9f79c1542e7f1d29628f214c3121136a  /root/assets/ck-synapse
+a7f323a198c7ef72cd8c79c0ebc6c5886890aab23f44af80e892040ea26b8ef3  /root/assets/ck-synapse-worker-cuda
+57f76c32ed3baca257b384691c07caee7102ccbbdee62179e54f32c835b0da0c  /root/assets/ck-synapse-worker-vulkan
+ddd5866fea4774942466ac0707eb3cce297df00168c3120e8a71fb7b4e89433c  /root/synapse/target/release/ckdev-synapse-certify

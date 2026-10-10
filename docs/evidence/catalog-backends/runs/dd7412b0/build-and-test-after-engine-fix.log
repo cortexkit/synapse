@@ -1,0 +1,14 @@
+dd7412b0409eb3c97d026c1bdd38797669813752
+0
+test model::tests::a_package_file_without_a_safetensors_extension_loads_as_one_file ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
+    Finished `release` profile [optimized] target(s) in 24.74s
+    Finished `release` profile [optimized] target(s) in 3.51s
+dd7412b0409eb3c97d026c1bdd38797669813752
+5d9198edefa64fbf64ab7a0f483ceb0a9f79c1542e7f1d29628f214c3121136a  /root/assets/ck-synapse
+a7f323a198c7ef72cd8c79c0ebc6c5886890aab23f44af80e892040ea26b8ef3  /root/assets/ck-synapse-worker-cuda
+57f76c32ed3baca257b384691c07caee7102ccbbdee62179e54f32c835b0da0c  /root/assets/ck-synapse-worker-vulkan
+ddd5866fea4774942466ac0707eb3cce297df00168c3120e8a71fb7b4e89433c  target/release/ckdev-synapse-certify
+0
+    Finished `release` profile [optimized] target(s) in 0.05s
+AFTER_DONE

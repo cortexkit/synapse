@@ -13,6 +13,9 @@
 | disk | 120 GB |
 | price | $0.316/h total (GPU offer $0.294/h plus disk) |
 | created | 2026-10-10T08:42:59Z |
+| destroyed | 2026-10-10T09:23:14Z |
+| wall time | 40 min |
+| cost | about $0.21 (40.25 min at $0.316/h) |
 
 ## Rental 1 (destroyed unused)
 
@@ -24,5 +27,16 @@
 | NVIDIA driver | 595.84 (vast `cuda_max_good` 13.2) |
 | price | $0.329/h total |
 | created | 2026-10-10T08:38:20Z |
-| destroyed | about 2026-10-10T08:42Z |
+| destroyed | about 2026-10-10T08:42Z (about 4 min, about $0.03) |
 | why | sshd refused every login: the host's `/root/.ssh/authorized_keys` had "bad ownership or modes" (from `vastai logs`), so the box was unreachable |
+
+## Total
+
+- Both rentals together were up for about 45 minutes.
+- Estimated cost: about $0.24.
+- Account credit fell from $10.003 to $9.725 after the second rental was
+  destroyed, a drop of $0.278. That figure includes vast's minimum billing
+  increments and bandwidth.
+
+After `vastai destroy instance 55175162` (2026-10-10T09:23:14Z), the account
+listed no instances: `vastai show instances --raw` printed `[]`.

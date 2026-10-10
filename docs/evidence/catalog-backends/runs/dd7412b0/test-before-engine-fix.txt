@@ -1,0 +1,6 @@
+# On the box: worktree at ff24e6715e1bb58ad6ba0c120b889ef7431ca6c3 plus only the
+# test hunks of dd7412b0 (crates/synapse-engine-cuda/src/model.rs), no fix.
+# CARGO_TARGET_DIR=/root/synapse/target cargo test -p synapse-engine-cuda --lib a_package_file_without
+test model::tests::a_package_file_without_a_safetensors_extension_loads_as_one_file ... FAILED
+thread 'model::tests::a_package_file_without_a_safetensors_extension_loads_as_one_file' (31971) panicked at crates/synapse-engine-cuda/src/model.rs:904:46:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s
