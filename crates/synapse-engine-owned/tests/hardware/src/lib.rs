@@ -204,6 +204,18 @@ mod tests {
     #[test]
     #[ignore = "requires verified GTE reranker weights; writes or compares raw preload logits"]
     fn preload_gte_raw_logits_match_baseline() {
+        // Production binaries are release builds, and the baseline compares
+        // bytes exactly. Optimized and unoptimized builds legitimately produce
+        // different logits (for example, LLVM merges the separate sin and cos
+        // calls in the RoPE tables into one sincos call only when optimizing),
+        // so a debug run would report a false regression or record a baseline
+        // that no shipped binary produces.
+        assert!(
+            !cfg!(debug_assertions),
+            "run with --release: production serves optimized-build numerics and this \
+             test compares raw logits byte for byte, so a debug build cannot match \
+             or record the baseline"
+        );
         let manifest = manifest();
         let slug = "gte-reranker-modernbert-base";
         let reference = fixtures(&manifest, slug);

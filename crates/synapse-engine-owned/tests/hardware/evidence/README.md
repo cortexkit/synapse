@@ -14,15 +14,32 @@ JSON `fingerprint` field is explicitly labeled as a hardware check with the
 manifest profile digest, not a module-generated lane fingerprint.
 
 `preload-baseline.f32le` contains 125 raw GTE reranker logits, in committed
-reference case order, generated from master commit
-`d49576a7664d333e4d173adfa8758d850745d317`. Its engine directory tree is identical
-to the implementation baseline `6c306520f63dffaa3307e75914a1166e100ee4cb`:
-`d3a6c0a264d6365dcdf1827eda6d2942fada0ea1`.
-The current preload path produced byte-identical outputs: 500 bytes, SHA-256
-`34c95ae0c13e7891429e69355f363bd15f75bc0ee2f3d8927996ca7764d04c72`.
-The baseline source was temporarily installed in this isolated worktree, built
-and run with the same harness/weights/toolchain, then restored from the index.
-No baseline source changes remain.
+reference case order (500 bytes, SHA-256
+`7d6eff7f4816a80e703df7ea37ff765d92a751c82246e1e096966cdcc178b4a2`). It was
+recaptured on 2026-10-10 with the following provenance:
+
+- Build profile: **release** (`cargo test --release`), the profile production
+  binaries use. The test now refuses to run in a debug build.
+- Engine source: master commit `e42617cd640446776ef92c1edad4f6d284636c97`. The
+  commit that adds this file changes only the hardware test crate; the
+  `crates/synapse-engine-owned/src` tree is `03772eca31d52b083eb970ab13f4f7f8c4bf6ab2`.
+- Machine: Mac17,6, macOS 27.0.1 (26A434), Xcode 27.0 (27A266a), cargo 1.99.0
+  and rustc 1.99.0, run on Metal with
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+- Weights: the manifest-pinned `gte-reranker-modernbert-base` snapshot, with all
+  four file digests checked by the test before loading.
+
+The same release bytes come out of commit `180c30f2`, so the engine's optimized
+numerics did not change between the original capture and the recapture.
+
+The original baseline (SHA-256
+`34c95ae0c13e7891429e69355f363bd15f75bc0ee2f3d8927996ca7764d04c72`) was generated
+from master commit `d49576a7664d333e4d173adfa8758d850745d317` in a **debug**
+build. Optimized builds differ from it in 123 of 125 logits by at most 2.21e-5,
+because LLVM merges the separate `sin` and `cos` calls in the ModernBERT RoPE
+tables into one `__sincosf_stret` call only when optimizing. Both are equally
+close to the fp32 CPU reference and rank both candidate pools identically. See
+`docs/reports/gte-reranker-logit-baseline.md`.
 
 No parity defect was found, so no inference fix was needed after the hardware
 runs. Selecting full Xcode instead of Command Line Tools and rebuilding the

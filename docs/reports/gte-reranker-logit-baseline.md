@@ -184,7 +184,12 @@ The production GTE reranker therefore serves the release bytes, SHA-256
 committed debug baseline `34c95ae0…04c72`. The release bytes were the same at
 the baseline commit and at master.
 
-## Proposed fix (not applied)
+## Proposed fix (applied afterwards)
+
+This was applied on 2026-10-10, after the report was written: the baseline was
+recaptured from a release build (SHA-256 `7d6eff7f…b4a2`, provenance in
+`crates/synapse-engine-owned/tests/hardware/evidence/README.md`), and the test
+now refuses to run in a debug build.
 
 Recommendation: **recapture the baseline from a release build, and make the
 test refuse to run in a debug build.** The second part only works together with
