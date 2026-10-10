@@ -1,4 +1,4 @@
-== run-1 / gte-modernbert
+== metal-fixed-cost/run-1 / gte-modernbert
 {
  "family": "gte-modernbert",
  "replays": 2,
@@ -57,7 +57,7 @@
  "gpu_fit": null,
  "vectors_sha256": "793dd764beacd50493d7258d18be58dabfa99ebfec31d6855127e5f78136bf94"
 }
-== run-1 / qwen3-0.6b
+== metal-fixed-cost/run-1 / qwen3-0.6b
 {
  "family": "qwen3-0.6b",
  "replays": 2,
@@ -116,7 +116,7 @@
  "gpu_fit": null,
  "vectors_sha256": "f0d3fc3623539d86586cfc3f5e0f60b2522b2ca445791a759e226bb95e88a0b6"
 }
-== run-gpu / gte-modernbert
+== metal-fixed-cost/run-gpu / gte-modernbert
 {
  "family": "gte-modernbert",
  "replays": 1,
@@ -181,7 +181,7 @@
  ],
  "vectors_sha256": "793dd764beacd50493d7258d18be58dabfa99ebfec31d6855127e5f78136bf94"
 }
-== run-gpu / qwen3-0.6b
+== metal-fixed-cost/run-gpu / qwen3-0.6b
 {
  "family": "qwen3-0.6b",
  "replays": 1,
@@ -246,7 +246,7 @@
  ],
  "vectors_sha256": "f0d3fc3623539d86586cfc3f5e0f60b2522b2ca445791a759e226bb95e88a0b6"
 }
-== ablation / gte-modernbert
+== metal-fixed-cost/ablation / gte-modernbert
 {
  "family": "gte-modernbert",
  "replays": 2,
@@ -301,6 +301,242 @@
   1.4975008668506717,
   0.0076033760980255,
   0.9192863203300488
+ ],
+ "gpu_fit": null,
+ "vectors_sha256": "796b23e7403a00570c1fc3160a34b27c8bd43f9fbafa54c298e2abaed0f5ebea"
+}
+== run-final/old-1 / gte-modernbert
+{
+ "family": "gte-modernbert",
+ "replays": 1,
+ "wall_s": 30.128166209,
+ "tokenize_ms": 747.3850019999998,
+ "engine_ms": 29296.698535999985,
+ "calls": 127,
+ "engine_calls": 826,
+ "passes": 826,
+ "rows": 6341,
+ "real_tokens": 855848,
+ "computed_tokens": 1085568,
+ "padded_rows": 239,
+ "shapes": {
+  "1x192": 2,
+  "1x256": 2,
+  "8x64": 26,
+  "8x96": 59,
+  "8x128": 167,
+  "8x160": 286,
+  "8x192": 182,
+  "8x256": 101,
+  "8x320": 1
+ },
+ "totals_ms": {
+  "engine_call": 29249.70799999999,
+  "pad": 1.2039999999999913,
+  "embed_in": 1511.2290000000032,
+  "host_prep": 425.56599999999975,
+  "select": 7.622999999999916,
+  "upload": 608.4320000000006,
+  "run": 25015.54099999999,
+  "readback": 178.10099999999983,
+  "native": 26059.69699999998,
+  "metal": 26234.734000000015,
+  "decode": 395.0940000000003,
+  "pool": 23.396000000000136,
+  "pass_total": 28999.84500000001
+ },
+ "run_ms_median_by_shape": {
+  "1x192": 8.48,
+  "1x256": 10.13,
+  "8x64": 13.89,
+  "8x96": 19.66,
+  "8x128": 23.57,
+  "8x160": 29.31,
+  "8x192": 33.81,
+  "8x256": 43.61,
+  "8x320": 57.5
+ },
+ "run_fit": [
+  5.150042324128403,
+  0.019125108735952,
+  0.8283755420387993
+ ],
+ "gpu_fit": null,
+ "vectors_sha256": "793dd764beacd50493d7258d18be58dabfa99ebfec31d6855127e5f78136bf94"
+}
+== run-final/final-1 / gte-modernbert
+{
+ "family": "gte-modernbert",
+ "replays": 1,
+ "wall_s": 14.761764917,
+ "tokenize_ms": 794.056212,
+ "engine_ms": 13922.01575,
+ "calls": 127,
+ "engine_calls": 826,
+ "passes": 826,
+ "rows": 6341,
+ "real_tokens": 855848,
+ "computed_tokens": 1085568,
+ "padded_rows": 239,
+ "shapes": {
+  "1x192": 2,
+  "1x256": 2,
+  "8x64": 26,
+  "8x96": 59,
+  "8x128": 167,
+  "8x160": 286,
+  "8x192": 182,
+  "8x256": 101,
+  "8x320": 1
+ },
+ "totals_ms": {
+  "engine_call": 13894.267000000009,
+  "pad": 1.2359999999999924,
+  "embed_in": 1574.0949999999982,
+  "host_prep": 445.15100000000024,
+  "select": 5.052999999999965,
+  "upload": 646.2419999999994,
+  "run": 10068.390000000009,
+  "readback": 170.432,
+  "native": 10980.233,
+  "metal": 11108.489999999996,
+  "decode": 381.4440000000001,
+  "pool": 12.881999999999977,
+  "pass_total": 13736.694
+ },
+ "run_ms_median_by_shape": {
+  "1x192": 6.26,
+  "1x256": 6.19,
+  "8x64": 7.9,
+  "8x96": 8.1,
+  "8x128": 9.64,
+  "8x160": 11.56,
+  "8x192": 13.72,
+  "8x256": 18.37,
+  "8x320": 25.38
+ },
+ "run_fit": [
+  1.983128606809272,
+  0.00776582007831434,
+  0.9484983637252685
+ ],
+ "gpu_fit": null,
+ "vectors_sha256": "796b23e7403a00570c1fc3160a34b27c8bd43f9fbafa54c298e2abaed0f5ebea"
+}
+== run-final/old-2 / gte-modernbert
+{
+ "family": "gte-modernbert",
+ "replays": 1,
+ "wall_s": 33.303193625,
+ "tokenize_ms": 1037.185171,
+ "engine_ms": 32161.229730000017,
+ "calls": 127,
+ "engine_calls": 826,
+ "passes": 826,
+ "rows": 6341,
+ "real_tokens": 855848,
+ "computed_tokens": 1085568,
+ "padded_rows": 239,
+ "shapes": {
+  "1x192": 2,
+  "1x256": 2,
+  "8x64": 26,
+  "8x96": 59,
+  "8x128": 167,
+  "8x160": 286,
+  "8x192": 182,
+  "8x256": 101,
+  "8x320": 1
+ },
+ "totals_ms": {
+  "engine_call": 32100.214,
+  "pad": 1.6589999999999887,
+  "embed_in": 2118.570000000002,
+  "host_prep": 583.2960000000008,
+  "select": 10.590999999999978,
+  "upload": 1045.2479999999991,
+  "run": 26202.85299999996,
+  "readback": 245.49000000000026,
+  "native": 27697.13300000003,
+  "metal": 27914.902000000002,
+  "decode": 523.892999999999,
+  "pool": 17.928999999999952,
+  "pass_total": 31689.426000000043
+ },
+ "run_ms_median_by_shape": {
+  "1x192": 12.87,
+  "1x256": 17.03,
+  "8x64": 14.74,
+  "8x96": 19.95,
+  "8x128": 24.35,
+  "8x160": 30.04,
+  "8x192": 34.7,
+  "8x256": 44.65,
+  "8x320": 67.64
+ },
+ "run_fit": [
+  8.228362573632609,
+  0.017876563710591566,
+  0.5972384177117844
+ ],
+ "gpu_fit": null,
+ "vectors_sha256": "793dd764beacd50493d7258d18be58dabfa99ebfec31d6855127e5f78136bf94"
+}
+== run-final/final-2 / gte-modernbert
+{
+ "family": "gte-modernbert",
+ "replays": 1,
+ "wall_s": 14.714758583,
+ "tokenize_ms": 731.309043,
+ "engine_ms": 13891.049894999984,
+ "calls": 127,
+ "engine_calls": 826,
+ "passes": 826,
+ "rows": 6341,
+ "real_tokens": 855848,
+ "computed_tokens": 1085568,
+ "padded_rows": 239,
+ "shapes": {
+  "1x192": 2,
+  "1x256": 2,
+  "8x64": 26,
+  "8x96": 59,
+  "8x128": 167,
+  "8x160": 286,
+  "8x192": 182,
+  "8x256": 101,
+  "8x320": 1
+ },
+ "totals_ms": {
+  "engine_call": 13849.83500000001,
+  "pad": 1.1779999999999933,
+  "embed_in": 1489.6460000000009,
+  "host_prep": 430.5529999999991,
+  "select": 5.99099999999995,
+  "upload": 677.3049999999995,
+  "run": 9704.378000000002,
+  "readback": 166.88999999999996,
+  "native": 10765.151,
+  "metal": 10898.76200000001,
+  "decode": 376.678,
+  "pool": 14.973999999999977,
+  "pass_total": 13605.207999999997
+ },
+ "run_ms_median_by_shape": {
+  "1x192": 6.75,
+  "1x256": 7.89,
+  "8x64": 7.53,
+  "8x96": 7.86,
+  "8x128": 9.16,
+  "8x160": 10.93,
+  "8x192": 12.96,
+  "8x256": 17.21,
+  "8x320": 33.2
+ },
+ "run_fit": [
+  2.5176402983602255,
+  0.0070237950211819574,
+  0.7811798600911184
  ],
  "gpu_fit": null,
  "vectors_sha256": "796b23e7403a00570c1fc3160a34b27c8bd43f9fbafa54c298e2abaed0f5ebea"

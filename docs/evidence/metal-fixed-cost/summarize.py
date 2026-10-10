@@ -148,7 +148,7 @@ def main():
             if not (run_dir / f"{family}.json").exists():
                 continue
             summary = summarize(run_dir, family)
-            print(f"== {run_dir.name} / {family}")
+            print(f"== {run_dir.parent.name}/{run_dir.name} / {family}")
             print(json.dumps(summary, indent=1))
 
 
