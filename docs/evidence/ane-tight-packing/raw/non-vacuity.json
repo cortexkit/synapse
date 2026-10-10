@@ -1,0 +1,80 @@
+{
+  "tool": "cargo 1.99.0 (5f94df478 2026-08-27), rustc 1.99.0 (b940084d7 2026-09-28)",
+  "command": "env -u TMPDIR CARGO_BUILD_JOBS=6 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer CARGO_TARGET_DIR=$HOME/mason-ane-tight-bg10a30/target cargo test --release --locked -p synapse-worker-ane-direct",
+  "mutation_evidence": [
+    {
+      "control": "replace the runtime mask placeholder with an all-zero graph constant",
+      "expected_red": "multirow::tight::tests::graph_has_four_runtime_inputs_and_no_constant_segment_geometry",
+      "captured_output": "graph_has_four_runtime_inputs_and_no_constant_segment_geometry FAILED: func main has 3 fp16 inputs, expected 4. 29 other unit tests passed; 17 hardware/subprocess tests ignored. single_row_layer_program_is_unchanged and runtime_mask_is_causal_isolated_and_padding_queries_are_finite stayed green.",
+      "applied_evidence": "crates/synapse-worker-ane-direct/src/tight_packing.rs: staged live state; empty git diff --stat before; during: 1 file changed, 2 insertions(+), 1 deletion(-); git checkout -- path && touch path; empty git diff --stat after",
+      "outcome": "reddened"
+    },
+    {
+      "control": "remove the tokens.len() <= width fallback refusal",
+      "expected_red": "multirow::tests::explicit_fallback_refuses_narrow_nonladder_empty_and_nonresident_rungs",
+      "captured_output": "explicit_fallback_refuses_narrow_nonladder_empty_and_nonresident_rungs FAILED: error did not contain invalid_fallback_rung. 29 other unit tests passed; 17 ignored. single_row_layer_program_is_unchanged and graph_has_four_runtime_inputs_and_no_constant_segment_geometry stayed green.",
+      "applied_evidence": "crates/synapse-worker-ane-direct/src/multirow.rs: staged live state; empty git diff --stat before; during: 1 file changed, 2 insertions(+), 1 deletion(-); git checkout -- path && touch path; empty git diff --stat after",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Insert a synthetic text field into the real clean hardware report",
+      "command": "python3 docs/evidence/ane-tight-packing/verify-raw.py docs/evidence/ane-tight-packing/raw",
+      "expected_red": "raw_reports_do_not_export_inputs",
+      "captured_output": "PASS raw_json_files_parse: 4 JSON files; FAIL raw_reports_do_not_export_inputs: planner-confirm-clean.json: forbidden key text; PASS raw_sha256_fields_are_digests: 4 JSON files",
+      "applied_evidence": "docs/evidence/ane-tight-packing/raw/planner-confirm-clean.json: staged live state; empty git diff --stat before; during: 1 file changed, 1 insertion(+); git checkout -- path && touch path; empty git diff --stat after",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Neutralize constant-compatible coefficient encoding, retaining nearest rounding",
+      "expected_red": "multirow::tight::tests::runtime_rope_coefficients_match_actual_graph_constant_bits",
+      "captured_output": "runtime_rope_coefficients_match_actual_graph_constant_bits FAILED: coefficient 1, width 256, actual bits 14419 vs constant bits 14418. Other 32 unit tests passed; 18 ignored. single_row_layer_program_is_unchanged and unqualified_runtime_rope_is_refused_before_compilation stayed green.",
+      "applied_evidence": "crates/synapse-worker-ane-direct/src/tight_packing.rs: staged live state; empty git diff --stat before; during: 1 file changed, 2 insertions(+), 7 deletions(-); git checkout -- path && touch path; empty git diff --stat after",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Replace the compact report's expected full-archive SHA-256 with a valid but wrong all-zero digest",
+      "command": "python3 docs/evidence/ane-tight-packing/verify-raw.py raw summary.json --full-raw <external archive>",
+      "expected_red": "full_raw_matches_compact",
+      "captured_output": "FAIL full_raw_matches_compact: external SHA-256 mismatch. PASS raw_json_files_parse, raw_reports_do_not_export_inputs, raw_sha256_fields_are_digests, compact_audit_retains_aggregates; 8 JSON files checked.",
+      "applied_evidence": "docs/evidence/ane-tight-packing/raw/tight-audit.json: staged live compact state; empty git diff --stat before; during: 1 file changed, 2 insertions(+), 1 deletion(-); git checkout -- path && touch path; empty git diff --stat after",
+      "outcome": "reddened"
+    }
+  ],
+  "restored_suite": {"unit_passed": 34, "unit_failed": 0, "ignored": 18, "integrity_passed": 1},
+  "unit_tests": [
+    "multirow::tight::tests::public_mode_accepts_only_qualified_profile_and_compatible_encoding",
+    "multirow::tight::tests::runtime_rope_coefficients_match_actual_graph_constant_bits",
+    "multirow::tight::tests::unqualified_runtime_rope_is_refused_before_compilation",
+    "multirow::replay::audit::row_audit_records_original_order_and_actual_positions_after_sorting",
+    "backend::admission_error_tests::only_resource_load_failure_gets_exhaustion_code",
+    "backend::cpu_rotation_tests::batched_fp32_projection_matches_independent_scalar_rows",
+    "backend::padding_golden_tests::direct_ane_padding_matches_independent_committed_golden",
+    "backend::tests::compiled_identity_separates_rotation_dtype_operation_shape_and_os",
+    "backend::tests::load_does_not_compile_and_nonresident_inference_refuses",
+    "backend::tests::placement_requires_exact_layer_cover_and_closed_cpu_set",
+    "backend::tests::smallest_rung_and_right_padding_mask",
+    "backend::fresh_process_hardware::production_shape_limit_refuses_fifth_shape",
+    "multirow::replay::windows_respect_export_batches_and_do_not_merge_eight_row_tails",
+    "multirow::tests::attention_bias_is_causal_and_never_crosses_rows",
+    "multirow::tests::each_row_takes_the_narrowest_slot_that_fits",
+    "multirow::tests::embedding_tail_matches_the_single_row_arithmetic",
+    "multirow::tests::explicit_fallback_refuses_narrow_nonladder_empty_and_nonresident_rungs",
+    "multirow::tests::multirow_layer_programs_build_with_one_input_and_the_packed_output_shape",
+    "multirow::tests::multirow_refuses_other_profiles_and_oversized_calls",
+    "multirow::tests::packed_index_is_a_bijection_with_the_documented_layouts",
+    "multirow::tests::packing_places_rows_in_slots_and_pads_the_rest",
+    "multirow::tests::passes_keep_every_row_once_in_order_and_send_long_rows_alone",
+    "multirow::tests::rope_positions_restart_for_every_row",
+    "multirow::tests::shape_refuses_single_rows_oversized_passes_and_unrunnable_widths",
+    "multirow::tests::single_row_layer_program_is_unchanged",
+    "multirow::tight::tests::embedding_gather_and_tail_use_real_segment_ends",
+    "multirow::tight::tests::first_fit_decreasing_covers_rows_once_and_preserves_ties",
+    "multirow::tight::tests::graph_has_four_runtime_inputs_and_no_constant_segment_geometry",
+    "multirow::tight::tests::runtime_mask_is_causal_isolated_and_padding_queries_are_finite",
+    "multirow::tight::tests::runtime_rope_restarts_at_each_variable_length_segment",
+    "worker::tests::hello_and_ping_do_not_resolve_private_framework",
+    "worker::tests::missing_private_api_is_typed_at_floor_and_load",
+    "worker::tests::unsupported_rerank_drains_raw_frame_then_pongs",
+    "worker::supervisor_tests::supervisor_wait_blocks_with_pending_bytes_and_detects_owner_death"
+  ]
+}

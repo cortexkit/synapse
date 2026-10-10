@@ -495,6 +495,18 @@ fn supported(model: &Model) -> Result<()> {
 }
 
 impl Model {
+    /// Opt-in Qwen3 fallback on an explicitly resident ladder width. Ordinary
+    /// run still selects the smallest fitting rung. Padding mask and last-token
+    /// pooling use the real tokens, not the requested padded width.
+    pub fn run_at_rung(&self, tokens: &[u32], width: usize) -> Result<Vec<f32>> {
+        supported(self)?;
+        ensure!(
+            LADDER.contains(&width) && !tokens.is_empty() && tokens.len() <= width,
+            "invalid_fallback_rung"
+        );
+        ane::autoreleasepool(|_| self.run_stages_at_rung(tokens, false, width))
+    }
+
     /// Compile one program per layer for `shape`. Refuses
     /// [`RowLayout::BatchAxis`], which returned wrong rows on hardware.
     pub fn compile_multirow(&self, shape: MultiRowShape) -> Result<MultiRowProgram> {
@@ -1013,6 +1025,33 @@ mod tests {
     }
 
     #[test]
+    fn explicit_fallback_refuses_narrow_nonladder_empty_and_nonresident_rungs() {
+        let model = synthetic::qwen_model(&[], 4);
+        for (tokens, width) in [
+            (vec![1; 129], 128),
+            (vec![1; 65], 64),
+            (vec![], 256),
+            (vec![1], 384),
+        ] {
+            assert!(model
+                .run_at_rung(&tokens, width)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid_fallback_rung"));
+        }
+        assert!(model
+            .run_at_rung(&[1; 65], 256)
+            .unwrap_err()
+            .to_string()
+            .contains("shape_not_admitted"));
+        assert!(model
+            .run(&[1; 65])
+            .unwrap_err()
+            .to_string()
+            .contains("shape_not_admitted"));
+    }
+
+    #[test]
     fn embedding_tail_matches_the_single_row_arithmetic() {
         let hidden_state: Vec<f32> = (0..16).map(|i| i as f32 * 0.37 - 2.0).collect();
         let weight: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 * 0.01).collect();
@@ -1053,6 +1092,13 @@ mod tests {
 /// `ANE_MULTIROW_REPLAY_EXTRA` (comma-separated extra shapes for the replay);
 /// `ANE_MULTIROW_REPLAY_ALL=1` (also replay every batch in the export's
 /// `.meta.json` plan).
+#[path = "tight_packing.rs"]
+pub mod tight;
+
+#[cfg(test)]
+#[path = "multirow_replay.rs"]
+mod replay;
+
 #[cfg(test)]
 mod hardware {
     use super::*;
@@ -1061,30 +1107,30 @@ mod hardware {
     use sha2::{Digest, Sha256};
     use std::time::Instant;
 
-    const SLUG: &str = "qwen3-embedding-0.6b";
+    pub(super) const SLUG: &str = "qwen3-embedding-0.6b";
     const SINGLE_ROW_GATE: f64 = 0.999;
     const MULTI_ROW_GATE: f64 = 0.9999;
 
-    fn load_average() -> f64 {
+    pub(super) fn load_average() -> f64 {
         let mut load = [0.0f64; 3];
         assert_eq!(unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }, 3);
         load[0]
     }
 
-    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    pub(super) fn cosine(a: &[f32], b: &[f32]) -> f64 {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
         let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         dot / (norm(a) * norm(b))
     }
 
-    fn max_abs(a: &[f32], b: &[f32]) -> f64 {
+    pub(super) fn max_abs(a: &[f32], b: &[f32]) -> f64 {
         a.iter()
             .zip(b)
             .map(|(x, y)| (*x as f64 - *y as f64).abs())
             .fold(0.0, f64::max)
     }
 
-    fn sha(bytes: &[u8]) -> String {
+    pub(super) fn sha(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
 
@@ -1095,17 +1141,17 @@ mod hardware {
             .collect::<Vec<_>>())
     }
 
-    fn ms(started: Instant) -> f64 {
+    pub(super) fn ms(started: Instant) -> f64 {
         started.elapsed().as_secs_f64() * 1000.0
     }
 
-    struct Chunk {
-        seq: u64,
-        text_sha256: String,
-        ids: Vec<u32>,
+    pub(super) struct Chunk {
+        pub(super) seq: u64,
+        pub(super) text_sha256: String,
+        pub(super) ids: Vec<u32>,
     }
 
-    fn tokenize_export(path: &str, tokenizer: &str, eos: u32) -> Vec<Chunk> {
+    pub(super) fn tokenize_export(path: &str, tokenizer: &str, eos: u32) -> Vec<Chunk> {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer).unwrap();
         std::fs::read_to_string(path)
             .unwrap()
@@ -1124,7 +1170,7 @@ mod hardware {
 
     /// The catalog's Qwen3 document composition: the tokenizer's own special
     /// tokens, then exactly one terminal end-of-text token.
-    fn compose(tokenizer: &tokenizers::Tokenizer, text: &str, eos: u32) -> Vec<u32> {
+    pub(super) fn compose(tokenizer: &tokenizers::Tokenizer, text: &str, eos: u32) -> Vec<u32> {
         let mut ids = tokenizer.encode(text, true).unwrap().get_ids().to_vec();
         if ids.last() == Some(&eos) {
             ids.pop();

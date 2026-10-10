@@ -5,6 +5,11 @@ one process per arm. Production Synapse on the development Mac was not touched:
 no Neural Engine compile or inference ran there. Raw JSON is in `raw/`; it holds
 hashes, token counts and fixture case names, never input text.
 
+**Follow-up:** [whole-export full-planner and runtime tight-packing results](../ane-tight-packing/README.md)
+measure both 64-row and production eight-row planning windows. They replace the
+~82 s estimate for tightly filling 256-column variable-length passes below with
+measured whole-export walls of 101 s (64-row planning) and 116 s (eight-row).
+
 ## Conclusions, ranked by confidence
 
 1. **High: several rows can share one pass, and the outputs do not change.**
