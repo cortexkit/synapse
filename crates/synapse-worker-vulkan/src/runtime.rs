@@ -782,7 +782,10 @@ impl Arena {
     }
 }
 
-/// Operation code served by the separate attention pipeline.
+/// Push-constant operation code for self-attention. Only the attention
+/// pipeline (shaders/attention.comp) implements it; it is kept out of the
+/// plain shader because its shared-memory tiles would lower the occupancy of
+/// every other kernel there.
 const ATTENTION_OP: u32 = 6;
 
 /// Threads that share one query in the attention shader, which pads the head
@@ -1578,5 +1581,31 @@ impl Engine {
             input,
             count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attention_lanes;
+
+    /// The attention shader sizes its tiles from the lane count alone; every
+    /// supported head width must fit its registers and shared arrays.
+    #[test]
+    fn attention_geometry_fits_shader_arrays_for_every_head_width() {
+        for dim in 1..=256 {
+            let lanes = attention_lanes(dim);
+            assert!([2, 4, 8].contains(&lanes), "{dim}");
+            // Each thread holds eight vec4 slices of the head.
+            assert!(lanes * 32 >= dim, "{dim}");
+            let width = lanes * 8;
+            let keys = 512 / width;
+            // Key and value tiles hold 512 vec4; keys advance four at a time;
+            // partial scores hold 64 per key in 2048 floats.
+            assert_eq!(keys * width, 512, "{dim}");
+            assert_eq!(keys % 4, 0, "{dim}");
+            assert!(keys * 64 <= 2048, "{dim}");
+        }
+        assert_eq!(attention_lanes(64), 2);
+        assert_eq!(attention_lanes(128), 4);
     }
 }

@@ -1,0 +1,64 @@
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+     Running tests/gpu_parity.rs (target/release/deps/gpu_parity-783633c9ba8da8d2)
+
+running 1 test
+test four_models_match_reference_vectors_scores_window_and_padding ... MoltenVK plain-path adapter: {"index":0,"discrete":false,"cpu":false,"vendor":4203,"api_major":1,"api_minor":3,"shader_float16":true,"storage_buffer16_bit_access":true,"subgroup_arithmetic":true,"subgroup_compute_stage":true,"max_storage_buffer_range":4294967295,"device_local_heaps":[137438953472],"cooperative_matrix":false}
+{"vulkan_load_report":{"allocations":1,"driver_memory_requirements_size":563911424,"heap_index":0,"requested_device_local_bytes":563911424}}
+gte-modernbert-base short-0 cosine=0.999997855
+gte-modernbert-base short-1 cosine=0.999999904
+gte-modernbert-base short-2 cosine=0.999999917
+gte-modernbert-base short-3 cosine=0.999999926
+gte-modernbert-base boundary-129 cosine=0.999999928
+gte-modernbert-base batch-0 cosine=0.999999940
+gte-modernbert-base batch-1 cosine=0.999999904
+gte-modernbert-base batch-2 cosine=0.999999914
+gte-modernbert-base batch-3 cosine=0.999999872
+gte-modernbert-base batch-4 cosine=0.999999840
+gte-modernbert-base batch-5 cosine=0.999999911
+GPU_PARITY gte-modernbert-base min_cosine=0.999997855 rows=11 padded_width=200
+GPU_PARITY gte-modernbert-base boundary-127 tokens=127 cosine=0.999999920
+GPU_PARITY gte-modernbert-base boundary-128 tokens=128 cosine=0.999999930
+GPU_PARITY gte-modernbert-base boundary-511 tokens=511 cosine=0.999999920
+GPU_PARITY gte-modernbert-base boundary-512 tokens=512 cosine=0.999999911
+GPU_PARITY gte-modernbert-base boundary-513 tokens=513 cosine=0.999999876
+GPU_PARITY gte-modernbert-base long-8192 tokens=8192 cosine=0.999999949
+MoltenVK plain-path adapter: {"index":0,"discrete":false,"cpu":false,"vendor":4203,"api_major":1,"api_minor":3,"shader_float16":true,"storage_buffer16_bit_access":true,"subgroup_arithmetic":true,"subgroup_compute_stage":true,"max_storage_buffer_range":4294967295,"device_local_heaps":[137438953472],"cooperative_matrix":false}
+{"vulkan_load_report":{"allocations":1,"driver_memory_requirements_size":564312064,"heap_index":0,"requested_device_local_bytes":564312064}}
+GPU_PARITY gte-reranker-modernbert-base max_score_error=0.001288861 min_kendall_tau=1.000000000 rows=19
+GPU_PARITY gte-reranker-modernbert-base boundary-127 tokens=127 score_error=0.000055850
+GPU_PARITY gte-reranker-modernbert-base boundary-128 tokens=128 score_error=0.000050724
+GPU_PARITY gte-reranker-modernbert-base boundary-511 tokens=511 score_error=0.000029266
+GPU_PARITY gte-reranker-modernbert-base boundary-512 tokens=512 score_error=0.000028551
+GPU_PARITY gte-reranker-modernbert-base boundary-513 tokens=513 score_error=0.000040710
+GPU_PARITY gte-reranker-modernbert-base long-8192 tokens=8192 score_error=0.000060856
+MoltenVK plain-path adapter: {"index":0,"discrete":false,"cpu":false,"vendor":4203,"api_major":1,"api_minor":3,"shader_float16":true,"storage_buffer16_bit_access":true,"subgroup_arithmetic":true,"subgroup_compute_stage":true,"max_storage_buffer_range":4294967295,"device_local_heaps":[137438953472],"cooperative_matrix":false}
+{"vulkan_load_report":{"allocations":1,"driver_memory_requirements_size":1764145408,"heap_index":0,"requested_device_local_bytes":1764145408}}
+qwen3-embedding-0.6b short-0 cosine=0.102998458
+qwen3-embedding-0.6b short-1 cosine=0.229196126
+qwen3-embedding-0.6b short-2 cosine=0.219334319
+qwen3-embedding-0.6b short-3 cosine=0.255626442
+qwen3-embedding-0.6b boundary-129 cosine=0.175268585
+qwen3-embedding-0.6b batch-0 cosine=0.227200872
+qwen3-embedding-0.6b batch-1 cosine=0.229196126
+qwen3-embedding-0.6b batch-2 cosine=0.264374818
+qwen3-embedding-0.6b batch-3 cosine=0.100344844
+qwen3-embedding-0.6b batch-4 cosine=0.185005756
+qwen3-embedding-0.6b batch-5 cosine=0.127696683
+GPU_PARITY qwen3-embedding-0.6b min_cosine=0.100344844 rows=11 padded_width=200
+
+thread 'four_models_match_reference_vectors_scores_window_and_padding' (43520994) panicked at crates/synapse-worker-vulkan/tests/gpu_parity.rs:171:13:
+qwen3-embedding-0.6b min cosine 0.1003448444239047
+FAILED
+
+failures:
+
+failures:
+    four_models_match_reference_vectors_scores_window_and_padding
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.91s
+
+error: test failed, to rerun pass `-p synapse-worker-vulkan --test gpu_parity`

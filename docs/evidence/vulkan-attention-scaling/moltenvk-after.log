@@ -1,0 +1,38 @@
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+prefrontal-build-slot: waiting for a compile slot (2 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+     Running tests/gpu_scaling.rs (target/release/deps/gpu_scaling-e2e8b0c9bd014e66)
+
+running 1 test
+test one_row_time_from_512_to_8192_tokens ... MoltenVK plain-path adapter: {"index":0,"discrete":false,"cpu":false,"vendor":4203,"api_major":1,"api_minor":3,"shader_float16":true,"storage_buffer16_bit_access":true,"subgroup_arithmetic":true,"subgroup_compute_stage":true,"max_storage_buffer_range":4294967295,"device_local_heaps":[137438953472],"cooperative_matrix":false}
+{"vulkan_load_report":{"allocations":1,"driver_memory_requirements_size":1764145408,"heap_index":0,"requested_device_local_bytes":1764145408}}
+TMP_VK_PROFILE width=512 ["op0:n=1:s=0.134", "op1:n=196:s=0.630", "op2:n=113:s=0.039", "op4:n=28:s=0.010", "op5:n=56:s=0.015", "op6:n=28:s=0.039", "op7:n=1:s=0.000", "op10:n=1:s=0.000", "op11:n=56:s=0.017"]
+TMP_VK_PROFILE width=512 ["op0:n=1:s=0.000", "op1:n=196:s=0.880", "op2:n=113:s=0.044", "op4:n=28:s=0.009", "op5:n=56:s=0.014", "op6:n=28:s=0.050", "op7:n=1:s=0.001", "op10:n=1:s=0.001", "op11:n=56:s=0.016"]
+GPU_SCALING qwen3-embedding-0.6b tokens=512 seconds=1.019 growth=-
+TMP_VK_PROFILE width=1024 ["op0:n=1:s=0.000", "op1:n=196:s=1.868", "op2:n=113:s=0.053", "op4:n=28:s=0.011", "op5:n=56:s=0.018", "op6:n=28:s=0.161", "op7:n=1:s=0.001", "op10:n=1:s=0.001", "op11:n=56:s=0.025"]
+GPU_SCALING qwen3-embedding-0.6b tokens=1024 seconds=2.142 growth=2.10
+TMP_VK_PROFILE width=2048 ["op0:n=1:s=0.000", "op1:n=196:s=3.189", "op2:n=113:s=0.065", "op4:n=28:s=0.013", "op5:n=56:s=0.024", "op6:n=28:s=0.432", "op7:n=1:s=0.001", "op10:n=1:s=0.000", "op11:n=56:s=0.023"]
+GPU_SCALING qwen3-embedding-0.6b tokens=2048 seconds=3.752 growth=1.75
+TMP_VK_PROFILE width=4096 ["op0:n=1:s=0.000", "op1:n=196:s=5.889", "op2:n=113:s=0.056", "op4:n=28:s=0.016", "op5:n=56:s=0.025", "op6:n=28:s=1.288", "op7:n=1:s=0.002", "op10:n=1:s=0.000", "op11:n=56:s=0.021"]
+GPU_SCALING qwen3-embedding-0.6b tokens=4096 seconds=7.302 growth=1.95
+TMP_VK_PROFILE width=8192 ["op0:n=1:s=0.000", "op1:n=196:s=12.059", "op2:n=113:s=0.081", "op4:n=28:s=0.026", "op5:n=56:s=0.037", "op6:n=28:s=4.493", "op7:n=1:s=0.004", "op10:n=1:s=0.000", "op11:n=56:s=0.075"]
+GPU_SCALING qwen3-embedding-0.6b tokens=8192 seconds=16.781 growth=2.30
+MoltenVK plain-path adapter: {"index":0,"discrete":false,"cpu":false,"vendor":4203,"api_major":1,"api_minor":3,"shader_float16":true,"storage_buffer16_bit_access":true,"subgroup_arithmetic":true,"subgroup_compute_stage":true,"max_storage_buffer_range":4294967295,"device_local_heaps":[137438953472],"cooperative_matrix":false}
+{"vulkan_load_report":{"allocations":1,"driver_memory_requirements_size":563911424,"heap_index":0,"requested_device_local_bytes":563911424}}
+TMP_VK_PROFILE width=512 ["op0:n=1:s=0.020", "op1:n=88:s=0.184", "op2:n=45:s=0.017", "op4:n=22:s=0.006", "op5:n=44:s=0.011", "op6:n=22:s=0.014", "op7:n=1:s=0.000", "op10:n=1:s=0.000", "op11:n=46:s=0.012"]
+TMP_VK_PROFILE width=512 ["op0:n=1:s=0.000", "op1:n=88:s=0.191", "op2:n=45:s=0.016", "op4:n=22:s=0.006", "op5:n=44:s=0.011", "op6:n=22:s=0.013", "op7:n=1:s=0.000", "op10:n=1:s=0.000", "op11:n=46:s=0.011"]
+GPU_SCALING gte-modernbert-base tokens=512 seconds=0.251 growth=-
+TMP_VK_PROFILE width=1024 ["op0:n=1:s=0.000", "op1:n=88:s=0.379", "op2:n=45:s=0.022", "op4:n=22:s=0.007", "op5:n=44:s=0.012", "op6:n=22:s=0.027", "op7:n=1:s=0.004", "op10:n=1:s=0.001", "op11:n=46:s=0.018"]
+GPU_SCALING gte-modernbert-base tokens=1024 seconds=0.474 growth=1.89
+TMP_VK_PROFILE width=2048 ["op0:n=1:s=0.001", "op1:n=88:s=0.814", "op2:n=45:s=0.020", "op4:n=22:s=0.012", "op5:n=44:s=0.015", "op6:n=22:s=0.077", "op7:n=1:s=0.000", "op10:n=1:s=0.000", "op11:n=46:s=0.016"]
+GPU_SCALING gte-modernbert-base tokens=2048 seconds=0.958 growth=2.02
+TMP_VK_PROFILE width=4096 ["op0:n=1:s=0.000", "op1:n=88:s=1.686", "op2:n=45:s=0.027", "op4:n=22:s=0.014", "op5:n=44:s=0.017", "op6:n=22:s=0.242", "op7:n=1:s=0.001", "op10:n=1:s=0.000", "op11:n=46:s=0.017"]
+GPU_SCALING gte-modernbert-base tokens=4096 seconds=2.006 growth=2.10
+TMP_VK_PROFILE width=8192 ["op0:n=1:s=0.000", "op1:n=88:s=3.159", "op2:n=45:s=0.028", "op4:n=22:s=0.015", "op5:n=44:s=0.022", "op6:n=22:s=0.774", "op7:n=1:s=0.001", "op10:n=1:s=0.000", "op11:n=46:s=0.023"]
+GPU_SCALING gte-modernbert-base tokens=8192 seconds=4.024 growth=2.01
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.44s
+
