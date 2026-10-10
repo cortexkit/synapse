@@ -91,9 +91,10 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
 
 #[test]
 fn only_the_graph_revision_moved_the_gte_modernbert_metal_fingerprint() {
-    // Graph revision 5 of the f16 ModernBERT graph rotated the gte-modernbert-base
-    // Metal lane. Recomputing it with the previous revision must give back the
-    // fingerprint the lane had before, so nothing else about the lane changed.
+    // Moving the f16 ModernBERT graph from revision 4 to 5 changed the
+    // gte-modernbert-base Metal lane's fingerprint from b904dd7b... to 9ca42893....
+    // Recomputing the lane with graph_revision 4 must give back b904dd7b..., which
+    // shows the graph revision is the only input that changed.
     let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();

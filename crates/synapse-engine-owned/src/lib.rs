@@ -182,8 +182,11 @@ pub const fn graph_revision(family: ModelFamily, dtype: OwnedDType) -> u32 {
     }
 }
 
-/// Kernel revision recorded in an owned-metal catalog lane's numeric profile. It
-/// names the graph revision of the lane's family and dtype and the bucket policy.
+/// Kernel revision string for one family and dtype, for example
+/// `owned-metal-graph-5-bucket-2`: the graph revision from `graph_revision` and
+/// `BUCKET_POLICY_VERSION`, the version of the sequence-bucket ladder. The module
+/// records it in the numeric profile of owned-metal catalog lanes, so it is part
+/// of their fingerprints.
 #[must_use]
 pub fn metal_kernel_revision(family: ModelFamily, dtype: OwnedDType) -> String {
     format!(
@@ -1311,8 +1314,9 @@ mod tests {
 
     #[test]
     fn only_the_f16_modernbert_graph_moved_to_revision_5() {
-        // Qwen3's identity, and with it its fingerprint and package cache key,
-        // must stay exactly as served before the f16 ModernBERT matmul change.
+        // Only the f16 ModernBERT graph changed structure (its weight projections
+        // now multiply in f16). Qwen3's graph did not, so its identity, and with
+        // it its fingerprint and package cache key, must stay on revision 4.
         let qwen = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
         assert_eq!(qwen.engine, "owned-metal");
         assert_eq!(qwen.version, "owned-metal-v1");
@@ -1332,7 +1336,8 @@ mod tests {
             (ModelFamily::Qwen3, OwnedDType::F32, 4),
             (ModelFamily::MiniLm, OwnedDType::F16, 4),
             (ModelFamily::MiniLm, OwnedDType::F32, 4),
-            // The f32 graph (the reranker's catalog profile) is structurally unchanged.
+            // The f32 ModernBERT graph, which the gte reranker's catalog profile
+            // uses, multiplied in f32 before and after, so it stays on revision 4.
             (ModelFamily::GteModernBert, OwnedDType::F32, 4),
             (ModelFamily::GteModernBert, OwnedDType::F16, 5),
         ] {

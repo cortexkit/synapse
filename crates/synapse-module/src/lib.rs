@@ -15330,12 +15330,16 @@ fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidenc
 
 /// Reference similarity margin below which a neighbour swap counts as a near tie.
 ///
-/// f16 lanes differ from their fp32 reference by about 2e-4 per similarity: the
-/// owned-Metal gte-modernbert f16 graph with f32 matmuls measured a mean
-/// |similarity error| of 1.98e-4 over 6,341 rows x 500 queries
-/// (docs/evidence/metal-fixed-cost/README.md). Two neighbours whose reference
-/// similarities differ by less than about 2.5x that error can trade places in any
-/// f16 lane, so such a swap measures rounding, not ranking quality.
+/// An f16 lane's pairwise similarities differ from its fp32 reference by f16
+/// rounding error. For the owned-Metal gte-modernbert f16 graph (with f32
+/// matmuls), the mean |similarity error| against its f32 graph was 1.98e-4 over
+/// 6,341 code chunks x 500 query chunks (p99 about 6.6e-4 over all pairs of a
+/// 1,500-chunk sample); the graph with f16 matmuls measured 1.99e-4
+/// (docs/evidence/metal-fixed-cost/README.md). Two
+/// neighbours whose reference similarities differ by less than about 2.5x that
+/// mean error can trade places from rounding alone, so such a swap does not
+/// measure ranking quality. Lanes with a larger rounding error than this
+/// measured one are not covered by that basis.
 const RANK_OVERLAP_NEAR_TIE_MARGIN: f64 = 5e-4;
 
 /// Mean and worst-decile top-k neighbour overlap of `left` against `right`, the

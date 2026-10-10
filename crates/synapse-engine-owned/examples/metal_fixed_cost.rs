@@ -1,5 +1,7 @@
-//! Replays AFT's exported engram chunks through the owned Metal engine, in the
-//! module's own engine-call shape, to attribute where serving time goes.
+//! Replays the engram code chunks exported by AFT (the agent file-tools client,
+//! which embeds code chunks through Synapse, 64 rows per call and two calls in
+//! flight) through the owned Metal engine, in the module's own engine-call
+//! shape, to attribute where serving time goes.
 //!
 //! Usage:
 //! `metal_fixed_cost FAMILY MODEL_DIR INPUT_JSONL OUT_JSON CACHE_DIR [REPLAYS] [DTYPE]`
