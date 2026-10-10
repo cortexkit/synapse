@@ -24920,7 +24920,8 @@ mod catalog_runtime_tests {
         let package = fixture_dir.join("package.safetensors");
         fs::write(&package, b"mock worker does not interpret package bytes").unwrap();
         spec.model_locator = ModelAssetLocator::LocalPath { path: package };
-        spec.worker_runtime_dir = Some(root.join("runtime"));
+        let runtime_dir = PathBuf::from("/tmp").join(format!("sew-{}", std::process::id()));
+        spec.worker_runtime_dir = Some(runtime_dir.clone());
         drop(fixture);
         let model = load_catalog_model_blocking(
             spec,
@@ -24943,6 +24944,7 @@ mod catalog_runtime_tests {
         drop(state);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(aliases).unwrap();
+        fs::remove_dir_all(runtime_dir).unwrap();
     }
 
     #[test]

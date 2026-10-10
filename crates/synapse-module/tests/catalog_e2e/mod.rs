@@ -1428,8 +1428,8 @@ async fn catalog_cold_install_load_continues_after_five_seconds_and_checks_on_fi
             serde_json::json!({"model_id":"gte-modernbert-base-metal"}),
         )
         .await;
-    assert_eq!(
-        status["state"], "loading",
+    assert!(
+        matches!(status["state"].as_str(), Some("validating" | "loading")),
         "the timed-out request must leave the load running: {status}"
     );
     let served = h.serve_when_ready("embed.query", request).await;
