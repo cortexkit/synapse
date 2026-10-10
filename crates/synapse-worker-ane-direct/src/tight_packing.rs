@@ -4,8 +4,10 @@
 use super::*;
 use crate::backend::Profile;
 
-/// Fastest tested width on AFT's 6,341-row Qwen3-Embedding-0.6B export;
-/// every output matched standalone bits and passed the 0.9999 cosine gate.
+/// Fastest tested width for Qwen3-Embedding-0.6B on a 6,341-row recorded
+/// code-search export (docs/evidence/ane-tight-packing). Every packed output
+/// was bit-identical to the same row embedded alone; the audit's pass bar was
+/// cosine 0.9999 against that standalone output.
 pub const RECOMMENDED_TIGHT_WIDTH: usize = 256;
 
 /// A first-fit-decreasing plan. Indices refer to the caller's input order.
@@ -301,11 +303,14 @@ fn public_mode(profile: &Profile, width: usize) -> Result<OperandMode> {
 }
 
 impl Model {
-    /// Compile 256-column packing for qwen3-embedding-0.6b.ane-direct-worker
-    /// only when all profile metadata matches the catalog. Runtime rotary uses
-    /// the graph-constant encoder that passed the standalone-output audit.
-    /// The 28 decoder layers add 28 executables to the caller's budget. Calls
-    /// must be serialized because the program reuses mutable input buffers.
+    /// Compile a tight-packing program of `width` columns. Only width 256 for
+    /// the pinned Qwen3-Embedding-0.6B profile is enabled (`public_mode`
+    /// refuses anything else), because it is the only width shown to match
+    /// standalone output. Runtime rotary coefficients go through the same fp16
+    /// encoder as graph constants, so packed rows equal standalone rows bit
+    /// for bit. The 28 decoder layers add 28 executables to the caller's
+    /// budget. Calls must be serialized: the program reuses mutable input
+    /// buffers.
     pub fn compile_tight_packing(&self, width: usize) -> Result<TightProgram> {
         supported(self)?;
         validate_width(width)?;
@@ -554,7 +559,8 @@ mod tests {
     #[test]
     fn runtime_mask_is_causal_isolated_and_padding_queries_are_finite() {
         let (mask, _, _) = runtime_operands(&[3, 2], 256, 4, 10000.0).unwrap();
-        // Expectations do not call runtime_operands to derive row boundaries.
+        // The expected boundaries below are written out by hand rather than
+        // derived with `runtime_operands`, so the test can't share its bug.
         for q in 0..256 {
             for k in 0..256 {
                 let allowed = match q {

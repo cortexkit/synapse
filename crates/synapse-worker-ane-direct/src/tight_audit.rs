@@ -1,5 +1,7 @@
-//! Embed every exported AFT row with both rotary encodings and compare with
-//! the same row run alone. Only correct arms can report whole-export wall time.
+//! Accuracy audit for tight packing. Every row of a recorded code-search
+//! export (the replay input) is embedded packed, once per rotary encoding
+//! (nearest-rounded and constant-compatible), and compared with the same row
+//! embedded alone. An encoding that fails any row reports no wall time.
 use super::*;
 
 type Ranges = Vec<std::ops::Range<usize>>;
@@ -313,9 +315,10 @@ fn tight_packing_audit() {
             encode_ms += ms(started);
             std::hint::black_box((&cos, &sin));
         }
-        // Compare constant-mask/rotary, runtime-mask, and a repaired runtime
-        // variant only if all export rows passed. Release single-row 128/256
-        // programs so at most three control programs occupy 84 executables.
+        // Only when every row passed: time the constant-mask/rotary,
+        // runtime-mask and constant-compatible runtime variants. Evict the
+        // single-row 128 and 256 programs first, because three 28-layer
+        // variants need 84 compiled executables of the worker's ~100 budget.
         evict_all(&mut model);
         let mut modes = vec![
             ("constants", tight::OperandMode::Constants(lengths.clone())),

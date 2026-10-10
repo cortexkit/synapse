@@ -444,8 +444,10 @@ fn tight_packing_experiment() {
             .map(|&i| reference[i].clone())
             .collect();
         let mut costs = Vec::new();
-        // Release both single-row programs so three input variants fit in 84
-        // executables; alternate their timing order, then restore the baseline.
+        // Evict both single-row programs first: three 28-layer variants need 84
+        // compiled executables, which only fits the worker's budget of about
+        // 100 once nothing else is resident. Alternate the variants' timing
+        // order, then restore the baseline programs.
         evict_all(&mut model);
         let mut variants = Vec::new();
         for (name, mode) in [
