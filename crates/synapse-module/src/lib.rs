@@ -18499,6 +18499,75 @@ mod tests {
         assert_eq!(tasks, 1, "a passed check was started again");
     }
 
+    /// After a lane's self-check has passed, serving many-row batches runs the
+    /// check no more, sends the worker nothing but the batches' own inference,
+    /// and keeps the one engine and worker process the lane was loaded with.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn serving_many_row_batches_after_the_check_passed_runs_no_check_and_one_worker() {
+        let fixture = ane_lane_fixture("ane-batches-after-check", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        let loaded = ane_lane_model(&state);
+        let later = || Some(tokio::time::Instant::now() + Duration::from_secs(10));
+        // The first request runs the pending check.
+        ensure_profile_request_certified(state.clone(), &loaded, later())
+            .await
+            .unwrap();
+        until_lane_check_settles(&state).await;
+        let passed_recorded = profile_check_passed(&state, ANE_TEST_LANE)
+            .unwrap()
+            .is_some_and(|model| Arc::ptr_eq(&model, &loaded));
+        let checks_after_pass = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let inferences_after_pass = fixture.control.inferences();
+        const BATCHES: u64 = 4;
+        for batch in 0..BATCHES {
+            ensure_profile_request_certified(state.clone(), &loaded, later())
+                .await
+                .unwrap();
+            let items = (0..64).map(|row| vec![1; 8 + row % 24]).collect::<Vec<_>>();
+            let vectors =
+                execute_embedding(&state.runtime, &loaded, TokenBatch { items }, later(), None)
+                    .await
+                    .unwrap_or_else(|error| panic!("batch {batch}: {error:?}"));
+            assert_eq!(vectors.len(), 64);
+        }
+        let checks_after_batches = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let inferences_for_batches = fixture.control.inferences() - inferences_after_pass;
+        let worker_starts = fixture.control.worker_starts();
+        let restarts = fixture.engine.serving.supervisor.stats().restarts;
+        let still_same_engine = model_slot_snapshot(&state.runtime, ANE_TEST_LANE)
+            .and_then(|slot| slot.loaded)
+            .is_some_and(|model| Arc::ptr_eq(&model, &loaded));
+        drop(loaded);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            passed_recorded,
+            "the passed check was not recorded for the lane"
+        );
+        assert_eq!(checks_after_pass, 1);
+        assert_eq!(
+            checks_after_batches, 1,
+            "the self-check ran again after passing"
+        );
+        // Every row of a batch pads to the 128-token shape: one exchange each.
+        assert_eq!(inferences_for_batches, BATCHES);
+        assert_eq!(worker_starts, 1, "a second worker process was started");
+        assert_eq!(restarts, 0);
+        assert!(still_same_engine, "the lane was loaded again");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {

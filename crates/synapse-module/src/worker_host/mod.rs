@@ -8620,6 +8620,16 @@ pub mod ane_residency {
                     .map(|(_, count)| *count)
                     .sum()
             }
+
+            /// Inference requests the mock worker has received.
+            pub(crate) fn inferences(&self) -> u64 {
+                self.0.lock().unwrap().inference_frames
+            }
+
+            /// Worker processes the engine has started, restarts included.
+            pub(crate) fn worker_starts(&self) -> u32 {
+                self.0.lock().unwrap().connects.values().sum()
+            }
         }
 
         #[cfg(unix)]
@@ -8643,6 +8653,12 @@ pub mod ane_residency {
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
                 let ledger = ledger.clone();
                 Box::pin(async move {
+                    *ledger
+                        .lock()
+                        .unwrap()
+                        .connects
+                        .entry("module-mock".into())
+                        .or_default() += 1;
                     let (stream, server) = tokio::net::UnixStream::pair().unwrap();
                     let task = tokio::spawn(serve_mock(server, ledger));
                     Ok(AneWorkerSession {

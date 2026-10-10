@@ -310,6 +310,14 @@ pub(super) async fn run(workload: &Workload, out: &Path) -> Result<()> {
     records.push(a?);
     records.push(b?);
     records.push(measured(&candidate, "incident-short-after", &inputs[..1]).await?);
+    // Opt-in idle time before the 64-row calls, so they can be measured with
+    // or without the after-effects of the incident's first-time compile.
+    if let Some(settle) = std::env::var("SYNAPSE_ANE_PROFILE_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(settle)).await;
+    }
     let batch = workload
         .batches
         .iter()
