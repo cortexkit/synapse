@@ -617,28 +617,6 @@ async fn observe(
             worker_requests: delta,
         },
     };
-    let raw_series = if row == "ane-m5" && model.starts_with("qwen3-") && parity.passed() {
-        let warm = cases
-            .iter()
-            .find(|case| {
-                case["input_ids"]
-                    .as_array()
-                    .is_some_and(|ids| ids.len() == 512)
-            })
-            .ok_or_else(|| refuse("512 latency fixture missing"))?;
-        let ane = latency_series(&mut session, method, request_params(warm, operation)).await?;
-        let mut metal_session = start(options, "metal-m5", model, &raw).await?;
-        let metal =
-            latency_series(&mut metal_session, method, request_params(warm, operation)).await?;
-        metal_session.shutdown().await?;
-        Some(synapse_certify::RawSeries {
-            session_id: format!("{}-{}", source, std::process::id()),
-            ane,
-            metal,
-        })
-    } else {
-        None
-    };
     let final_snapshot = session.observations().await?;
     let inventories: Vec<Inventory> =
         serde_json::from_value(final_snapshot["inventories"].clone()).map_err(err)?;
@@ -694,33 +672,16 @@ async fn observe(
             .as_u64()
             .ok_or_else(|| refuse("independent ADMITTED counter missing"))?
             as usize,
-        raw_series,
     })
 }
 // `Session::request` returns the unwrapped `result`, so an embed or rerank
 // reply carries `vectors` or `scores` and `truncation_disclosures` at its top
 // level; there is no `payload` envelope.
-fn inference_succeeded(response: &Value) -> bool {
-    response["error"].is_null() && (response["vectors"].is_array() || response["scores"].is_array())
-}
 
 fn any_truncated(response: &Value) -> bool {
     response["truncation_disclosures"]
         .as_array()
         .is_some_and(|items| items.iter().any(|item| item["truncated"] == true))
-}
-
-async fn latency_series(session: &mut Session, method: &str, params: Value) -> Result<Vec<f64>> {
-    let mut samples = Vec::with_capacity(23);
-    for _ in 0..23 {
-        let started = std::time::Instant::now();
-        let response = session.request(method, params.clone()).await?;
-        if !inference_succeeded(&response) {
-            return Err(refuse(format!("latency inference failed: {response}")));
-        }
-        samples.push(started.elapsed().as_secs_f64() * 1000.0);
-    }
-    Ok(samples)
 }
 
 fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
@@ -866,12 +827,6 @@ mod tests {
             "truncation_disclosures": [{"effective_tokens": 512, "submitted_tokens": 512, "truncated": false}]});
         let rerank = json!({"dims": 1, "scores": [0.99],
             "truncation_disclosures": [{"truncated": false}, {"truncated": false}]});
-        assert!(inference_succeeded(&embed));
-        assert!(inference_succeeded(&rerank));
-        assert!(!inference_succeeded(
-            &json!({"error": {"code": "sequence_too_long"}})
-        ));
-        assert!(!inference_succeeded(&json!({"dims": 2})));
         assert!(!any_truncated(&embed));
         let mut cut = rerank.clone();
         cut["truncation_disclosures"][1]["truncated"] = json!(true);

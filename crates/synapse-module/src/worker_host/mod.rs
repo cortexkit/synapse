@@ -9083,7 +9083,7 @@ pub mod ane_residency {
                         "tokens_8192": {"outcome":"processed", "truncated":false, "diverted":false, "worker_requests":1},
                         "tokens_8193": {"outcome":"sequence_too_long", "truncated":false, "diverted":false, "worker_requests":0}
                     }, "layer_count": LAYERS, "inventories": inventories,
-                    "admitted_count": admitted, "raw_series": null
+                    "admitted_count": admitted
                 })).unwrap()
             };
             let run = |runner: &mut SnapshotRunner| {

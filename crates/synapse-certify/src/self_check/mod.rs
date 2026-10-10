@@ -12,6 +12,15 @@ const INDEX: &[u8] = include_bytes!("index.json");
 const SOURCE_INDEX: &[u8] = include_bytes!("../../../../bench/parity/fixtures/index.json");
 const MANIFEST: &[u8] = include_bytes!("../../../../bench/parity/models.json");
 
+/// The candidate's embedded parity manifest, independent of checkout metadata.
+pub fn manifest() -> Result<Manifest> {
+    Manifest::from_slice(MANIFEST).map_err(|error| refuse(error.to_string()))
+}
+
+pub(crate) fn source_index() -> Result<Value> {
+    serde_json::from_slice(SOURCE_INDEX).map_err(|error| refuse(error.to_string()))
+}
+
 pub struct References {
     pub manifest: Manifest,
     pub fixtures: FixtureSet,

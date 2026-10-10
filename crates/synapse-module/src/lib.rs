@@ -67,6 +67,34 @@ pub use store::{
 };
 pub mod worker_host;
 
+/// Plain, compiled lane declarations and tasks for offline certification. The
+/// validator never obtains catalog pins from a checkout or from record fields.
+pub fn certification_catalog() -> synapse_certify::Result<synapse_certify::Catalog> {
+    let compiled =
+        catalog::compiled_catalog().map_err(|error| synapse_certify::Error(error.to_string()))?;
+    Ok(synapse_certify::Catalog {
+        lanes: compiled
+            .models
+            .iter()
+            .flat_map(|model| {
+                model.backends.iter().map(|backend| {
+                    (
+                        model.id.clone(),
+                        backend.backend.clone(),
+                        backend.engine.clone(),
+                        backend.fingerprint.clone(),
+                    )
+                })
+            })
+            .collect(),
+        tasks: compiled
+            .models
+            .iter()
+            .map(|model| (model.id.clone(), model.task.clone()))
+            .collect(),
+    })
+}
+
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use owned_decode_certification::probe::ProbeSnapshot;

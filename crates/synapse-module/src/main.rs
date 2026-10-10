@@ -28,7 +28,8 @@ async fn main() {
                 option_env!("SYNAPSE_BUILD_TREE"),
             );
             match tokio::task::spawn_blocking(move || {
-                synapse_certify::command::dispatch(command, source)
+                let catalog = synapse_module::certification_catalog()?;
+                synapse_certify::command::dispatch(command, source, &catalog)
             })
             .await
             .expect("certification command task panicked")
