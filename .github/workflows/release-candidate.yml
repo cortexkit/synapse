@@ -269,12 +269,15 @@ jobs:
         run: |
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
-          # Protocol 0.30 leaves messages between modules and daemons unchanged.
-          # The module refuses scope_apply unless the daemon advertises that operation, so requires_core stays 0.20.53.
+          # Protocol 0.30 changed no bytes a module sends or receives unless it
+          # uses the new scope operations, and the SDK's scope_apply refuses
+          # itself on a daemon that doesn't advertise it. SUBC confirmed the
+          # ck-subc floor stays at requires_core 0.20.53 for 0.30.x.
+          # A new protocol minor needs that floor rechecked with SUBC.
           case "$protocol" in
             0.30.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.30.x" >&2
+              echo "subc-protocol is $protocol, not 0.30.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
