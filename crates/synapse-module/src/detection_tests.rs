@@ -52,9 +52,12 @@ fn stub_binary() -> PathBuf {
 }
 
 /// The shared stub executable for `slot`. Each slot gets its own source file
-/// name beside the built stub, and `ckdev_binary` publishes that name once per
-/// build at a content-addressed path, so later test processes reuse the same
-/// already-assessed file instead of creating a new one.
+/// name beside the built stub. `ckdev_binary` publishes each name once per
+/// build, at a path derived from the file's content hash, so every later test
+/// process runs that same file. macOS Gatekeeper assesses each new executable
+/// file the first time it runs (one assessment per path and file), so reusing
+/// one file per slot keeps the cost to one assessment per slot per build
+/// instead of one per test.
 fn slot_executable(slot: usize) -> PathBuf {
     static SLOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     SLOTS.get_or_init(|| {
@@ -70,16 +73,20 @@ fn slot_executable(slot: usize) -> PathBuf {
                     env::consts::EXE_SUFFIX
                 ));
                 // These source files are only hashed and copied, never run.
-                // Replace a stale one whole, so a test process starting at
-                // the same moment never hashes a half-written file.
+                // When one differs from the current build (a stale copy from a
+                // previous build), write a full temporary copy and rename it
+                // into place, so a test process starting at the same moment
+                // never hashes a half-written file.
                 if fs::read(&source).ok().as_deref() != Some(&bytes[..]) {
                     let temporary = dir.join(format!(".{}-{slot}.tmp", std::process::id()));
                     fs::write(&temporary, &bytes).unwrap();
                     fs::rename(&temporary, &source).unwrap();
                 }
                 let worker = synapse_core::dev_binary::ckdev_binary(&source, &dir).unwrap();
-                // Pay macOS's first-launch assessment of a newly published
-                // copy here, not inside a probe deadline a test is timing.
+                // Run a newly published copy once here, so macOS Gatekeeper's
+                // first-launch assessment (which can take longer than a short
+                // probe deadline under load) happens before any test times a
+                // probe.
                 let warmed = Command::new(&worker).arg("--warm").status().unwrap();
                 assert!(warmed.success(), "probe stub warm-up failed: {warmed}");
                 worker
@@ -91,9 +98,10 @@ fn slot_executable(slot: usize) -> PathBuf {
 
 impl Stub {
     /// A stub with `config` as its behaviour and an empty log. It takes a free
-    /// shared executable and forgets that executable's cached probes, so its
-    /// first probe of each kind really runs. A test holding every slot must
-    /// drop a stub before making another.
+    /// shared executable and clears the module's in-process probe cache
+    /// (`catalog_probe`, keyed by worker path) for it, so its first probe of
+    /// each kind really launches the stub. A test holding every slot must drop
+    /// a stub before making another.
     fn new(config: Value) -> Self {
         let slot = {
             let mut in_use = SLOTS_IN_USE
@@ -107,10 +115,11 @@ impl Stub {
             slot
         };
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        // An isolated test process runs every probe with the state directory
-        // its parent named, including probes the module launches itself.
-        // Elsewhere each stub owns its state directory, and only commands from
-        // `Stub::command` carry it.
+        // In a test re-run as its own child process (`isolated_test`), the
+        // parent sets STUB_STATE_ENV, and every probe the child launches,
+        // including the module's own, inherits that state directory. In the
+        // shared test process each stub owns its state directory instead, and
+        // only commands built by `Stub::command` are pointed at it.
         let (root, state) = match env::var_os(STUB_STATE_ENV) {
             Some(state) => {
                 let state = PathBuf::from(state);
@@ -135,7 +144,8 @@ impl Stub {
         stub
     }
 
-    /// This stub's configuration or log file in its state directory.
+    /// The stub's file with this extension in its state directory: `json` for
+    /// its configured behaviour, `log` for the calls it recorded.
     fn file(&self, extension: &str) -> PathBuf {
         self.state
             .join(self.worker.file_name().unwrap())
