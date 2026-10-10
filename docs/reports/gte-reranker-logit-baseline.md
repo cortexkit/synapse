@@ -172,14 +172,50 @@ gates in (`bench/parity/src/evaluator.rs:370`, `:392-396`; the fp32 class allows
   `pool-100` (1.3e-5 in sigmoid space) is larger than any debug/release
   difference that would reorder it, and no reordering occurs.
 
+## Which bytes production serves
+
+Production runs a release build. The macOS release-candidate matrix entry builds
+`synapse-module`, which links `synapse-engine-owned`, among other packages
+(`.github/workflows/release-candidate.yml:76-77`; dependency at
+`crates/synapse-module/Cargo.toml:40`). It builds them with
+`cargo build --release --locked` (`.github/workflows/release-candidate.yml:192`).
+The production GTE reranker therefore serves the release bytes, SHA-256
+`7d6eff7f4816a80e703df7ea37ff765d92a751c82246e1e096966cdcc178b4a2`, not the
+committed debug baseline `34c95ae0…04c72`. The release bytes were the same at
+the baseline commit and at master.
+
+## Proposed fix (not applied)
+
+Recommendation: **recapture the baseline from a release build, and make the
+test refuse to run in a debug build.** The second part only works together with
+the first, so the two belong in one change.
+
+- Why release: the README describes the test as the way "to compare production
+  preload logits" (`crates/synapse-engine-owned/tests/hardware/README.md:25`),
+  and production is a release build. A debug baseline tests numerics that no
+  shipped binary produces. Today it would pass while the shipped bytes moved,
+  and fail while they stayed the same.
+- Why also refuse debug: the comparison is exact (`src/lib.rs:224`), and debug
+  and release differ by design (the `sin`/`cos` merge above). A release baseline
+  without a guard would fail every plain `cargo test` run in the documented
+  debug invocation (`README.md:10-11`). That failure would look exactly like
+  real drift, which is how this question arose. At the top of
+  `preload_gte_raw_logits_match_baseline`, add
+  `assert!(!cfg!(debug_assertions), "run with --release: the baseline is production (optimized) numerics")`,
+  or mark the test `#[cfg_attr(debug_assertions, ignore = "…")]`. Either turns
+  the confusing byte mismatch into a clear instruction.
+- Accompanying edits: add `--release` to the README commands; record the build
+  profile next to the machine and toolchain in `evidence/README.md`; regenerate
+  `evidence/preload-baseline.f32le` with `METAL_PRELOAD_LABEL=baseline` from a
+  release build, which should give `7d6eff7f…b4a2` on this Mac.
+- The rejected alternative is to keep the debug baseline and require debug runs.
+  It keeps the test green, but the test then guards bytes production never
+  serves, so it would not catch a real change in the release numerics.
+
 ## Notes
 
 - Nothing in the repository was changed apart from this report. The test, the
-  baseline, and the tolerance are untouched, as asked. If the baseline is
-  meant to track production, the record would need to state the build profile.
-  One option is to recapture it from a `--release` run. The other is to keep the
-  debug capture and document that the test must run without `--release`. That
-  decision is left to the owner.
+  baseline, and the tolerance are untouched, as asked.
 - `sin_cos` also appears in `modernbert.rs:775` (`apply_rope`) and in
   `qwen3.rs:626`, `:832` and `:1069`. Any byte-exact baseline taken over those
   paths will show the same debug/release split. This was not measured for the
