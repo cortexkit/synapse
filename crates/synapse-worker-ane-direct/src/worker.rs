@@ -21,7 +21,7 @@ struct Args {
     nonce: String,
 }
 
-fn private_api() -> Result<()> {
+pub(crate) fn private_api() -> Result<()> {
     use std::sync::OnceLock;
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     let available = AVAILABLE.get_or_init(|| unsafe {
