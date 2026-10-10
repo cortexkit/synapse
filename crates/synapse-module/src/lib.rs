@@ -22503,7 +22503,7 @@ mod tests {
         .contains("prompt_template"));
     }
 
-    fn catalog_test_model(dir: &Path, spec: &StoredModelConfig) -> Arc<EmbeddingModel> {
+    pub(crate) fn catalog_test_model(dir: &Path, spec: &StoredModelConfig) -> Arc<EmbeddingModel> {
         use worker_host::{WorkerEngine, WorkerHostConfig};
         fs::create_dir_all(dir).unwrap();
         let tokenizer_path = dir.join("catalog-tokenizer.json");
@@ -23897,7 +23897,8 @@ mod routing_identity_dump_tests {
 mod catalog_runtime_tests {
     use super::*;
     use crate::tests::{
-        response_result, test_machine_profile, test_module_state, test_storage_descriptor,
+        catalog_test_model, response_result, test_machine_profile, test_module_state,
+        test_storage_descriptor,
     };
 
     #[tokio::test]
@@ -23984,8 +23985,7 @@ mod catalog_runtime_tests {
                 lanes += 1;
             }
         }
-        // Fails if the catalog shrinks to nothing and the loop proves nothing.
-        assert!(lanes >= 6, "only {lanes} catalog lanes checked");
+        assert_eq!(lanes, 14, "every declared catalog lane must be checked");
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
@@ -24023,6 +24023,259 @@ mod catalog_runtime_tests {
                 key["engine_identity"],
                 serde_json::to_value(&spec.engine_identity).unwrap()
             );
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_gpu_specs_use_manifest_preload_identity_and_package() {
+        let (root, state) = isolated_catalog_state("gpu-specs", false);
+        for entry in &state.runtime.release_catalog.models {
+            for name in ["cuda", "vulkan"] {
+                let backend = entry.backend(name).unwrap();
+                let profile = CatalogProfile::load(backend.profile.as_deref().unwrap()).unwrap();
+                let spec =
+                    catalog_profile_lane_spec(&state, entry, backend, &profile.id, false).unwrap();
+                assert_eq!(spec.engine, format!("owned-{name}"));
+                assert_eq!(spec.model_id, catalog::lane_id(&entry.id, name));
+                assert_eq!(spec.artifact_format, "safetensors-package");
+                assert_eq!(spec.artifact_digest, profile.artifact_digest());
+                assert_eq!(
+                    spec.model_locator,
+                    ModelAssetLocator::CacheDigest {
+                        digest: profile.artifact_digest()
+                    }
+                );
+                assert_eq!(
+                    spec.engine_identity,
+                    profile
+                        .owned_config(
+                            backend.execution.as_deref(),
+                            backend.attention_units.map(|units| units as usize)
+                        )
+                        .unwrap()
+                        .identity_override
+                        .unwrap()
+                );
+                assert_eq!(spec.engine_identity.build_flags["profile"], profile.id);
+                assert_eq!(spec.max_tokens, 8192);
+                assert_eq!(spec.quant, "f16");
+            }
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_catalog_gpu_sequences_refuse_before_worker_spawn() {
+        let (root, state) = isolated_catalog_state("gpu-release-ceiling", false);
+        for name in ["cuda", "vulkan"] {
+            let entry = state
+                .runtime
+                .release_catalog
+                .entry("gte-modernbert-base")
+                .unwrap();
+            let backend = entry.backend(name).unwrap();
+            let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+            let dir = root.join(name);
+            let model = catalog_test_model(&dir, &spec);
+            let text = std::iter::repeat_n("a", 8193).collect::<Vec<_>>().join(" ");
+            let mut tokenized = model.tokenizer.tokenize_batch([text.as_str()]).unwrap();
+            let error = compose_catalog_embed(&model, &mut tokenized).unwrap_err();
+            assert_eq!(error.code, "sequence_too_long", "{name}: {error:?}");
+            assert!(!dir.join("worker-called").exists());
+            // The boundary control distinguishes the ceiling from a path that
+            // refuses all inputs regardless of their composed token count.
+            let text = std::iter::repeat_n("a", 8192).collect::<Vec<_>>().join(" ");
+            let mut tokenized = model.tokenizer.tokenize_batch([text.as_str()]).unwrap();
+            compose_catalog_embed(&model, &mut tokenized).unwrap();
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn release_catalog_feature_off_gpu_workers_refuse_below_admission() {
+        let scratch = env::temp_dir().join(format!(
+            "synapse-catalog-load-isolated-{}",
+            std::process::id()
+        ));
+        let original = std::env::current_exe().unwrap();
+        let binaries = original.parent().unwrap().parent().unwrap();
+        let executable = synapse_core::dev_binary::ckdev_binary(&original, &scratch).unwrap();
+        let mut command =
+            synapse_core::without_launch_nonce(std::process::Command::new(executable));
+        command.args([
+            "--exact",
+            "catalog_runtime_tests::release_catalog_gpu_worker_load_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for key in [
+            "SYNAPSE_TEST_RUNNABLE_BACKENDS",
+            "SYNAPSE_TEST_CATALOG",
+            "SYNAPSE_CUDA_DRIVER_API",
+            "CUDA_DRIVER_API",
+            "SYNAPSE_CUDA_COMPUTE_CAPABILITY",
+            "CUDA_COMPUTE_CAPABILITY",
+            "SYNAPSE_CUDA_PACKAGING_DRIVER",
+        ] {
+            command.env_remove(key);
+        }
+        for name in ["cuda", "vulkan"] {
+            let key = format!("SYNAPSE_TEST_{}_WORKER", name.to_ascii_uppercase());
+            let source = env::var_os(&key).map(PathBuf::from).unwrap_or_else(|| {
+                binaries.join(format!(
+                    "ck-synapse-worker-{name}{}",
+                    env::consts::EXE_SUFFIX
+                ))
+            });
+            command.env(key, source);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(scratch);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[ignore = "run in an isolated process by release_catalog_feature_off_gpu_workers_refuse_below_admission"]
+    fn release_catalog_gpu_worker_load_fixture() {
+        assert!(cuda_floor_override().is_none());
+        let (root, state) = isolated_catalog_state("gpu", false);
+        for name in ["cuda", "vulkan"] {
+            let source = env::var_os(format!("SYNAPSE_TEST_{}_WORKER", name.to_ascii_uppercase()))
+                .map(PathBuf::from)
+                .expect("isolated parent supplies staged worker paths");
+            let worker = synapse_core::dev_binary::ckdev_binary(&source, root.join(name)).unwrap();
+            let version = synapse_core::without_launch_nonce(std::process::Command::new(&worker))
+                .arg("--version")
+                .output()
+                .unwrap();
+            assert!(
+                version.status.success()
+                    && String::from_utf8_lossy(&version.stdout).contains("features=none"),
+                "stage a feature-off {name} worker: {}",
+                source.display()
+            );
+            for entry in &state.runtime.release_catalog.models {
+                let backend = entry.backend(name).unwrap();
+                let mut spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+                let dir = root.join(&spec.model_id);
+                let model = catalog_test_model(&dir, &spec);
+                spec.tokenizer_locator = ModelAssetLocator::LocalPath {
+                    path: dir.join("catalog-tokenizer.json"),
+                };
+                spec.tokenizer_sanitized_digest =
+                    format!("sha256:{}", model.tokenizer.sanitized_sha256());
+                spec.model_locator = ModelAssetLocator::LocalPath {
+                    path: dir.join("absent-package.safetensors"),
+                };
+                spec.worker_bin = Some(worker.clone());
+                let serving = root.join("s");
+                spec.worker_runtime_dir = Some(serving.clone());
+                let error = load_catalog_model_blocking(
+                    spec,
+                    state.model_cache.clone(),
+                    8192,
+                    Duration::from_secs(10),
+                    0,
+                    Arc::new(Mutex::new(
+                        owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
+                    )),
+                    None,
+                )
+                .err()
+                .expect("feature-off worker must refuse");
+                if name == "vulkan" {
+                    // This LOAD error can only arrive after protocol-v2 HELLO.
+                    // Device discovery must refuse before opening the absent package.
+                    assert!(
+                        error.message.contains("vulkan_no_device"),
+                        "{}: {error:?}",
+                        entry.id
+                    );
+                } else {
+                    assert_eq!(
+                        error.code, "owned_cuda_unsupported",
+                        "{}: {error:?}",
+                        entry.id
+                    );
+                    assert!(
+                        error
+                            .message
+                            .contains("owned-cuda floor refused before worker creation")
+                            && error.message.contains("cuda_no_driver"),
+                        "{}: {error:?}",
+                        entry.id
+                    );
+                    assert!(
+                        !serving.exists(),
+                        "CUDA floor refusal must precede serving-worker spawn"
+                    );
+                }
+            }
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "downloads pinned real tokenizers; integrator must compare Linux and Windows output before merge"]
+    fn mint_release_catalog_fingerprints() {
+        let (root, state) = isolated_catalog_state("mint-catalog-fingerprints", false);
+        for entry in &state.runtime.release_catalog.models {
+            let file = &entry.backend_files("cuda")["tokenizer"];
+            state
+                .model_cache
+                .ingest(ModelCacheIngest {
+                    source_url: format!(
+                        "https://huggingface.co/{}/resolve/{}/{}",
+                        entry.upstream.hf_repo, entry.upstream.revision, file.path
+                    ),
+                    expected_digest: Some(format!("sha256:{}", file.sha256)),
+                    format: "json".into(),
+                    tokenizer_path: None,
+                    pin_module_id: None,
+                })
+                .unwrap();
+            let tokenizer_path = state.model_cache.blob_path(&file.sha256);
+            assert_eq!(
+                fs::metadata(&tokenizer_path).unwrap().len(),
+                file.size_bytes
+            );
+            assert_eq!(sha256_file(&tokenizer_path).unwrap(), file.sha256);
+            let tokenizer = SanitizedTokenizer::from_file(
+                &tokenizer_path,
+                TokenizerConfig {
+                    max_tokens: usize::MAX,
+                },
+            )
+            .unwrap();
+            for name in ["cuda", "vulkan"] {
+                let backend = entry.backend(name).unwrap();
+                let profile_id = backend.profile.as_deref().unwrap();
+                let profile = CatalogProfile::load(profile_id).unwrap();
+                profile.validate_readout(&tokenizer).unwrap();
+                // Fingerprints bind the converted package's declared checksum and
+                // the real tokenizer, not a device or a worker transport. No model
+                // conversion or GPU is needed to mint the cross-platform pins.
+                let mut spec =
+                    catalog_profile_lane_spec(&state, entry, backend, profile_id, false).unwrap();
+                spec.tokenizer_sanitized_digest =
+                    format!("sha256:{}", tokenizer.sanitized_sha256());
+                let spec =
+                    normalize_catalog_model(spec, &InlineConfig::default(), &JobConfig::default())
+                        .unwrap();
+                println!("{} {}", spec.model_id, spec.fingerprint.0);
+            }
         }
         drop(state);
         fs::remove_dir_all(root).unwrap();
@@ -24247,7 +24500,7 @@ mod catalog_runtime_tests {
             state.clone(),
             Some("gte-modernbert-base"),
             ModelTask::Embed,
-            Some(&"0".repeat(64)),
+            Some(&"1".repeat(64)),
             None,
             None,
         )

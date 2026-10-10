@@ -38,7 +38,12 @@ pub(crate) const COMPILED_CATALOG_JSON: &str = include_str!("models.json");
 pub(crate) const ALLOWED_BACKENDS: [&str; 4] = ["metal", "ane", "cuda", "vulkan"];
 
 /// Every engine value a catalog backend may name in this release.
-pub(crate) const ALLOWED_ENGINES: [&str; 2] = ["owned-metal", "ane-direct-worker"];
+pub(crate) const ALLOWED_ENGINES: [&str; 4] = [
+    "owned-metal",
+    "ane-direct-worker",
+    "owned-cuda",
+    "owned-vulkan",
+];
 
 /// Every file role. Per backend there is exactly one `model` and one
 /// `tokenizer` file and at most one `config` file.
@@ -708,12 +713,18 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
         field,
         value,
     };
-    if row.engine == "ane-direct-worker" {
+    let profile_backend = match row.engine.as_str() {
+        "ane-direct-worker" => Some("ane"),
+        "owned-cuda" => Some("cuda"),
+        "owned-vulkan" => Some("vulkan"),
+        _ => None,
+    };
+    if let Some(expected_backend) = profile_backend {
         let profile = row.profile.as_deref().ok_or_else(|| missing("profile"))?;
         let references = synapse_certify::self_check::load(profile)
             .map_err(|error| invalid("profile", error.to_string()))?;
         let declared = &references.manifest.profiles[profile];
-        if row.backend != "ane"
+        if row.backend != expected_backend
             || declared.model != id
             || declared.lane.as_str() != row.engine
             || serde_json::to_value(declared.storage_dtype).expect("dtype serializes")
@@ -979,6 +990,34 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 dims: Some(768),
                 rerank_abs_tolerance: None,
             },
+            FrozenBackend {
+                backend: "cuda",
+                engine: "owned-cuda",
+                profile: Some("gte-modernbert-base.owned-cuda"),
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("cls"),
+                normalize: Some(true),
+                dims: Some(768),
+                rerank_abs_tolerance: None,
+            },
+            FrozenBackend {
+                backend: "vulkan",
+                engine: "owned-vulkan",
+                profile: Some("gte-modernbert-base.owned-vulkan"),
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("cls"),
+                normalize: Some(true),
+                dims: Some(768),
+                rerank_abs_tolerance: None,
+            },
         ],
     },
     FrozenEntry {
@@ -986,20 +1025,50 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
         hf_repo: "Alibaba-NLP/gte-reranker-modernbert-base",
         revision: "f7481e6055501a30fb19d090657df9ec1f79ab2c",
         default_for_task: true,
-        backends: &[FrozenBackend {
-            backend: "metal",
-            engine: "owned-metal",
-            profile: None,
-            family: "gte-modernbert",
-            dtype: "f32",
-            execution: "explicit",
-            attention_units: FROZEN_ATTENTION_UNITS,
-            max_tokens: FROZEN_MAX_TOKENS,
-            pooling: None,
-            normalize: None,
-            dims: None,
-            rerank_abs_tolerance: Some(0.005),
-        }],
+        backends: &[
+            FrozenBackend {
+                backend: "metal",
+                engine: "owned-metal",
+                profile: None,
+                family: "gte-modernbert",
+                dtype: "f32",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+            FrozenBackend {
+                backend: "cuda",
+                engine: "owned-cuda",
+                profile: Some("gte-reranker-modernbert-base.owned-cuda"),
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+            FrozenBackend {
+                backend: "vulkan",
+                engine: "owned-vulkan",
+                profile: Some("gte-reranker-modernbert-base.owned-vulkan"),
+                family: "gte-modernbert",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+        ],
     },
     FrozenEntry {
         id: "qwen3-embedding-0.6b",
@@ -1035,6 +1104,34 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 dims: Some(1024),
                 rerank_abs_tolerance: None,
             },
+            FrozenBackend {
+                backend: "cuda",
+                engine: "owned-cuda",
+                profile: Some("qwen3-embedding-0.6b.owned-cuda"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("last"),
+                normalize: Some(true),
+                dims: Some(1024),
+                rerank_abs_tolerance: None,
+            },
+            FrozenBackend {
+                backend: "vulkan",
+                engine: "owned-vulkan",
+                profile: Some("qwen3-embedding-0.6b.owned-vulkan"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: Some("last"),
+                normalize: Some(true),
+                dims: Some(1024),
+                rerank_abs_tolerance: None,
+            },
         ],
     },
     FrozenEntry {
@@ -1042,20 +1139,50 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
         hf_repo: "Qwen/Qwen3-Reranker-0.6B",
         revision: "e61197ed45024b0ed8a2d74b80b4d909f1255473",
         default_for_task: false,
-        backends: &[FrozenBackend {
-            backend: "ane",
-            engine: "ane-direct-worker",
-            profile: Some("qwen3-reranker-0.6b.ane-direct-worker"),
-            family: "qwen3-0.6b",
-            dtype: "f16",
-            execution: "explicit",
-            attention_units: FROZEN_ATTENTION_UNITS,
-            max_tokens: FROZEN_MAX_TOKENS,
-            pooling: None,
-            normalize: None,
-            dims: None,
-            rerank_abs_tolerance: Some(0.005),
-        }],
+        backends: &[
+            FrozenBackend {
+                backend: "ane",
+                engine: "ane-direct-worker",
+                profile: Some("qwen3-reranker-0.6b.ane-direct-worker"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+            FrozenBackend {
+                backend: "cuda",
+                engine: "owned-cuda",
+                profile: Some("qwen3-reranker-0.6b.owned-cuda"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+            FrozenBackend {
+                backend: "vulkan",
+                engine: "owned-vulkan",
+                profile: Some("qwen3-reranker-0.6b.owned-vulkan"),
+                family: "qwen3-0.6b",
+                dtype: "f16",
+                execution: "explicit",
+                attention_units: FROZEN_ATTENTION_UNITS,
+                max_tokens: FROZEN_MAX_TOKENS,
+                pooling: None,
+                normalize: None,
+                dims: None,
+                rerank_abs_tolerance: Some(0.005),
+            },
+        ],
     },
 ];
 
@@ -1396,6 +1523,58 @@ mod tests {
                 matches!(&error, CatalogError::UnknownEngine { engine, .. } if engine == value),
                 "{value}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn profile_engines_require_their_backend_model_lane_and_dtype() {
+        let catalog = compiled_catalog().unwrap();
+        for entry in &catalog.models {
+            for backend in entry.backends.iter().filter(|row| row.profile.is_some()) {
+                validate_backend(&entry.id, entry.task == "embed", backend).unwrap();
+                let mut missing = backend.clone();
+                missing.profile = None;
+                assert!(matches!(
+                    validate_backend(&entry.id, entry.task == "embed", &missing),
+                    Err(CatalogError::MissingBackendField {
+                        field: "profile",
+                        ..
+                    })
+                ));
+                for field in ["backend", "model", "lane", "dtype"] {
+                    let mut row = backend.clone();
+                    let mut id = entry.id.as_str();
+                    match field {
+                        "backend" => row.backend = "metal".into(),
+                        "model" => id = "another-model",
+                        "lane" => {
+                            row.profile = Some(format!(
+                                "{}.{}",
+                                entry.id,
+                                if row.engine == "owned-cuda" {
+                                    "owned-vulkan"
+                                } else {
+                                    "owned-cuda"
+                                }
+                            ))
+                        }
+                        "dtype" => row.dtype = Some("f32".into()),
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        matches!(
+                            validate_backend(id, entry.task == "embed", &row),
+                            Err(CatalogError::InvalidBackendField {
+                                field: "profile",
+                                ..
+                            })
+                        ),
+                        "{}-{}: {field}",
+                        entry.id,
+                        backend.backend
+                    );
+                }
+            }
         }
     }
 
@@ -1769,9 +1948,9 @@ mod tests {
             assert_eq!(
                 entry.backends.len(),
                 if id == "gte-reranker-modernbert-base" {
-                    1
+                    3
                 } else {
-                    2
+                    4
                 },
                 "{id}"
             );
@@ -1800,7 +1979,7 @@ mod tests {
                 .contains("bench/parity/reference/generate_reference.py --catalog"));
         }
         let qwen_reranker = catalog.entry("qwen3-reranker-0.6b").unwrap();
-        assert_eq!(qwen_reranker.backends.len(), 1);
+        assert_eq!(qwen_reranker.backends.len(), 3);
         assert_eq!(qwen_reranker.files.len(), 2);
         assert!(qwen_reranker.self_check.is_none());
         // ANE backends check against fp32 reference inputs and expected outputs
@@ -1835,6 +2014,25 @@ mod tests {
                 .revision,
             "f7481e6055501a30fb19d090657df9ec1f79ab2c"
         );
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|entry| entry.backends.len())
+                .sum::<usize>(),
+            14
+        );
+        for entry in &catalog.models {
+            for backend in &entry.backends {
+                assert_ne!(
+                    backend.fingerprint,
+                    "0".repeat(64),
+                    "{}-{} fingerprint must be minted on Linux and Windows before merge",
+                    entry.id,
+                    backend.backend
+                );
+            }
+        }
     }
 
     #[test]
@@ -1852,11 +2050,66 @@ mod tests {
             // entry with a manifest profile for another model would fail the
             // profile-to-model consistency check before reaching that rejection.
             let mut copy = doc["models"][1].clone();
+            copy["backends"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["backend"] == "metal");
+            for file in copy["files"].as_array_mut().unwrap() {
+                file["backends"] = json!(["metal"]);
+            }
             copy["id"] = json!("minilm");
             copy["default_for_task"] = json!(false);
             doc["models"].as_array_mut().unwrap().push(copy);
         });
         assert!(matches!(extra, CatalogError::FrozenIdSet { .. }), "{extra}");
+    }
+
+    #[test]
+    fn existing_catalog_lane_ids_and_fingerprints_are_unchanged() {
+        let catalog = compiled_catalog().unwrap();
+        for (id, backend, fingerprint) in [
+            (
+                "gte-modernbert-base",
+                "metal",
+                "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3",
+            ),
+            (
+                "gte-modernbert-base",
+                "ane",
+                "fa07e22359bfdff6deb529b64db81adf54ca0c6e23f146a0bc48ee3eadd08c5a",
+            ),
+            (
+                "gte-reranker-modernbert-base",
+                "metal",
+                "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9",
+            ),
+            (
+                "qwen3-embedding-0.6b",
+                "metal",
+                "62b20d3a03d6e17a6022925dc3c5da4766bc89b1e11233d8c5c10d146871b37c",
+            ),
+            (
+                "qwen3-embedding-0.6b",
+                "ane",
+                "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b",
+            ),
+            (
+                "qwen3-reranker-0.6b",
+                "ane",
+                "afa50ba3e4c56f42c750d10751f91b700f812c73862bdec8977d3a3db169aef3",
+            ),
+        ] {
+            assert_eq!(lane_id(id, backend), format!("{id}-{backend}"));
+            assert_eq!(
+                catalog
+                    .entry(id)
+                    .unwrap()
+                    .backend(backend)
+                    .unwrap()
+                    .fingerprint,
+                fingerprint
+            );
+        }
     }
 
     #[test]
@@ -1895,26 +2148,43 @@ mod tests {
     #[test]
     fn release_rejects_backend_sets_outside_the_frozen_set() {
         let index = compiled_entry_index("gte-modernbert-base");
-        let cuda = release_error(|doc| {
+        let missing_cuda = release_error(|doc| {
             let entry = &mut doc["models"][index];
-            let mut row = entry["backends"][0].clone();
-            row["backend"] = json!("cuda");
-            entry["backends"].as_array_mut().unwrap().push(row);
+            entry["backends"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["backend"] != "cuda");
             for file in entry["files"].as_array_mut().unwrap() {
-                file["backends"].as_array_mut().unwrap().push(json!("cuda"));
+                file["backends"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|backend| backend != "cuda");
             }
         });
         assert!(
-            matches!(&cuda, CatalogError::FrozenMismatch { field, .. } if field == "backends"),
-            "{cuda}"
+            matches!(&missing_cuda, CatalogError::FrozenMismatch { field, .. } if field == "backends"),
+            "{missing_cuda}"
+        );
+        let reordered = release_error(|doc| {
+            doc["models"][index]["backends"]
+                .as_array_mut()
+                .unwrap()
+                .swap(2, 3);
+        });
+        assert!(
+            matches!(&reordered, CatalogError::FrozenMismatch { field, .. } if field == "backends"),
+            "{reordered}"
         );
         let qwen_reranker = compiled_entry_index("qwen3-reranker-0.6b");
         let gte_reranker = compiled_entry_index("gte-reranker-modernbert-base");
         let runnable_qwen_reranker = release_error(|doc| {
             let donor = doc["models"][gte_reranker].clone();
             let entry = &mut doc["models"][qwen_reranker];
-            entry["backends"] = donor["backends"].clone();
+            entry["backends"] = json!([donor["backends"][0].clone()]);
             entry["files"] = donor["files"].clone();
+            for file in entry["files"].as_array_mut().unwrap() {
+                file["backends"] = json!(["metal"]);
+            }
             entry["self_check"] = donor["self_check"].clone();
         });
         assert!(
@@ -2105,7 +2375,31 @@ mod tests {
             298_041_568 + 3_583_228 + 1_184
         );
         assert_eq!(entry.download_bytes(&[]), 0);
-        assert_eq!(entry.download_bytes(&["cuda"]), 0);
+        for (id, expected) in [
+            ("gte-modernbert-base", 298_041_568 + 3_583_228),
+            ("gte-reranker-modernbert-base", 598_436_708 + 3_583_499),
+            ("qwen3-embedding-0.6b", 1_191_586_416 + 11_423_705),
+            ("qwen3-reranker-0.6b", 1_191_588_280 + 11_422_654),
+        ] {
+            let entry = catalog.entry(id).unwrap();
+            assert_eq!(entry.download_bytes(&["cuda"]), expected, "{id}");
+            assert_eq!(entry.download_bytes(&["vulkan"]), expected, "{id}");
+            assert_eq!(
+                entry.download_bytes(&["cuda", "vulkan", "cuda"]),
+                expected,
+                "{id}"
+            );
+            for backend in ["cuda", "vulkan"] {
+                assert_eq!(
+                    entry
+                        .backend_files(backend)
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    ["model", "tokenizer"]
+                );
+            }
+        }
         let unservable = catalog.entry("qwen3-reranker-0.6b").unwrap();
         assert_eq!(unservable.download_bytes(&["metal"]), 0);
     }
