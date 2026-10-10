@@ -4,9 +4,8 @@ On a rented RTX 5070 Ti (driver 610.57.04), the owned Vulkan worker matched
 the fp32 references for Qwen3-Embedding-0.6B and Qwen3-Reranker-0.6B up to
 513 tokens. Their 8192-token rows failed the worker's fixed 30 s request
 timeout. One 512-token row took about 0.42 s. Those records, made at commit
-`dd7412b0`, were filed as development evidence on the branch
-`alfonso/task/bg_b173cdb59264cfff-prove-the-cuda-and-vulkan-catalog-lanes-on-a-ren`
-(`docs/evidence/catalog-backends/`). This change replaces the Vulkan kernel
+`dd7412b0`, are under `docs/evidence/certification/dd7412b0…/vulkan-linux-nvidia/`,
+with the run logs in `docs/evidence/catalog-backends/`. This change replaces the Vulkan kernel
 revision and all four Vulkan lane fingerprints, so every Vulkan record made at
 `dd7412b0` is superseded and must be remade.
 
