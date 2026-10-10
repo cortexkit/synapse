@@ -34,11 +34,18 @@ pub mod owned_decode_engine;
 pub use runtime::Precision;
 
 pub const ENGINE_VERSION: &str = "owned-metal-v1";
-// Bump whenever a compiled MPSGraph changes structure (ops added, removed, or reordered).
-// The revision is part of both the explicit-executable package cache key and the engine
-// identity, so raising it invalidates stale cached executables that still encode the old
-// graph and moves the provenance fingerprint to match the new one.
+// Base graph revision, shared by every family and dtype whose graph has not moved past
+// it. Bump it whenever a change alters the compiled MPSGraph of every family (ops added,
+// removed, or reordered); a change confined to one family's graph raises that family's
+// entry in `graph_revision` instead, so other families keep their fingerprints and
+// cached executables. The revision is part of both the explicit-executable package cache
+// key and the engine identity, so raising it invalidates stale cached executables that
+// still encode the old graph and moves the provenance fingerprint to match the new one.
 pub const GRAPH_REVISION: u32 = 4;
+// Revision 5 of the f16 ModernBERT graph runs its weight projections (QKV, attention
+// output, MLP) in f16 instead of widening both operands to f32. f32 ModernBERT graphs
+// are structurally unchanged and stay on the base revision.
+const GTE_MODERNBERT_F16_GRAPH_REVISION: u32 = 5;
 pub const BUCKET_POLICY_VERSION: u32 = 2;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
 #[cfg(target_os = "macos")]
@@ -165,13 +172,37 @@ fn read_model_config(model_dir: &Path) -> Result<serde_json::Value, OwnedEngineE
     })
 }
 
+/// Graph revision of the compiled MPSGraph for one family and dtype. It goes into
+/// the engine identity's `graph_revision` build flag and into the package cache key.
+#[must_use]
+pub const fn graph_revision(family: ModelFamily, dtype: OwnedDType) -> u32 {
+    match (family, dtype) {
+        (ModelFamily::GteModernBert, OwnedDType::F16) => GTE_MODERNBERT_F16_GRAPH_REVISION,
+        _ => GRAPH_REVISION,
+    }
+}
+
+/// Kernel revision recorded in an owned-metal catalog lane's numeric profile. It
+/// names the graph revision of the lane's family and dtype and the bucket policy.
+#[must_use]
+pub fn metal_kernel_revision(family: ModelFamily, dtype: OwnedDType) -> String {
+    format!(
+        "owned-metal-graph-{}-bucket-{}",
+        graph_revision(family, dtype),
+        BUCKET_POLICY_VERSION
+    )
+}
+
 #[must_use]
 pub fn engine_identity(family: ModelFamily, dtype: OwnedDType) -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
     build_flags.insert("backend".to_string(), "metal-mpsgraph".to_string());
     build_flags.insert("family".to_string(), family.as_str().to_string());
     build_flags.insert("dtype".to_string(), dtype.as_str().to_string());
-    build_flags.insert("graph_revision".to_string(), GRAPH_REVISION.to_string());
+    build_flags.insert(
+        "graph_revision".to_string(),
+        graph_revision(family, dtype).to_string(),
+    );
     build_flags.insert(
         "bucket_policy".to_string(),
         format!("v{BUCKET_POLICY_VERSION}"),
@@ -908,6 +939,7 @@ fn package_root(
     resolve_package_root(
         cache_root,
         family.as_str(),
+        graph_revision(family, dtype),
         &model_hash,
         dtype.as_str(),
         &os_build,
@@ -975,19 +1007,20 @@ fn parse_package_key<'a>(name: &'a str, family: &str) -> Option<PackageKey<'a>> 
     })
 }
 
-/// Create the package directory for the current graph revision, bucket policy
-/// and OS build, then prune stale keys of the same model and dtype.
+/// Create the package directory for the given graph revision, the current bucket
+/// policy and OS build, then prune stale keys of the same model and dtype.
 #[cfg(target_os = "macos")]
 fn resolve_package_root(
     cache_root: &Path,
     family: &str,
+    graph_revision: u32,
     model_hash: &str,
     dtype: &str,
     os_build: &str,
 ) -> Result<PathBuf, String> {
     let name = package_key_name(
         family,
-        GRAPH_REVISION,
+        graph_revision,
         BUCKET_POLICY_VERSION,
         model_hash,
         dtype,
@@ -997,7 +1030,15 @@ fn resolve_package_root(
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("create package root {}: {error}", root.display()))?;
     if os_build != UNKNOWN_OS_BUILD {
-        prune_stale_package_siblings(cache_root, &name, family, model_hash, dtype, os_build);
+        prune_stale_package_siblings(
+            cache_root,
+            &name,
+            family,
+            graph_revision,
+            model_hash,
+            dtype,
+            os_build,
+        );
     }
     Ok(root)
 }
@@ -1030,6 +1071,7 @@ fn prune_stale_package_siblings(
     cache_root: &Path,
     current: &str,
     family: &str,
+    graph_revision: u32,
     model_hash: &str,
     dtype: &str,
     os_build: &str,
@@ -1050,7 +1092,7 @@ fn prune_stale_package_siblings(
                 key.model_hash == model_hash
                     && key.dtype == dtype
                     && (key.os_build != os_build
-                        || key.graph_revision < GRAPH_REVISION
+                        || key.graph_revision < graph_revision
                         || key.bucket_policy < BUCKET_POLICY_VERSION)
             })
     };
@@ -1245,6 +1287,7 @@ mod tests {
     #[test]
     fn identity_separates_family_dtype_graph_and_policy() {
         assert_eq!(BUCKET_POLICY_VERSION, runtime::BUCKET_POLICY_VERSION);
+        assert_eq!(GRAPH_REVISION, runtime::GRAPH_REVISION);
         let minilm_f16 = engine_identity(ModelFamily::MiniLm, OwnedDType::F16);
         let minilm_f32 = engine_identity(ModelFamily::MiniLm, OwnedDType::F32);
         let qwen_f16 = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
@@ -1262,6 +1305,45 @@ mod tests {
             assert_eq!(
                 engine_identity(family, family.recommended_dtype()).build_flags["bucket_policy"],
                 "v2"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_f16_modernbert_graph_moved_to_revision_5() {
+        // Qwen3's identity, and with it its fingerprint and package cache key,
+        // must stay exactly as served before the f16 ModernBERT matmul change.
+        let qwen = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
+        assert_eq!(qwen.engine, "owned-metal");
+        assert_eq!(qwen.version, "owned-metal-v1");
+        assert_eq!(
+            qwen.build_flags,
+            BTreeMap::from([
+                ("backend".to_string(), "metal-mpsgraph".to_string()),
+                ("bucket_policy".to_string(), "v2".to_string()),
+                ("dtype".to_string(), "f16".to_string()),
+                ("family".to_string(), "qwen3-0.6b".to_string()),
+                ("graph_revision".to_string(), "4".to_string()),
+                ("risk_class".to_string(), "abort_safe".to_string()),
+            ])
+        );
+        for (family, dtype, revision) in [
+            (ModelFamily::Qwen3, OwnedDType::F16, 4),
+            (ModelFamily::Qwen3, OwnedDType::F32, 4),
+            (ModelFamily::MiniLm, OwnedDType::F16, 4),
+            (ModelFamily::MiniLm, OwnedDType::F32, 4),
+            // The f32 graph (the reranker's catalog profile) is structurally unchanged.
+            (ModelFamily::GteModernBert, OwnedDType::F32, 4),
+            (ModelFamily::GteModernBert, OwnedDType::F16, 5),
+        ] {
+            assert_eq!(
+                graph_revision(family, dtype),
+                revision,
+                "{family:?} {dtype:?}"
+            );
+            assert_eq!(
+                engine_identity(family, dtype).build_flags["graph_revision"],
+                revision.to_string()
             );
         }
     }
@@ -1325,7 +1407,9 @@ mod tests {
         let unrelated = cache_root.join("unrelated-directory");
         std::fs::create_dir_all(&unrelated).unwrap();
 
-        let resolved = resolve_package_root(&cache_root, family, model, "f16", "26A428").unwrap();
+        let resolved =
+            resolve_package_root(&cache_root, family, current_graph, model, "f16", "26A428")
+                .unwrap();
 
         assert_eq!(resolved, current_populated);
         assert!(
@@ -1381,13 +1465,62 @@ mod tests {
         ));
         std::fs::create_dir_all(&real).unwrap();
 
-        resolve_package_root(&cache_root, family, model, "f16", UNKNOWN_OS_BUILD).unwrap();
+        resolve_package_root(
+            &cache_root,
+            family,
+            GRAPH_REVISION,
+            model,
+            "f16",
+            UNKNOWN_OS_BUILD,
+        )
+        .unwrap();
 
         assert!(
             real.is_dir(),
             "a failed sw_vers read must not prune the real OS build's packages"
         );
         std::fs::remove_dir_all(&cache_root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn package_keys_follow_each_family_and_dtype_graph_revision() {
+        let temp = std::env::temp_dir().join(format!(
+            "synapse-package-revision-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache_root = temp.join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let model = temp.join("model.safetensors");
+        std::fs::write(&model, b"weights").unwrap();
+        let name = |family, dtype| {
+            package_root(&cache_root, &model, family, dtype)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let gte_f16 = name(ModelFamily::GteModernBert, OwnedDType::F16);
+        let gte_f32 = name(ModelFamily::GteModernBert, OwnedDType::F32);
+        let qwen_f16 = name(ModelFamily::Qwen3, OwnedDType::F16);
+        assert!(gte_f16.starts_with("gte-modernbert-graph-v5-bucket-policy-v2-"));
+        assert!(gte_f32.starts_with("gte-modernbert-graph-v4-bucket-policy-v2-"));
+        assert!(qwen_f16.starts_with("qwen3-0.6b-graph-v4-bucket-policy-v2-"));
+
+        // A revision-4 f16 ModernBERT key holds executables of the old graph, so
+        // resolving the f16 key prunes it; the f32 key on revision 4 is current.
+        let stale_f16 = cache_root.join(gte_f16.replace("-graph-v5-", "-graph-v4-"));
+        std::fs::create_dir_all(&stale_f16).unwrap();
+        assert_eq!(name(ModelFamily::GteModernBert, OwnedDType::F16), gte_f16);
+        assert!(!stale_f16.exists(), "stale revision-4 f16 key survived");
+        assert!(cache_root.join(&gte_f32).is_dir());
+        assert!(cache_root.join(&qwen_f16).is_dir());
+        std::fs::remove_dir_all(&temp).unwrap();
     }
 
     #[cfg(target_os = "macos")]

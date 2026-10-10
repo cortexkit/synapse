@@ -118,6 +118,9 @@ static MPSGraphTensor *modernbert_cast(MPSGraph *graph, MPSGraphTensor *tensor, 
     return tensor.dataType == data_type ? tensor : [graph castTensor:tensor toType:data_type name:nil];
 }
 
+// Attention score and context products of the non-fused attention fallback
+// (macOS before 15). They multiply in f32 and cast the product back to the graph
+// dtype, the numerics this fallback has always had.
 static MPSGraphTensor *modernbert_matmul(
     MPSGraph *graph,
     MPSGraphTensor *primary,
@@ -130,6 +133,10 @@ static MPSGraphTensor *modernbert_matmul(
     return modernbert_cast(graph, product, data_type);
 }
 
+// Weight projections multiply in the graph dtype. In an f16 graph this keeps the
+// QKV, attention-output and MLP matmuls on the GPU's f16 matrix path; widening
+// both operands to f32 made the whole f16 forward pass about 2.5x slower on an
+// M5 Max. In an f32 graph the casts are no-ops, so f32 graphs are unchanged.
 static MPSGraphTensor *modernbert_linear(
     MPSGraph *graph,
     MPSGraphTensor *input,
@@ -137,7 +144,9 @@ static MPSGraphTensor *modernbert_linear(
     MPSDataType data_type
 ) {
     MPSGraphTensor *transposed = [graph transposeTensor:weight dimension:0 withDimension:1 name:nil];
-    return modernbert_matmul(graph, input, transposed, data_type);
+    return [graph matrixMultiplicationWithPrimaryTensor:modernbert_cast(graph, input, data_type)
+                                        secondaryTensor:modernbert_cast(graph, transposed, data_type)
+                                                   name:nil];
 }
 
 static MPSGraphTensor *modernbert_layer_norm(

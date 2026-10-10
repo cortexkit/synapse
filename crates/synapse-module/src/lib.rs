@@ -3226,16 +3226,27 @@ impl CatalogProfile {
         numeric.manifest_profile_digest = Some(sha256_hex(
             &synapse_parity::canonical::canonical_bytes(&entry),
         ));
-        numeric.kernel_revision = Some(
-            match self.profile()["lane"].as_str().expect("lane") {
-                "owned-metal" => synapse_core::METAL_KERNEL_REVISION,
-                "owned-cuda" => synapse_core::CUDA_KERNEL_REVISION,
-                "owned-vulkan" => synapse_core::VULKAN_KERNEL_REVISION,
-                "ane-direct-worker" => synapse_core::ANE_DIRECT_KERNEL_REVISION,
-                _ => unreachable!("manifest lane"),
-            }
-            .into(),
-        );
+        numeric.kernel_revision = Some(match self.profile()["lane"].as_str().expect("lane") {
+            // The Metal graph revision is per family and dtype, so a lane's kernel
+            // revision only moves when its own graph does.
+            "owned-metal" => synapse_engine_owned::metal_kernel_revision(
+                if self.model()["architecture"]["family"] == "qwen3" {
+                    OwnedFamily::Qwen3
+                } else {
+                    OwnedFamily::GteModernBert
+                },
+                OwnedDType::parse(
+                    self.profile()["storage_dtype"]
+                        .as_str()
+                        .expect("manifest storage dtype"),
+                )
+                .expect("manifest storage dtype"),
+            ),
+            "owned-cuda" => synapse_core::CUDA_KERNEL_REVISION.into(),
+            "owned-vulkan" => synapse_core::VULKAN_KERNEL_REVISION.into(),
+            "ane-direct-worker" => synapse_core::ANE_DIRECT_KERNEL_REVISION.into(),
+            _ => unreachable!("manifest lane"),
+        });
     }
 }
 

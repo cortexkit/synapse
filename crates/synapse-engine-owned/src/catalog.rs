@@ -56,6 +56,8 @@ mod tests {
     use super::*;
     #[test]
     fn metal_revision_matches_graph_and_bucket() {
+        // The shared constant names the base graph revision, which every family and
+        // dtype uses except the f16 ModernBERT graph.
         assert_eq!(
             synapse_core::METAL_KERNEL_REVISION,
             format!(
@@ -63,6 +65,18 @@ mod tests {
                 crate::GRAPH_REVISION,
                 crate::BUCKET_POLICY_VERSION
             )
+        );
+        assert_eq!(
+            crate::metal_kernel_revision(ModelFamily::Qwen3, OwnedDType::F16),
+            synapse_core::METAL_KERNEL_REVISION
+        );
+        assert_eq!(
+            crate::metal_kernel_revision(ModelFamily::GteModernBert, OwnedDType::F32),
+            synapse_core::METAL_KERNEL_REVISION
+        );
+        assert_eq!(
+            crate::metal_kernel_revision(ModelFamily::GteModernBert, OwnedDType::F16),
+            "owned-metal-graph-5-bucket-2"
         );
     }
     #[test]

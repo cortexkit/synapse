@@ -4,6 +4,57 @@ use std::collections::BTreeMap;
 use synapse_core::fingerprint::NumericProfile;
 use synapse_engine_owned::{engine_identity, ModelFamily, OwnedDType};
 
+/// Fingerprint of a catalog Metal lane, computed from its catalog parameters and
+/// the given engine identity the same way the module computes it at load.
+fn metal_lane_fingerprint(
+    entry: &Value,
+    backend: &Value,
+    tokenizers: &BTreeMap<String, String>,
+    engine: &synapse_core::EngineIdentity,
+) -> String {
+    let roles: BTreeMap<String, String> = entry["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| {
+            file["backends"]
+                .as_array()
+                .unwrap()
+                .contains(&backend["backend"])
+        })
+        .map(|file| {
+            (
+                file["role"].as_str().unwrap().to_string(),
+                format!("sha256:{}", file["sha256"].as_str().unwrap()),
+            )
+        })
+        .collect();
+    let roles = roles.into_iter().collect::<Vec<_>>();
+    let artifact = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&roles).unwrap()))
+    );
+    let pooling = backend["pooling"].as_str().unwrap_or("cls");
+    let profile: NumericProfile = serde_json::from_value(json!({
+        "model_digest":artifact, "quant":backend["dtype"],
+        "engine":engine,
+        "sanitized_tokenizer_digest":tokenizers[entry["id"].as_str().unwrap()],
+        "pooling":if pooling == "last" { "last_token" } else { pooling },
+        "normalization":if backend["normalize"] == true {"l2"} else {"none"},
+        "dtype":backend["dtype"], "flash_attention":"disabled",
+        "certified_shape":{"max_context_tokens":backend["max_tokens"],"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},
+        "prompt_template":if entry["task"] == "rerank" {Some("synapse-rerank-bos-query-sep-doc-eos-v1")} else {None}, "thread_policy":"balanced"
+    })).unwrap();
+    profile.fingerprint().0
+}
+
+fn catalog_engine_identity(backend: &Value) -> synapse_core::EngineIdentity {
+    engine_identity(
+        ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap(),
+        OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap(),
+    )
+}
+
 #[test]
 fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
     let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
@@ -21,40 +72,12 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
             if backend["backend"] != "metal" {
                 continue;
             }
-            let roles: BTreeMap<String, String> = entry["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|file| {
-                    file["backends"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&backend["backend"])
-                })
-                .map(|file| {
-                    (
-                        file["role"].as_str().unwrap().to_string(),
-                        format!("sha256:{}", file["sha256"].as_str().unwrap()),
-                    )
-                })
-                .collect();
-            let roles = roles.into_iter().collect::<Vec<_>>();
-            let artifact = format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(serde_json::to_vec(&roles).unwrap()))
+            let computed = metal_lane_fingerprint(
+                entry,
+                backend,
+                &tokenizers,
+                &catalog_engine_identity(backend),
             );
-            let pooling = backend["pooling"].as_str().unwrap_or("cls");
-            let profile: NumericProfile = serde_json::from_value(json!({
-                "model_digest":artifact, "quant":backend["dtype"],
-                "engine":engine_identity(ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap(), OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap()),
-                "sanitized_tokenizer_digest":tokenizers[entry["id"].as_str().unwrap()],
-                "pooling":if pooling == "last" { "last_token" } else { pooling },
-                "normalization":if backend["normalize"] == true {"l2"} else {"none"},
-                "dtype":backend["dtype"], "flash_attention":"disabled",
-                "certified_shape":{"max_context_tokens":backend["max_tokens"],"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},
-                "prompt_template":if entry["task"] == "rerank" {Some("synapse-rerank-bos-query-sep-doc-eos-v1")} else {None}, "thread_policy":"balanced"
-            })).unwrap();
-            let computed = profile.fingerprint().0;
             assert_eq!(
                 backend["fingerprint"], computed,
                 "catalog backend {} {}",
@@ -64,6 +87,42 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
         }
     }
     assert_eq!(checked, 3);
+}
+
+#[test]
+fn only_the_graph_revision_moved_the_gte_modernbert_metal_fingerprint() {
+    // Graph revision 5 of the f16 ModernBERT graph rotated the gte-modernbert-base
+    // Metal lane. Recomputing it with the previous revision must give back the
+    // fingerprint the lane had before, so nothing else about the lane changed.
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "gte-modernbert-base")
+        .unwrap();
+    let backend = entry["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|backend| backend["backend"] == "metal")
+        .unwrap();
+    let current = catalog_engine_identity(backend);
+    assert_eq!(current.build_flags["graph_revision"], "5");
+    let mut previous = current.clone();
+    previous
+        .build_flags
+        .insert("graph_revision".to_string(), "4".to_string());
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &previous),
+        "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+    );
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &current),
+        "9ca42893d0c355b12a569ccc4c752e705df72db9de5387906656625c9f536904"
+    );
 }
 
 #[test]
