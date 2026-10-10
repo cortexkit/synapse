@@ -26,10 +26,28 @@ pub(crate) const EVIDENCE_DIR: &str = "docs/evidence/catalog-backends";
 /// this order, form a record's `engine_tree`. Tree hashes of these
 /// directories do not change when a record is committed elsewhere, so
 /// checking a record in does not invalidate it.
-pub(crate) const ENGINE_TREE_DIRS: [&str; 3] = [
-    "crates/synapse-engine-owned",
-    "crates/synapse-worker-ane",
-    "crates/synapse-worker-ane-direct",
+pub(crate) const ENGINE_TREE_DIRS: [(&str, &[&str]); 4] = [
+    (
+        "metal",
+        &[
+            "crates/synapse-engine-owned",
+            "crates/synapse-worker-ane",
+            "crates/synapse-worker-ane-direct",
+        ],
+    ),
+    (
+        "ane",
+        &[
+            "crates/synapse-engine-owned",
+            "crates/synapse-worker-ane",
+            "crates/synapse-worker-ane-direct",
+        ],
+    ),
+    (
+        "cuda",
+        &["crates/synapse-engine-cuda", "crates/synapse-worker-cuda"],
+    ),
+    ("vulkan", &["crates/synapse-worker-vulkan"]),
 ];
 
 /// The minimum cosine against the fp32 reference an embed backend must
@@ -156,12 +174,13 @@ pub(crate) enum EvidenceFailure {
 ///
 /// `catalog_json` is the catalog at the release tag, which must pass release
 /// validation; `records` maps record file names to their contents (see
-/// [`read_evidence_dir`]); `engine_tree` is [`engine_tree_at`] for the tag.
+/// [`read_evidence_dir`]); `engine_trees` maps each backend to its
+/// [`engine_tree_at`] value for the tag.
 /// Returns the verified `(catalog_id, backend)` pairs, or every failure.
 pub(crate) fn verify_catalog_evidence(
     catalog_json: &str,
     records: &BTreeMap<String, String>,
-    engine_tree: &str,
+    engine_trees: &BTreeMap<String, String>,
 ) -> Result<Vec<(String, String)>, Vec<EvidenceFailure>> {
     let catalog =
         load_release_valid(catalog_json).map_err(|error| vec![EvidenceFailure::Catalog(error)])?;
@@ -170,7 +189,7 @@ pub(crate) fn verify_catalog_evidence(
     for entry in &catalog.models {
         for backend in &entry.backends {
             let before = failures.len();
-            verify_backend(entry, backend, records, engine_tree, &mut failures);
+            verify_backend(entry, backend, records, engine_trees, &mut failures);
             if failures.len() == before {
                 verified.push((entry.id.clone(), backend.backend.clone()));
             }
@@ -187,10 +206,17 @@ fn verify_backend(
     entry: &CatalogEntry,
     backend: &CatalogBackend,
     records: &BTreeMap<String, String>,
-    engine_tree: &str,
+    engine_trees: &BTreeMap<String, String>,
     failures: &mut Vec<EvidenceFailure>,
 ) {
     let file = record_file_name(&entry.id, &backend.backend);
+    let Some(engine_tree) = engine_trees.get(&backend.backend) else {
+        failures.push(EvidenceFailure::MalformedRecord {
+            file,
+            reason: format!("no release engine tree supplied for {}", backend.backend),
+        });
+        return;
+    };
     let Some(text) = records.get(&file) else {
         failures.push(EvidenceFailure::MissingRecord {
             catalog_id: entry.id.clone(),
@@ -372,9 +398,18 @@ pub(crate) fn read_evidence_dir(dir: &Path) -> std::io::Result<BTreeMap<String, 
 
 /// The `engine_tree` key at `revision`: the newline-joined
 /// `git rev-parse <revision>:<dir>` tree hashes of [`ENGINE_TREE_DIRS`].
-pub(crate) fn engine_tree_at(repo_root: &Path, revision: &str) -> Result<String, String> {
-    let mut trees = Vec::with_capacity(ENGINE_TREE_DIRS.len());
-    for dir in ENGINE_TREE_DIRS {
+pub(crate) fn engine_tree_at(
+    repo_root: &Path,
+    revision: &str,
+    backend: &str,
+) -> Result<String, String> {
+    let dirs = ENGINE_TREE_DIRS
+        .iter()
+        .find(|(name, _)| *name == backend)
+        .map(|(_, dirs)| *dirs)
+        .ok_or_else(|| format!("unknown evidence backend {backend}"))?;
+    let mut trees = Vec::with_capacity(dirs.len());
+    for dir in dirs {
         let output = synapse_core::without_launch_nonce(Command::new("git"))
             .arg("-C")
             .arg(repo_root)
@@ -401,6 +436,15 @@ mod tests {
     const ENGINE_TREE: &str =
         "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222";
 
+    fn engine_trees() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("metal".into(), ENGINE_TREE.into()),
+            ("ane".into(), ENGINE_TREE.into()),
+            ("cuda".into(), "3".repeat(40)),
+            ("vulkan".into(), "4".repeat(40)),
+        ])
+    }
+
     /// Synthetic passing records for verifier tests, not hardware evidence.
     fn passing_records() -> BTreeMap<String, Value> {
         let catalog = compiled_catalog().unwrap();
@@ -423,7 +467,7 @@ mod tests {
                         "manifest_digest": entry.manifest_digest(),
                         "fixture_revision": entry.self_check.as_ref().map_or(1, |check| check.fixture_revision),
                         "fingerprint": backend.fingerprint,
-                        "engine_tree": ENGINE_TREE,
+                        "engine_tree": engine_trees()[&backend.backend],
                         "machine": {"chip": "Apple M5", "os_build": "27A100"},
                         "engine_build": "owned-metal-v1 graph_revision=4",
                         "dtype": backend.dtype,
@@ -449,7 +493,7 @@ mod tests {
         catalog: &str,
         records: &BTreeMap<String, Value>,
     ) -> Result<Vec<(String, String)>, Vec<EvidenceFailure>> {
-        verify_catalog_evidence(catalog, &texts(records), ENGINE_TREE)
+        verify_catalog_evidence(catalog, &texts(records), &engine_trees())
     }
 
     /// Mutates the passing record of one backend and returns the failures.
@@ -468,9 +512,17 @@ mod tests {
     #[ignore = "requires checked-in full-corpus hardware evidence for the release tree"]
     fn release_catalog_evidence() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let engine_tree = engine_tree_at(&root, "HEAD").expect("release engine trees at HEAD");
+        let engine_trees = ENGINE_TREE_DIRS
+            .iter()
+            .map(|(backend, _)| {
+                (
+                    backend.to_string(),
+                    engine_tree_at(&root, "HEAD", backend).expect("release engine trees at HEAD"),
+                )
+            })
+            .collect();
         let records = read_evidence_dir(&root.join(EVIDENCE_DIR)).expect("read release evidence");
-        match verify_catalog_evidence(COMPILED_CATALOG_JSON, &records, &engine_tree) {
+        match verify_catalog_evidence(COMPILED_CATALOG_JSON, &records, &engine_trees) {
             Ok(verified) => println!("verified {} catalog backends at HEAD", verified.len()),
             Err(failures) => {
                 for failure in &failures {
@@ -491,13 +543,27 @@ mod tests {
             [
                 ("gte-modernbert-base".to_string(), "metal".to_string()),
                 ("gte-modernbert-base".to_string(), "ane".to_string()),
+                ("gte-modernbert-base".to_string(), "cuda".to_string()),
+                ("gte-modernbert-base".to_string(), "vulkan".to_string()),
                 (
                     "gte-reranker-modernbert-base".to_string(),
                     "metal".to_string()
                 ),
+                (
+                    "gte-reranker-modernbert-base".to_string(),
+                    "cuda".to_string()
+                ),
+                (
+                    "gte-reranker-modernbert-base".to_string(),
+                    "vulkan".to_string()
+                ),
                 ("qwen3-embedding-0.6b".to_string(), "metal".to_string()),
                 ("qwen3-embedding-0.6b".to_string(), "ane".to_string()),
+                ("qwen3-embedding-0.6b".to_string(), "cuda".to_string()),
+                ("qwen3-embedding-0.6b".to_string(), "vulkan".to_string()),
                 ("qwen3-reranker-0.6b".to_string(), "ane".to_string()),
+                ("qwen3-reranker-0.6b".to_string(), "cuda".to_string()),
+                ("qwen3-reranker-0.6b".to_string(), "vulkan".to_string()),
             ]
         );
     }
@@ -706,36 +772,31 @@ mod tests {
     }
 
     #[test]
-    fn a_cuda_row_on_any_entry_fails() {
-        // A cuda row is schema-valid, so this is the frozen backend set
-        // rejecting it, both added beside metal and replacing it.
-        let mut added: Value = serde_json::from_str(COMPILED_CATALOG_JSON).unwrap();
-        let entry = &mut added["models"][1];
-        let mut row = entry["backends"][0].clone();
-        row["backend"] = json!("cuda");
-        entry["backends"].as_array_mut().unwrap().push(row);
-        for file in entry["files"].as_array_mut().unwrap() {
-            file["backends"] = json!(["metal", "cuda"]);
-        }
-        let mut records = passing_records();
-        let mut cuda_record = records[RERANKER].clone();
-        cuda_record["backend"] = json!("cuda");
-        records.insert(
-            record_file_name("gte-reranker-modernbert-base", "cuda"),
-            cuda_record,
-        );
-        for catalog in [
-            added.to_string(),
-            catalog_with_backend_renamed("qwen3-embedding-0.6b", "cuda"),
+    fn cpu_and_llama_rows_on_any_entry_fail() {
+        for id in [
+            "gte-modernbert-base",
+            "gte-reranker-modernbert-base",
+            "qwen3-embedding-0.6b",
+            "qwen3-reranker-0.6b",
         ] {
-            let failures = verify(&catalog, &records).unwrap_err();
-            assert!(
-                matches!(
-                    failures.as_slice(),
-                    [EvidenceFailure::Catalog(CatalogError::FrozenMismatch { field, .. })] if field == "backends"
-                ),
-                "{failures:?}"
-            );
+            for backend in ["cpu", "llama"] {
+                let mut document: Value = serde_json::from_str(COMPILED_CATALOG_JSON).unwrap();
+                let entry = document["models"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|entry| entry["id"] == id)
+                    .unwrap();
+                let mut row = entry["backends"][0].clone();
+                row["backend"] = json!(backend);
+                entry["backends"].as_array_mut().unwrap().push(row);
+                let failures = verify(&document.to_string(), &passing_records()).unwrap_err();
+                assert!(
+                    matches!(failures.as_slice(),
+                    [EvidenceFailure::Catalog(CatalogError::UnknownBackend { backend: actual, .. })] if actual == backend),
+                    "{id}-{backend}: {failures:?}"
+                );
+            }
         }
     }
 
@@ -817,19 +878,159 @@ mod tests {
     #[test]
     fn engine_tree_joins_the_engine_directory_tree_hashes() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let tree = engine_tree_at(&repo_root, "HEAD").expect("git tree hashes at HEAD");
-        let lines: Vec<&str> = tree.lines().collect();
-        assert_eq!(lines.len(), ENGINE_TREE_DIRS.len());
-        assert!(lines
-            .iter()
-            .all(|line| line.len() == 40 && line.bytes().all(|b| b.is_ascii_hexdigit())));
-        assert!(engine_tree_at(&repo_root, "no-such-revision-anywhere").is_err());
+        let expected: [(&str, &[&str]); 4] = [
+            (
+                "metal",
+                &[
+                    "crates/synapse-engine-owned",
+                    "crates/synapse-worker-ane",
+                    "crates/synapse-worker-ane-direct",
+                ],
+            ),
+            (
+                "ane",
+                &[
+                    "crates/synapse-engine-owned",
+                    "crates/synapse-worker-ane",
+                    "crates/synapse-worker-ane-direct",
+                ],
+            ),
+            (
+                "cuda",
+                &["crates/synapse-engine-cuda", "crates/synapse-worker-cuda"],
+            ),
+            ("vulkan", &["crates/synapse-worker-vulkan"]),
+        ];
+        for (backend, dirs) in expected {
+            let expected = dirs
+                .iter()
+                .map(|dir| {
+                    let output = synapse_core::without_launch_nonce(Command::new("git"))
+                        .arg("-C")
+                        .arg(&repo_root)
+                        .args(["rev-parse", &format!("HEAD:{dir}")])
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    String::from_utf8(output.stdout).unwrap().trim().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                engine_tree_at(&repo_root, "HEAD", backend).unwrap(),
+                expected,
+                "{backend}"
+            );
+            assert!(engine_tree_at(&repo_root, "no-such-revision-anywhere", backend).is_err());
+        }
+        assert!(engine_tree_at(&repo_root, "HEAD", "cpu").is_err());
     }
 
     #[test]
     fn read_evidence_dir_treats_a_missing_directory_as_no_records() {
         let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-evidence-dir");
         assert!(read_evidence_dir(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_tree_changes_are_isolated_to_the_backend_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".engine-tree-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = synapse_core::without_launch_nonce(Command::new("git"))
+                .arg("-C")
+                .arg(&root)
+                .args([
+                    "-c",
+                    "user.name=Engine Tree Test",
+                    "-c",
+                    "user.email=engine-tree@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        for dir in [
+            "crates/synapse-engine-owned",
+            "crates/synapse-worker-ane",
+            "crates/synapse-worker-ane-direct",
+            "crates/synapse-engine-cuda",
+            "crates/synapse-worker-cuda",
+            "crates/synapse-worker-vulkan",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("source.rs"), "initial").unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "initial engine trees"]);
+        let trees = || {
+            ["metal", "ane", "cuda", "vulkan"]
+                .map(|backend| engine_tree_at(&root, "HEAD", backend).unwrap())
+        };
+        for (dir, affected) in [
+            ("crates/synapse-engine-cuda", [false, false, true, false]),
+            ("crates/synapse-worker-cuda", [false, false, true, false]),
+            ("crates/synapse-worker-vulkan", [false, false, false, true]),
+            (
+                "crates/synapse-worker-ane-direct",
+                [true, true, false, false],
+            ),
+        ] {
+            let before = trees();
+            std::fs::write(root.join(dir).join("source.rs"), "changed").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "--quiet", "-m", "change one backend source"]);
+            let after = trees();
+            for index in 0..4 {
+                assert_eq!(
+                    before[index] != after[index],
+                    affected[index],
+                    "{dir}: backend {index}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backend_evidence_cannot_use_another_backends_engine_tree() {
+        for backend in ["cuda", "vulkan"] {
+            let file = record_file_name("gte-modernbert-base", backend);
+            let failures =
+                failures_after(&file, |record| record["engine_tree"] = json!(ENGINE_TREE));
+            assert!(
+                matches!(
+                    failures.as_slice(),
+                    [EvidenceFailure::KeyMismatch {
+                        field: "engine_tree",
+                        ..
+                    }]
+                ),
+                "{failures:?}"
+            );
+        }
+        let mut trees = engine_trees();
+        trees.remove("cuda");
+        let failures =
+            verify_catalog_evidence(COMPILED_CATALOG_JSON, &texts(&passing_records()), &trees)
+                .unwrap_err();
+        assert_eq!(failures.len(), 4);
+        assert!(failures.iter().all(|failure| matches!(failure, EvidenceFailure::MalformedRecord { reason, .. } if reason == "no release engine tree supplied for cuda")));
     }
 
     #[test]
