@@ -20,7 +20,7 @@ fn unix_ms() -> u64 {
 }
 
 fn source_commit() -> String {
-    let output = std::process::Command::new("git")
+    let output = synapse_core::without_launch_nonce(std::process::Command::new("git"))
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
