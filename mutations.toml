@@ -1012,3 +1012,23 @@ expect_message = "called `Result::unwrap_err()` on an `Ok` value"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+
+[[control]]
+id = "catalog-load-fingerprint-before-engine"
+guards = "A verified catalog lane must match its pinned fingerprint before engine loading"
+file = "crates/synapse-module/src/lib.rs"
+old = "if spec.fingerprint.0 != backend.fingerprint {"
+new = "if false { // NON-VACUITY BREAK: skip the fingerprint comparison"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["catalog_runtime_tests::catalog_load_rejects_fingerprint_mismatch_before_engine_invocation"]
+expect_message = "catalog engine load attempts should stay empty"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

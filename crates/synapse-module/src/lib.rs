@@ -24557,6 +24557,158 @@ mod catalog_runtime_tests {
     }
 
     #[tokio::test]
+    async fn catalog_load_rejects_fingerprint_mismatch_before_engine_invocation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (root, mut state) = isolated_catalog_state("fingerprint-mismatch", true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let backend_name = if cfg!(target_os = "macos") {
+            "metal"
+        } else {
+            "cuda"
+        };
+        let bodies = std::sync::Arc::new(BTreeMap::from([
+            ("model.safetensors".to_string(), b"test model bytes".to_vec()),
+            (
+                "tokenizer.json".to_string(),
+                br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"WhitespaceSplit"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1},"unk_token":"[UNK]"}}"#.to_vec(),
+            ),
+            ("config.json".to_string(), b"{}".to_vec()),
+        ]));
+        let runtime = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap();
+        runtime.hf_endpoint = endpoint;
+        runtime.runnable_backends = BTreeSet::from([backend_name.into()]);
+        let entry = runtime
+            .release_catalog
+            .models
+            .iter_mut()
+            .find(|entry| entry.id == "gte-modernbert-base")
+            .unwrap();
+        let backend = entry
+            .backends
+            .iter_mut()
+            .find(|backend| backend.backend == backend_name)
+            .unwrap();
+        backend.profile = None;
+        backend.fingerprint = "0".repeat(64);
+        for file in &mut entry.files {
+            file.backends = vec![backend_name.into()];
+            let body = &bodies[&file.path];
+            file.sha256 = sha256_hex(body);
+            file.size_bytes = body.len() as u64;
+        }
+        let pinned_fingerprint = backend.fingerprint.clone();
+        let lane = catalog::lane_id(&entry.id, &backend.backend);
+
+        let server_bodies = bodies.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..server_bodies.len() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap();
+                let body = &server_bodies[path];
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let accepted = response_result(
+            models_download(
+                state.clone(),
+                json!({"catalog_id":"gte-modernbert-base","request_key":"fingerprint-mismatch"}),
+            )
+            .await,
+            "models.download",
+        );
+        assert_eq!(accepted["state"], "queued");
+        let job = accepted["job_id"].as_str().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record = state.store.get_job(job).unwrap().unwrap();
+            if !store::is_download_non_terminal(&record.state) {
+                assert_eq!(record.state, "committed", "{record:?}");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let load_attempts_path = root.join("catalog-load-attempts");
+        let lane_env = "SYNAPSE_TEST_CATALOG_FAULT_LANE";
+        let attempts_env = "SYNAPSE_TEST_CATALOG_LOAD_ATTEMPTS";
+        let previous_lane = std::env::var_os(lane_env);
+        let previous_attempts = std::env::var_os(attempts_env);
+        std::env::set_var(lane_env, &lane);
+        std::env::set_var(attempts_env, &load_attempts_path);
+        let result = resolve_serving_model(
+            state.clone(),
+            Some(&lane),
+            ModelTask::Embed,
+            None,
+            None,
+            Some(5_000),
+        )
+        .await;
+        let lane_state = model_slot_snapshot(&state.runtime, &lane).map(|slot| slot.state);
+        let load_attempts = fs::read_to_string(&load_attempts_path).unwrap_or_default();
+        if let Some(value) = previous_lane {
+            std::env::set_var(lane_env, value);
+        } else {
+            std::env::remove_var(lane_env);
+        }
+        if let Some(value) = previous_attempts {
+            std::env::set_var(attempts_env, value);
+        } else {
+            std::env::remove_var(attempts_env);
+        }
+
+        server.abort();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&state) > 1 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            load_attempts.is_empty(),
+            "catalog engine load attempts should stay empty, got {load_attempts:?}"
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a mismatched catalog pin must refuse the lane"),
+        };
+        assert_eq!(error.code, "artifact_invalid", "{error:?}");
+        let details = error.details.expect("fingerprint mismatch details");
+        assert_eq!(details["expected_fingerprint"], pinned_fingerprint);
+        let actual_fingerprint = details["actual_fingerprint"].as_str().unwrap();
+        assert_eq!(actual_fingerprint.len(), 64);
+        assert!(actual_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(actual_fingerprint, pinned_fingerprint);
+        assert!(matches!(lane_state, Some(ModelRuntimeState::Failed(_))));
+    }
+
+    #[tokio::test]
     async fn catalog_no_accelerator_lists_every_entry_and_refuses_downloads() {
         let (root, state) = isolated_catalog_state("no-accelerator", false);
         let result = response_result(
