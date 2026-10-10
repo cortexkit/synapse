@@ -17,14 +17,14 @@
           "role": "model",
           "sha256": "3e85899d5728cb7de79781c0c3acfb91ccef9f875f1f7e0b3c9f3dd4b6a724ba",
           "size_bytes": 298041568,
-          "backends": ["metal", "ane"]
+          "backends": ["metal", "ane", "cuda", "vulkan"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
           "size_bytes": 3583228,
-          "backends": ["metal", "ane"]
+          "backends": ["metal", "ane", "cuda", "vulkan"]
         },
         {
           "path": "config.json",
@@ -61,6 +61,34 @@
           "normalize": true,
           "dims": 768,
           "fingerprint": "fa07e22359bfdff6deb529b64db81adf54ca0c6e23f146a0bc48ee3eadd08c5a"
+        },
+        {
+          "backend": "cuda",
+          "engine": "owned-cuda",
+          "profile": "gte-modernbert-base.owned-cuda",
+          "family": "gte-modernbert",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "cls",
+          "normalize": true,
+          "dims": 768,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "backend": "vulkan",
+          "engine": "owned-vulkan",
+          "profile": "gte-modernbert-base.owned-vulkan",
+          "family": "gte-modernbert",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "cls",
+          "normalize": true,
+          "dims": 768,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
         }
       ],
       "self_check": {
@@ -97,14 +125,14 @@
           "role": "model",
           "sha256": "13c533d902d6a48fa97375c6856c3e60854f9228ea760e3fc18ebde057e0cf31",
           "size_bytes": 598436708,
-          "backends": ["metal"]
+          "backends": ["metal", "cuda", "vulkan"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd",
           "size_bytes": 3583499,
-          "backends": ["metal"]
+          "backends": ["metal", "cuda", "vulkan"]
         },
         {
           "path": "config.json",
@@ -125,6 +153,30 @@
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
           "fingerprint": "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9"
+        },
+        {
+          "backend": "cuda",
+          "engine": "owned-cuda",
+          "profile": "gte-reranker-modernbert-base.owned-cuda",
+          "family": "gte-modernbert",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "rerank_abs_tolerance": 0.005,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "backend": "vulkan",
+          "engine": "owned-vulkan",
+          "profile": "gte-reranker-modernbert-base.owned-vulkan",
+          "family": "gte-modernbert",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "rerank_abs_tolerance": 0.005,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
         }
       ],
       "self_check": {
@@ -174,14 +226,14 @@
           "role": "model",
           "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
           "size_bytes": 1191586416,
-          "backends": ["metal", "ane"]
+          "backends": ["metal", "ane", "cuda", "vulkan"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
           "size_bytes": 11423705,
-          "backends": ["metal", "ane"]
+          "backends": ["metal", "ane", "cuda", "vulkan"]
         },
         {
           "path": "config.json",
@@ -218,6 +270,34 @@
           "normalize": true,
           "dims": 1024,
           "fingerprint": "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b"
+        },
+        {
+          "backend": "cuda",
+          "engine": "owned-cuda",
+          "profile": "qwen3-embedding-0.6b.owned-cuda",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "last",
+          "normalize": true,
+          "dims": 1024,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "backend": "vulkan",
+          "engine": "owned-vulkan",
+          "profile": "qwen3-embedding-0.6b.owned-vulkan",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "pooling": "last",
+          "normalize": true,
+          "dims": 1024,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
         }
       ],
       "self_check": {
@@ -254,14 +334,14 @@
           "role": "model",
           "sha256": "27cd75a405b9c1b46b59abfd88aaa209e6fed2a1972cde9b70e7659537c5e65b",
           "size_bytes": 1191588280,
-          "backends": ["ane"]
+          "backends": ["ane", "cuda", "vulkan"]
         },
         {
           "path": "tokenizer.json",
           "role": "tokenizer",
           "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
           "size_bytes": 11422654,
-          "backends": ["ane"]
+          "backends": ["ane", "cuda", "vulkan"]
         }
       ],
       "backends": [
@@ -276,6 +356,30 @@
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
           "fingerprint": "afa50ba3e4c56f42c750d10751f91b700f812c73862bdec8977d3a3db169aef3"
+        },
+        {
+          "backend": "cuda",
+          "engine": "owned-cuda",
+          "profile": "qwen3-reranker-0.6b.owned-cuda",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "rerank_abs_tolerance": 0.005,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "backend": "vulkan",
+          "engine": "owned-vulkan",
+          "profile": "qwen3-reranker-0.6b.owned-vulkan",
+          "family": "qwen3-0.6b",
+          "dtype": "f16",
+          "execution": "explicit",
+          "attention_units": 67108864,
+          "max_tokens": 8192,
+          "rerank_abs_tolerance": 0.005,
+          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
         }
       ]
     }
