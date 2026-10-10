@@ -286,7 +286,7 @@ jobs:
         working-directory: synapse
         shell: bash
         run: |
-          cargo install --locked --git https://github.com/cortexkit/commons --rev ac214583ad3613765dc1a2d81c744867382c4c2c cortexkit-mutate
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
           ckdev-mutate --version
 
       - name: Replay touched mutation controls
