@@ -55,6 +55,26 @@ fn rank_gate(expected: &[f64], actual: &[f32]) -> f64 {
     tau
 }
 
+/// Cosine between one output vector and its fp32 reference, after checking
+/// the vector is unit length.
+fn checked_cosine(slug: &str, case: &Case, vector: &[f32]) -> f64 {
+    let expected: Vec<f64> = serde_json::from_value(case.output.clone()).unwrap();
+    assert_eq!(expected.len(), vector.len());
+    let norm = vector
+        .iter()
+        .map(|v| f64::from(*v).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!((norm - 1.0).abs() <= 1e-3, "{slug} {} norm {norm}", case.id);
+    let reference_norm = expected.iter().map(|v| v * v).sum::<f64>().sqrt();
+    vector
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| f64::from(*a) * b)
+        .sum::<f64>()
+        / (norm * reference_norm)
+}
+
 #[test]
 #[ignore = "requires GPU, converted SYNAPSE_VULKAN_TEST_PACKAGES; macOS additionally requires moltenvk-diagnostic and SYNAPSE_MOLTENVK_LOADER"]
 fn four_models_match_reference_vectors_scores_window_and_padding() {
@@ -67,6 +87,7 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
     );
     assert!(root.canonicalize().unwrap().starts_with(&repo));
     let manifest = synapse_worker_vulkan::manifest();
+    let mut outputs: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     for slug in MODEL_SLUGS {
         let model = manifest.models[slug].clone();
         let profile = manifest.profiles[&format!("{slug}.owned-vulkan")].clone();
@@ -138,22 +159,7 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
             assert_eq!(actual.len(), selected.len() * dim);
             let mut min_cosine = 1.0f64;
             for (row, case) in selected.iter().enumerate() {
-                let vector = &actual[row * dim..(row + 1) * dim];
-                let expected: Vec<f64> = serde_json::from_value(case.output.clone()).unwrap();
-                assert_eq!(expected.len(), dim);
-                let norm = vector
-                    .iter()
-                    .map(|v| f64::from(*v).powi(2))
-                    .sum::<f64>()
-                    .sqrt();
-                assert!((norm - 1.0).abs() <= 1e-3, "{slug} {} norm {norm}", case.id);
-                let reference_norm = expected.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let cosine = vector
-                    .iter()
-                    .zip(&expected)
-                    .map(|(a, b)| f64::from(*a) * b)
-                    .sum::<f64>()
-                    / (norm * reference_norm);
+                let cosine = checked_cosine(slug, case, &actual[row * dim..(row + 1) * dim]);
                 min_cosine = min_cosine.min(cosine);
                 eprintln!("{slug} {} cosine={cosine:.9}", case.id);
             }
@@ -191,5 +197,50 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
             println!("GPU_PARITY {slug} max_score_error={max_error:.9} min_kendall_tau={min_tau:.9} rows={}", selected.len());
             assert!(max_error <= 0.02, "{slug} max score error {max_error}");
         }
+        for (row, case) in selected.iter().enumerate() {
+            let width = actual.len() / selected.len();
+            outputs.insert(
+                format!("{slug}/{}", case.id),
+                actual[row * width..(row + 1) * width].to_vec(),
+            );
+        }
+        // The remaining length cases, up to the 8192-token row, run one per
+        // request so that each is padded only to its own length.
+        let lengths: Vec<&Case> = fixture
+            .cases
+            .iter()
+            .filter(|c| c.category == "shape_boundary" || c.category == "long")
+            .filter(|c| !selected.iter().any(|s| s.id == c.id))
+            .collect();
+        assert!(
+            lengths.iter().any(|c| c.input_ids.len() == 8192),
+            "must exercise the 8192-token context"
+        );
+        for case in lengths {
+            let actual = engine.infer(std::slice::from_ref(&case.input_ids)).unwrap();
+            assert!(actual.iter().all(|v| v.is_finite()));
+            let tokens = case.input_ids.len();
+            if model.operation == Operation::Embed {
+                let cosine = checked_cosine(slug, case, &actual);
+                println!(
+                    "GPU_PARITY {slug} {} tokens={tokens} cosine={cosine:.9}",
+                    case.id
+                );
+                assert!(cosine >= 0.999, "{slug} {} cosine {cosine}", case.id);
+            } else {
+                assert_eq!(actual.len(), 1);
+                let error = (f64::from(actual[0]) - case.output.as_f64().unwrap()).abs();
+                println!(
+                    "GPU_PARITY {slug} {} tokens={tokens} score_error={error:.9}",
+                    case.id
+                );
+                assert!(error <= 0.02, "{slug} {} score error {error}", case.id);
+            }
+            outputs.insert(format!("{slug}/{}", case.id), actual);
+        }
+    }
+    // Optional dump of every output, to compare two kernel revisions directly.
+    if let Some(path) = std::env::var_os("SYNAPSE_VULKAN_PARITY_OUTPUTS") {
+        std::fs::write(path, serde_json::to_vec(&outputs).unwrap()).unwrap();
     }
 }
