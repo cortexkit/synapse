@@ -615,7 +615,12 @@ async fn joined_boot_fixture() {
     let ack = ack(Some(serde_json::to_value(descriptor).unwrap()));
     let handler = SynapseHandler::new("synapse-test".into(), PathBuf::new());
     let waiting = async {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // This loop polling while boot is still pending is the proof that boot
+        // runs off the executor. The bound only turns a blocked executor into a
+        // failure instead of a hang (a blocking boot would never be released),
+        // so it must outlast a slow boot (store open, migrations, catalog sync)
+        // on a loaded CI runner.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !cuda.root.join("ready").exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
