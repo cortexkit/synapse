@@ -20,6 +20,8 @@ pub fn ckdev_binary(binary: impl AsRef<Path>, _scratch: impl AsRef<Path>) -> io:
 
 /// Certification must execute the same inode that was hashed, not a copy.
 /// Refuse a cross-volume layout rather than weakening that attestation.
+/// Hard links now reuse a content-addressed directory; certification still gets
+/// a hard link to the exact candidate bytes, so attestation is unchanged.
 pub fn ckdev_binary_hard_link(
     binary: impl AsRef<Path>,
     scratch: impl AsRef<Path>,
@@ -41,10 +43,11 @@ pub fn ckdev_script(name: impl AsRef<Path>, bytes: &[u8]) -> io::Result<PathBuf>
                 "script needs a UTF-8 file name",
             )
         })?;
-    let dir = test_script_dir();
+    let digest = hex::encode(Sha256::digest(bytes));
+    let dir = test_script_dir().join(&digest[..16]);
     fs::create_dir_all(&dir)?;
     let source = dir.join(file_name);
-    if fs::read(&source).ok().as_deref() != Some(bytes) {
+    if !source.is_file() {
         let temporary = dir.join(format!(
             ".{file_name}-{}-{}.tmp",
             std::process::id(),
@@ -56,7 +59,13 @@ pub fn ckdev_script(name: impl AsRef<Path>, bytes: &[u8]) -> io::Result<PathBuf>
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))?;
         }
-        fs::rename(&temporary, &source)?;
+        match fs::rename(&temporary, &source) {
+            Ok(()) => {}
+            Err(_) if source.is_file() => {
+                let _ = fs::remove_file(&temporary);
+            }
+            Err(e) => return Err(e),
+        }
     }
     ckdev_binary(&source, &dir)
 }
@@ -223,7 +232,7 @@ fn destination_is_hard_link(destination: &Path, binary: &Path) -> io::Result<boo
                 Ok(m.is_file() && m.len() == bin_meta.len())
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
     }
 }
@@ -438,6 +447,35 @@ mod tests {
             .unwrap()
             .starts_with("ckdev-"));
         assert_eq!(fs::read(&first).unwrap(), script);
+    }
+
+    #[test]
+    fn ckdev_script_publishes_distinct_paths_for_different_contents_under_same_name() {
+        let first_bytes = if cfg!(windows) {
+            b"@echo off\r\necho first\r\n" as &[u8]
+        } else {
+            b"#!/bin/sh\necho first\n"
+        };
+        let second_bytes = if cfg!(windows) {
+            b"@echo off\r\necho second\r\n" as &[u8]
+        } else {
+            b"#!/bin/sh\necho second\n"
+        };
+        let script_name = if cfg!(windows) {
+            "ck-same-name.cmd"
+        } else {
+            "ck-same-name.sh"
+        };
+        let first = ckdev_script(script_name, first_bytes).unwrap();
+        let second = ckdev_script(script_name, second_bytes).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), first_bytes);
+        assert_eq!(fs::read(&second).unwrap(), second_bytes);
+
+        let first_out = std::process::Command::new(&first).output().unwrap();
+        assert!(String::from_utf8_lossy(&first_out.stdout).contains("first"));
+        let second_out = std::process::Command::new(&second).output().unwrap();
+        assert!(String::from_utf8_lossy(&second_out.stdout).contains("second"));
     }
 
     fn test_root(label: &str) -> PathBuf {
