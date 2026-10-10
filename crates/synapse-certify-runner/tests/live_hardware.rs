@@ -5,6 +5,8 @@
 fn metal_m5_live_candidate_writes_passed_without_floor_probe() {
     use std::path::PathBuf;
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let model =
+        std::env::var("SYNAPSE_CERTIFY_MODEL").unwrap_or_else(|_| "gte-modernbert-base".into());
     let root = crate_root.join(format!(".live/hardware-checkout-{}", std::process::id()));
     std::fs::create_dir_all(root.join("bench")).unwrap();
     let parity = root.join("bench/parity");
@@ -28,14 +30,9 @@ fn metal_m5_live_candidate_writes_passed_without_floor_probe() {
     // The assets directory has no worker binary: any hardware-floor subprocess
     // mistakenly invoked for in-process Metal must fail instead of going unnoticed.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ckdev-synapse-certify"))
-        .args([
-            "run",
-            "--row",
-            "metal-m5",
-            "--model",
-            "gte-modernbert-base",
-            "--assets",
-        ])
+        .args(["run", "--row", "metal-m5", "--model"])
+        .arg(&model)
+        .arg("--assets")
         .arg(assets.canonicalize().unwrap())
         .arg("--checkout")
         .arg(root.canonicalize().unwrap())

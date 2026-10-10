@@ -317,6 +317,22 @@ mod tests {
             .to_string()
             .contains("runner deadline"));
     }
+
+    #[tokio::test]
+    async fn oversized_success_after_truncation_cannot_be_an_admission_pass() {
+        let mut client = stub(vec![
+            json!({"fingerprint":"pin","truncation_disclosures":[{"submitted_tokens":8193,"effective_tokens":8192,"truncated":true}]}),
+        ]);
+        let mut session =
+            CertifiedSession::new(&mut client, pin(), Instant::now() + Duration::from_secs(1));
+        assert!(session
+            .oversized("embed.query", json!({"text":"oversized"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("8193 admission refused"));
+        assert_eq!(client.calls.len(), 1);
+    }
     #[tokio::test]
     async fn fatal_codes_refuse_instead_of_completing_or_retrying() {
         for code in [
