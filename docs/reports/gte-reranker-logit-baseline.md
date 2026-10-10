@@ -22,7 +22,7 @@ today at master as at the commit that recorded the baseline.
   separate calls, `sin` and `cos`. With optimization on, LLVM on Darwin merges
   those two calls into one call to Apple's `__sincosf_stret`. Without
   optimization, the debug build calls `sinf` and `cosf` separately. The two
-  routes disagree in the last bit for about 4% of RoPE table entries. That
+  routes disagree for about 4% of RoPE table entries, by at most 6e-8 each. That
   changes the GPU inputs, and the change reaches the final logit as a difference
   of about 1e-5.
 - Against the fp32 CPU reference, the release logits are slightly *closer*
