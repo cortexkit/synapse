@@ -69,6 +69,19 @@ pub(crate) fn cached_probe(worker: &Path, kind: ProbeKind) -> ProbeResult {
         .clone()
 }
 
+/// Drop every cached probe of one worker. Tests run many differently configured
+/// probe stubs from one shared executable path, because macOS assesses each new
+/// executable path on its first launch; a freshly configured stub must not be
+/// answered from an earlier configuration's cache entry.
+#[cfg(test)]
+pub(crate) fn forget_cached_probes(worker: &Path) {
+    let worker = std::fs::canonicalize(worker).unwrap_or_else(|_| worker.to_path_buf());
+    PROBES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(path, _), _| path != &worker);
+}
+
 pub(crate) fn run_probe(command: &mut Command, timeout: Duration) -> ProbeResult {
     let deadline = Instant::now() + timeout;
     // Take ownership of the caller's command to preserve its argv and environment
