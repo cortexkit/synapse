@@ -74,7 +74,7 @@
           "pooling": "cls",
           "normalize": true,
           "dims": 768,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010"
         },
         {
           "backend": "vulkan",
@@ -88,7 +88,7 @@
           "pooling": "cls",
           "normalize": true,
           "dims": 768,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "885776108d3fd5be2e9e3f17cc02df97d8d3ec83fcbd7978913093e1fdee4bad"
         }
       ],
       "self_check": {
@@ -164,7 +164,7 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "829c20af3757ecd5bb53ab89507ff64d4382225688f5888d6236ffc1670f2d4d"
         },
         {
           "backend": "vulkan",
@@ -176,7 +176,7 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "084f55877211334b1a11354668afd243637d9897747a539c74281fa43f298205"
         }
       ],
       "self_check": {
@@ -283,7 +283,7 @@
           "pooling": "last",
           "normalize": true,
           "dims": 1024,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "9628e6a8b0f30e9eb459f09cfb985306bbbaf2440579d38660e9795c4353554b"
         },
         {
           "backend": "vulkan",
@@ -297,7 +297,7 @@
           "pooling": "last",
           "normalize": true,
           "dims": 1024,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "62e7abe5dacb0c8f8932a057f39c04e7b7a1f8994897b138cabe88ce9461eed5"
         }
       ],
       "self_check": {
@@ -367,7 +367,7 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688"
         },
         {
           "backend": "vulkan",
@@ -379,7 +379,7 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "rerank_abs_tolerance": 0.005,
-          "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+          "fingerprint": "e892cb51a90e2ccb87a4a88d6fab5237ecb48959ee50da69cd7fee2a1111764a"
         }
       ]
     }
