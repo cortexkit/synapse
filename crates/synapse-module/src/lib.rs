@@ -24568,6 +24568,7 @@ mod catalog_runtime_tests {
         } else {
             "cuda"
         };
+        let catalog_id = "fingerprint-mismatch-fixture";
         let bodies = std::sync::Arc::new(BTreeMap::from([
             ("model.safetensors".to_string(), b"test model bytes".to_vec()),
             (
@@ -24585,6 +24586,7 @@ mod catalog_runtime_tests {
             .iter_mut()
             .find(|entry| entry.id == "gte-modernbert-base")
             .unwrap();
+        entry.id = catalog_id.into();
         let backend = entry
             .backends
             .iter_mut()
@@ -24632,7 +24634,7 @@ mod catalog_runtime_tests {
         let accepted = response_result(
             models_download(
                 state.clone(),
-                json!({"catalog_id":"gte-modernbert-base","request_key":"fingerprint-mismatch"}),
+                json!({"catalog_id":catalog_id,"request_key":"fingerprint-mismatch"}),
             )
             .await,
             "models.download",
