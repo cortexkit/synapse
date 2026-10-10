@@ -8025,7 +8025,8 @@ pub mod ane_residency {
         /// deadline a compile takes the stream, before classification. No
         /// compile held the stream during the wait.
         #[tokio::test]
-        async fn stream_wait_behind_inference_is_deadline_exceeded_even_if_a_compile_follows() {
+        async fn caller_classifies_a_stream_wait_behind_inference_as_deadline_exceeded_even_if_a_compile_follows(
+        ) {
             let ledger = SharedLedger::default();
             let serving = serving_fixture(&ledger).await;
             serving.infer(vec![vec![1]], false).await.unwrap();
@@ -8043,9 +8044,11 @@ pub mod ane_residency {
             finish_inference.notify_one();
             acknowledged(&compiling).await;
             let compiling_at_classification = serving.channel.compiling_shape();
+            // Only the caller classifies: the serving task's own
+            // classification stays held until the caller has answered.
             gate.release(GateSite::Caller);
-            gate.release(GateSite::Inner);
             let answered = waiting.await.unwrap();
+            gate.release(GateSite::Inner);
             finish_compile.notify_one();
             inference.await.unwrap().unwrap();
             compile.await.unwrap().unwrap();
@@ -8059,7 +8062,8 @@ pub mod ane_residency {
         /// (b) A compile holds the stream through the deadline; after the
         /// deadline an inference takes the stream, before classification.
         #[tokio::test]
-        async fn stream_wait_behind_a_compile_is_shape_compiling_even_if_inference_follows() {
+        async fn caller_classifies_a_stream_wait_behind_a_compile_as_shape_compiling_even_if_inference_follows(
+        ) {
             let ledger = SharedLedger::default();
             let serving = serving_fixture(&ledger).await;
             serving.infer(vec![vec![1]], false).await.unwrap();
@@ -8077,9 +8081,113 @@ pub mod ane_residency {
             // The compiling request's own inference now holds the stream.
             acknowledged(&inferring).await;
             let compiling_at_classification = serving.channel.compiling_shape();
+            // Only the caller classifies: the serving task's own
+            // classification stays held until the caller has answered.
             gate.release(GateSite::Caller);
-            gate.release(GateSite::Inner);
             let answered = waiting.await.unwrap();
+            gate.release(GateSite::Inner);
+            finish_inference.notify_one();
+            compile.await.unwrap().unwrap();
+            assert_eq!(compiling_at_classification, None);
+            assert!(
+                matches!(
+                    answered,
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                ),
+                "{answered:?}"
+            );
+        }
+
+        /// The serving task's own stream wait (no caller involved) expires
+        /// behind an inference; a compile takes the stream before the wait is
+        /// classified. No compile held the stream during the wait.
+        #[tokio::test]
+        async fn serving_task_classifies_a_stream_wait_behind_inference_as_deadline_exceeded_even_if_a_compile_follows(
+        ) {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
+            let (inferring, finish_inference) = notify_pair();
+            ledger.lock().unwrap().inference_gate =
+                Some((inferring.clone(), finish_inference.clone()));
+            let inference = spawn_infer(&serving, 1, None);
+            acknowledged(&inferring).await;
+            let (request, raw) = embed_request(&serving, 1);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let ready = async { Ok(Box::new(()) as ExchangePermit) };
+            let waiting = serving.channel.exchange_inference(
+                &request,
+                Some(&raw),
+                Some(deadline),
+                Duration::from_secs(1),
+                ready,
+            );
+            let (compiling, finish_compile) = notify_pair();
+            let mut compile = None;
+            let switch_holder = async {
+                tokio::time::timeout(Duration::from_secs(2), gate.reached(GateSite::Inner, 1))
+                    .await
+                    .expect("the wait never expired");
+                ledger.lock().unwrap().admit_gate =
+                    Some((compiling.clone(), finish_compile.clone()));
+                compile = Some(spawn_infer(&serving, 600, None));
+                finish_inference.notify_one();
+                acknowledged(&compiling).await;
+                let compiling_at_classification = serving.channel.compiling_shape();
+                gate.release(GateSite::Inner);
+                compiling_at_classification
+            };
+            let (answered, compiling_at_classification) = tokio::join!(waiting, switch_holder);
+            finish_compile.notify_one();
+            inference.await.unwrap().unwrap();
+            compile.unwrap().await.unwrap().unwrap();
+            assert_eq!(compiling_at_classification, Some(1024));
+            assert!(
+                matches!(answered, Err(AneResidencyError::DeadlineExceeded)),
+                "{answered:?}"
+            );
+        }
+
+        /// The serving task's own stream wait (no caller involved) expires
+        /// behind a compile; an inference takes the stream before the wait is
+        /// classified.
+        #[tokio::test]
+        async fn serving_task_classifies_a_stream_wait_behind_a_compile_as_shape_compiling_even_if_inference_follows(
+        ) {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            serving.infer(vec![vec![1]], false).await.unwrap();
+            let gate = gate_classification(&serving);
+            let (compiling, finish_compile) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((compiling.clone(), finish_compile.clone()));
+            let compile = spawn_infer(&serving, 600, None);
+            acknowledged(&compiling).await;
+            let (request, raw) = embed_request(&serving, 1);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+            let ready = async { Ok(Box::new(()) as ExchangePermit) };
+            let waiting = serving.channel.exchange_inference(
+                &request,
+                Some(&raw),
+                Some(deadline),
+                Duration::from_secs(1),
+                ready,
+            );
+            let (inferring, finish_inference) = notify_pair();
+            let switch_holder = async {
+                tokio::time::timeout(Duration::from_secs(2), gate.reached(GateSite::Inner, 1))
+                    .await
+                    .expect("the wait never expired");
+                ledger.lock().unwrap().inference_gate =
+                    Some((inferring.clone(), finish_inference.clone()));
+                finish_compile.notify_one();
+                // The compiling request's own inference now holds the stream.
+                acknowledged(&inferring).await;
+                let compiling_at_classification = serving.channel.compiling_shape();
+                gate.release(GateSite::Inner);
+                compiling_at_classification
+            };
+            let (answered, compiling_at_classification) = tokio::join!(waiting, switch_holder);
             finish_inference.notify_one();
             compile.await.unwrap().unwrap();
             assert_eq!(compiling_at_classification, None);

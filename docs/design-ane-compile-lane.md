@@ -76,9 +76,11 @@ Before:
 After:
 1. Resolver: unchanged. The lane mutex is now contended only by real lifecycle
    work, so `model_loading` means "loading or self-checking".
-2. Profile certification: lane mutex, waited for only until the request
-   deadline (answered `model_loading` when it expires, as the resolver does).
-   It is held only briefly unless the self-check itself runs.
+2. Profile certification: no lane mutex. Once the check has passed, a status
+   read and nothing else. Otherwise the request subscribes to the lane's
+   single in-flight self-check task (which holds the lane mutex, see
+   "Self-check" below) and waits only until its own deadline; it is answered
+   `model_loading` when the deadline expires, as the resolver does.
 3. Serving-gate READ guard *(deadline; `deadline_exceeded` when it expires)*.
    No lane mutex. No permit yet.
 4. Detached task (owns the read guard), for each rung:
@@ -110,8 +112,9 @@ Permit count and holding time are the same as today.
 Before: lane mutex (no time limit). The reference cases then execute through
 the serving path, reusing that mutex guard: permit, supervisor lease or admit,
 stream, then release.
-After (profile check). The load and the check run to completion in their own
-task, so a request that started them can give up without cancelling them:
+After (profile check). The check runs to completion in its own task, so a
+request that started it can give up without cancelling it. The task does not
+load the model; it answers `model_loading` if the model is not loaded:
 1. Lane mutex.
 2. Gate WRITE guard. This waits for in-flight readers to drain. Tokio's
    `RwLock` is fair, so new readers queue behind it.
@@ -131,6 +134,11 @@ resolution, so a check queued before an unload cannot bring the lane back.
 
 The non-profile 2000 ms check keeps both guards in `CatalogInvocation` until its
 blocking task ends.
+
+A job-shaped catalog batch request readies its lane in a task bounded by the
+job budget. That task waits for the lane lock only until the job deadline and
+checks the deadline again once it holds the lock. An expired job never goes on
+to load a lane, possibly one an operator has just unloaded.
 
 ### Unload
 
@@ -214,8 +222,10 @@ serving-gate guard, not a permit, is retained until the admission drains.
 They are unchanged: the same count, taken at the same point (just before the
 engine call), held for the same span. The only difference is that the per-lane
 serialisation those engines need comes from the lane execution mutex instead
-of the lifecycle mutex. Non-catalog models never took a lane lock and still
-don't.
+of the lifecycle mutex. Serving a non-catalog model takes no lane lock, as
+before. The one exception is the profile self-check task, which takes the
+model's lifecycle lock (keyed by model id) for catalog lanes and non-catalog
+profile models alike.
 
 ## The `shape_compiling` error
 
@@ -248,6 +258,17 @@ is doing when the error is mapped. Blocked on a compile means one of:
    the wait began before the oldest hold still kept could have ended, the
    history cannot rule a compile out, and the answer is `shape_compiling`,
    which is safe to retry.
+
+   Accepted residual: an admit hold's interval is stamped by `HolderMark` in
+   bookkeeping code next to the stream lock, not at the exact instant the
+   tokio mutex changes hands. The start is taken as the admit exchange begins
+   (it already holds the stream) and the end as the exchange returns (just
+   before the guard is dropped), so the recorded interval can differ from the
+   real hold by the few instructions in between. A deadline that falls
+   exactly in that sliver can be classified either way. This is harmless:
+   nothing is written to or read from the worker in that sliver, so no compile
+   time is misattributed, and both possible answers tell the client the
+   request did not run (`shape_compiling` additionally says it may be resent).
 
 A deadline that expires on any other wait (permit, budget queue, eviction,
 ordinary inference ahead of it) keeps `deadline_exceeded`. An inference that

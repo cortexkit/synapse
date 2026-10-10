@@ -1292,6 +1292,10 @@ struct RuntimeState {
     profile_check_passes_for_test: Mutex<bool>,
     #[cfg(test)]
     lane_check_tasks: std::sync::atomic::AtomicUsize,
+    /// Holds a certification caller between its fast-path miss and joining
+    /// the lane's check.
+    #[cfg(test)]
+    fast_path_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
     catalog_disk: Mutex<()>,
@@ -2392,6 +2396,8 @@ impl RuntimeState {
             profile_check_passes_for_test: Mutex::new(false),
             #[cfg(test)]
             lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fast_path_gate: Mutex::new(None),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
             catalog_disk: Mutex::new(()),
@@ -18266,6 +18272,189 @@ mod tests {
         assert!(lock_free, "nothing may stay queued on the lane lock");
     }
 
+    #[cfg(unix)]
+    fn ane_lane_entry(state: &ModuleState) -> (catalog::CatalogEntry, catalog::CatalogBackend) {
+        resolved_catalog_lane(&state.runtime, ANE_TEST_LANE)
+            .map(|(entry, backend)| (entry.clone(), backend.clone()))
+            .expect("test lane is a catalog lane")
+    }
+
+    /// An expired catalog job must not load the lane, whether the lane lock is
+    /// granted to it in the same poll as its expired timer or is simply free.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_expired_catalog_job_never_loads_the_lane_once_it_holds_the_lock() {
+        let fixture = ane_lane_fixture("ane-job-late-grant", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = ane_lane_entry(&state);
+        // The operator unloaded the lane and still holds its lifecycle lock.
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Unloaded);
+        let unload = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let job = ensure_catalog_lane_ready(
+            state.clone(),
+            entry.clone(),
+            backend.clone(),
+            Some(deadline),
+        );
+        tokio::pin!(job);
+        // One poll queues the job for the lane lock.
+        assert!(tokio::time::timeout(Duration::ZERO, &mut job)
+            .await
+            .is_err());
+        tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
+        // Released after the deadline: the lock goes to the queued job.
+        drop(unload);
+        let granted = job.await.map(drop);
+        let after_grant = model_slot_snapshot(&state.runtime, ANE_TEST_LANE).unwrap();
+        // A job already out of budget that finds the lock free.
+        let expired_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let free = ensure_catalog_lane_ready(state.clone(), entry, backend, Some(expired_at))
+            .await
+            .map(drop);
+        let after_free = model_slot_snapshot(&state.runtime, ANE_TEST_LANE).unwrap();
+        let lock_free = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
+            .try_lock()
+            .is_ok();
+        finish_ane_lane_fixture(fixture).await;
+        for (case, answer) in [("late grant", &granted), ("free lock", &free)] {
+            match answer {
+                Err(error) => assert_eq!(error.code, "deadline_exceeded", "{case}: {error:?}"),
+                Ok(()) => panic!("{case}: an expired job readied the lane"),
+            }
+        }
+        for (case, slot) in [("late grant", &after_grant), ("free lock", &after_free)] {
+            assert!(
+                matches!(slot.state, ModelRuntimeState::Unloaded) && slot.loaded.is_none(),
+                "{case}: an expired job touched the unloaded lane: {:?}",
+                slot.state
+            );
+        }
+        assert!(lock_free);
+    }
+
+    /// An admitted catalog job that is already out of budget is still failed
+    /// with deadline_exceeded and removed from the catalog job registry.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_expired_catalog_job_is_failed_and_unregistered() {
+        let fixture = ane_lane_fixture("ane-job-finalize", true).await;
+        let state = fixture.state.clone();
+        let (entry, backend) = ane_lane_entry(&state);
+        let params = json!({"request_key": "expired-catalog-job", "texts": ["a"]});
+        // Admitted long enough ago that its one-millisecond budget has run out.
+        let admission = state
+            .store
+            .admit_job(
+                "expired-catalog-job",
+                "sha256:expired-catalog-job",
+                "embed.batch",
+                state.module_generation,
+                None,
+                &params,
+                now_ms() - 10_000,
+                1,
+                60_000,
+            )
+            .unwrap();
+        let JobAdmission::Admitted(record) = admission else {
+            panic!("the job was not admitted")
+        };
+        state
+            .runtime
+            .catalog_jobs
+            .lock()
+            .unwrap()
+            .insert(record.job_id.clone(), entry.id.clone());
+        run_catalog_embed_job(
+            state.clone(),
+            record.clone(),
+            entry,
+            backend,
+            params,
+            "sha256:expired-catalog-job".into(),
+        )
+        .await;
+        let stored = state.store.get_job(&record.job_id).unwrap().unwrap();
+        let registered = state
+            .runtime
+            .catalog_jobs
+            .lock()
+            .unwrap()
+            .contains_key(&record.job_id);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(stored.is_terminal_failed(), "{}", stored.state);
+        assert_eq!(
+            stored
+                .error_json
+                .as_ref()
+                .map(|error| error["code"].clone()),
+            Some(json!("deadline_exceeded"))
+        );
+        assert!(!registered, "the expired job stayed registered");
+    }
+
+    /// A caller sees the check pending, then the check passes and leaves the
+    /// in-flight map before the caller joins. Joining must find the passed
+    /// check rather than start a second one.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_caller_that_joins_after_the_check_passed_does_not_start_another() {
+        let fixture = ane_lane_fixture("ane-check-stale-fast-path", false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        let state = fixture.state.clone();
+        let (compiling, finish_compile) = ane_gate();
+        fixture
+            .control
+            .hold_next_admission(compiling.clone(), finish_compile.clone());
+        let later = || Some(tokio::time::Instant::now() + Duration::from_secs(10));
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let model = ane_lane_model(&state);
+                ensure_profile_request_certified(state, &model, later()).await
+            }
+        });
+        // The check is running its first reference case.
+        tokio::time::timeout(Duration::from_secs(2), compiling.notified())
+            .await
+            .unwrap();
+        let (missed, join) = ane_gate();
+        *state.runtime.fast_path_gate.lock().unwrap() = Some((missed.clone(), join.clone()));
+        let second = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let model = ane_lane_model(&state);
+                ensure_profile_request_certified(state, &model, later()).await
+            }
+        });
+        // The second caller saw the check pending and is about to join it.
+        tokio::time::timeout(Duration::from_secs(2), missed.notified())
+            .await
+            .unwrap();
+        finish_compile.notify_one();
+        let first = first.await.unwrap();
+        until_lane_check_settles(&state).await;
+        join.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(2), second).await;
+        let tasks = state
+            .runtime
+            .lane_check_tasks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert!(matches!(second, Ok(Ok(Ok(())))), "{second:?}");
+        assert_eq!(tasks, 1, "a passed check was started again");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn profile_certification_waits_for_a_lane_self_check_only_until_its_deadline() {
@@ -26284,6 +26473,14 @@ async fn ensure_profile_preload_ready(
             format!("catalog lane '{model_id}' is running its numerical self-check"),
         )
     };
+    #[cfg(test)]
+    {
+        let gate = state.runtime.fast_path_gate.lock().unwrap().take();
+        if let Some((reached, proceed)) = gate {
+            reached.notify_one();
+            proceed.notified().await;
+        }
+    }
     let mut outcome = join_lane_check(&state, model_id);
     let finished = async move {
         outcome
@@ -26351,6 +26548,14 @@ fn join_lane_check(
     let mut checks = state.runtime.lane_checks.lock().expect("lane checks");
     if let Some(outcome) = checks.get(model_id) {
         return outcome.clone();
+    }
+    // The caller's fast path may have seen the check pending just before it
+    // passed and left this map. Decide again here, where no new check can
+    // start concurrently, so a passed check is never run a second time.
+    match profile_check_passed(state, model_id) {
+        Ok(Some(model)) => return tokio::sync::watch::channel(Some(Ok(model))).1,
+        Ok(None) => {}
+        Err(error) => return tokio::sync::watch::channel(Some(Err(error))).1,
     }
     let (publish, outcome) = tokio::sync::watch::channel(None);
     checks.insert(model_id.to_string(), outcome.clone());
@@ -26636,6 +26841,16 @@ async fn ensure_catalog_lane_ready(
             None => (lock.lock_owned().await, true),
         },
     };
+    // The lock can be granted in the same poll as the expired timer, or be
+    // free for a job that was already out of budget. Either way the job must
+    // not go on to load the lane.
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        drop(guard);
+        return Err(WireOperationError::from_stable(
+            StableError::deadline_exceeded(),
+            "catalog batch execution deadline expired",
+        ));
+    }
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
@@ -26985,6 +27200,89 @@ fn catalog_cache_roots(state: &ModuleState) -> Result<Vec<String>, SynapseStoreE
     Ok(roots)
 }
 
+/// Runs an admitted catalog embed job: readies its lane within the job's
+/// execution budget, executes it, and always finalizes the job record and its
+/// `catalog_jobs` registration, whatever the outcome.
+async fn run_catalog_embed_job(
+    state: Arc<ModuleState>,
+    record: store::JobRecord,
+    entry: catalog::CatalogEntry,
+    backend: catalog::CatalogBackend,
+    params: Value,
+    digest: String,
+) {
+    let job = record.job_id.clone();
+    let prepared = async {
+        let budget = record
+            .execution_expires_ms
+            .unwrap_or(now_ms())
+            .saturating_sub(now_ms());
+        let task_state = state.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+        let loading = tokio::spawn(async move {
+            ensure_catalog_lane_ready(task_state, entry, backend, Some(deadline)).await
+        });
+        let model = tokio::time::timeout(Duration::from_millis(budget), loading)
+            .await
+            .map_err(|_| {
+                WireOperationError::from_stable(
+                    StableError::deadline_exceeded(),
+                    "catalog batch execution deadline expired",
+                )
+            })?
+            .map_err(|e| {
+                WireOperationError::from_stable(
+                    StableError::engine_crashed(Some(250)),
+                    e.to_string(),
+                )
+            })??;
+        let parsed: EmbedBatchParams =
+            serde_json::from_value(params).map_err(|e| artifact_invalid_error(e.to_string()))?;
+        let items = batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
+        let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
+        let mut tokenized = model
+            .tokenizer
+            .tokenize_batch(items.iter().map(|i| i.text.as_str()))
+            .map_err(|e| artifact_invalid_error(e.to_string()))?;
+        compose_catalog_embed(&model, &mut tokenized)?;
+        apply_owned_tokenizer_policy(&model, &mut tokenized);
+        let total_tokens = tokenized
+            .real_token_counts
+            .iter()
+            .map(|n| u64::from(*n))
+            .sum();
+        let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
+        check_fingerprint_constraints(
+            &model,
+            &alias_table,
+            parsed.target_fingerprint.as_deref(),
+            parsed.required_fingerprint.as_deref(),
+            false,
+            parsed.required_epoch,
+        )?;
+        Ok::<_, WireOperationError>(EmbedBatchJobWork {
+            model,
+            request_digest: digest,
+            ids: items.into_iter().map(|i| i.id).collect(),
+            tokenized,
+            alias_table,
+            request_bytes,
+            total_tokens,
+        })
+    }
+    .await;
+    match prepared {
+        Ok(work) => execute_embed_batch_job(state.clone(), job.clone(), work).await,
+        Err(e) => fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e),
+    }
+    state
+        .runtime
+        .catalog_jobs
+        .lock()
+        .expect("catalog jobs")
+        .remove(&job);
+}
+
 async fn submit_catalog_embed_job(
     state: Arc<ModuleState>,
     entry: catalog::CatalogEntry,
@@ -27061,81 +27359,9 @@ async fn submit_catalog_embed_job(
     let response = job_status_payload(&state, &record);
     if matches!(admission, JobAdmission::Admitted(_)) {
         state.runtime.admission_telemetry.record_job_minted();
-        tokio::spawn(async move {
-            let job = record.job_id.clone();
-            let prepared = async {
-                let budget = record
-                    .execution_expires_ms
-                    .unwrap_or(now_ms())
-                    .saturating_sub(now_ms());
-                let task_state = state.clone();
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
-                let loading = tokio::spawn(async move {
-                    ensure_catalog_lane_ready(task_state, entry, backend, Some(deadline)).await
-                });
-                let model = tokio::time::timeout(Duration::from_millis(budget), loading)
-                    .await
-                    .map_err(|_| {
-                        WireOperationError::from_stable(
-                            StableError::deadline_exceeded(),
-                            "catalog batch execution deadline expired",
-                        )
-                    })?
-                    .map_err(|e| {
-                        WireOperationError::from_stable(
-                            StableError::engine_crashed(Some(250)),
-                            e.to_string(),
-                        )
-                    })??;
-                let parsed: EmbedBatchParams = serde_json::from_value(params)
-                    .map_err(|e| artifact_invalid_error(e.to_string()))?;
-                let items =
-                    batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
-                let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
-                let mut tokenized = model
-                    .tokenizer
-                    .tokenize_batch(items.iter().map(|i| i.text.as_str()))
-                    .map_err(|e| artifact_invalid_error(e.to_string()))?;
-                compose_catalog_embed(&model, &mut tokenized)?;
-                apply_owned_tokenizer_policy(&model, &mut tokenized);
-                let total_tokens = tokenized
-                    .real_token_counts
-                    .iter()
-                    .map(|n| u64::from(*n))
-                    .sum();
-                let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
-                check_fingerprint_constraints(
-                    &model,
-                    &alias_table,
-                    parsed.target_fingerprint.as_deref(),
-                    parsed.required_fingerprint.as_deref(),
-                    false,
-                    parsed.required_epoch,
-                )?;
-                Ok::<_, WireOperationError>(EmbedBatchJobWork {
-                    model,
-                    request_digest: digest,
-                    ids: items.into_iter().map(|i| i.id).collect(),
-                    tokenized,
-                    alias_table,
-                    request_bytes,
-                    total_tokens,
-                })
-            }
-            .await;
-            match prepared {
-                Ok(work) => execute_embed_batch_job(state.clone(), job.clone(), work).await,
-                Err(e) => {
-                    fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e)
-                }
-            }
-            state
-                .runtime
-                .catalog_jobs
-                .lock()
-                .expect("catalog jobs")
-                .remove(&job);
-        });
+        tokio::spawn(run_catalog_embed_job(
+            state, record, entry, backend, params, digest,
+        ));
     }
     result_outcome(response)
 }
