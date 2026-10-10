@@ -296,7 +296,8 @@ fn detection_contract_fixture() {
     ensure_owned_cuda_floor(Some(&cuda.worker)).unwrap();
     assert_eq!(cuda.counts(), (1, 1));
     assert_eq!(vulkan.counts(), (1, 1));
-    // Each stub below needs a shared executable of its own.
+    // Free both shared stub executables: the checks below create more stubs,
+    // and a process can hold only `STUB_SLOTS` stubs at once.
     drop((cuda, vulkan));
     for (backend, code, reason) in [
         ("cuda", "cuda_no_driver", "driver_missing"),
