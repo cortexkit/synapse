@@ -13,10 +13,22 @@ Artifact paths are relative to the extracted candidate asset directory, not ZIP 
 validator hashes the files themselves. Only passed combinations appear in the
 returned `eligible` list.
 
-`ck-synapse certify run --row <row-id> --model <slug> --assets <extracted-dir>
+Build the separate, non-shipped runner from the candidate's clean source commit:
+`cargo build --locked --release -p synapse-certify-runner`. Do not rebuild the
+extracted candidate assets. `ck-synapse certify source` prints its embedded commit
+only for a clean build; dirty or missing stamps refuse. Before producing evidence,
+the runner probes that candidate and requires the same clean source commit as its
+own build. It logs its own executable path, commit and SHA-256 to stderr; the
+schema-2 record remains unchanged.
+
+`ckdev-synapse-certify run --row <row-id> --model <slug> --assets <extracted-dir>
 --checkout <root> --weights <pinned-model-dir>` executes the named candidate
 asset directory's `ck-synapse` and row worker, never a Cargo-built fallback.
-It starts a private in-process daemon with isolated config, leases and store.
+Candidate and worker execution use hard links under `ckdev-*` names, never copies;
+keep the assets and scratch checkout on the same filesystem. Their release bytes
+remain the artifacts hashed in the record. Only the runner links the private
+in-process daemon; the shipped module retains offline validation and self-checks.
+The runner starts the daemon with isolated config, leases and store.
 The generated config selects one `<slug>.<lane>` preload profile from
 `bench/parity/models.json`, pinning the model's numeric execution settings for
 the requested hardware lane, and enables the
@@ -62,6 +74,6 @@ have both series. The validator disregards the stated drop cause and accepts a Q
 recomputed ratio strictly greater than three. Producer placement failures never
 justify a drop.
 
-Run `cargo test -p synapse-certify` for the synthetic contract fixtures. These
+Run `cargo test -p synapse-certify -p synapse-certify-runner` for the synthetic contract fixtures. These
 prove decisions and validation, not hardware parity. Run the ignored hardware
 test explicitly on the named machine to certify a real candidate.

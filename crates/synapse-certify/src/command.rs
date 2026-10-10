@@ -3,22 +3,21 @@ use crate::{refuse, validate_checkout, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const LIVE_OPTIONS_MISSING: &str =
-    "certify run requires --assets <extracted-dir> --checkout <root> --weights <model-dir>";
+pub const USAGE: &str = "usage: ck-synapse certify source | ck-synapse certify validate --assets <dir> <checkout-root> (run with ckdev-synapse-certify)";
 
-pub const USAGE: &str = "usage: ck-synapse certify run --row <row-id> --model <slug> --assets <extracted-dir> --checkout <root> --weights <model-dir> | ck-synapse certify validate --assets <dir> <checkout-root>";
+/// Evidence is keyed by the embedded Git commit, never by a dirty or missing build identity.
+pub fn source_stamp<'a>(revision: Option<&'a str>, tree: Option<&str>) -> Option<&'a str> {
+    revision.filter(|revision| {
+        tree == Some("clean")
+            && revision.len() == 40
+            && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Run {
-        row: String,
-        model: String,
-        options: Option<crate::live::Options>,
-    },
-    Validate {
-        assets: PathBuf,
-        checkout: PathBuf,
-    },
+    Source,
+    Validate { assets: PathBuf, checkout: PathBuf },
 }
 
 pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
@@ -27,46 +26,8 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
     }
     let bad = || refuse(USAGE);
     match arguments.get(1).and_then(|s| s.to_str()) {
-        Some("run") if arguments.len() >= 6 && arguments.len().is_multiple_of(2) => {
-            let mut row = None;
-            let mut model = None;
-            let mut assets = None;
-            let mut checkout = None;
-            let mut weights = None;
-            for pair in arguments[2..].as_chunks::<2>().0 {
-                let value = pair[1]
-                    .to_str()
-                    .filter(|s| !s.is_empty() && !s.starts_with('-'))
-                    .ok_or_else(bad)?;
-                match pair[0].to_str() {
-                    Some("--row") if row.is_none() => row = Some(value.to_string()),
-                    Some("--model") if model.is_none() => model = Some(value.to_string()),
-                    Some("--assets") if assets.is_none() => assets = Some(PathBuf::from(value)),
-                    Some("--checkout") if checkout.is_none() => {
-                        checkout = Some(PathBuf::from(value))
-                    }
-                    Some("--weights") if weights.is_none() => weights = Some(PathBuf::from(value)),
-                    _ => return Err(bad()),
-                }
-            }
-            let row = row.ok_or_else(bad)?;
-            let model = model.ok_or_else(bad)?;
-            crate::combination(&row, &model)?;
-            let options = match (assets, checkout, weights) {
-                (Some(assets), Some(checkout), Some(weights)) => Some(crate::live::Options {
-                    assets,
-                    checkout,
-                    weights,
-                }),
-                (None, None, None) => None,
-                _ => return Err(refuse(LIVE_OPTIONS_MISSING)),
-            };
-            Ok(Some(Command::Run {
-                row,
-                model,
-                options,
-            }))
-        }
+        Some("source") if arguments.len() == 2 => Ok(Some(Command::Source)),
+        Some("run") => Err(refuse("certify run moved to ckdev-synapse-certify run")),
         Some("validate") if arguments.len() == 5 && arguments[2] == "--assets" => {
             if arguments[3..]
                 .iter()
@@ -85,31 +46,9 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
 
 pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Value> {
     match command {
-        Command::Run {
-            row,
-            model,
-            options,
-        } => {
-            let options = options.ok_or_else(|| refuse(LIVE_OPTIONS_MISSING))?;
-            crate::combination(&row, &model)?;
-            let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
-            let candidate = options
-                .assets
-                .join(format!("ck-synapse{}", std::env::consts::EXE_SUFFIX));
-            let executable = std::env::current_exe().map_err(|error| refuse(error.to_string()))?;
-            if synapse_parity::canonical::sha256_file(&candidate)
-                .map_err(|error| refuse(error.to_string()))?
-                != synapse_parity::canonical::sha256_file(&executable)
-                    .map_err(|error| refuse(error.to_string()))?
-            {
-                return Err(refuse(
-                    "executing producer does not match the named candidate ck-synapse",
-                ));
-            }
-            let mut runner = crate::live::LiveRunner::new(options.clone(), source)?;
-            let record = crate::produce(&mut runner, &options.assets, &row, &model)?;
-            crate::write_record(&record, &options.checkout)?;
-            serde_json::to_value(record).map_err(|error| refuse(error.to_string()))
+        Command::Source => {
+            let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; source commit unavailable"))?;
+            Ok(serde_json::Value::String(source.to_string()))
         }
         Command::Validate { assets, checkout } => {
             let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
@@ -128,16 +67,8 @@ mod tests {
     #[test]
     fn parses_certification_commands() {
         assert!(matches!(
-            parse(&args(&[
-                "certify",
-                "run",
-                "--row",
-                "metal-m5",
-                "--model",
-                "gte-modernbert-base"
-            ]))
-            .unwrap(),
-            Some(Command::Run { .. })
+            parse(&args(&["certify", "source"])).unwrap(),
+            Some(Command::Source)
         ));
         assert!(matches!(
             parse(&args(&[
@@ -149,21 +80,36 @@ mod tests {
         assert_eq!(parse(&args(&["restore-import"])).unwrap(), None);
     }
     #[test]
-    fn run_requires_candidate_paths() {
-        let command = parse(&args(&[
-            "certify",
-            "run",
-            "--row",
-            "metal-m5",
-            "--model",
-            "gte-modernbert-base",
-        ]))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            dispatch(command, None).unwrap_err().to_string(),
-            format!("certification_refused: {LIVE_OPTIONS_MISSING}")
-        );
+    fn run_is_not_a_shipped_command() {
+        assert!(parse(&args(&["certify", "run"]))
+            .unwrap_err()
+            .to_string()
+            .contains("ckdev-synapse-certify"));
+    }
+
+    #[test]
+    fn clean_source_is_reported() {
+        let commit = "a".repeat(40);
+        let source = source_stamp(Some(&commit), Some("clean"));
+        assert_eq!(dispatch(Command::Source, source).unwrap(), commit);
+    }
+
+    #[test]
+    fn dirty_source_is_refused() {
+        let commit = "a".repeat(40);
+        let source = source_stamp(Some(&commit), Some("dirty"));
+        assert!(dispatch(Command::Source, source).is_err());
+    }
+
+    #[test]
+    fn missing_source_is_refused() {
+        for (revision, tree) in [
+            (None, None),
+            (None, Some("clean")),
+            (Some("bad"), Some("clean")),
+        ] {
+            assert!(dispatch(Command::Source, source_stamp(revision, tree)).is_err());
+        }
     }
     #[test]
     fn bad_arguments_are_typed_refusals() {

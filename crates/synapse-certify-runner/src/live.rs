@@ -1,7 +1,5 @@
 //! Executes candidate artifacts against a private in-process daemon.
-use crate::{
-    refuse, Admission, ArtifactFile, Inventory, Outcome, Parity, Result, RunEvidence, Runner,
-};
+use crate::refuse;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -16,6 +14,9 @@ use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, read_frame, write_atomic, write_frame,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
+};
+use synapse_certify::{
+    Admission, ArtifactFile, Inventory, Outcome, Parity, Result, RunEvidence, Runner,
 };
 use synapse_parity::{
     evaluator::{evaluate, FixtureSet, ObservedCase, Output},
@@ -86,7 +87,7 @@ impl Runner for LiveRunner {
                         binary(&self.options.assets, role),
                         self.options
                             .checkout
-                            .join("crates/synapse-certify/.live")
+                            .join("crates/synapse-certify-runner/.live")
                             .join(format!("{}-{row}-floor", std::process::id())),
                     )
                     .map_err(err)?,
@@ -209,7 +210,7 @@ impl Session {
 async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> Result<Session> {
     let root = options
         .checkout
-        .join("crates/synapse-certify/.live")
+        .join("crates/synapse-certify-runner/.live")
         .join(format!("{}-{}", std::process::id(), row));
     std::fs::create_dir_all(root.join("data")).map_err(err)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
@@ -630,7 +631,7 @@ async fn observe(
         let metal =
             latency_series(&mut metal_session, method, request_params(warm, operation)).await?;
         metal_session.shutdown().await?;
-        Some(crate::RawSeries {
+        Some(synapse_certify::RawSeries {
             session_id: format!("{}-{}", source, std::process::id()),
             ane,
             metal,
@@ -752,7 +753,7 @@ fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
             .output()
             .map_err(err)?;
         Ok(
-            json!({"model_identifier": hardware["machine_model"], "platform_uuid_sha256": crate::platform_uuid_sha256(platform_uuid), "os": String::from_utf8_lossy(&os.stdout).trim(), "driver": if row == "metal-m5" { json!(format!("Metal on macOS {}", String::from_utf8_lossy(&os.stdout).trim())) } else { floor.cloned().unwrap_or(Value::Null) }}),
+            json!({"model_identifier": hardware["machine_model"], "platform_uuid_sha256": synapse_certify::platform_uuid_sha256(platform_uuid), "os": String::from_utf8_lossy(&os.stdout).trim(), "driver": if row == "metal-m5" { json!(format!("Metal on macOS {}", String::from_utf8_lossy(&os.stdout).trim())) } else { floor.cloned().unwrap_or(Value::Null) }}),
         )
     }
     #[cfg(not(target_os = "macos"))]
@@ -809,7 +810,7 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
         }
         let pci = u32::from_str_radix(fields[0].trim_start_matches("0x"), 16).map_err(err)?;
         (
-            json!({"vendor_id": pci & 0xffff, "device_id": pci >> 16, "name": fields[1], "uuid_sha256": crate::gpu_uuid_sha256(fields[2])}),
+            json!({"vendor_id": pci & 0xffff, "device_id": pci >> 16, "name": fields[1], "uuid_sha256": synapse_certify::gpu_uuid_sha256(fields[2])}),
             fields[3].to_string(),
         )
     } else {
@@ -837,7 +838,7 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
                 .ok_or_else(|| refuse(format!("Vulkan machine identifier missing: {key}")))
         };
         (
-            json!({"vendor_id": get("vendorID")?, "device_id": get("deviceID")?, "name": get("deviceName")?, "uuid_sha256": crate::gpu_uuid_sha256(get("deviceUUID")?)}),
+            json!({"vendor_id": get("vendorID")?, "device_id": get("deviceID")?, "name": get("deviceName")?, "uuid_sha256": synapse_certify::gpu_uuid_sha256(get("deviceUUID")?)}),
             format!("{} {}", get("driverName")?, get("driverInfo")?),
         )
     };

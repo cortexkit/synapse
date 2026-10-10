@@ -37,6 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/check-release-candidate.py source --commit "$SOURCE_COMMIT"
+          python3 scripts/check-module-runtime-deps.py
       - name: Create immutable candidate draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,7 +50,7 @@ jobs:
             echo "Candidate already exists: $tag; use a new source commit" >&2
             exit 1
           fi
-          gh release create "$tag" --target "$SOURCE_COMMIT" --draft --title "$tag" --notes "Certification candidate built from $SOURCE_COMMIT"
+          gh release create "$tag" --target "$SOURCE_COMMIT" --draft --title "$tag" --notes "Certification candidate built from $SOURCE_COMMIT. On release hardware, build ckdev-synapse-certify from this clean commit (cargo build --locked --release -p synapse-certify-runner), then run ckdev-synapse-certify run --row <row> --model <model> --assets <extracted-dir> --checkout <root> --weights <pinned-model-dir>. Keep assets and scratch on one filesystem: candidate and workers execute only via hard links. Never rebuild shipped assets. The runner checks the candidate's clean source stamp and logs its own path, commit and sha256. ck-synapse certify validate remains the offline tag gate. See crates/synapse-certify/README.md."
 
   build:
     needs: prepare

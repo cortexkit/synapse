@@ -112,15 +112,14 @@ to the private backup directory, including when the record reports a drop.
 
 ```sh
 source_commit="$(git rev-parse HEAD)"
-scratch="$(mktemp -d)"
-ln "$PWD/target/release/ck-synapse" "$scratch/ckdev-synapse"
+cargo build --locked --release -p synapse-certify-runner
 for model in qwen3-embedding-0.6b qwen3-reranker-0.6b; do
   weights="$SYNAPSE_QWEN_WEIGHTS"
   if [ "$model" = qwen3-reranker-0.6b ]; then weights="$reranker_weights"; fi
   quiet > "$backup/$model-certification-load.log"
   set +e
   env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-    "$scratch/ckdev-synapse" certify run \
+    "$PWD/target/release/ckdev-synapse-certify" run \
     --row ane-m5 --model "$model" \
     --assets "$PWD/target/release" --checkout "$PWD" --weights "$weights" \
     > "$backup/$model-$source_commit.stdout.json" \
@@ -131,9 +130,11 @@ for model in qwen3-embedding-0.6b qwen3-reranker-0.6b; do
   if [ -f "$record" ]; then mv "$record" "$backup/$model-$source_commit.record.json"; fi
   if [ "$result" -ne 0 ]; then exit "$result"; fi
 done
-rm "$scratch/ckdev-synapse"
-rmdir "$scratch"
 ```
+
+The runner and candidate must have the same clean build commit. For releases,
+point `--assets` at the extracted candidate instead of rebuilding its binaries;
+candidate and worker execution remains hard-link-only on the same filesystem.
 
 Report the records' accuracy cases, 8192 acceptance and 8193 refusal, and
 placement gates **verbatim**. Do not replace them with the earlier single-fixture

@@ -24,33 +24,30 @@ fn metal_m5_live_candidate_writes_passed_without_floor_probe() {
     );
     let assets = crate_root.join(".live/metal-candidate");
     std::fs::create_dir_all(&assets).unwrap();
-    std::fs::copy(candidate, assets.join("ck-synapse")).unwrap();
+    std::fs::hard_link(candidate, assets.join("ck-synapse")).unwrap();
     // The assets directory has no worker binary: any hardware-floor subprocess
     // mistakenly invoked for in-process Metal must fail instead of going unnoticed.
-    let output = std::process::Command::new(
-        synapse_core::dev_binary::ckdev_binary_hard_link(assets.join("ck-synapse"), &root).unwrap(),
-    )
-    .args([
-        "certify",
-        "run",
-        "--row",
-        "metal-m5",
-        "--model",
-        "gte-modernbert-base",
-        "--assets",
-    ])
-    .arg(assets.canonicalize().unwrap())
-    .arg("--checkout")
-    .arg(root.canonicalize().unwrap())
-    .arg("--weights")
-    .arg(
-        crate_root
-            .join(".live/weights/gte-modernbert-base")
-            .canonicalize()
-            .unwrap(),
-    )
-    .output()
-    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ckdev-synapse-certify"))
+        .args([
+            "run",
+            "--row",
+            "metal-m5",
+            "--model",
+            "gte-modernbert-base",
+            "--assets",
+        ])
+        .arg(assets.canonicalize().unwrap())
+        .arg("--checkout")
+        .arg(root.canonicalize().unwrap())
+        .arg("--weights")
+        .arg(
+            crate_root
+                .join(".live/weights/gte-modernbert-base")
+                .canonicalize()
+                .unwrap(),
+        )
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

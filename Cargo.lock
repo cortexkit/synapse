@@ -6630,12 +6630,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synapse-parity",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "synapse-certify-runner"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
  "subc-daemon",
  "subc-protocol",
  "subc-transport",
+ "synapse-certify",
  "synapse-core",
  "synapse-parity",
- "thiserror 1.0.69",
  "tokio",
 ]
 

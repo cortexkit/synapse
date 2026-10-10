@@ -4,6 +4,7 @@
 # failing locally is free.
 bash scripts/check-train-preconditions.sh || refuse "train preconditions failed — see scripts/check-train-preconditions.sh"
 bash scripts/check-no-external-path-deps.sh || refuse "a Cargo path dependency resolves outside the repository — see scripts/check-no-external-path-deps.sh"
+python3 scripts/check-module-runtime-deps.py || refuse "shipped module includes daemon or presence — see scripts/check-module-runtime-deps.py"
 
 # CI compiles 7 of the workspace members. The Metal engine and the ANE worker
 # need a Mac, and the macos runner left with the M1 box, so this

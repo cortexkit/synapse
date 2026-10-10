@@ -24,7 +24,8 @@ name instead. Cargo's own test harness binaries keep their usual
   reproduction. macOS did not provide a reason for those signals, so the copy
   is the tested remedy, not a proven explanation of the failure mechanism.
 - `ckdev_binary_hard_link` is the same helper with copying forbidden.
-  `ck-synapse certify run` uses it because the certification record attests
+  `ckdev-synapse-certify run` uses it (including its offline candidate source
+  probe) because the certification record attests
   the SHA-256 of the built binaries: running a hard link executes those exact
   bytes, and a layout that would need a copy is refused. This helper remains a
   hard link in the caller's scratch directory and still rejects cross-volume

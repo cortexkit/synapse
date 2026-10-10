@@ -32,6 +32,7 @@ members = [
     "crates/synapse-core",
     "crates/synapse-native-probe",
     "crates/synapse-certify",
+    "crates/synapse-certify-runner",
     "crates/synapse-engine-owned",
     "crates/synapse-engine-cuda",
     "crates/synapse-engine-owned/owned-decode-worker",
