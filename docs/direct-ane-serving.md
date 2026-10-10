@@ -81,7 +81,7 @@ worker engine does.
 
 ## Certification observation
 
-`ck-synapse certify run` sets `certify_observation` in the config it generates
+`ckdev-synapse-certify run` sets `certify_observation` in the config it generates
 for the candidate. The supervisor then records every placement inventory the
 workers report: executable IDs, which layers they cover, and which stages run
 on the CPU. It keeps those records alongside its own count of admissions,
@@ -92,7 +92,7 @@ pass. With observation off, which is normal serving, nothing is recorded.
 
 ## Hardware certification
 
-`certify run --row ane-m5` drives a candidate build through this serving path
+`ckdev-synapse-certify run --row ane-m5` drives a candidate build through this serving path
 against the real Neural Engine. It needs a quiet machine (1-minute load under
 16) and the original checkpoint at the revision and digests pinned in
 `bench/parity/models.json`. Build from a clean, committed tree so the build
@@ -100,23 +100,25 @@ declares its commit, then run:
 
 ```sh
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo build --release --locked -p synapse-module -p synapse-worker-ane-direct
+  cargo build --release --locked -p synapse-module -p synapse-worker-ane-direct -p synapse-certify-runner
 
-scratch="$(mktemp -d)"
-ln "$PWD/target/release/ck-synapse" "$scratch/ckdev-synapse"
 env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  "$scratch/ckdev-synapse" certify run \
+  "$PWD/target/release/ckdev-synapse-certify" run \
   --row ane-m5 --model gte-modernbert-base \
   --assets "$PWD/target/release" --checkout "$PWD" \
   --weights "${GTE_MODERNBERT_WEIGHTS:?set to the original pinned checkpoint directory}"
-rm -rf "$scratch"
 ```
 
-`--assets` must be the `target/release` directory of the same clean build: the
+For this development example, `--assets` is the `target/release` directory of the same clean build: the
 record attests to the `ck-synapse` and `ck-synapse-worker-ane-direct` binaries
 it finds there. Execution uses `ckdev-*` hard links in the run's scratch tree;
 the record retains the original file names and hashes. `TMPDIR` must be unset, because the private ANE compiler only
 accepts the per-user temporary directory.
+
+For release certification, use extracted candidate assets without rebuilding them.
+Build only the runner from the candidate's clean source commit; its source probe
+must match. Keep assets and scratch on one filesystem so hard links succeed.
+The runner logs its own path, commit and SHA-256 separately from the record.
 
 Cold shape compiles dominate a first run: the 8192-token case spends most of
 its 2-3 minutes compiling its shape, while warm requests take milliseconds. A

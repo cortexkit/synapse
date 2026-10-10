@@ -445,6 +445,31 @@ fn validate_dispatch_uses_supplied_clean_candidate_source() {
 }
 
 #[test]
+fn shipped_validate_entry_point_accepts_a_complete_synthetic_matrix() {
+    let assets = Assets::new();
+    for record in matrix(&assets) {
+        write_record(&record, &assets.0).unwrap();
+    }
+    let arguments = vec![
+        "certify".into(),
+        "validate".into(),
+        "--assets".into(),
+        assets.0.clone().into_os_string(),
+        assets.0.clone().into_os_string(),
+    ];
+    let command = synapse_certify::command::parse(&arguments)
+        .unwrap()
+        .unwrap();
+    let source = "a".repeat(40);
+    let report = synapse_certify::command::dispatch(command, Some(&source)).unwrap();
+    assert_eq!(report["source_commit"], source);
+    assert_eq!(
+        report["eligible"].as_array().unwrap().len(),
+        ROWS.len() * MODELS.len()
+    );
+}
+
+#[test]
 fn validate_dispatch_without_clean_source_refuses_and_writes_nothing() {
     let assets = Assets::new();
     let checkout = assets.0.join("absent-checkout");

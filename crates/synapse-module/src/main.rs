@@ -23,18 +23,20 @@ async fn main() {
 
     match synapse_certify::command::parse(&arguments) {
         Ok(Some(command)) => {
-            let source = if option_env!("SYNAPSE_BUILD_TREE") == Some("clean") {
-                option_env!("SYNAPSE_BUILD_REV")
-            } else {
-                None
-            };
+            let source = synapse_certify::command::source_stamp(
+                option_env!("SYNAPSE_BUILD_REV"),
+                option_env!("SYNAPSE_BUILD_TREE"),
+            );
             match tokio::task::spawn_blocking(move || {
                 synapse_certify::command::dispatch(command, source)
             })
             .await
-            .expect("certification runner task panicked")
+            .expect("certification command task panicked")
             {
-                Ok(report) => println!("{report}"),
+                Ok(report) => match report.as_str() {
+                    Some(source) => println!("{source}"),
+                    None => println!("{report}"),
+                },
                 Err(error) => {
                     eprintln!("{error}");
                     std::process::exit(1);
@@ -119,14 +121,7 @@ mod tests {
     #[test]
     fn certification_verbs_are_recognized_before_module_startup() {
         for arguments in [
-            vec![
-                "certify".into(),
-                "run".into(),
-                "--row".into(),
-                "metal-m5".into(),
-                "--model".into(),
-                "gte-modernbert-base".into(),
-            ],
+            vec!["certify".into(), "source".into()],
             vec![
                 "certify".into(),
                 "validate".into(),

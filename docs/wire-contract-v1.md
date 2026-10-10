@@ -205,7 +205,7 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   its complete snapshot has empty inventories and request counts and zero admissions.
   CUDA and Vulkan report request counts without ANE placement inventories.
   Direct ANE reports `available: false` until production inference is connected
-  to the residency supervisor; `certify run --row ane-m5` still refuses for that
+  to the residency supervisor; `ckdev-synapse-certify run --row ane-m5` still refuses for that
   missing integration. Supervisor observation capture retains every successful
   ADMITTED inventory across eviction and confirmed-exit restart, separately from
   its cumulative admission count. Observation never changes computation.
@@ -976,7 +976,7 @@ by the parity evaluator. Numerical and semantic gates and manifest tolerances
 are unchanged. Full-corpus and 8192-token coverage remain certification gates,
 not claims made by the small load-time check.
 
-The `ck-synapse certify run` producer currently certifies only `metal-m5`.
+The `ckdev-synapse-certify run` producer currently certifies only `metal-m5`.
 Worker-backed `cuda-*`,
 `vulkan-*`, and `ane-m5` runs refuse with `missing_worker_observation` before
 launching workers or writing a record. Enabling those rows requires capture of
