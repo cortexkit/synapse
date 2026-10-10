@@ -324,6 +324,7 @@ impl ModernBertModel {
             self.config.max_position_embeddings
         );
 
+        let pad_started = Instant::now();
         let mut input_ids = vec![self.config.pad_token_id; batch * seq];
         let mut attention_mask = vec![0u8; batch * seq];
         for (row, ids) in sequences.iter().enumerate() {
@@ -333,16 +334,17 @@ impl ModernBertModel {
             }
         }
 
+        let pad_ms = pad_started.elapsed().as_secs_f64() * 1_000.0;
         let forward_started = Instant::now();
         let hidden = self.forward(provider, &input_ids, &attention_mask, batch, seq)?;
+        let forward_ms = forward_started.elapsed().as_secs_f64() * 1_000.0;
         if profile {
             eprintln!(
                 "[synapse-embed-profile] modernbert_forward batch={} seq={} forward_ms={:.3}",
-                batch,
-                seq,
-                forward_started.elapsed().as_secs_f64() * 1_000.0
+                batch, seq, forward_ms
             );
         }
+        let pool_started = Instant::now();
         let mut vectors = Vec::with_capacity(real_batch);
         for row in 0..real_batch {
             let start = row * seq * self.config.hidden_size;
@@ -351,6 +353,17 @@ impl ModernBertModel {
             vectors.push(vector);
         }
         if profile {
+            eprintln!(
+                "[synapse-embed-profile] pass_host family=modernbert batch={} seq={} rows={} tokens={} pad_ms={:.3} forward_ms={:.3} pool_ms={:.3} total_ms={:.3}",
+                batch,
+                seq,
+                real_batch,
+                sequences.iter().map(Vec::len).sum::<usize>(),
+                pad_ms,
+                forward_ms,
+                pool_started.elapsed().as_secs_f64() * 1_000.0,
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
             eprintln!(
                 "[synapse-embed-profile] modernbert_embed_ids items={} shape={}x{} total_ms={:.3}",
                 real_batch,
@@ -538,7 +551,14 @@ impl ModernBertModel {
         batch: usize,
         seq: usize,
     ) -> Result<Vec<f32>> {
+        let embed_started = Instant::now();
         let mut current = self.initial_hidden(input_ids)?;
+        if crate::embed_profile_enabled() {
+            eprintln!(
+                "[synapse-embed-profile] pass_embed_in family=modernbert batch={batch} seq={seq} embed_in_ms={:.3}",
+                embed_started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
 
         let mut run = |context: &mut dyn Any| {
             let context = context
@@ -993,6 +1013,7 @@ impl MetalContext {
         batch: usize,
         seq: usize,
     ) -> Result<()> {
+        let prep_started = Instant::now();
         let bucket = self.buckets.entry(seq).or_insert_with(|| {
             let head_dim = model.config.hidden_size / model.config.num_attention_heads;
             let (global_cos, global_sin) =
@@ -1060,6 +1081,8 @@ impl MetalContext {
         let mut output_f32 = vec![0.0; hidden_states.len()];
         let mut output_f16 = vec![0u16; hidden_states.len()];
         let f16 = matches!(self.precision, Precision::F16);
+        let prep_ms = prep_started.elapsed().as_secs_f64() * 1_000.0;
+        let native_started = Instant::now();
         let status = unsafe {
             synapse_modernbert_mps_forward(
                 self.raw.as_ptr(),
@@ -1094,6 +1117,7 @@ impl MetalContext {
                 std::ptr::null(),
                 0.0,
                 0,
+                i32::from(self.execution.f16_projections()),
                 params.as_ptr(),
                 if f16 {
                     output_f16.as_mut_ptr().cast()
@@ -1107,10 +1131,18 @@ impl MetalContext {
             "ModernBERT MPSGraph forward failed: {}",
             metal_error()
         );
+        let native_ms = native_started.elapsed().as_secs_f64() * 1_000.0;
+        let decode_started = Instant::now();
         if f16 {
             hidden_states.copy_from_slice(&decode_f16_bits(&output_f16));
         } else {
             hidden_states.copy_from_slice(&output_f32);
+        }
+        if crate::embed_profile_enabled() {
+            eprintln!(
+                "[synapse-embed-profile] pass_metal family=modernbert batch={batch} seq={seq} prep_ms={prep_ms:.3} native_ms={native_ms:.3} decode_ms={:.3}",
+                decode_started.elapsed().as_secs_f64() * 1_000.0
+            );
         }
         Ok(())
     }
@@ -1204,6 +1236,7 @@ impl MetalContext {
                 head.classifier_weight.as_ptr(),
                 head.classifier_bias,
                 1,
+                i32::from(self.execution.f16_projections()),
                 params.as_ptr(),
                 scores.as_mut_ptr().cast(),
             )
@@ -1282,6 +1315,7 @@ unsafe extern "C" {
         classifier_weight: *const f32,
         classifier_bias: f32,
         rerank: i32,
+        f16_projections: i32,
         layer_params: *const ModernBertLayerParams,
         output: *mut std::ffi::c_void,
     ) -> i32;

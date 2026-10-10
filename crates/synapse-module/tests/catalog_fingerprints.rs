@@ -2,7 +2,67 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use synapse_core::fingerprint::NumericProfile;
-use synapse_engine_owned::{engine_identity, ModelFamily, OwnedDType};
+use synapse_engine_owned::{
+    engine_identity, engine_identity_with_projections, ModelFamily, OwnedDType, ProjectionDtype,
+};
+
+/// Fingerprint of a catalog Metal lane, computed from its catalog parameters and
+/// the given engine identity the same way the module computes it at load.
+fn metal_lane_fingerprint(
+    entry: &Value,
+    backend: &Value,
+    tokenizers: &BTreeMap<String, String>,
+    engine: &synapse_core::EngineIdentity,
+) -> String {
+    let roles: BTreeMap<String, String> = entry["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| {
+            file["backends"]
+                .as_array()
+                .unwrap()
+                .contains(&backend["backend"])
+        })
+        .map(|file| {
+            (
+                file["role"].as_str().unwrap().to_string(),
+                format!("sha256:{}", file["sha256"].as_str().unwrap()),
+            )
+        })
+        .collect();
+    let roles = roles.into_iter().collect::<Vec<_>>();
+    let artifact = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&roles).unwrap()))
+    );
+    let pooling = backend["pooling"].as_str().unwrap_or("cls");
+    let profile: NumericProfile = serde_json::from_value(json!({
+        "model_digest":artifact, "quant":backend["dtype"],
+        "engine":engine,
+        "sanitized_tokenizer_digest":tokenizers[entry["id"].as_str().unwrap()],
+        "pooling":if pooling == "last" { "last_token" } else { pooling },
+        "normalization":if backend["normalize"] == true {"l2"} else {"none"},
+        "dtype":backend["dtype"], "flash_attention":"disabled",
+        "certified_shape":{"max_context_tokens":backend["max_tokens"],"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},
+        "prompt_template":if entry["task"] == "rerank" {Some("synapse-rerank-bos-query-sep-doc-eos-v1")} else {None}, "thread_policy":"balanced"
+    })).unwrap();
+    profile.fingerprint().0
+}
+
+/// Engine identity of a catalog Metal lane: catalog lanes opt in to f16 weight
+/// projections exactly when they are f16 gte-modernbert, as the module's
+/// `catalog_projection_dtype` decides.
+fn catalog_engine_identity(backend: &Value) -> synapse_core::EngineIdentity {
+    let family = ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap();
+    let dtype = OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap();
+    let projections = if family == ModelFamily::GteModernBert && dtype == OwnedDType::F16 {
+        ProjectionDtype::F16
+    } else {
+        ProjectionDtype::F32
+    };
+    engine_identity_with_projections(family, dtype, projections)
+}
 
 #[test]
 fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
@@ -21,40 +81,12 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
             if backend["backend"] != "metal" {
                 continue;
             }
-            let roles: BTreeMap<String, String> = entry["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|file| {
-                    file["backends"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&backend["backend"])
-                })
-                .map(|file| {
-                    (
-                        file["role"].as_str().unwrap().to_string(),
-                        format!("sha256:{}", file["sha256"].as_str().unwrap()),
-                    )
-                })
-                .collect();
-            let roles = roles.into_iter().collect::<Vec<_>>();
-            let artifact = format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(serde_json::to_vec(&roles).unwrap()))
+            let computed = metal_lane_fingerprint(
+                entry,
+                backend,
+                &tokenizers,
+                &catalog_engine_identity(backend),
             );
-            let pooling = backend["pooling"].as_str().unwrap_or("cls");
-            let profile: NumericProfile = serde_json::from_value(json!({
-                "model_digest":artifact, "quant":backend["dtype"],
-                "engine":engine_identity(ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap(), OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap()),
-                "sanitized_tokenizer_digest":tokenizers[entry["id"].as_str().unwrap()],
-                "pooling":if pooling == "last" { "last_token" } else { pooling },
-                "normalization":if backend["normalize"] == true {"l2"} else {"none"},
-                "dtype":backend["dtype"], "flash_attention":"disabled",
-                "certified_shape":{"max_context_tokens":backend["max_tokens"],"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},
-                "prompt_template":if entry["task"] == "rerank" {Some("synapse-rerank-bos-query-sep-doc-eos-v1")} else {None}, "thread_policy":"balanced"
-            })).unwrap();
-            let computed = profile.fingerprint().0;
             assert_eq!(
                 backend["fingerprint"], computed,
                 "catalog backend {} {}",
@@ -64,6 +96,46 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
         }
     }
     assert_eq!(checked, 3);
+}
+
+#[test]
+fn the_gte_metal_catalog_lane_moved_only_by_its_projection_opt_in() {
+    // The gte-modernbert-base catalog Metal lane opts in to f16 weight
+    // projections. Without the opt-in (graph revision 4, no projection_dtype
+    // flag) the lane's fingerprint is b904dd7b...; recomputing it that way must
+    // give exactly that value, which shows the opt-in is the only input that
+    // differs between the two fingerprints.
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "gte-modernbert-base")
+        .unwrap();
+    let backend = entry["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|backend| backend["backend"] == "metal")
+        .unwrap();
+    let opted_in = catalog_engine_identity(backend);
+    assert_eq!(opted_in.build_flags["graph_revision"], "5");
+    assert_eq!(opted_in.build_flags["projection_dtype"], "f16");
+    let without = engine_identity(ModelFamily::GteModernBert, OwnedDType::F16);
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &without),
+        "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+    );
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &opted_in),
+        backend["fingerprint"].as_str().unwrap()
+    );
+    assert_ne!(
+        backend["fingerprint"],
+        "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+    );
 }
 
 #[test]

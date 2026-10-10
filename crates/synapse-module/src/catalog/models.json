@@ -46,7 +46,7 @@
           "pooling": "cls",
           "normalize": true,
           "dims": 768,
-          "fingerprint": "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+          "fingerprint": "471684f94ff4cd408c35e93441c8a1d95907fa684f852893835171f9db22c126"
         },
         {
           "backend": "ane",

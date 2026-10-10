@@ -1,4 +1,9 @@
 #import "mpsgraph_runtime.h"
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 BOOL synapse_mps_runtime_init(SynapseMpsRuntimeContext *context) {
     if (context == NULL) return NO;
@@ -272,4 +277,59 @@ NSArray<MPSGraphTensorData *> *synapse_mps_executable_inputs(
         [inputs addObject:data];
     }
     return inputs;
+}
+
+BOOL synapse_mps_gpu_profile_enabled(void) {
+    const char *value = getenv("SYNAPSE_EMBED_PROFILE_GPU");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+double synapse_mps_now_ms(void) {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (double)time.tv_sec * 1000.0 + (double)time.tv_nsec / 1e6;
+}
+
+MPSGraphTensorData *synapse_mps_run_executable(
+    SynapseMpsRuntimeContext *context,
+    MPSGraphExecutable *executable,
+    NSArray<MPSGraphTensorData *> *inputs,
+    SynapseMpsRunTiming *timing
+) {
+    if (context == NULL || executable == nil || inputs == nil) return nil;
+    const double started = synapse_mps_now_ms();
+    if (timing != NULL) {
+        timing->encode_ms = -1.0;
+        timing->gpu_ms = -1.0;
+        timing->command_buffers = 0;
+    }
+    if (timing == NULL || !synapse_mps_gpu_profile_enabled()) {
+        MPSGraphTensorData *result = [[executable runWithMTLCommandQueue:context->queue
+                                                             inputsArray:inputs
+                                                            resultsArray:nil
+                                                     executionDescriptor:nil] firstObject];
+        if (timing != NULL) timing->run_ms = synapse_mps_now_ms() - started;
+        return result;
+    }
+    // Profiling path. MPSGraph may commit the root command buffer and continue on
+    // a fresh one while encoding; the first and last root buffers bound the GPU
+    // span, and the queue executes them in order.
+    MPSCommandBuffer *command_buffer = [MPSCommandBuffer commandBufferFromCommandQueue:context->queue];
+    id<MTLCommandBuffer> first = [command_buffer.rootCommandBuffer retain];
+    NSArray<MPSGraphTensorData *> *results = [executable encodeToCommandBuffer:command_buffer
+                                                                  inputsArray:inputs
+                                                                 resultsArray:nil
+                                                          executionDescriptor:nil];
+    const double encoded = synapse_mps_now_ms();
+    id<MTLCommandBuffer> last = [command_buffer.rootCommandBuffer retain];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    [first waitUntilCompleted];
+    timing->run_ms = synapse_mps_now_ms() - started;
+    timing->encode_ms = encoded - started;
+    timing->gpu_ms = (last.GPUEndTime - first.GPUStartTime) * 1000.0;
+    timing->command_buffers = first == last ? 1 : 2;
+    [first release];
+    [last release];
+    return [results firstObject];
 }

@@ -96,6 +96,14 @@ mod tests {
                 }
                 .into(),
             );
+            // Catalog lanes for f16 gte-modernbert opt in to f16 weight
+            // projections (the module's catalog_projection_dtype); check that graph.
+            if family == ModelFamily::GteModernBert && dtype == OwnedDType::F16 {
+                config.values.insert(
+                    synapse_engine_owned::PROJECTION_DTYPE_CONFIG_KEY.into(),
+                    "f16".into(),
+                );
+            }
         }
         let mut engine = OwnedMetalEmbedEngine::new(family, dtype);
         let loaded = engine

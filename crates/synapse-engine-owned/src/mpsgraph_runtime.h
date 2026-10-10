@@ -65,4 +65,30 @@ NSArray<MPSGraphTensorData *> *synapse_mps_executable_inputs(
     NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds
 );
 
+// Wall-clock split of one executable run, in milliseconds. `encode_ms` and `gpu_ms`
+// are -1 unless SYNAPSE_EMBED_PROFILE_GPU=1 selected the profiling run path.
+typedef struct SynapseMpsRunTiming {
+    double run_ms;
+    double encode_ms;
+    double gpu_ms;
+    int32_t command_buffers;
+} SynapseMpsRunTiming;
+
+BOOL synapse_mps_gpu_profile_enabled(void);
+double synapse_mps_now_ms(void);
+
+// Runs `executable` to completion and returns its first result.
+//
+// The serving path is `runWithMTLCommandQueue`, which encodes, commits and waits
+// inside one call. With SYNAPSE_EMBED_PROFILE_GPU=1 the same executable is
+// instead encoded into an MPSCommandBuffer that this function commits and waits
+// on, so CPU encode time and the GPU's own start/end timestamps can be reported
+// separately. Both paths run the same compiled executable on the same inputs.
+MPSGraphTensorData *synapse_mps_run_executable(
+    SynapseMpsRuntimeContext *context,
+    MPSGraphExecutable *executable,
+    NSArray<MPSGraphTensorData *> *inputs,
+    SynapseMpsRunTiming *timing
+);
+
 #endif

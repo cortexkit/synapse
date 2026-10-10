@@ -1,0 +1,25 @@
+# fixture_cosines on the 17 gte-modernbert-base fp32 fixture cases (f16, explicit).
+# master = engine source at ff24e671; head = final build. "config" loads from
+# config.json like a preload lane; "profile" loads the gte-modernbert-base.owned-metal
+# catalog profile. Neither sets projection_dtype except head-profile-optin (f16).
+# Columns: case, tokens, vector SHA-256 prefix per run, cosine vs fp32 reference.
+short-0           5  6904ccbb5743 6904ccbb5743 6904ccbb5743 6904ccbb5743 1ef5a766e267  cos legacy 0.9999913637  cos opt-in 0.9999939857
+short-1          20  4b6067a388c3 4b6067a388c3 4b6067a388c3 4b6067a388c3 8fb11271b02c  cos legacy 0.9999993929  cos opt-in 0.9999987934
+short-2          66  fce64e3e3fb3 fce64e3e3fb3 fce64e3e3fb3 fce64e3e3fb3 7f78e1373cf1  cos legacy 0.9999996032  cos opt-in 0.9999996296
+short-3          26  24e0b6725b2e 24e0b6725b2e 24e0b6725b2e 24e0b6725b2e b052eebe4a5a  cos legacy 0.9999996024  cos opt-in 0.9999995914
+boundary-127    127  8e8309e727b4 8e8309e727b4 8e8309e727b4 8e8309e727b4 664ae3b10423  cos legacy 0.9999991992  cos opt-in 0.9999992640
+boundary-128    128  f1b3c2dd8240 f1b3c2dd8240 f1b3c2dd8240 f1b3c2dd8240 15745133339d  cos legacy 0.9999993527  cos opt-in 0.9999993409
+boundary-129    129  64320c898186 64320c898186 64320c898186 64320c898186 24f08b6c521c  cos legacy 0.9999992366  cos opt-in 0.9999992498
+boundary-511    511  a132e40bba56 a132e40bba56 a132e40bba56 a132e40bba56 808b6ae2b9f1  cos legacy 0.9999994971  cos opt-in 0.9999992754
+boundary-512    512  e0d9d526578d e0d9d526578d e0d9d526578d e0d9d526578d d2aea90003a1  cos legacy 0.9999993321  cos opt-in 0.9999994694
+boundary-513    513  47eb0bd56f7b 47eb0bd56f7b 47eb0bd56f7b 47eb0bd56f7b 70d8c4ee5a53  cos legacy 0.9999990578  cos opt-in 0.9999990280
+batch-0          18  bffdf51a1b24 bffdf51a1b24 bffdf51a1b24 bffdf51a1b24 e858e55ce066  cos legacy 0.9999995723  cos opt-in 0.9999995309
+batch-1          20  4b6067a388c3 4b6067a388c3 4b6067a388c3 4b6067a388c3 8fb11271b02c  cos legacy 0.9999993929  cos opt-in 0.9999987934
+batch-2          17  4bcbc6f2ccac 4bcbc6f2ccac 4bcbc6f2ccac 4bcbc6f2ccac 86176d7e2531  cos legacy 0.9999991221  cos opt-in 0.9999993402
+batch-3          40  ff1735d38874 ff1735d38874 ff1735d38874 ff1735d38874 2d7896888ee5  cos legacy 0.9999994849  cos opt-in 0.9999993694
+batch-4         128  3ad01863cf04 3ad01863cf04 3ad01863cf04 3ad01863cf04 6be9108cb769  cos legacy 0.9999992981  cos opt-in 0.9999988418
+batch-5         200  227a4f95c90c 227a4f95c90c 227a4f95c90c 227a4f95c90c a461efc060e2  cos legacy 0.9999993516  cos opt-in 0.9999993499
+long-8192      8192  003ad6caec50 003ad6caec50 003ad6caec50 003ad6caec50 850608ccb8d4  cos legacy 0.9999996492  cos opt-in 0.9999996552
+master-config vs head-config: 17/17 byte-identical
+master-profile vs head-profile: 17/17 byte-identical
+head-profile-optin differs from head-profile in 17/17 cases

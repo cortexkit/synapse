@@ -56,6 +56,8 @@ mod tests {
     use super::*;
     #[test]
     fn metal_revision_matches_graph_and_bucket() {
+        // The shared constant names the revision-4 graph that every lane without
+        // the f16-projection opt-in uses.
         assert_eq!(
             synapse_core::METAL_KERNEL_REVISION,
             format!(
@@ -63,6 +65,14 @@ mod tests {
                 crate::GRAPH_REVISION,
                 crate::BUCKET_POLICY_VERSION
             )
+        );
+        assert_eq!(
+            crate::metal_kernel_revision(crate::ProjectionDtype::F32),
+            synapse_core::METAL_KERNEL_REVISION
+        );
+        assert_eq!(
+            crate::metal_kernel_revision(crate::ProjectionDtype::F16),
+            "owned-metal-graph-5-bucket-2"
         );
     }
     #[test]

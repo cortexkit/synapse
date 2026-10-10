@@ -121,9 +121,9 @@ use synapse_core::{
     OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_owned::{
-    engine_identity as owned_engine_identity, ModelFamily as OwnedFamily, OwnedDType,
-    OwnedMetalEmbedEngine, TokenizerPolicy as OwnedTokenizerPolicy,
-    DEFAULT_ATTENTION_UNITS as OWNED_DEFAULT_ATTENTION_UNITS,
+    engine_identity_with_projections, ModelFamily as OwnedFamily, OwnedDType,
+    OwnedMetalEmbedEngine, ProjectionDtype, TokenizerPolicy as OwnedTokenizerPolicy,
+    DEFAULT_ATTENTION_UNITS as OWNED_DEFAULT_ATTENTION_UNITS, PROJECTION_DTYPE_CONFIG_KEY,
 };
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
@@ -2939,6 +2939,7 @@ fn normalize_catalog_model(
                 ModuleError::Config("owned-metal catalog entry is missing dtype".to_string())
             })?)
             .map_err(|error| ModuleError::Config(error.to_string()))?,
+            projections: stored_projection_dtype(&model.engine_identity),
             execution: model
                 .owned_execution
                 .clone()
@@ -3151,8 +3152,13 @@ impl CatalogProfile {
         )
         .map_err(|error| ModuleError::Config(error.to_string()))?;
         let lane = self.profile()["lane"].as_str().expect("manifest lane");
+        let projections = if lane == "owned-metal" {
+            catalog_projection_dtype(family, dtype)
+        } else {
+            ProjectionDtype::F32
+        };
         let mut identity = if lane == "owned-metal" {
-            owned_engine_identity(family, dtype)
+            engine_identity_with_projections(family, dtype, projections)
         } else if lane == "owned-cuda" {
             owned_cuda_engine_identity(
                 family.as_str(),
@@ -3192,6 +3198,7 @@ impl CatalogProfile {
         Ok(OwnedCatalogConfig {
             family,
             dtype,
+            projections,
             execution: execution.into(),
             // A catalog profile always serves up to 8192 tokens, and the engine
             // refuses to load a model whose attention budget can't cover
@@ -3237,16 +3244,28 @@ impl CatalogProfile {
         numeric.manifest_profile_digest = Some(sha256_hex(
             &synapse_parity::canonical::canonical_bytes(&entry),
         ));
-        numeric.kernel_revision = Some(
-            match self.profile()["lane"].as_str().expect("lane") {
-                "owned-metal" => synapse_core::METAL_KERNEL_REVISION,
-                "owned-cuda" => synapse_core::CUDA_KERNEL_REVISION,
-                "owned-vulkan" => synapse_core::VULKAN_KERNEL_REVISION,
-                "ane-direct-worker" => synapse_core::ANE_DIRECT_KERNEL_REVISION,
-                _ => unreachable!("manifest lane"),
-            }
-            .into(),
-        );
+        numeric.kernel_revision = Some(match self.profile()["lane"].as_str().expect("lane") {
+            // Catalog profile lanes record the graph revision of the projection
+            // precision they run, so only lanes that opt in to f16 projections
+            // get a new kernel revision (and with it a new fingerprint).
+            "owned-metal" => synapse_engine_owned::metal_kernel_revision(catalog_projection_dtype(
+                if self.model()["architecture"]["family"] == "qwen3" {
+                    OwnedFamily::Qwen3
+                } else {
+                    OwnedFamily::GteModernBert
+                },
+                OwnedDType::parse(
+                    self.profile()["storage_dtype"]
+                        .as_str()
+                        .expect("manifest storage dtype"),
+                )
+                .expect("manifest storage dtype"),
+            )),
+            "owned-cuda" => synapse_core::CUDA_KERNEL_REVISION.into(),
+            "owned-vulkan" => synapse_core::VULKAN_KERNEL_REVISION.into(),
+            "ane-direct-worker" => synapse_core::ANE_DIRECT_KERNEL_REVISION.into(),
+            _ => unreachable!("manifest lane"),
+        });
     }
 }
 
@@ -3254,6 +3273,10 @@ impl CatalogProfile {
 struct OwnedCatalogConfig {
     family: OwnedFamily,
     dtype: OwnedDType,
+    /// ModernBERT weight-projection precision. Only catalog lanes opt in to f16
+    /// (see `catalog_projection_dtype`); every other lane keeps f32 projections
+    /// and an engine identity without a `projection_dtype` flag.
+    projections: ProjectionDtype,
     execution: String,
     attention_units: usize,
     config_locator: Option<ModelAssetLocator>,
@@ -3261,6 +3284,31 @@ struct OwnedCatalogConfig {
     /// CUDA carries a backend-specific identity while reusing the catalog's
     /// family/dtype storage fields.
     identity_override: Option<EngineIdentity>,
+}
+
+/// Projection precision of a catalog Metal lane. Catalog lanes are new lanes, so
+/// f16 gte-modernbert catalog lanes opt in to f16 weight projections. Existing
+/// production lanes (preloads and `model.load` lanes) never come through here and
+/// keep the f32 projections their fingerprints were certified on.
+fn catalog_projection_dtype(family: OwnedFamily, dtype: OwnedDType) -> ProjectionDtype {
+    if family == OwnedFamily::GteModernBert && dtype == OwnedDType::F16 {
+        ProjectionDtype::F16
+    } else {
+        ProjectionDtype::F32
+    }
+}
+
+/// Projection precision a persisted lane was built with, read back from its
+/// engine identity. A lane stored without the flag keeps f32 projections.
+fn stored_projection_dtype(identity: &EngineIdentity) -> ProjectionDtype {
+    match identity
+        .build_flags
+        .get(PROJECTION_DTYPE_CONFIG_KEY)
+        .map(String::as_str)
+    {
+        Some("f16") => ProjectionDtype::F16,
+        _ => ProjectionDtype::F32,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3318,9 +3366,9 @@ fn build_stored_model_config(
         .as_ref()
         .and_then(|profile| profile.identity_override.clone())
         .or_else(|| {
-            owned
-                .as_ref()
-                .map(|profile| owned_engine_identity(profile.family, profile.dtype))
+            owned.as_ref().map(|profile| {
+                engine_identity_with_projections(profile.family, profile.dtype, profile.projections)
+            })
         })
         .map_or_else(|| catalog_model_engine_identity(engine_name), Ok)?;
     let catalog = engine_identity
@@ -3468,6 +3516,7 @@ fn owned_catalog_config(
     Ok(OwnedCatalogConfig {
         family: detected,
         dtype,
+        projections: ProjectionDtype::F32,
         execution,
         attention_units,
         config_locator,
@@ -3548,6 +3597,7 @@ fn owned_cuda_catalog_config(
     Ok(OwnedCatalogConfig {
         family,
         dtype,
+        projections: ProjectionDtype::F32,
         execution,
         attention_units: attention_units.unwrap_or(OWNED_DEFAULT_ATTENTION_UNITS),
         config_locator: None,
@@ -6267,6 +6317,7 @@ fn stored_owned_profile(
                 .map_err(|error| artifact_invalid_error(error.to_string()))?,
             dtype: OwnedDType::parse(dtype)
                 .map_err(|error| artifact_invalid_error(error.to_string()))?,
+            projections: stored_projection_dtype(&spec.engine_identity),
             execution: spec
                 .owned_execution
                 .clone()
@@ -7065,6 +7116,18 @@ fn model_runtime_config(
         );
     }
     if spec.engine == "owned-metal" {
+        // The engine identity decides the graph: a lane whose identity records
+        // f16 projections asks the engine for them, and a lane without the flag
+        // gets the engine's default f32 projections.
+        if let Some(projections) = spec
+            .engine_identity
+            .build_flags
+            .get(PROJECTION_DTYPE_CONFIG_KEY)
+        {
+            runtime_config
+                .values
+                .insert(PROJECTION_DTYPE_CONFIG_KEY.to_string(), projections.clone());
+        }
         runtime_config
             .values
             .insert("max_tokens".to_string(), spec.max_tokens.to_string());
@@ -15328,6 +15391,24 @@ fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidenc
     }
 }
 
+/// Reference similarity margin below which a neighbour swap counts as a near tie.
+///
+/// An f16 lane's pairwise similarities differ from its fp32 reference by f16
+/// rounding error. For the owned-Metal gte-modernbert f16 graph (with f32
+/// matmuls), the mean |similarity error| against its f32 graph was 1.98e-4 over
+/// 6,341 code chunks x 500 query chunks (p99 about 6.6e-4 over all pairs of a
+/// 1,500-chunk sample); the graph with f16 matmuls measured 1.99e-4
+/// (docs/evidence/metal-fixed-cost/README.md). Two
+/// neighbours whose reference similarities differ by less than about 2.5x that
+/// mean error can trade places from rounding alone, so such a swap does not
+/// measure ranking quality. Lanes with a larger rounding error than this
+/// measured one are not covered by that basis.
+const RANK_OVERLAP_NEAR_TIE_MARGIN: f64 = 5e-4;
+
+/// Mean and worst-decile top-k neighbour overlap of `left` against `right`, the
+/// reference. A neighbour `left` ranks into the top k in place of a reference
+/// neighbour still counts as a hit when the reference separates the two by less
+/// than `RANK_OVERLAP_NEAR_TIE_MARGIN`.
 fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     let n = left.len().min(right.len());
     if n <= 2 {
@@ -15338,10 +15419,7 @@ fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     for query in 0..n {
         let top_left = top_k_neighbors(query, left, k);
         let top_right = top_k_neighbors(query, right, k);
-        let hits = top_left
-            .iter()
-            .filter(|candidate| top_right.contains(candidate))
-            .count();
+        let hits = near_tie_tolerant_hits(query, right, &top_left, &top_right);
         overlaps.push(hits as f64 / k as f64);
     }
     overlaps.sort_by(f64::total_cmp);
@@ -15349,6 +15427,37 @@ fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     let worst_len = overlaps.len().div_ceil(10).max(1);
     let worst = overlaps[..worst_len].iter().sum::<f64>() / worst_len as f64;
     (mean, worst)
+}
+
+/// Neighbours of `query` that both top-k sets share, plus swaps the reference
+/// treats as near ties. Each reference neighbour the lane dropped is paired with
+/// a neighbour the lane took instead, weakest dropped with strongest taken, which
+/// pairs the closest reference similarities first; a pair whose reference margin
+/// is below `RANK_OVERLAP_NEAR_TIE_MARGIN` counts as a hit.
+fn near_tie_tolerant_hits(
+    query: usize,
+    reference: &[Vec<f32>],
+    lane_top: &BTreeSet<usize>,
+    reference_top: &BTreeSet<usize>,
+) -> usize {
+    let shared = lane_top.intersection(reference_top).count();
+    let similarity = |index: &usize| cosine(&reference[query], &reference[*index]);
+    let mut dropped = reference_top
+        .difference(lane_top)
+        .map(similarity)
+        .collect::<Vec<_>>();
+    let mut taken = lane_top
+        .difference(reference_top)
+        .map(similarity)
+        .collect::<Vec<_>>();
+    dropped.sort_by(f64::total_cmp);
+    taken.sort_by(|left, right| right.total_cmp(left));
+    let near_ties = dropped
+        .iter()
+        .zip(&taken)
+        .filter(|(dropped, taken)| *dropped - *taken < RANK_OVERLAP_NEAR_TIE_MARGIN)
+        .count();
+    shared + near_ties
 }
 
 fn top_k_neighbors(query: usize, vectors: &[Vec<f32>], k: usize) -> BTreeSet<usize> {
@@ -21971,6 +22080,7 @@ mod tests {
         let owned = || OwnedCatalogConfig {
             family: OwnedFamily::GteModernBert,
             dtype: OwnedDType::F32,
+            projections: ProjectionDtype::F32,
             execution: "explicit".to_string(),
             attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
             config_locator: None,
@@ -22338,7 +22448,12 @@ mod tests {
             let expected = [
                 "c0f400f352d41b549b864b9cbe59bc7c401e820c48c0585b98d1bc7d7c6eecd0",
                 "27166bbf06d295c10dad348a8df8bf6774e209791bef402fc4847b24f96b1b39",
-                "3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2",
+                // gte-modernbert-base.owned-metal: catalog profile lanes for f16
+                // ModernBERT opt in to f16 weight projections (projection_dtype = f16,
+                // kernel revision owned-metal-graph-5-bucket-2). Without the opt-in
+                // this profile's fingerprint is
+                // 3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2.
+                "7f51a5b7679f7168f7e6b344eb79f81e88664e0600950002e336b208c46da1d1",
                 "c86eceac46723880b0790de173899b8cd7a9cb2c560e1025ca4c1851c9a85195",
                 "a006367b6adb645e44c82c9a56e973f3423fb4f9be2461ff80a38df68aa9c543",
                 "510721ab2b99d667e5461764ac3c129e0244b4f1b32370a269608aa8e56bba20",
@@ -22365,23 +22480,51 @@ mod tests {
 
     #[test]
     fn preload_fingerprints_rebuild_from_committed_inputs() {
-        for bytes in [
-            include_bytes!("../../../bench/parity/preload/gte-modernbert-base-f16.json").as_slice(),
-            include_bytes!("../../../bench/parity/preload/gte-reranker-modernbert-base-f32.json")
+        // Existing production lanes must keep their fingerprints: a preload
+        // lane is built exactly as the module builds it, with no projection
+        // opt-in, and must reproduce the captured production identity and
+        // fingerprint byte for byte.
+        for (bytes, pinned) in [
+            (
+                include_bytes!("../../../bench/parity/preload/gte-modernbert-base-f16.json")
+                    .as_slice(),
+                "24cc5271f42dbc2d154f963e2d67d1adef322cbdfbb541b3eddfaa8ae8859dfb",
+            ),
+            (
+                include_bytes!(
+                    "../../../bench/parity/preload/gte-reranker-modernbert-base-f32.json"
+                )
                 .as_slice(),
+                "2fa5f24c0208f30c6db4bf18eb66bc0b2c46f765882cb744fcc58cd080b2b92d",
+            ),
         ] {
             let fixture: Value = serde_json::from_slice(bytes).unwrap();
             let inline: InlineConfig = serde_json::from_value(fixture["inline"].clone()).unwrap();
             let jobs: JobConfig = serde_json::from_value(fixture["jobs"].clone()).unwrap();
-            let owned = OwnedCatalogConfig {
-                family: OwnedFamily::parse(fixture["owned_family"].as_str().unwrap()).unwrap(),
-                dtype: OwnedDType::parse(fixture["owned_dtype"].as_str().unwrap()).unwrap(),
-                execution: "explicit".into(),
-                attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
-                config_locator: None,
-                extra_locators: Vec::new(),
-                identity_override: None,
-            };
+            // A preload without a catalog profile goes through owned_catalog_config,
+            // which detects the family from config.json beside the weights.
+            let model_dir = std::env::temp_dir().join(format!(
+                "synapse-preload-identity-{}-{}",
+                std::process::id(),
+                fixture["model_id"].as_str().unwrap()
+            ));
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(
+                model_dir.join("config.json"),
+                br#"{"model_type":"modernbert"}"#,
+            )
+            .unwrap();
+            let owned = owned_catalog_config(
+                &model_dir,
+                fixture["owned_family"].as_str(),
+                fixture["owned_dtype"].as_str(),
+                Some("explicit"),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap();
+            let _ = std::fs::remove_dir_all(&model_dir);
             let spec = build_stored_model_config(
                 fixture["model_id"].as_str().unwrap().into(),
                 "owned-metal",
@@ -22413,12 +22556,156 @@ mod tests {
                 &jobs,
             )
             .unwrap();
-            let expected = fixture["expected_fingerprint"]
-                .as_str()
-                .expect("preload fixture must pin expected_fingerprint");
-            assert_eq!(spec.fingerprint.0, expected);
+            let captured: EngineIdentity =
+                serde_json::from_value(fixture["captured"]["engine_identity"].clone()).unwrap();
+            assert_eq!(fixture["expected_fingerprint"], pinned);
+            assert_eq!(spec.engine_identity, captured);
+            assert_eq!(spec.engine_identity.build_flags["graph_revision"], "4");
+            assert!(!spec
+                .engine_identity
+                .build_flags
+                .contains_key(PROJECTION_DTYPE_CONFIG_KEY));
             assert!(!spec.engine_identity.build_flags.contains_key("profile"));
+            assert_eq!(spec.fingerprint.0, pinned);
         }
+    }
+
+    #[test]
+    fn only_catalog_f16_modernbert_lanes_opt_in_and_the_engine_is_told() {
+        assert_eq!(
+            catalog_projection_dtype(OwnedFamily::GteModernBert, OwnedDType::F16),
+            ProjectionDtype::F16
+        );
+        for (family, dtype) in [
+            (OwnedFamily::GteModernBert, OwnedDType::F32),
+            (OwnedFamily::Qwen3, OwnedDType::F16),
+            (OwnedFamily::MiniLm, OwnedDType::F16),
+        ] {
+            assert_eq!(
+                catalog_projection_dtype(family, dtype),
+                ProjectionDtype::F32
+            );
+        }
+        let spec = |projections| {
+            build_stored_model_config(
+                "gte-lane".into(),
+                "owned-metal",
+                ModelTask::Embed,
+                "sha256:model".into(),
+                "safetensors".into(),
+                "sha256:tokenizer".into(),
+                ModelAssetLocator::LocalPath {
+                    path: "unused".into(),
+                },
+                ModelAssetLocator::LocalPath {
+                    path: "unused".into(),
+                },
+                String::new(),
+                String::new(),
+                WorkerPooling::Cls,
+                true,
+                8192,
+                "f16".into(),
+                false,
+                None,
+                None,
+                Vec::new(),
+                Some(OwnedCatalogConfig {
+                    family: OwnedFamily::GteModernBert,
+                    dtype: OwnedDType::F16,
+                    projections,
+                    execution: "explicit".into(),
+                    attention_units: OWNED_DEFAULT_ATTENTION_UNITS,
+                    config_locator: None,
+                    extra_locators: Vec::new(),
+                    identity_override: None,
+                }),
+                &InlineConfig::default(),
+                &JobConfig::default(),
+            )
+            .unwrap()
+        };
+        let runtime = |spec: &StoredModelConfig| {
+            model_runtime_config(spec, Path::new("model"), &[], Path::new("cache"), 0, None)
+        };
+        let opted_in = spec(ProjectionDtype::F16);
+        assert_eq!(
+            opted_in.engine_identity.build_flags[PROJECTION_DTYPE_CONFIG_KEY],
+            "f16"
+        );
+        assert_eq!(opted_in.engine_identity.build_flags["graph_revision"], "5");
+        assert_eq!(
+            runtime(&opted_in).values[PROJECTION_DTYPE_CONFIG_KEY],
+            "f16"
+        );
+        assert_eq!(
+            stored_projection_dtype(&opted_in.engine_identity),
+            ProjectionDtype::F16
+        );
+        let default = spec(ProjectionDtype::F32);
+        assert!(!default
+            .engine_identity
+            .build_flags
+            .contains_key(PROJECTION_DTYPE_CONFIG_KEY));
+        assert!(!runtime(&default)
+            .values
+            .contains_key(PROJECTION_DTYPE_CONFIG_KEY));
+        assert_ne!(opted_in.fingerprint, default.fingerprint);
+    }
+
+    /// Unit vectors whose similarity to every other item is ordered by `scale`:
+    /// item i is `scale[i] * e0 + sqrt(1 - scale[i]^2) * e(i+1)`, so the cosine of
+    /// items i and j is `scale[i] * scale[j]`.
+    fn rank_fixture(scale: &[f64]) -> Vec<Vec<f32>> {
+        scale
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let mut vector = vec![0.0_f32; scale.len() + 1];
+                vector[0] = value as f32;
+                vector[index + 1] = (1.0 - value * value).sqrt() as f32;
+                vector
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rank_overlap_ignores_near_ties_but_catches_clear_swaps() {
+        // 64 items, so k = 6. Queries 0-5 have items 6 and 7 at the edge of
+        // their top 6, and every other adjacent pair is 3e-3 apart.
+        let spaced = (0..64).map(|i| 0.9 - 0.003 * i as f64).collect::<Vec<_>>();
+        let swapped = |mut scale: Vec<f64>| {
+            scale.swap(6, 7);
+            scale
+        };
+
+        // Near tie: the reference separates items 6 and 7 by at most 1.8e-4 for
+        // any query, under RANK_OVERLAP_NEAR_TIE_MARGIN, so a lane that swaps
+        // them keeps full overlap even though its top-6 sets differ.
+        let mut near = spaced.clone();
+        near[7] = near[6] - 2e-4;
+        let reference = rank_fixture(&near);
+        let lane = rank_fixture(&swapped(near.clone()));
+        assert_ne!(
+            top_k_neighbors(0, &lane, 6),
+            top_k_neighbors(0, &reference, 6),
+            "the near-tie lane must really change a top-6 set"
+        );
+        let tied = probe_evidence_between(&lane, &reference);
+        assert_eq!((tied.rank_overlap, tied.worst_decile), (1.0, 1.0));
+
+        // Planted defect: the reference separates items 6 and 7 by at least
+        // 2.1e-3, so the same swap is a real ordering error and must fail the
+        // probe's 0.999 rank-overlap bar.
+        let reference = rank_fixture(&spaced);
+        let lane = rank_fixture(&swapped(spaced.clone()));
+        let defect = probe_evidence_between(&lane, &reference);
+        assert!(
+            defect.rank_overlap < 0.999,
+            "a clear-margin neighbour swap passed the rank-overlap bar: {}",
+            defect.rank_overlap
+        );
+        assert!(defect.mean_cosine > 0.999_99, "{}", defect.mean_cosine);
     }
 
     #[test]
@@ -26392,11 +26679,14 @@ fn catalog_lane_spec(
     } else {
         format!("sha256:{}", "0".repeat(64))
     };
+    let family = OwnedFamily::parse(backend.family.as_deref().expect("validated family"))
+        .map_err(|e| artifact_invalid_error(e.to_string()))?;
+    let dtype = OwnedDType::parse(backend.dtype.as_deref().expect("validated dtype"))
+        .map_err(|e| artifact_invalid_error(e.to_string()))?;
     let owned = OwnedCatalogConfig {
-        family: OwnedFamily::parse(backend.family.as_deref().expect("validated family"))
-            .map_err(|e| artifact_invalid_error(e.to_string()))?,
-        dtype: OwnedDType::parse(backend.dtype.as_deref().expect("validated dtype"))
-            .map_err(|e| artifact_invalid_error(e.to_string()))?,
+        family,
+        dtype,
+        projections: catalog_projection_dtype(family, dtype),
         execution: backend.execution.clone().expect("validated execution"),
         attention_units: backend.attention_units.expect("validated attention units") as usize,
         config_locator: files.get("config").map(|f| ModelAssetLocator::CacheDigest {
@@ -26604,12 +26894,11 @@ fn catalog_self_check_key(
             .identity_override
             .expect("profile identity")
     } else {
-        owned_engine_identity(
-            OwnedFamily::parse(backend.family.as_deref().expect("family"))
-                .map_err(|e| artifact_invalid_error(e.to_string()))?,
-            OwnedDType::parse(backend.dtype.as_deref().expect("dtype"))
-                .map_err(|e| artifact_invalid_error(e.to_string()))?,
-        )
+        let family = OwnedFamily::parse(backend.family.as_deref().expect("family"))
+            .map_err(|e| artifact_invalid_error(e.to_string()))?;
+        let dtype = OwnedDType::parse(backend.dtype.as_deref().expect("dtype"))
+            .map_err(|e| artifact_invalid_error(e.to_string()))?;
+        engine_identity_with_projections(family, dtype, catalog_projection_dtype(family, dtype))
     };
     #[cfg(feature = "test-support")]
     let identity = {

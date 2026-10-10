@@ -118,6 +118,9 @@ static MPSGraphTensor *modernbert_cast(MPSGraph *graph, MPSGraphTensor *tensor, 
     return tensor.dataType == data_type ? tensor : [graph castTensor:tensor toType:data_type name:nil];
 }
 
+// Attention score and context products of the non-fused attention fallback
+// (macOS before 15). They multiply in f32 and cast the product back to the graph
+// dtype, the numerics this fallback has always had.
 static MPSGraphTensor *modernbert_matmul(
     MPSGraph *graph,
     MPSGraphTensor *primary,
@@ -130,14 +133,24 @@ static MPSGraphTensor *modernbert_matmul(
     return modernbert_cast(graph, product, data_type);
 }
 
+// Weight projection: both operands are cast to `projection_type`, multiplied,
+// and the product is cast to `data_type`. Lanes multiply in f32 (widening f16
+// operands), the graph existing fingerprints were certified on. A lane that opts
+// in to f16 projections passes the f16 graph dtype instead, which keeps the QKV,
+// attention-output and MLP matmuls on the GPU's f16 matrix path, about 2x faster
+// for the whole f16 forward pass on an M5 Max; the casts are then no-ops.
 static MPSGraphTensor *modernbert_linear(
     MPSGraph *graph,
     MPSGraphTensor *input,
     MPSGraphTensor *weight,
-    MPSDataType data_type
+    MPSDataType data_type,
+    MPSDataType projection_type
 ) {
     MPSGraphTensor *transposed = [graph transposeTensor:weight dimension:0 withDimension:1 name:nil];
-    return modernbert_matmul(graph, input, transposed, data_type);
+    input = modernbert_cast(graph, input, projection_type);
+    transposed = modernbert_cast(graph, transposed, projection_type);
+    MPSGraphTensor *product = [graph matrixMultiplicationWithPrimaryTensor:input secondaryTensor:transposed name:nil];
+    return modernbert_cast(graph, product, data_type);
 }
 
 static MPSGraphTensor *modernbert_layer_norm(
@@ -271,9 +284,10 @@ static NSString *modernbert_plan_key(
     float epsilon,
     uint64_t pattern,
     int32_t dtype,
-    int32_t rerank
+    int32_t rerank,
+    int32_t f16_projections
 ) {
-    return [NSString stringWithFormat:@"modernbert:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%llu:%d:%d",
+    return [NSString stringWithFormat:@"modernbert:%llu:%llu:%llu:%llu:%llu:%llu:%.9g:%llu:%d:%d:%d",
                                       (unsigned long long)batch,
                                       (unsigned long long)seq,
                                       (unsigned long long)hidden,
@@ -283,7 +297,8 @@ static NSString *modernbert_plan_key(
                                       (double)epsilon,
                                       (unsigned long long)pattern,
                                       dtype,
-                                      rerank];
+                                      rerank,
+                                      f16_projections];
 }
 
 static ModernBertPlan *modernbert_plan_new(
@@ -296,7 +311,8 @@ static ModernBertPlan *modernbert_plan_new(
     float epsilon,
     const ModernBertLayerParams *params,
     int32_t dtype,
-    int32_t rerank
+    int32_t rerank,
+    int32_t f16_projections
 ) {
     ModernBertPlan *plan = (ModernBertPlan *)calloc(1, sizeof(ModernBertPlan));
     if (plan == NULL) {
@@ -306,6 +322,7 @@ static ModernBertPlan *modernbert_plan_new(
     uint64_t rows = batch * seq;
     uint64_t head_dim = hidden / heads;
     MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+    MPSDataType projection_type = f16_projections ? data_type : MPSDataTypeFloat32;
     plan->layer_count = layer_count;
     plan->hidden_shape = [@[ @(batch), @(seq), @(hidden) ] retain];
     plan->hidden_2d_shape = [@[ @(rows), @(hidden) ] retain];
@@ -369,7 +386,7 @@ static ModernBertPlan *modernbert_plan_new(
         if (index > 0) {
             attention_input = modernbert_layer_norm(plan->graph, x, layer->attention_norm_weight, rows, epsilon, data_type);
         }
-        MPSGraphTensor *qkv = modernbert_linear(plan->graph, attention_input, layer->qkv_weight, data_type);
+        MPSGraphTensor *qkv = modernbert_linear(plan->graph, attention_input, layer->qkv_weight, data_type, projection_type);
         if (index == 0) { [debug_outputs addObject:qkv]; [debug_names addObject:@"qkv"]; }
         qkv = [plan->graph reshapeTensor:qkv withShape:qkv_shape name:nil];
         NSArray<MPSGraphTensor *> *parts = [plan->graph splitTensor:qkv numSplits:3 axis:2 name:nil];
@@ -419,18 +436,18 @@ static ModernBertPlan *modernbert_plan_new(
         context = [plan->graph transposeTensor:context permutation:@[ @0, @2, @1, @3 ] name:nil];
         context = [plan->graph reshapeTensor:context withShape:plan->hidden_2d_shape name:nil];
         if (index == 0) { [debug_outputs addObject:context]; [debug_names addObject:@"context"]; }
-        MPSGraphTensor *attention_output = modernbert_linear(plan->graph, context, layer->attention_output_weight, data_type);
+        MPSGraphTensor *attention_output = modernbert_linear(plan->graph, context, layer->attention_output_weight, data_type, projection_type);
         x = [plan->graph additionWithPrimaryTensor:x secondaryTensor:attention_output name:nil];
         if (index == 0) { [debug_outputs addObject:x]; [debug_names addObject:@"attention-residual"]; }
 
         MPSGraphTensor *mlp_input = modernbert_layer_norm(plan->graph, x, layer->mlp_norm_weight, rows, epsilon, data_type);
         if (index == 0) { [debug_outputs addObject:mlp_input]; [debug_names addObject:@"mlp-norm"]; }
-        MPSGraphTensor *projected = modernbert_linear(plan->graph, mlp_input, layer->mlp_input_weight, data_type);
+        MPSGraphTensor *projected = modernbert_linear(plan->graph, mlp_input, layer->mlp_input_weight, data_type, projection_type);
         if (index == 0) { [debug_outputs addObject:projected]; [debug_names addObject:@"mlp-projected"]; }
         NSArray<MPSGraphTensor *> *mlp_parts = [plan->graph splitTensor:projected numSplits:2 axis:1 name:nil];
         MPSGraphTensor *activated = modernbert_gelu(plan->graph, [mlp_parts objectAtIndex:0], data_type);
         activated = [plan->graph multiplicationWithPrimaryTensor:activated secondaryTensor:[mlp_parts objectAtIndex:1] name:nil];
-        MPSGraphTensor *mlp_output = modernbert_linear(plan->graph, activated, layer->mlp_output_weight, data_type);
+        MPSGraphTensor *mlp_output = modernbert_linear(plan->graph, activated, layer->mlp_output_weight, data_type, projection_type);
         if (index == 0) { [debug_outputs addObject:mlp_output]; [debug_names addObject:@"mlp-output"]; }
         x = [plan->graph additionWithPrimaryTensor:x secondaryTensor:mlp_output name:nil];
         [layer_outputs addObject:x];
@@ -449,10 +466,10 @@ static ModernBertPlan *modernbert_plan_new(
         MPSGraphTensor *one_count = [plan->graph constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
         counts = [plan->graph maximumWithPrimaryTensor:counts secondaryTensor:one_count name:nil];
         pooled = [plan->graph divisionWithPrimaryTensor:pooled secondaryTensor:counts name:nil];
-        pooled = modernbert_linear(plan->graph, pooled, plan->head_dense_tensor, MPSDataTypeFloat32);
+        pooled = modernbert_linear(plan->graph, pooled, plan->head_dense_tensor, MPSDataTypeFloat32, MPSDataTypeFloat32);
         pooled = modernbert_gelu(plan->graph, pooled, MPSDataTypeFloat32);
         pooled = modernbert_layer_norm(plan->graph, pooled, plan->head_norm_tensor, batch, epsilon, MPSDataTypeFloat32);
-        MPSGraphTensor *logits = modernbert_linear(plan->graph, pooled, plan->classifier_weight_tensor, MPSDataTypeFloat32);
+        MPSGraphTensor *logits = modernbert_linear(plan->graph, pooled, plan->classifier_weight_tensor, MPSDataTypeFloat32, MPSDataTypeFloat32);
         logits = [plan->graph additionWithPrimaryTensor:logits secondaryTensor:plan->classifier_bias_tensor name:nil];
         plan->output_tensor = [[plan->graph reshapeTensor:logits withShape:plan->score_shape name:@"rerank_scores"] retain];
     } else {
@@ -482,13 +499,14 @@ static ModernBertPlan *modernbert_get_plan(
     float epsilon,
     const ModernBertLayerParams *params,
     int32_t dtype,
-    int32_t rerank
+    int32_t rerank,
+    int32_t f16_projections
 ) {
     uint64_t pattern = modernbert_attention_pattern(params, layer_count);
-    NSString *key = modernbert_plan_key(batch, seq, hidden, heads, intermediate, layer_count, epsilon, pattern, dtype, rerank);
+    NSString *key = modernbert_plan_key(batch, seq, hidden, heads, intermediate, layer_count, epsilon, pattern, dtype, rerank, f16_projections);
     ModernBertPlan *cached = synapse_mps_cached_plan(&context->runtime, key);
     if (cached != NULL) return cached;
-    ModernBertPlan *plan = modernbert_plan_new(batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
+    ModernBertPlan *plan = modernbert_plan_new(batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank, f16_projections);
     if (plan != NULL) {
         synapse_mps_cache_plan(&context->runtime, key, plan);
     }
@@ -590,6 +608,7 @@ int32_t synapse_modernbert_mps_forward(
     const float *classifier_weight,
     float classifier_bias,
     int32_t rerank,
+    int32_t f16_projections,
     const ModernBertLayerParams *params,
     void *output
 ) {
@@ -611,7 +630,7 @@ int32_t synapse_modernbert_mps_forward(
             const BOOL profile = modernbert_profile_enabled();
             const double call_started = modernbert_profile_now();
             const double plan_started = modernbert_profile_now();
-            ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank);
+            ModernBertPlan *plan = modernbert_get_plan(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, params, dtype, rerank, f16_projections);
             if (plan == NULL) {
                 return -3;
             }
@@ -643,6 +662,8 @@ int32_t synapse_modernbert_mps_forward(
                         executable_cached ? 1 : 0,
                         (modernbert_profile_now() - executable_started) * 1000.0);
             }
+            const double select_ms = (modernbert_profile_now() - executable_started) * 1000.0;
+            const double upload_started = modernbert_profile_now();
             NSUInteger mask_count = (NSUInteger)(batch * seq * seq);
             NSUInteger rope_count = (NSUInteger)(seq * (hidden / heads));
             id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:hidden_count * element_size options:MTLResourceStorageModeShared];
@@ -698,10 +719,13 @@ int32_t synapse_modernbert_mps_forward(
                 status = -5;
             } else {
                 MPSGraphTensorData *result = nil;
+                SynapseMpsRunTiming run_timing = { -1.0, -1.0, -1.0, 0 };
+                double upload_ms = -1.0;
                 const double execute_started = modernbert_profile_now();
                 if (plan->executable != nil) {
                     NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
-                    result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+                    upload_ms = (modernbert_profile_now() - upload_started) * 1000.0;
+                    result = synapse_mps_run_executable(&context->runtime, plan->executable, inputs, profile ? &run_timing : NULL);
                 } else {
                     NSString *dump_dir = [[[NSProcessInfo processInfo] environment] objectForKey:@"SYNAPSE_MODERNBERT_DUMP_DIR"];
                     NSArray<MPSGraphTensor *> *targets = @[ plan->output_tensor ];
@@ -748,6 +772,15 @@ int32_t synapse_modernbert_mps_forward(
                 } else {
                     const double readback_started = modernbert_profile_now();
                     [array readBytes:output strideBytes:NULL];
+                    if (profile) {
+                        fprintf(stderr, "[synapse-embed-profile] pass_native family=modernbert batch=%llu seq=%llu cached=%d select_ms=%.3f upload_ms=%.3f run_ms=%.3f encode_ms=%.3f gpu_ms=%.3f command_buffers=%d readback_ms=%.3f native_ms=%.3f\n",
+                                (unsigned long long)batch, (unsigned long long)seq,
+                                executable_cached ? 1 : 0, select_ms, upload_ms,
+                                run_timing.run_ms, run_timing.encode_ms, run_timing.gpu_ms,
+                                run_timing.command_buffers,
+                                (modernbert_profile_now() - readback_started) * 1000.0,
+                                (modernbert_profile_now() - call_started) * 1000.0);
+                    }
                     if (profile) {
                         fprintf(stderr, "[synapse-embed-profile] modernbert_readback batch=%llu seq=%llu readback_ms=%.3f total_ms=%.3f\n",
                                 (unsigned long long)batch, (unsigned long long)seq,

@@ -1,0 +1,17 @@
+{"category":"short","cosine":0.9999913637148157,"id":"short-0","tokens":5}
+{"category":"short","cosine":0.9999993929073837,"id":"short-1","tokens":20}
+{"category":"short","cosine":0.9999996032480372,"id":"short-2","tokens":66}
+{"category":"short","cosine":0.9999996023686193,"id":"short-3","tokens":26}
+{"category":"shape_boundary","cosine":0.9999991992008661,"id":"boundary-127","tokens":127}
+{"category":"shape_boundary","cosine":0.9999993526720126,"id":"boundary-128","tokens":128}
+{"category":"shape_boundary","cosine":0.9999992366263956,"id":"boundary-129","tokens":129}
+{"category":"shape_boundary","cosine":0.9999994970524284,"id":"boundary-511","tokens":511}
+{"category":"shape_boundary","cosine":0.9999993320636704,"id":"boundary-512","tokens":512}
+{"category":"shape_boundary","cosine":0.9999990577942748,"id":"boundary-513","tokens":513}
+{"category":"batched","cosine":0.9999995723399894,"id":"batch-0","tokens":18}
+{"category":"batched","cosine":0.9999993929073837,"id":"batch-1","tokens":20}
+{"category":"batched","cosine":0.9999991220675218,"id":"batch-2","tokens":17}
+{"category":"batched","cosine":0.9999994848910592,"id":"batch-3","tokens":40}
+{"category":"batched","cosine":0.9999992981091668,"id":"batch-4","tokens":128}
+{"category":"batched","cosine":0.9999993516122349,"id":"batch-5","tokens":200}
+{"category":"long","cosine":0.9999996491983884,"id":"long-8192","tokens":8192}

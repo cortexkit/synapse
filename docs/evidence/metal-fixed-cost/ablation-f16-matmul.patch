@@ -1,0 +1,18 @@
+diff --git a/crates/synapse-engine-owned/src/modernbert_mpsgraph.m b/crates/synapse-engine-owned/src/modernbert_mpsgraph.m
+index 363fa2af..06f72e48 100644
+--- a/crates/synapse-engine-owned/src/modernbert_mpsgraph.m
++++ b/crates/synapse-engine-owned/src/modernbert_mpsgraph.m
+@@ -124,10 +124,10 @@ static void modernbert_set_ns_error(NSString *message) {
+     MPSGraphTensor *secondary,
+     MPSDataType data_type
+ ) {
+-    primary = modernbert_cast(graph, primary, MPSDataTypeFloat32);
+-    secondary = modernbert_cast(graph, secondary, MPSDataTypeFloat32);
++    primary = modernbert_cast(graph, primary, data_type);
++    secondary = modernbert_cast(graph, secondary, data_type);
+     MPSGraphTensor *product = [graph matrixMultiplicationWithPrimaryTensor:primary secondaryTensor:secondary name:nil];
+-    return modernbert_cast(graph, product, data_type);
++    return product;
+ }
+ 
+ static MPSGraphTensor *modernbert_linear(

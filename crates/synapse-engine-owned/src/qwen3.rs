@@ -6,6 +6,7 @@
 
 use std::any::Any;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
@@ -226,6 +227,7 @@ impl Model {
             real_seq
         );
         let (batch, seq) = (target.batch, target.seq);
+        let embed_started = Instant::now();
         let hidden = self.config.hidden_size;
         let mut hidden_states = vec![0.0f32; batch * seq * hidden];
         let (input_ids, attention_mask) =
@@ -248,6 +250,12 @@ impl Model {
                 hidden_states[target..target + hidden]
                     .copy_from_slice(&self.embeddings.data[source..source + hidden]);
             }
+        }
+        if crate::embed_profile_enabled() {
+            eprintln!(
+                "[synapse-embed-profile] pass_embed_in family=qwen3 batch={batch} seq={seq} embed_in_ms={:.3}",
+                embed_started.elapsed().as_secs_f64() * 1_000.0
+            );
         }
 
         let mut run = |context: &mut dyn Any| {
@@ -343,10 +351,25 @@ impl ModelFamily for Model {
         sequences: &[Vec<u32>],
         shape: Option<BatchShape>,
     ) -> Result<Vec<Vec<f32>>> {
+        let started = Instant::now();
         let (states, mask, batch, seq, real_batch) =
             self.forward_ids(provider, sequences, shape)?;
+        let forward_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let pool_started = Instant::now();
         let mut pooled = last_token_pool_l2(&states, &mask, batch, seq, self.config.hidden_size);
         pooled.truncate(real_batch);
+        if crate::embed_profile_enabled() {
+            eprintln!(
+                "[synapse-embed-profile] pass_host family=qwen3 batch={} seq={} rows={} tokens={} pad_ms=0.000 forward_ms={:.3} pool_ms={:.3} total_ms={:.3}",
+                batch,
+                seq,
+                real_batch,
+                sequences.iter().map(Vec::len).sum::<usize>(),
+                forward_ms,
+                pool_started.elapsed().as_secs_f64() * 1_000.0,
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         Ok(pooled)
     }
 }
@@ -814,6 +837,7 @@ mod metal {
                 final_norm.weight.data.len() == hidden,
                 "Qwen3 final norm shape mismatch"
             );
+            let prep_started = std::time::Instant::now();
             let mut additive_mask = vec![0.0f32; batch * seq * seq];
             for b in 0..batch {
                 for query in 0..seq {
@@ -914,6 +938,8 @@ mod metal {
                 .transpose()?;
             let mut output_f32 = vec![0.0f32; hidden_states.len()];
             let mut output_f16 = vec![0u16; hidden_states.len()];
+            let prep_ms = prep_started.elapsed().as_secs_f64() * 1_000.0;
+            let native_started = std::time::Instant::now();
             let status = unsafe {
                 synapse_qwen3_forward(
                     self.raw.as_ptr(),
@@ -962,10 +988,18 @@ mod metal {
                     last_error()
                 );
             }
+            let native_ms = native_started.elapsed().as_secs_f64() * 1_000.0;
+            let decode_started = std::time::Instant::now();
             if f16 {
                 hidden_states.copy_from_slice(&decode_f16_bits(&output_f16));
             } else {
                 hidden_states.copy_from_slice(&output_f32);
+            }
+            if crate::embed_profile_enabled() {
+                eprintln!(
+                    "[synapse-embed-profile] pass_metal family=qwen3 batch={batch} seq={seq} prep_ms={prep_ms:.3} native_ms={native_ms:.3} decode_ms={:.3}",
+                    decode_started.elapsed().as_secs_f64() * 1_000.0
+                );
             }
             Ok(())
         }
