@@ -12,20 +12,29 @@ use std::{
 };
 
 fn main() {
-    // Tests launch each fresh copy once with --warm before timing it: macOS
+    // Tests launch each shared copy once with --warm before timing it: macOS
     // assesses a new executable on its first launch, which under load can take
     // longer than the probe deadlines under test. Warming logs nothing.
     if std::env::args().nth(1).as_deref() == Some("--warm") {
         return;
     }
+    // Many tests, in several processes at once, run this same executable file
+    // (a new executable path costs a macOS security assessment). The caller's
+    // state directory therefore holds this copy's configuration and log, named
+    // after the copy's file name, rather than files beside the executable.
     let path = std::env::current_exe().unwrap();
+    let state = PathBuf::from(
+        std::env::var_os("SYNAPSE_PROBE_STUB_STATE")
+            .expect("SYNAPSE_PROBE_STUB_STATE names the probe stub's state directory"),
+    );
+    let files = state.join(path.file_name().unwrap());
     let config: Value =
-        serde_json::from_slice(&fs::read(path.with_extension("json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(files.with_extension("json")).unwrap()).unwrap();
     let args: Vec<_> = std::env::args().skip(1).collect();
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path.with_extension("log"))
+        .open(files.with_extension("log"))
         .unwrap();
     // Concurrent probes append to the same log, and the tests parse each line
     // as JSON. One write of the whole line keeps lines from interleaving;

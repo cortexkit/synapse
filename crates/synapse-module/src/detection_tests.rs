@@ -4,15 +4,34 @@
 #![cfg(test)]
 
 use super::*;
-use catalog_probe::{cached_probe, run_probe, ProbeKind, PROBE_TIMEOUT};
+use catalog_probe::{cached_probe, forget_cached_probes, run_probe, ProbeKind, PROBE_TIMEOUT};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// Names the directory that holds the probe stub's per-test configuration and
+/// log (see `bin/probe_stub.rs`).
+const STUB_STATE_ENV: &str = "SYNAPSE_PROBE_STUB_STATE";
+
+/// macOS runs a security assessment the first time any executable runs from a
+/// new path (a new file or a new name for one), so every test shares a fixed
+/// set of stub executables published once per build. Two is the fewest that
+/// works: the probe cache keys on the canonical worker path, so a call that
+/// probes a CUDA and a Vulkan worker concurrently needs two distinct paths.
+const STUB_SLOTS: usize = 2;
+
+/// Which shared stub executables this process's live `Stub`s are using.
+static SLOTS_IN_USE: Mutex<[bool; STUB_SLOTS]> = Mutex::new([false; STUB_SLOTS]);
+
 struct Stub {
+    /// Scratch directory owned by this stub alone.
     root: PathBuf,
+    /// The shared executable; tests running in other processes may run it too.
     worker: PathBuf,
+    /// The stub's state directory: the value of `STUB_STATE_ENV` it runs with.
+    state: PathBuf,
+    slot: usize,
 }
 
 fn stub_binary() -> PathBuf {
@@ -32,32 +51,112 @@ fn stub_binary() -> PathBuf {
         })
 }
 
+/// The shared stub executable for `slot`. Each slot gets its own source file
+/// name beside the built stub, and `ckdev_binary` publishes that name once per
+/// build at a content-addressed path, so later test processes reuse the same
+/// already-assessed file instead of creating a new one.
+fn slot_executable(slot: usize) -> PathBuf {
+    static SLOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let built = stub_binary();
+        let bytes =
+            fs::read(&built).expect("build synapse-probe-stub before running the --lib tests");
+        let dir = built.parent().unwrap().join("probe-stub-slots");
+        fs::create_dir_all(&dir).unwrap();
+        (0..STUB_SLOTS)
+            .map(|slot| {
+                let source = dir.join(format!(
+                    "synapse-probe-stub-{slot}{}",
+                    env::consts::EXE_SUFFIX
+                ));
+                // These source files are only hashed and copied, never run.
+                // Replace a stale one whole, so a test process starting at
+                // the same moment never hashes a half-written file.
+                if fs::read(&source).ok().as_deref() != Some(&bytes[..]) {
+                    let temporary = dir.join(format!(".{}-{slot}.tmp", std::process::id()));
+                    fs::write(&temporary, &bytes).unwrap();
+                    fs::rename(&temporary, &source).unwrap();
+                }
+                let worker = synapse_core::dev_binary::ckdev_binary(&source, &dir).unwrap();
+                // Pay macOS's first-launch assessment of a newly published
+                // copy here, not inside a probe deadline a test is timing.
+                let warmed = Command::new(&worker).arg("--warm").status().unwrap();
+                assert!(warmed.success(), "probe stub warm-up failed: {warmed}");
+                worker
+            })
+            .collect()
+    })[slot]
+        .clone()
+}
+
 impl Stub {
+    /// A stub with `config` as its behaviour and an empty log. It takes a free
+    /// shared executable and forgets that executable's cached probes, so its
+    /// first probe of each kind really runs. A test holding every slot must
+    /// drop a stub before making another.
     fn new(config: Value) -> Self {
-        let root = env::temp_dir().join(format!(
-            "synapse-detection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let slot = {
+            let mut in_use = SLOTS_IN_USE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = in_use
+                .iter()
+                .position(|used| !used)
+                .expect("every shared probe stub is in use; drop a Stub before making another");
+            in_use[slot] = true;
+            slot
+        };
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        // An isolated test process runs every probe with the state directory
+        // its parent named, including probes the module launches itself.
+        // Elsewhere each stub owns its state directory, and only commands from
+        // `Stub::command` carry it.
+        let (root, state) = match env::var_os(STUB_STATE_ENV) {
+            Some(state) => {
+                let state = PathBuf::from(state);
+                (state.join(format!("stub-{n}")), state)
+            }
+            None => {
+                let root =
+                    env::temp_dir().join(format!("synapse-detection-{}-{n}", std::process::id()));
+                (root.clone(), root)
+            }
+        };
         fs::create_dir_all(&root).unwrap();
-        let source = root.join(if cfg!(windows) {
-            "synapse-probe-stub.exe"
-        } else {
-            "synapse-probe-stub"
-        });
-        fs::copy(stub_binary(), &source)
-            .expect("build synapse-probe-stub before running isolated --lib tests");
-        let worker = synapse_core::dev_binary::ckdev_binary(&source, &root).unwrap();
-        fs::write(worker.with_extension("json"), config.to_string()).unwrap();
-        // Pay macOS's first-launch assessment of this new executable here, not
-        // inside a probe deadline the test is timing.
-        let warmed = Command::new(&worker).arg("--warm").status().unwrap();
-        assert!(warmed.success(), "probe stub warm-up failed: {warmed}");
-        Self { root, worker }
+        let stub = Self {
+            root,
+            worker: slot_executable(slot),
+            state,
+            slot,
+        };
+        let _ = fs::remove_file(stub.file("log"));
+        stub.configure(config);
+        forget_cached_probes(&stub.worker);
+        stub
+    }
+
+    /// This stub's configuration or log file in its state directory.
+    fn file(&self, extension: &str) -> PathBuf {
+        self.state
+            .join(self.worker.file_name().unwrap())
+            .with_extension(extension)
+    }
+
+    /// Replace the behaviour without forgetting cached probes, so a test can
+    /// prove that a later probe was answered from the cache.
+    fn configure(&self, config: Value) {
+        fs::write(self.file("json"), config.to_string()).unwrap();
+    }
+
+    /// A command that runs this stub with its state directory.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.worker);
+        command.env(STUB_STATE_ENV, &self.state);
+        command
     }
 
     fn logs(&self) -> Vec<Value> {
-        let text = fs::read_to_string(self.worker.with_extension("log")).unwrap_or_default();
+        let text = fs::read_to_string(self.file("log")).unwrap_or_default();
         let rows: Vec<Value> = text
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -87,7 +186,7 @@ impl Stub {
     }
 
     fn assert_reaped(&self, pid: u32) {
-        let mut child = synapse_core::without_launch_nonce(Command::new(&self.worker))
+        let mut child = synapse_core::without_launch_nonce(self.command())
             .arg("--assert-reaped")
             .stdin(Stdio::piped())
             .spawn()
@@ -102,7 +201,12 @@ impl Stub {
 
 impl Drop for Stub {
     fn drop(&mut self) {
+        let _ = fs::remove_file(self.file("json"));
+        let _ = fs::remove_file(self.file("log"));
         let _ = fs::remove_dir_all(&self.root);
+        SLOTS_IN_USE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[self.slot] = false;
     }
 }
 
@@ -119,17 +223,24 @@ fn refusing(backend: &str, code: &str) -> Value {
     json!({"version":version(backend), "floor":{"exit":2,"envelope":{"status":"refused","code":code,"required":{},"observed":null}}})
 }
 
+/// Run one ignored fixture in a child test process with a launch nonce in its
+/// environment and its own stub state directory. The child is the shared
+/// content-addressed copy of this test binary, so every isolated test reuses
+/// one executable path per build.
 fn isolated_test(name: &str, extra_env: &[(&str, &str)]) {
     let executable = std::env::current_exe().unwrap();
-    let scratch = env::temp_dir().join(format!(
-        "synapse-isolated-{}",
+    let state = env::temp_dir().join(format!(
+        "synapse-isolated-{}-{}",
+        std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let executable = synapse_core::dev_binary::ckdev_binary(executable, &scratch).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let executable = synapse_core::dev_binary::ckdev_binary(executable, &state).unwrap();
     let mut command = synapse_core::without_launch_nonce(Command::new(executable));
     command
         .args(["--exact", name, "--ignored", "--nocapture"])
         .env("SYNAPSE_PROBE_STUB_BINARY", stub_binary())
+        .env(STUB_STATE_ENV, &state)
         .env(subc_os::launch_nonce::LAUNCH_NONCE_ENV, "probe-test-nonce")
         .env(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV, "123");
     for key in [
@@ -158,7 +269,7 @@ fn isolated_test(name: &str, extra_env: &[(&str, &str)]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let _ = fs::remove_dir_all(scratch);
+    let _ = fs::remove_dir_all(state);
 }
 
 #[test]
@@ -185,6 +296,8 @@ fn detection_contract_fixture() {
     ensure_owned_cuda_floor(Some(&cuda.worker)).unwrap();
     assert_eq!(cuda.counts(), (1, 1));
     assert_eq!(vulkan.counts(), (1, 1));
+    // Each stub below needs a shared executable of its own.
+    drop((cuda, vulkan));
     for (backend, code, reason) in [
         ("cuda", "cuda_no_driver", "driver_missing"),
         (
@@ -218,11 +331,7 @@ fn detection_contract_fixture() {
             Err(reason),
             "{code}"
         );
-        fs::write(
-            stub.worker.with_extension("json"),
-            json!({"version":version(backend),"floor":{"envelope":cuda_ok()}}).to_string(),
-        )
-        .unwrap();
+        stub.configure(json!({"version":version(backend),"floor":{"envelope":cuda_ok()}}));
         assert_eq!(
             detect_worker_backend(backend, Some(&stub.worker)),
             Err(reason),
@@ -258,11 +367,7 @@ fn detection_contract_fixture() {
             detect_worker_backend("cuda", Some(&stub.worker)),
             Err("probe_failed")
         );
-        fs::write(
-            stub.worker.with_extension("json"),
-            json!({"version":version("cuda"),"floor":{"envelope":cuda_ok()}}).to_string(),
-        )
-        .unwrap();
+        stub.configure(json!({"version":version("cuda"),"floor":{"envelope":cuda_ok()}}));
         assert_eq!(
             detect_worker_backend("cuda", Some(&stub.worker)),
             Err("probe_failed")
@@ -270,6 +375,7 @@ fn detection_contract_fixture() {
         assert_eq!(stub.counts(), (1, 0));
     }
     assert_eq!(detect_worker_backend("cuda", None), Err("worker_missing"));
+    let cuda = Stub::new(json!({"version":version("cuda"),"floor":{"envelope":cuda_ok()}}));
     let missing = cuda.root.join("ckdev-absent");
     assert_eq!(
         detect_worker_backend("cuda", Some(&missing)),
@@ -283,6 +389,7 @@ fn detection_contract_fixture() {
     );
     let resolved = resolve_catalog_worker(CUDA_WORKER_ENGINE, Some(&cuda.worker)).unwrap();
     assert_eq!(resolved, cuda.worker);
+    drop(cuda);
     overlap_is_observed();
 }
 
@@ -298,8 +405,7 @@ fn overlap_is_observed() {
     let cuda = Stub::new(Value::Null);
     let vulkan = Stub::new(Value::Null);
     for (stub, backend) in [(&cuda, "cuda"), (&vulkan, "vulkan")] {
-        let config = json!({"version":version(backend),"floor":{"ready":stub.root.join("ready"),"release":stub.root.join("release"),"envelope":cuda_ok()}});
-        fs::write(stub.worker.with_extension("json"), config.to_string()).unwrap();
+        stub.configure(json!({"version":version(backend),"floor":{"ready":stub.root.join("ready"),"release":stub.root.join("release"),"envelope":cuda_ok()}}));
     }
     let paths = (cuda.worker.clone(), vulkan.worker.clone());
     let task = std::thread::spawn(move || detect_gpu_backends(Some(paths.0), Some(paths.1)));
@@ -324,7 +430,7 @@ fn each_probe_kind_is_deadlined_killed_reaped_and_stdout_capped() {
     assert_eq!(PROBE_TIMEOUT, Duration::from_secs(10));
     for kind in ["--version", "--probe-floor"] {
         let stub = Stub::new(json!({"version":{"sleep":true},"floor":{"sleep":true}}));
-        let mut command = Command::new(&stub.worker);
+        let mut command = stub.command();
         command
             .arg(kind)
             .env(subc_os::launch_nonce::LAUNCH_NONCE_ENV, "nonce")
@@ -350,7 +456,7 @@ fn each_probe_kind_is_deadlined_killed_reaped_and_stdout_capped() {
             json!({"version":{"stdout":"x".repeat(4097)},"floor":{"stdout":"x".repeat(4097)}}),
         );
         assert_eq!(
-            run_probe(Command::new(&big.worker).arg(kind), Duration::from_secs(2))
+            run_probe(big.command().arg(kind), Duration::from_secs(2))
                 .unwrap_err()
                 .reason,
             "probe_failed"
@@ -376,9 +482,10 @@ fn complete_cuda_override_fixture() {
     assert!(cuda_floor_override().is_some());
     assert_eq!(detect_worker_backend("cuda", None), Err("worker_missing"));
     let absent = Stub::new(Value::Null);
-    fs::remove_file(&absent.worker).unwrap();
+    // The stub executable is shared, so name a missing file instead of deleting it.
+    let missing = absent.root.join(absent.worker.file_name().unwrap());
     assert_eq!(
-        detect_worker_backend("cuda", Some(&absent.worker)),
+        detect_worker_backend("cuda", Some(&missing)),
         Err("worker_missing")
     );
     assert_eq!(absent.counts(), (0, 0));
@@ -428,6 +535,12 @@ fn parity_manifest_pins_equal_cuda_floors() {
 
 #[test]
 fn canonical_worker_and_argv_kind_are_distinct_cache_keys() {
+    isolated_test("detection_tests::canonical_cache_key_fixture", &[]);
+}
+
+#[test]
+#[ignore = "executed in an isolated process whose probes inherit the stub state directory"]
+fn canonical_cache_key_fixture() {
     let stub = Stub::new(json!({"version":version("cuda"),"floor":{"envelope":cuda_ok()}}));
     let noncanonical = stub
         .worker
@@ -597,7 +710,7 @@ async fn joined_boot_fixture() {
     let cuda = Stub::new(Value::Null);
     let vulkan =
         Stub::new(json!({"version":version("none (vulkan disabled)"),"floor":{"sleep":true}}));
-    fs::write(cuda.worker.with_extension("json"),json!({"version":version("cuda"),"floor":{"ready":cuda.root.join("ready"),"release":cuda.root.join("release"),"envelope":cuda_ok()}}).to_string()).unwrap();
+    cuda.configure(json!({"version":version("cuda"),"floor":{"ready":cuda.root.join("ready"),"release":cuda.root.join("release"),"envelope":cuda_ok()}}));
     let config = cuda.root.join("synapse.jsonc");
     fs::write(&config, "{}").unwrap();
     env::set_var("SYNAPSE_CONFIG_PATH", config);
