@@ -643,6 +643,8 @@ int32_t synapse_modernbert_mps_forward(
                         executable_cached ? 1 : 0,
                         (modernbert_profile_now() - executable_started) * 1000.0);
             }
+            const double select_ms = (modernbert_profile_now() - executable_started) * 1000.0;
+            const double upload_started = modernbert_profile_now();
             NSUInteger mask_count = (NSUInteger)(batch * seq * seq);
             NSUInteger rope_count = (NSUInteger)(seq * (hidden / heads));
             id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:hidden_count * element_size options:MTLResourceStorageModeShared];
@@ -698,10 +700,13 @@ int32_t synapse_modernbert_mps_forward(
                 status = -5;
             } else {
                 MPSGraphTensorData *result = nil;
+                SynapseMpsRunTiming run_timing = { -1.0, -1.0, -1.0, 0 };
+                double upload_ms = -1.0;
                 const double execute_started = modernbert_profile_now();
                 if (plan->executable != nil) {
                     NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
-                    result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+                    upload_ms = (modernbert_profile_now() - upload_started) * 1000.0;
+                    result = synapse_mps_run_executable(&context->runtime, plan->executable, inputs, profile ? &run_timing : NULL);
                 } else {
                     NSString *dump_dir = [[[NSProcessInfo processInfo] environment] objectForKey:@"SYNAPSE_MODERNBERT_DUMP_DIR"];
                     NSArray<MPSGraphTensor *> *targets = @[ plan->output_tensor ];
@@ -748,6 +753,15 @@ int32_t synapse_modernbert_mps_forward(
                 } else {
                     const double readback_started = modernbert_profile_now();
                     [array readBytes:output strideBytes:NULL];
+                    if (profile) {
+                        fprintf(stderr, "[synapse-embed-profile] pass_native family=modernbert batch=%llu seq=%llu cached=%d select_ms=%.3f upload_ms=%.3f run_ms=%.3f encode_ms=%.3f gpu_ms=%.3f command_buffers=%d readback_ms=%.3f native_ms=%.3f\n",
+                                (unsigned long long)batch, (unsigned long long)seq,
+                                executable_cached ? 1 : 0, select_ms, upload_ms,
+                                run_timing.run_ms, run_timing.encode_ms, run_timing.gpu_ms,
+                                run_timing.command_buffers,
+                                (modernbert_profile_now() - readback_started) * 1000.0,
+                                (modernbert_profile_now() - call_started) * 1000.0);
+                    }
                     if (profile) {
                         fprintf(stderr, "[synapse-embed-profile] modernbert_readback batch=%llu seq=%llu readback_ms=%.3f total_ms=%.3f\n",
                                 (unsigned long long)batch, (unsigned long long)seq,

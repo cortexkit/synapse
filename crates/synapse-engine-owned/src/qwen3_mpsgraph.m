@@ -14,8 +14,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static char qwen3_error[1024];
+
+static BOOL qwen3_profile_enabled(void) {
+    const char *value = getenv("SYNAPSE_EMBED_PROFILE");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
 
 typedef struct Qwen3LayerParams {
     const void *input_norm;
@@ -392,6 +398,8 @@ int32_t synapse_qwen3_forward(
                 set_error(@"invalid Qwen3 MPSGraph forward arguments");
                 return -1;
             }
+            const BOOL profile = qwen3_profile_enabled();
+            const double call_started = synapse_mps_now_ms();
             NSString *key = plan_key(batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, dtype);
             Qwen3Plan *plan = synapse_mps_cached_plan(&context->runtime, key);
             if (plan == NULL) {
@@ -401,6 +409,8 @@ int32_t synapse_qwen3_forward(
             }
             MPSDataType data_type = dtype == 1 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
             NSUInteger element_size = dtype == 1 ? sizeof(uint16_t) : sizeof(float);
+            const BOOL executable_cached = plan->executable != nil;
+            const double executable_started = synapse_mps_now_ms();
             if (explicit_execution && plan->executable == nil) {
                 plan->executable = synapse_mps_explicit_executable(
                     plan->graph, context->runtime.device, plan->output,
@@ -412,6 +422,8 @@ int32_t synapse_qwen3_forward(
                     return -6;
                 }
             }
+            const double select_ms = synapse_mps_now_ms() - executable_started;
+            const double upload_started = synapse_mps_now_ms();
             const NSUInteger rows = (NSUInteger)(batch * seq);
             id<MTLBuffer> input_buffer = [context->runtime.device newBufferWithBytes:input length:rows * hidden * element_size options:MTLResourceStorageModeShared];
             id<MTLBuffer> mask_buffer = [context->runtime.device newBufferWithBytes:mask length:batch * seq * seq * sizeof(float) options:MTLResourceStorageModeShared];
@@ -451,9 +463,12 @@ int32_t synapse_qwen3_forward(
                 }
             }
             MPSGraphTensorData *result = nil;
+            SynapseMpsRunTiming run_timing = { -1.0, -1.0, -1.0, 0 };
+            double upload_ms = -1.0;
             if (plan->executable != nil) {
                 NSArray<MPSGraphTensorData *> *inputs = synapse_mps_executable_inputs(plan->executable_feed_tensors, feeds);
-                result = [[plan->executable runWithMTLCommandQueue:context->runtime.queue inputsArray:inputs resultsArray:nil executionDescriptor:nil] firstObject];
+                upload_ms = synapse_mps_now_ms() - upload_started;
+                result = synapse_mps_run_executable(&context->runtime, plan->executable, inputs, profile ? &run_timing : NULL);
             } else {
                 NSDictionary *results = [plan->graph runWithMTLCommandQueue:context->runtime.queue feeds:feeds targetTensors:@[ plan->output ] targetOperations:nil];
                 result = [results objectForKey:plan->output];
@@ -464,7 +479,17 @@ int32_t synapse_qwen3_forward(
                 [feeds release]; [input_buffer release]; [mask_buffer release]; [cos_buffer release]; [sin_buffer release];
                 return -5;
             }
+            const double readback_started = synapse_mps_now_ms();
             [array readBytes:output strideBytes:NULL];
+            if (profile) {
+                fprintf(stderr, "[synapse-embed-profile] pass_native family=qwen3 batch=%llu seq=%llu cached=%d select_ms=%.3f upload_ms=%.3f run_ms=%.3f encode_ms=%.3f gpu_ms=%.3f command_buffers=%d readback_ms=%.3f native_ms=%.3f\n",
+                        (unsigned long long)batch, (unsigned long long)seq,
+                        executable_cached ? 1 : 0, select_ms, upload_ms,
+                        run_timing.run_ms, run_timing.encode_ms, run_timing.gpu_ms,
+                        run_timing.command_buffers,
+                        synapse_mps_now_ms() - readback_started,
+                        synapse_mps_now_ms() - call_started);
+            }
             [feeds release]; [input_buffer release]; [mask_buffer release]; [cos_buffer release]; [sin_buffer release];
             return 0;
         } @catch (NSException *exception) {
