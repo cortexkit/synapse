@@ -15328,6 +15328,20 @@ fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidenc
     }
 }
 
+/// Reference similarity margin below which a neighbour swap counts as a near tie.
+///
+/// f16 lanes differ from their fp32 reference by about 2e-4 per similarity: the
+/// owned-Metal gte-modernbert f16 graph with f32 matmuls measured a mean
+/// |similarity error| of 1.98e-4 over 6,341 rows x 500 queries
+/// (docs/evidence/metal-fixed-cost/README.md). Two neighbours whose reference
+/// similarities differ by less than about 2.5x that error can trade places in any
+/// f16 lane, so such a swap measures rounding, not ranking quality.
+const RANK_OVERLAP_NEAR_TIE_MARGIN: f64 = 5e-4;
+
+/// Mean and worst-decile top-k neighbour overlap of `left` against `right`, the
+/// reference. A neighbour `left` ranks into the top k in place of a reference
+/// neighbour still counts as a hit when the reference separates the two by less
+/// than `RANK_OVERLAP_NEAR_TIE_MARGIN`.
 fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     let n = left.len().min(right.len());
     if n <= 2 {
@@ -15338,10 +15352,7 @@ fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     for query in 0..n {
         let top_left = top_k_neighbors(query, left, k);
         let top_right = top_k_neighbors(query, right, k);
-        let hits = top_left
-            .iter()
-            .filter(|candidate| top_right.contains(candidate))
-            .count();
+        let hits = near_tie_tolerant_hits(query, right, &top_left, &top_right);
         overlaps.push(hits as f64 / k as f64);
     }
     overlaps.sort_by(f64::total_cmp);
@@ -15349,6 +15360,37 @@ fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
     let worst_len = overlaps.len().div_ceil(10).max(1);
     let worst = overlaps[..worst_len].iter().sum::<f64>() / worst_len as f64;
     (mean, worst)
+}
+
+/// Neighbours of `query` that both top-k sets share, plus swaps the reference
+/// treats as near ties. Each reference neighbour the lane dropped is paired with
+/// a neighbour the lane took instead, weakest dropped with strongest taken, which
+/// pairs the closest reference similarities first; a pair whose reference margin
+/// is below `RANK_OVERLAP_NEAR_TIE_MARGIN` counts as a hit.
+fn near_tie_tolerant_hits(
+    query: usize,
+    reference: &[Vec<f32>],
+    lane_top: &BTreeSet<usize>,
+    reference_top: &BTreeSet<usize>,
+) -> usize {
+    let shared = lane_top.intersection(reference_top).count();
+    let similarity = |index: &usize| cosine(&reference[query], &reference[*index]);
+    let mut dropped = reference_top
+        .difference(lane_top)
+        .map(similarity)
+        .collect::<Vec<_>>();
+    let mut taken = lane_top
+        .difference(reference_top)
+        .map(similarity)
+        .collect::<Vec<_>>();
+    dropped.sort_by(f64::total_cmp);
+    taken.sort_by(|left, right| right.total_cmp(left));
+    let near_ties = dropped
+        .iter()
+        .zip(&taken)
+        .filter(|(dropped, taken)| *dropped - *taken < RANK_OVERLAP_NEAR_TIE_MARGIN)
+        .count();
+    shared + near_ties
 }
 
 fn top_k_neighbors(query: usize, vectors: &[Vec<f32>], k: usize) -> BTreeSet<usize> {
@@ -22447,6 +22489,61 @@ mod tests {
                 assert_eq!(spec.fingerprint.0, expected);
             }
         }
+    }
+
+    /// Unit vectors whose similarity to every other item is ordered by `scale`:
+    /// item i is `scale[i] * e0 + sqrt(1 - scale[i]^2) * e(i+1)`, so the cosine of
+    /// items i and j is `scale[i] * scale[j]`.
+    fn rank_fixture(scale: &[f64]) -> Vec<Vec<f32>> {
+        scale
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let mut vector = vec![0.0_f32; scale.len() + 1];
+                vector[0] = value as f32;
+                vector[index + 1] = (1.0 - value * value).sqrt() as f32;
+                vector
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rank_overlap_ignores_near_ties_but_catches_clear_swaps() {
+        // 64 items, so k = 6. Queries 0-5 have items 6 and 7 at the edge of
+        // their top 6, and every other adjacent pair is 3e-3 apart.
+        let spaced = (0..64).map(|i| 0.9 - 0.003 * i as f64).collect::<Vec<_>>();
+        let swapped = |mut scale: Vec<f64>| {
+            scale.swap(6, 7);
+            scale
+        };
+
+        // Near tie: the reference separates items 6 and 7 by at most 1.8e-4 for
+        // any query, under RANK_OVERLAP_NEAR_TIE_MARGIN, so a lane that swaps
+        // them keeps full overlap even though its top-6 sets differ.
+        let mut near = spaced.clone();
+        near[7] = near[6] - 2e-4;
+        let reference = rank_fixture(&near);
+        let lane = rank_fixture(&swapped(near.clone()));
+        assert_ne!(
+            top_k_neighbors(0, &lane, 6),
+            top_k_neighbors(0, &reference, 6),
+            "the near-tie lane must really change a top-6 set"
+        );
+        let tied = probe_evidence_between(&lane, &reference);
+        assert_eq!((tied.rank_overlap, tied.worst_decile), (1.0, 1.0));
+
+        // Planted defect: the reference separates items 6 and 7 by at least
+        // 2.1e-3, so the same swap is a real ordering error and must fail the
+        // probe's 0.999 rank-overlap bar.
+        let reference = rank_fixture(&spaced);
+        let lane = rank_fixture(&swapped(spaced.clone()));
+        let defect = probe_evidence_between(&lane, &reference);
+        assert!(
+            defect.rank_overlap < 0.999,
+            "a clear-margin neighbour swap passed the rank-overlap bar: {}",
+            defect.rank_overlap
+        );
+        assert!(defect.mean_cosine > 0.999_99, "{}", defect.mean_cosine);
     }
 
     #[test]
