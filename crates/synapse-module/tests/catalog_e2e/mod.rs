@@ -1466,15 +1466,34 @@ async fn catalog_native_non_macos_lists_metal_as_unsupported_without_override() 
         serde_json::json!({"method":"models.catalog","params":{}}),
     )
     .await;
+    // Metal and the Neural Engine are Apple-only, so off macOS they are never
+    // supported. CUDA and Vulkan are supported here; whether they are runnable
+    // depends on the host's GPU and built workers, so only their platform
+    // reason is asserted. This test host builds no GPU worker and has no GPU,
+    // so nothing is runnable and nothing would be downloaded.
+    let mut apple_backends = 0;
+    let mut gpu_backends = 0;
     for row in result["result"]["models"].as_array().unwrap() {
         assert_eq!(row["download_bytes"], 0);
         for backend in row["backends"].as_array().unwrap() {
             assert_eq!(backend["runnable"], false);
-            assert_eq!(backend["reason"], "not_supported_on_platform");
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["self_check"], Value::Null);
+            match backend["backend"].as_str().unwrap() {
+                "metal" | "ane" => {
+                    apple_backends += 1;
+                    assert_eq!(backend["reason"], "not_supported_on_platform");
+                }
+                "cuda" | "vulkan" => {
+                    gpu_backends += 1;
+                    assert_ne!(backend["reason"], "not_supported_on_platform");
+                }
+                other => panic!("unexpected catalog backend {other}"),
+            }
         }
     }
+    // Both kinds must be present, or the loop above asserted nothing about them.
+    assert!(apple_backends > 0 && gpu_backends > 0);
     let runnable = route_request(
         &mut consumer,
         route,
