@@ -1413,8 +1413,9 @@ mod tests {
 
     #[test]
     fn identities_without_the_opt_in_are_unchanged_and_the_opt_in_is_visible() {
-        // Lanes that do not ask for f16 projections must hash exactly the bytes
-        // they always have: graph revision 4 and no projection_dtype flag.
+        // Lanes that do not ask for f16 projections keep the identity production
+        // lanes were fingerprinted with: graph revision 4 and no projection_dtype
+        // flag, so their fingerprints cannot change.
         for (family, dtype, name) in [
             (
                 ModelFamily::GteModernBert,
@@ -1675,7 +1676,8 @@ mod tests {
         );
         let qwen = name(ModelFamily::Qwen3, OwnedDType::F16, ProjectionDtype::F32);
         // Same weights, same dtype: the two ModernBERT graphs still get separate
-        // directories, and lanes without the opt-in keep today's key.
+        // directories, and lanes without the opt-in keep the revision-4 key
+        // (gte-modernbert-graph-v4-...) that their cached executables live under.
         assert!(f32_projections.starts_with("gte-modernbert-graph-v4-bucket-policy-v2-"));
         assert!(f16_projections
             .starts_with("gte-modernbert-f16-projections-graph-v5-bucket-policy-v2-"));

@@ -3235,7 +3235,8 @@ impl CatalogProfile {
         ));
         numeric.kernel_revision = Some(match self.profile()["lane"].as_str().expect("lane") {
             // Catalog profile lanes record the graph revision of the projection
-            // precision they run, so only the lanes that opt in move.
+            // precision they run, so only lanes that opt in to f16 projections
+            // get a new kernel revision (and with it a new fingerprint).
             "owned-metal" => synapse_engine_owned::metal_kernel_revision(catalog_projection_dtype(
                 if self.model()["architecture"]["family"] == "qwen3" {
                     OwnedFamily::Qwen3
@@ -22438,8 +22439,9 @@ mod tests {
                 "27166bbf06d295c10dad348a8df8bf6774e209791bef402fc4847b24f96b1b39",
                 // gte-modernbert-base.owned-metal: catalog profile lanes for f16
                 // ModernBERT opt in to f16 weight projections (projection_dtype = f16,
-                // kernel revision owned-metal-graph-5-bucket-2), which moved this
-                // profile from 3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2.
+                // kernel revision owned-metal-graph-5-bucket-2). Without the opt-in
+                // this profile's fingerprint is
+                // 3a0b02613e9f7cd7b502de500e28613df43025b59df2cd4b0ec604de42e5a2e2.
                 "7f51a5b7679f7168f7e6b344eb79f81e88664e0600950002e336b208c46da1d1",
                 "7808303bba4061bbd0ee205c22a0a53d039c12b61a380dc7d2c2bf6f240a0934",
                 "a006367b6adb645e44c82c9a56e973f3423fb4f9be2461ff80a38df68aa9c543",

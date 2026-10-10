@@ -101,9 +101,10 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
 #[test]
 fn the_gte_metal_catalog_lane_moved_only_by_its_projection_opt_in() {
     // The gte-modernbert-base catalog Metal lane opts in to f16 weight
-    // projections, which moved its fingerprint from b904dd7b... (revision-4 graph,
-    // no projection_dtype flag). Recomputing it without the opt-in must give back
-    // b904dd7b..., which shows the opt-in is the only input that changed.
+    // projections. Without the opt-in (graph revision 4, no projection_dtype
+    // flag) the lane's fingerprint is b904dd7b...; recomputing it that way must
+    // give exactly that value, which shows the opt-in is the only input that
+    // differs between the two fingerprints.
     let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
