@@ -180,12 +180,16 @@ mod tests {
     #[test]
     fn source_probe_executes_a_hard_link_under_a_development_name() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let root =
-            std::env::temp_dir().join(format!("certify-source-probe-{}", std::process::id()));
+        let root = synapse_core::dev_binary::test_script_dir().join("certify-source-probe");
         std::fs::create_dir_all(&root).unwrap();
         let candidate = root.join("ck-synapse");
-        std::fs::write(&candidate, format!("#!/bin/sh\n[ \"$1 $2\" = 'certify source' ] || exit 2\nprintf '%s\\n' '{COMMIT}'\n")).unwrap();
-        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\n[ \"$1 $2\" = 'certify source' ] || exit 2\nprintf '%s\\n' '{COMMIT}'\n"
+        );
+        if std::fs::read(&candidate).ok().as_deref() != Some(script.as_bytes()) {
+            std::fs::write(&candidate, &script).unwrap();
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         verify_candidate_source(&candidate, &root.join("probe"), COMMIT).unwrap();
         let alias_dir = std::fs::read_dir(root.join("probe"))
             .unwrap()
@@ -198,7 +202,6 @@ mod tests {
             std::fs::metadata(&candidate).unwrap().ino(),
             std::fs::metadata(&alias).unwrap().ino()
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

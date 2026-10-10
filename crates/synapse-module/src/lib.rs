@@ -18909,22 +18909,6 @@ mod tests {
 
     #[test]
     fn cuda_floor_probe_cache_is_keyed_per_worker_binary() {
-        let root = std::env::temp_dir().join(format!(
-            "synapse-probe-key-{}-{}",
-            std::process::id(),
-            TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let good = root.join(if cfg!(windows) {
-            "ckdev-good.cmd"
-        } else {
-            "ckdev-good.sh"
-        });
-        let bad = root.join(if cfg!(windows) {
-            "ckdev-bad.cmd"
-        } else {
-            "ckdev-bad.sh"
-        });
         let header = if cfg!(windows) {
             "@echo off\r\n"
         } else {
@@ -18936,22 +18920,29 @@ mod tests {
         } else {
             format!("{header}echo '{json}'\n")
         };
-        fs::write(&good, &success).unwrap();
-        fs::write(
-            &bad,
-            format!(
-                "{header}echo missing-library >&2\n{}\n",
-                if cfg!(windows) { "exit /b 9" } else { "exit 9" }
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&good, &bad] {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-            }
+        let failure_script = format!(
+            "{header}echo missing-library >&2\n{}\n",
+            if cfg!(windows) { "exit /b 9" } else { "exit 9" }
+        );
+        let good_name = if cfg!(windows) {
+            "ck-good.cmd"
+        } else {
+            "ck-good.sh"
+        };
+        let bad_name = if cfg!(windows) {
+            "ck-bad.cmd"
+        } else {
+            "ck-bad.sh"
+        };
+        let good = synapse_core::dev_binary::ckdev_script(good_name, success.as_bytes()).unwrap();
+        let bad =
+            synapse_core::dev_binary::ckdev_script(bad_name, failure_script.as_bytes()).unwrap();
+
+        // Restore bad's original failure script in case a previous run was interrupted
+        if fs::read(&bad).ok().as_deref() != Some(failure_script.as_bytes()) {
+            fs::write(&bad, &failure_script).unwrap();
         }
+
         let failure = owned_cuda_probe_floor(Some(&bad)).unwrap_err();
         assert!(failure.contains("missing-library"), "{failure}");
         let reading = owned_cuda_probe_floor(Some(&good)).unwrap();
@@ -18964,13 +18955,15 @@ mod tests {
             (13030, 8, 9)
         );
         // Failure caching is deliberate, but must not contaminate another worker.
-        fs::write(&bad, success).unwrap();
+        fs::write(&bad, &success).unwrap();
         assert_eq!(owned_cuda_probe_floor(Some(&bad)).unwrap_err(), failure);
         assert_eq!(
             owned_cuda_probe_floor(Some(&good)).unwrap().driver_api,
             13030
         );
-        fs::remove_dir_all(root).unwrap();
+
+        // Restore bad's script content so subsequent test runs reuse it without rewriting
+        fs::write(&bad, &failure_script).unwrap();
     }
 
     #[test]
@@ -18983,26 +18976,17 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let ready = root.join("ready");
         let release = root.join("release");
-        let slow = root.join(if cfg!(windows) {
-            "ckdev-slow.cmd"
-        } else {
-            "ckdev-slow.sh"
-        });
-        let quick = root.join(if cfg!(windows) {
-            "ckdev-quick.cmd"
-        } else {
-            "ckdev-quick.sh"
-        });
+        std::env::set_var("SYNAPSE_PROBE_SLOW_READY", &ready);
+        std::env::set_var("SYNAPSE_PROBE_SLOW_RELEASE", &release);
+
         let json = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
         let stalled = if cfg!(windows) {
             format!(
-                "@echo off\r\necho ready >\"{}\"\r\n:wait\r\nif exist \"{}\" goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:done\r\necho {json}\r\n",
-                ready.display(), release.display()
+                "@echo off\r\necho ready > \"%SYNAPSE_PROBE_SLOW_READY%\"\r\n:wait\r\nif exist \"%SYNAPSE_PROBE_SLOW_RELEASE%\" goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:done\r\necho {json}\r\n"
             )
         } else {
             format!(
-                "#!/bin/sh\nprintf ready >'{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\necho '{json}'\n",
-                ready.display(), release.display()
+                "#!/bin/sh\nprintf ready > \"$SYNAPSE_PROBE_SLOW_READY\"\nwhile [ ! -f \"$SYNAPSE_PROBE_SLOW_RELEASE\" ]; do sleep 0.05; done\necho '{json}'\n"
             )
         };
         let success = if cfg!(windows) {
@@ -19010,15 +18994,19 @@ mod tests {
         } else {
             format!("#!/bin/sh\necho '{json}'\n")
         };
-        fs::write(&slow, stalled).unwrap();
-        fs::write(&quick, success).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for path in [&slow, &quick] {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-        }
+        let slow_name = if cfg!(windows) {
+            "ck-slow.cmd"
+        } else {
+            "ck-slow.sh"
+        };
+        let quick_name = if cfg!(windows) {
+            "ck-quick.cmd"
+        } else {
+            "ck-quick.sh"
+        };
+        let slow = synapse_core::dev_binary::ckdev_script(slow_name, stalled.as_bytes()).unwrap();
+        let quick = synapse_core::dev_binary::ckdev_script(quick_name, success.as_bytes()).unwrap();
+
         let stalled = std::thread::spawn(move || owned_cuda_probe_floor(Some(&slow)));
         let ready_deadline = Instant::now() + Duration::from_secs(3);
         while !ready.exists() && Instant::now() < ready_deadline {
@@ -22892,23 +22880,19 @@ mod tests {
             .activate_profile(&profile, 1, 1000)
             .expect("activate profile");
         let state = test_module_state(store, profile);
-        let worker = storage_dir.join(if cfg!(windows) {
-            "probe.cmd"
-        } else {
-            "probe.sh"
-        });
         let output = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
         let script = if cfg!(windows) {
             format!("@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho {output}\r\n")
         } else {
             format!("#!/bin/sh\nsleep 2\nprintf '%s\\n' '{output}'\n")
         };
-        fs::write(&worker, script).expect("write probe");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let probe_name = if cfg!(windows) {
+            "ck-probe.cmd"
+        } else {
+            "ck-probe.sh"
+        };
+        let worker = synapse_core::dev_binary::ckdev_script(probe_name, script.as_bytes())
+            .expect("publish test probe");
         let mut spec = stuck_model_spec();
         spec.engine_identity.engine = CUDA_WORKER_ENGINE.to_string();
         spec.worker_bin = Some(worker);
