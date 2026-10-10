@@ -1463,6 +1463,16 @@ impl WorkerEngine {
         LoadedModel { model_id }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn attach_mock_worker_for_test<F>(&self, respond: F)
+    where
+        F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
+    {
+        self.runtime().block_on(async {
+            tests::attach_mock_worker(&mut self.lock_host().unwrap(), respond);
+        });
+    }
+
     pub(crate) fn embed_batch_with_job(
         &self,
         model: &LoadedModel,
@@ -2986,7 +2996,7 @@ mod tests {
     /// with `respond`. The returned task yields every request (and its raw
     /// frame) once the host drops the connection.
     #[cfg(unix)]
-    fn attach_mock_worker<F>(
+    pub(super) fn attach_mock_worker<F>(
         host: &mut WorkerHost,
         respond: F,
     ) -> tokio::task::JoinHandle<SeenRequests>

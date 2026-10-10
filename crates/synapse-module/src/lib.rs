@@ -23026,6 +23026,152 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn catalog_boundary_worker(request: &synapse_core::WorkerRequest, raw: Option<&[u8]>) -> (synapse_core::WorkerResponse, Option<Vec<u8>>) {
+        use synapse_core::{WorkerRequest, WorkerResponse};
+        match request {
+            WorkerRequest::EmbedBatch { req_id, items, .. } => {
+                let ids = synapse_core::decode_i32_frame(raw.unwrap()).unwrap();
+                assert_eq!(ids.len(), items.iter().map(|item| item.n_tokens).sum::<usize>());
+                (WorkerResponse::Vectors { req_id: req_id.clone(), dims: 1, n: items.len() }, Some(synapse_core::encode_f32_frame(&vec![1.0; items.len()])))
+            }
+            WorkerRequest::Rerank { req_id, candidates, .. } => (WorkerResponse::Scores { req_id: req_id.clone() }, Some(synapse_core::encode_f32_frame(&vec![0.5; candidates.len()]))),
+            WorkerRequest::RerankSequences { req_id, sequences, .. } => (WorkerResponse::Scores { req_id: req_id.clone() }, Some(synapse_core::encode_f32_frame(&vec![0.5; sequences.len()]))),
+            other => (WorkerResponse::unsupported_request(other), None),
+        }
+    }
+
+    #[cfg(unix)]
+    fn installed_catalog_boundary_state(id: &str, name: &str) -> (PathBuf, Arc<ModuleState>) {
+        use store::{CatalogInstallMember, CatalogInstallRecord, DownloadJobRequest};
+        let (root, mut state) = catalog_runtime_tests::isolated_catalog_state("installed-catalog-boundary", true);
+        Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap().runnable_backends = BTreeSet::from([name.into()]);
+        let entry = state.runtime.release_catalog.entry(id).unwrap();
+        let backend = entry.backend(name).unwrap();
+        let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+        let seed = catalog_fixture_config(backend.profile.as_deref().unwrap_or(&format!("{id}.owned-metal")));
+        let mut model = catalog_test_model(&root, &seed);
+        let tokenizer_path = root.join("catalog-tokenizer.json");
+        if id.starts_with("gte-") {
+            let mut tokenizer: Value = serde_json::from_slice(&fs::read(&tokenizer_path).unwrap()).unwrap();
+            tokenizer["post_processor"] = json!({"type":"BertProcessing", "sep":["unused-2",2], "cls":["unused-3",3]});
+            fs::write(&tokenizer_path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        }
+        let inner = Arc::get_mut(&mut model).unwrap();
+        inner.model_id = spec.model_id.clone();
+        inner.engine_identity = spec.engine_identity.clone();
+        inner.fingerprint = spec.fingerprint.clone();
+        inner.certification_fingerprint = spec.fingerprint.clone();
+        inner.numeric_profile_id = spec.numeric_profile_id.clone();
+        let owned = stored_owned_profile(&spec).unwrap();
+        inner.tokenizer = SanitizedTokenizer::from_file(&tokenizer_path, TokenizerConfig { max_tokens: if backend.profile.is_some() { usize::MAX } else { owned_tokenizer_max_tokens(spec.max_tokens, owned.as_ref()) } }).unwrap();
+        if id == "qwen3-embedding-0.6b" && backend.profile.is_none() {
+            inner.owned_tokenizer_policy = Some(OwnedTokenizerPolicy { add_special_tokens: true, pad_token_id: 0, terminal_token_id: Some(151643) });
+        }
+        let EmbedBackend::Worker(engine) = &inner.backend else { unreachable!() };
+        engine.lock().unwrap().attach_mock_worker_for_test(catalog_boundary_worker);
+        let job = state.store.admit_download_job(&DownloadJobRequest { request_key: "fixture", request_digest: "fixture", module_generation: 1, params_json: &json!({}), now_ms: 1, result_retention_ttl_ms: 60000, entry_complete: false }).unwrap();
+        state.store.commit_download_job(&job.record().job_id, &[CatalogInstallRecord { catalog_id: id.into(), manifest_digest: entry.manifest_digest(), backend: name.into(), members: entry.backend_files(name).values().map(|file| CatalogInstallMember { path: file.path.clone(), digest: file.sha256.clone() }).collect() }], 2).unwrap();
+        let (check_id, key) = catalog_self_check_key(&state, entry, backend).unwrap();
+        let generation = catalog_check_generation(&state, &check_id, &key).unwrap();
+        assert!(catalog_complete_check(&state, &check_id, generation, "passed", None).unwrap());
+        state.runtime.catalog.lock().unwrap().insert(spec.model_id.clone(), ModelSlot { spec, loaded: Some(model), state: ModelRuntimeState::Ready, notify: Arc::new(Notify::new()), last_cold_load_ms: None });
+        (root, state)
+    }
+
+    #[cfg(unix)]
+    fn boundary_text(count: usize) -> String {
+        std::iter::repeat_n("a", count).collect::<Vec<_>>().join(" ")
+    }
+
+    #[cfg(unix)]
+    fn boundary_call(state: &Arc<ModuleState>, method: &str, params: Value) -> Value {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        response_result(runtime.block_on(dispatch_request(state.clone(), MethodEnvelope { method: method.into(), params }, None)), method)
+    }
+
+    #[cfg(unix)]
+    fn assert_catalog_boundary_refusal(state: &Arc<ModuleState>, method: &str, params: Value, item: &str) {
+        let before = certify_worker_snapshot(&state.runtime);
+        let result = boundary_call(state, method, params);
+        assert_eq!(result["error"]["code"], "sequence_too_long", "catalog pre-admission ceiling: {result}");
+        assert_eq!(result["error"]["class"], "permanent");
+        assert_eq!(result["error"]["safe_to_retry_same_request"], false);
+        assert!(result["error"].get("retry_after_ms").is_none());
+        assert_eq!(result["error"]["details"], json!({"tokens":8193,"max_tokens":8192,"item_id":item}));
+        assert!(result.get("job_id").is_none());
+        assert!(result.get("truncation_disclosures").is_none());
+        assert_eq!(certify_worker_snapshot(&state.runtime), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_catalog_embed_boundary_precedes_admission() {
+        for id in ["gte-modernbert-base", "qwen3-embedding-0.6b"] {
+            for name in ["metal", "ane", "cuda", "vulkan"] {
+                let (root, state) = installed_catalog_boundary_state(id, name);
+                let lane = catalog::lane_id(id, name);
+                let overhead = if id.starts_with("gte-") { 2 } else { 1 };
+                assert_catalog_boundary_refusal(&state, "embed.query", json!({"model":lane,"id":"query-8193","text":boundary_text(8193-overhead)}), "query-8193");
+                let before = certify_worker_snapshot(&state.runtime);
+                let result = boundary_call(&state, "embed.query", json!({"model":lane,"text":boundary_text(8192-overhead)}));
+                assert_eq!(result["vectors"][0]["vector"], json!([1.0]), "{id}/{name}: {result}");
+                assert_eq!(result["real_token_counts"], json!([8192]));
+                assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
+                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_catalog_batch_boundary_precedes_job_diversion() {
+        for id in ["gte-modernbert-base", "qwen3-embedding-0.6b"] {
+            for name in ["metal", "ane", "cuda", "vulkan"] {
+                let (root, state) = installed_catalog_boundary_state(id, name);
+                let lane = catalog::lane_id(id, name);
+                let overhead = if id.starts_with("gte-") { 2 } else { 1 };
+                let item = json!({"id":"row-8193","text":boundary_text(8193-overhead)});
+                assert_catalog_boundary_refusal(&state, "embed.batch", json!({"model":lane,"items":[item.clone()]}), "row-8193");
+                let mut items = vec![json!({"id":"short","text":"a"}); state.runtime.inline.max_items];
+                items.push(item);
+                assert_catalog_boundary_refusal(&state, "embed.batch", json!({"model":lane,"items":items}), "row-8193");
+                let before = certify_worker_snapshot(&state.runtime);
+                let result = boundary_call(&state, "embed.batch", json!({"model":lane,"items":[{"id":"row-8192","text":boundary_text(8192-overhead)}]}));
+                assert_eq!(result["vectors"][0]["vector"], json!([1.0]), "{id}/{name}: {result}");
+                assert_eq!(result["real_token_counts"], json!([8192]));
+                assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
+                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_catalog_rerank_boundary_precedes_inline_budget() {
+        for (id, names) in [("gte-reranker-modernbert-base", &["metal", "cuda", "vulkan"][..]), ("qwen3-reranker-0.6b", &["ane", "cuda", "vulkan"][..])] {
+            for name in names {
+                let (root, state) = installed_catalog_boundary_state(id, name);
+                let lane = catalog::lane_id(id, name);
+                let overhead = if id.starts_with("gte-") { 5 } else {
+                    let model = state.runtime.catalog.lock().unwrap()[&lane].loaded.clone().unwrap();
+                    owned_rerank_pairs(&model, "a a", &[String::new()]).unwrap().unwrap()[0].len()
+                };
+                assert_catalog_boundary_refusal(&state, "rerank.score", json!({"model":lane,"query":"a a","candidates":[boundary_text(8193-overhead)]}), "0");
+                let before = certify_worker_snapshot(&state.runtime);
+                let result = boundary_call(&state, "rerank.score", json!({"model":lane,"query":"a a","candidates":[boundary_text(8192-overhead)]}));
+                assert_eq!(result["scores"], json!([0.5]), "{id}/{name}: {result}");
+                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn catalog_embed_ceiling_precedes_job_diversion_and_worker_call() {
         let (dir, descriptor) = test_storage_descriptor("catalog-embed-ceiling");
@@ -24818,7 +24964,7 @@ mod catalog_runtime_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn isolated_catalog_state(label: &str, runnable: bool) -> (PathBuf, Arc<ModuleState>) {
+    pub(super) fn isolated_catalog_state(label: &str, runnable: bool) -> (PathBuf, Arc<ModuleState>) {
         let (root, descriptor) = test_storage_descriptor(label);
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
         let profile = test_machine_profile("catalog-test-os");
