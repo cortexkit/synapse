@@ -43,8 +43,10 @@ pub fn parse(arguments: &[OsString]) -> Result<Command> {
     }
     let row = row.ok_or_else(bad)?;
     let model = model.ok_or_else(bad)?;
-    if !synapse_certify::ROWS.contains(&row.as_str())
-        || !synapse_certify::MODELS.contains(&model.as_str())
+    if synapse_certify::row_backend(&row).is_none()
+        || !synapse_certify::self_check::manifest()?
+            .models
+            .contains_key(&model)
     {
         return Err(refuse("unknown certification row or model"));
     }
@@ -138,7 +140,11 @@ mod tests {
         #[cfg(windows)]
         use std::os::windows::process::ExitStatusExt;
         use synapse_certify::command::{dispatch, source_stamp, Command};
-        match dispatch(Command::Source, source_stamp(revision, tree)) {
+        match dispatch(
+            Command::Source,
+            source_stamp(revision, tree),
+            &synapse_certify::Catalog::default(),
+        ) {
             Ok(source) => Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout: format!("{}\n", source.as_str().unwrap()).into_bytes(),

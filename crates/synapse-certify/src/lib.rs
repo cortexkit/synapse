@@ -7,25 +7,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+mod catalog;
 pub mod command;
 pub mod self_check;
+mod validation;
 
-pub const ROWS: [&str; 8] = [
-    "vulkan-windows-amd",
-    "vulkan-linux-amd",
-    "vulkan-linux-nvidia",
-    "vulkan-windows-nvidia",
-    "cuda-linux-nvidia",
-    "cuda-windows-nvidia",
-    "metal-m5",
-    "ane-m5",
-];
-pub const MODELS: [&str; 4] = [
-    "gte-modernbert-base",
-    "gte-reranker-modernbert-base",
-    "qwen3-embedding-0.6b",
-    "qwen3-reranker-0.6b",
-];
+pub use catalog::{derive_cells, row_backend, Catalog, CatalogLane, Cell, ROW_BACKENDS};
+pub use validation::{validate, validate_checkout, validate_record};
 pub const GATES: [&str; 10] = [
     "complete",
     "dimension",
@@ -40,10 +28,9 @@ pub const GATES: [&str; 10] = [
 ];
 
 /// Record schema version written by the producer and the only one the
-/// validator accepts. Version 2 replaced the raw hardware UUIDs in `machine`
-/// with salted SHA-256 digests (see [`platform_uuid_sha256`] and
-/// [`gpu_uuid_sha256`]).
-pub const RECORD_SCHEMA: u32 = 2;
+/// validator accepts. Version 3 adds offline-verifiable ANE placement evidence;
+/// hardware identities remain domain-separated SHA-256 digests.
+pub const RECORD_SCHEMA: u32 = 3;
 
 /// Domain-separation prefix hashed in front of an Apple platform UUID: the
 /// bytes `synapse-certify/machine/v1` followed by one NUL byte.
@@ -140,9 +127,6 @@ impl Parity {
             .all(|name| self.gates.get(*name) == Some(&true))
             && self.gates.values().all(|passed| *passed)
     }
-    fn failed(&self) -> bool {
-        self.gates.values().any(|passed| !passed)
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,7 +144,7 @@ pub struct Admission {
     pub tokens_8193: Outcome,
 }
 impl Admission {
-    fn passed(&self) -> bool {
+    pub fn passed(&self) -> bool {
         self.tokens_8192.outcome == "processed"
             && !self.tokens_8192.truncated
             && !self.tokens_8192.diverted
@@ -169,32 +153,6 @@ impl Admission {
             && !self.tokens_8193.truncated
             && !self.tokens_8193.diverted
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawSeries {
-    pub session_id: String,
-    pub ane: Vec<f64>,
-    pub metal: Vec<f64>,
-}
-impl RawSeries {
-    pub fn ratio(&self) -> Result<f64> {
-        if self.session_id.is_empty() {
-            return Err(refuse("missing latency session"));
-        }
-        Ok(median(&self.ane)? / median(&self.metal)?)
-    }
-}
-pub fn median(series: &[f64]) -> Result<f64> {
-    if series.len() != 23 || series.iter().any(|n| !n.is_finite() || *n <= 0.0) {
-        return Err(refuse(
-            "latency series must contain 3 warmups and 20 positive samples",
-        ));
-    }
-    let mut measured = series[3..].to_vec();
-    measured.sort_by(f64::total_cmp);
-    Ok(measured[9] / 2.0 + measured[10] / 2.0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,9 +171,7 @@ pub struct Record {
     pub admission: Admission,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub drop_cause: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_series: Option<RawSeries>,
+    pub placement: Option<Placement>,
 }
 impl Record {
     pub fn eligible(&self) -> bool {
@@ -269,6 +225,14 @@ impl Inventory {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Placement {
+    pub layer_count: usize,
+    pub admitted_count: usize,
+    pub inventories: Vec<Inventory>,
+}
+
 /// Observations collected through the candidate module. The worker's hardware
 /// capability check (`--probe-floor`) is separate because Metal is in-process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -290,7 +254,6 @@ pub struct RunEvidence {
     /// Supervisor admission events counted separately from the captured inventories,
     /// so an omitted inventory cannot silently reduce both counts.
     pub admitted_count: usize,
-    pub raw_series: Option<RawSeries>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -307,13 +270,13 @@ pub trait Runner {
 }
 
 fn combination(row: &str, model: &str) -> Result<()> {
-    if !ROWS.contains(&row) || !MODELS.contains(&model) {
+    if row_backend(row).is_none() {
         return Err(refuse("unknown row or model"));
     }
+    self_check::manifest()?
+        .model(model)
+        .map_err(|e| refuse(e.to_string()))?;
     Ok(())
-}
-fn droppable(row: &str, model: &str) -> bool {
-    row == "ane-m5" && model.starts_with("qwen3-")
 }
 fn hex(value: &str, length: usize) -> bool {
     value.len() == length
@@ -345,16 +308,24 @@ pub fn digest(assets: &Path, file: &str) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 fn identity(record: &Record) -> Result<()> {
-    if record.schema != RECORD_SCHEMA || !hex(&record.source_commit, 40) {
-        return Err(refuse("invalid schema or source commit"));
+    if record.schema != RECORD_SCHEMA {
+        return Err(refuse("record_schema_mismatch"));
+    }
+    if !hex(&record.source_commit, 40) {
+        return Err(refuse("invalid source commit"));
     }
     combination(&record.row_id, &record.model)?;
     machine_identity(record)?;
     let p = &record.parity;
-    if p.model != record.model
-        || p.operation != record.operation
-        || p.profile_id != record.profile_id
-        || p.fingerprint != record.fingerprint
+    if p.model != record.model || p.fingerprint != record.fingerprint {
+        return Err(refuse("parity identity mismatch"));
+    }
+    Ok(())
+}
+
+fn producer_identity(record: &Record) -> Result<()> {
+    identity(record)?;
+    if record.parity.operation != record.operation || record.parity.profile_id != record.profile_id
     {
         return Err(refuse("parity identity mismatch"));
     }
@@ -379,7 +350,8 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
         failures: vec!["no parity output".into()],
     });
     let placement_ok = row != "ane-m5"
-        || (evidence.inventories.len() == evidence.admitted_count
+        || (evidence.admitted_count > 0
+            && evidence.inventories.len() == evidence.admitted_count
             && evidence
                 .inventories
                 .iter()
@@ -387,34 +359,13 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
     if !placement_ok {
         return Err(refuse("placement inventory failed"));
     }
-    let cause = if droppable(row, model) && parity.failed() {
-        Some("parity")
-    } else if droppable(row, model)
-        && evidence
-            .raw_series
-            .as_ref()
-            .map(RawSeries::ratio)
-            .transpose()?
-            .is_some_and(|ratio| ratio > 3.0)
-    {
-        Some("latency")
-    } else {
-        None
-    };
-    if cause.is_none()
-        && (!floor_ok
-            || !parity.passed()
-            || !evidence.admission.passed()
-            || (row == "ane-m5" && evidence.inventories.is_empty()))
-    {
+    if !floor_ok || !parity.passed() || !evidence.admission.passed() {
         let gate = if !floor_ok {
             "floor"
         } else if !parity.passed() {
             "parity"
-        } else if !evidence.admission.passed() {
-            "admission"
         } else {
-            "placement inventory"
+            "admission"
         };
         return Err(refuse(format!("{gate} gate failed")));
     }
@@ -455,21 +406,20 @@ pub fn produce(runner: &mut impl Runner, assets: &Path, row: &str, model: &str) 
         fingerprint: evidence.fingerprint,
         parity,
         admission: evidence.admission,
-        status: if cause.is_some() { "dropped" } else { "passed" }.into(),
-        drop_cause: cause.map(str::to_string),
-        raw_series: if cause.is_some() {
-            evidence.raw_series
-        } else {
-            None
-        },
+        status: "passed".into(),
+        placement: (row == "ane-m5").then_some(Placement {
+            layer_count: evidence.layer_count,
+            admitted_count: evidence.admitted_count,
+            inventories: evidence.inventories,
+        }),
     };
-    identity(&record)?;
+    producer_identity(&record)?;
     Ok(record)
 }
 
 /// Called only after all producer gates succeed; a refused run writes nothing.
 pub fn write_record(record: &Record, checkout: &Path) -> Result<PathBuf> {
-    identity(record)?;
+    producer_identity(record)?;
     let path = record.path(checkout);
     std::fs::create_dir_all(path.parent().ok_or_else(|| refuse("record path"))?)
         .map_err(|e| refuse(e.to_string()))?;
@@ -478,77 +428,4 @@ pub fn write_record(record: &Record, checkout: &Path) -> Result<PathBuf> {
     std::fs::write(&temporary, bytes).map_err(|e| refuse(e.to_string()))?;
     std::fs::rename(temporary, &path).map_err(|e| refuse(e.to_string()))?;
     Ok(path)
-}
-
-/// Validates status, drop evidence, extracted-file digests, parity identity and
-/// matrix coverage. Hardware and admission checks belong to the producer, not
-/// this offline validator, which does not execute candidate binaries.
-pub fn validate(records: &[Record], assets: &Path) -> Result<Vec<(String, String)>> {
-    let mut combinations = BTreeSet::new();
-    let mut eligible = Vec::new();
-    for record in records {
-        identity(record)?;
-        if !combinations.insert((record.row_id.as_str(), record.model.as_str())) {
-            return Err(refuse("duplicate combination"));
-        }
-        match record.status.as_str() {
-            "passed" => eligible.push((record.row_id.clone(), record.model.clone())),
-            "dropped" if droppable(&record.row_id, &record.model) => {
-                if !record.parity.failed()
-                    && !record
-                        .raw_series
-                        .as_ref()
-                        .ok_or_else(|| refuse("missing raw latency series"))?
-                        .ratio()?
-                        .gt(&3.0)
-                {
-                    return Err(refuse(
-                        "drop requires failing parity or ratio strictly greater than 3",
-                    ));
-                }
-            }
-            _ => return Err(refuse("invalid certification status")),
-        }
-        for artifact in &record.executed_artifacts {
-            if digest(assets, &artifact.file)? != artifact.sha256 {
-                return Err(refuse(format!(
-                    "executed artifact digest mismatch: {}",
-                    artifact.file
-                )));
-            }
-        }
-    }
-    if combinations.len() != ROWS.len() * MODELS.len() {
-        return Err(refuse("missing certification combination"));
-    }
-    Ok(eligible)
-}
-
-pub fn validate_checkout(
-    checkout: &Path,
-    assets: &Path,
-    source: &str,
-) -> Result<Vec<(String, String)>> {
-    if !hex(source, 40) {
-        return Err(refuse("invalid source commit"));
-    }
-    let mut records = Vec::new();
-    for row in ROWS {
-        for model in MODELS {
-            let path = checkout
-                .join("docs/evidence/certification")
-                .join(source)
-                .join(row)
-                .join(format!("{model}.json"));
-            let bytes =
-                std::fs::read(path).map_err(|e| refuse(format!("missing {row}/{model}: {e}")))?;
-            let record: Record =
-                serde_json::from_slice(&bytes).map_err(|e| refuse(e.to_string()))?;
-            if record.row_id != row || record.model != model || record.source_commit != source {
-                return Err(refuse("record does not match canonical path"));
-            }
-            records.push(record);
-        }
-    }
-    validate(&records, assets)
 }

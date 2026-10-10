@@ -1,5 +1,5 @@
 //! Candidate certification command parsing and validator dispatch.
-use crate::{refuse, validate_checkout, Result};
+use crate::{refuse, validate_checkout, Catalog, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -44,7 +44,11 @@ pub fn parse(arguments: &[OsString]) -> Result<Option<Command>> {
     }
 }
 
-pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Value> {
+pub fn dispatch(
+    command: Command,
+    source: Option<&str>,
+    catalog: &Catalog,
+) -> Result<serde_json::Value> {
     match command {
         Command::Source => {
             let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; source commit unavailable"))?;
@@ -52,7 +56,7 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
         }
         Command::Validate { assets, checkout } => {
             let source = source.ok_or_else(|| refuse("candidate was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
-            let eligible = validate_checkout(&checkout, &assets, source)?;
+            let eligible = validate_checkout(&checkout, &assets, source, catalog)?;
             Ok(serde_json::json!({"source_commit": source, "eligible": eligible}))
         }
     }
@@ -91,14 +95,17 @@ mod tests {
     fn clean_source_is_reported() {
         let commit = "a".repeat(40);
         let source = source_stamp(Some(&commit), Some("clean"));
-        assert_eq!(dispatch(Command::Source, source).unwrap(), commit);
+        assert_eq!(
+            dispatch(Command::Source, source, &Catalog::default()).unwrap(),
+            commit
+        );
     }
 
     #[test]
     fn dirty_source_is_refused() {
         let commit = "a".repeat(40);
         let source = source_stamp(Some(&commit), Some("dirty"));
-        assert!(dispatch(Command::Source, source).is_err());
+        assert!(dispatch(Command::Source, source, &Catalog::default()).is_err());
     }
 
     #[test]
@@ -108,7 +115,12 @@ mod tests {
             (None, Some("clean")),
             (Some("bad"), Some("clean")),
         ] {
-            assert!(dispatch(Command::Source, source_stamp(revision, tree)).is_err());
+            assert!(dispatch(
+                Command::Source,
+                source_stamp(revision, tree),
+                &Catalog::default()
+            )
+            .is_err());
         }
     }
     #[test]
