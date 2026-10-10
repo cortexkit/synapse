@@ -1,0 +1,95 @@
+{
+  "schema": 2,
+  "row_id": "cuda-linux-nvidia",
+  "source_commit": "dd7412b0409eb3c97d026c1bdd38797669813752",
+  "machine": {
+    "driver": "610.57.04",
+    "driver_api": 13030,
+    "gpu": {
+      "device_id": 11269,
+      "name": "NVIDIA GeForce RTX 5070 Ti",
+      "uuid_sha256": "d0f1ebd52fb3b02ea847da24d02ae5d058dd4aec46d1580a2abc136809e65c9e",
+      "vendor_id": 4318
+    },
+    "instance_id": "vast-55175162",
+    "os": "Linux 6.8.0-142-generic #142-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:24:27 UTC 2026",
+    "system_product_name": "B550 UD AC-Y1"
+  },
+  "executed_artifacts": [
+    {
+      "role": "ck-synapse",
+      "file": "ck-synapse",
+      "sha256": "5d9198edefa64fbf64ab7a0f483ceb0a9f79c1542e7f1d29628f214c3121136a"
+    },
+    {
+      "role": "ck-synapse-worker-cuda",
+      "file": "ck-synapse-worker-cuda",
+      "sha256": "a7f323a198c7ef72cd8c79c0ebc6c5886890aab23f44af80e892040ea26b8ef3"
+    }
+  ],
+  "model": "qwen3-reranker-0.6b",
+  "operation": "rerank",
+  "profile_id": "qwen3-reranker-0.6b.owned-cuda",
+  "fingerprint": "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688",
+  "parity": {
+    "model": "qwen3-reranker-0.6b",
+    "operation": "rerank",
+    "profile_id": "qwen3-reranker-0.6b.owned-cuda",
+    "fingerprint": "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688",
+    "fixture_set_id": "qwen3-reranker-0.6b.ref-v1.transformers-5.16.1.seed-0",
+    "completed_fixtures": 125,
+    "expected_fixtures": 125,
+    "tolerance_class": "fp16",
+    "metrics": {
+      "max_absolute_error": 0.00006061792373679431,
+      "max_norm_error": null,
+      "min_cosine": null,
+      "pools": {
+        "pool-10": {
+          "backend_ties": 0,
+          "concordant": 21,
+          "discordant": 0,
+          "passed": true,
+          "tau": 1.0,
+          "top10": true
+        },
+        "pool-100": {
+          "backend_ties": 0,
+          "concordant": 1924,
+          "discordant": 0,
+          "passed": true,
+          "tau": 1.0,
+          "top10": true
+        }
+      }
+    },
+    "gates": {
+      "complete": true,
+      "cosine": true,
+      "coverage": true,
+      "coverage_8192": true,
+      "dimension": true,
+      "finite": true,
+      "ranking": true,
+      "score": true,
+      "semantics": true,
+      "unit_norm": true
+    },
+    "failures": []
+  },
+  "admission": {
+    "tokens_8192": {
+      "outcome": "processed",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 1
+    },
+    "tokens_8193": {
+      "outcome": "sequence_too_long",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    }
+  },
+  "status": "passed"
+}

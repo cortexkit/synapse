@@ -1,0 +1,16 @@
+base ff24e6715e1bb58ad6ba0c120b889ef7431c   Compiling subc-tran---- catalog_runtime_tests::catalog_cuda_lane_specs_rehydrate_a_supervised_worker_profile stdout ----
+
+thread 'catalog_runtime_tests::catalog_cuda_lane_specs_rehydrate_a_supervised_worker_profile' (22023) panicked at crates/synapse-module/src/lib.rs:24009:17:
+assertion `left == right` failed: gte-modernbert-base-cuda
+  left: Some("explicit")
+ right: Some("supervised")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    catalog_runtime_tests::catalog_cuda_lane_specs_rehydrate_a_supervised_worker_profile
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 696 filtered out; finished in 0.18s
+
+error: test failed, to rerun pass `-p synapse-module --lib`
+BEFORE_DONE

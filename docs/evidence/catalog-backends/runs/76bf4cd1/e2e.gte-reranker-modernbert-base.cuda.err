@@ -1,0 +1,4 @@
+
+thread 'main' (27735) panicked at src/main.rs:108:97:
+{"error":{"class":"transient","code":"engine_crashed","message":"worker returned artifact_invalid: model path /root/e2e-runs/gte-reranker-modernbert-base-cuda/model-cache/blobs/b40b133b99ff8f70a7bc7d0cefbcb3a5aba78f6fb55f67cda7b7991e085f0f6d is neither a directory nor a safetensors file","retry_after_ms":250,"safe_to_retry_same_request":true},"module_generation":1}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

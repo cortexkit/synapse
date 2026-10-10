@@ -1,0 +1,14 @@
+76bf4cd15087dd7307613ff05fb81be93cb96dd5
+0
+test catalog_runtime_tests::catalog_cuda_lane_specs_rehydrate_a_supervised_worker_profile ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 696 filtered out; finished in 0.18s
+    Finished `release` profile [optimized] target(s) in 24.77s
+    Finished `release` profile [optimized] target(s) in 3.60s
+76bf4cd15087dd7307613ff05fb81be93cb96dd5
+c4c86ae57bd03177c849bbf15f9e7d0b4b59e7ba9655df99e02cf110146bf9d1  /root/assets/ck-synapse
+6f78d48caba2fb668a89e8e22ad58172c00bee7054e94b24b2cb5f0ed3b80f5b  /root/assets/ck-synapse-worker-cuda
+57f76c32ed3baca257b384691c07caee7102ccbbdee62179e54f32c835b0da0c  /root/assets/ck-synapse-worker-vulkan
+67c76646f26c763c00ead4ae3fadf46190da89cf7767ce720d7b55af230046ea  target/release/ckdev-synapse-certify
+0
+    Finished `release` profile [optimized] target(s) in 21.10s
+AFTER_DONE

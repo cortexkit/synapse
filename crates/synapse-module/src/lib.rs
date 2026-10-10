@@ -3178,10 +3178,21 @@ impl CatalogProfile {
         identity
             .build_flags
             .insert("storage_dtype".into(), dtype.as_str().into());
+        // `execution` picks between owned-metal's in-process modes, and the
+        // catalog declares `explicit` on every backend. The CUDA engine only
+        // runs inside its supervised worker, and owned_cuda_catalog_config
+        // refuses anything else when the lane loads, so a CUDA profile always
+        // records `supervised`. Execution is not part of the numeric profile,
+        // so this does not change the lane fingerprint.
+        let execution = if lane == CUDA_WORKER_ENGINE {
+            "supervised"
+        } else {
+            execution.unwrap_or("explicit")
+        };
         Ok(OwnedCatalogConfig {
             family,
             dtype,
-            execution: execution.unwrap_or("explicit").into(),
+            execution: execution.into(),
             // A catalog profile always serves up to 8192 tokens, and the engine
             // refuses to load a model whose attention budget can't cover
             // max_tokens squared. The generic default (sized for legacy lanes)
@@ -23986,6 +23997,46 @@ mod catalog_runtime_tests {
             }
         }
         assert_eq!(lanes, 14, "every declared catalog lane must be checked");
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_cuda_lane_specs_rehydrate_a_supervised_worker_profile() {
+        // The catalog declares `execution: explicit` on every backend, an
+        // owned-metal in-process mode. Loading an owned-cuda lane rebuilds its
+        // profile through owned_cuda_catalog_config, which accepts only
+        // supervised worker execution, so the stored spec must carry that.
+        let (root, state) = isolated_catalog_state("cuda-specs", true);
+        let mut lanes = 0;
+        for entry in &state.runtime.release_catalog.models {
+            for backend in &entry.backends {
+                if backend.engine != CUDA_WORKER_ENGINE {
+                    continue;
+                }
+                assert_eq!(backend.execution.as_deref(), Some("explicit"));
+                let lane = catalog::lane_id(&entry.id, &backend.backend);
+                let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
+                assert_eq!(
+                    spec.owned_execution.as_deref(),
+                    Some("supervised"),
+                    "{lane}"
+                );
+                let profile = stored_owned_profile(&spec)
+                    .unwrap_or_else(|error| panic!("{lane}: {error:?}"))
+                    .unwrap_or_else(|| panic!("{lane}: owned-cuda spec must yield a profile"));
+                assert_eq!(profile.execution, "supervised", "{lane}");
+                lanes += 1;
+            }
+        }
+        assert_eq!(lanes, 4, "every owned-cuda catalog lane must be checked");
+        // The certification runner preloads the same profiles with
+        // `execution: explicit`; that path goes through owned_config as well.
+        let preload = CatalogProfile::load("gte-modernbert-base.owned-cuda")
+            .unwrap()
+            .owned_config(Some("explicit"), None)
+            .unwrap();
+        assert_eq!(preload.execution, "supervised");
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
