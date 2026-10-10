@@ -2,10 +2,11 @@
 //! module's own engine-call shape, to attribute where serving time goes.
 //!
 //! Usage:
-//! `metal_fixed_cost FAMILY MODEL_DIR INPUT_JSONL OUT_JSON CACHE_DIR [REPLAYS]`
+//! `metal_fixed_cost FAMILY MODEL_DIR INPUT_JSONL OUT_JSON CACHE_DIR [REPLAYS] [DTYPE]`
 //!
-//! - `FAMILY` is `gte-modernbert` or `qwen3`; both run f16, as their owned-metal
-//!   catalog profiles do.
+//! - `FAMILY` is `gte-modernbert` or `qwen3`. `DTYPE` defaults to `f16`, the
+//!   dtype of both families' owned-metal embedding catalog profiles; `f32` runs
+//!   the full-precision graph, for example as a reference for f16 vectors.
 //! - `INPUT_JSONL` is the engram export; `INPUT_JSONL.meta.json` beside it holds
 //!   the 127-call batch plan AFT used.
 //! - Each 64-row call is tokenized with the module's `SanitizedTokenizer`, then
@@ -114,8 +115,8 @@ struct EngineCallRecord {
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     assert!(
-        (6..=7).contains(&args.len()),
-        "usage: metal_fixed_cost FAMILY MODEL_DIR INPUT_JSONL OUT_JSON CACHE_DIR [REPLAYS]"
+        (6..=8).contains(&args.len()),
+        "usage: metal_fixed_cost FAMILY MODEL_DIR INPUT_JSONL OUT_JSON CACHE_DIR [REPLAYS] [DTYPE]"
     );
     let family = ModelFamily::parse(&args[1]).expect("FAMILY must be gte-modernbert or qwen3");
     assert!(
@@ -164,7 +165,9 @@ fn main() {
         "batch plan must cover every row"
     );
 
-    let dtype = OwnedDType::F16;
+    let dtype = args.get(7).map_or(OwnedDType::F16, |value| {
+        OwnedDType::parse(value).expect("DTYPE")
+    });
     let tokenizer = SanitizedTokenizer::from_file(
         model_dir.join("tokenizer.json"),
         TokenizerConfig {
