@@ -588,7 +588,12 @@ async fn catalog_semantic_refusals_match_golden_and_never_fetch() {
     assert_eq!(unload["error"]["code"], "invalid_request");
     assert_eq!(
         unload["error"]["details"]["lane_ids"],
-        serde_json::json!(["gte-modernbert-base-metal", "gte-modernbert-base-ane"])
+        serde_json::json!([
+            "gte-modernbert-base-metal",
+            "gte-modernbert-base-ane",
+            "gte-modernbert-base-cuda",
+            "gte-modernbert-base-vulkan"
+        ])
     );
     assert!(h.server.paths().is_empty());
     h.assert_clean();
@@ -1843,14 +1848,23 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
         for backend in entry["backends"].as_array().unwrap() {
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["runnable"], false);
-            // On macOS, Metal needs a GPU device; the ANE lane needs the
-            // direct Neural Engine worker binary.
-            let expected = match (cfg!(target_os = "macos"), backend["backend"].as_str()) {
-                (false, _) => "not_supported_on_platform",
-                (true, Some("ane")) => "worker_missing",
-                (true, _) => "device_missing",
-            };
-            assert_eq!(backend["reason"], expected, "{}", backend["lane_id"]);
+            // On macOS, Metal needs a GPU device, the ANE lane needs the
+            // direct Neural Engine worker binary, and CUDA and Vulkan are not
+            // offered. Elsewhere Metal and ANE are never offered, while CUDA
+            // and Vulkan are, so their reason depends on the host's GPU and
+            // built workers and is only checked not to claim the platform.
+            let lane = &backend["lane_id"];
+            match (cfg!(target_os = "macos"), backend["backend"].as_str()) {
+                (true, Some("ane")) => assert_eq!(backend["reason"], "worker_missing", "{lane}"),
+                (true, Some("metal")) => assert_eq!(backend["reason"], "device_missing", "{lane}"),
+                (true, Some("cuda" | "vulkan")) | (false, Some("metal" | "ane")) => {
+                    assert_eq!(backend["reason"], "not_supported_on_platform", "{lane}")
+                }
+                (false, Some("cuda" | "vulkan")) => {
+                    assert_ne!(backend["reason"], "not_supported_on_platform", "{lane}")
+                }
+                (_, other) => panic!("unexpected catalog backend {other:?}"),
+            }
         }
     }
     let refused = h.download("gte-modernbert-base", "unavailable").await;
