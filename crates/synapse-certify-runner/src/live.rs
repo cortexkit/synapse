@@ -1,12 +1,7 @@
 //! Executes candidate artifacts against a private in-process daemon.
 use crate::refuse;
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
@@ -15,13 +10,8 @@ use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, read_frame, write_atomic, write_frame,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
-use synapse_certify::{
-    Admission, ArtifactFile, Inventory, Outcome, Parity, Result, RunEvidence, Runner,
-};
-use synapse_parity::{
-    evaluator::{evaluate, FixtureSet, ObservedCase, Output},
-    manifest::Manifest,
-};
+use synapse_certify::{Admission, Inventory, Outcome, Parity, Result, RunEvidence, Runner};
+use synapse_parity::evaluator::{evaluate, FixtureSet, ObservedCase, Output};
 use tokio::{
     net::{TcpListener, TcpStream},
     process::Command,
@@ -32,7 +22,7 @@ use tokio::{
 pub struct Options {
     pub assets: PathBuf,
     pub checkout: PathBuf,
-    pub weights: PathBuf,
+    pub mirror: PathBuf,
 }
 
 pub struct LiveRunner {
@@ -40,14 +30,12 @@ pub struct LiveRunner {
     source: String,
     runtime: tokio::runtime::Runtime,
     floor: Option<Value>,
+    layout: Option<(String, crate::assets::Layout)>,
 }
 fn err(error: impl std::fmt::Display) -> crate::Error {
     refuse(error.to_string())
 }
-fn binary(root: &Path, role: &str) -> PathBuf {
-    root.join(format!("{role}{}", std::env::consts::EXE_SUFFIX))
-}
-fn lane(row: &str) -> &'static str {
+pub(crate) fn lane(row: &str) -> &'static str {
     if row == "metal-m5" {
         "owned-metal"
     } else if row == "ane-m5" {
@@ -58,7 +46,7 @@ fn lane(row: &str) -> &'static str {
         "owned-vulkan"
     }
 }
-fn worker(row: &str) -> Option<&'static str> {
+pub(crate) fn worker(row: &str) -> Option<&'static str> {
     match lane(row) {
         "owned-cuda" => Some("ck-synapse-worker-cuda"),
         "owned-vulkan" => Some("ck-synapse-worker-vulkan"),
@@ -67,34 +55,56 @@ fn worker(row: &str) -> Option<&'static str> {
     }
 }
 impl LiveRunner {
-    pub fn new(options: Options, source: &str) -> Result<Self> {
+    pub fn new(mut options: Options, source: &str) -> Result<Self> {
+        options.assets = std::fs::canonicalize(&options.assets).map_err(err)?;
+        options.checkout = std::fs::canonicalize(&options.checkout).map_err(err)?;
+        options.mirror = std::fs::canonicalize(&options.mirror).map_err(err)?;
         Ok(Self {
             options,
             source: source.into(),
             runtime: tokio::runtime::Runtime::new().map_err(err)?,
             floor: None,
+            layout: None,
         })
+    }
+    fn prepare(&mut self, row: &str) -> Result<()> {
+        if let Some((existing, _)) = &self.layout {
+            if existing != row {
+                return Err(refuse("runner cannot change row during a run"));
+            }
+            return Ok(());
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(err)?
+            .as_nanos();
+        let scratch = self
+            .options
+            .checkout
+            .join("crates/synapse-certify-runner/.live")
+            .join(format!("run-{}-{unique}", std::process::id()));
+        self.layout = Some((
+            row.into(),
+            crate::assets::Layout::new(&self.options.assets, &scratch, row)?,
+        ));
+        Ok(())
     }
 }
 impl Runner for LiveRunner {
     fn probe_floor(&mut self, row: &str, _model: &str) -> Result<String> {
-        let role = worker(row).ok_or_else(|| refuse("metal-m5 has no floor probe"))?;
+        self.prepare(row)?;
+        let layout = &self.layout.as_ref().expect("prepared layout").1;
+        let alias = layout
+            .worker
+            .as_ref()
+            .ok_or_else(|| refuse("metal-m5 has no floor probe"))?;
         let output = self.runtime.block_on(async {
             timeout(
                 Duration::from_secs(60),
-                synapse_core::without_launch_nonce_tokio(Command::new(
-                    synapse_core::dev_binary::ckdev_binary_hard_link(
-                        binary(&self.options.assets, role),
-                        self.options
-                            .checkout
-                            .join("crates/synapse-certify-runner/.live")
-                            .join(format!("{}-{row}-floor", std::process::id())),
-                    )
-                    .map_err(err)?,
-                ))
-                .arg("--probe-floor")
-                .kill_on_drop(true)
-                .output(),
+                synapse_core::without_launch_nonce_tokio(Command::new(alias))
+                    .arg("--probe-floor")
+                    .kill_on_drop(true)
+                    .output(),
             )
             .await
             .map_err(err)?
@@ -110,12 +120,14 @@ impl Runner for LiveRunner {
         })
     }
     fn observe(&mut self, row: &str, model: &str) -> Result<RunEvidence> {
+        self.prepare(row)?;
         self.runtime.block_on(observe(
             &self.options,
             &self.source,
             row,
             model,
             self.floor.as_ref(),
+            &self.layout.as_ref().expect("prepared layout").1,
         ))
     }
 }
@@ -198,20 +210,19 @@ impl Session {
         .await?;
         Ok(value.get("result").cloned().unwrap_or(value))
     }
-    async fn observations(&mut self) -> Result<Value> {
-        let value = self.request("certify.observations", json!({})).await?;
-        if value["available"] != true {
-            return Err(refuse(format!("certify.observations unavailable: {value}")));
-        }
-        Ok(value)
+}
+impl crate::catalog::Client for Session {
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        Session::request(self, method, params).await
     }
 }
 
-async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> Result<Session> {
-    let root = options
-        .checkout
-        .join("crates/synapse-certify-runner/.live")
-        .join(format!("{}-{}", std::process::id(), row));
+async fn start(
+    options: &Options,
+    layout: &crate::assets::Layout,
+    endpoint: &str,
+) -> Result<Session> {
+    let root = &layout.root;
     std::fs::create_dir_all(root.join("data")).map_err(err)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let conn = ConnectionInfo {
@@ -237,60 +248,33 @@ async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> R
     let daemon = DaemonTask(tokio::spawn(async move {
         serve_listener(listener, router, auth).await.map_err(err)
     }));
-    let pinned = &manifest["models"][model];
-    let model_path = if worker(row).is_some() {
-        let manifest =
-            Manifest::from_slice(&serde_json::to_vec(manifest).map_err(err)?).map_err(err)?;
-        let package = synapse_parity::convert::convert_profile_file(
-            &manifest,
-            &format!("{model}.{}", lane(row)),
-            &options.weights.join("model.safetensors"),
-        )
-        .map_err(err)?;
-        let path = root.join("profile.safetensors");
-        std::fs::write(&path, package).map_err(err)?;
-        path
-    } else {
-        options.weights.join("model.safetensors")
-    };
-    let operation = pinned["operation"]
-        .as_str()
-        .ok_or_else(|| refuse("manifest operation missing"))?;
-    let mut preload = json!({
-        "model_id": "certify-candidate", "engine": lane(row), "profile": format!("{model}.{}", lane(row)),
-        "task": operation, "model_path": model_path,
-        "tokenizer_path": options.weights.join("tokenizer.json"),
-        "pooling": match pinned["grammar"]["pooling"].as_str() { Some("cls") => "cls", Some("masked_mean") => "mean", _ => "last" }, "normalize": pinned["output"]["normalization"] == "l2",
-        "execution": "explicit", "attention_units": 8192 * 8192,
-    });
-    if let Some(role) = worker(row) {
-        preload["worker_bin"] = json!(synapse_core::dev_binary::ckdev_binary_hard_link(
-            binary(&options.assets, role),
-            &root
-        )
-        .map_err(err)?);
-        preload["worker_runtime_dir"] = json!(options.assets);
-    }
     let config = root.join("config.json");
-    std::fs::write(&config, serde_json::to_vec(&json!({"certify_observation": true, "preload_models": [preload], "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": INLINE_ITEMS, "max_tokens": INLINE_TOKENS}})).map_err(err)?).map_err(err)?;
-    let child = synapse_core::without_launch_nonce_tokio(Command::new(
-        synapse_core::dev_binary::ckdev_binary_hard_link(
-            binary(&options.assets, "ck-synapse"),
-            &root,
-        )
-        .map_err(err)?,
-    ))
-    .arg("--subc")
-    .arg(&conn_path)
-    .env("SUBC_MODULE_ID", "synapse")
-    .env("SYNAPSE_CONFIG_PATH", &config)
-    .env("XDG_DATA_HOME", root.join("data"))
-    .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
-    .env("CORTEXKIT_STORE_ROOT", root.join("store"))
-    .stderr(std::process::Stdio::inherit())
-    .kill_on_drop(true)
-    .spawn()
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&crate::assets::config(endpoint)).map_err(err)?,
+    )
     .map_err(err)?;
+    let mut command = synapse_core::without_launch_nonce_tokio(Command::new(&layout.candidate));
+    for (name, value) in layout.environment() {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    let child = command
+        .current_dir(root)
+        .arg("--subc")
+        .arg(&conn_path)
+        .env("SUBC_MODULE_ID", "synapse")
+        .env("SYNAPSE_CONFIG_PATH", &config)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
+        .env("CORTEXKIT_STORE_ROOT", root.join("store"))
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(err)?;
     let mut stream = TcpStream::connect(("127.0.0.1", conn.endpoints[0].port))
         .await
         .map_err(err)?;
@@ -332,9 +316,9 @@ async fn start(options: &Options, row: &str, model: &str, manifest: &Value) -> R
 }
 fn request_params(case: &Value, operation: &str) -> Value {
     if operation == "embed" {
-        json!({"model": "certify-candidate", "text": case["text"], "accept_declared": true})
+        json!({"text": case["text"], "accept_declared": true})
     } else {
-        json!({"model": "certify-candidate", "query": case["query"], "candidates": [case["document"]], "accept_declared": true})
+        json!({"query": case["query"], "candidates": [case["document"]], "accept_declared": true})
     }
 }
 fn observed_output(response: &Value, index: usize, operation: &str) -> serde_json::Result<Output> {
@@ -410,7 +394,7 @@ fn group_params(group: &[&Value], operation: &str) -> Result<(&'static str, Valu
             .collect::<Vec<_>>();
         Ok((
             "embed.batch",
-            json!({"model": "certify-candidate", "items": items, "accept_declared": true}),
+            json!({"items": items, "accept_declared": true}),
         ))
     } else {
         let query = &group[0]["query"];
@@ -423,7 +407,7 @@ fn group_params(group: &[&Value], operation: &str) -> Result<(&'static str, Valu
             .collect::<Vec<_>>();
         Ok((
             "rerank.score",
-            json!({"model": "certify-candidate", "query": query, "candidates": candidates, "accept_declared": true}),
+            json!({"query": query, "candidates": candidates, "accept_declared": true}),
         ))
     }
 }
@@ -447,55 +431,49 @@ async fn observe(
     row: &str,
     model: &str,
     floor: Option<&Value>,
+    layout: &crate::assets::Layout,
 ) -> Result<RunEvidence> {
     let parity_root = options.checkout.join("bench/parity");
-    let manifest = Manifest::load(&parity_root.join("models.json")).map_err(err)?;
-    synapse_parity::checkpoint::check_checkpoint(&manifest, model, &options.weights, &parity_root)
-        .map_err(err)?;
-    let raw: Value =
-        serde_json::from_slice(&std::fs::read(parity_root.join("models.json")).map_err(err)?)
+    let manifest = synapse_certify::self_check::manifest()?;
+    let index: Value =
+        serde_json::from_slice(include_bytes!("../../../bench/parity/fixtures/index.json"))
             .map_err(err)?;
-    let fixtures = FixtureSet::load(&parity_root, &manifest, model).map_err(err)?;
-    let index: Value = serde_json::from_slice(
-        &std::fs::read(parity_root.join("fixtures/index.json")).map_err(err)?,
-    )
-    .map_err(err)?;
     let fixture_id = synapse_parity::evaluator::fixture_set_id(&manifest, model);
-    let document: Value = serde_json::from_slice(
-        &std::fs::read(
-            parity_root.join(
-                index[&fixture_id]["path"]
-                    .as_str()
-                    .ok_or_else(|| refuse("fixture path missing"))?,
-            ),
-        )
-        .map_err(err)?,
+    let fixture_bytes = std::fs::read(
+        parity_root.join(
+            index[&fixture_id]["path"]
+                .as_str()
+                .ok_or_else(|| refuse("fixture path missing"))?,
+        ),
     )
     .map_err(err)?;
+    let fixtures = FixtureSet::from_bytes(
+        &manifest,
+        model,
+        &fixture_bytes,
+        index[&fixture_id]["sha256"]
+            .as_str()
+            .ok_or_else(|| refuse("fixture digest missing"))?,
+    )
+    .map_err(err)?;
+    let document: Value = serde_json::from_slice(&fixture_bytes).map_err(err)?;
     let cases = document["cases"]
         .as_array()
         .ok_or_else(|| refuse("fixture cases missing"))?;
-    let operation = raw["models"][model]["operation"]
-        .as_str()
-        .ok_or_else(|| refuse("operation missing"))?;
+    let mirror = crate::mirror::Mirror::start(&options.mirror).await?;
+    let mut candidate = start(options, layout, &mirror.endpoint).await?;
+    let deadline = tokio::time::Instant::now() + crate::catalog::RUN_BUDGET;
+    let pin = crate::catalog::install(&mut candidate, row, model, deadline).await?;
+    let operation = pin.task.clone();
+    let operation = operation.as_str();
     let method = if operation == "embed" {
         "embed.query"
     } else {
         "rerank.score"
     };
     let profile_id = format!("{model}.{}", lane(row));
-    let mut session = start(options, row, model, &raw).await?;
+    let mut session = crate::catalog::CertifiedSession::new(&mut candidate, pin, deadline);
     let mut outputs = BTreeMap::new();
-    let listed = session.request("models.list", json!({})).await?;
-    let mut fingerprint = listed["models"]
-        .as_array()
-        .and_then(|models| {
-            models
-                .iter()
-                .find(|model| model["model_id"] == "certify-candidate")
-        })
-        .and_then(|model| model["fingerprint"].as_str())
-        .map(str::to_string);
     let mut long_response = None;
     let mut long_request_count = 0;
     for group in fixture_requests(cases, operation)? {
@@ -509,23 +487,11 @@ async fn observe(
             None
         };
         let (request_method, params) = group_params(&group, operation)?;
-        let response = session.request(request_method, params).await?;
-        if outputs.is_empty() && response.get("error").is_some() {
-            eprintln!("certification input {} refused: {response}", case["id"]);
-        }
-        if let Some(value) = response["fingerprint"].as_str() {
-            if fingerprint.as_deref().is_some_and(|old| old != value) {
-                return Err(refuse("fingerprint changed during run"));
-            }
-            fingerprint = Some(value.to_string());
-        }
+        let response = session.fixture(request_method, params).await?;
         let ids: Vec<Vec<u32>> =
-            match serde_json::from_value(response["observation"]["input_ids"].clone()) {
-                Ok(ids) => ids,
-                Err(_) => continue,
-            };
+            serde_json::from_value(response["observation"]["input_ids"].clone()).map_err(err)?;
         if ids.len() != group.len() {
-            continue;
+            return Err(refuse("fixture observation count mismatch"));
         }
         let readout = response["observation"]["readout_ids"]
             .as_array()
@@ -537,10 +503,7 @@ async fn observe(
                 .ok_or_else(|| refuse("worker counter regressed on 8192 input"))?;
         }
         for (index, (case, input_ids)) in group.into_iter().zip(ids).enumerate() {
-            let output = observed_output(&response, index, operation);
-            let Ok(output) = output else {
-                continue;
-            };
+            let output = observed_output(&response, index, operation).map_err(err)?;
             outputs.insert(
                 case["id"]
                     .as_str()
@@ -554,7 +517,7 @@ async fn observe(
             );
         }
     }
-    let fingerprint = fingerprint.ok_or_else(|| refuse("candidate produced no fingerprint"))?;
+    let fingerprint = session.pin.fingerprint.clone();
     let evaluation =
         evaluate(&manifest, &profile_id, &fingerprint, &fixtures, &outputs).map_err(err)?;
     let parity: Parity =
@@ -581,7 +544,7 @@ async fn observe(
     ));
     let before = session.observations().await?;
     let rejected = session
-        .request(method, request_params(&oversized, operation))
+        .oversized(method, request_params(&oversized, operation))
         .await?;
     let after = session.observations().await?;
     if rejected["error"]["code"] == "sequence_too_long"
@@ -620,38 +583,9 @@ async fn observe(
     let final_snapshot = session.observations().await?;
     let inventories: Vec<Inventory> =
         serde_json::from_value(final_snapshot["inventories"].clone()).map_err(err)?;
-    let mut artifacts = vec![ArtifactFile {
-        role: "ck-synapse".into(),
-        file: binary(Path::new(""), "ck-synapse")
-            .to_string_lossy()
-            .into_owned(),
-    }];
-    if let Some(role) = worker(row) {
-        artifacts.push(ArtifactFile {
-            role: role.into(),
-            file: binary(Path::new(""), role).to_string_lossy().into_owned(),
-        });
-    }
-    if row == "cuda-windows-nvidia" {
-        let package_manifest: Value = serde_json::from_slice(
-            &std::fs::read(options.assets.join("manifest.json")).map_err(err)?,
-        )
-        .map_err(err)?;
-        for runtime in package_manifest["runtime_files"]
-            .as_array()
-            .ok_or_else(|| refuse("CUDA runtime_files missing"))?
-        {
-            let file = runtime["file"]
-                .as_str()
-                .ok_or_else(|| refuse("CUDA runtime file name missing"))?;
-            artifacts.push(ArtifactFile {
-                role: format!("cuda-runtime:{file}"),
-                file: file.into(),
-            });
-        }
-    }
+    let artifacts = layout.artifacts.clone();
     let machine = machine(row, floor)?;
-    session.shutdown().await?;
+    candidate.shutdown().await?;
     Ok(RunEvidence {
         source_commit: source.into(),
         machine,
@@ -664,9 +598,12 @@ async fn observe(
         tolerance_class: parity.tolerance_class.clone(),
         parity: (!outputs.is_empty()).then_some(parity),
         admission,
-        layer_count: raw["models"][model]["architecture"]["params"]["num_hidden_layers"]
-            .as_u64()
-            .ok_or_else(|| refuse("layer count missing"))? as usize,
+        layer_count: manifest
+            .model(model)
+            .map_err(err)?
+            .architecture
+            .int("num_hidden_layers")
+            .map_err(err)? as usize,
         inventories,
         admitted_count: final_snapshot["admitted_count"]
             .as_u64()
@@ -819,6 +756,71 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn floor_probe_and_worker_environment_use_one_alias_per_run() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".live/floor-test-{}", std::process::id()));
+        let assets = root.join("assets/linux-x64");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("ck-synapse"), b"candidate").unwrap();
+        let worker = assets.join("ck-synapse-worker-cuda");
+        std::fs::write(&worker, "#!/bin/sh\n[ \"$1\" = '--probe-floor' ] || exit 2\nprintf '{\"status\":\"ok\",\"executable\":\"%s\"}\\n' \"$0\"\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runner = LiveRunner::new(
+            Options {
+                assets: root.join("assets"),
+                checkout: root.clone(),
+                mirror: root.clone(),
+            },
+            &"a".repeat(40),
+        )
+        .unwrap();
+        assert_eq!(
+            runner
+                .probe_floor("cuda-linux-nvidia", "gte-modernbert-base")
+                .unwrap(),
+            "ok"
+        );
+        let alias = runner
+            .layout
+            .as_ref()
+            .unwrap()
+            .1
+            .worker
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            runner.floor.as_ref().unwrap()["executable"],
+            alias.to_str().unwrap()
+        );
+        runner.prepare("cuda-linux-nvidia").unwrap();
+        let layout = &runner.layout.as_ref().unwrap().1;
+        assert_eq!(layout.worker.as_ref().unwrap(), &alias);
+        assert_eq!(
+            layout
+                .environment()
+                .into_iter()
+                .find(|(name, _)| name == "SYNAPSE_OWNED_CUDA_WORKER_BIN")
+                .unwrap()
+                .1,
+            Some(alias.clone())
+        );
+        assert_eq!(
+            std::fs::metadata(&worker).unwrap().ino(),
+            std::fs::metadata(&alias).unwrap().ino()
+        );
+        assert_ne!(layout.candidate.parent(), alias.parent());
+        assert_eq!(
+            std::fs::read_dir(alias.parent().unwrap()).unwrap().count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // Shapes copied from real module replies captured during an ane-m5 run.
     #[test]
@@ -846,7 +848,14 @@ mod tests {
             "ck-synapse-worker-vulkan",
             "ck-synapse-worker-ane-direct",
         ] {
-            let built = binary(&assets, role);
+            let built = assets.join(crate::assets::binary_file(
+                if cfg!(windows) {
+                    "cuda-windows-nvidia"
+                } else {
+                    "metal-m5"
+                },
+                role,
+            ));
             std::fs::write(&built, role.as_bytes()).unwrap();
             let alias =
                 synapse_core::dev_binary::ckdev_binary_hard_link(&built, root.join("run")).unwrap();

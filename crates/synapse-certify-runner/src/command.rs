@@ -4,8 +4,8 @@ use std::{ffi::OsString, path::Path, process::Output};
 use synapse_certify::Result;
 
 pub const LIVE_OPTIONS_MISSING: &str =
-    "certify run requires --assets <extracted-dir> --checkout <root> --weights <model-dir>";
-pub const USAGE: &str = "usage: ckdev-synapse-certify run --row <row-id> --model <slug> --assets <extracted-dir> --checkout <root> --weights <model-dir>";
+    "certify run requires --assets <aggregate-dir> --checkout <root> --mirror <dir>";
+pub const USAGE: &str = "usage: ckdev-synapse-certify run --row <row-id> --model <slug> --assets <aggregate-dir> --checkout <root> --mirror <dir>";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
@@ -26,7 +26,7 @@ pub fn parse(arguments: &[OsString]) -> Result<Command> {
     let mut model = None;
     let mut assets = None;
     let mut checkout = None;
-    let mut weights = None;
+    let mut mirror = None;
     for pair in arguments[1..].as_chunks::<2>().0 {
         let value = pair[1]
             .to_str()
@@ -37,7 +37,7 @@ pub fn parse(arguments: &[OsString]) -> Result<Command> {
             Some("--model") if model.is_none() => model = Some(value.to_string()),
             Some("--assets") if assets.is_none() => assets = Some(value.into()),
             Some("--checkout") if checkout.is_none() => checkout = Some(value.into()),
-            Some("--weights") if weights.is_none() => weights = Some(value.into()),
+            Some("--mirror") if mirror.is_none() => mirror = Some(value.into()),
             _ => return Err(bad()),
         }
     }
@@ -50,11 +50,11 @@ pub fn parse(arguments: &[OsString]) -> Result<Command> {
     {
         return Err(refuse("unknown certification row or model"));
     }
-    let options = match (assets, checkout, weights) {
-        (Some(assets), Some(checkout), Some(weights)) => Some(live::Options {
+    let options = match (assets, checkout, mirror) {
+        (Some(assets), Some(checkout), Some(mirror)) => Some(live::Options {
             assets,
             checkout,
-            weights,
+            mirror,
         }),
         (None, None, None) => None,
         _ => return Err(refuse(LIVE_OPTIONS_MISSING)),
@@ -81,7 +81,8 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
     let source = source.ok_or_else(|| refuse("runner was built from a dirty tree or without git; evidence cannot be bound to a commit"))?;
     let candidate = options
         .assets
-        .join(format!("ck-synapse{}", std::env::consts::EXE_SUFFIX));
+        .join(crate::assets::os_arch(&command.row)?)
+        .join(crate::assets::binary_file(&command.row, "ck-synapse"));
     verify_candidate_source(
         &candidate,
         &options
@@ -238,8 +239,8 @@ mod tests {
             "assets",
             "--checkout",
             "root",
-            "--weights",
-            "weights",
+            "--mirror",
+            "mirror",
         ]))
         .unwrap();
         assert_eq!(
@@ -247,7 +248,7 @@ mod tests {
             live::Options {
                 assets: "assets".into(),
                 checkout: "root".into(),
-                weights: "weights".into()
+                mirror: "mirror".into()
             }
         );
     }

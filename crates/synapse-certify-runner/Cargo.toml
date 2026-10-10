@@ -16,7 +16,7 @@ synapse-certify = { path = "../synapse-certify" }
 synapse-core = { path = "../synapse-core" }
 synapse-parity = { path = "../../bench/parity" }
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 subc-daemon.workspace = true
 subc-transport.workspace = true
 subc-protocol.workspace = true

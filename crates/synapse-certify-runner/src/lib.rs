@@ -1,8 +1,11 @@
 //! Live certification tooling; synapse-module must not depend on this daemon-backed crate.
 #![forbid(unsafe_code)]
 
+mod assets;
+mod catalog;
 pub mod command;
 pub mod live;
+mod mirror;
 
 use synapse_certify::Error;
 
