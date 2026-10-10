@@ -149,8 +149,10 @@ impl Layout {
 }
 
 pub(crate) fn config(endpoint: &str) -> Value {
+    // Allow one token beyond the model's 8192-token limit into the queue. The probe
+    // must fail the model's length check, not the queue's total-token budget.
     json!({"hf_endpoint": endpoint, "certify_observation": true,
-        "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": 64, "max_tokens": 8192}})
+        "inline": {"deadline_ms": 3600000, "max_queue_ms": 3600000, "max_items": 64, "max_tokens": 8193}})
 }
 
 #[cfg(test)]
@@ -249,6 +251,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["certify_observation", "hf_endpoint", "inline"]
         );
+        assert_eq!(config("http://localhost:1")["inline"]["max_tokens"], 8193);
 
         let model = "gte-modernbert-base";
         let manifest = synapse_certify::self_check::manifest().unwrap();
