@@ -63,6 +63,9 @@ pub(crate) struct BatchPlan {
 pub(crate) struct MetalExecutionConfig {
     execution: Execution,
     package_root: Option<PathBuf>,
+    // Multiply ModernBERT's f16 weight projections in f16 instead of widening them
+    // to f32. Off unless the lane opted in; see `ProjectionDtype`.
+    f16_projections: bool,
 }
 
 impl MetalExecutionConfig {
@@ -74,7 +77,17 @@ impl MetalExecutionConfig {
         Ok(Self {
             execution,
             package_root,
+            f16_projections: false,
         })
+    }
+
+    pub(crate) fn with_f16_projections(mut self, f16_projections: bool) -> Self {
+        self.f16_projections = f16_projections;
+        self
+    }
+
+    pub(crate) fn f16_projections(&self) -> bool {
+        self.f16_projections
     }
 
     #[allow(dead_code)]
@@ -395,6 +408,7 @@ impl MetalProvider {
             MetalExecutionConfig {
                 execution: Execution::Lazy,
                 package_root: None,
+                f16_projections: false,
             },
         )
     }

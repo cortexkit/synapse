@@ -1117,6 +1117,7 @@ impl MetalContext {
                 std::ptr::null(),
                 0.0,
                 0,
+                i32::from(self.execution.f16_projections()),
                 params.as_ptr(),
                 if f16 {
                     output_f16.as_mut_ptr().cast()
@@ -1235,6 +1236,7 @@ impl MetalContext {
                 head.classifier_weight.as_ptr(),
                 head.classifier_bias,
                 1,
+                i32::from(self.execution.f16_projections()),
                 params.as_ptr(),
                 scores.as_mut_ptr().cast(),
             )
@@ -1313,6 +1315,7 @@ unsafe extern "C" {
         classifier_weight: *const f32,
         classifier_bias: f32,
         rerank: i32,
+        f16_projections: i32,
         layer_params: *const ModernBertLayerParams,
         output: *mut std::ffi::c_void,
     ) -> i32;

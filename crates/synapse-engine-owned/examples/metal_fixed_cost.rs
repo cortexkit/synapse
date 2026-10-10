@@ -20,6 +20,9 @@
 //!   (default 1) measured replays follow. Measured replays must reproduce the
 //!   warm-up vectors bit for bit.
 //!
+//! Set `OWNED_METAL_PROJECTION_DTYPE=f16` to run gte-modernbert with the f16 weight
+//! projections catalog lanes opt in to; unset runs the default f32 projections.
+//!
 //! Run with `SYNAPSE_EMBED_PROFILE=1` to get the engine's per-pass stage lines on
 //! stderr. Add `SYNAPSE_EMBED_PROFILE_GPU=1` to split each pass's synchronous run
 //! into CPU encode time and GPU time. Before each engine call this probe prints a
@@ -40,7 +43,8 @@ use sha2::{Digest, Sha256};
 use synapse_core::tokenizer::{SanitizedTokenizer, TokenizerConfig};
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
 use synapse_engine_owned::{
-    engine_identity, ModelFamily, OwnedDType, OwnedMetalEmbedEngine, BUCKET_POLICY_VERSION,
+    engine_identity_with_projections, ModelFamily, OwnedDType, OwnedMetalEmbedEngine,
+    ProjectionDtype, BUCKET_POLICY_VERSION,
 };
 
 /// The owned-metal catalog profiles serve up to 8,192 tokens with an attention
@@ -190,6 +194,14 @@ fn main() {
     ] {
         config.values.insert(key.to_string(), value);
     }
+    // OWNED_METAL_PROJECTION_DTYPE=f16 opts the lane in to f16 ModernBERT weight
+    // projections, as catalog lanes do; unset keeps the engine default (f32).
+    if let Ok(projections) = std::env::var("OWNED_METAL_PROJECTION_DTYPE") {
+        config.values.insert(
+            synapse_engine_owned::PROJECTION_DTYPE_CONFIG_KEY.to_string(),
+            projections,
+        );
+    }
     let mut engine = OwnedMetalEmbedEngine::new(family, dtype);
     let cold_started = Instant::now();
     let loaded = engine
@@ -304,7 +316,11 @@ fn main() {
     let output = Output {
         family: family.as_str(),
         dtype: dtype.as_str(),
-        engine_identity: engine_identity(family, dtype),
+        engine_identity: engine_identity_with_projections(
+            family,
+            dtype,
+            ProjectionDtype::from_config(&config, family, dtype).expect("projection dtype"),
+        ),
         bucket_policy_version: BUCKET_POLICY_VERSION,
         max_tokens: MAX_TOKENS,
         attention_units: ATTENTION_UNITS,

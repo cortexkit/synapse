@@ -2,7 +2,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use synapse_core::fingerprint::NumericProfile;
-use synapse_engine_owned::{engine_identity, ModelFamily, OwnedDType};
+use synapse_engine_owned::{
+    engine_identity, engine_identity_with_projections, ModelFamily, OwnedDType, ProjectionDtype,
+};
 
 /// Fingerprint of a catalog Metal lane, computed from its catalog parameters and
 /// the given engine identity the same way the module computes it at load.
@@ -48,11 +50,18 @@ fn metal_lane_fingerprint(
     profile.fingerprint().0
 }
 
+/// Engine identity of a catalog Metal lane: catalog lanes opt in to f16 weight
+/// projections exactly when they are f16 gte-modernbert, as the module's
+/// `catalog_projection_dtype` decides.
 fn catalog_engine_identity(backend: &Value) -> synapse_core::EngineIdentity {
-    engine_identity(
-        ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap(),
-        OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap(),
-    )
+    let family = ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap();
+    let dtype = OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap();
+    let projections = if family == ModelFamily::GteModernBert && dtype == OwnedDType::F16 {
+        ProjectionDtype::F16
+    } else {
+        ProjectionDtype::F32
+    };
+    engine_identity_with_projections(family, dtype, projections)
 }
 
 #[test]
@@ -90,11 +99,11 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
 }
 
 #[test]
-fn only_the_graph_revision_moved_the_gte_modernbert_metal_fingerprint() {
-    // Moving the f16 ModernBERT graph from revision 4 to 5 changed the
-    // gte-modernbert-base Metal lane's fingerprint from b904dd7b... to 9ca42893....
-    // Recomputing the lane with graph_revision 4 must give back b904dd7b..., which
-    // shows the graph revision is the only input that changed.
+fn the_gte_metal_catalog_lane_moved_only_by_its_projection_opt_in() {
+    // The gte-modernbert-base catalog Metal lane opts in to f16 weight
+    // projections, which moved its fingerprint from b904dd7b... (revision-4 graph,
+    // no projection_dtype flag). Recomputing it without the opt-in must give back
+    // b904dd7b..., which shows the opt-in is the only input that changed.
     let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
@@ -110,19 +119,21 @@ fn only_the_graph_revision_moved_the_gte_modernbert_metal_fingerprint() {
         .iter()
         .find(|backend| backend["backend"] == "metal")
         .unwrap();
-    let current = catalog_engine_identity(backend);
-    assert_eq!(current.build_flags["graph_revision"], "5");
-    let mut previous = current.clone();
-    previous
-        .build_flags
-        .insert("graph_revision".to_string(), "4".to_string());
+    let opted_in = catalog_engine_identity(backend);
+    assert_eq!(opted_in.build_flags["graph_revision"], "5");
+    assert_eq!(opted_in.build_flags["projection_dtype"], "f16");
+    let without = engine_identity(ModelFamily::GteModernBert, OwnedDType::F16);
     assert_eq!(
-        metal_lane_fingerprint(entry, backend, &tokenizers, &previous),
+        metal_lane_fingerprint(entry, backend, &tokenizers, &without),
         "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
     );
     assert_eq!(
-        metal_lane_fingerprint(entry, backend, &tokenizers, &current),
-        "9ca42893d0c355b12a569ccc4c752e705df72db9de5387906656625c9f536904"
+        metal_lane_fingerprint(entry, backend, &tokenizers, &opted_in),
+        backend["fingerprint"].as_str().unwrap()
+    );
+    assert_ne!(
+        backend["fingerprint"],
+        "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
     );
 }
 

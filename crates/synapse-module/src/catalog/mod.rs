@@ -2068,15 +2068,16 @@ mod tests {
     fn existing_catalog_lane_ids_and_fingerprints_are_unchanged() {
         let catalog = compiled_catalog().unwrap();
         for (id, backend, fingerprint) in [
-            // This lane's fingerprint changed on purpose: its f16 ModernBERT Metal
-            // graph moved to graph revision 5, whose weight projections multiply in
-            // f16, and the graph revision is part of the engine identity. It was
-            // b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3 on
-            // revision 4. Every other lane listed here must keep its fingerprint.
+            // This catalog lane's fingerprint changed on purpose: it opts in to
+            // f16 weight projections, recorded in its engine identity as
+            // projection_dtype = f16 and graph revision 5. It was
+            // b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3
+            // without the opt-in. Every other lane listed here must keep its
+            // fingerprint.
             (
                 "gte-modernbert-base",
                 "metal",
-                "9ca42893d0c355b12a569ccc4c752e705df72db9de5387906656625c9f536904",
+                "471684f94ff4cd408c35e93441c8a1d95907fa684f852893835171f9db22c126",
             ),
             (
                 "gte-modernbert-base",

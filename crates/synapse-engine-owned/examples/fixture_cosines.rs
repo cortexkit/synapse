@@ -9,7 +9,8 @@
 //!   each case carries its exact `input_ids` and the fp32 reference `output`.
 //! - Without `CASE_ID`, every case runs in fixture order in batches of eight, the
 //!   way the real-weight hardware parity test feeds them, and one JSON line per
-//!   case reports its token count and cosine against the reference.
+//!   case reports its token count, cosine against the reference and the SHA-256
+//!   of the vector's little-endian f32 bytes.
 //! - With `CASE_ID`, only that case runs, alone. Pair it with `EXECUTION=lazy`
 //!   and `SYNAPSE_MODERNBERT_DUMP_DIR` to dump ModernBERT's per-stage tensors.
 //!
@@ -19,6 +20,7 @@
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
 use synapse_engine_owned::{ModelFamily, OwnedDType, OwnedMetalEmbedEngine};
 
@@ -50,6 +52,14 @@ fn main() {
         ("attention_units", (8192 * 8192).to_string()),
     ] {
         config.values.insert(key.to_string(), value);
+    }
+    // OWNED_METAL_PROJECTION_DTYPE=f16 opts the lane in to f16 ModernBERT weight
+    // projections, as catalog lanes do; unset keeps the engine default (f32).
+    if let Ok(projections) = std::env::var("OWNED_METAL_PROJECTION_DTYPE") {
+        config.values.insert(
+            synapse_engine_owned::PROJECTION_DTYPE_CONFIG_KEY.to_string(),
+            projections,
+        );
     }
     // Load through the catalog profile, as the hardware parity test and catalog
     // lanes do: architecture parameters come from bench/parity/models.json. A
@@ -127,6 +137,17 @@ fn main() {
                     "category": case["category"],
                     "tokens": case["input_ids"].as_array().map_or(0, Vec::len),
                     "cosine": cosine,
+                    // Little-endian f32 bytes of the engine's vector, for
+                    // byte-identity comparisons between builds.
+                    "vector_sha256": format!(
+                        "{:x}",
+                        Sha256::digest(
+                            vector
+                                .iter()
+                                .flat_map(|value| value.to_le_bytes())
+                                .collect::<Vec<_>>()
+                        )
+                    ),
                 })
             );
         }

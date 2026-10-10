@@ -52,6 +52,14 @@ fn main() {
     ] {
         config.values.insert(key.to_string(), value);
     }
+    // OWNED_METAL_PROJECTION_DTYPE=f16 opts the lane in to f16 ModernBERT weight
+    // projections, as catalog lanes do; unset keeps the engine default (f32).
+    if let Ok(projections) = std::env::var("OWNED_METAL_PROJECTION_DTYPE") {
+        config.values.insert(
+            synapse_engine_owned::PROJECTION_DTYPE_CONFIG_KEY.to_string(),
+            projections,
+        );
+    }
     let mut engine = OwnedMetalEmbedEngine::new(family, dtype);
     let loaded = engine
         .load(

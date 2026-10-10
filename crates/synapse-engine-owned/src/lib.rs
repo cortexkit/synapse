@@ -34,18 +34,18 @@ pub mod owned_decode_engine;
 pub use runtime::Precision;
 
 pub const ENGINE_VERSION: &str = "owned-metal-v1";
-// Base graph revision, shared by every family and dtype whose graph has not moved past
-// it. Bump it whenever a change alters the compiled MPSGraph of every family (ops added,
-// removed, or reordered); a change confined to one family's graph raises that family's
-// entry in `graph_revision` instead, so other families keep their fingerprints and
-// cached executables. The revision is part of both the explicit-executable package cache
-// key and the engine identity, so raising it invalidates stale cached executables that
-// still encode the old graph and moves the provenance fingerprint to match the new one.
+// Bump whenever a compiled MPSGraph changes structure (ops added, removed, or reordered).
+// The revision is part of both the explicit-executable package cache key and the engine
+// identity, so raising it invalidates stale cached executables that still encode the old
+// graph and moves the provenance fingerprint to match the new one.
 pub const GRAPH_REVISION: u32 = 4;
-// Revision 5 of the f16 ModernBERT graph runs its weight projections (QKV, attention
-// output, MLP) in f16 instead of widening both operands to f32. f32 ModernBERT graphs
-// are structurally unchanged and stay on the base revision.
-const GTE_MODERNBERT_F16_GRAPH_REVISION: u32 = 5;
+// Graph revision of the f16 ModernBERT graph whose weight projections (QKV, attention
+// output, MLP) multiply in f16. Only lanes that opt in with `projection_dtype = f16`
+// build it; every other lane keeps the revision-4 graph, which widens those
+// projections to f32.
+const F16_PROJECTION_GRAPH_REVISION: u32 = 5;
+/// Runtime config key that selects the ModernBERT weight-projection precision.
+pub const PROJECTION_DTYPE_CONFIG_KEY: &str = "projection_dtype";
 pub const BUCKET_POLICY_VERSION: u32 = 2;
 pub const DEFAULT_ATTENTION_UNITS: usize = 4_000_000;
 #[cfg(target_os = "macos")]
@@ -172,40 +172,93 @@ fn read_model_config(model_dir: &Path) -> Result<serde_json::Value, OwnedEngineE
     })
 }
 
-/// Graph revision of the compiled MPSGraph for one family and dtype. It goes into
-/// the engine identity's `graph_revision` build flag and into the package cache key.
-#[must_use]
-pub const fn graph_revision(family: ModelFamily, dtype: OwnedDType) -> u32 {
-    match (family, dtype) {
-        (ModelFamily::GteModernBert, OwnedDType::F16) => GTE_MODERNBERT_F16_GRAPH_REVISION,
-        _ => GRAPH_REVISION,
+/// Precision of ModernBERT's weight-projection matmuls (QKV, attention output, MLP).
+///
+/// `F32` widens both f16 operands to f32 and narrows the product: the graph every
+/// existing lane was certified on. `F16` multiplies in f16, about 2x faster on
+/// Apple GPUs, with a different numeric result. It is an explicit opt-in, never
+/// implied by family and dtype, so a lane's fingerprint only moves when its
+/// configuration asks for the new graph.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProjectionDtype {
+    #[default]
+    F32,
+    F16,
+}
+
+impl ProjectionDtype {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        }
+    }
+
+    /// Reads the projection precision from a runtime config. Absent means `F32`.
+    /// `f16` is accepted only for f16 ModernBERT, the one graph that has the option.
+    pub fn from_config(
+        cfg: &RuntimeConfig,
+        family: ModelFamily,
+        dtype: OwnedDType,
+    ) -> Result<Self, OwnedEngineError> {
+        let projections = match cfg
+            .values
+            .get(PROJECTION_DTYPE_CONFIG_KEY)
+            .map(String::as_str)
+        {
+            None | Some("f32") => Self::F32,
+            Some("f16") => Self::F16,
+            Some(other) => {
+                return Err(OwnedEngineError::InvalidPackage(format!(
+                    "unsupported {PROJECTION_DTYPE_CONFIG_KEY} '{other}'"
+                )))
+            }
+        };
+        if projections == Self::F16
+            && (family != ModelFamily::GteModernBert || dtype != OwnedDType::F16)
+        {
+            return Err(OwnedEngineError::InvalidPackage(format!(
+                "{PROJECTION_DTYPE_CONFIG_KEY}=f16 applies only to f16 gte-modernbert, not {} {}",
+                family.as_str(),
+                dtype.as_str()
+            )));
+        }
+        Ok(projections)
     }
 }
 
-/// Kernel revision string for one family and dtype, for example
-/// `owned-metal-graph-5-bucket-2`: the graph revision from `graph_revision` and
-/// `BUCKET_POLICY_VERSION`, the version of the sequence-bucket ladder. The module
-/// records it in the numeric profile of owned-metal catalog lanes, so it is part
-/// of their fingerprints.
+/// Graph revision for the given projection precision. It goes into the engine
+/// identity's `graph_revision` build flag and into the package cache key.
 #[must_use]
-pub fn metal_kernel_revision(family: ModelFamily, dtype: OwnedDType) -> String {
+pub const fn graph_revision(projections: ProjectionDtype) -> u32 {
+    match projections {
+        ProjectionDtype::F32 => GRAPH_REVISION,
+        ProjectionDtype::F16 => F16_PROJECTION_GRAPH_REVISION,
+    }
+}
+
+/// Kernel revision string, for example `owned-metal-graph-4-bucket-2`: the graph
+/// revision for `projections` and `BUCKET_POLICY_VERSION`, the version of the
+/// sequence-bucket ladder. The module records it in the numeric profile of
+/// owned-metal catalog profile lanes, so it is part of their fingerprints.
+#[must_use]
+pub fn metal_kernel_revision(projections: ProjectionDtype) -> String {
     format!(
         "owned-metal-graph-{}-bucket-{}",
-        graph_revision(family, dtype),
+        graph_revision(projections),
         BUCKET_POLICY_VERSION
     )
 }
 
+/// Engine identity of a lane that uses the default f32-widened projections.
 #[must_use]
 pub fn engine_identity(family: ModelFamily, dtype: OwnedDType) -> EngineIdentity {
     let mut build_flags = BTreeMap::new();
     build_flags.insert("backend".to_string(), "metal-mpsgraph".to_string());
     build_flags.insert("family".to_string(), family.as_str().to_string());
     build_flags.insert("dtype".to_string(), dtype.as_str().to_string());
-    build_flags.insert(
-        "graph_revision".to_string(),
-        graph_revision(family, dtype).to_string(),
-    );
+    build_flags.insert("graph_revision".to_string(), GRAPH_REVISION.to_string());
     build_flags.insert(
         "bucket_policy".to_string(),
         format!("v{BUCKET_POLICY_VERSION}"),
@@ -216,6 +269,29 @@ pub fn engine_identity(family: ModelFamily, dtype: OwnedDType) -> EngineIdentity
         version: ENGINE_VERSION.to_string(),
         build_flags,
     }
+}
+
+/// Engine identity for an explicit projection precision. With `F32` it is exactly
+/// `engine_identity`: no extra build flag, so existing lanes hash the same bytes.
+/// With `F16` it records `projection_dtype = f16` and graph revision 5.
+#[must_use]
+pub fn engine_identity_with_projections(
+    family: ModelFamily,
+    dtype: OwnedDType,
+    projections: ProjectionDtype,
+) -> EngineIdentity {
+    let mut identity = engine_identity(family, dtype);
+    if projections == ProjectionDtype::F16 {
+        identity.build_flags.insert(
+            "graph_revision".to_string(),
+            graph_revision(projections).to_string(),
+        );
+        identity.build_flags.insert(
+            PROJECTION_DTYPE_CONFIG_KEY.to_string(),
+            projections.as_str().to_string(),
+        );
+    }
+    identity
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,10 +554,19 @@ impl OwnedMetalEmbedEngine {
                 ))
             }
         };
-        let package_root = package_root(&cache_root, &model_path, self.family, self.dtype)
-            .map_err(|error| Self::error(EngineErrorStage::Load, error))?;
-        let config = runtime::MetalExecutionConfig::new(execution, Some(package_root))
+        let projections = ProjectionDtype::from_config(cfg, self.family, self.dtype)
             .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?;
+        let package_root = package_root(
+            &cache_root,
+            &model_path,
+            self.family,
+            self.dtype,
+            projections,
+        )
+        .map_err(|error| Self::error(EngineErrorStage::Load, error))?;
+        let config = runtime::MetalExecutionConfig::new(execution, Some(package_root))
+            .map_err(|error| Self::error(EngineErrorStage::Load, error.to_string()))?
+            .with_f16_projections(projections == ProjectionDtype::F16);
         let family = if let Some((_, _, model)) = &catalog_model {
             runtime::load_catalog_family(&model_path, precision(self.dtype), model)
         } else {
@@ -929,6 +1014,7 @@ fn package_root(
     model_path: &Path,
     family: ModelFamily,
     dtype: OwnedDType,
+    projections: ProjectionDtype,
 ) -> Result<PathBuf, String> {
     let model_hash = canonical_model_hash(model_path);
     let os_build = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
@@ -941,12 +1027,25 @@ fn package_root(
         .unwrap_or_else(|| UNKNOWN_OS_BUILD.to_string());
     resolve_package_root(
         cache_root,
-        family.as_str(),
-        graph_revision(family, dtype),
+        &package_family(family, projections),
+        graph_revision(projections),
         &model_hash,
         dtype.as_str(),
         &os_build,
     )
+}
+
+/// Family component of a package directory name. The f16-projection graph gets a
+/// family name of its own, so its executables can never load for a lane on the
+/// f32-projection graph or the reverse, and stale-key pruning never treats one
+/// graph's directory as an older revision of the other: two lanes over the same
+/// weights can keep both sets cached side by side.
+#[cfg(target_os = "macos")]
+fn package_family(family: ModelFamily, projections: ProjectionDtype) -> String {
+    match projections {
+        ProjectionDtype::F32 => family.as_str().to_string(),
+        ProjectionDtype::F16 => format!("{}-f16-projections", family.as_str()),
+    }
 }
 
 /// OS build recorded when `sw_vers` cannot be read. Pruning is skipped under it,
@@ -1313,44 +1412,98 @@ mod tests {
     }
 
     #[test]
-    fn only_the_f16_modernbert_graph_moved_to_revision_5() {
-        // Only the f16 ModernBERT graph changed structure (its weight projections
-        // now multiply in f16). Qwen3's graph did not, so its identity, and with
-        // it its fingerprint and package cache key, must stay on revision 4.
-        let qwen = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);
-        assert_eq!(qwen.engine, "owned-metal");
-        assert_eq!(qwen.version, "owned-metal-v1");
-        assert_eq!(
-            qwen.build_flags,
-            BTreeMap::from([
-                ("backend".to_string(), "metal-mpsgraph".to_string()),
-                ("bucket_policy".to_string(), "v2".to_string()),
-                ("dtype".to_string(), "f16".to_string()),
-                ("family".to_string(), "qwen3-0.6b".to_string()),
-                ("graph_revision".to_string(), "4".to_string()),
-                ("risk_class".to_string(), "abort_safe".to_string()),
-            ])
-        );
-        for (family, dtype, revision) in [
-            (ModelFamily::Qwen3, OwnedDType::F16, 4),
-            (ModelFamily::Qwen3, OwnedDType::F32, 4),
-            (ModelFamily::MiniLm, OwnedDType::F16, 4),
-            (ModelFamily::MiniLm, OwnedDType::F32, 4),
-            // The f32 ModernBERT graph, which the gte reranker's catalog profile
-            // uses, multiplied in f32 before and after, so it stays on revision 4.
-            (ModelFamily::GteModernBert, OwnedDType::F32, 4),
-            (ModelFamily::GteModernBert, OwnedDType::F16, 5),
+    fn identities_without_the_opt_in_are_unchanged_and_the_opt_in_is_visible() {
+        // Lanes that do not ask for f16 projections must hash exactly the bytes
+        // they always have: graph revision 4 and no projection_dtype flag.
+        for (family, dtype, name) in [
+            (
+                ModelFamily::GteModernBert,
+                OwnedDType::F16,
+                "gte-modernbert",
+            ),
+            (
+                ModelFamily::GteModernBert,
+                OwnedDType::F32,
+                "gte-modernbert",
+            ),
+            (ModelFamily::Qwen3, OwnedDType::F16, "qwen3-0.6b"),
+            (ModelFamily::MiniLm, OwnedDType::F16, "minilm"),
         ] {
+            let identity = engine_identity(family, dtype);
+            assert_eq!(identity.engine, "owned-metal");
+            assert_eq!(identity.version, "owned-metal-v1");
             assert_eq!(
-                graph_revision(family, dtype),
-                revision,
-                "{family:?} {dtype:?}"
+                identity.build_flags,
+                BTreeMap::from([
+                    ("backend".to_string(), "metal-mpsgraph".to_string()),
+                    ("bucket_policy".to_string(), "v2".to_string()),
+                    ("dtype".to_string(), dtype.as_str().to_string()),
+                    ("family".to_string(), name.to_string()),
+                    ("graph_revision".to_string(), "4".to_string()),
+                    ("risk_class".to_string(), "abort_safe".to_string()),
+                ])
             );
             assert_eq!(
-                engine_identity(family, dtype).build_flags["graph_revision"],
-                revision.to_string()
+                engine_identity_with_projections(family, dtype, ProjectionDtype::F32),
+                identity
             );
         }
+        let opted_in = engine_identity_with_projections(
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+            ProjectionDtype::F16,
+        );
+        let mut expected = engine_identity(ModelFamily::GteModernBert, OwnedDType::F16);
+        expected
+            .build_flags
+            .insert("graph_revision".to_string(), "5".to_string());
+        expected
+            .build_flags
+            .insert("projection_dtype".to_string(), "f16".to_string());
+        assert_eq!(opted_in, expected);
+        assert_eq!(
+            metal_kernel_revision(ProjectionDtype::F32),
+            "owned-metal-graph-4-bucket-2"
+        );
+        assert_eq!(
+            metal_kernel_revision(ProjectionDtype::F16),
+            "owned-metal-graph-5-bucket-2"
+        );
+    }
+
+    #[test]
+    fn projection_dtype_defaults_to_f32_and_f16_is_only_for_f16_modernbert() {
+        let config = |value: Option<&str>| {
+            let mut config = RuntimeConfig::default();
+            if let Some(value) = value {
+                config
+                    .values
+                    .insert(PROJECTION_DTYPE_CONFIG_KEY.to_string(), value.to_string());
+            }
+            config
+        };
+        let gte = ModelFamily::GteModernBert;
+        // A lane whose config never mentions the key keeps the f32 projections.
+        assert_eq!(
+            ProjectionDtype::from_config(&config(None), gte, OwnedDType::F16).unwrap(),
+            ProjectionDtype::F32
+        );
+        assert_eq!(
+            ProjectionDtype::from_config(&config(Some("f32")), gte, OwnedDType::F16).unwrap(),
+            ProjectionDtype::F32
+        );
+        assert_eq!(
+            ProjectionDtype::from_config(&config(Some("f16")), gte, OwnedDType::F16).unwrap(),
+            ProjectionDtype::F16
+        );
+        for (family, dtype) in [
+            (gte, OwnedDType::F32),
+            (ModelFamily::Qwen3, OwnedDType::F16),
+            (ModelFamily::MiniLm, OwnedDType::F16),
+        ] {
+            assert!(ProjectionDtype::from_config(&config(Some("f16")), family, dtype).is_err());
+        }
+        assert!(ProjectionDtype::from_config(&config(Some("bf16")), gte, OwnedDType::F16).is_err());
     }
 
     #[test]
@@ -1489,9 +1642,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn package_keys_follow_each_family_and_dtype_graph_revision() {
+    fn f16_and_f32_projection_graphs_never_share_or_prune_package_keys() {
         let temp = std::env::temp_dir().join(format!(
-            "synapse-package-revision-test-{}-{}",
+            "synapse-package-projection-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1502,29 +1655,60 @@ mod tests {
         std::fs::create_dir_all(&cache_root).unwrap();
         let model = temp.join("model.safetensors");
         std::fs::write(&model, b"weights").unwrap();
-        let name = |family, dtype| {
-            package_root(&cache_root, &model, family, dtype)
+        let name = |family, dtype, projections| {
+            package_root(&cache_root, &model, family, dtype, projections)
                 .unwrap()
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         };
-        let gte_f16 = name(ModelFamily::GteModernBert, OwnedDType::F16);
-        let gte_f32 = name(ModelFamily::GteModernBert, OwnedDType::F32);
-        let qwen_f16 = name(ModelFamily::Qwen3, OwnedDType::F16);
-        assert!(gte_f16.starts_with("gte-modernbert-graph-v5-bucket-policy-v2-"));
-        assert!(gte_f32.starts_with("gte-modernbert-graph-v4-bucket-policy-v2-"));
-        assert!(qwen_f16.starts_with("qwen3-0.6b-graph-v4-bucket-policy-v2-"));
+        let f32_projections = name(
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+            ProjectionDtype::F32,
+        );
+        let f16_projections = name(
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+            ProjectionDtype::F16,
+        );
+        let qwen = name(ModelFamily::Qwen3, OwnedDType::F16, ProjectionDtype::F32);
+        // Same weights, same dtype: the two ModernBERT graphs still get separate
+        // directories, and lanes without the opt-in keep today's key.
+        assert!(f32_projections.starts_with("gte-modernbert-graph-v4-bucket-policy-v2-"));
+        assert!(f16_projections
+            .starts_with("gte-modernbert-f16-projections-graph-v5-bucket-policy-v2-"));
+        assert!(qwen.starts_with("qwen3-0.6b-graph-v4-bucket-policy-v2-"));
+        assert_ne!(f32_projections, f16_projections);
 
-        // A revision-4 f16 ModernBERT key holds executables of the old graph, so
-        // resolving the f16 key prunes it; the f32 key on revision 4 is current.
-        let stale_f16 = cache_root.join(gte_f16.replace("-graph-v5-", "-graph-v4-"));
-        std::fs::create_dir_all(&stale_f16).unwrap();
-        assert_eq!(name(ModelFamily::GteModernBert, OwnedDType::F16), gte_f16);
-        assert!(!stale_f16.exists(), "stale revision-4 f16 key survived");
-        assert!(cache_root.join(&gte_f32).is_dir());
-        assert!(cache_root.join(&qwen_f16).is_dir());
+        // Resolving either graph's key, in either order, prunes neither: the
+        // revision-4 directory is not an older revision of the f16-projection graph.
+        for projections in [
+            ProjectionDtype::F16,
+            ProjectionDtype::F32,
+            ProjectionDtype::F16,
+        ] {
+            name(ModelFamily::GteModernBert, OwnedDType::F16, projections);
+            assert!(
+                cache_root.join(&f32_projections).is_dir(),
+                "f32-projection packages were pruned"
+            );
+            assert!(
+                cache_root.join(&f16_projections).is_dir(),
+                "f16-projection packages were pruned"
+            );
+        }
+
+        // An older revision of the f16-projection graph itself is still stale.
+        let stale = cache_root.join(f16_projections.replace("-graph-v5-", "-graph-v4-"));
+        std::fs::create_dir_all(&stale).unwrap();
+        name(
+            ModelFamily::GteModernBert,
+            OwnedDType::F16,
+            ProjectionDtype::F16,
+        );
+        assert!(!stale.exists(), "stale f16-projection key survived");
         std::fs::remove_dir_all(&temp).unwrap();
     }
 
@@ -1554,6 +1738,7 @@ mod tests {
             &model_a,
             ModelFamily::GteModernBert,
             OwnedDType::F16,
+            ProjectionDtype::F32,
         )
         .unwrap();
         let root_a2 = package_root(
@@ -1561,6 +1746,7 @@ mod tests {
             &model_a,
             ModelFamily::GteModernBert,
             OwnedDType::F32,
+            ProjectionDtype::F32,
         )
         .unwrap();
 
@@ -1581,10 +1767,17 @@ mod tests {
             &model_b,
             ModelFamily::GteModernBert,
             OwnedDType::F16,
+            ProjectionDtype::F32,
         )
         .unwrap();
-        let root_b2 =
-            package_root(&cache_root, &model_b, ModelFamily::Qwen3, OwnedDType::F16).unwrap();
+        let root_b2 = package_root(
+            &cache_root,
+            &model_b,
+            ModelFamily::Qwen3,
+            OwnedDType::F16,
+            ProjectionDtype::F32,
+        )
+        .unwrap();
 
         // An unrelated directory in cache_root that should not be touched
         let unrelated = cache_root.join("unrelated-directory");
