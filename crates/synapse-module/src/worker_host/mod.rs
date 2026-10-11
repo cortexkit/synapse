@@ -3494,15 +3494,23 @@ pub mod ane_residency {
     }
 
     #[derive(Debug)]
-    struct RequestWaits(Mutex<WaitPhase>);
+    struct RequestWaits {
+        phase: Mutex<WaitPhase>,
+        abandoned: std::sync::atomic::AtomicBool,
+        abandonment: Notify,
+    }
 
     impl RequestWaits {
         fn new() -> Self {
-            Self(Mutex::new(WaitPhase::Other))
+            Self {
+                phase: Mutex::new(WaitPhase::Other),
+                abandoned: std::sync::atomic::AtomicBool::new(false),
+                abandonment: Notify::new(),
+            }
         }
 
         fn lock(&self) -> MutexGuard<'_, WaitPhase> {
-            self.0
+            self.phase
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
@@ -3511,6 +3519,49 @@ pub mod ane_residency {
     tokio::task_local! {
         /// The wait phase of the serving request whose task this is.
         static REQUEST_WAITS: Arc<RequestWaits>;
+    }
+
+    // The caller may disappear while dispatched I/O drains in its detached task.
+    // Only work that has not reached the wire is cancelled by this signal.
+    struct RequestAbandonment(Arc<RequestWaits>);
+    impl Drop for RequestAbandonment {
+        fn drop(&mut self) {
+            self.0.abandoned.store(true, Ordering::Release);
+            self.0.abandonment.notify_waiters();
+        }
+    }
+
+    fn ensure_request_live() -> Result<(), AneResidencyError> {
+        if REQUEST_WAITS
+            .try_with(|waits| waits.abandoned.load(Ordering::Acquire))
+            .unwrap_or(false)
+        {
+            return Err(AneResidencyError::Abandoned);
+        }
+        Ok(())
+    }
+
+    async fn cancellable_wait<F: Future>(future: F) -> Result<F::Output, AneResidencyError> {
+        let cancellation = async {
+            if let Ok(waits) = REQUEST_WAITS.try_with(Arc::clone) {
+                let notified = waits.abandonment.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !waits.abandoned.load(Ordering::Acquire) {
+                    notified.await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! { result = future => Ok(result), _ = cancellation => Err(AneResidencyError::Abandoned) }
+    }
+
+    async fn request_scope<F: Future>(waits: Option<Arc<RequestWaits>>, future: F) -> F::Output {
+        match waits {
+            Some(waits) => REQUEST_WAITS.scope(waits, future).await,
+            None => future.await,
+        }
     }
 
     fn deadline_cause_error(cause: Option<usize>) -> AneResidencyError {
@@ -3571,6 +3622,8 @@ pub mod ane_residency {
 
     #[derive(Debug, Error)]
     pub enum AneResidencyError {
+        #[error("direct-ANE request abandoned by its caller")]
+        Abandoned,
         #[error("direct-ANE request deadline exceeded")]
         DeadlineExceeded,
         #[error("sequence of {n_tokens} tokens exceeds the largest direct-ANE shape {max}")]
@@ -4258,6 +4311,7 @@ pub mod ane_residency {
                     pass_worker_gate(worker).await;
                     return Err(lease_deadline_expired());
                 }
+                ensure_request_live()?;
                 // Register for wakeups before reading the state, so a change
                 // between the check and the wait is not missed.
                 let notified = self.inner.changed.notified();
@@ -4274,6 +4328,7 @@ pub mod ane_residency {
                         continue_grant.notified().await;
                     }
                 }
+                ensure_request_live()?;
                 match self.next_step(ticket.id, &key, worker, executables) {
                     Step::Retired => {
                         return Err(AneResidencyError::Channel("worker is retired".into()))
@@ -4305,10 +4360,19 @@ pub mod ane_residency {
                         enter_wait(compiling.map_or(WaitPhase::Other, WaitPhase::Compile));
                         let wait_deadline =
                             request_deadline.map_or(deadline, |request| request.min(deadline));
-                        if tokio::time::timeout_at(wait_deadline, notified)
-                            .await
-                            .is_err()
+                        let timed_out = match tokio::time::timeout_at(
+                            wait_deadline,
+                            cancellable_wait(notified),
+                        )
+                        .await
                         {
+                            Ok(result) => {
+                                result?;
+                                false
+                            }
+                            Err(_) => true,
+                        };
+                        if timed_out {
                             if request_deadline
                                 .is_some_and(|request| tokio::time::Instant::now() >= request)
                             {
@@ -4530,11 +4594,13 @@ pub mod ane_residency {
             }
             let mut outputs: Vec<Option<T>> = (0..lengths.len()).map(|_| None).collect();
             for (rung, indices) in rungs {
+                ensure_request_live()?;
                 let lease = self.lease_until(worker, model_ref, rung, deadline).await?;
                 if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                     drop(lease);
                     return Err(lease_deadline_expired());
                 }
+                ensure_request_live()?;
                 let results = run(rung, indices.clone()).await;
                 drop(lease);
                 let results = results?;
@@ -4677,37 +4743,46 @@ pub mod ane_residency {
             // The exchange runs on its own task so its outcome is recorded even
             // if the waiting request is dropped part way through.
             let supervisor = self.clone();
+            let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
             let task = tokio::spawn(async move {
-                #[cfg(test)]
-                let _serial_admission = match &inner.admission_gate {
-                    Some(gate) => Some(gate.lock().await),
-                    None => None,
-                };
-                match worker
-                    .admit_program(generation, &key.model_ref, key.shape, key.program)
-                    .await
-                {
-                    Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
-                    Err(error) if worker.generation() != generation => {
-                        mark_failed_admission(&inner, &key, slot_id);
-                        Err(resource_refusal(error))
-                    }
-                    Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
-                        retry_resource_admission(&supervisor, &worker, key, slot_id, error).await
-                    }
-                    Err(error)
-                        if key.program != AneProgram::Single
-                            && error.code() == Some("unsupported_request") =>
+                request_scope(waits, async move {
+                    #[cfg(test)]
+                    let _serial_admission = match &inner.admission_gate {
+                        Some(gate) => Some(gate.lock().await),
+                        None => None,
+                    };
+                    match worker
+                        .admit_program(generation, &key.model_ref, key.shape, key.program)
+                        .await
                     {
-                        forget_failed_admission(&inner, &key, slot_id);
+                        Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                        Err(AneResidencyError::Abandoned) => {
+                            forget_failed_admission(&inner, &key, slot_id);
+                            Err(AneResidencyError::Abandoned)
+                        }
+                        Err(error) if worker.generation() != generation => {
+                            mark_failed_admission(&inner, &key, slot_id);
+                            Err(resource_refusal(error))
+                        }
+                        Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
+                            retry_resource_admission(&supervisor, &worker, key, slot_id, error)
+                                .await
+                        }
                         Err(error)
+                            if key.program != AneProgram::Single
+                                && error.code() == Some("unsupported_request") =>
+                        {
+                            forget_failed_admission(&inner, &key, slot_id);
+                            Err(error)
+                        }
+                        Err(error) => {
+                            mark_failed_admission(&inner, &key, slot_id);
+                            recover_worker_at_generation(&inner, &worker, generation).await;
+                            Err(error)
+                        }
                     }
-                    Err(error) => {
-                        mark_failed_admission(&inner, &key, slot_id);
-                        recover_worker_at_generation(&inner, &worker, generation).await;
-                        Err(error)
-                    }
-                }
+                })
+                .await
             });
             task.await.map_err(|error| {
                 AneResidencyError::Channel(format!("shape admission task failed: {error}"))
@@ -4870,6 +4945,10 @@ pub mod ane_residency {
             .await
         {
             Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
+            Err(AneResidencyError::Abandoned) => {
+                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                Err(AneResidencyError::Abandoned)
+            }
             Err(error) if worker.generation() != generation => {
                 mark_failed_admission(&supervisor.inner, &key, slot_id);
                 Err(resource_refusal(error))
@@ -5418,7 +5497,7 @@ pub mod ane_residency {
                 // which restarts the worker. Time spent queueing for the stream
                 // behind other work is not the worker being silent, so the
                 // timer starts only once this exchange holds the stream.
-                let mut guard = self.stream.lock().await;
+                let mut guard = cancellable_wait(self.stream.lock()).await?;
                 let operation = self.exchange_locked(&mut guard, request, raw, generation);
                 match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
                     Ok(result) => result,
@@ -5524,16 +5603,21 @@ pub mod ane_residency {
             let stream_wait = tokio::time::Instant::now();
             enter_wait(WaitPhase::Stream(stream_wait));
             let mut guard = match deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, self.stream.lock()).await
-                {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        #[cfg(test)]
-                        self.pass_classify_gate(GateSite::Inner).await;
-                        return Err(deadline_expired(self.compile_during(stream_wait, deadline)));
+                Some(deadline) => {
+                    match tokio::time::timeout_at(deadline, cancellable_wait(self.stream.lock()))
+                        .await
+                    {
+                        Ok(guard) => guard?,
+                        Err(_) => {
+                            #[cfg(test)]
+                            self.pass_classify_gate(GateSite::Inner).await;
+                            return Err(deadline_expired(
+                                self.compile_during(stream_wait, deadline),
+                            ));
+                        }
                     }
-                },
-                None => self.stream.lock().await,
+                }
+                None => cancellable_wait(self.stream.lock()).await?,
             };
             // A timer can expire in the same poll that grants the lock. Nothing
             // may be written after the deadline, and the admits that held the
@@ -5546,16 +5630,18 @@ pub mod ane_residency {
             }
             enter_wait(WaitPhase::Other);
             let _permit = match deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, permit).await {
-                    Ok(permit) => permit?,
-                    Err(_) => {
-                        drop(guard);
-                        #[cfg(test)]
-                        self.pass_classify_gate(GateSite::Inner).await;
-                        return Err(deadline_expired(None));
+                Some(deadline) => {
+                    match tokio::time::timeout_at(deadline, cancellable_wait(permit)).await {
+                        Ok(permit) => permit??,
+                        Err(_) => {
+                            drop(guard);
+                            #[cfg(test)]
+                            self.pass_classify_gate(GateSite::Inner).await;
+                            return Err(deadline_expired(None));
+                        }
                     }
-                },
-                None => permit.await?,
+                }
+                None => cancellable_wait(permit).await??,
             };
             if expired(deadline) {
                 return Err(deadline_expired(None));
@@ -5613,6 +5699,7 @@ pub mod ane_residency {
             }
             let stream = &mut session.stream;
             let max_frame = self.max_frame;
+            ensure_request_live()?;
             let mut exchange_guard = ExchangeFaultGuard {
                 faulted: &self.faulted,
                 completed: false,
@@ -6478,6 +6565,7 @@ pub mod ane_residency {
             self.active_requests.fetch_add(1, Ordering::AcqRel);
             let activity = RequestActivity(self.active_requests.clone());
             let waits = Arc::new(RequestWaits::new());
+            let _abandonment = RequestAbandonment(waits.clone());
             let task = tokio::spawn(REQUEST_WAITS.scope(waits.clone(), async move {
                 let _guards = guards;
                 let _activity = activity;
@@ -6558,6 +6646,7 @@ pub mod ane_residency {
             fault_generation: &AtomicU64,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             let lengths = sequences.iter().map(Vec::len).collect::<Vec<_>>();
+            ensure_request_live()?;
             let mut output = vec![Vec::new(); sequences.len()];
             let mut singles: Vec<_> = (0..sequences.len()).collect();
             if self.channel.packing_available()
@@ -6585,6 +6674,7 @@ pub mod ane_residency {
                             continue_lease.notified().await;
                         }
                     }
+                    ensure_request_live()?;
                     if let Some(lease) = self
                         .supervisor
                         .try_packed_lease(worker, &self.metadata.model_ref)
@@ -8463,25 +8553,40 @@ pub mod ane_residency {
             let peer = Arc::new(Mutex::new(PackedPeer::default()));
             let serving = packed_peer(false, peer.clone()).await;
             assert!(serving.prepare_packed().await.unwrap());
+            let before = peer.lock().unwrap().requests.len();
             let packed_started = Arc::new(Notify::new());
             let packed_release = Arc::new(Notify::new());
-            let single_started = Arc::new(Notify::new());
-            let single_release = Arc::new(Notify::new());
-            peer.lock().unwrap().inference_gates.extend([
-                (packed_started.clone(), packed_release.clone()),
-                (single_started.clone(), single_release.clone()),
-            ]);
+            peer.lock()
+                .unwrap()
+                .inference_gates
+                .push_back((packed_started.clone(), packed_release.clone()));
+            let execution = Arc::new(tokio::sync::Semaphore::new(1));
+            let permits: PermitSource = Arc::new({
+                let execution = execution.clone();
+                move |_| {
+                    let execution = execution.clone();
+                    Box::pin(async move {
+                        Ok(Box::new(execution.acquire_owned().await.unwrap()) as ExchangePermit)
+                    })
+                }
+            });
             let infer = tokio::spawn({
                 let serving = serving.clone();
                 async move {
                     serving
-                        .infer_packed(vec![vec![41; 127], vec![42; 129], vec![43; 257]])
+                        .infer_packed_permitted(
+                            vec![vec![41; 127], vec![42; 129], vec![43; 257]],
+                            None,
+                            (),
+                            Some(permits),
+                        )
                         .await
                 }
             });
             notified(&packed_started).await;
             infer.abort();
             let _ = infer.await;
+            assert_eq!(execution.available_permits(), 0, "the real execution permit must survive caller cancellation until the dispatched reply drains");
             {
                 let state = serving.supervisor.inner.lock();
                 assert_eq!(state.slots.values().map(|s| s.leases).sum::<u32>(), 1);
@@ -8491,18 +8596,6 @@ pub mod ane_residency {
                 ) && slot.leases == 1));
             }
             packed_release.notify_one();
-            notified(&single_started).await;
-            {
-                let state = serving.supervisor.inner.lock();
-                assert_eq!(state.slots.values().map(|s| s.leases).sum::<u32>(), 1);
-                assert!(state
-                    .slots
-                    .iter()
-                    .any(|(key, slot)| key.program == AneProgram::Single
-                        && key.shape == 512
-                        && slot.leases == 1));
-            }
-            single_release.notify_one();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while serving.active_requests.load(Ordering::Acquire) != 0 {
                     tokio::task::yield_now().await;
@@ -8510,6 +8603,13 @@ pub mod ane_residency {
             })
             .await
             .unwrap();
+            assert_eq!(execution.available_permits(), 1);
+            let requests = peer.lock().unwrap();
+            assert_eq!(requests.requests[before..].len(), 1, "an abandoned mixed call must not admit or dispatch its undispatched standalone rungs");
+            assert!(matches!(
+                requests.requests[before],
+                WorkerRequest::EmbedPacked { .. }
+            ));
             assert_eq!(
                 serving
                     .supervisor
