@@ -8,10 +8,10 @@ import re
 import subprocess
 import zipfile
 
-ROWS = ('vulkan-windows-amd', 'vulkan-linux-amd', 'vulkan-linux-nvidia',
-        'vulkan-windows-nvidia', 'cuda-linux-nvidia', 'cuda-windows-nvidia', 'metal-m5', 'ane-m5')
-MODELS = ('gte-modernbert-base', 'gte-reranker-modernbert-base',
-          'qwen3-embedding-0.6b', 'qwen3-reranker-0.6b')
+ROW_BACKENDS = {'vulkan-windows-amd': 'vulkan', 'vulkan-linux-amd': 'vulkan',
+                'vulkan-linux-nvidia': 'vulkan', 'vulkan-windows-nvidia': 'vulkan',
+                'cuda-linux-nvidia': 'cuda', 'cuda-windows-nvidia': 'cuda',
+                'metal-m5': 'metal', 'ane-m5': 'ane'}
 BOUND = {'ck-synapse', 'ck-synapse-worker-cuda', 'ck-synapse-worker-vulkan', 'ck-synapse-worker-ane-direct'}
 
 
@@ -32,7 +32,20 @@ def git(root, *args):
     return subprocess.check_output(['git', '-C', str(root), *args]).decode().strip()
 
 
+def catalog_cells(root):
+    models = load(root / 'crates/synapse-module/src/catalog/models.json')['models']
+    return [(row, model['id']) for row, backend in ROW_BACKENDS.items() for model in models
+            if any(lane['backend'] == backend for lane in model['backends'])]
+
+
+def cuda_models(cells):
+    return {model for row, model in cells if ROW_BACKENDS[row] == 'cuda'}
+
+
 def source(root):
+    require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root.resolve(),
+            'checkout must be the repository root')
+    require(not git(root, 'status', '--porcelain'), 'dirty checkout')
     parents = git(root, 'rev-list', '--parents', '-n', '1', 'HEAD').split()
     require(len(parents) == 2, 'evidence commit must have exactly one parent')
     s = parents[1]
@@ -76,7 +89,7 @@ def extract(download, target, entries):
                 path.chmod(0o755)
 
 
-def inventory(entries, assets, records):
+def inventory(entries, assets, records, cells):
     require(len(entries) == len({e['asset'] for e in entries}), 'duplicate inventory entry')
     for e in entries:
         name = e.get('binary', '').removesuffix('.exe')
@@ -97,9 +110,11 @@ def inventory(entries, assets, records):
         file = assets / e['os_arch'] / binary
         sha = digest(file.read_bytes())
         for row in e['rows']:
-            require(row in ROWS, 'unknown binding row')
-            passed = [r for r in records if r['row_id'] == row and r['status'] == 'passed']
-            require(passed and all(any(a['sha256'] == sha and Path(a['file']).name == binary for a in r['executed_artifacts']) for r in passed), 'missing extracted binary binding: ' + binary)
+            require(row in ROW_BACKENDS, 'unknown binding row')
+            for expected_row, model in cells:
+                if expected_row == row:
+                    passed = [r for r in records if r['row_id'] == row and r['model'] == model and r['status'] == 'passed']
+                    require(passed and all(any(a['sha256'] == sha and Path(a['file']).name == binary for a in r['executed_artifacts']) for r in passed), 'missing extracted binary binding: ' + binary)
         if e.get('runtime_files_from'):
             manifest = load(file.parent / e['runtime_files_from'])
             require(manifest['worker_sha256'] == sha, 'worker manifest mismatch')
@@ -118,18 +133,11 @@ def median(series):
     return (s[9] + s[10]) / 2
 
 
-def benchmark(report, records):
+def benchmark(report, expected_cells):
     cells = report['cells']
-    require({c['row_id'] for c in cells} == set(ROWS) and {c['model'] for c in cells} == set(MODELS), 'incomplete benchmark')
-    require({(c['row_id'], c['model']) for c in cells} == {(r, m) for r in ROWS for m in MODELS}, 'missing benchmark combination')
-    dropped = {(r['row_id'], r['model']) for r in records if r['status'] == 'dropped'}
+    require({(c['row_id'], c['model']) for c in cells} == set(expected_cells), 'benchmark differs from catalog cells')
     for c in cells:
         metrics = c['metrics']
-        if (c['row_id'], c['model']) in dropped:
-            require(c['status'] == 'dropped' and c.get('drop_cause') in ('parity', 'latency') and all(v is None for v in metrics.values()), 'numeric dropped cell')
-            if c['drop_cause'] == 'latency':
-                require(median(c['raw_series']['ane']) / median(c['raw_series']['metal']) > 3, 'invalid benchmark drop')
-            continue
         status = c['status']
         require(status in ('measured', 'model_unsupported', 'hardware_unavailable'), 'invalid benchmark status')
         probe = c['probe']
@@ -142,10 +150,13 @@ def benchmark(report, records):
             require(b['batch_size'] <= c['inline_max_items'] or b.get('request_path') == 'job', 'missing above-inline request path')
 
 
-def cuda_driver_floor(root):
+def cuda_driver_floor(root, cells):
+    models = cuda_models(cells)
     profiles = [p for p in load(root / 'bench/parity/models.json')['profiles'].values()
-                if p.get('lane') == 'owned-cuda']
-    require({p['model'] for p in profiles} == set(MODELS), 'missing CUDA profiles')
+                 if p.get('lane') == 'owned-cuda' and p['model'] in models]
+    require({p['model'] for p in profiles} == models, 'missing CUDA profiles')
+    if not models:
+        return None
     floors = [p['cuda_min_driver_api'] for p in profiles]
     require(all(type(floor) is int and floor > 0 for floor in floors) and len(set(floors)) == 1,
             'CUDA profiles disagree on driver floor')
@@ -168,35 +179,33 @@ def stress_evidence(stress):
 
 def evidence(root, s, assets, entries):
     cert = root / 'docs/evidence/certification' / s
-    records = [load(cert / row / (model + '.json')) for row in ROWS for model in MODELS]
+    cells = catalog_cells(root)
+    paths = [cert / row / (model + '.json') for row, model in cells]
+    records = [load(path) for path in paths]
     for path in cert.rglob('*.json'):
         obj = load(path)
         if 'source_commit' in obj:
             require(obj['source_commit'] == s, 'foreign record source')
-    for r, (row, model) in zip(records, ((r, m) for r in ROWS for m in MODELS)):
+        if path != cert / 'ane-direct-stress.json':
+            require(path in paths, 'unexpected certification record: ' + str(path.relative_to(cert)))
+    for r, (row, model) in zip(records, cells):
         require(r['source_commit'] == s and r['row_id'] == row and r['model'] == model, 'record path mismatch')
-        # Records store hardware UUIDs only as salted digests (record schema 2);
+        require(r['status'] == 'passed', 'record must be passed')
+        # Records store hardware UUIDs only as salted digests;
         # a raw value means the record came from an older or altered producer.
         machine = r.get('machine') or {}
         require('platform_uuid' not in machine and 'uuid' not in (machine.get('gpu') or {}),
                 'raw hardware UUID in certification record')
-    inventory(entries, assets, records)
-    driver_floor = cuda_driver_floor(root)
-    for model in MODELS:
+    inventory(entries, assets, records, cells)
+    driver_floor = cuda_driver_floor(root, cells)
+    for model in cuda_models(cells):
         require(any(r['model'] == model and r['row_id'].startswith('cuda-') and r['status'] == 'passed' and r['machine'].get('driver_api') == driver_floor for r in records), f'missing CUDA {driver_floor} boundary: ' + model)
     if any(r['row_id'] == 'ane-m5' and r['status'] == 'passed' for r in records):
         stress = load(cert / 'ane-direct-stress.json')
         stress_evidence(stress)
-    notes = (cert / 'RELEASE-NOTES.md').read_text()
-    for r in records:
-        if r['status'] == 'dropped':
-            require(r['row_id'] in notes and r['model'] in notes, 'missing dropped release note')
-        if r['row_id'] == 'metal-m5':
-            for path in (root / 'bench/parity/preload').glob(r['model'] + '-*.json'):
-                preload = load(path)
-                require(r['model'] in notes and r['fingerprint'] in notes and preload['expected_fingerprint'] in notes, 'missing Metal fingerprint pair')
+    require((cert / 'RELEASE-NOTES.md').is_file(), 'missing release notes')
     report_dir = root / 'docs/evidence/benchmark' / s
-    benchmark(load(report_dir / 'report.json'), records)
+    benchmark(load(report_dir / 'report.json'), cells)
     if any(r['row_id'] == 'ane-m5' and r['model'] == 'gte-modernbert-base' and r['status'] == 'passed' for r in records):
         t = load(report_dir / 'ane-transition.json')
         core, direct = median(t['coreml']), median(t['direct'])
@@ -214,12 +223,12 @@ def main():
     if args.mode == 'source':
         print(candidate_source(root))
         return
+    s = source(root) if args.mode == 'validate' else None
     entries = load(root / 'bench/parity/release-assets.json')['assets']
     if args.os_arch:
         entries = [e for e in entries if e['os_arch'] == args.os_arch]
     extract(args.downloads, args.assets, entries)
     if args.mode == 'validate':
-        s = source(root)
         evidence(root, s, args.assets, entries)
         subprocess.run([str((args.assets / 'linux-x64/ck-synapse').resolve()), 'certify', 'validate', '--assets', str(args.assets.resolve()), '.'], check=True)
 

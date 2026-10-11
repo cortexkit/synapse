@@ -93,9 +93,7 @@ diff -r "$first/fixtures" "$second/fixtures"
 ```
 
 To stage `crates/synapse-module/src/catalog/models.json` (inputs and reference
-outputs used to check newly loaded catalog lanes) and
-`crates/synapse-module/src/fixtures/catalog_rerank_gte_modernbert_fp32.json`
-(query/candidate scores used to verify the reranker before release):
+outputs used to check newly loaded catalog lanes):
 
 ```sh
 output=$(mktemp -d)
@@ -107,8 +105,8 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 ```
 
 The catalog mode reads its input texts and query/candidate groups from the
-committed catalog and evidence JSON, preserves their order and unrelated
-metadata, and writes those same relative paths under the output root. Omit
+committed catalog JSON, preserves their order and unrelated
+metadata, and writes that same relative path under the output root. Omit
 `--output-dir` only when ready to overwrite the committed outputs. Catalog mode
 does not add a self-check to entries that have none, including Qwen3 reranker.
 
@@ -131,8 +129,7 @@ generator's deterministic Transformers 5.16.1 / Torch 2.14.0 CPU fp32 outputs.
 | qwen3-embedding-0.6b | Candle Transformers 0.10.2 CPU f32 | 7.262907800661966e-7 | 0.9999999999901454 |
 
 Cosine was measured per embedding vector and per reranker query's score row.
-The GTE reranker release evidence's raw logits and scores were unchanged
-(maximum absolute difference: 0 for each). Qwen3 reranker has no catalog
+Qwen3 reranker has no catalog
 self-check and therefore no catalog comparison. The three catalog self-checks
 listed in the table use fixture revision 2 so installed lanes re-check against
 the new provenance and references. Catalog manifest digests depend only on upstream and file
@@ -141,8 +138,8 @@ pins, not self-check data, and remain unchanged.
 ## Verification (2026-10-06)
 
 The final generator was run again through its CLI for all four parity models
-and catalog mode. All seven generated files (four parity fixtures, their
-index, catalog JSON, and reranker evidence JSON) were byte-identical to the
+and catalog mode. All six generated files (four parity fixtures, their
+index, and catalog JSON) were byte-identical to the
 new committed outputs. This also verifies that adding catalog mode did not
 change the deterministic parity outputs.
 

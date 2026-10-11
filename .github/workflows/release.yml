@@ -30,7 +30,10 @@ jobs:
         run: gh release download "candidate-${{ steps.source.outputs.commit }}" --dir "$RUNNER_TEMP/candidate"
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Validate inventory, release gates and all 32 records
+      # Manual prerequisite before tagging: produce each declared cell on its
+      # hardware with the catalog-path runner: ckdev-synapse-certify run --row <row> --model <catalog_id>
+      # --assets <aggregate-dir> --checkout <root> --mirror <dir>.
+      - name: Validate inventory, release gates and catalog-derived records
         run: python3 crates/synapse-release-checks/check.py validate --downloads "$RUNNER_TEMP/candidate" --assets "$RUNNER_TEMP/extracted"
       - uses: actions/upload-artifact@v4
         with:

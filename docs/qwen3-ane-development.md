@@ -28,12 +28,12 @@ against the shared live budget of 100, but that count is not proof that an
 this before a shipping decision. If it fails, report the largest independently
 loaded shape and its compile/load time; do not reduce the ceiling.
 
-Release evidence remains required. In particular, adding ANE file memberships
-changes installation-manifest digests, and the catalog evidence gate now binds
-the direct worker's source tree too. Existing release evidence must not be
-treated as certification of these new lanes. Development certification records
-contain the Mac's hardware UUID and must remain outside git pending the owner's
-publication decision.
+Release certification records remain required for every declared catalog cell.
+Adding ANE file memberships changes installation-manifest digests; records bind
+the catalog pin and the exact candidate and worker binary bytes. Existing records
+must not be reused for a new candidate. Records contain a salted SHA-256 digest
+of the Mac's hardware UUID, never the raw UUID. Keep development records outside
+git; they do not certify a release candidate.
 
 ## Quiet-window commands
 
@@ -70,8 +70,7 @@ The configuration test prepares the direct worker's converted weight packages
 without running inference on an accelerator. It checks SHA-256 checksums of the
 original model and tokenizer files, converts the weights using the rules in
 `bench/parity/models.json`, and checks each resulting package's recorded checksum.
-It also compares catalog installation settings with the startup-loading settings
-used for hardware certification. The saved packages are ignored build artifacts
+It also checks the catalog installation settings. The saved packages are ignored build artifacts
 derived from those exact checkpoints, not replacement model checkpoints.
 
 ```sh
@@ -105,23 +104,26 @@ timeout (for example 1200 seconds), rather than abandoning a live compile.
 
 ### Hardware certification
 
-This is the command from [direct-ane-serving.md](direct-ane-serving.md), with
-Qwen's original checkpoint substituted. Embedding runs first, then reranking.
-The command writes a record under the checkout; immediately move that record
-to the private backup directory, including when the record reports a drop.
+Use the extracted candidate aggregate root (containing `darwin-arm64/`) and a
+local mirror laid out as `<hf_repo>/resolve/<revision>/<file>` with the catalog's
+pinned original files. Embedding runs first, then reranking. The runner downloads
+through the catalog, loads `<catalog_id>-ane` on the first fixture request and
+requires its self-check and response fingerprints to match the catalog pin.
+Only a passing run writes a record; move development records to the private
+backup directory before starting the next cell from the clean checkout.
 
 ```sh
 source_commit="$(git rev-parse HEAD)"
+assets="${SYNAPSE_CERTIFY_ASSETS:?set the extracted candidate aggregate root}"
+mirror="${SYNAPSE_CERTIFY_MIRROR:?set the pinned catalog mirror root}"
 cargo build --locked --release -p synapse-certify-runner
 for model in qwen3-embedding-0.6b qwen3-reranker-0.6b; do
-  weights="$SYNAPSE_QWEN_WEIGHTS"
-  if [ "$model" = qwen3-reranker-0.6b ]; then weights="$reranker_weights"; fi
   quiet > "$backup/$model-certification-load.log"
   set +e
   env -u TMPDIR DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
     "$PWD/target/release/ckdev-synapse-certify" run \
     --row ane-m5 --model "$model" \
-    --assets "$PWD/target/release" --checkout "$PWD" --weights "$weights" \
+    --assets "$assets" --checkout "$PWD" --mirror "$mirror" \
     > "$backup/$model-$source_commit.stdout.json" \
     2> "$backup/$model-$source_commit.stderr.log"
   result=$?
@@ -132,14 +134,15 @@ for model in qwen3-embedding-0.6b qwen3-reranker-0.6b; do
 done
 ```
 
-The runner and candidate must have the same clean build commit. For releases,
-point `--assets` at the extracted candidate instead of rebuilding its binaries;
+The runner and candidate must have the same clean build commit. Always point
+`--assets` at the extracted candidate aggregate root, not a local build directory;
 candidate and worker execution remains hard-link-only on the same filesystem.
 
 Report the records' accuracy cases, 8192 acceptance and 8193 refusal, and
 placement gates **verbatim**. Do not replace them with the earlier single-fixture
-parity measurements. The certifier's latency series is not an interleaved
-comparison, so run the separate comparison below for the owner's 3× decision.
+parity measurements. Certification does not collect latency series; run the
+separate ANE/Metal latency comparison below against the 3× development threshold.
+It does not permit a failing catalog lane to ship without a passing record.
 
 ### Warm latency and AFT-shaped throughput
 

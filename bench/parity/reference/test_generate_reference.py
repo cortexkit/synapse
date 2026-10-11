@@ -149,10 +149,9 @@ class CatalogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        for relative in (gr.CATALOG_PATH, gr.EVIDENCE_PATH):
-            path = self.root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(gr.REPO_ROOT / relative, path)
+        path = self.root / gr.CATALOG_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(gr.REPO_ROOT / gr.CATALOG_PATH, path)
         RecordingBackend.calls = []
 
     def tearDown(self):
@@ -164,7 +163,7 @@ class CatalogTests(unittest.TestCase):
             installed_version=version, backend_factory=RecordingBackend, repo_root=self.root,
         )
 
-    def test_catalog_mode_preserves_inputs_and_metadata_and_stages_both_schemas(self):
+    def test_catalog_mode_preserves_inputs_and_metadata_and_stages_only_catalog(self):
         original = (self.root / gr.CATALOG_PATH).read_bytes()
         path = self.generate()
         self.assertEqual((self.root / gr.CATALOG_PATH).read_bytes(), original)
@@ -183,15 +182,8 @@ class CatalogTests(unittest.TestCase):
                 self.assertEqual(new["self_check"]["reference"]["vectors"], [[1.0, 0.0]] * 8)
             else:
                 self.assertEqual(new["self_check"]["reference"]["scores"], [[0.5] * len(group["candidates"]) for group in old["self_check"]["inputs"]])
-        evidence = json.loads((self.root / "output" / gr.EVIDENCE_PATH).read_text())
-        old_evidence = json.loads((self.root / gr.EVIDENCE_PATH).read_text())
-        for field in ("upstream", "files", "corpus_id", "pairs"):
-            self.assertEqual(evidence[field], old_evidence[field])
-        for old, new in zip(old_evidence["items"], evidence["items"]):
-            for field in ("id", "query", "candidates"):
-                self.assertEqual(old[field], new[field])
-            self.assertEqual(new["raw_logits"], [0.0] * len(new["candidates"]))
-            self.assertEqual(new["scores"], [0.5] * len(new["candidates"]))
+        self.assertEqual([file.relative_to(self.root / "output")
+                          for file in (self.root / "output").rglob("*.json")], [gr.CATALOG_PATH])
         self.assertEqual(len([event for event in RecordingBackend.calls if event[0] == "load"]), 3)
         first = path.read_bytes()
         self.assertEqual(self.generate().read_bytes(), first)
