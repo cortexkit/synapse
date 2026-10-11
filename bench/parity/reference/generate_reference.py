@@ -13,9 +13,9 @@ Usage:
         --with torch==2.14.0 python bench/parity/reference/generate_reference.py \
         --hf-cache ~/.cache/huggingface/hub --model qwen3-reranker-0.6b [--seed 0]
 
-Use --catalog instead of --model to regenerate the catalog self-checks and
-the GTE reranker release evidence, keeping their existing inputs. --output-dir
-stages either mode under a separate root for comparison before replacement.
+Use --catalog instead of --model to regenerate the catalog self-checks,
+keeping their existing inputs. --output-dir stages either mode under a separate
+root for comparison before replacement.
 
 Each parity run writes fixtures/<slug>/<fixture set id>.json and records its SHA-256
 in fixtures/index.json. The fixture set id names the reference version and
@@ -46,7 +46,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 PARITY_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = PARITY_DIR.parent.parent
 CATALOG_PATH = Path("crates/synapse-module/src/catalog/models.json")
-EVIDENCE_PATH = Path("crates/synapse-module/src/fixtures/catalog_rerank_gte_modernbert_fp32.json")
 CATALOG_FIXTURE_REVISION = 2
 TORCH_VERSION = "2.14.0"
 RUNTIME_SETTINGS = {
@@ -270,7 +269,7 @@ class TorchBackend:
         self.model.to("cpu").eval()
 
     def classifier_logit(self, ids: list[int]) -> float:
-        """Catalog evidence retains raw logits as well as double-precision sigmoid scores."""
+        """Return the raw logit so catalog self-checks apply sigmoid in Python precision."""
         torch = self.torch
         input_ids = torch.tensor([ids], dtype=torch.long)
         with torch.no_grad():
@@ -359,7 +358,6 @@ def catalog_embed_ids(entry: dict, compose, text: str) -> list[int]:
 def generate_catalog(manifest: dict, hf_cache: Path, seed: int, version: str,
                      repo_root: Path, output_root: Path, backend_factory=None) -> Path:
     catalog = json.loads((repo_root / CATALOG_PATH).read_text())
-    evidence = json.loads((repo_root / EVIDENCE_PATH).read_text())
     tool = (
         f"transformers {version}, torch {TORCH_VERSION}; CPU fp32, eager attention, "
         "seed 0, intra-op/inter-op threads 1, deterministic algorithms, "
@@ -388,24 +386,16 @@ def generate_catalog(manifest: dict, hf_cache: Path, seed: int, version: str,
                 rows = []
                 for group in groups:
                     logits = [backend.classifier_logit(compose(group["query"], doc)) for doc in group["candidates"]]
-                    rows.append((logits, [1.0 / (1.0 + math.exp(-logit)) for logit in logits]))
+                    rows.append([1.0 / (1.0 + math.exp(-logit)) for logit in logits])
                 return rows
 
-            check["reference"] = {"scores": [scores for _, scores in score_groups(check["inputs"])]}
+            check["reference"] = {"scores": score_groups(check["inputs"])}
             check["reference_tool"] = tool + "; sigmoid(raw classifier logit)"
-            for item, (logits, scores) in zip(evidence["items"], score_groups(evidence["items"])):
-                item["raw_logits"], item["scores"] = logits, scores
-            evidence["reference_tool"] = check["reference_tool"]
-            evidence["generation_command"] = (
-                f"uv run --no-project --python 3.12 --with transformers=={version} --with torch=={TORCH_VERSION} "
-                "python bench/parity/reference/generate_reference.py --catalog --hf-cache ~/.cache/huggingface/hub"
-            )
         check["fixture_revision"] = CATALOG_FIXTURE_REVISION
-    for relative, document in ((CATALOG_PATH, catalog), (EVIDENCE_PATH, evidence)):
-        destination = output_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(catalog_dumps(document) + "\n", encoding="utf-8")
-    return output_root / CATALOG_PATH
+    destination = output_root / CATALOG_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(catalog_dumps(catalog) + "\n", encoding="utf-8")
+    return destination
 
 
 def run(argv: Sequence[str], *, installed_version: str | None = None,
@@ -415,7 +405,7 @@ def run(argv: Sequence[str], *, installed_version: str | None = None,
     parser.add_argument("--hf-cache", type=Path, required=True)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--model")
-    mode.add_argument("--catalog", action="store_true", help="write catalog self-checks and reranker evidence")
+    mode.add_argument("--catalog", action="store_true", help="write catalog self-checks")
     parser.add_argument("--output-dir", type=Path, help="stage outputs under this root instead of overwriting committed files")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args(argv)

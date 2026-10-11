@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 import subprocess
@@ -12,11 +13,31 @@ import smoke
 import promote
 
 
+MODELS = ('gte-modernbert-base', 'gte-reranker-modernbert-base',
+          'qwen3-embedding-0.6b', 'qwen3-reranker-0.6b')
+ROWS = tuple(check.ROW_BACKENDS)
+REPO = Path(__file__).resolve().parents[2]
+
+
 class ReleaseChecks(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.catalog = {'models': [
+            {'id': model, 'backends': [{'backend': backend} for backend in backends]}
+            for model, backends in zip(MODELS, (
+                ('metal', 'ane', 'cuda', 'vulkan'), ('metal', 'cuda', 'vulkan'),
+                ('metal', 'ane', 'cuda', 'vulkan'), ('ane', 'cuda', 'vulkan')))]}
+        self.catalog_path = self.root / 'crates/synapse-module/src/catalog/models.json'
+        self.catalog_path.parent.mkdir(parents=True)
+        self.write_catalog()
+
+    def write_catalog(self):
+        self.catalog_path.write_text(json.dumps(self.catalog))
+
+    def cells(self):
+        return check.catalog_cells(self.root)
 
     def rejects(self, function, *args):
         with self.assertRaises((ValueError, FileNotFoundError)):
@@ -25,26 +46,92 @@ class ReleaseChecks(unittest.TestCase):
     def records(self) -> list[dict[str, Any]]:
         return [dict(row_id=row, model=model, status='passed', source_commit='a' * 40,
                      machine={'driver_api': 13020}, executed_artifacts=[], fingerprint='catalog')
-                for row in check.ROWS for model in check.MODELS]
+                for row, model in self.cells()]
 
     def report(self) -> dict[str, Any]:
         return {'cells': [dict(row_id=row, model=model, status='measured',
                                metrics={'p50': 100}, probe={'exit_code': 0, 'stdout': '', 'stderr': ''},
                                inline_max_items=8, embedding=[{'batch_size': 128, 'request_path': 'job'}])
-                          for row in check.ROWS for model in check.MODELS]}
+                          for row, model in self.cells()]}
+
+    def test_rust_and_python_row_tables_agree(self):
+        rust = (REPO / 'crates/synapse-certify/src/catalog.rs').read_text()
+        table = re.search(r'pub const ROW_BACKENDS:.*?=\s*\[(.*?)\];', rust, re.S)
+        self.assertIsNotNone(table)
+        pairs = re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', table.group(1))
+        self.assertEqual(pairs, list(check.ROW_BACKENDS.items()))
+
+    def test_catalog_cells_follow_declared_backends(self):
+        expected = {(row, model) for row in ROWS for model in MODELS}
+        expected -= {('metal-m5', 'qwen3-reranker-0.6b'),
+                     ('ane-m5', 'gte-reranker-modernbert-base')}
+        self.assertEqual(set(self.cells()), expected)
+        self.catalog['models'] = [{'id': 'single', 'backends': [{'backend': 'metal'}]}]
+        self.write_catalog()
+        self.assertEqual(self.cells(), [('metal-m5', 'single')])
+
+    def test_removing_cuda_removes_cells_profiles_and_refuses_leftover(self):
+        entries, records, assets, cert, report_dir = self.evidence_fixture()
+        before = set(self.cells())
+        model = MODELS[0]
+        dropped = {('cuda-linux-nvidia', model), ('cuda-windows-nvidia', model)}
+        self.catalog['models'][0]['backends'] = [lane for lane in self.catalog['models'][0]['backends']
+                                               if lane['backend'] != 'cuda']
+        self.write_catalog()
+        self.assertEqual(set(self.cells()), before - dropped)
+        manifest_path = self.root / 'bench/parity/models.json'
+        manifest = check.load(manifest_path)
+        del manifest['profiles'][model + '.owned-cuda']
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertEqual(check.cuda_driver_floor(self.root, self.cells()), 13020)
+        other_profile = manifest['profiles'].pop(MODELS[1] + '.owned-cuda')
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'missing CUDA profiles'):
+            check.cuda_driver_floor(self.root, self.cells())
+        manifest['profiles'][MODELS[1] + '.owned-cuda'] = other_profile
+        manifest_path.write_text(json.dumps(manifest))
+        report = self.report()
+        (report_dir / 'report.json').write_text(json.dumps(report))
+        for row, removed_model in dropped:
+            (cert / row / (removed_model + '.json')).unlink()
+        check.evidence(self.root, 'a' * 40, assets, entries)
+        other = cert / 'metal-m5' / (model + '.json')
+        original = other.read_text()
+        other.unlink()
+        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
+        other.write_text(original)
+        leftover = next(r for r in records if (r['row_id'], r['model']) in dropped)
+        (cert / leftover['row_id'] / (model + '.json')).write_text(json.dumps(leftover))
+        with self.assertRaisesRegex(ValueError, 'unexpected certification record'):
+            check.evidence(self.root, 'a' * 40, assets, entries)
+
+    def test_no_cuda_lanes_need_no_cuda_profiles_or_bindings(self):
+        entries, records, assets, cert, report_dir = self.evidence_fixture()
+        for model in self.catalog['models']:
+            model['backends'] = [lane for lane in model['backends'] if lane['backend'] != 'cuda']
+        self.write_catalog()
+        (self.root / 'bench/parity/models.json').write_text('{"profiles": {}}')
+        self.assertIsNone(check.cuda_driver_floor(self.root, self.cells()))
+        for record in records:
+            if record['row_id'].startswith('cuda-'):
+                (cert / record['row_id'] / (record['model'] + '.json')).unlink()
+        (report_dir / 'report.json').write_text(json.dumps(self.report()))
+        check.evidence(self.root, 'a' * 40, assets, entries)
 
     def test_benchmark_support_and_completeness(self):
         report = self.report()
         amd = report['cells'][0]
         amd.update(status='hardware_unavailable', metrics={'p50': None}, cause='TEI requires CUDA',
                    probe={'exit_code': 2, 'stdout': '', 'stderr': 'TEI requires CUDA'})
-        check.benchmark(report, self.records())
-        for edit in ('missing_row', 'missing_model', 'metric', 'probe', 'unsupported_success', 'inline'):
+        check.benchmark(report, self.cells())
+        for edit in ('missing_row', 'missing_model', 'extra_cell', 'metric', 'probe', 'unsupported_success', 'inline'):
             bad = copy.deepcopy(report)
             if edit == 'missing_row':
-                bad['cells'] = [c for c in bad['cells'] if c['row_id'] != check.ROWS[-1]]
+                bad['cells'] = [c for c in bad['cells'] if c['row_id'] != ROWS[-1]]
             elif edit == 'missing_model':
-                bad['cells'] = [c for c in bad['cells'] if c['model'] != check.MODELS[-1]]
+                bad['cells'] = [c for c in bad['cells'] if c['model'] != MODELS[-1]]
+            elif edit == 'extra_cell':
+                bad['cells'].append(dict(row_id='metal-m5', model='qwen3-reranker-0.6b'))
             elif edit == 'metric':
                 bad['cells'][0]['metrics']['p50'] = 1
             elif edit == 'probe':
@@ -55,16 +142,13 @@ class ReleaseChecks(unittest.TestCase):
             else:
                 bad['cells'][1]['embedding'][0].pop('request_path')
             with self.subTest(edit=edit):
-                self.rejects(check.benchmark, bad, self.records())
+                self.rejects(check.benchmark, bad, self.cells())
 
-    def test_dropped_numeric_metric(self):
-        records = self.records()
-        records[-1]['status'] = 'dropped'
+    def test_benchmark_refuses_dropped_status(self):
         report = self.report()
-        report['cells'][-1].update(status='dropped', drop_cause='parity', metrics={'p50': None})
-        check.benchmark(report, records)
-        report['cells'][-1]['metrics']['p50'] = 10
-        self.rejects(check.benchmark, report, records)
+        report['cells'][-1].update(status='dropped', metrics={'p50': None})
+        with self.assertRaisesRegex(ValueError, 'invalid benchmark status'):
+            check.benchmark(report, self.cells())
 
     def git(self, *args):
         return check.git(self.root, *args)
@@ -73,6 +157,60 @@ class ReleaseChecks(unittest.TestCase):
         self.git('add', '.')
         self.git('commit', '-qm', message)
         return self.git('rev-parse', 'HEAD')
+
+    def source_fixture(self):
+        self.git('init', '-q')
+        self.git('config', 'user.email', 'test@example.com')
+        self.git('config', 'user.name', 'test')
+        self.git('config', 'maintenance.auto', 'false')
+        self.git('config', 'gc.auto', '0')
+        (self.root / '.gitignore').write_text('ignored-checkout/\n')
+        s = self.commit('source')
+        note = self.root / 'docs/evidence/note.md'
+        note.parent.mkdir(parents=True)
+        note.write_text('Evidence')
+        self.commit('evidence')
+        self.assertEqual(check.source(self.root), s)
+        return s
+
+    def test_source_refuses_dirty_checkout(self):
+        self.source_fixture()
+        for state in ('untracked', 'unstaged', 'staged'):
+            path = self.root / ('new.txt' if state == 'untracked' else '.gitignore')
+            original = path.read_text() if path.exists() else None
+            path.write_text('dirty')
+            if state == 'staged':
+                self.git('add', '.gitignore')
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, 'dirty checkout'):
+                check.source(self.root)
+            if original is None:
+                path.unlink()
+            else:
+                path.write_text(original)
+                self.git('add', '.gitignore')
+        check.source(self.root)
+
+    def test_source_refuses_ignored_checkout_with_altered_fixture_index(self):
+        s = self.source_fixture()
+        checkout = self.root / 'ignored-checkout'
+        index = check.load(REPO / 'bench/parity/fixtures/index.json')
+        for entry in index.values():
+            path = checkout / 'bench/parity' / entry['path']
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = (REPO / 'bench/parity' / entry['path']).read_bytes() + b'\n'
+            path.write_bytes(data)
+            entry['sha256'] = check.digest(data)
+        (checkout / 'bench/parity/fixtures/index.json').write_text(json.dumps(index))
+        catalog = checkout / 'crates/synapse-module/src/catalog/models.json'
+        catalog.parent.mkdir(parents=True)
+        catalog.write_text(self.catalog_path.read_text())
+        self.assertEqual(check.git(checkout, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
+        self.assertEqual(check.git(checkout, 'rev-parse', 'HEAD^'), s)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        for entry in index.values():
+            self.assertEqual(check.digest((checkout / 'bench/parity' / entry['path']).read_bytes()), entry['sha256'])
+        with self.assertRaisesRegex(ValueError, 'checkout must be the repository root'):
+            check.source(checkout)
 
     def test_source_parent_and_prior_evidence(self):
         self.git('init', '-q')
@@ -135,7 +273,21 @@ class ReleaseChecks(unittest.TestCase):
 
     def test_legacy_and_new_inventory_pass(self):
         entries, records, assets, _ = self.fixture_inventory()
-        check.inventory(entries, assets, records)
+        check.inventory(entries, assets, records, self.cells())
+
+    def test_inventory_requires_each_declared_cell_binding(self):
+        entries, records, assets, _ = self.fixture_inventory()
+        records.pop()
+        with self.assertRaisesRegex(ValueError, 'missing extracted binary binding'):
+            check.inventory(entries, assets, records, self.cells())
+
+    def test_certification_requires_passed_status(self):
+        entries, records, assets, cert, _ = self.evidence_fixture()
+        record = records[-1]
+        record['status'] = 'dropped'
+        (cert / record['row_id'] / (record['model'] + '.json')).write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, 'record must be passed'):
+            check.evidence(self.root, 'a' * 40, assets, entries)
 
     def test_undeclared_or_absent_asset_and_sidecar(self):
         entries, records, assets, download = self.fixture_inventory()
@@ -152,9 +304,9 @@ class ReleaseChecks(unittest.TestCase):
         for e in bad:
             if e.get('binary') == 'ck-synapse-worker-vulkan':
                 e.update(binding='exempt', reason='not certified')
-        self.rejects(check.inventory, bad, assets, records)
+        self.rejects(check.inventory, bad, assets, records, self.cells())
         records[4]['executed_artifacts'][0]['sha256'] = check.digest((download / 'ck-synapse-linux-x64.zip').read_bytes())
-        self.rejects(check.inventory, entries, assets, records)
+        self.rejects(check.inventory, entries, assets, records, self.cells())
 
     def test_missing_manifest_dll_or_record_dll_and_extra_dll_fail(self):
         entries, records, assets, _ = self.fixture_inventory()
@@ -163,14 +315,14 @@ class ReleaseChecks(unittest.TestCase):
         m = json.loads(original)
         m['runtime_files'] = []
         manifest_path.write_text(json.dumps(m))
-        self.rejects(check.inventory, entries, assets, records)
+        self.rejects(check.inventory, entries, assets, records, self.cells())
         manifest_path.write_text(original)
         r = next(r for r in records if r['row_id'] == 'cuda-windows-nvidia')
         r['executed_artifacts'] = [a for a in r['executed_artifacts'] if not a['file'].endswith('.dll')]
-        self.rejects(check.inventory, entries, assets, records)
+        self.rejects(check.inventory, entries, assets, records, self.cells())
         r['executed_artifacts'].append({'file': 'runtime.dll', 'sha256': check.digest(b'runtime')})
         r['executed_artifacts'].append({'file': 'extra.dll', 'sha256': '0' * 64})
-        self.rejects(check.inventory, entries, assets, records)
+        self.rejects(check.inventory, entries, assets, records, self.cells())
 
     def stress_fixture(self) -> dict[str, Any]:
         return dict(schema=1, kind='development', harness_profile='release', source_commit='a' * 40,
@@ -215,18 +367,18 @@ class ReleaseChecks(unittest.TestCase):
                 self.rejects(check.stress_evidence, stress)
 
     def test_driver_floor_from_agreeing_profiles(self):
-        profiles = {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in check.MODELS}
+        profiles = {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in MODELS}
         (self.root / 'bench/parity').mkdir(parents=True)
         manifest = self.root / 'bench/parity/models.json'
         manifest.write_text(json.dumps({'profiles': profiles}))
-        self.assertEqual(check.cuda_driver_floor(self.root), 13020)
+        self.assertEqual(check.cuda_driver_floor(self.root, self.cells()), 13020)
         for p in profiles.values():
             p['cuda_min_driver_api'] = 13040
         manifest.write_text(json.dumps({'profiles': profiles}))
-        self.assertEqual(check.cuda_driver_floor(self.root), 13040)
-        profiles[check.MODELS[-1] + '.owned-cuda']['cuda_min_driver_api'] = 13080
+        self.assertEqual(check.cuda_driver_floor(self.root, self.cells()), 13040)
+        profiles[MODELS[-1] + '.owned-cuda']['cuda_min_driver_api'] = 13080
         manifest.write_text(json.dumps({'profiles': profiles}))
-        self.rejects(check.cuda_driver_floor, self.root)
+        self.rejects(check.cuda_driver_floor, self.root, self.cells())
 
     def evidence_fixture(self):
         entries, records, assets, _ = self.fixture_inventory()
@@ -238,11 +390,9 @@ class ReleaseChecks(unittest.TestCase):
             path.write_text(json.dumps(r))
         (cert / 'ane-direct-stress.json').write_text(json.dumps(self.stress_fixture()))
         manifest = self.root / 'bench/parity/models.json'
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text(json.dumps({'profiles': {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in check.MODELS}}))
-        (cert / 'RELEASE-NOTES.md').write_text('No dropped cells')
-        preload = self.root / 'bench/parity/preload'
-        preload.mkdir(parents=True)
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps({'profiles': {m + '.owned-cuda': {'lane': 'owned-cuda', 'model': m, 'cuda_min_driver_api': 13020} for m in MODELS}}))
+        (cert / 'RELEASE-NOTES.md').write_text('Catalog lane certification')
         report_dir = self.root / 'docs/evidence/benchmark' / ('a' * 40)
         report_dir.mkdir(parents=True)
         (report_dir / 'report.json').write_text(json.dumps(self.report()))
@@ -259,7 +409,7 @@ class ReleaseChecks(unittest.TestCase):
         check.evidence(self.root, 'a' * 40, assets, entries)
         for row, edit in (('metal-m5', {'platform_uuid': '4F3A2B1C-0D9E-4A7B-8C6D-5E4F3A2B1C0D'}),
                           ('cuda-linux-nvidia', {'gpu': {'uuid': 'GPU-7D1C9E2A-3B4F-4C5D-8E6F-0A1B2C3D4E5F'}})):
-            r = next(r for r in records if r['row_id'] == row and r['model'] == check.MODELS[0])
+            r = next(r for r in records if r['row_id'] == row and r['model'] == MODELS[0])
             path = cert / row / (r['model'] + '.json')
             original = path.read_text()
             changed = copy.deepcopy(r)
@@ -274,7 +424,7 @@ class ReleaseChecks(unittest.TestCase):
         entries, records, assets, cert, _ = self.evidence_fixture()
         check.evidence(self.root, 'a' * 40, assets, entries)
         for row, api in [('cuda-linux-nvidia', 13040), ('cuda-windows-nvidia', 13080)]:
-            r = next(r for r in records if r['row_id'] == row and r['model'] == check.MODELS[0])
+            r = next(r for r in records if r['row_id'] == row and r['model'] == MODELS[0])
             path = cert / row / (r['model'] + '.json')
             r['machine']['driver_api'] = api
             path.write_text(json.dumps(r))
@@ -285,7 +435,7 @@ class ReleaseChecks(unittest.TestCase):
         (cert / 'foreign.json').write_text(json.dumps({'source_commit': 'b' * 40}))
         self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
         (cert / 'foreign.json').unlink()
-        (cert / check.ROWS[0] / (check.MODELS[0] + '.json')).unlink()
+        (cert / ROWS[0] / (MODELS[0] + '.json')).unlink()
         self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
 
     def test_stress_transition_and_release_notes_required(self):
@@ -363,23 +513,14 @@ class ReleaseChecks(unittest.TestCase):
             self.assertEqual(check.candidate_source(self.root), 'a' * 40)
             self.assertIn('candidate-' + 'a' * 40, gh.call_args.args[0])
 
-    def test_release_notes_name_dropped_and_metal_pairs(self):
-        entries, records, assets, cert, _ = self.evidence_fixture()
-        preload = self.root / 'bench/parity/preload' / (check.MODELS[0] + '-f16.json')
-        preload.write_text(json.dumps({'expected_fingerprint': 'preload'}))
-        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
+    def test_release_notes_required(self):
+        entries, _, assets, cert, _ = self.evidence_fixture()
         notes = cert / 'RELEASE-NOTES.md'
-        notes.write_text(check.MODELS[0] + ' catalog preload')
+        notes.write_text('')
         check.evidence(self.root, 'a' * 40, assets, entries)
-        r = records[-1]
-        r['status'] = 'dropped'
-        (cert / r['row_id'] / (r['model'] + '.json')).write_text(json.dumps(r))
-        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
-        notes.write_text(notes.read_text() + '\n' + r['row_id'] + '/' + r['model'])
-        report = check.load(self.root / 'docs/evidence/benchmark' / ('a' * 40) / 'report.json')
-        report['cells'][-1].update(status='dropped', drop_cause='parity', metrics={'p50': None})
-        (self.root / 'docs/evidence/benchmark' / ('a' * 40) / 'report.json').write_text(json.dumps(report))
-        check.evidence(self.root, 'a' * 40, assets, entries)
+        notes.unlink()
+        with self.assertRaisesRegex(ValueError, 'missing release notes'):
+            check.evidence(self.root, 'a' * 40, assets, entries)
 
     def test_transition_boundary(self):
         self.assertTrue(check.median([105] * 23) <= 1.05 * check.median([100] * 23))

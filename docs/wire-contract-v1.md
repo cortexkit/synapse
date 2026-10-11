@@ -204,9 +204,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   `admitted_count`, and `available`. In-process Metal uses no worker IPC, so
   its complete snapshot has empty inventories and request counts and zero admissions.
   CUDA and Vulkan report request counts without ANE placement inventories.
-  Direct ANE reports `available: false` until production inference is connected
-  to the residency supervisor; `ckdev-synapse-certify run --row ane-m5` still refuses for that
-  missing integration. Supervisor observation capture retains every successful
+   Direct ANE reports placement from its residency supervisor. Supervisor
+   observation capture retains every successful
   ADMITTED inventory across eviction and confirmed-exit restart, separately from
   its cumulative admission count. Observation never changes computation.
 - **Certification observation responses** — consumers must not use this surface.
@@ -232,8 +231,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     pages readable and resumes by item id.
 - **rerank.score** {model, query, candidates[], …} — RAW per-candidate
   scores (no server-side ordering opinions); interactive ≤20 candidates,
-  bulk beyond. Catalog `qwen3-reranker-0.6b` has no backends and cannot
-  download or serve (`backend_unavailable`). Free-form local reranking accepts
+   bulk beyond. Catalog `qwen3-reranker-0.6b` declares ANE, CUDA and Vulkan lanes,
+   but no Metal lane. Free-form local reranking accepts
   owned engines only, never llama.cpp.
 - **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
   `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
@@ -976,17 +975,20 @@ by the parity evaluator. Numerical and semantic gates and manifest tolerances
 are unchanged. Full-corpus and 8192-token coverage remain certification gates,
 not claims made by the small load-time check.
 
-The `ckdev-synapse-certify run` producer currently certifies only `metal-m5`.
-Worker-backed `cuda-*`,
-`vulkan-*`, and `ane-m5` runs refuse with `missing_worker_observation` before
-launching workers or writing a record. Enabling those rows requires capture of
-every worker `ADMITTED` inventory, a sent-request count getter, and the independent
-`stats()` admission count. An unavailable observation stream is never interpreted
-as an empty, complete inventory. The checked-in Metal development evidence lives
-under `crates/synapse-certify/tests/evidence/`; it is labelled development, is a
-record-schema-1 record with the raw machine UUID it was produced with removed,
-and is not a release-candidate certification record. Current (schema-2)
-records never hold a hardware UUID, only its salted SHA-256 digest
+The `ckdev-synapse-certify run --row <row> --model <catalog_id> --assets
+<aggregate-dir> --checkout <root> --mirror <dir>` producer certifies each catalog
+backend on its declared hardware rows: `metal-m5`, `ane-m5`, `cuda-*`, and
+`vulkan-*`. The mirror serves pinned files from
+`<hf_repo>/resolve/<revision>/<file>`. The runner checks `models.catalog`, downloads
+through `models.download` and polls `model.status` to `committed`. Its first
+fixture request loads and checks `<catalog_id>-<backend>`; `model_loading` replies
+are retried within a bounded deadline and never count as completed fixtures.
+`models.list` must then report a passed self-check and exactly the catalog pin,
+and every successful fixture response must carry that same fingerprint.
+Direct ANE records include every successful `ADMITTED` inventory and the
+independent admission count. An unavailable observation stream is never
+interpreted as an empty, complete inventory. Current schema-3 records never hold
+a hardware UUID, only its salted SHA-256 digest
 (`machine.platform_uuid_sha256` on Apple rows, `machine.gpu.uuid_sha256` on
 CUDA and Vulkan rows); `crates/synapse-certify/README.md` gives the exact
 construction.
