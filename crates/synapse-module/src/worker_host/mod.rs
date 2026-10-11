@@ -4410,6 +4410,11 @@ pub mod ane_residency {
         ) -> Option<AneShapeLease> {
             let key = Self::packed_key(worker, model_ref);
             let mut state = self.inner.lock();
+            // Packed arrivals have no budget-queue ticket. Do not let their fast
+            // path repeatedly lease the only program a starved admission can evict.
+            if state.starved_head.is_some() {
+                return None;
+            }
             if state.recovering.contains(worker.worker_id())
                 || state.retired.contains(worker.worker_id())
             {
@@ -8484,6 +8489,106 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
+        async fn packed_fast_path_yields_to_starved_admission_and_serves_singles() {
+            let peer = Arc::new(Mutex::new(PackedPeer::default()));
+            let serving = packed_peer(false, peer.clone()).await;
+            assert!(serving.prepare_packed().await.unwrap());
+            let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+            let short = serving
+                .supervisor
+                .lease(&worker, PACKED_MODEL, 128)
+                .await
+                .unwrap();
+            let medium = serving
+                .supervisor
+                .lease(&worker, PACKED_MODEL, 256)
+                .await
+                .unwrap();
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            peer.lock()
+                .unwrap()
+                .inference_gates
+                .push_back((started.clone(), release.clone()));
+            let packed = tokio::spawn({
+                let serving = serving.clone();
+                async move {
+                    serving
+                        .infer_packed(vec![vec![41; 127], vec![42; 129]])
+                        .await
+                }
+            });
+            notified(&started).await;
+            let long = tokio::spawn({
+                let serving = serving.clone();
+                let worker = worker.clone();
+                async move { serving.supervisor.lease(&worker, PACKED_MODEL, 512).await }
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while serving.supervisor.inner.lock().starved_head.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(serving.supervisor.inner.lock().reserved_executables(), 84);
+            assert!(
+                serving
+                    .supervisor
+                    .try_packed_lease(&worker, PACKED_MODEL)
+                    .is_none(),
+                "new packed leases must not keep the starved head's only eviction victim busy"
+            );
+            let before = peer.lock().unwrap().requests.len();
+            let mut arrivals = Vec::new();
+            for _ in 0..2 {
+                arrivals.push(tokio::spawn({
+                    let serving = serving.clone();
+                    async move {
+                        serving
+                            .infer_packed(vec![vec![51; 127], vec![52; 129]])
+                            .await
+                    }
+                }));
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while serving.supervisor.inner.lock().waiters.len() < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let key = AneResidencySupervisor::packed_key(&worker, PACKED_MODEL);
+            assert_eq!(serving.supervisor.inner.lock().slots[&key].leases, 1);
+            release.notify_one();
+            let long_lease = tokio::time::timeout(Duration::from_secs(3), long)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(packed.await.unwrap().unwrap(), vec![vec![41.0], vec![42.0]]);
+            for arrival in arrivals {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), arrival)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    vec![vec![51.0], vec![52.0]]
+                );
+            }
+            assert!(
+                peer.lock().unwrap().requests[before..]
+                    .iter()
+                    .all(|request| !matches!(request, WorkerRequest::EmbedPacked { .. })),
+                "calls arriving behind a starved head must execute standalone"
+            );
+            drop(long_lease);
+            drop(short);
+            drop(medium);
+        }
+
+        #[tokio::test]
         async fn packed_preparation_skips_full_leased_budget_and_retries_idle() {
             let peer = Arc::new(Mutex::new(PackedPeer::default()));
             let mut serving = packed_peer(false, peer.clone()).await;
@@ -8676,9 +8781,16 @@ pub mod ane_residency {
                 .iter()
                 .all(|r| !is_packed_request(r)));
             assert!(serving.prepare_packed().await.unwrap());
+            let prepared = peer.lock().unwrap().requests.len();
             assert_eq!(
                 serving.infer_packed(rows).await.unwrap(),
                 vec![vec![41.0], vec![42.0], vec![43.0], vec![42.0]]
+            );
+            assert!(
+                peer.lock().unwrap().requests[prepared..]
+                    .iter()
+                    .any(|request| matches!(request, WorkerRequest::EmbedPacked { .. })),
+                "a prepared resident packed program must actually execute packing"
             );
         }
 
