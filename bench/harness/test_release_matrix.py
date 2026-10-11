@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -90,16 +91,6 @@ class ProducerTests(unittest.TestCase):
         self.assertEqual(cell['metrics'], dict.fromkeys(matrix.METRICS))
         self.assertEqual(cell['probe']['stderr'], 'model rejected\n')
 
-    def test_drop_nulls_and_strict_latency_ratio(self):
-        record = {'row_id': 'ane-m5', 'model': 'qwen3-embedding-0.6b', 'drop_cause': 'latency', 'parity': {},
-                  'raw_series': {'session_id': 'same', 'ane': [301] * 23, 'metal': [100] * 23}}
-        result = matrix.dropped_cell(record)
-        self.assertEqual(result['metrics'], dict.fromkeys(matrix.METRICS))
-        self.assertEqual(result['raw_series'], record['raw_series'])
-        record['raw_series']['ane'] = [300] * 23
-        with self.assertRaises(ValueError):
-            matrix.dropped_cell(record)
-
     def test_transition_boundary_and_both_load_series(self):
         for direct, expected in ((105, True), (106, False)):
             cfg = {'transition': {'inputs': {'text': 'same', 'composed_length': 512},
@@ -115,33 +106,89 @@ class ProducerTests(unittest.TestCase):
                 self.assertEqual(len(result['machine_load']), 23)
                 self.assertTrue((Path(directory) / 'ane-transition.json').is_file())
 
-    def test_assembled_matrix_passes_tag_validator_including_drops(self):
-        manifest = matrix.load(matrix.ROOT / 'bench/parity/models.json')
-        digest = hashlib.sha256((matrix.ROOT / 'bench/parity/models.json').read_bytes()).hexdigest()
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            for row in matrix.ROWS:
-                cells = []
-                for model in manifest['models']:
-                    for runtime in ('synapse',) + matrix.COMPETITORS:
-                        cell = {'row_id': row, 'model': model, 'runtime': runtime, 'status': 'measured',
-                                'probe': {'exit_code': 0, 'stdout': '{}', 'stderr': ''}, 'metrics': {'p50': 10}}
-                        if row == 'ane-m5' and model == 'qwen3-embedding-0.6b' and runtime == 'synapse':
-                            cell = matrix.dropped_cell({'row_id': row, 'model': model, 'drop_cause': 'parity', 'parity': {'gates': {'cosine': False}}})
-                        if runtime == 'tei' and row.endswith('-amd'):
-                            cell.update(status='hardware_unavailable', metrics={'p50': None}, cause='no AMD hardware',
-                                        probe={'exit_code': 2, 'stdout': '', 'stderr': 'no AMD hardware'})
-                        cells.append(cell)
-                matrix.save(output / f'{row}.json', {'source_commit': 'source', 'manifest_digest': digest, 'session_id': row, 'machine': row, 'cells': cells})
-            result = matrix.assemble(matrix.ROOT, 'source', output)
-            self.assertEqual(len(result['cells']), 32)
-            self.assertEqual(set(result['competitors']), set(matrix.COMPETITORS))
-            self.assertEqual(len(result['competitors']['tei']), 32)
-            bad = matrix.load(output / 'metal-m5.json')
-            bad['cells'][0]['probe']['exit_code'] = 2
-            matrix.save(output / 'metal-m5.json', bad)
-            with self.assertRaisesRegex(ValueError, 'probe/status mismatch'):
-                matrix.assemble(matrix.ROOT, 'source', output)
+    def matrix_fixture(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        for relative in ('bench/parity/models.json', 'crates/synapse-module/src/catalog/models.json',
+                         'crates/synapse-release-checks/check.py'):
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(matrix.ROOT / relative, destination)
+        output = root / 'reports'
+        self.write_reports(root, output)
+        return root, output
+
+    def write_reports(self, root, output):
+        digest = hashlib.sha256((root / 'bench/parity/models.json').read_bytes()).hexdigest()
+        expected = matrix.release_checks(root).catalog_cells(root)
+        for row in dict.fromkeys(row for row, _ in expected):
+            cells = []
+            for cell_row, model in expected:
+                if cell_row != row:
+                    continue
+                for runtime in ('synapse',) + matrix.COMPETITORS:
+                    cell = {'row_id': row, 'model': model, 'runtime': runtime, 'status': 'measured',
+                            'probe': {'exit_code': 0, 'stdout': '{}', 'stderr': ''}, 'metrics': {'p50': 10}}
+                    if runtime == 'tei' and row.endswith('-amd'):
+                        cell.update(status='hardware_unavailable', metrics={'p50': None}, cause='no AMD hardware',
+                                    probe={'exit_code': 2, 'stdout': '', 'stderr': 'no AMD hardware'})
+                    cells.append(cell)
+            matrix.save(output / f'{row}.json', {'source_commit': 'source', 'manifest_digest': digest,
+                                                'session_id': row, 'machine': row, 'cells': cells})
+
+    def test_removing_backend_removes_assembled_cells_and_passes_tag_validator(self):
+        root, output = self.matrix_fixture()
+        before = matrix.assemble(root, 'source', output)
+        before_cells = {(cell['row_id'], cell['model']) for cell in before['cells']}
+        catalog_path = root / 'crates/synapse-module/src/catalog/models.json'
+        catalog = matrix.load(catalog_path)
+        model = 'gte-modernbert-base'
+        entry = next(entry for entry in catalog['models'] if entry['id'] == model)
+        entry['backends'] = [lane for lane in entry['backends'] if lane['backend'] != 'cuda']
+        matrix.save(catalog_path, catalog)
+        self.write_reports(root, output)
+        result = matrix.assemble(root, 'source', output)
+        removed = {('cuda-linux-nvidia', model), ('cuda-windows-nvidia', model)}
+        self.assertTrue(removed <= before_cells)
+        self.assertEqual({(cell['row_id'], cell['model']) for cell in result['cells']}, before_cells - removed)
+        checks = matrix.release_checks(root)
+        cells = checks.catalog_cells(root)
+        checks.benchmark(result, cells)
+        self.assertEqual(set(result['competitors']), set(matrix.COMPETITORS))
+        for runtime, competitor_cells in result['competitors'].items():
+            with self.subTest(runtime=runtime):
+                self.assertEqual({(cell['row_id'], cell['model']) for cell in competitor_cells}, before_cells - removed)
+                checks.benchmark({'cells': competitor_cells}, cells)
+        bad = matrix.load(output / 'metal-m5.json')
+        bad['cells'][0]['probe']['exit_code'] = 2
+        matrix.save(output / 'metal-m5.json', bad)
+        with self.assertRaisesRegex(ValueError, 'probe/status mismatch'):
+            matrix.assemble(root, 'source', output)
+
+    def test_assembled_matrix_refuses_dropped_owned_cell(self):
+        root, output = self.matrix_fixture()
+        report = matrix.load(output / 'ane-m5.json')
+        owned = next(cell for cell in report['cells']
+                     if cell['runtime'] == 'synapse' and cell['model'] == 'qwen3-embedding-0.6b')
+        owned.update(status='dropped', metrics={'p50': None})
+        matrix.save(output / 'ane-m5.json', report)
+        with self.assertRaisesRegex(ValueError, 'invalid benchmark status'):
+            matrix.assemble(root, 'source', output)
+
+    def test_assembled_matrix_validates_each_competitor(self):
+        root, output = self.matrix_fixture()
+        for runtime in matrix.COMPETITORS:
+            path = output / 'metal-m5.json'
+            report = matrix.load(path)
+            competitor_cell = next(cell for cell in report['cells'] if cell['runtime'] == runtime)
+            original = competitor_cell['probe']['exit_code']
+            competitor_cell['probe']['exit_code'] = 2
+            matrix.save(path, report)
+            with self.subTest(runtime=runtime), self.assertRaisesRegex(ValueError, 'probe/status mismatch'):
+                matrix.assemble(root, 'source', output)
+            competitor_cell['probe']['exit_code'] = original
+            matrix.save(path, report)
 
     def test_manifest_digest_is_required(self):
         manifest = matrix.load(matrix.ROOT / 'bench/parity/models.json')
@@ -161,7 +208,10 @@ class ProducerTests(unittest.TestCase):
             file_digest = hashlib.sha256(model_file.read_bytes()).hexdigest()
             cfg = {'row_id': 'metal-m5', 'source_commit': 'source', 'manifest_digest': digest,
                    'machine': {'id': 'test-machine', 'memory_kind': 'footprint'}, 'models': {}}
-            for model, definition in manifest['models'].items():
+            models = [model for row, model in matrix.release_checks(matrix.ROOT).catalog_cells(matrix.ROOT)
+                      if row == 'metal-m5']
+            for model in models:
+                definition = manifest['models'][model]
                 record = output / f'{model}-record.json'
                 matrix.save(record, {'row_id': 'metal-m5', 'model': model, 'source_commit': 'source', 'status': 'passed'})
                 adapters = {runtime: {'command': ['test'], 'precision': 'f16', 'file': str(model_file), 'file_sha256': file_digest}
@@ -172,10 +222,20 @@ class ProducerTests(unittest.TestCase):
                                         'inputs': self.base(definition['operation'])['inputs'], 'adapters': adapters}
             with patch.object(matrix, 'Adapter', FakeAdapter):
                 report = matrix.run_row(cfg, matrix.ROOT, output)
-            self.assertEqual(len(report['cells']), 20)
+            self.assertEqual(len(report['cells']), len(models) * (1 + len(matrix.COMPETITORS)))
+            self.assertEqual({cell['model'] for cell in report['cells']}, set(models))
+            self.assertNotIn('qwen3-reranker-0.6b', models)
             self.assertEqual({c['input_digest'] for c in report['cells']}, {report['cells'][0]['input_digest']})
             self.assertEqual(sum(c.get('label') is not None for c in report['cells']), 1)
             self.assertTrue((output / 'metal-m5.json').is_file())
+            record_path = Path(cfg['models']['gte-modernbert-base']['certification_record'])
+            record = matrix.load(record_path)
+            record['status'] = 'dropped'
+            matrix.save(record_path, record)
+            with patch.object(matrix, 'Adapter', FakeAdapter), self.assertRaisesRegex(ValueError, 'certification record must be passed'):
+                matrix.run_row(cfg, matrix.ROOT, output)
+            record['status'] = 'passed'
+            matrix.save(record_path, record)
             cfg['models']['gte-modernbert-base']['f16_sha256'] = 'wrong'
             with patch.object(matrix, 'Adapter', FakeAdapter), self.assertRaisesRegex(ValueError, 'same f16 file'):
                 matrix.run_row(cfg, matrix.ROOT, output)
