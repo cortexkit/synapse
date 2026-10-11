@@ -38,6 +38,10 @@ mod backend;
 mod modernbert;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
+#[path = "../src/multirow.rs"]
+mod multirow;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 #[path = "../src/profile.rs"]
 mod profile;
 #[cfg(target_os = "macos")]

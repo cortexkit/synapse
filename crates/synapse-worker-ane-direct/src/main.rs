@@ -2,9 +2,9 @@
 mod backend;
 #[cfg(target_os = "macos")]
 mod modernbert;
-// Multi-row passes are an opt-in prototype. The request loop does not call
-// them: the module's supervisor counts 28 executables per admitted shape
-// against the Neural Engine's capacity, and multi-row programs are not counted.
+// Fixed-slot multi-row layouts remain experimental. Serving compiles the kernel
+// that packs rows into 256 columns separately from single-row kernels, charging
+// its 28 layer executables to the same 100-executable ANE residency budget.
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod multirow;

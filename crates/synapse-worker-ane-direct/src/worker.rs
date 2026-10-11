@@ -76,6 +76,7 @@ fn hello(nonce: String) -> WorkerHello {
         },
         manifest_digest: Some(env!("ANE_MANIFEST_DIGEST").into()),
         kernel_revision: Some(REVISION.into()),
+        packed: Some(synapse_core::PackedCapability::tight256()),
     }
 }
 pub fn main() -> Result<()> {
@@ -173,6 +174,19 @@ fn error(req_id: Option<String>, message: &str) -> WorkerResponse {
         msg: message.into(),
     }
 }
+
+pub(crate) fn request_error(req_id: Option<String>, failure: &anyhow::Error) -> WorkerResponse {
+    let mut response = error(req_id, &failure.to_string());
+    if let WorkerResponse::Err { code, msg, .. } = &mut response {
+        // Layer context is a diagnostic, not an error class. Inspect the typed
+        // cause even when compilation added one or more contextual messages.
+        if failure.chain().any(|cause| matches!(cause.downcast_ref::<ane::Error>(), Some(ane::Error::Load(message)) if message.contains("no ANE resources"))) {
+            *code = "ane_resources_exhausted".into();
+        }
+        *msg = format!("{failure:#}");
+    }
+    response
+}
 fn os_build() -> Result<String> {
     let output = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
         .arg("-buildVersion")
@@ -186,6 +200,7 @@ fn request_loop<S: Read + Write>(
     mut probe: impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let mut models: BTreeMap<String, Model> = BTreeMap::new();
+    let mut packed = BTreeMap::<String, crate::multirow::tight::TightProgram>::new();
     loop {
         let frame = match read_frame(stream, max) {
             Ok(frame) => frame,
@@ -260,6 +275,43 @@ fn request_loop<S: Read + Write>(
                         .admit(shape, &os_build()?)?;
                     (WorkerResponse::Admitted { req_id, inventory }, None)
                 }
+                WorkerRequest::AneAdmitPacked {
+                    req_id,
+                    model_ref,
+                    program_revision,
+                } => {
+                    anyhow::ensure!(
+                        program_revision == synapse_core::PACKED_PROGRAM_REVISION,
+                        "unsupported_request"
+                    );
+                    let model = models.get(&model_ref).context("model_not_loaded")?;
+                    if !packed.contains_key(&model_ref) {
+                        let program = model.compile_tight_packing(synapse_core::PACKED_WIDTH)?;
+                        packed.insert(model_ref.clone(), program);
+                    }
+                    let inventory = synapse_core::AnePlacementInventory {
+                        executables: (0..packed[&model_ref].executable_count())
+                            .map(|layer| synapse_core::AneExecutable {
+                                id: format!("tight256-r{program_revision}-layer{layer}"),
+                                layers: vec![layer as u32],
+                            })
+                            .collect(),
+                        cpu_stages: vec!["embedding_gather".into(), "final_rms_l2".into()],
+                    };
+                    (WorkerResponse::Admitted { req_id, inventory }, None)
+                }
+                WorkerRequest::AneEvictPacked {
+                    req_id,
+                    model_ref,
+                    program_revision,
+                } => {
+                    anyhow::ensure!(
+                        program_revision == synapse_core::PACKED_PROGRAM_REVISION,
+                        "unsupported_request"
+                    );
+                    drop(packed.remove(&model_ref));
+                    (WorkerResponse::Evicted { req_id }, None)
+                }
                 WorkerRequest::AneEvictShape {
                     req_id,
                     model_ref,
@@ -306,6 +358,35 @@ fn request_loop<S: Read + Write>(
                     )?;
                     (WorkerResponse::Scores { req_id }, Some(scores))
                 }
+                WorkerRequest::EmbedPacked {
+                    req_id,
+                    model_ref,
+                    program_revision,
+                    items,
+                    passes,
+                } => {
+                    anyhow::ensure!(
+                        program_revision == synapse_core::PACKED_PROGRAM_REVISION,
+                        "unsupported_request"
+                    );
+                    let model = models.get(&model_ref).context("model_not_loaded")?;
+                    let program = packed.get(&model_ref).context("shape_not_admitted")?;
+                    let vectors = packed_sequences(
+                        model,
+                        program,
+                        &items.iter().map(|i| i.n_tokens).collect::<Vec<_>>(),
+                        &passes,
+                        raw.as_deref().unwrap(),
+                    )?;
+                    (
+                        WorkerResponse::Vectors {
+                            req_id,
+                            dims: model.profile.n("hidden_size"),
+                            n: items.len(),
+                        },
+                        Some(vectors),
+                    )
+                }
                 WorkerRequest::Ping { req_id } => (
                     WorkerResponse::Pong {
                         req_id,
@@ -325,6 +406,7 @@ fn request_loop<S: Read + Write>(
                     None,
                 ),
                 WorkerRequest::Unload { req_id, model_ref } => {
+                    drop(packed.remove(&model_ref));
                     models.remove(&model_ref).context("model_not_loaded")?;
                     (WorkerResponse::Unloaded { req_id }, None)
                 }
@@ -340,13 +422,59 @@ fn request_loop<S: Read + Write>(
             })
         })();
         let (response, output) =
-            result.unwrap_or_else(|e| (error(req_id.clone(), &e.to_string()), None));
+            result.unwrap_or_else(|e| (request_error(req_id.clone(), &e), None));
         write_json_frame(stream, &response, max)?;
         if let Some(output) = output {
             write_frame(stream, &encode_f32_frame(&output), max)?;
         }
         profile.finish(serde_json::json!({"kind":"request", "req_id":req_id}));
     }
+}
+fn packed_sequences(
+    model: &Model,
+    program: &crate::multirow::tight::TightProgram,
+    sizes: &[usize],
+    passes: &[Vec<usize>],
+    raw: &[u8],
+) -> Result<Vec<f32>> {
+    synapse_core::validate_packed_passes(sizes, passes)?;
+    let tokens = decode_i32_frame(raw)?;
+    let total = sizes
+        .iter()
+        .try_fold(0usize, |n, &v| n.checked_add(v))
+        .context("invalid_request")?;
+    anyhow::ensure!(total == tokens.len(), "invalid_request");
+    let tokens = tokens
+        .into_iter()
+        .map(u32::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let hidden = model.profile.n("hidden_size");
+    let vocabulary = model
+        .tensor(&format!("{}embed_tokens.weight", model.profile.prefix()))?
+        .len()
+        / hidden;
+    // Check every token before running the first pass, not while gathering a later pass.
+    anyhow::ensure!(
+        tokens.iter().all(|&id| (id as usize) < vocabulary),
+        "invalid_token"
+    );
+    let mut offset = 0;
+    let rows: Vec<_> = sizes
+        .iter()
+        .map(|&size| {
+            let row = &tokens[offset..offset + size];
+            offset += size;
+            row
+        })
+        .collect();
+    let mut output = vec![0.0; hidden * rows.len()];
+    for pass in passes {
+        let vectors = program.run(model, &pass.iter().map(|&i| rows[i]).collect::<Vec<_>>())?;
+        for (&index, vector) in pass.iter().zip(vectors) {
+            output[index * hidden..(index + 1) * hidden].copy_from_slice(&vector);
+        }
+    }
+    Ok(output)
 }
 fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
     let mut profile = crate::profile::LaneProfile::new();
@@ -394,6 +522,110 @@ pub(crate) fn test_private_api() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run the signed development test binary with `ANE_TEST_PACKAGES` pointing
+    /// at checksum-pinned converted packages. The global Neural Engine process
+    /// lock prevents these test programs from overlapping another ANE workload.
+    #[test]
+    #[ignore = "requires macOS ANE hardware and the pinned Qwen embedding package"]
+    fn packed_fixture_v1_is_bit_identical_to_standalone_and_rotary_constants() {
+        let lock_path = PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+            .join("Library/Caches/ck-synapse/ane-direct.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        lock.try_lock()
+            .expect("another process holds the global ANE lane lock");
+        private_api().unwrap();
+        crate::multirow::tight::tests::runtime_rope_coefficients_match_actual_graph_constant_bits();
+        let profile = Profile::select("qwen3-embedding-0.6b.ane-direct-worker", "embed").unwrap();
+        let digest = profile.numeric["converted_package_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let path = PathBuf::from(std::env::var_os("ANE_TEST_PACKAGES").expect("ANE_TEST_PACKAGES"))
+            .join("qwen3-embedding-0.6b.safetensors");
+        let mut model = Model::load(profile, &path, &digest).unwrap();
+        let fixtures = synapse_core::packed_qualification_fixtures_v1();
+        let mut references = Vec::new();
+        for fixture in &fixtures {
+            let mut vectors = Vec::new();
+            for row in fixture {
+                model
+                    .admit(
+                        crate::backend::rung(row.len()).unwrap(),
+                        &os_build().unwrap(),
+                    )
+                    .unwrap();
+                vectors.push(model.run(row).unwrap());
+            }
+            references.push(vectors);
+        }
+        model.evict(512);
+        let program = model
+            .compile_tight_packing(synapse_core::PACKED_WIDTH)
+            .unwrap();
+        assert_eq!(program.executable_count(), 28);
+        for (fixture, reference) in fixtures.iter().zip(references) {
+            let lengths = fixture.iter().map(Vec::len).collect::<Vec<_>>();
+            let plan = synapse_core::plan_packed(&lengths).unwrap();
+            let mut indices = plan.passes.iter().flatten().copied().collect::<Vec<_>>();
+            indices.sort_unstable();
+            let passes = plan
+                .passes
+                .iter()
+                .map(|pass| {
+                    pass.iter()
+                        .map(|i| indices.binary_search(i).unwrap())
+                        .collect()
+                })
+                .collect::<Vec<Vec<usize>>>();
+            let ids = indices
+                .iter()
+                .flat_map(|&i| fixture[i].iter().map(|&id| id as i32))
+                .collect::<Vec<_>>();
+            let sizes = indices.iter().map(|&i| lengths[i]).collect::<Vec<_>>();
+            let raw = synapse_core::encode_i32_frame(&ids);
+            let vectors = packed_sequences(&model, &program, &sizes, &passes, &raw).unwrap();
+            for (&index, vector) in indices
+                .iter()
+                .zip(vectors.chunks_exact(model.profile.n("hidden_size")))
+            {
+                assert!(
+                    vector
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .eq(reference[index].iter().map(|v| v.to_bits())),
+                    "qualification-v1 packed row {index}, length {}",
+                    lengths[index]
+                );
+            }
+            for index in plan.singles {
+                if lengths[index] > 256 {
+                    model.evict(256);
+                }
+                model
+                    .admit(
+                        crate::backend::rung(lengths[index]).unwrap(),
+                        &os_build().unwrap(),
+                    )
+                    .unwrap();
+                let vector = model.run(&fixture[index]).unwrap();
+                assert!(
+                    vector
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .eq(reference[index].iter().map(|v| v.to_bits())),
+                    "qualification-v1 standalone fallback row {index}"
+                );
+            }
+        }
+    }
     use synapse_core::worker_framing_sync::write_json_frame;
     struct Duplex {
         input: io::Cursor<Vec<u8>>,

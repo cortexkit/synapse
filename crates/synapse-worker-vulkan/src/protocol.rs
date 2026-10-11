@@ -37,6 +37,7 @@ pub fn hello(nonce: &str) -> WorkerHello {
         },
         manifest_digest: Some(MANIFEST_DIGEST.into()),
         kernel_revision: Some(KERNEL_REVISION.into()),
+        packed: None,
     }
 }
 

@@ -63,6 +63,168 @@ pub struct WorkerHello {
     /// omitted by the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_revision: Option<String>,
+    /// Optional packed-execution capability, outside the hashed EngineIdentity.
+    /// Legacy v2 peers omit it and must receive standalone requests only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed: Option<PackedCapability>,
+}
+
+pub const PACKED_WIDTH: usize = 256;
+pub const PACKED_PROGRAM_REVISION: u32 = 1;
+
+/// Version-one fixtures compare packed embedding output with standalone output.
+/// Rows end at and cross the 128-column attention tile boundary; repeated and
+/// reordered rows test scattering, and a 257-token row tests standalone fallback.
+pub fn packed_qualification_fixtures_v1() -> Vec<Vec<Vec<u32>>> {
+    let row = |len: usize, seed: u32| {
+        (0..len)
+            .map(|i| 16 + (seed + i as u32 * 7) % 1000)
+            .collect::<Vec<_>>()
+    };
+    vec![
+        vec![row(127, 1), row(129, 2), row(1, 3), row(255, 4)],
+        vec![
+            row(128, 5),
+            row(128, 6),
+            row(129, 7),
+            row(126, 8),
+            row(1, 9),
+        ],
+        vec![
+            row(127, 1),
+            row(257, 10),
+            row(127, 1),
+            row(129, 2),
+            row(1, 3),
+            row(256, 11),
+        ],
+    ]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackedCapability {
+    pub width: usize,
+    pub program_revision: u32,
+}
+
+impl PackedCapability {
+    pub fn tight256() -> Self {
+        Self {
+            width: PACKED_WIDTH,
+            program_revision: PACKED_PROGRAM_REVISION,
+        }
+    }
+}
+
+/// Indices are in the request's original row order; each inner list is one pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackedPlan {
+    pub passes: Vec<Vec<usize>>,
+    pub singles: Vec<usize>,
+}
+
+/// Portable first-fit-decreasing planning, with original index breaking ties.
+/// A short row alone gains nothing from packing and stays at its natural rung.
+pub fn plan_packed(lengths: &[usize]) -> Result<PackedPlan, RawFrameError> {
+    if lengths.contains(&0) {
+        return Err(RawFrameError::new("empty_row"));
+    }
+    let mut order: Vec<_> = (0..lengths.len()).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(lengths[i]), i));
+    let mut plan = PackedPlan::default();
+    let mut used = Vec::<usize>::new();
+    for index in order {
+        if lengths[index] > PACKED_WIDTH {
+            plan.singles.push(index);
+        } else if let Some(pass) = used
+            .iter()
+            .position(|&n| n + lengths[index] <= PACKED_WIDTH)
+        {
+            used[pass] += lengths[index];
+            plan.passes[pass].push(index);
+        } else {
+            used.push(lengths[index]);
+            plan.passes.push(vec![index]);
+        }
+    }
+    plan.passes.retain(|pass| {
+        if pass.len() == 1 && lengths[pass[0]] <= 128 {
+            plan.singles.push(pass[0]);
+            false
+        } else {
+            true
+        }
+    });
+    plan.singles.sort_unstable();
+    Ok(plan)
+}
+
+/// Validate all pass boundaries before any executable is dispatched. Execution
+/// requests contain packed rows only, so every row must occur exactly once.
+pub fn validate_packed_passes(
+    lengths: &[usize],
+    passes: &[Vec<usize>],
+) -> Result<(), RawFrameError> {
+    if lengths.is_empty() || lengths.contains(&0) || passes.is_empty() {
+        return Err(RawFrameError::new("empty_packed_plan"));
+    }
+    let mut seen = vec![false; lengths.len()];
+    for pass in passes {
+        if pass.is_empty() {
+            return Err(RawFrameError::new("empty_pass"));
+        }
+        let mut used = 0usize;
+        for &index in pass {
+            let length = lengths
+                .get(index)
+                .ok_or_else(|| RawFrameError::new("invalid_row_index"))?;
+            if seen[index] {
+                return Err(RawFrameError::new("duplicate_row"));
+            }
+            seen[index] = true;
+            used = used
+                .checked_add(*length)
+                .ok_or_else(|| RawFrameError::new("packed_length_overflow"))?;
+        }
+        if used > PACKED_WIDTH {
+            return Err(RawFrameError::new("packed_rows_too_wide"));
+        }
+    }
+    if seen.contains(&false) {
+        return Err(RawFrameError::new("missing_row"));
+    }
+    Ok(())
+}
+
+/// Real queries attend causally inside their segment. Padding queries attend
+/// themselves to keep softmax finite. Rotary positions restart in each segment.
+pub fn packed_mask_positions(
+    lengths: &[usize],
+    width: usize,
+) -> Result<(Vec<f32>, Vec<usize>), RawFrameError> {
+    let total = lengths
+        .iter()
+        .try_fold(0usize, |n, &v| n.checked_add(v))
+        .ok_or_else(|| RawFrameError::new("packed_length_overflow"))?;
+    if lengths.is_empty() || lengths.contains(&0) || total > width || width > 512 {
+        return Err(RawFrameError::new("invalid_segment_lengths"));
+    }
+    let mut mask = vec![-10_000.0; width * width];
+    let mut positions = vec![0; width];
+    let mut start = 0;
+    for &length in lengths {
+        for q in start..start + length {
+            positions[q] = q - start;
+            for k in start..=q {
+                mask[q * width + k] = 0.0;
+            }
+        }
+        start += length;
+    }
+    for q in total..width {
+        mask[q * width + q] = 0.0;
+    }
+    Ok((mask, positions))
 }
 
 /// The manifest digest and kernel revision a host requires from an owned
@@ -217,6 +379,24 @@ pub enum WorkerRequest {
         normalize: bool,
         items: Vec<WorkerTokenItem>,
     },
+    /// One raw i32 frame in original row order, with explicit pass boundaries.
+    EmbedPacked {
+        req_id: String,
+        model_ref: String,
+        program_revision: u32,
+        items: Vec<WorkerTokenItem>,
+        passes: Vec<Vec<usize>>,
+    },
+    AneAdmitPacked {
+        req_id: String,
+        model_ref: String,
+        program_revision: u32,
+    },
+    AneEvictPacked {
+        req_id: String,
+        model_ref: String,
+        program_revision: u32,
+    },
     Rerank {
         req_id: String,
         model_ref: String,
@@ -268,6 +448,9 @@ impl WorkerRequest {
         match self {
             Self::Load { .. } => "LOAD",
             Self::EmbedBatch { .. } => "EMBED_BATCH",
+            Self::EmbedPacked { .. } => "EMBED_PACKED",
+            Self::AneAdmitPacked { .. } => "ANE_ADMIT_PACKED",
+            Self::AneEvictPacked { .. } => "ANE_EVICT_PACKED",
             Self::Rerank { .. } => "RERANK",
             Self::RerankSequences { .. } => "RERANK_SEQUENCES",
             Self::AneAdmitShape { .. } => "ANE_ADMIT_SHAPE",
@@ -283,6 +466,9 @@ impl WorkerRequest {
         match self {
             Self::Load { req_id, .. }
             | Self::EmbedBatch { req_id, .. }
+            | Self::EmbedPacked { req_id, .. }
+            | Self::AneAdmitPacked { req_id, .. }
+            | Self::AneEvictPacked { req_id, .. }
             | Self::Rerank { req_id, .. }
             | Self::RerankSequences { req_id, .. }
             | Self::AneAdmitShape { req_id, .. }
@@ -301,6 +487,7 @@ impl WorkerRequest {
         matches!(
             self,
             Self::EmbedBatch { .. }
+                | Self::EmbedPacked { .. }
                 | Self::Rerank { .. }
                 | Self::RerankSequences { .. }
                 | Self::Generate { .. }
@@ -452,6 +639,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_planner_boundaries_ties_occurrences_and_order_restoration() {
+        let lengths = [1, 127, 128, 129, 255, 256, 257];
+        let plan = plan_packed(&lengths).unwrap();
+        assert_eq!(plan.passes, vec![vec![5], vec![4, 0], vec![3, 1]]);
+        assert_eq!(plan.singles, vec![2, 6]);
+        let mut occurrences = vec![0; lengths.len()];
+        let mut restored = vec![0; lengths.len()];
+        for &index in plan.passes.iter().flatten().chain(&plan.singles) {
+            occurrences[index] += 1;
+            restored[index] = lengths[index];
+        }
+        assert_eq!(occurrences, vec![1; lengths.len()]);
+        assert_eq!(restored, lengths);
+        assert_eq!(
+            plan_packed(&[128, 128, 128, 128]).unwrap().passes,
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        assert_eq!(plan_packed(&[1]).unwrap().singles, vec![0]);
+        assert!(plan_packed(&[0]).is_err());
+    }
+
+    #[test]
+    fn packed_masks_match_independent_segment_oracle() {
+        for lengths in [
+            vec![1, 127, 128],
+            vec![127, 129],
+            vec![129, 126, 1],
+            vec![255, 1],
+            vec![256],
+            vec![128, 1],
+        ] {
+            let owners: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .flat_map(|(segment, &len)| (0..len).map(move |position| (segment, position)))
+                .collect();
+            let (mask, positions) = packed_mask_positions(&lengths, 256).unwrap();
+            for q in 0..256 {
+                assert_eq!(positions[q], owners.get(q).map_or(0, |&(_, pos)| pos));
+                for k in 0..256 {
+                    let allowed = match (owners.get(q), owners.get(k)) {
+                        (Some(&(sq, pq)), Some(&(sk, pk))) => sq == sk && pk <= pq,
+                        (None, _) => q == k,
+                        _ => false,
+                    };
+                    assert_eq!(
+                        mask[q * 256 + k],
+                        if allowed { 0.0 } else { -10_000.0 },
+                        "lengths={lengths:?} q={q} k={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_plan_validation_rejects_whole_invalid_plan() {
+        assert!(validate_packed_passes(&[127, 129], &[vec![1, 0]]).is_ok());
+        for passes in [
+            vec![vec![0]],
+            vec![vec![0, 0, 1]],
+            vec![vec![0, 2]],
+            vec![vec![], vec![0, 1]],
+        ] {
+            assert!(validate_packed_passes(&[127, 129], &passes).is_err());
+        }
+        assert!(validate_packed_passes(&[257], &[vec![0]]).is_err());
+    }
+
+    #[test]
+    fn packed_requests_have_distinct_wire_tags_and_raw_frame() {
+        let request = WorkerRequest::EmbedPacked {
+            req_id: "packed".into(),
+            model_ref: "model".into(),
+            program_revision: 1,
+            items: vec![
+                WorkerTokenItem {
+                    id: "a".into(),
+                    n_tokens: 127,
+                },
+                WorkerTokenItem {
+                    id: "b".into(),
+                    n_tokens: 129,
+                },
+            ],
+            passes: vec![vec![1, 0]],
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WorkerRequest>(&bytes).unwrap(),
+            request
+        );
+        assert_eq!(request.wire_type(), "EMBED_PACKED");
+        assert!(request.carries_raw_frame());
+        assert_eq!(request.req_id(), Some("packed"));
+        for request in [
+            WorkerRequest::AneAdmitPacked {
+                req_id: "admit".into(),
+                model_ref: "model".into(),
+                program_revision: 1,
+            },
+            WorkerRequest::AneEvictPacked {
+                req_id: "evict".into(),
+                model_ref: "model".into(),
+                program_revision: 1,
+            },
+        ] {
+            assert!(!request.carries_raw_frame());
+            assert_eq!(
+                serde_json::from_slice::<WorkerRequest>(&serde_json::to_vec(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v2_hello_bytes_and_binding_are_unchanged_by_capability() {
+        let bytes = br#"{"v":2,"nonce":"legacy","engine":{"engine":"ane-direct-worker","version":"0.1.0"},"pid":42,"max_frame":16777216,"manifest_digest":"manifest","kernel_revision":"ane-direct-graph-v1"}"#;
+        let mut hello: WorkerHello = serde_json::from_slice(bytes).unwrap();
+        assert!(hello.packed.is_none());
+        assert_eq!(serde_json::to_vec(&hello).unwrap(), bytes);
+        let expected = ExpectedHelloBinding {
+            manifest_digest: "manifest".into(),
+            kernel_revision: "ane-direct-graph-v1".into(),
+        };
+        check_hello_binding(&hello, Some(&expected)).unwrap();
+        let refusal = check_hello_binding(&hello, Some(&binding())).unwrap_err();
+        hello.packed = Some(PackedCapability::tight256());
+        check_hello_binding(&hello, Some(&expected)).unwrap();
+        assert_eq!(
+            check_hello_binding(&hello, Some(&binding())).unwrap_err(),
+            refusal
+        );
+        let original_engine = serde_json::to_vec(&hello.engine).unwrap();
+        hello.packed = None;
+        assert_eq!(serde_json::to_vec(&hello.engine).unwrap(), original_engine);
+    }
+
+    #[test]
     fn raw_i32_frames_round_trip() {
         let values = [-1, 0, 42, i32::MAX];
         assert_eq!(
@@ -525,6 +852,7 @@ mod tests {
             max_frame: DEFAULT_MAX_FRAME_BYTES,
             manifest_digest: manifest.map(str::to_owned),
             kernel_revision: revision.map(str::to_owned),
+            packed: None,
         }
     }
 

@@ -211,6 +211,7 @@ pub fn main() -> Result<()> {
         // The llama worker is not bound to the model manifest.
         manifest_digest: None,
         kernel_revision: None,
+        packed: None,
     };
     run_worker_loop(args, hello)?;
     Ok(())
@@ -416,6 +417,9 @@ fn worker_request_loop<S: Read + Write>(
             // the raw frame a refused request carries so the connection stays
             // usable.
             unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::EmbedPacked { .. }
+            | WorkerRequest::AneAdmitPacked { .. }
+            | WorkerRequest::AneEvictPacked { .. }
             | WorkerRequest::AneAdmitShape { .. }
             | WorkerRequest::AneEvictShape { .. }) => {
                 if unsupported.carries_raw_frame() {

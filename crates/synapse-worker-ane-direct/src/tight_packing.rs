@@ -1,6 +1,9 @@
-//! Opt-in variable-length width packing for Qwen3. Every pass supplies a
-//! block-causal mask and rotary tables as runtime IOSurface inputs; the fixed
-//! width is compiled, but segment boundaries are not. No serving path calls it.
+//! Opt-in variable-length width packing for Qwen3. Each execution concatenates
+//! rows into one fixed-width tensor and supplies a block-causal mask and rotary
+//! tables as runtime IOSurface inputs. Compilation fixes the tensor width, not
+//! the row boundaries. Serving compiles the packed program separately from the
+//! single-row kernel and verifies bit-identical output on fixed fixtures before
+//! planning requests against the packed program.
 use super::*;
 use crate::backend::Profile;
 
@@ -70,21 +73,7 @@ pub fn runtime_operands(
         .context("packed_length_overflow")?;
     ensure!(total <= width, "packed_rows_too_wide");
     ensure!(dim > 0 && dim.is_multiple_of(2), "invalid_head_dim");
-    let mut mask = vec![MASKED; width * width];
-    let mut positions = vec![0; width];
-    let mut start = 0;
-    for &length in lengths {
-        for q in start..start + length {
-            positions[q] = q - start;
-            for k in start..=q {
-                mask[q * width + k] = 0.0;
-            }
-        }
-        start += length;
-    }
-    for q in total..width {
-        mask[q * width + q] = 0.0;
-    }
+    let (mask, positions) = synapse_core::packed_mask_positions(lengths, width)?;
     let (base_cos, base_sin) = crate::modernbert::rope_tables(width, dim, theta);
     let mut cos = vec![0.0; dim * width];
     let mut sin = cos.clone();
@@ -329,11 +318,9 @@ impl Model {
             let mut executables = Vec::new();
             for layer in 0..self.profile.n("num_hidden_layers") {
                 let (graph, _) = build_graph(self, layer, width, &mode)?;
-                executables.push(
-                    graph
-                        .compile(NSQualityOfService::UserInteractive)
-                        .with_context(|| format!("tight layer {layer}"))?,
-                );
+                executables.push(compile_layer(&graph, layer, |graph| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })?);
             }
             Ok(TightProgram {
                 width,
@@ -347,6 +334,14 @@ impl Model {
             })
         })
     }
+}
+
+fn compile_layer(
+    graph: &Graph,
+    layer: usize,
+    compile: impl FnOnce(&Graph) -> std::result::Result<Executable, ane::Error>,
+) -> Result<Executable> {
+    compile(graph).with_context(|| format!("tight layer {layer}"))
 }
 
 impl TightProgram {
@@ -475,10 +470,47 @@ pub fn pack_tight(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
     #[test]
-    fn runtime_rope_coefficients_match_actual_graph_constant_bits() {
+    fn packed_compile_exhaustion_keeps_typed_wire_code_and_layer_context() {
+        let failure = compile_layer(&Graph::new(), 3, |_| {
+            Err(ane::Error::Load(
+                "no ANE resources (transient; retry)".into(),
+            ))
+        })
+        .err()
+        .unwrap();
+        let response = crate::worker::request_error(Some("packed-admit".into()), &failure);
+        match response {
+            synapse_core::WorkerResponse::Err { code, msg, .. } => {
+                assert_eq!(
+                    code, "ane_resources_exhausted",
+                    "packed resource exhaustion must keep its typed wire code"
+                );
+                assert!(
+                    msg.contains("tight layer 3") && msg.contains("no ANE resources"),
+                    "the diagnostic must retain layer and underlying compile context"
+                );
+            }
+            other => panic!("unexpected admission failure: {other:?}"),
+        }
+        for error in [
+            ane::Error::Load("unrelated load failure".into()),
+            ane::Error::Compile("no ANE resources".into()),
+            ane::Error::Evaluate("no ANE resources".into()),
+        ] {
+            let failure = compile_layer(&Graph::new(), 3, |_| Err(error))
+                .err()
+                .unwrap();
+            assert!(
+                matches!(crate::worker::request_error(None, &failure), synapse_core::WorkerResponse::Err { code, .. } if code != "ane_resources_exhausted")
+            );
+        }
+    }
+    #[test]
+    pub(crate) fn runtime_rope_coefficients_match_actual_graph_constant_bits() {
         for width in [256, 384, 512] {
             let (_, cos, sin) = runtime_operands(&[3, 17, 129], width, 128, 1_000_000.0).unwrap();
             for values in [cos, sin] {

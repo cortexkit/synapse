@@ -101,6 +101,26 @@ fn hosted_worker_hello_ping_unsupported_rerank_ping() {
     ping(&mut stream, "after");
     write_json_frame(
         &mut stream,
+        &WorkerRequest::EmbedPacked {
+            req_id: "unsupported-packed".into(),
+            model_ref: "none".into(),
+            program_revision: 1,
+            items: vec![synapse_core::WorkerTokenItem {
+                id: "row".into(),
+                n_tokens: 1,
+            }],
+            passes: vec![vec![0]],
+        },
+        DEFAULT_MAX_FRAME_BYTES,
+    )
+    .unwrap();
+    write_frame(&mut stream, &42i32.to_le_bytes(), DEFAULT_MAX_FRAME_BYTES).unwrap();
+    assert!(
+        matches!(read_json_frame::<_, WorkerResponse>(&mut stream, DEFAULT_MAX_FRAME_BYTES).unwrap(), WorkerResponse::Err { req_id, code, .. } if req_id.as_deref() == Some("unsupported-packed") && code == "unsupported_request")
+    );
+    ping(&mut stream, "after-packed");
+    write_json_frame(
+        &mut stream,
         &WorkerRequest::Load {
             req_id: "load".into(),
             artifact_path: "missing-model".into(),

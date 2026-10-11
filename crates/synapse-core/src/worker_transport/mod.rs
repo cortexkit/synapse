@@ -12,16 +12,18 @@ pub mod windows_client;
 #[cfg(unix)]
 pub use unix::{
     accept_worker_handshake, accept_worker_handshake_with_engine,
-    accept_worker_handshake_with_engine_and_protocol_version, bind_listener, handshake_on_stream,
-    handshake_on_stream_with_engine, handshake_on_stream_with_engine_and_protocol_version,
+    accept_worker_handshake_with_engine_and_protocol_version, accept_worker_handshake_with_hello,
+    bind_listener, handshake_on_stream, handshake_on_stream_with_engine,
+    handshake_on_stream_with_engine_and_protocol_version, handshake_on_stream_with_hello,
     prepare_listener, read_json, read_raw, write_json, write_raw, TransportError,
     WorkerTransportStream,
 };
 #[cfg(windows)]
 pub use windows::{
     accept_worker_handshake, accept_worker_handshake_with_engine,
-    accept_worker_handshake_with_engine_and_protocol_version, bind_listener, handshake_on_stream,
-    handshake_on_stream_with_engine, handshake_on_stream_with_engine_and_protocol_version,
+    accept_worker_handshake_with_engine_and_protocol_version, accept_worker_handshake_with_hello,
+    bind_listener, handshake_on_stream, handshake_on_stream_with_engine,
+    handshake_on_stream_with_engine_and_protocol_version, handshake_on_stream_with_hello,
     prepare_listener, read_json, read_raw, write_json, write_raw, TransportError,
     WorkerTransportStream,
 };
