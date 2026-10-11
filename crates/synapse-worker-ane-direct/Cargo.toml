@@ -36,3 +36,4 @@ tokenizers.workspace = true
 [build-dependencies]
 serde_json.workspace = true
 sha2.workspace = true
+synapse-build-stamp = { path = "../synapse-build-stamp" }

@@ -12,6 +12,8 @@ before they become production engines or workers.
 
 ## Major pieces
 
+**Build stamp helper** (`crates/synapse-build-stamp`). A standard-library-only Cargo build dependency that shares worktree-aware Git revision and clean/dirty stamping across module and worker build scripts.
+
 **`synapse-module`** (`crates/synapse-module`). The subc module and the only process
 consumers talk to. It registers the management operations, loads layered config
 (`SYNAPSE_CONFIG_PATH`, else `.cortexkit/synapse.jsonc` in the working directory,

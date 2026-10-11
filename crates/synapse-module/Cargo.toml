@@ -76,3 +76,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
+
+[build-dependencies]
+synapse-build-stamp = { path = "../synapse-build-stamp" }

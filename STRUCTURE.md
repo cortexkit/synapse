@@ -15,6 +15,7 @@ bench/                      benchmark and research tree
   spikes/                   research prototypes (unified-rt, ane-*, laya-owned, stt-bias)
 contracts/                  interface contracts and their validators
 crates/                     production Rust crates
+  synapse-build-stamp/       standard-library-only shared Git provenance build helper
   synapse-core/             shared types, engine traits, tokenizer, worker protocol, scheduler
   synapse-engine-cuda/      CUDA embedding engine (PTX kernel ports)
   synapse-engine-owned/     Metal embedding engine, Metal decode kernels, owned-decode supervisor (macOS)

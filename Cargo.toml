@@ -30,6 +30,7 @@ members = [
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
     "crates/synapse-core",
+    "crates/synapse-build-stamp",
     "crates/synapse-native-probe",
     "crates/synapse-certify",
     "crates/synapse-certify-runner",

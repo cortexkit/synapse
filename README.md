@@ -10,6 +10,7 @@ installation and automatic self-check. Unsupported hosts have no runnable catalo
 backend or CPU fallback; ONNX Runtime is bench-only. Decode routing is unchanged.
 See [the wire contract](docs/wire-contract-v1.md) for operations and migration.
 
+- `synapse-build-stamp`: standard-library-only build dependency for shared clean/dirty Git provenance stamps.
 - `synapse-core`: shared protocol, error, cache, fingerprint, scheduler, and tokenizer types.
 - `synapse-native-probe`: safe wrappers for the Windows system calls the machine profile reads (version, architecture, memory), keeping unsafe code out of `synapse-core`.
 - `synapse-certify`: daemon-free schema-2 records, self-check references and offline 32-combination candidate validator.

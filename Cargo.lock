@@ -6624,6 +6624,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-build-stamp"
+version = "0.1.0"
+
+[[package]]
 name = "synapse-certify"
 version = "0.1.0"
 dependencies = [
@@ -6728,6 +6732,7 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "syn 2.0.118",
+ "synapse-build-stamp",
  "synapse-certify",
  "synapse-core",
  "synapse-engine-owned",
@@ -6811,6 +6816,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-protocol",
+ "synapse-build-stamp",
  "synapse-core",
  "tokenizers 0.21.4",
 ]
