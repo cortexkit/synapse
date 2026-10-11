@@ -13,9 +13,6 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-ROWS = ('metal-m5', 'ane-m5', 'cuda-linux-nvidia', 'cuda-windows-nvidia',
-        'vulkan-linux-amd', 'vulkan-windows-amd', 'vulkan-linux-nvidia',
-        'vulkan-windows-nvidia')
 COMPETITORS = ('llama.cpp', 'lm-studio', 'ollama', 'tei')
 METRICS = ('throughput', 'p50', 'p95', 'peak_memory', 'cold_load')
 LANES = {'metal': 'owned-metal', 'ane': 'ane-direct-worker',
@@ -29,6 +26,15 @@ def require(condition, message):
 
 def load(path):
     return json.loads(Path(path).read_text())
+
+
+def release_checks(root):
+    spec = importlib.util.spec_from_file_location('release_checks', root / 'crates/synapse-release-checks/check.py')
+    if spec is None or spec.loader is None:
+        raise ValueError('release checker cannot be imported')
+    checks = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checks)
+    return checks
 
 
 def save(path, value):
@@ -190,18 +196,6 @@ def measure(adapter, base, config, row_fixture, memory_kind):
     return cell
 
 
-def dropped_cell(record):
-    cause = record['drop_cause']
-    require(record['row_id'] == 'ane-m5' and record['model'].startswith('qwen3-') and cause in ('parity', 'latency'), 'invalid drop')
-    result = {'row_id': record['row_id'], 'model': record['model'], 'runtime': 'synapse',
-              'status': 'dropped', 'drop_cause': cause, 'metrics': dict.fromkeys(METRICS), 'parity': record['parity']}
-    if cause == 'latency':
-        raw = record['raw_series']
-        require(summarize(raw['ane'])['median'] / summarize(raw['metal'])['median'] > 3, 'invalid latency drop')
-        result['raw_series'] = raw
-    return result
-
-
 def transition(config, manifest_digest, session, output):
     inputs = config['transition']['inputs']
     require(inputs['composed_length'] == 512, 'transition input must contain exactly 512 composed tokens')
@@ -228,7 +222,8 @@ def transition(config, manifest_digest, session, output):
 
 def run_row(config, root, output):
     row = config['row_id']
-    require(row in ROWS, 'unknown certification row')
+    checks = release_checks(root)
+    require(row in checks.ROW_BACKENDS, 'unknown certification row')
     manifest_path = root / 'bench/parity/models.json'
     manifest = load(manifest_path)
     digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -240,9 +235,16 @@ def run_row(config, root, output):
     require(memory_kind in ('footprint', 'rss_plus_device'), 'missing memory architecture')
     if row in ('metal-m5', 'ane-m5'):
         require(memory_kind == 'footprint', 'Apple rows use unified memory')
-    lane = LANES[row.split('-')[0]]
-    for model, definition in manifest['models'].items():
+    expected_cells = checks.catalog_cells(root)
+    lane = LANES[checks.ROW_BACKENDS[row]]
+    for cell_row, model in expected_cells:
+        if cell_row != row:
+            continue
+        definition = manifest['models'][model]
         shared = config['models'][model]
+        record = load(shared['certification_record'])
+        require(record['row_id'] == row and record['model'] == model and record['source_commit'] == config['source_commit'], 'wrong certification record')
+        require(record['status'] == 'passed', 'certification record must be passed')
         inputs = shared['inputs']
         input_digest = hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         for runtime in ('synapse',) + COMPETITORS:
@@ -254,11 +256,6 @@ def run_row(config, root, output):
             require(file_digest == cfg['file_sha256'], 'model file digest mismatch')
             if runtime != 'synapse':
                 require(file_digest == shared['f16_sha256'], 'competitors must share the same f16 file')
-            record = load(shared['certification_record'])
-            require(record['row_id'] == row and record['model'] == model and record['source_commit'] == config['source_commit'], 'wrong certification record')
-            if runtime == 'synapse' and record['status'] == 'dropped':
-                cells.append(dropped_cell(record))
-                continue
             base = {'source_commit': config['source_commit'], 'session_id': session, 'row_id': row,
                     'runtime': runtime, 'lane': lane, 'model': model, 'operation': definition['operation'],
                     'manifest_digest': digest, 'input_digest': input_digest, 'file': str(file),
@@ -268,35 +265,30 @@ def run_row(config, root, output):
     report = {'schema': 1, 'source_commit': config['source_commit'], 'manifest_digest': digest,
               'session_id': session, 'machine': config['machine'], 'cells': cells}
     save(output / f'{row}.json', report)
-    if row == 'ane-m5':
+    if (row, 'gte-modernbert-base') in expected_cells and row == 'ane-m5':
         transition(config, digest, session, output)
     return report
 
 
 def assemble(root, source, output):
-    reports = [load(output / f'{row}.json') for row in ROWS]
+    checks = release_checks(root)
+    cells = checks.catalog_cells(root)
+    rows = tuple(dict.fromkeys(row for row, _ in cells))
+    reports = [load(output / f'{row}.json') for row in rows]
     digest = hashlib.sha256((root / 'bench/parity/models.json').read_bytes()).hexdigest()
     require(all(r['source_commit'] == source and r['manifest_digest'] == digest for r in reports), 'mixed candidate/manifest')
-    cells = [c for r in reports for c in r['cells']]
-    expected = {(row, model, runtime) for row in ROWS for model in load(root / 'bench/parity/models.json')['models'] for runtime in ('synapse',) + COMPETITORS}
-    require(len(cells) == len(expected) and {(c['row_id'], c['model'], c['runtime']) for c in cells} == expected, 'incomplete or duplicate runtime matrix')
-    report = {'schema': 1, 'source_commit': source, 'manifest_digest': digest, 'cells': cells,
-              'sessions': [{'row_id': row, **{k: r[k] for k in ('session_id', 'machine')}} for row, r in zip(ROWS, reports)]}
-    spec = importlib.util.spec_from_file_location('release_checks', root / 'crates/synapse-release-checks/check.py')
-    if spec is None or spec.loader is None:
-        raise ValueError('release checker cannot be imported')
-    checks = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(checks)
-    # The release checker matches drops by row and model, ignoring runtime.
-    # Validate owned cells with drop records and competitors with support probes.
-    records = [{'row_id': c['row_id'], 'model': c['model'], 'status': 'dropped'} for c in cells if c['status'] == 'dropped']
-    checks.benchmark({'cells': [c for c in cells if c['runtime'] == 'synapse']}, records)
+    reported = [c for r in reports for c in r['cells']]
+    expected = {(row, model, runtime) for row, model in cells for runtime in ('synapse',) + COMPETITORS}
+    require(len(reported) == len(expected) and {(c['row_id'], c['model'], c['runtime']) for c in reported} == expected, 'incomplete or duplicate runtime matrix')
+    report = {'schema': 1, 'source_commit': source, 'manifest_digest': digest,
+              'sessions': [{'row_id': row, **{k: r[k] for k in ('session_id', 'machine')}} for row, r in zip(rows, reports)]}
+    owned = [c for c in reported if c['runtime'] == 'synapse']
+    checks.benchmark({'cells': owned}, cells)
     for runtime in COMPETITORS:
-        checks.benchmark({'cells': [c for c in cells if c['runtime'] == runtime]}, [])
-    # Only owned cells go in cells: the release checker applies owned drop
-    # records to that array. Competitor support remains independently validated.
-    report['competitors'] = {runtime: [c for c in cells if c['runtime'] == runtime] for runtime in COMPETITORS}
-    report['cells'] = [c for c in cells if c['runtime'] == 'synapse']
+        checks.benchmark({'cells': [c for c in reported if c['runtime'] == runtime]}, cells)
+    # Keep owned measurements separate from independently validated competitor support.
+    report['competitors'] = {runtime: [c for c in reported if c['runtime'] == runtime] for runtime in COMPETITORS}
+    report['cells'] = owned
     save(output / 'report.json', report)
     return report
 
