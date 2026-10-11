@@ -2,9 +2,11 @@
 
 ## Reproduction
 
-At `f1149e55ea631e70496d4310e1e32a50023ee408`, a signed release
-module serving the catalog lane `gte-reranker-modernbert-base-metal` returned
-raw logits under pin
+The task-base revision `f1149e55ea631e70496d4310e1e32a50023ee408` has identical
+serving-module source, owned-engine source, and catalog data to the provided
+signed release at `d08bf55c4d5bc479baa7729bf6891fed5e24fbe2` used for reproduction
+(verified with `git diff --exit-code` on those paths). That release served the
+catalog lane `gte-reranker-modernbert-base-metal` as raw logits under pin
 `6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9`.
 The ignored `catalog_metal_rerank_fixture_readout_probe` downloads from a local
 pinned mirror, loads through the catalog, and calls `rerank.score` with the first
@@ -83,6 +85,31 @@ catalog pins remain unchanged. Legacy `gte-reranker-modernbert-base-f32` retains
 Portable module tests replay the independently captured native head bytes for
 fixed fixture token inputs through the real execution boundary. They verify the
 legacy bytes/fingerprint, all six catalog rerank lanes across Metal/ANE/CUDA/Vulkan,
-and actual native lane pin construction. The ignored Metal engine test also
-checks the legacy head's exact bytes against original weights. The portable
-Qwen3 ANE golden bytes and golden test remain unchanged.
+and numeric fingerprints computed through the production lane constructor. The
+ignored Metal engine test replays
+that same catalog checkpoint through the ordinary legacy loader and checks its
+exact raw-head bytes; the production legacy fingerprint is pinned independently
+by the frozen preload fixture. No production store or production checkpoint is
+read. The unchanged portable Qwen3 ANE golden bytes and golden test guard against
+accidentally changing an unrelated catalog backend's numeric identity.
+
+## Release verification
+
+A clean-stamped, signed release candidate built from fix commit
+`6b9674c78863eee9a74896a96096d98830df7c40` passed the
+`metal-m5/gte-reranker-modernbert-base` certification cell, covering all sealed
+score/token fixtures, ranking pools, and sequence-length admission checks:
+
+- `status=passed`, 125 of 125 fixtures complete; score, ranking, token semantics,
+  finiteness, dimensions and 8192-token coverage pass (all record gates true);
+- worst absolute score error `6.9141387939453125e-6`, below the fp32 `0.005` bound;
+- the 10- and 100-document ranking pools have Kendall tau `1.0` and top ten
+  matching the sealed fp32 reference rankings;
+- 8192 tokens processed without truncation/diversion; 8193 refused before execution.
+
+The short real-path probe also passed with `pool100-007` (candidate 7 in the
+100-document pool for the Vulkan GPU-selection query) returning exactly
+`0.976148784160614`, equal to its sealed reference (absolute error zero).
+The normalized certification record is retained at
+`docs/evidence/certification/6b9674c78863eee9a74896a96096d98830df7c40/metal-m5/gte-reranker-modernbert-base.json`.
+Only the structured record is committed, not raw runtime logs or machine paths.

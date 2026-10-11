@@ -1,10 +1,11 @@
 use super::*;
 
 const CASE_IDS: [&str; 4] = ["pool100-000", "pool100-007", "pool100-042", "pool100-063"];
-// Raw scores captured at source revision f1149e55 from the native ModernBERT
-// head for pool100-000/007/042/063 in the first 64-candidate parity fixture request.
-// Native catalog and legacy loads share that raw head. The replay checks that
-// the module preserves those exact bytes when serving the legacy lane.
+// Raw scores captured from signed release revision d08bf55c (whose serving code
+// matches task-base revision f1149e55) for pool100-000/007/042/063 in the first
+// 64-candidate parity fixture request. Native catalog and legacy loads share
+// that raw head. The replay checks that the module preserves those exact bytes
+// when serving the legacy lane.
 const MASTER_LOGITS: [f32; 4] = [3.311_804_3, 3.711_782, -0.079_588_935, 0.104_514_48];
 const MASTER_LOGIT_BYTES: [u8; 16] = [
     154, 244, 83, 64, 214, 141, 109, 64, 134, 255, 162, 189, 176, 11, 214, 61,
