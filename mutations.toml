@@ -1155,3 +1155,57 @@ expect_message = "vulkan"
 only = false
 timeout_s = 120
 build_timeout_s = 1800
+
+
+[[control]]
+id = "benchmark-producer-owned-validation"
+guards = "Owned benchmark cells cannot bypass the release validator and accept dropped status"
+file = "bench/harness/release_matrix.py"
+old = "checks.benchmark({'cells': owned}, cells)"
+new = "pass  # NON-VACUITY BREAK: skip owned benchmark validation"
+edits = []
+test_file = "bench/harness/test_release_matrix.py"
+runner = "command"
+command = ["python3", "-c", 'import subprocess,sys,unittest; print("MUTATION DIFF STAT:", flush=True); print(subprocess.check_output(["git","diff","--stat"]).decode(), flush=True); sys.path.insert(0,"bench/harness"); unittest.main(module=None, argv=["unittest",sys.argv[1]], verbosity=2)', "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["test_release_matrix.ProducerTests.test_assembled_matrix_refuses_dropped_owned_cell"]
+expect_message = "ValueError not raised"
+only = false
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "benchmark-producer-competitor-validation"
+guards = "Every competitor runtime must independently satisfy the release benchmark validator"
+file = "bench/harness/release_matrix.py"
+old = "checks.benchmark({'cells': [c for c in reported if c['runtime'] == runtime]}, cells)"
+new = "pass  # NON-VACUITY BREAK: skip competitor benchmark validation"
+edits = []
+test_file = "bench/harness/test_release_matrix.py"
+runner = "command"
+command = ["python3", "-c", 'import subprocess,sys,unittest; print("MUTATION DIFF STAT:", flush=True); print(subprocess.check_output(["git","diff","--stat"]).decode(), flush=True); sys.path.insert(0,"bench/harness"); unittest.main(module=None, argv=["unittest",sys.argv[1]], verbosity=2)', "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["test_release_matrix.ProducerTests.test_assembled_matrix_validates_each_competitor"]
+expect_message = "ValueError not raised"
+only = false
+timeout_s = 120
+build_timeout_s = 1800
+
+
+[[control]]
+id = "benchmark-producer-passed-record"
+guards = "A declared benchmark model requires a passing certification record before execution"
+file = "bench/harness/release_matrix.py"
+old = "require(record['status'] == 'passed', 'certification record must be passed')"
+new = "require(True, 'certification record must be passed')  # NON-VACUITY BREAK"
+edits = []
+test_file = "bench/harness/test_release_matrix.py"
+runner = "command"
+command = ["python3", "-c", 'import subprocess,sys,unittest; print("MUTATION DIFF STAT:", flush=True); print(subprocess.check_output(["git","diff","--stat"]).decode(), flush=True); sys.path.insert(0,"bench/harness"); unittest.main(module=None, argv=["unittest",sys.argv[1]], verbosity=2)', "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["test_release_matrix.ProducerTests.test_full_row_shared_files_and_precision_label"]
+expect_message = "ValueError not raised"
+only = false
+timeout_s = 120
+build_timeout_s = 1800
