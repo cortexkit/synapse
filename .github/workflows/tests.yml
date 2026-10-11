@@ -291,8 +291,15 @@ jobs:
         working-directory: synapse
         shell: bash
         run: |
+          # A restored Rust cache can carry cargo's install record for this rev
+          # while ~/.cargo/bin still holds an older ckdev-mutate, so cargo skips
+          # the install. Check the version and force a reinstall when it differs.
+          want='ckdev-mutate 0.10.0'
           cargo install --locked --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
-          ckdev-mutate --version
+          if [ "$(ckdev-mutate --version)" != "$want" ]; then
+            cargo install --locked --force --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+          fi
+          test "$(ckdev-mutate --version)" = "$want"
 
       - name: Replay touched mutation controls
         working-directory: synapse
