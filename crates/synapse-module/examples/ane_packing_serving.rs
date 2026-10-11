@@ -1029,7 +1029,7 @@ fn worker_proxy() -> Result<()> {
         .spawn()?;
     let result: Result<()> = (|| {
         let deadline = Instant::now() + Duration::from_secs(20);
-        let mut worker_stream = loop {
+        let worker_stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1042,6 +1042,7 @@ fn worker_proxy() -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         };
+        let mut worker_stream = blocking_worker_stream(worker_stream)?;
         let mut host = UnixStream::connect(host_socket)?;
         let mut log = std::fs::OpenOptions::new()
             .create(true)
@@ -1340,5 +1341,40 @@ mod relay_tests {
         assert!(log.contains("EMBED_PACKED"));
         assert!(!log.contains("secret"));
         assert_eq!(log.lines().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+fn blocking_worker_stream(
+    stream: std::os::unix::net::UnixStream,
+) -> Result<std::os::unix::net::UnixStream> {
+    // BSD can inherit the listener's nonblocking flag on accepted sockets;
+    // read_exact must wait for a complete worker frame rather than return EAGAIN.
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+#[cfg(all(test, unix))]
+mod socket_mode_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+    };
+    #[test]
+    fn worker_stream_waits_for_frames_after_inheriting_nonblocking_mode() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = blocking_worker_stream(reader).unwrap();
+        let peer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.write_all(b"x").unwrap();
+        });
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        peer.join().unwrap();
     }
 }
