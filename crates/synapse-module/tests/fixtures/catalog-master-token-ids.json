@@ -1,0 +1,678 @@
+{
+  "cases": [
+    {
+      "case": "short",
+      "lane_id": "gte-modernbert-base-metal",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "gte-modernbert-base-metal",
+        "text": "The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "gte-modernbert-base-metal",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "gte-modernbert-base-metal"
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "gte-modernbert-base-metal",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "gte-modernbert-base-metal",
+        "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "gte-modernbert-base-metal",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "gte-modernbert-base-metal"
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "gte-modernbert-base-ane",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "gte-modernbert-base-ane",
+        "text": "The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "gte-modernbert-base-ane",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "gte-modernbert-base-ane"
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "gte-modernbert-base-ane",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "gte-modernbert-base-ane",
+        "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "gte-modernbert-base-ane",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "gte-modernbert-base-ane"
+      },
+      "token_ids": [
+        [
+          50281, 510, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380,
+          3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253,
+          22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516,
+          30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370,
+          15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287,
+          689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "gte-reranker-modernbert-base-metal",
+      "method": "rerank.score",
+      "params": {
+        "candidates": [
+          "The quick brown fox jumps over the lazy dog."
+        ],
+        "deadline_ms": 30000,
+        "model": "gte-reranker-modernbert-base-metal",
+        "query": "What is a vector database?"
+      },
+      "token_ids": [
+        [
+          50281, 1276, 310, 247, 4972, 5447, 32, 50282, 510, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "gte-reranker-modernbert-base-metal",
+      "method": "rerank.score",
+      "params": {
+        "candidates": [
+          "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+        ],
+        "deadline_ms": 30000,
+        "model": "gte-reranker-modernbert-base-metal",
+        "query": "What is a vector database?"
+      },
+      "token_ids": [
+        [
+          50281, 1276, 310, 247, 4972, 5447, 32, 50282, 510, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013,
+          27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15,
+          380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689,
+          253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158,
+          8516, 30013, 27287, 689, 253, 22658, 4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658,
+          4370, 15, 380, 3158, 8516, 30013, 27287, 689, 253, 22658, 4370, 15, 50282
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "qwen3-embedding-0.6b-metal",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "qwen3-embedding-0.6b-metal",
+        "text": "The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "qwen3-embedding-0.6b-metal",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "qwen3-embedding-0.6b-metal"
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "qwen3-embedding-0.6b-metal",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "qwen3-embedding-0.6b-metal",
+        "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "qwen3-embedding-0.6b-metal",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "qwen3-embedding-0.6b-metal"
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "qwen3-embedding-0.6b-ane",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "qwen3-embedding-0.6b-ane",
+        "text": "The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "qwen3-embedding-0.6b-ane",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "qwen3-embedding-0.6b-ane"
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "qwen3-embedding-0.6b-ane",
+      "method": "embed.query",
+      "params": {
+        "deadline_ms": 30000,
+        "model": "qwen3-embedding-0.6b-ane",
+        "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "qwen3-embedding-0.6b-ane",
+      "method": "embed.batch",
+      "params": {
+        "deadline_ms": 30000,
+        "items": [
+          {
+            "id": "row",
+            "text": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+          }
+        ],
+        "model": "qwen3-embedding-0.6b-ane"
+      },
+      "token_ids": [
+        [
+          785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 151643
+        ]
+      ]
+    },
+    {
+      "case": "short",
+      "lane_id": "qwen3-reranker-0.6b-ane",
+      "method": "rerank.score",
+      "params": {
+        "candidates": [
+          "The quick brown fox jumps over the lazy dog."
+        ],
+        "deadline_ms": 30000,
+        "model": "qwen3-reranker-0.6b-ane",
+        "query": "What is a vector database?"
+      },
+      "token_ids": [
+        [
+          151644, 8948, 198, 60256, 3425, 279, 11789, 20027, 279, 8502, 3118, 389, 279, 11361, 323, 279,
+          758, 1235, 3897, 13, 7036, 429, 279, 4226, 646, 1172, 387, 330, 9693, 1, 476, 330,
+          2152, 3263, 151645, 198, 151644, 872, 198, 27, 641, 1235, 26818, 16246, 264, 3482, 2711, 3239,
+          11, 17179, 9760, 46769, 429, 4226, 279, 3239, 198, 27, 2859, 26818, 3555, 374, 264, 4621,
+          4625, 5267, 75692, 26818, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151645, 198,
+          151644, 77091, 198, 151667, 271, 151668, 271
+        ]
+      ]
+    },
+    {
+      "case": "approximately-512",
+      "lane_id": "qwen3-reranker-0.6b-ane",
+      "method": "rerank.score",
+      "params": {
+        "candidates": [
+          "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+        ],
+        "deadline_ms": 30000,
+        "model": "qwen3-reranker-0.6b-ane",
+        "query": "What is a vector database?"
+      },
+      "token_ids": [
+        [
+          151644, 8948, 198, 60256, 3425, 279, 11789, 20027, 279, 8502, 3118, 389, 279, 11361, 323, 279,
+          758, 1235, 3897, 13, 7036, 429, 279, 4226, 646, 1172, 387, 330, 9693, 1, 476, 330,
+          2152, 3263, 151645, 198, 151644, 872, 198, 27, 641, 1235, 26818, 16246, 264, 3482, 2711, 3239,
+          11, 17179, 9760, 46769, 429, 4226, 279, 3239, 198, 27, 2859, 26818, 3555, 374, 264, 4621,
+          4625, 5267, 75692, 26818, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678,
+          5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835,
+          34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13,
+          576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916,
+          279, 15678, 5562, 13, 576, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 3974,
+          13876, 38835, 34208, 916, 279, 15678, 5562, 13, 151645, 198, 151644, 77091, 198, 151667, 271, 151668,
+          271
+        ]
+      ]
+    }
+  ],
+  "master_commit": "027e1d30b11feac82dd4ac4a343c2de9e023bad3"
+}

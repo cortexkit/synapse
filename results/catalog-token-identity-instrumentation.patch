@@ -1,0 +1,107 @@
+diff --git a/crates/synapse-engine-owned/src/lib.rs b/crates/synapse-engine-owned/src/lib.rs
+index 02d1ca7c..73d0fcf9 100644
+--- a/crates/synapse-engine-owned/src/lib.rs
++++ b/crates/synapse-engine-owned/src/lib.rs
+@@ -21,6 +21,8 @@ use synapse_core::{
+ mod catalog;
+ #[cfg(target_os = "macos")]
+ mod runtime;
++#[cfg(all(feature = "test-support", target_os = "macos"))]
++mod token_capture_test_model;
+ 
+ /// Production-owned Metal decode engines for Qwen3-0.6B and LFM2-1.2B.
+ /// Ported from `bench/spikes/unified-rt/` into production-owned code.
+diff --git a/crates/synapse-module/src/lib.rs b/crates/synapse-module/src/lib.rs
+index 5818ad40..e0076fc9 100644
+--- a/crates/synapse-module/src/lib.rs
++++ b/crates/synapse-module/src/lib.rs
+@@ -95,6 +95,9 @@ pub fn certification_catalog() -> synapse_certify::Result<synapse_certify::Catal
+     })
+ }
+ 
++#[cfg(all(test, target_os = "macos"))]
++mod catalog_token_identity_tests;
++
+ use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
+ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+ use owned_decode_certification::probe::ProbeSnapshot;
+diff --git a/crates/synapse-module/src/worker_host/mod.rs b/crates/synapse-module/src/worker_host/mod.rs
+index 19bfbb0c..846e1c69 100644
+--- a/crates/synapse-module/src/worker_host/mod.rs
++++ b/crates/synapse-module/src/worker_host/mod.rs
+@@ -7133,10 +7133,35 @@ pub mod ane_residency {
+             inference_frames: u64,
+             /// Their request ids, in arrival order.
+             inference_ids: Vec<String>,
++            capture_token_ids: bool,
++            captured_token_ids: Vec<Vec<u32>>,
+         }
+ 
+         type SharedLedger = Arc<Mutex<Ledger>>;
+ 
++        fn record_token_ids(
++            ledger: &SharedLedger,
++            lengths: impl Iterator<Item = usize>,
++            raw: &[u8],
++        ) {
++            let mut ledger = ledger.lock().unwrap();
++            if !ledger.capture_token_ids {
++                return;
++            }
++            let ids = synapse_core::decode_i32_frame(raw).unwrap();
++            let mut offset = 0;
++            for length in lengths {
++                ledger.captured_token_ids.push(
++                    ids[offset..offset + length]
++                        .iter()
++                        .map(|id| u32::try_from(*id).unwrap())
++                        .collect(),
++                );
++                offset += length;
++            }
++            assert_eq!(offset, ids.len());
++        }
++
+         fn record_residency(ledger: &mut Ledger) {
+             let mut per_model: HashMap<&str, usize> = HashMap::new();
+             for (model, _) in &ledger.resident {
+@@ -7351,6 +7376,11 @@ pub mod ane_residency {
+                             Some(total * 4),
+                             "the id frame holds every item's tokens"
+                         );
++                        record_token_ids(
++                            &ledger,
++                            items.iter().map(|item| item.n_tokens),
++                            raw.as_ref().unwrap(),
++                        );
+                         if rungs
+                             .iter()
+                             .all(|rung| own.contains(&(model_ref.clone(), *rung)))
+@@ -7389,6 +7419,11 @@ pub mod ane_residency {
+                             raw.as_ref().map(Vec::len),
+                             Some(sequences.iter().map(|s| s.n_tokens).sum::<usize>() * 4)
+                         );
++                        record_token_ids(
++                            &ledger,
++                            sequences.iter().map(|item| item.n_tokens),
++                            raw.as_ref().unwrap(),
++                        );
+                         if rungs
+                             .iter()
+                             .all(|rung| own.contains(&(model_ref.clone(), *rung)))
+@@ -8611,6 +8646,15 @@ pub mod ane_residency {
+ 
+         #[cfg(unix)]
+         impl ModuleMockControl {
++            #[cfg(target_os = "macos")]
++            pub(crate) fn enable_token_capture(&self) {
++                self.0.lock().unwrap().capture_token_ids = true;
++            }
++
++            #[cfg(target_os = "macos")]
++            pub(crate) fn take_token_ids(&self) -> Vec<Vec<u32>> {
++                std::mem::take(&mut self.0.lock().unwrap().captured_token_ids)
++            }
+             pub(crate) fn hold_next_admission(&self, started: Arc<Notify>, release: Arc<Notify>) {
+                 self.0.lock().unwrap().admit_gate = Some((started, release));
+             }

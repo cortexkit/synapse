@@ -95,6 +95,9 @@ pub fn certification_catalog() -> synapse_certify::Result<synapse_certify::Catal
     })
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod catalog_token_identity_tests;
+
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use owned_decode_certification::probe::ProbeSnapshot;

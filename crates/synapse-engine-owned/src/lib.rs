@@ -21,6 +21,8 @@ use synapse_core::{
 mod catalog;
 #[cfg(target_os = "macos")]
 mod runtime;
+#[cfg(all(feature = "test-support", target_os = "macos"))]
+mod token_capture_test_model;
 
 /// Production-owned Metal decode engines for Qwen3-0.6B and LFM2-1.2B.
 /// Ported from `bench/spikes/unified-rt/` into production-owned code.
