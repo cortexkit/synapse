@@ -11,7 +11,9 @@ use subc_transport::{
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
 use synapse_certify::{Admission, Inventory, Outcome, Parity, Result, RunEvidence, Runner};
-use synapse_parity::evaluator::{evaluate, FixtureSet, ObservedCase, Output};
+use synapse_parity::evaluator::{
+    evaluate, rerank_tolerance, Case, Evaluation, FixtureSet, ObservedCase, Output,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     process::Command,
@@ -425,6 +427,217 @@ fn sent(snapshot: &Value) -> Result<usize> {
                 .ok_or_else(|| refuse("worker counter overflow"))
         })
 }
+fn parity_failure_message(
+    evaluation: &Evaluation,
+    cases: &[Case],
+    outputs: &BTreeMap<String, ObservedCase>,
+    expected_readout: Option<(u32, u32)>,
+) -> String {
+    let tolerance_class = match evaluation.tolerance_class {
+        synapse_parity::manifest::ToleranceClass::Fp32 => "fp32",
+        synapse_parity::manifest::ToleranceClass::Fp16 => "fp16",
+    };
+    let score_bound = rerank_tolerance(evaluation.tolerance_class);
+    let mut lines = vec![
+        format!(
+            "parity gate failed: model={} profile={}",
+            evaluation.model, evaluation.profile_id
+        ),
+        format!("precision_class={tolerance_class} rerank_score_bound<={score_bound:.6}"),
+    ];
+
+    if !evaluation.gates.complete {
+        let missing = cases
+            .iter()
+            .find(|case| !outputs.contains_key(&case.id))
+            .map(|case| case.id.as_str())
+            .or_else(|| {
+                outputs
+                    .keys()
+                    .find(|id| !cases.iter().any(|case| &case.id == *id))
+                    .map(String::as_str)
+            })
+            .unwrap_or("unavailable");
+        lines.push(format!(
+            "gate=fixture_completeness bound=completed==expected observed={}/{} worst_case_id={missing}",
+            evaluation.completed_fixtures, evaluation.expected_fixtures
+        ));
+    }
+
+    if !evaluation.gates.score {
+        let worst = cases
+            .iter()
+            .filter_map(|case| {
+                let observed = outputs.get(&case.id)?;
+                match (&case.output, &observed.output) {
+                    (Output::Score(reference), Output::Score(actual)) => Some((
+                        case.id.as_str(),
+                        if actual.is_finite() {
+                            (actual - reference).abs()
+                        } else {
+                            f64::INFINITY
+                        },
+                        *actual,
+                    )),
+                    _ => None,
+                }
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1));
+        if let Some((case_id, error, actual)) = worst {
+            let observed = if actual.is_finite() {
+                format!("{error:.9}")
+            } else {
+                "non_finite".into()
+            };
+            lines.push(format!(
+                "gate=score_error bound<={score_bound:.6} observed_worst={observed} worst_case_id={case_id}"
+            ));
+        } else {
+            let case_id = cases
+                .iter()
+                .find(|case| outputs.contains_key(&case.id))
+                .map(|case| case.id.as_str())
+                .unwrap_or("unavailable");
+            lines.push(format!(
+                "gate=score_error bound<={score_bound:.6} observed_worst=type_mismatch worst_case_id={case_id}"
+            ));
+        }
+    }
+
+    if !evaluation.gates.ranking {
+        let worst_pool = evaluation
+            .metrics
+            .pools
+            .iter()
+            .filter(|(_, ranking)| !ranking.passed)
+            .min_by(|left, right| left.1.tau.total_cmp(&right.1.tau));
+        if let Some((pool, ranking)) = worst_pool {
+            let mut near_ties = 0;
+            let mut worst_pair: Option<(&str, &str, f64, f64, f64)> = None;
+            let pool_cases = cases
+                .iter()
+                .filter(|case| case.pool.as_deref() == Some(pool.as_str()))
+                .filter_map(|case| {
+                    let Output::Score(reference) = &case.output else {
+                        return None;
+                    };
+                    let Output::Score(actual) = &outputs.get(&case.id)?.output else {
+                        return None;
+                    };
+                    actual
+                        .is_finite()
+                        .then_some((case.id.as_str(), *reference, *actual))
+                })
+                .collect::<Vec<_>>();
+            for left in 0..pool_cases.len() {
+                for right in left + 1..pool_cases.len() {
+                    let (left_id, left_reference, left_actual) = pool_cases[left];
+                    let (right_id, right_reference, right_actual) = pool_cases[right];
+                    let gap = (left_reference - right_reference).abs();
+                    if gap < 0.01 {
+                        near_ties += 1;
+                        continue;
+                    }
+                    let (high_id, high_actual, low_id, low_actual) =
+                        if left_reference > right_reference {
+                            (left_id, left_actual, right_id, right_actual)
+                        } else {
+                            (right_id, right_actual, left_id, left_actual)
+                        };
+                    if high_actual <= low_actual
+                        && worst_pair.is_none_or(|(_, _, worst_gap, _, _)| gap > worst_gap)
+                    {
+                        worst_pair = Some((high_id, low_id, gap, high_actual, low_actual));
+                    }
+                }
+            }
+            let pair = worst_pair.map_or_else(
+                || "unavailable".to_string(),
+                |(high, low, gap, high_score, low_score)| {
+                    format!(
+                        "{high}/{low} reference_gap={gap:.9} observed_scores={high_score:.9}/{low_score:.9}"
+                    )
+                },
+            );
+            lines.push(format!(
+                "gate=ranking_order_or_tau bound=tau>=0.99,top10=true observed_tau={:.9} top10={} pool={pool} worst_case_pair={pair} near_ties_excluded={near_ties}(reference_gap<0.01)",
+                ranking.tau, ranking.top10
+            ));
+        } else {
+            lines.push(
+                "gate=ranking_order_or_tau bound=tau>=0.99,top10=true observed=pool_metrics_unavailable worst_case_pair=unavailable near_ties_excluded=unavailable(reference_gap<0.01)".into(),
+            );
+        }
+    }
+
+    if !evaluation.gates.semantics {
+        let reason = evaluation
+            .failures
+            .iter()
+            .find(|failure| failure.starts_with("qwen_"))
+            .map(String::as_str)
+            .unwrap_or("token_readout_mismatch");
+        let mismatch = cases.iter().find_map(|case| {
+            let observed = outputs.get(&case.id)?;
+            let token_mismatch = observed.input_ids != case.input_ids;
+            let readout_mismatch =
+                expected_readout.is_some_and(|expected| observed.readout != Some(expected));
+            (token_mismatch || readout_mismatch).then_some((case, observed))
+        });
+        let details = mismatch.map_or_else(
+            || "worst_case_id=unavailable".to_string(),
+            |(case, observed)| {
+                format!(
+                    "worst_case_id={} expected_readout={expected_readout:?} observed_readout={:?} input_ids_match={}",
+                    case.id,
+                    observed.readout,
+                    observed.input_ids == case.input_ids
+                )
+            },
+        );
+        lines.push(format!(
+            "gate=token_readout_or_template failed={reason} {details}"
+        ));
+    }
+
+    if !evaluation.gates.coverage_8192 {
+        let case = cases.iter().find(|case| case.input_ids.len() == 8192);
+        let (case_id, observed_tokens) = case.map_or(("unavailable", 0), |case| {
+            (
+                case.id.as_str(),
+                outputs
+                    .get(&case.id)
+                    .map_or(0, |observed| observed.input_ids.len()),
+            )
+        });
+        lines.push(format!(
+            "gate=token_readout_8192 bound=exact_8192_tokens observed_tokens={observed_tokens} worst_case_id={case_id}"
+        ));
+    }
+
+    if !evaluation.gates.coverage {
+        lines.push(format!(
+            "gate=fixture_category_coverage bound=all_required_categories observed={:?}",
+            evaluation.failures
+        ));
+    }
+
+    for (gate, passed) in [
+        ("dimension", evaluation.gates.dimension),
+        ("finite", evaluation.gates.finite),
+        ("unit_norm", evaluation.gates.unit_norm),
+        ("cosine", evaluation.gates.cosine),
+    ] {
+        if !passed {
+            lines.push(format!(
+                "gate={gate} failed; inspect fixture outputs for the observed value and case id"
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
 async fn observe(
     options: &Options,
     source: &str,
@@ -521,7 +734,18 @@ async fn observe(
     let evaluation =
         evaluate(&manifest, &profile_id, &fingerprint, &fixtures, &outputs).map_err(err)?;
     let parity: Parity =
-        serde_json::from_value(serde_json::to_value(evaluation).map_err(err)?).map_err(err)?;
+        serde_json::from_value(serde_json::to_value(&evaluation).map_err(err)?).map_err(err)?;
+    let expected_readout = manifest.models.get(model).and_then(|model| {
+        model
+            .grammar
+            .readout
+            .yes
+            .as_ref()
+            .zip(model.grammar.readout.no.as_ref())
+            .map(|(yes, no)| (yes.id, no.id))
+    });
+    let parity_failure = (!parity.passed())
+        .then(|| parity_failure_message(&evaluation, fixtures.cases(), &outputs, expected_readout));
     let long_case = cases
         .iter()
         .find(|case| {
@@ -586,6 +810,9 @@ async fn observe(
     let artifacts = layout.artifacts.clone();
     let machine = machine(row, floor)?;
     candidate.shutdown().await?;
+    if let Some(message) = parity_failure {
+        return Err(refuse(message));
+    }
     Ok(RunEvidence {
         source_commit: source.into(),
         machine,
@@ -908,6 +1135,61 @@ mod tests {
             Output::Score(0.75)
         );
         assert!(observed_output(&embed, 2, "embed").is_err());
+    }
+
+    #[test]
+    fn parity_failure_reports_score_bound_class_and_worst_fixture() {
+        use synapse_parity::manifest::{Operation, ToleranceClass};
+
+        let case = Case {
+            id: "rerank-worst".into(),
+            category: "short".into(),
+            input_ids: vec![1, 2],
+            output: Output::Score(0.25),
+            pool: None,
+        };
+        let outputs = BTreeMap::from([(
+            case.id.clone(),
+            ObservedCase {
+                output: Output::Score(0.27),
+                input_ids: case.input_ids.clone(),
+                readout: None,
+            },
+        )]);
+        let evaluation = Evaluation {
+            model: "gte-reranker-modernbert-base".into(),
+            operation: Operation::Rerank,
+            profile_id: "gte-reranker-modernbert-base.owned-metal".into(),
+            fingerprint: "catalog-pin".into(),
+            fixture_set_id: "fixture-set".into(),
+            tolerance_class: ToleranceClass::Fp32,
+            completed_fixtures: 1,
+            expected_fixtures: 1,
+            metrics: synapse_parity::evaluator::Metrics {
+                max_absolute_error: Some(0.02),
+                ..Default::default()
+            },
+            gates: synapse_parity::evaluator::Gates {
+                complete: true,
+                dimension: true,
+                finite: true,
+                unit_norm: true,
+                cosine: true,
+                score: false,
+                ranking: true,
+                coverage_8192: true,
+                coverage: true,
+                semantics: true,
+            },
+            failures: vec![],
+        };
+
+        let message = parity_failure_message(&evaluation, &[case], &outputs, None);
+        assert!(message.contains("precision_class=fp32 rerank_score_bound<=0.005000"));
+        assert!(message.contains(
+            "gate=score_error bound<=0.005000 observed_worst=0.020000000 worst_case_id=rerank-worst"
+        ));
+        assert!(message.lines().count() <= 20);
     }
 
     #[test]
