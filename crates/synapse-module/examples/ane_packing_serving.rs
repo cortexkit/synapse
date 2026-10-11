@@ -839,8 +839,13 @@ async fn main() -> Result<()> {
     let parent = out.parent().context("output parent")?;
     std::fs::create_dir_all(parent)?;
     let parent = parent.canonicalize()?;
+    let repository = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    ensure!(repository.status.success(), "source repository unavailable");
+    let repository = PathBuf::from(String::from_utf8(repository.stdout)?.trim()).canonicalize()?;
     ensure!(
-        !parent.starts_with(env::current_dir()?.canonicalize()?),
+        raw_output_is_external(&parent, &repository),
         "raw output must be outside the repository"
     );
     ensure!(!out.exists(), "never overwrite an existing run");
@@ -1067,11 +1072,20 @@ fn worker_proxy() -> Result<()> {
 }
 
 fn wire_snapshot(path: &Path) -> Result<Value> {
-    let mut counts = serde_json::Map::new();
     if !path.exists() {
-        return Ok(Value::Object(counts));
+        return Ok(json!({}));
     }
-    for line in std::fs::read_to_string(path)?.lines() {
+    wire_snapshot_text(&std::fs::read_to_string(path)?)
+}
+fn wire_snapshot_text(text: &str) -> Result<Value> {
+    let mut counts = serde_json::Map::new();
+    // A newline marks a complete observation. Concurrent readers must not
+    // deserialize an unfinished last record. Completed corrupt records remain
+    // errors rather than silently disappearing from the dispatch evidence.
+    for line in text.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            break;
+        }
         let record: Value = serde_json::from_str(line)?;
         ensure!(
             record["response"] != "ERR",
@@ -1286,7 +1300,7 @@ fn relay_frames(
             _ => 0,
         };
         let record = json!({"req_id":request.req_id(),"operation":request.wire_type(),"rows":rows,"response":parsed["type"],"wall_ms":start.elapsed().as_secs_f64()*1000.0});
-        writeln!(log, "{record}")?;
+        std::io::Write::write_all(log, format!("{record}\n").as_bytes())?;
         write_frame(host, &response, max)?;
         if let Some(raw) = raw {
             write_frame(host, &raw, max)?;
@@ -1390,5 +1404,50 @@ mod query_envelope_tests {
         );
         let obsolete = json!({"fingerprint":PIN,"vector":vec![json!(0.25);DIM]});
         assert!(vectors(&obsolete, &[0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wire_snapshot_tests {
+    use super::*;
+    #[test]
+    fn concurrent_wire_reader_ignores_only_uncommitted_trailing_records() {
+        let complete = "{\"operation\":\"EMBED_PACKED\",\"response\":\"VECTORS\",\"rows\":8}\n";
+        let partial = format!("{complete}{{\"operation\":\"EMBED_PACKED\",\"response\":\"VEC");
+        let snapshot = wire_snapshot_text(&partial).unwrap();
+        assert_eq!(snapshot["EMBED_PACKED"], 1);
+        assert_eq!(snapshot["max_embed_rows"], 8);
+        assert!(wire_snapshot_text("{broken-json}\n").is_err());
+        assert_eq!(wire_snapshot_text("{pending").unwrap(), json!({}));
+        let refused = "{\"operation\":\"EMBED_PACKED\",\"response\":\"ERR\"}\n";
+        assert!(wire_snapshot_text(refused).is_err());
+    }
+}
+
+fn raw_output_is_external(parent: &Path, repository: &Path) -> bool {
+    !parent.starts_with(repository)
+}
+#[cfg(test)]
+mod output_fence_tests {
+    use super::*;
+    #[test]
+    fn raw_output_fence_uses_repository_root_instead_of_callers_subdirectory() {
+        let repository = Path::new("/source");
+        assert!(!raw_output_is_external(
+            Path::new("/source/raw"),
+            repository
+        ));
+        assert!(!raw_output_is_external(
+            Path::new("/source/examples/raw"),
+            repository
+        ));
+        assert!(raw_output_is_external(
+            Path::new("/outside/raw"),
+            repository
+        ));
+        assert!(raw_output_is_external(
+            Path::new("/source-other/raw"),
+            repository
+        ));
     }
 }

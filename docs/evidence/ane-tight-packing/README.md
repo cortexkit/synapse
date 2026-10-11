@@ -767,3 +767,137 @@ samples module/worker/relay RSS every three seconds, captures `vm_stat`, and
 uses **only** `memory_pressure -Q` (query mode, never synthetic pressure).
 Every sample has a Unix timestamp for correlation with module/worker profiles.
 The monitor output and full stderr stay outside Git.
+
+## Instrumented full comparison: failed, incomplete
+
+A second full alternating comparison used source
+`78a611b4131cf114842ddf9a80a1683f31d028a8`, the **same** export/checkpoint,
+module configuration, thresholds and 1,000-query strata, with query-only
+memory sampling and append-only worker stderr. It again completed three
+serial and two packed arms. This time the third packed arm aborted during
+warm preparation, before any packed admission, with a harness JSON-reader
+error rather than a recorded module refusal:
+
+```text
+EOF while parsing a string at line 1 column 85
+```
+
+| Arm | Full export (s) | Outer-call p50 / p99 (ms) | Query-under-bulk p50 / p99 (ms) | First packed admission/compile (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Serial 1 | 204.736 | 3,353.987 / 5,479.778 | 369.554 / 709.426 | — |
+| Packed 1 | 170.882 | 2,695.075 / 5,423.585 | 305.530 / 585.851 | 27,489.785 |
+| Serial 2 | 189.574 | 3,114.464 / 6,233.985 | 366.616 / 704.831 | — |
+| Packed 2 | 170.523 | 2,650.436 / 6,215.023 | 308.307 / 591.749 | 51,595.191 |
+| Serial 3 | 226.662 | 3,497.436 / 6,951.202 | 382.970 / 896.262 | — |
+| Packed 3 | **Aborted during warm preparation** | Not reached | Not reached | Not admitted |
+
+Among these completed arms, the serial median was 204.736 s and the packed
+median 170.703 s (**0.83377×**, above 0.80×). Even an arbitrarily fast third
+packed result would leave a three-sample packed median at least 170.523 s,
+above the 163.788 s threshold for the three completed serial arms. No additional
+arm or third comparison was selected to improve these numbers.
+
+All 31,705 completed export rows again compare bit-identical and retain the
+same ordered vector digest as the first run. The 5,000 query vectors and
+68,886 background vectors also compare identically, with zero mismatches.
+Pooled query p50/p99 were 370.421/829.333 ms serial (3,000 samples) and
+307.026/588.260 ms packed (2,000 samples), below the 407.463/912.266 ms limits.
+Each complete packed export again recorded 825 packed worker exchanges and
+81 single exchanges, with an eight-row maximum. Each complete packed arm
+admitted the packed program once; median compile-request cost was 39,542.488 ms.
+
+### Memory observations and remaining diagnosis
+
+The monitor retained **1,147 samples, zero sampling errors**, with no sample
+containing clients from two different arms. The worker and module from each
+arm therefore did not remain as overlapping clients of the next arm in the
+sampled intervals. These process observations do not measure memory retained
+inside the system Neural Engine service or kernel.
+
+| Arm | Peak real-worker RSS (MiB) | Peak module RSS (MiB) |
+| --- | ---: | ---: |
+| Serial 1 | 1,114.438 | 160.719 |
+| Packed 1 | 1,438.047 | 297.828 |
+| Serial 2 | 1,078.047 | 207.141 |
+| Packed 2 | 863.906 | 219.891 |
+| Serial 3 | 1,234.188 | 150.922 |
+| Packed 3 warm-up only | 543.719 | 113.562 |
+
+There is no monotonic growth of sampled per-process RSS across arms; these
+samples do not establish a module/worker process leak. They do establish
+substantial **system-wide paging** on the 16-GiB machine:
+
+- `memory_pressure -Q` free percentage ranged from 14% to 43%. This is Apple's
+  system-wide metric, not simply the physical free-page count.
+- At 16,384 bytes per page, physical free pages reached 1,103 (17.234 MiB), and
+  occupied compressor pages peaked at 523,806 (7.993 GiB).
+- Over the captured interval, `vm_stat` counters increased by 7,153,671 swap-in
+  pages (109.156 GiB) and 8,432,130 swap-out pages (128.664 GiB), alongside
+  63,594,082 page compressions and 59,859,657 decompressions. These are global
+  counter deltas, not attribution of all paging to the embedding worker.
+
+The final arm's initial 64-row warm-up took 79.005 s, compared with 39.382 s
+for the same initial batch in the failed final arm of the first comparison.
+Neither cold warm-up is included in the export medians. Its private module
+log records that warm-up interval:
+
+```text
+2026-10-11T15:45:59.827Z INFO  synapse.admission: job admitted model_id=qwen3-embedding-0.6b-ane job_id=inline-1-0
+2026-10-11T15:47:18.834Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-0 lane=ane-direct tokens=2489 wall_ms=79005
+```
+
+That arm's completed wire log contains one `PING`, one `LOAD`, three single
+shape admissions and 24 standalone embeddings, with no packed admission and
+no `ERR` response. Its last worker response (`embed-27`) finished successfully
+in 276.097 ms at Unix microsecond `1791733640563969`. Full retained worker
+stderr and module stderr are empty. Thus the second termination is not
+evidence of a packed inference crash or numeric mismatch.
+
+A separate harness defect was found: `wire_snapshot` could parse the final
+NDJSON record while the worker relay was still appending it. The writer used
+piecewise formatted writes, and the reader treated an unterminated last line
+as complete JSON. A portable regression reproduces the same EOF error class.
+The final driver serializes each record before writing it and reads only
+newline-terminated observations; malformed **complete** records still fail.
+Removing that boundary check fails only
+`wire_snapshot_tests::concurrent_wire_reader_ignores_only_uncommitted_trailing_records`;
+the ten other driver tests in that mutation run remain green. This repair was
+not used to retcon either measurement or to select a replacement arm.
+
+**The first run's initiating slowdown remains undiagnosed.** System memory
+pressure is now demonstrated in the second comparison and is consistent with
+slow execution/readiness work, but cannot retrospectively prove the cause of
+the first run's catalog timeout. The retained evidence does not show packed
+recompilation, resource-exhaustion responses or a worker reload as its trigger.
+The five-second catalog-resolution/readiness budget and the unexplained
+slowdown require investigation before enabling packing on any device. No
+module or worker implementation was changed to force a pass.
+
+### Final gate disposition and retained second-run evidence
+
+**Rollout gate: NOT PASSED. Keep packing disabled outside private runs.**
+Neither attempt completed three clean repetitions per arm; the second
+completed-arm timing also misses the 0.80× limit. Bit identity and the measured
+query-latency limits passed only for the completed strata. The first failed
+attempt is retained alongside the second, not replaced or pooled with it.
+
+- `module-serving-instrumented.json`: compact second-run statistics; full raw
+  report is 360,243 bytes, SHA-256 `ab97720b0e4d84083a49ffd505ef7694738a4a46897c88a215f08ac68db21748`.
+- `module-serving-memory.json`: compact RSS/paging observations; full memory
+  trace is 2,247,377 bytes, SHA-256 `7b9342eac9c049331ac3932116605fecf543c2102b2b608cc20040c16bcbd38f`.
+- Full call timings, all private-arm profiles/logs, complete stderr and
+  privacy-filtered first-failure store events remain outside Git and outside
+  regenerable build directories. No input text, vectors or machine paths are
+  committed in the new summaries. All test/measurement clients exited and the
+  global lane lock has no remaining measurement client.
+
+Recompute the second attempt's compact summaries with its missing third packed
+repetition explicitly marked incomplete and its acceptance gate kept failed:
+
+```sh
+python3 docs/evidence/ane-tight-packing/summarize-serving.py "$SECOND_RAW_REPORT" \
+  --allow-incomplete --out docs/evidence/ane-tight-packing/module-serving-instrumented.json
+python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py \
+  --summarize "$MEMORY_JSONL" --summary-out docs/evidence/ane-tight-packing/module-serving-memory.json
+python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py --self-test
+```
