@@ -396,3 +396,76 @@ fn legacy_metal_engine_keeps_master_logit_bytes() {
     EmbedEngine::unload(&mut engine, &model);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn catalog_serving_keeps_probability_readout_after_self_check_passes() {
+    let (root, state) = test_state("catalog-readout-self-check-serving");
+    let mut entry = state
+        .runtime
+        .release_catalog
+        .entry("gte-reranker-modernbert-base")
+        .unwrap()
+        .clone();
+    let backend = entry.backend("metal").unwrap().clone();
+    let spec = catalog_lane_spec(&state, &entry, &backend, false).unwrap();
+    let (pairs, references) = fixture_pairs_and_references();
+    let check = entry.self_check.as_mut().unwrap();
+    // The inference double replays captured head scores. Synthetic texts keep
+    // this test about score readout, independent of tokenizer/model numerics.
+    check.inputs = vec![
+        catalog::SelfCheckInput::Rerank(catalog::RerankSelfCheckInput {
+            query: "a".into(),
+            candidates: vec!["a".into(); 4],
+        });
+        4
+    ];
+    check.reference.scores = Some(vec![references.clone(); 4]);
+    let self_checked = tokio::task::spawn_blocking({
+        let root = root.clone();
+        let spec = spec.clone();
+        move || {
+            let mut model = replay_model(&root, &spec, false);
+            // Use native pair composition; the callback supplies the replayed
+            // head output, so the owned engine need not load weights or hardware.
+            Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::Owned(Arc::new(Mutex::new(
+                OwnedMetalEmbedEngine::new(OwnedFamily::GteModernBert, OwnedDType::F32),
+            )));
+            numerical_catalog_check(
+                &model,
+                &entry,
+                &backend,
+                |_| panic!("rerank self-check must not embed"),
+                |pairs| {
+                    assert_eq!(pairs.len(), 4);
+                    Ok(synapse_core::RerankScores {
+                        scores: MASTER_LOGITS.to_vec(),
+                    })
+                },
+            )
+            .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        self_checked.0,
+        "catalog self-check must accept captured head scores"
+    );
+    assert_eq!(self_checked.2, 0.005);
+    println!(
+        "catalog self-check passed with probability error={}",
+        self_checked.1
+    );
+    // Exercise the serving executor separately: a passing self-check must not
+    // stand in for proving that responses use the same probability readout.
+    let scores = serve_replay(&state, &root, &spec, pairs).await;
+    for (actual, expected) in scores.scores.iter().zip(references) {
+        assert!(
+            (f64::from(*actual) - expected).abs() <= 0.005,
+            "catalog serving must return fixture probabilities after self-check passes"
+        );
+    }
+    drop(state);
+    fs::remove_dir_all(root).unwrap();
+}

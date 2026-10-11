@@ -49,10 +49,11 @@ if self.catalog_readout {
 }
 ```
 
-The native catalog self-check in `numerical_catalog_check` separately applies
-`1.0 / (1.0 + (-f64::from(*x)).exp())` to the raw head result. Before this fix,
-ordinary serving returned the engine scores unchanged. Consequently self-check
-could pass while serving/certification compared logits with probabilities.
+Before the fix, the native catalog self-check in `numerical_catalog_check`
+separately applied `1.0 / (1.0 + (-f64::from(*x)).exp())` to the raw head result.
+Ordinary serving returned the engine scores unchanged, so self-check could pass
+while `synapse-certify-runner` compared serving's logits against sealed
+probability references.
 
 ANE-direct, CUDA, Vulkan, and profile-loaded Metal already transform their
 catalog reranker heads into probabilities:
@@ -72,7 +73,11 @@ The module's common rerank execution boundary now selects catalog probability
 readout by reserved-lane ownership, independently of the optional profile flag.
 For native Metal engine logits it applies sigmoid once; already-probabilistic
 profile backends pass through. Non-catalog lanes pass through byte-for-byte.
-The raw engine head and native raw-engine self-check are unchanged.
+The raw engine head is unchanged. Native self-check and serving both call
+`RerankReadout::select(...).apply(...)`; self-check no longer owns a second copy
+of the sigmoid rule. A combined regression first proves self-check passes and
+then independently checks the serving executor's output against sealed
+probabilities. Bypassing only the serving readout must fail that regression.
 
 Only the native catalog reranker identity acquires
 `rerank_readout=sigmoid_classifier_logit`. Its new pin, computed by the production
@@ -93,7 +98,7 @@ by the frozen preload fixture. No production store or production checkpoint is
 read. The unchanged portable Qwen3 ANE golden bytes and golden test guard against
 accidentally changing an unrelated catalog backend's numeric identity.
 
-## Release verification
+## Development verification (release build)
 
 A clean-stamped, signed release candidate built from fix commit
 `6b9674c78863eee9a74896a96096d98830df7c40` passed the
@@ -110,6 +115,34 @@ score/token fixtures, ranking pools, and sequence-length admission checks:
 The short real-path probe also passed with `pool100-007` (candidate 7 in the
 100-document pool for the Vulkan GPU-selection query) returning exactly
 `0.976148784160614`, equal to its sealed reference (absolute error zero).
-The normalized certification record is retained at
-`docs/evidence/certification/6b9674c78863eee9a74896a96096d98830df7c40/metal-m5/gte-reranker-modernbert-base.json`.
-Only the structured record is committed, not raw runtime logs or machine paths.
+This was a development run on the task's fix commit, using release-optimized
+binaries, not release-source certification evidence. No record is retained under
+`docs/evidence/certification/`. The run's key fields were:
+
+```json
+{
+  "status": "passed",
+  "fingerprint": "f6c27197647b9d6302971dcda763d23391d5c7e7d45e78606e826bdf0bac4c4d",
+  "parity": {
+    "completed_fixtures": 125,
+    "expected_fixtures": 125,
+    "metrics": {
+      "max_absolute_error": 6.9141387939453125e-6
+    }
+  },
+  "admission": {
+    "tokens_8192": {
+      "outcome": "processed",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    },
+    "tokens_8193": {
+      "outcome": "sequence_too_long",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    }
+  }
+}
+```

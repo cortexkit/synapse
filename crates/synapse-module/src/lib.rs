@@ -22633,7 +22633,17 @@ mod tests {
         let (dir, _) = test_storage_descriptor("catalog-rerank-tolerance");
         let mut spec = catalog_fixture_config("gte-reranker-modernbert-base.owned-metal");
         spec.model_id = "gte-reranker-modernbert-base-metal".into();
-        let model = catalog_test_model(&dir, &spec);
+        let mut model = catalog_test_model(&dir, &spec);
+        // The tokenizer fixture is profile-backed, but the native Metal engine
+        // whose logits this test replays is loaded without a profile flag.
+        Arc::get_mut(&mut model)
+            .unwrap()
+            .engine_identity
+            .build_flags
+            .remove("profile");
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::Owned(Arc::new(Mutex::new(
+            OwnedMetalEmbedEngine::new(OwnedFamily::GteModernBert, OwnedDType::F32),
+        )));
         let mut entry = catalog::compiled_catalog()
             .unwrap()
             .entry("gte-reranker-modernbert-base")
@@ -28005,12 +28015,14 @@ fn numerical_catalog_check(
             let pairs =
                 owned_rerank_pairs(model, &input.query, &input.candidates)?.expect("owned pairs");
             let raw = rerank_pairs(pairs).map_err(engine_error_to_wire)?;
-            let scores = raw
+            let raw_finite = raw.scores.iter().all(|score| score.is_finite());
+            let scores = RerankReadout::select(true, &model.engine_identity)
+                .apply(raw)
                 .scores
-                .iter()
-                .map(|x| 1.0 / (1.0 + (-f64::from(*x)).exp()))
+                .into_iter()
+                .map(f64::from)
                 .collect::<Vec<_>>();
-            if scores.len() != reference.len() || raw.scores.iter().any(|s| !s.is_finite()) {
+            if scores.len() != reference.len() || !raw_finite {
                 passed = false;
                 continue;
             }
