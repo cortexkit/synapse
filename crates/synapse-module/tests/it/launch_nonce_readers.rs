@@ -323,7 +323,11 @@ fn every_shipped_command_strips_the_launch_nonce() {
     let mut offenders = Vec::new();
     for path in sources {
         let relative = path.strip_prefix(&root).unwrap();
-        if relative.starts_with("bench") {
+        // The build-stamp crate is linked only into Cargo build scripts, which
+        // run at compile time and never receive a daemon launch nonce, so its
+        // git commands have nothing to strip. build.rs files themselves sit
+        // outside src/ and are never collected.
+        if relative.starts_with("bench") || relative.starts_with("crates/synapse-build-stamp") {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read source file");
