@@ -57,7 +57,7 @@ class ReleaseChecks(unittest.TestCase):
     def test_rust_and_python_row_tables_agree(self):
         rust = (REPO / 'crates/synapse-certify/src/catalog.rs').read_text()
         table = re.search(r'pub const ROW_BACKENDS:.*?=\s*\[(.*?)\];', rust, re.S)
-        self.assertIsNotNone(table)
+        assert table is not None, 'Rust ROW_BACKENDS table not found'
         pairs = re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', table.group(1))
         self.assertEqual(pairs, list(check.ROW_BACKENDS.items()))
 
@@ -131,7 +131,9 @@ class ReleaseChecks(unittest.TestCase):
             elif edit == 'missing_model':
                 bad['cells'] = [c for c in bad['cells'] if c['model'] != MODELS[-1]]
             elif edit == 'extra_cell':
-                bad['cells'].append(dict(row_id='metal-m5', model='qwen3-reranker-0.6b'))
+                extra = copy.deepcopy(bad['cells'][0])
+                extra.update(row_id='metal-m5', model='qwen3-reranker-0.6b')
+                bad['cells'].append(extra)
             elif edit == 'metric':
                 bad['cells'][0]['metrics']['p50'] = 1
             elif edit == 'probe':
