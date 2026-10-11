@@ -1,0 +1,18 @@
+[[control]]
+id = "catalog-ready-request-deadline"
+guards = "A delayed Ready catalog resolver uses the request deadline instead of a separate five-second loading budget"
+file = "crates/synapse-module/src/lib.rs"
+old = "match tokio::time::timeout_at(deadline, handle).await {"
+new = "match tokio::time::timeout(Duration::from_millis(5000), handle).await { // NON-VACUITY BREAK: restore the readiness cap"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "cargo"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::delayed_ready_catalog_resolver_uses_the_request_deadline"]
+expect_message = "a delayed Ready resolver must serve within the request deadline"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
