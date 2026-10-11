@@ -545,3 +545,95 @@ python3 docs/evidence/ane-tight-packing/verify-raw.py \
 if using another clone. It reuses the specified pinned tokenizer/checkpoint and
 the mini's export, unsets `TMPDIR`, and runs exactly one ignored test with one
 test thread. The scratch build/cache is separate from production.
+
+## Module-serving measurement driver
+
+`crates/synapse-module/examples/ane_packing_serving.rs` measures serving rather
+than the earlier worker-only replay. It installs the checksum-pinned Qwen
+catalog lane in a private module/store, with a loopback checkpoint server and
+no daemon discovery. Only `ane_direct.tight_packing` differs between arms;
+the default eight-row engine quantum and 3,072-token quantum budget remain
+unchanged. The export's original 127 calls (up to 64 rows each) run with two
+calls in flight, covering all 6,341 rows exactly once per repetition.
+
+The default order is serial, packed, serial, packed, serial, packed. Each
+fresh private module is warmed before its timed export. A second stratum
+makes 1,000 warm `embed.query` calls while two document-batch callers cycle
+through the export continuously. Query text is deterministically export row
+zero, not chosen to improve a result. All document vectors, including bulk
+background results, and query vectors are compared by `f32::to_bits()` against
+the first serial reference. Reports contain indices, counts, hashes and
+timings, never export text or vector payloads.
+
+Both arms use the same Unix-socket frame relay. It preserves the worker's
+HELLO identity/capabilities and raw frames, records operation names without
+tensor payloads, and passes the inherited global ANE lane-lock descriptor as
+the real worker's stdin. The module still acquires the normal global lock;
+neither `HOME` nor the lock location is overridden. A normal module request
+must send `EMBED_PACKED` after the module's standalone-versus-packed fixture
+checks; successful embeddings alone are not evidence that packing was used.
+The relay also records actual worker call sizes to enforce the eight-row cap.
+
+Packed compilation is reported as the worker-side duration of the first
+`admit-packed` request, from the existing worker profiling log. This includes
+admission/request handling and response writing, not just compiler internals;
+it excludes catalog download, model load, standalone reference generation
+and packed qualification. Later admissions are retained separately so a
+recompile cannot be mistaken for a one-time cost. Profiling and the relay are
+enabled identically in both arms and their overhead is part of serving time.
+
+### Reproduce the module comparison
+
+Obtain approval for the target device before **each** invocation. If another
+Neural Engine client is present, ask its owner rather than stopping it. The
+driver checks both hyphenated and underscored Synapse names and `ckdev` names
+before the run and before each fresh arm. Use an isolated copy of the committed
+source, never a serving checkout or production store. Verify the transfer's
+SHA-256 at the destination. Keep raw JSON, profiles, module logs, private
+configs and stores outside the repository and outside regenerable build trees.
+
+In the isolated source copy, build native macOS binaries (serialized Cargo
+invocations) with Xcode selected:
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+cargo build --release --locked -p synapse-module --features test-support \
+  --bin ck-synapse --example ane_packing_serving
+cargo build --release --locked -p synapse-worker-ane-direct
+```
+
+Copy the example to a `ckdev-ane-packing-serving` alias and ad-hoc sign it:
+
+```sh
+cp "$BUILD_ASSETS/examples/ane_packing_serving" "$RUN_ASSETS/ckdev-ane-packing-serving"
+codesign --force --sign - "$RUN_ASSETS/ckdev-ane-packing-serving"
+codesign --verify --strict "$RUN_ASSETS/ckdev-ane-packing-serving"
+env -u TMPDIR SYNAPSE_PACKING_APPROVED=1 \
+  SYNAPSE_COMPARE_ASSETS="$BUILD_ASSETS" \
+  SYNAPSE_QWEN_WEIGHTS="$PINNED_CHECKPOINT_DIRECTORY" \
+  SYNAPSE_PACKING_INPUT="$FULL_EXPORT_JSONL" \
+  SYNAPSE_PACKING_OUT="$RAW_OUTPUT_JSON" \
+  "$RUN_ASSETS/ckdev-ane-packing-serving"
+```
+
+The driver copies and ad-hoc signs its private module, real worker and relay
+aliases before executing them. The output must not already exist. At least
+three repetitions and 1,000 queries per arm are enforced even when overriding
+`SYNAPSE_PACKING_REPEATS` or `SYNAPSE_PACKING_QUERY_SAMPLES`. A failed acceptance
+gate exits nonzero **after** preserving the measurements; do not change the
+workload or thresholds to make it pass.
+
+Run the driver's hardware-free unit tests and strict lint check:
+
+```sh
+cargo test -p synapse-module --example ane_packing_serving --features test-support
+cargo clippy -p synapse-module --example ane_packing_serving --features test-support -- -D warnings
+```
+
+The tests cover export coverage, ID-based vector restoration, signed-zero bit
+identity, nearest-rank percentiles, median/tolerance gates, refusal of absent
+packed dispatch or an active serial switch, and payload-free socket relaying.
+Forcing `assess`'s `packed_dispatch_and_off_switch` check to return true
+regardless of worker exchanges fails only
+`gate_tests::acceptance_requires_real_packed_dispatch_and_serial_off_switch`;
+the seven other driver tests remain green.
