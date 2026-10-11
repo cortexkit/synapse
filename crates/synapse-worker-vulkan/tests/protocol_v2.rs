@@ -54,7 +54,7 @@ async fn hosted_hello_ping_unsupported_rerank_then_ping() {
     )
     .await
     .unwrap();
-    for (index, id) in ["before", "after"].iter().enumerate() {
+    for (index, id) in ["before", "after", "after-packed"].iter().enumerate() {
         if index == 1 {
             write_json(
                 &mut stream,
@@ -80,6 +80,37 @@ async fn hosted_hello_ping_unsupported_rerank_then_ping() {
                 .unwrap();
             assert!(
                 matches!(response,WorkerResponse::Err {req_id,code,..} if req_id.as_deref()==Some("unsupported") && code=="unsupported_request")
+            );
+        }
+        if index == 2 {
+            write_json(
+                &mut stream,
+                &WorkerRequest::EmbedPacked {
+                    req_id: "unsupported-packed".into(),
+                    model_ref: "not-loaded".into(),
+                    program_revision: 1,
+                    items: vec![synapse_core::WorkerTokenItem {
+                        id: "row".into(),
+                        n_tokens: 3,
+                    }],
+                    passes: vec![vec![0]],
+                },
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            write_raw(
+                &mut stream,
+                &encode_i32_frame(&[1, 2, 3]),
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            let response: WorkerResponse = read_json(&mut stream, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, WorkerResponse::Err { req_id, code, .. } if req_id.as_deref() == Some("unsupported-packed") && code == "unsupported_request")
             );
         }
         write_json(

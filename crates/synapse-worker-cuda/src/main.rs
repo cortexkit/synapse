@@ -308,6 +308,9 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                 }
             }
             unsupported @ (WorkerRequest::AneAdmitShape { .. }
+            | WorkerRequest::EmbedPacked { .. }
+            | WorkerRequest::AneAdmitPacked { .. }
+            | WorkerRequest::AneEvictPacked { .. }
             | WorkerRequest::AneEvictShape { .. }) => {
                 if unsupported.carries_raw_frame() {
                     read_frame(stream, max_frame)
@@ -638,6 +641,7 @@ fn worker_hello(nonce: String) -> WorkerHello {
         max_frame: DEFAULT_MAX_FRAME_BYTES,
         manifest_digest: Some(manifest_digest()),
         kernel_revision: Some(KERNEL_REVISION.into()),
+        packed: None,
     }
 }
 

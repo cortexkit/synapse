@@ -3672,6 +3672,7 @@ pub fn main() -> Result<()> {
             // The decode worker is not bound to the embed/rerank manifest.
             manifest_digest: None,
             kernel_revision: None,
+            packed: None,
         },
         protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
     };
@@ -4562,6 +4563,7 @@ mod tests {
                 max_frame: DEFAULT_MAX_FRAME_BYTES,
                 manifest_digest: None,
                 kernel_revision: None,
+                packed: None,
             },
             protocol_version: OWNED_DECODE_ENVELOPE_PROTOCOL_VERSION,
         };

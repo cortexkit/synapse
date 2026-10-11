@@ -96,7 +96,7 @@ pub async fn accept_worker_handshake_with_engine(
 /// and, when `expected_binding` is given, an owned worker's manifest digest
 /// and kernel revision (see [`check_hello_binding`]).
 pub async fn accept_worker_handshake_with_engine_and_protocol_version(
-    mut server: NamedPipeServer,
+    server: NamedPipeServer,
     expected_nonce: &str,
     max_frame: u32,
     handshake_timeout: Duration,
@@ -104,10 +104,34 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
     required_protocol_version: Option<u8>,
     expected_binding: Option<&ExpectedHelloBinding>,
 ) -> Result<NamedPipeServer, TransportError> {
+    accept_worker_handshake_with_hello(
+        server,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        expected_engine,
+        required_protocol_version,
+        expected_binding,
+    )
+    .await
+    .map(|(stream, _)| stream)
+}
+
+/// Returns the validated HELLO so callers can read optional execution capabilities
+/// without changing the engine identity or the handshake's validation rules.
+pub async fn accept_worker_handshake_with_hello(
+    mut server: NamedPipeServer,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+    required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
+) -> Result<(NamedPipeServer, WorkerHello), TransportError> {
     timeout(handshake_timeout, server.connect())
         .await
         .map_err(|_| TransportError::Protocol("worker handshake timed out".to_string()))??;
-    handshake_on_stream_with_engine_and_protocol_version(
+    let hello = handshake_on_stream_with_hello(
         &mut server,
         expected_nonce,
         max_frame,
@@ -117,7 +141,7 @@ pub async fn accept_worker_handshake_with_engine_and_protocol_version(
         expected_binding,
     )
     .await?;
-    Ok(server)
+    Ok((server, hello))
 }
 
 pub async fn handshake_on_stream<S>(
@@ -167,6 +191,31 @@ pub async fn handshake_on_stream_with_engine_and_protocol_version<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    handshake_on_stream_with_hello(
+        stream,
+        expected_nonce,
+        max_frame,
+        handshake_timeout,
+        expected_engine,
+        required_protocol_version,
+        expected_binding,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn handshake_on_stream_with_hello<S>(
+    stream: &mut S,
+    expected_nonce: &str,
+    max_frame: u32,
+    handshake_timeout: Duration,
+    expected_engine: Option<&str>,
+    required_protocol_version: Option<u8>,
+    expected_binding: Option<&ExpectedHelloBinding>,
+) -> Result<WorkerHello, TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let hello: serde_json::Value = timeout(handshake_timeout, read_json_frame(stream, max_frame))
         .await
         .map_err(|_| TransportError::Protocol("worker HELLO timed out".to_string()))??;
@@ -210,7 +259,7 @@ where
         ack["protocol_version"] = serde_json::Value::from(protocol_version);
     }
     write_json_frame(stream, &ack, accepted_frame).await?;
-    Ok(())
+    Ok(hello)
 }
 
 pub async fn read_json<T: DeserializeOwned, S: AsyncRead + Unpin>(
@@ -315,6 +364,7 @@ mod tests {
             max_frame,
             manifest_digest: None,
             kernel_revision: None,
+            packed: None,
         };
         write_json_frame(&mut client, &hello, max_frame)
             .await
@@ -355,6 +405,7 @@ mod tests {
             max_frame: 4096,
             manifest_digest: manifest.map(str::to_owned),
             kernel_revision: revision.map(str::to_owned),
+            packed: None,
         };
         write_json_frame(&mut worker, &hello, 4096).await.unwrap();
         handshake_on_stream_with_engine_and_protocol_version(

@@ -76,6 +76,7 @@ fn worker_hello(nonce: String) -> WorkerHello {
         max_frame: DEFAULT_MAX_FRAME_BYTES,
         manifest_digest: std::env::var("SYNAPSE_WORKER_EXPECTED_MANIFEST_DIGEST").ok(),
         kernel_revision: std::env::var("SYNAPSE_WORKER_EXPECTED_KERNEL_REVISION").ok(),
+        packed: None,
     }
 }
 
@@ -195,6 +196,9 @@ fn run_worker<S: Read + Write>(
                 write_json_frame(stream, &WorkerResponse::Unloaded { req_id }, max_frame)?;
             }
             unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::EmbedPacked { .. }
+            | WorkerRequest::AneAdmitPacked { .. }
+            | WorkerRequest::AneEvictPacked { .. }
             | WorkerRequest::AneAdmitShape { .. }
             | WorkerRequest::AneEvictShape { .. }) => {
                 if unsupported.carries_raw_frame() {
@@ -215,6 +219,9 @@ fn run_worker<S: Read + Write>(
                     | WorkerRequest::Ping { .. }
                     | WorkerRequest::Generate { .. }
                     | WorkerRequest::RerankSequences { .. }
+                    | WorkerRequest::EmbedPacked { .. }
+                    | WorkerRequest::AneAdmitPacked { .. }
+                    | WorkerRequest::AneEvictPacked { .. }
                     | WorkerRequest::AneAdmitShape { .. }
                     | WorkerRequest::AneEvictShape { .. }
                     | WorkerRequest::Shutdown {} => None,

@@ -124,6 +124,27 @@ async fn llama_worker_speaks_protocol_v2_and_refuses_owned_worker_requests() {
         .unwrap();
     expect_unsupported(&mut stream, "rerank-sequences-1").await;
     ping(&mut stream, "ping-1").await;
+    write_json(
+        &mut stream,
+        &WorkerRequest::EmbedPacked {
+            req_id: "packed-1".into(),
+            model_ref: "llama:0".into(),
+            program_revision: 1,
+            items: vec![synapse_core::WorkerTokenItem {
+                id: "row".into(),
+                n_tokens: 2,
+            }],
+            passes: vec![vec![0]],
+        },
+        MAX_FRAME,
+    )
+    .await
+    .unwrap();
+    write_raw(&mut stream, &encode_i32_frame(&[1, 2]), MAX_FRAME)
+        .await
+        .unwrap();
+    expect_unsupported(&mut stream, "packed-1").await;
+    ping(&mut stream, "ping-after-packed").await;
 
     // ANE_ADMIT_SHAPE has no raw frame after its JSON request.
     write_json(
