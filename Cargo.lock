@@ -6810,6 +6810,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-protocol",
  "synapse-core",
  "tokenizers 0.21.4",
 ]

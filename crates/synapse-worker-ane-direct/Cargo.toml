@@ -8,13 +8,16 @@ license.workspace = true
 name = "ck-synapse-worker-ane-direct"
 path = "src/main.rs"
 
+[dependencies]
+serde_json.workspace = true
+subc-protocol.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 ane = { path = "vendor/ane" }
 anyhow.workspace = true
 clap.workspace = true
 synapse-core = { path = "../synapse-core" }
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 half = "2.7"
 safetensors = "0.7"
@@ -22,8 +25,8 @@ libc = "0.2"
 libm = "0.2"
 
 [dev-dependencies]
-serde_json.workspace = true
 sha2.workspace = true
+synapse-core = { path = "../synapse-core" }
 
 # Tokenizes exported AFT chunks for `multirow::hardware::multirow_experiment`,
 # a Neural Engine test that only builds and runs on macOS.

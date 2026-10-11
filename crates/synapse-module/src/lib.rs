@@ -17520,6 +17520,12 @@ fn manifest(module_id: &str) -> ModuleManifest {
         .build()
 }
 
+/// Serialize the manifest with this binary's source revision, if available.
+/// This lets placement check the build without connecting to the daemon.
+pub fn manifest_json() -> String {
+    serde_json::to_string(&manifest("synapse")).expect("the SDK module manifest is serializable")
+}
+
 /// Where this build's commit came from, as embedded by `build.rs`.
 fn build_git_sha_source() -> BuildGitShaSource<'static> {
     match (

@@ -1,0 +1,17 @@
+[[control]]
+id = "worker-manifest-provenance"
+guards = "The ANE-direct worker manifest probe returns provenance before the worker can require its socket or launch nonce"
+file = "crates/synapse-worker-ane-direct/src/main.rs"
+old = "if std::env::args_os().skip(1).any(|argument| argument == \"--manifest\") {"
+new = "if std::env::args_os().skip(1).any(|argument| argument == \"--manifest-disabled\") {"
+edits = []
+test_file = "crates/synapse-worker-ane-direct/tests/manifest.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-worker-ane-direct"
+target = "--test manifest"
+expect_red = ["manifest_cli_reports_provenance_from_the_compiled_tree"]
+expect_message = "--manifest must bypass worker startup"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

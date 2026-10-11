@@ -21,6 +21,11 @@ async fn main() {
         return;
     }
 
+    if arguments.iter().any(|argument| argument == "--manifest") {
+        println!("{}", synapse_module::manifest_json());
+        return;
+    }
+
     match synapse_certify::command::parse(&arguments) {
         Ok(Some(command)) => {
             let source = synapse_certify::command::source_stamp(
