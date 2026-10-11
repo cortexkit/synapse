@@ -190,6 +190,83 @@ fn ane_catalog_fingerprints_bind_the_pinned_manifest_profiles() {
     }
 }
 
+pub(crate) mod qwen3_ane_golden {
+    // Captured at 0075afb7bb47f460b65a800c4ee6bebdc12d3f45 from both the
+    // hand-built profile and verified catalog installation. Keep complete bytes
+    // rather than only a hash so changes to any identity field are visible.
+    pub(crate) const STABLE_BYTES: &[u8] = br#"{"model_digest":"sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd","quant":"f16","engine":{"engine":"ane-direct-worker","version":"protocol-v2","build_flags":{"compute_dtype":"f16","profile":"qwen3-embedding-0.6b.ane-direct-worker","risk_class":"abort_capable","storage_dtype":"f16"}},"sanitized_tokenizer_digest":"sha256:71241c4586582e04d5d51a420bad74d3ef5353bfdac5a53a7ba7440dbf33e350","pooling":"last_token","normalization":"l2","dtype":"f16","flash_attention":"disabled","certified_shape":{"max_context_tokens":8192,"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},"thread_policy":"balanced","operation":"embed","input_grammar":"synapse-input-grammar-v1:0786dec33dd85e7bf6da2bfb5ebfd16736c33dfc87fd8680575853f30facbd21","kernel_revision":"ane-direct-graph-v1","rotation":"none","converted_package_digest":"sha256:1af6d091d7d5f21a998af0f438333d9af051c82af8b27bd2439c60efa09bd5db","manifest_profile_digest":"05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511"}"#;
+    pub(crate) const FINGERPRINT: &str =
+        "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b";
+    pub(crate) const ENGINE_IDENTITY: &[u8] = br#"{"engine":"ane-direct-worker","version":"protocol-v2","build_flags":{"compute_dtype":"f16","profile":"qwen3-embedding-0.6b.ane-direct-worker","risk_class":"abort_capable","storage_dtype":"f16"}}"#;
+}
+
+#[test]
+fn qwen3_ane_numeric_profile_and_engine_identity_match_golden() {
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let manifest = synapse_parity::manifest::Manifest::from_slice(include_bytes!(
+        "../../../bench/parity/models.json"
+    ))
+    .unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "qwen3-embedding-0.6b")
+        .unwrap();
+    let backend = entry["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|backend| backend["backend"] == "ane")
+        .unwrap();
+    let id = backend["profile"].as_str().unwrap();
+    let declared = &manifest.profiles[id];
+    let model = manifest.model(&declared.model).unwrap();
+    let profile: NumericProfile = serde_json::from_value(json!({
+        "model_digest": model.checkpoint_digest,
+        "quant": declared.storage_dtype,
+        "engine": {"engine": "ane-direct-worker", "version": "protocol-v2", "build_flags": {
+            "profile": id, "compute_dtype": declared.compute_dtype, "storage_dtype": declared.storage_dtype,
+            "risk_class": "abort_capable"
+        }},
+        "sanitized_tokenizer_digest": tokenizers[&declared.model],
+        "pooling": if backend["pooling"] == "last" { "last_token" } else { "cls" },
+        "normalization": model.output.normalization,
+        "dtype": declared.storage_dtype, "flash_attention": "disabled",
+        "certified_shape": {"max_context_tokens": 8192, "max_batch_tokens": 8192, "max_micro_batch_tokens": 3072, "max_sequences": 64},
+        "thread_policy": "balanced", "operation": model.operation,
+        "input_grammar": format!("synapse-input-grammar-v1:{}", manifest.grammar_digest(&declared.model).unwrap()),
+        "kernel_revision": synapse_core::ANE_DIRECT_KERNEL_REVISION,
+        "rotation": declared.rotation,
+        "converted_package_digest": declared.converted_package_digest,
+        "manifest_profile_digest": synapse_parity::canonical::sha256_hex(&synapse_parity::canonical::canonical_bytes(&manifest.profile_entry(id).unwrap()))
+    })).unwrap();
+    assert_eq!(profile.stable_bytes(), qwen3_ane_golden::STABLE_BYTES);
+    assert_eq!(backend["fingerprint"], qwen3_ane_golden::FINGERPRINT);
+    assert_eq!(profile.fingerprint().0, qwen3_ane_golden::FINGERPRINT);
+    let expected_engine: synapse_core::EngineIdentity =
+        serde_json::from_slice(qwen3_ane_golden::ENGINE_IDENTITY).unwrap();
+    assert_eq!(profile.engine, expected_engine);
+    assert_eq!(
+        serde_json::to_vec(&profile.engine).unwrap(),
+        qwen3_ane_golden::ENGINE_IDENTITY
+    );
+
+    // A catalog fingerprint hashes [checkpoint, quant, SHA-256(stable bytes)],
+    // not the stable bytes directly. Hash the committed literal independently
+    // of the current NumericProfile serializer to bind it to the catalog pin.
+    let literal: NumericProfile = serde_json::from_slice(qwen3_ane_golden::STABLE_BYTES).unwrap();
+    let numeric_id = hex::encode(Sha256::digest(qwen3_ane_golden::STABLE_BYTES));
+    let payload =
+        serde_json::to_vec(&json!([literal.model_digest, literal.quant, numeric_id])).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(payload)),
+        qwen3_ane_golden::FINGERPRINT
+    );
+}
+
 #[test]
 #[ignore = "requires original pinned Hugging Face snapshots; no accelerator inference"]
 fn catalog_tokenizer_pins_match_original_snapshots() {

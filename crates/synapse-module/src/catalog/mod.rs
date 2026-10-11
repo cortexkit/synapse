@@ -1275,10 +1275,125 @@ fn show<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "absent".to_string(), |value| value.to_string())
 }
 
+// Reuse the portable test source so install-path checks consume the very same
+// committed literals without exporting test fixtures from the production API.
+#[cfg(test)]
+#[path = "../../tests/catalog_fingerprints.rs"]
+mod fingerprint_anchors;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Fetch the real checksum-named tokenizer inputs, then supply the original
+    // Qwen checkpoint snapshot at the catalog's pinned revision. The verified
+    // install path converts the checkpoint in an isolated cache; it never runs
+    // accelerator inference or opens the production store.
+    //
+    // python3 scripts/fetch-token-identity-assets.py
+    // SYNAPSE_TOKEN_IDENTITY_ASSETS="$PWD/target/token-identity-assets" \
+    // SYNAPSE_GOLDEN_QWEN_SNAPSHOT="/path/to/pinned/qwen/snapshot" \
+    //   cargo test -p synapse-module --lib \
+    //   catalog::tests::qwen3_ane_catalog_install_matches_golden_identity \
+    //   -- --ignored --exact --nocapture
+    #[test]
+    #[ignore = "requires checksum-pinned tokenizer and original checkpoint; no accelerator inference"]
+    fn qwen3_ane_catalog_install_matches_golden_identity() {
+        use super::fingerprint_anchors::qwen3_ane_golden;
+        use crate::{
+            catalog_profile_lane_spec, catalog_runtime_tests::isolated_catalog_state,
+            local_file_url, sha256_file, CatalogProfile, InlineConfig, JobConfig,
+        };
+        use std::{env, fs, path::PathBuf};
+        use synapse_core::{fingerprint::NumericProfile, ModelCacheIngest};
+
+        let assets = PathBuf::from(
+            env::var_os("SYNAPSE_TOKEN_IDENTITY_ASSETS").expect("SYNAPSE_TOKEN_IDENTITY_ASSETS"),
+        );
+        let snapshot = PathBuf::from(
+            env::var_os("SYNAPSE_GOLDEN_QWEN_SNAPSHOT").expect("SYNAPSE_GOLDEN_QWEN_SNAPSHOT"),
+        );
+        let (root, state) = isolated_catalog_state("qwen3-ane-golden", false);
+        let entry = state
+            .runtime
+            .release_catalog
+            .entry("qwen3-embedding-0.6b")
+            .unwrap();
+        let backend = entry.backend("ane").unwrap();
+        let files = entry.backend_files("ane");
+        for (role, source) in [
+            ("tokenizer", assets.join(&files["tokenizer"].sha256)),
+            ("model", snapshot.join(&files["model"].path)),
+        ] {
+            let file = &files[role];
+            assert_eq!(
+                fs::metadata(&source).unwrap().len(),
+                file.size_bytes,
+                "{role}"
+            );
+            assert_eq!(sha256_file(&source).unwrap(), file.sha256, "{role}");
+            state
+                .model_cache
+                .ingest(ModelCacheIngest {
+                    source_url: local_file_url(&source.canonicalize().unwrap()),
+                    expected_digest: Some(format!("sha256:{}", file.sha256)),
+                    format: if role == "model" {
+                        "safetensors"
+                    } else {
+                        "json"
+                    }
+                    .into(),
+                    tokenizer_path: None,
+                    pin_module_id: None,
+                })
+                .unwrap();
+        }
+        let profile_id = backend.profile.as_deref().unwrap();
+        let spec = catalog_profile_lane_spec(&state, entry, backend, profile_id, true).unwrap();
+        assert_eq!(spec.fingerprint.0, qwen3_ane_golden::FINGERPRINT);
+        assert_eq!(backend.fingerprint, qwen3_ane_golden::FINGERPRINT);
+        assert_eq!(spec.model_id, "qwen3-embedding-0.6b-ane");
+        let expected_engine: synapse_core::EngineIdentity =
+            serde_json::from_slice(qwen3_ane_golden::ENGINE_IDENTITY).unwrap();
+        assert_eq!(spec.engine_identity, expected_engine);
+        assert_eq!(
+            serde_json::to_vec(&spec.engine_identity).unwrap(),
+            qwen3_ane_golden::ENGINE_IDENTITY
+        );
+
+        // StoredModelConfig retains hashes but not NumericProfile bytes. Rebuild
+        // the profile from the returned install settings, then bind its hash to
+        // the stored numeric_profile_id and fingerprint before comparing bytes.
+        let inline = InlineConfig::default();
+        let jobs = JobConfig::default();
+        let mut numeric: NumericProfile = serde_json::from_value(json!({
+            "model_digest": spec.artifact_digest,
+            "quant": spec.quant,
+            "engine": spec.engine_identity,
+            "sanitized_tokenizer_digest": spec.tokenizer_sanitized_digest,
+            "pooling": if spec.pooling == "last" { "last_token" } else { &spec.pooling },
+            "normalization": if spec.normalize { "l2" } else { "none" },
+            "dtype": spec.owned_dtype,
+            "flash_attention": "disabled",
+            "certified_shape": {
+                "max_context_tokens": spec.max_tokens,
+                "max_batch_tokens": inline.max_tokens,
+                "max_micro_batch_tokens": jobs.bulk_quantum_tokens,
+                "max_sequences": inline.max_items,
+            },
+            "thread_policy": "balanced",
+        }))
+        .unwrap();
+        CatalogProfile::load(profile_id)
+            .unwrap()
+            .apply_numeric_profile(&mut numeric);
+        assert_eq!(numeric.numeric_profile_id(), spec.numeric_profile_id);
+        assert_eq!(numeric.fingerprint(), spec.fingerprint);
+        assert_eq!(numeric.stable_bytes(), qwen3_ane_golden::STABLE_BYTES);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn sha(seed: char) -> String {
         seed.to_string().repeat(64)
