@@ -435,19 +435,15 @@ impl Candidate {
     }
 }
 
-fn vectors(response: &Value, seqs: &[usize], query: bool) -> Result<Vec<Vec<u32>>> {
+fn vectors(response: &Value, seqs: &[usize]) -> Result<Vec<Vec<u32>>> {
     ensure!(
         response["fingerprint"] == PIN,
         "catalog fingerprint changed"
     );
-    let entries = if query {
-        vec![json!({"id":format!("row-{}",seqs[0]),"vector":response["vector"]})]
-    } else {
-        response["vectors"]
-            .as_array()
-            .context("inline vectors missing")?
-            .clone()
-    };
+    let entries = response["vectors"]
+        .as_array()
+        .context("inline vectors missing")?
+        .clone();
     ensure!(entries.len() == seqs.len(), "vector count mismatch");
     let mut ordered = vec![None; seqs.len()];
     for entry in entries {
@@ -485,20 +481,16 @@ async fn embed(
     let params = json!({"model":LANE,"input_type":"document","accept_declared":true,"request_key":key,
         "items":chunks.iter().map(|c|json!({"id":format!("row-{}",c.seq),"text":c.text})).collect::<Vec<_>>()});
     let response = candidate.call("embed.batch", params).await?;
-    vectors(
-        &response,
-        &chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
-        false,
-    )
+    vectors(&response, &chunks.iter().map(|c| c.seq).collect::<Vec<_>>())
 }
 async fn query(candidate: &Candidate, chunk: &Chunk) -> Result<Vec<u32>> {
     let response = candidate
         .call(
             "embed.query",
-            json!({"model":LANE,"text":chunk.text,"accept_declared":true}),
+            json!({"model":LANE,"id":format!("row-{}",chunk.seq),"text":chunk.text,"accept_declared":true}),
         )
         .await?;
-    Ok(vectors(&response, &[chunk.seq], true)?.remove(0))
+    Ok(vectors(&response, &[chunk.seq])?.remove(0))
 }
 fn packed_requests(observation: &Value) -> u64 {
     observation["wire"]["EMBED_PACKED"].as_u64().unwrap_or(0)
@@ -1134,16 +1126,16 @@ mod tests {
         let a = vec![json!(0.5); DIM];
         let b = vec![json!(-0.0); DIM];
         let response = json!({"fingerprint":PIN,"vectors":[{"id":"row-2","vector":b},{"id":"row-1","vector":a}]});
-        let rows = vectors(&response, &[1, 2], false).unwrap();
+        let rows = vectors(&response, &[1, 2]).unwrap();
         assert_eq!(rows[0], vec![0.5_f32.to_bits(); DIM]);
         assert_eq!(rows[1], vec![(-0.0_f32).to_bits(); DIM]);
         assert_ne!(rows[1], vec![0.0_f32.to_bits(); DIM]);
         let mut duplicate = response.clone();
         duplicate["vectors"][0]["id"] = json!("row-1");
-        assert!(vectors(&duplicate, &[1, 2], false).is_err());
+        assert!(vectors(&duplicate, &[1, 2]).is_err());
         let mut wrong = response;
         wrong["fingerprint"] = json!("different");
-        assert!(vectors(&wrong, &[1, 2], false).is_err());
+        assert!(vectors(&wrong, &[1, 2]).is_err());
     }
     #[test]
     fn vector_digest_hashes_bits_not_display_values() {
@@ -1376,5 +1368,21 @@ mod socket_mode_tests {
         reader.read_exact(&mut byte).unwrap();
         assert_eq!(byte, *b"x");
         peer.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod query_envelope_tests {
+    use super::*;
+    #[test]
+    fn one_row_query_uses_the_same_identified_vectors_envelope_as_batch() {
+        let response =
+            json!({"fingerprint":PIN,"vectors":[{"id":"row-0","vector":vec![json!(0.25);DIM]}]});
+        assert_eq!(
+            vectors(&response, &[0]).unwrap(),
+            vec![vec![0.25_f32.to_bits(); DIM]]
+        );
+        let obsolete = json!({"fingerprint":PIN,"vector":vec![json!(0.25);DIM]});
+        assert!(vectors(&obsolete, &[0]).is_err());
     }
 }
