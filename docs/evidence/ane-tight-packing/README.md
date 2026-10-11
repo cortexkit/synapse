@@ -901,3 +901,74 @@ python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py \
   --summarize "$MEMORY_JSONL" --summary-out docs/evidence/ane-tight-packing/module-serving-memory.json
 python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py --self-test
 ```
+
+## Third module-serving rerun: incomplete, stopped for paging
+
+A third invocation used the current `origin/master` source at
+`c00feeb728ec4dd6b95d0a0c4cd6d6ca94614870` on the M4 mini (16 GiB, Apple M4).
+The committed driver and direct-ANE worker were built in an isolated source clone;
+the transferred bundle SHA-256 `bfe41fd5ebeeff6aa7037cde6795279ad32f0449f841fb1a029707ba6ce7c4b5`
+was verified on the mini, and native builds used
+`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` (rustc 1.99.0,
+Cargo 1.99.0). The 6,341-row export and pinned checkpoint match the prior
+attempts by SHA-256.
+
+The sequence remained serial then packed, with the driver's defaults (three
+repetitions and 1,000 query samples per arm); no workload, configuration,
+acceptance threshold or module code was changed. The run used signed `ckdev-*`
+aliases and per-arm private config, store, lease and data roots. The module
+acquired the normal global ANE lock: `lsof` showed the module holding it and the
+relay and real worker inheriting it on descriptor zero. The lock location and
+`HOME` were not overridden. The `ck-synapse`, `ck_synapse`, and `ckdev` busy
+scan was clear before launch and before each fresh candidate; no measurement
+client or global-lock holder remained afterward. No M5 ANE
+or production store was used.
+
+At the initial mini check (00:05 CEST), `memory_pressure` reported **26% free**
+on the 16-GiB machine. The largest observed processes were the Virtualization
+VM (about 424 MiB RSS), Spark Mail renderer (280 MiB), three WebKit content
+processes (264, 261 and 234 MiB), `whisper-server` (169 MiB), ClickUp renderer
+(126 MiB), Claude (101 MiB) and Finder (83 MiB). These were the mini owner's
+apps and were left running untouched. Immediately before the actual invocation
+(00:20 CEST), the busy scan was clear and `memory_pressure -Q` reported 28% free.
+The beside-driver monitor started at 26% free and retained 603 samples with no
+sampling errors or overlapping arms. Across the capture, query-only memory
+pressure ranged from 11% to 37%; free pages reached 1,018 (15.9 MiB), compressor
+occupancy reached 502,380 pages (7.666 GiB), swap-ins increased by 6,496,149
+pages (99.123 GiB), and swap-outs by 7,163,645 pages (109.308 GiB). Those are
+global system counters, not attribution to the embedding process. Because swap
+was growing sharply, the run was stopped after its current complete alternating
+pair rather than continuing into more paging.
+
+| Arm | Full export (s) | Outer-call p50 / p99 (ms) | Query-under-bulk p50 / p99 (ms) | First packed admission/compile (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Serial 1 | 300.168 | 3,964.181 / 16,558.979 | 513.768 / 1,953.525 | — |
+| Packed 1 | 183.529 | 2,817.610 / 6,174.728 | 342.131 / 737.338 | 49,643.687 |
+
+Both recorded exports covered all 6,341 rows with zero vector mismatches and the
+same ordered vector digest as the earlier attempts. Both had 1,000 identical
+query vectors and zero mismatches among the background document vectors
+(13,220 serial and 13,847 packed). The packed export observed 825 packed worker
+calls, 81 single calls, and an eight-row maximum. The partial one-pair export
+ratio is 0.61142; its query-under-bulk p50/p99 are below the limits calculated
+from the one recorded serial arm. These are descriptive partial results, not an
+acceptance result: only one serial/packed pair was recorded, so three complete
+repetitions per arm were not obtained.
+
+**Acceptance gate: NOT PASSED.** The raw report and independent reducer both
+mark the run incomplete and `passed: false`. After completing repetition 0, the
+runner began setting up `serial-1` but was interrupted before that candidate
+started serving; it has no report arm or wire observations. No sample was
+stitched, selected or discarded. The two completed arms' module stderr is empty
+and their wire logs contain no refusal response; in particular, no
+`model_loading` refusal occurred.
+
+The compact record is `module-serving-rerun.json`. The full raw report and
+memory trace, private stores/configs, profiles, wire logs and stderr remain
+outside Git and outside regenerable build directories. The raw report is
+150,696 bytes, SHA-256
+`47dbc7af9e2f02758c631d918792614ac756196f49eb58e6fe3ddab7f51913c3`; the
+1,182,694-byte memory trace has SHA-256
+`81dab7ed49de4a165a51cf33ea75402b856adb1a4f51f8d9bc8ccc99a510ece7`.
+This rerun does not change either earlier attempt or the rollout disposition:
+packing remains disabled outside private runs.

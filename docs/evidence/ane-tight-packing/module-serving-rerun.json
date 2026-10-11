@@ -1,0 +1,197 @@
+{
+  "schema": 1,
+  "source_commit": "c00feeb728ec4dd6b95d0a0c4cd6d6ca94614870",
+  "source_transfer_sha256": "bfe41fd5ebeeff6aa7037cde6795279ad32f0449f841fb1a029707ba6ce7c4b5",
+  "build_environment": {
+    "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+    "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo_version": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "python_version": "Python 3.9.6"
+  },
+  "chip": "Apple M4",
+  "fingerprint": "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b",
+  "input_sha256": "1db27b7fd308b1e2d805f034b9f9f990cab5e321d04484f9d6b97980bd5ded4c",
+  "meta_sha256": "bfcef3e0035a9854b5bcc92bab3c500b566067885e9b33f02d1411199a83cfa4",
+  "checkpoint_sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+  "tokenizer_sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+  "module_sha256": "60e1804fbd33fc188843edbcc17f99b4f22cd340132e28970a5183f3f98740c0",
+  "worker_sha256": "a386fe8b08841ea4205af0ba0ced232015fbf2133e6d982343fef7fbaeb817b6",
+  "driver_sha256": "1bdcb648b16c2ab0d1e4bea681cd7f63c7cff9fc23207437cf517f4ea7eac7fb",
+  "rows": 6341,
+  "outer_calls": 127,
+  "calls_in_flight": 2,
+  "engine_quantum_rows": 8,
+  "query_row": 0,
+  "arms": [
+    {
+      "repetition": 0,
+      "packing": false,
+      "export_seconds": 300.16770675,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 3964.18075,
+        "p99_ms": 16558.979292
+      },
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 513.767833,
+        "p99_ms": 1953.525292
+      },
+      "identical_rows": 6341,
+      "mismatched_rows": [],
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811",
+      "identical_queries": 1000,
+      "background_calls": 265,
+      "background_identical_rows": 13220,
+      "background_mismatched_rows": 0,
+      "packed_export_worker_calls": 0,
+      "packed_total_worker_calls": 0,
+      "single_export_worker_calls": 931,
+      "max_engine_rows": 8,
+      "packed_compile_request_ms": []
+    },
+    {
+      "repetition": 0,
+      "packing": true,
+      "export_seconds": 183.529469584,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 2817.6100420000002,
+        "p99_ms": 6174.728499999999
+      },
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 342.131292,
+        "p99_ms": 737.3375
+      },
+      "identical_rows": 6341,
+      "mismatched_rows": [],
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811",
+      "identical_queries": 1000,
+      "background_calls": 278,
+      "background_identical_rows": 13847,
+      "background_mismatched_rows": 0,
+      "packed_export_worker_calls": 825,
+      "packed_total_worker_calls": 836,
+      "single_export_worker_calls": 81,
+      "max_engine_rows": 8,
+      "packed_compile_request_ms": [
+        49643.686707999994
+      ]
+    }
+  ],
+  "gates": {
+    "serial_median_seconds": 300.16770675,
+    "packed_median_seconds": 183.529469584,
+    "packed_over_serial": 0.6114230993437805,
+    "serial_queries": {
+      "count": 1000,
+      "p50_ms": 513.767833,
+      "p99_ms": 1953.525292
+    },
+    "packed_queries": {
+      "count": 1000,
+      "p50_ms": 342.131292,
+      "p99_ms": 737.3375
+    },
+    "query_p50_limit_ms": 565.1446163,
+    "query_p99_limit_ms": 2148.8778212,
+    "all_vectors_bit_identical": true,
+    "packed_dispatch_and_off_switch": true,
+    "export_time_pass": true,
+    "query_latency_pass": true,
+    "passed": false
+  },
+  "complete": false,
+  "completed_serial_arms": 1,
+  "completed_packed_arms": 1,
+  "packed_preparation_first_request_median_ms": 49643.686707999994,
+  "raw_report_bytes": 150696,
+  "raw_report_sha256": "47dbc7af9e2f02758c631d918792614ac756196f49eb58e6fe3ddab7f51913c3",
+  "run_status": "incomplete; stopped after repetition 0 because global swap activity grew sharply",
+  "stop_reason": "After the serial-0/packed-0 pair was recorded, the driver was interrupted during setup of serial-1 before that candidate served. The monitor observed 7,163,645 global swap-out pages during 603 samples; no arm was stitched or selected.",
+  "refusals": [],
+  "global_lock": {
+    "normal_global_lock_used": true,
+    "module_held_lock": true,
+    "relay_inherited_lock_on_stdin": true,
+    "worker_inherited_lock_on_stdin": true,
+    "overridden": false,
+    "remaining_holders_after_run": 0
+  },
+  "preflight": {
+    "initial_owner_report": {
+      "time_local": "2026-10-12 00:05 CEST",
+      "physical_memory_bytes": 17179869184,
+      "memory_pressure_free_pct": 26,
+      "busy_scan": "only the SSH shell and Perl probe matched the broad text scan; no serving client was present",
+      "top_processes": [
+        {"name": "Virtualization VM", "rss_mib": 424.3},
+        {"name": "Spark Mail renderer", "rss_mib": 279.6},
+        {"name": "WebKit WebContent (1)", "rss_mib": 264.0},
+        {"name": "WebKit WebContent (2)", "rss_mib": 261.1},
+        {"name": "WebKit WebContent (3)", "rss_mib": 234.1},
+        {"name": "whisper-server", "rss_mib": 169.4},
+        {"name": "ClickUp Helper renderer", "rss_mib": 126.2},
+        {"name": "Claude", "rss_mib": 101.0},
+        {"name": "Finder", "rss_mib": 82.9}
+      ],
+      "owner_apps_touched": false
+    },
+    "measurement_start": {
+      "time_local": "2026-10-12 00:20 CEST",
+      "memory_pressure_free_pct": 28,
+      "busy_scan": "clear",
+      "owner_apps_touched": false,
+      "top_processes": [
+        {"name": "Claude", "rss_mib": 512.0},
+        {"name": "Virtualization VM", "rss_mib": 406.0},
+        {"name": "WebKit WebContent", "rss_mib": 360.0},
+        {"name": "mediaanalysisd", "rss_mib": 174.0},
+        {"name": "whisper-server", "rss_mib": 169.4},
+        {"name": "Spark Mail renderer", "rss_mib": 145.8},
+        {"name": "WhatsApp bridge", "rss_mib": 121.9},
+        {"name": "ClickUp Helper renderer", "rss_mib": 117.8},
+        {"name": "Claude Helper renderer", "rss_mib": 116.8},
+        {"name": "Finder", "rss_mib": 114.7}
+      ]
+    }
+  },
+  "memory_monitor": {
+    "physical_memory_bytes": 17179869184,
+    "page_size_bytes": 16384,
+    "interval_seconds": 3,
+    "samples": 603,
+    "sample_errors": [],
+    "start_unix_us": 1791757251306532,
+    "end_unix_us": 1791759062553548,
+    "memory_pressure_free_pct_start": 26,
+    "memory_pressure_free_pct_min": 11,
+    "memory_pressure_free_pct_max": 37,
+    "memory_pressure_free_pct_end": 32,
+    "global_vm_counter_deltas_pages": {
+      "Compressions": 47555848,
+      "Decompressions": 44031939,
+      "Pageins": 4423829,
+      "Pageouts": 10036,
+      "Swapins": 6496149,
+      "Swapouts": 7163645
+    },
+    "free_pages_min": 1018,
+    "free_pages_max": 63134,
+    "compressor_occupied_pages_min": 248448,
+    "compressor_occupied_pages_max": 502380,
+    "samples_with_multiple_active_arms": 0,
+    "peak_rss_kib_by_arm": [
+      {"arm": null, "name": "ckdev-ane-packing-serving", "peak_rss_kib": 62624},
+      {"arm": "serial-0", "name": "ckdev-ane-packing-module", "peak_rss_kib": 181456},
+      {"arm": "serial-0", "name": "ckdev-ane-packing-worker-proxy", "peak_rss_kib": 6144},
+      {"arm": "serial-0", "name": "ckdev-ane-packing-worker", "peak_rss_kib": 494272},
+      {"arm": "packed-0", "name": "ckdev-ane-packing-module", "peak_rss_kib": 179360},
+      {"arm": "packed-0", "name": "ckdev-ane-packing-worker-proxy", "peak_rss_kib": 6496},
+      {"arm": "packed-0", "name": "ckdev-ane-packing-worker", "peak_rss_kib": 777856}
+    ],
+    "raw_memory_bytes": 1182694,
+    "raw_memory_sha256": "81dab7ed49de4a165a51cf33ea75402b856adb1a4f51f8d9bc8ccc99a510ece7"
+  }
+}
