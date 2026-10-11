@@ -2,8 +2,8 @@
 id = "catalog-ready-request-deadline"
 guards = "A delayed Ready catalog resolver uses the request deadline instead of a separate five-second loading budget"
 file = "crates/synapse-module/src/lib.rs"
-old = "match tokio::time::timeout_at(deadline, handle).await {"
-new = "match tokio::time::timeout(Duration::from_millis(5000), handle).await { // NON-VACUITY BREAK: restore the readiness cap"
+old = "let mut readiness = tokio::time::timeout_at(resolution_deadline, &mut handle).await;"
+new = "let mut readiness = tokio::time::timeout_at(resolution_deadline.min(tokio::time::Instant::now() + Duration::from_millis(5000)), &mut handle).await; // NON-VACUITY BREAK: restore the readiness cap"
 edits = []
 test_file = "crates/synapse-module/src/lib.rs"
 runner = "cargo"

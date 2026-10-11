@@ -18652,7 +18652,11 @@ mod tests {
             ANE_TEST_LANE,
             ModelRuntimeState::Failed(failure.clone()),
         );
-        let expired = catalog_resolution_expired(&fixture.state.runtime, ANE_TEST_LANE);
+        let expired = catalog_resolution_expired(
+            &fixture.state.runtime,
+            ANE_TEST_LANE,
+            tokio::time::Instant::now(),
+        );
         finish_ane_lane_fixture(fixture).await;
         assert_eq!(
             expired, failure,
@@ -18706,7 +18710,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn unresolved_catalog_resolver_answers_model_loading_at_the_request_deadline() {
+    async fn unresolved_catalog_resolver_preserves_the_five_second_loading_cap() {
         for lifecycle in [ModelRuntimeState::Unloaded, ModelRuntimeState::Loading] {
             let fixture = installed_ready_ane_fixture().await;
             {
@@ -18716,10 +18720,13 @@ mod tests {
                 slot.loaded = None;
             }
             *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
-                Some(Duration::from_millis(300));
+                Some(Duration::from_millis(6500));
             let began = Instant::now();
-            let result = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+            let result = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
             let elapsed = began.elapsed();
+            let load_continues = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+                .try_lock_owned()
+                .is_err();
             let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
                 .lock_owned()
                 .await;
@@ -18732,15 +18739,135 @@ mod tests {
             );
             assert_eq!(error.retry_after_ms, Some(250));
             assert!(error.safe_to_retry_same_request);
+            assert!(
+                load_continues,
+                "the loading task must retain lifecycle ownership after the capped response"
+            );
             assert_eq!(
                 error.message,
                 format!("catalog lane '{ANE_TEST_LANE}' is loading")
             );
             assert!(
-                elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+                elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
                 "{elapsed:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unresolved_catalog_resolver_uses_deadline_exceeded_when_the_request_budget_runs_out() {
+        let fixture = installed_ready_ane_fixture().await;
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.state = ModelRuntimeState::Unloaded;
+            slot.loaded = None;
+        }
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(300));
+        let began = Instant::now();
+        let result = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+        let elapsed = began.elapsed();
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code, "deadline_exceeded",
+            "the loading cap must not extend the request deadline: {error:?}"
+        );
+        assert!(!error.safe_to_retry_same_request);
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_loading_catalog_resolver_that_observes_ready_uses_the_request_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        let model = ane_lane_model(&fixture.state);
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.state = ModelRuntimeState::Loading;
+            slot.loaded = None;
+        }
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(5200));
+        let publish_ready = tokio::spawn({
+            let state = fixture.state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut slots = state.runtime.catalog.lock().unwrap();
+                let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+                slot.loaded = Some(model);
+                slot.state = ModelRuntimeState::Ready;
+            }
+        });
+        let began = Instant::now();
+        let result = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
+        let elapsed = began.elapsed();
+        publish_ready.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "the readiness delay must execute: {elapsed:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "a lane that became Ready must not be described as loading: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_ready_catalog_resolver_that_must_reload_uses_the_loading_cap() {
+        let fixture = installed_ready_ane_fixture().await;
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(6500));
+        let request = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !request.is_finished(),
+            "resolution must retain its lifecycle wait"
+        );
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.loaded = None;
+            slot.state = ModelRuntimeState::Unloaded;
+        }
+        let began = Instant::now();
+        drop(lock);
+        let result = request.await.unwrap();
+        let elapsed = began.elapsed();
+        let load_continues = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .try_lock_owned()
+            .is_err();
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code, "model_loading",
+            "an unload before lifecycle acquisition requires a capped reload: {error:?}"
+        );
+        assert_eq!(error.retry_after_ms, Some(250));
+        assert!(load_continues);
+        assert!(
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+            "{elapsed:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -30174,25 +30301,58 @@ async fn resolve_serving_model_until(
     let (entry, backend) = select_catalog_lane(&state, requested, task, required, target)?;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
     if tokio::time::Instant::now() >= deadline {
-        return Err(catalog_resolution_expired(&state.runtime, &lane));
+        return Err(catalog_resolution_expired(&state.runtime, &lane, deadline));
     }
+    let mut loading_capped = !catalog_lane_is_ready(&state.runtime, &lane)
+        && !catalog_lane_check_running(&state.runtime, &lane);
+    // Only unresolved loading work has the wire contract's five-second cap.
+    // Both lifecycle queueing and the detached load consume this one cap, which
+    // never extends the request deadline. Ready lanes and running numerical checks
+    // use the request deadline instead.
+    let mut resolution_deadline = if loading_capped {
+        deadline.min(tokio::time::Instant::now() + Duration::from_secs(5))
+    } else {
+        deadline
+    };
+    tracing::debug!(model_id = %lane, stage = "resolver_budget", loading_capped,
+        remaining_ms = remaining_request_ms(resolution_deadline), "catalog resolver");
     let started = std::time::Instant::now();
-    let (guard, waited) = catalog_resolution_guard_until(&state.runtime, &lane, deadline).await?;
+    let mut locked =
+        catalog_resolution_guard_until(&state.runtime, &lane, resolution_deadline, deadline).await;
+    if locked.is_err()
+        && loading_capped
+        && catalog_lane_is_ready(&state.runtime, &lane)
+        && tokio::time::Instant::now() < deadline
+    {
+        locked = catalog_resolution_guard_until(&state.runtime, &lane, deadline, deadline).await;
+    }
+    let (guard, waited) = locked?;
     ane_lane_timing("resolver_lane_wait", &lane, None, started);
     tracing::debug!(model_id = %lane, stage = "lifecycle_acquired", waited,
         wall_ms = started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
+    // The lifecycle lock may have been held by an unload after selection saw
+    // Ready. Re-evaluate the load budget under that lock before starting work.
+    let needs_load = !catalog_lane_is_ready(&state.runtime, &lane)
+        && !catalog_lane_check_running(&state.runtime, &lane);
+    if needs_load && !loading_capped {
+        loading_capped = true;
+        resolution_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+    } else if !needs_load {
+        loading_capped = false;
+        resolution_deadline = deadline;
+    }
     if tokio::time::Instant::now() >= deadline {
-        return Err(catalog_resolution_expired(&state.runtime, &lane));
+        return Err(catalog_resolution_expired(&state.runtime, &lane, deadline));
     }
     let task_state = state.clone();
     // Only the lock owner starts detached work. A timed-out waiter must not
     // stay queued and start a new load after the attempt it was waiting for fails.
     let owner = tracing::debug_span!("catalog_readiness_owner", model_id = %lane);
     tracing::debug!(model_id = %lane, stage = "readiness_spawn", "catalog resolver");
-    let handle = tokio::spawn(
+    let mut handle = tokio::spawn(
         async move {
             tracing::debug!(stage = "readiness_start", "catalog resolver");
             let result = ensure_catalog_lane_ready_owned(task_state, entry, backend, guard).await;
@@ -30206,10 +30366,20 @@ async fn resolve_serving_model_until(
         }
         .instrument(owner),
     );
-    match tokio::time::timeout_at(deadline, handle).await {
+    let mut readiness = tokio::time::timeout_at(resolution_deadline, &mut handle).await;
+    // A cold attempt can publish Ready before its bookkeeping task settles.
+    // Once loading has ended, delayed bookkeeping must not masquerade as a load.
+    if readiness.is_err()
+        && loading_capped
+        && catalog_lane_is_ready(&state.runtime, &lane)
+        && tokio::time::Instant::now() < deadline
+    {
+        readiness = tokio::time::timeout_at(deadline, &mut handle).await;
+    }
+    match readiness {
         Ok(Ok(result)) => {
             if tokio::time::Instant::now() >= deadline {
-                Err(catalog_resolution_expired(&state.runtime, &lane))
+                Err(catalog_resolution_expired(&state.runtime, &lane, deadline))
             } else {
                 result
             }
@@ -30218,7 +30388,7 @@ async fn resolve_serving_model_until(
             StableError::engine_crashed(Some(250)),
             format!("catalog load task failed: {e}"),
         )),
-        Err(_) => Err(catalog_resolution_expired(&state.runtime, &lane)),
+        Err(_) => Err(catalog_resolution_expired(&state.runtime, &lane, deadline)),
     }
 }
 
@@ -30228,29 +30398,26 @@ async fn catalog_resolution_guard(
     lane: &str,
     budget: u64,
 ) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), WireOperationError> {
-    catalog_resolution_guard_until(
-        runtime,
-        lane,
-        tokio::time::Instant::now() + Duration::from_millis(budget),
-    )
-    .await
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+    catalog_resolution_guard_until(runtime, lane, deadline, deadline).await
 }
 
-/// Wait only until the request's absolute deadline; a timed-out waiter leaves
-/// the lifecycle queue and cannot start a load after the caller has gone away.
+/// A timed-out waiter leaves the lifecycle queue and cannot start another load.
+/// The loading cap and the request deadline share this same queueing budget.
 async fn catalog_resolution_guard_until(
     runtime: &RuntimeState,
     lane: &str,
-    deadline: tokio::time::Instant,
+    resolution_deadline: tokio::time::Instant,
+    request_deadline: tokio::time::Instant,
 ) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), WireOperationError> {
     let lock = catalog_lane_lock(runtime, lane);
     tracing::debug!(model_id = %lane, stage = "lifecycle_wait", "catalog resolver");
     match lock.clone().try_lock_owned() {
         Ok(guard) => Ok((guard, false)),
         Err(_) => Ok((
-            tokio::time::timeout_at(deadline, lock.lock_owned())
+            tokio::time::timeout_at(resolution_deadline, lock.lock_owned())
                 .await
-                .map_err(|_| catalog_resolution_expired(runtime, lane))?,
+                .map_err(|_| catalog_resolution_expired(runtime, lane, request_deadline))?,
             true,
         )),
     }
@@ -30263,7 +30430,25 @@ fn remaining_request_ms(deadline: tokio::time::Instant) -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn catalog_resolution_expired(runtime: &RuntimeState, lane: &str) -> WireOperationError {
+fn catalog_lane_is_ready(runtime: &RuntimeState, lane: &str) -> bool {
+    model_slot_snapshot(runtime, lane)
+        .is_some_and(|slot| matches!(slot.state, ModelRuntimeState::Ready) && slot.loaded.is_some())
+}
+
+fn catalog_lane_check_running(runtime: &RuntimeState, lane: &str) -> bool {
+    runtime
+        .lane_checks
+        .lock()
+        .expect("lane checks")
+        .get(lane)
+        .is_some_and(|outcome| outcome.borrow().is_none())
+}
+
+fn catalog_resolution_expired(
+    runtime: &RuntimeState,
+    lane: &str,
+    deadline: tokio::time::Instant,
+) -> WireOperationError {
     let slot = model_slot_snapshot(runtime, lane);
     if let Some(ModelSlotSnapshot {
         state: ModelRuntimeState::Failed(error),
@@ -30277,13 +30462,8 @@ fn catalog_resolution_expired(runtime: &RuntimeState, lane: &str) -> WireOperati
     let ready = slot.is_some_and(|slot| {
         matches!(slot.state, ModelRuntimeState::Ready) && slot.loaded.is_some()
     });
-    let checking = runtime
-        .lane_checks
-        .lock()
-        .expect("lane checks")
-        .get(lane)
-        .is_some_and(|outcome| outcome.borrow().is_none());
-    let error = if ready && !checking {
+    let checking = catalog_lane_check_running(runtime, lane);
+    let error = if !checking && (ready || tokio::time::Instant::now() >= deadline) {
         WireOperationError::from_stable(
             StableError::deadline_exceeded(),
             "catalog admission deadline expired",
