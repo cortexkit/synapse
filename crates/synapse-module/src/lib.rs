@@ -881,6 +881,8 @@ pub(crate) struct ModuleConfig {
     #[serde(default)]
     worker: WorkerConfig,
     #[serde(default)]
+    ane_direct: AneDirectConfig,
+    #[serde(default)]
     log: LogConfig,
     #[serde(default)]
     jobs: JobConfig,
@@ -920,6 +922,7 @@ impl Default for ModuleConfig {
             preload_models: Vec::new(),
             inline: InlineConfig::default(),
             worker: WorkerConfig::default(),
+            ane_direct: AneDirectConfig::default(),
             log: LogConfig::default(),
             jobs: JobConfig::default(),
             probe: ProbeConfig::default(),
@@ -972,6 +975,14 @@ fn validate_decode_chain_k(value: u32) -> Result<(), ModuleError> {
             "decode_chain_k must be between 1 and {MAX_DECODE_CHAIN_K}, got {value}"
         )))
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AneDirectConfig {
+    // Packing is a per-device serving optimization, not part of numerical identity.
+    #[serde(default)]
+    tight_packing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1312,6 +1323,7 @@ impl AdmissionTelemetry {
 
 struct RuntimeState {
     certify_observation: bool,
+    ane_direct: AneDirectConfig,
     hf_endpoint: String,
     release_catalog: catalog::Catalog,
     runnable_backends: BTreeSet<String>,
@@ -1410,9 +1422,132 @@ struct ActivityTelemetry {
     by_model: Mutex<BTreeMap<String, u64>>,
     completed_tokens: AtomicU64,
     inline_sequence: AtomicU64,
+    #[cfg(unix)]
+    packed_preparations: Mutex<BTreeMap<String, Arc<PackedPreparation>>>,
+}
+
+#[cfg(unix)]
+struct PackedPreparation {
+    runtime: std::sync::Weak<RuntimeState>,
+    model: std::sync::Weak<EmbeddingModel>,
+    executor: tokio::runtime::Handle,
+    state: Mutex<PackedPreparationState>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct PackedPreparationState {
+    running: bool,
+    retry: bool,
+    finished: bool,
+}
+
+fn packed_lane_enabled(runtime: &RuntimeState, model: &EmbeddingModel) -> bool {
+    runtime.ane_direct.tight_packing
+        && model.model_id == "qwen3-embedding-0.6b-ane"
+        && model.task == ModelTask::Embed
+        && is_direct_ane(model)
+        && resolved_catalog_lane(runtime, &model.model_id)
+            .is_some_and(|(_, backend)| model.fingerprint.0 == backend.fingerprint)
+}
+
+fn start_packed_preparation(runtime: &Arc<RuntimeState>, model: &Arc<EmbeddingModel>) {
+    #[cfg(unix)]
+    if packed_lane_enabled(runtime, model) {
+        let telemetry = &runtime.activity_telemetry;
+        {
+            let mut preparations = telemetry.packed_preparations.lock().expect("preparations");
+            if preparations
+                .get(&model.model_id)
+                .is_none_or(|p| !p.model.ptr_eq(&Arc::downgrade(model)))
+            {
+                preparations.insert(
+                    model.model_id.clone(),
+                    Arc::new(PackedPreparation {
+                        runtime: Arc::downgrade(runtime),
+                        model: Arc::downgrade(model),
+                        executor: tokio::runtime::Handle::current(),
+                        state: Mutex::new(PackedPreparationState::default()),
+                    }),
+                );
+            }
+        }
+        telemetry.prepare_when_idle(&model.model_id);
+    }
+    #[cfg(not(unix))]
+    let _ = (runtime, model);
 }
 
 impl ActivityTelemetry {
+    #[cfg(unix)]
+    fn prepare_when_idle(self: &Arc<Self>, model_id: &str) {
+        if self
+            .by_model
+            .lock()
+            .expect("activity")
+            .contains_key(model_id)
+        {
+            return;
+        }
+        let Some(preparation) = self
+            .packed_preparations
+            .lock()
+            .expect("preparations")
+            .get(model_id)
+            .cloned()
+        else {
+            return;
+        };
+        {
+            let mut state = preparation.state.lock().expect("preparation state");
+            if state.finished {
+                return;
+            }
+            if state.running {
+                // An idle transition during compilation must not lose a deferred retry.
+                state.retry = true;
+                return;
+            }
+            state.running = true;
+        }
+        let telemetry = self.clone();
+        let model_id = model_id.to_string();
+        let executor = preparation.executor.clone();
+        executor.spawn(async move {
+            let mut prepared = false;
+            if let (Some(runtime), Some(model)) =
+                (preparation.runtime.upgrade(), preparation.model.upgrade())
+            {
+                let current = model_slot_snapshot(&runtime, &model_id).is_some_and(|slot| {
+                    matches!(slot.state, ModelRuntimeState::Ready)
+                        && slot.loaded.is_some_and(|loaded| Arc::ptr_eq(&loaded, &model))
+                });
+                // A shared serving guard prevents unload without blocking new
+                // requests on the lifecycle gate. Their own deadlines then bound
+                // the worker-stream wait and report shape_compiling during a compile.
+                if current && !telemetry.by_model.lock().expect("activity").contains_key(&model_id) {
+                    if let Ok(_gate) = lane_serving_gate(&runtime, &model_id).try_read_owned() {
+                        if let EmbedBackend::DirectAne(engine) = &model.backend {
+                            match engine.serving.prepare_packed().await {
+                                Ok(qualified) => prepared = qualified,
+                                Err(error) => tracing::warn!(model_id, %error, "packed preparation deferred; serving standalone"),
+                            }
+                        }
+                    }
+                }
+            }
+            let retry = {
+                let mut state = preparation.state.lock().expect("preparation state");
+                state.running = false;
+                state.finished = prepared;
+                std::mem::take(&mut state.retry) && !prepared
+            };
+            if retry {
+                telemetry.prepare_when_idle(&model_id);
+            }
+        });
+    }
+
     fn begin(self: &Arc<Self>, model_id: &str) -> ActivityGuard {
         if let Ok(mut by_model) = self.by_model.lock() {
             let count = by_model.entry(model_id.to_string()).or_default();
@@ -1441,6 +1576,7 @@ struct ActivityGuard {
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
+        let mut idle = false;
         if let Ok(mut by_model) = self.telemetry.by_model.lock() {
             let remove = by_model.get_mut(&self.model_id).is_some_and(|count| {
                 *count = count.saturating_sub(1);
@@ -1448,8 +1584,15 @@ impl Drop for ActivityGuard {
             });
             if remove {
                 by_model.remove(&self.model_id);
+                idle = true;
             }
         }
+        #[cfg(unix)]
+        if idle {
+            self.telemetry.prepare_when_idle(&self.model_id);
+        }
+        #[cfg(not(unix))]
+        let _ = idle;
     }
 }
 
@@ -2417,6 +2560,7 @@ impl RuntimeState {
             .collect();
         Ok(Self {
             certify_observation: config.certify_observation,
+            ane_direct: config.ane_direct,
             hf_endpoint,
             release_catalog,
             runnable_backends,
@@ -6312,6 +6456,22 @@ async fn load_catalog_model_task(
             let cold_load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
             let model = Arc::new(model);
             set_model_slot_ready(&state.runtime, &model_id, Arc::clone(&model), cold_load_ms);
+            if packed_lane_enabled(&state.runtime, &model) {
+                let state = state.clone();
+                let model = model.clone();
+                tokio::spawn(async move {
+                    // Reloading a lane with a persisted passing self-check skips
+                    // run_lane_check, so schedule its preparation here instead.
+                    // Wait for the load owner to release the lifecycle lock first.
+                    let guard = catalog_lane_lock(&state.runtime, &model.model_id)
+                        .lock_owned()
+                        .await;
+                    drop(guard);
+                    if profile_check_passed(&state, &model.model_id).is_ok_and(|m| m.is_some()) {
+                        start_packed_preparation(&state.runtime, &model);
+                    }
+                });
+            }
             Ok(model)
         }
         Err(error) => {
@@ -12817,15 +12977,27 @@ async fn execute_embedding_with_catalog_guard(
             }
             let roundtrip_started = Instant::now();
             let _ = (permit, lane_execution);
-            let result = engine
-                .infer_permitted(
-                    batch.items,
-                    false,
-                    deadline,
-                    (catalog_guard, _activity),
-                    Some(direct_ane_permit_source(runtime)),
-                )
-                .await;
+            let result = if packed_lane_enabled(runtime, model) {
+                engine
+                    .serving
+                    .infer_packed_permitted(
+                        batch.items,
+                        deadline,
+                        (catalog_guard, _activity),
+                        Some(direct_ane_permit_source(runtime)),
+                    )
+                    .await
+            } else {
+                engine
+                    .infer_permitted(
+                        batch.items,
+                        false,
+                        deadline,
+                        (catalog_guard, _activity),
+                        Some(direct_ane_permit_source(runtime)),
+                    )
+                    .await
+            };
             ane_lane_timing(
                 "direct_ane_roundtrip",
                 &model.model_id,
@@ -18166,6 +18338,831 @@ mod tests {
         (Arc::new(Notify::new()), Arc::new(Notify::new()))
     }
 
+    #[cfg(unix)]
+    const PACKING_TEST_LANE: &str = "qwen3-embedding-0.6b-ane";
+    #[cfg(unix)]
+    const PACKING_TEST_MODEL: &str = "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:pinned";
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct PackingPeer {
+        requests: Vec<synapse_core::WorkerRequest>,
+        admission_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+        corrupt: bool,
+    }
+
+    #[cfg(unix)]
+    async fn packing_test_serving(
+        peer: Arc<Mutex<PackingPeer>>,
+        supervisor: worker_host::ane_residency::AneResidencySupervisor,
+        id: &str,
+    ) -> Arc<worker_host::ane_residency::AneServing<tokio::net::UnixStream>> {
+        use synapse_core::{worker_protocol::*, worker_transport::*};
+        use worker_host::ane_residency::*;
+        let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
+            let peer = peer.clone();
+            Box::pin(async move {
+                let (host, mut worker) = tokio::net::UnixStream::pair().unwrap();
+                let task = tokio::spawn(async move {
+                    let max = DEFAULT_MAX_FRAME_BYTES;
+                    let mut resident = BTreeSet::new();
+                    while let Ok(request) = read_json::<WorkerRequest, _>(&mut worker, max).await {
+                        let raw = if request.carries_raw_frame() {
+                            Some(read_raw(&mut worker, max).await.unwrap())
+                        } else {
+                            None
+                        };
+                        peer.lock().unwrap().requests.push(request.clone());
+                        let inventory = || AnePlacementInventory {
+                            executables: (0..28)
+                                .map(|layer| AneExecutable {
+                                    id: format!("layer-{layer}"),
+                                    layers: vec![layer],
+                                })
+                                .collect(),
+                            cpu_stages: vec!["cpu_tail".into()],
+                        };
+                        let mut output = None;
+                        let response = match &request {
+                            WorkerRequest::AneAdmitShape { req_id, shape, .. } => {
+                                resident.insert((false, *shape));
+                                WorkerResponse::Admitted {
+                                    req_id: req_id.clone(),
+                                    inventory: inventory(),
+                                }
+                            }
+                            WorkerRequest::AneAdmitPacked { req_id, .. } => {
+                                let gate = peer.lock().unwrap().admission_gate.take();
+                                if let Some((started, release)) = gate {
+                                    started.notify_one();
+                                    release.notified().await;
+                                }
+                                resident.insert((true, 256));
+                                WorkerResponse::Admitted {
+                                    req_id: req_id.clone(),
+                                    inventory: inventory(),
+                                }
+                            }
+                            WorkerRequest::AneEvictShape { req_id, shape, .. } => {
+                                resident.remove(&(false, *shape));
+                                WorkerResponse::Evicted {
+                                    req_id: req_id.clone(),
+                                }
+                            }
+                            WorkerRequest::AneEvictPacked { req_id, .. } => {
+                                resident.remove(&(true, 256));
+                                WorkerResponse::Evicted {
+                                    req_id: req_id.clone(),
+                                }
+                            }
+                            WorkerRequest::EmbedBatch { req_id, items, .. }
+                            | WorkerRequest::EmbedPacked { req_id, items, .. } => {
+                                let gate = peer.lock().unwrap().inference_gate.take();
+                                if let Some((started, release)) = gate {
+                                    started.notify_one();
+                                    release.notified().await;
+                                }
+                                let packed = matches!(request, WorkerRequest::EmbedPacked { .. });
+                                if let WorkerRequest::EmbedPacked { passes, .. } = &request {
+                                    synapse_core::validate_packed_passes(
+                                        &items.iter().map(|item| item.n_tokens).collect::<Vec<_>>(),
+                                        passes,
+                                    )
+                                    .unwrap();
+                                    assert!(
+                                        resident.contains(&(true, 256)),
+                                        "packed dispatch must be resident"
+                                    );
+                                } else {
+                                    assert!(
+                                        items.iter().all(|item| resident.contains(&(
+                                            false,
+                                            *worker_host::ane_residency::ANE_SHAPE_LADDER
+                                                .iter()
+                                                .find(|&&width| width >= item.n_tokens)
+                                                .unwrap()
+                                        ))),
+                                        "standalone dispatch must use its natural resident rung"
+                                    );
+                                }
+                                let ids = decode_i32_frame(raw.as_ref().unwrap()).unwrap();
+                                let mut offset = 0;
+                                let values = items
+                                    .iter()
+                                    .map(|item| {
+                                        let value = ids[offset] as f32;
+                                        offset += item.n_tokens;
+                                        value
+                                            + if packed && peer.lock().unwrap().corrupt {
+                                                1.0
+                                            } else {
+                                                0.0
+                                            }
+                                    })
+                                    .collect::<Vec<_>>();
+                                assert_eq!(offset, ids.len());
+                                output = Some(encode_f32_frame(&values));
+                                WorkerResponse::Vectors {
+                                    req_id: req_id.clone(),
+                                    dims: 1,
+                                    n: items.len(),
+                                }
+                            }
+                            _ => WorkerResponse::unsupported_request(&request),
+                        };
+                        if write_json(&mut worker, &response, max).await.is_err() {
+                            break;
+                        }
+                        if let Some(output) = output {
+                            if write_raw(&mut worker, &output, max).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Ok(AneWorkerSession {
+                    stream: host,
+                    packed: Some(synapse_core::PackedCapability::tight256()),
+                    confirm_exit: Box::pin(async move {
+                        task.await
+                            .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+                        Ok(())
+                    }),
+                })
+            })
+        });
+        let channel = Arc::new(
+            AneWorkerChannel::connect(id, DEFAULT_MAX_FRAME_BYTES, connector)
+                .await
+                .unwrap(),
+        );
+        Arc::new(
+            AneServing::new(
+                channel,
+                supervisor,
+                AneServingMetadata {
+                    model_ref: PACKING_TEST_MODEL.into(),
+                    dims: 1,
+                    buckets: worker_host::ane_residency::ANE_SHAPE_LADDER.to_vec(),
+                    pooling: WorkerPooling::Last,
+                    normalize: true,
+                    timeout: Duration::from_secs(3),
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn packing_lane_fixture(
+        config: ModuleConfig,
+        passed: bool,
+    ) -> (AneLaneFixture, Arc<Mutex<PackingPeer>>) {
+        let (root, descriptor) = test_storage_descriptor("module-packing");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("packing-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state_with_config(store, profile, config);
+        let mut spec = catalog_fixture_config("qwen3-embedding-0.6b.ane-direct-worker");
+        spec.model_id = PACKING_TEST_LANE.into();
+        spec.fingerprint = Fingerprint(
+            state
+                .runtime
+                .release_catalog
+                .entry("qwen3-embedding-0.6b")
+                .unwrap()
+                .backend("ane")
+                .unwrap()
+                .fingerprint
+                .clone(),
+        );
+        let mut model = catalog_test_model(&root, &spec);
+        let (mut engine, control) =
+            tokio::task::spawn_blocking(worker_host::ane_residency::module_mock_engine_controlled)
+                .await
+                .unwrap();
+        engine.serving.retire().await.unwrap();
+        let peer = Arc::new(Mutex::new(PackingPeer::default()));
+        Arc::get_mut(&mut engine).unwrap().serving = packing_test_serving(
+            peer.clone(),
+            worker_host::ane_residency::AneResidencySupervisor::new(Default::default()),
+            "module-packing",
+        )
+        .await;
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+        state.runtime.catalog.lock().unwrap().insert(
+            PACKING_TEST_LANE.into(),
+            ModelSlot {
+                spec,
+                loaded: Some(model),
+                state: ModelRuntimeState::Ready,
+                notify: Arc::new(Notify::new()),
+                last_cold_load_ms: None,
+            },
+        );
+        if passed {
+            let model = model_slot_snapshot(&state.runtime, PACKING_TEST_LANE)
+                .unwrap()
+                .loaded
+                .unwrap();
+            let (id, key) = profile_check_identity(&state, &model).unwrap();
+            let generation = catalog_check_generation(&state, &id, &key).unwrap();
+            assert!(catalog_complete_check(&state, &id, generation, "passed", None).unwrap());
+        }
+        (
+            AneLaneFixture {
+                root,
+                state,
+                engine,
+                control,
+            },
+            peer,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn packing_call(
+        state: &ModuleState,
+        rows: Vec<Vec<u32>>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vectors, WireOperationError> {
+        let model = model_slot_snapshot(&state.runtime, PACKING_TEST_LANE)
+            .unwrap()
+            .loaded
+            .unwrap();
+        execute_embedding(
+            &state.runtime,
+            &model,
+            TokenBatch { items: rows },
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn packing_attempt_settled(state: &ModuleState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let preparation = state
+                    .runtime
+                    .activity_telemetry
+                    .packed_preparations
+                    .lock()
+                    .unwrap()
+                    .get(PACKING_TEST_LANE)
+                    .unwrap()
+                    .clone();
+                if !preparation.state.lock().unwrap().running {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preparation must finish or defer, not wait for budget");
+    }
+
+    #[cfg(unix)]
+    fn packing_config() -> ModuleConfig {
+        parse_module_config_json(
+            r#"{"ane_direct":{"tight_packing":true}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn packing_test_numeric(config: &ModuleConfig) -> NumericProfile {
+        let spec = catalog_fixture_config("qwen3-embedding-0.6b.ane-direct-worker");
+        let mut numeric: NumericProfile = serde_json::from_value(json!({
+            "model_digest": spec.artifact_digest,
+            "quant": spec.quant,
+            "engine": spec.engine_identity,
+            "sanitized_tokenizer_digest": spec.tokenizer_sanitized_digest,
+            "pooling": "last_token",
+            "normalization": "l2",
+            "dtype": spec.owned_dtype,
+            "flash_attention": "disabled",
+            "certified_shape": {
+                "max_context_tokens": spec.max_tokens,
+                "max_batch_tokens": config.inline.max_tokens,
+                "max_micro_batch_tokens": config.jobs.bulk_quantum_tokens,
+                "max_sequences": config.inline.max_items,
+            },
+            "thread_policy": "balanced",
+        }))
+        .unwrap();
+        CatalogProfile::load("qwen3-embedding-0.6b.ane-direct-worker")
+            .unwrap()
+            .apply_numeric_profile(&mut numeric);
+        assert_eq!(numeric.numeric_profile_id(), spec.numeric_profile_id);
+        numeric
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn omitted_tight_packing_never_prepares_qualifies_or_dispatches_even_a_qualified_key() {
+        use synapse_core::WorkerRequest;
+        let config = parse_module_config_json(
+            r#"{"jobs":{"bulk_quantum_tokens":3072}}"#,
+            "existing install",
+            ConfigTier::User,
+        )
+        .unwrap();
+        let before = packing_test_numeric(&config).stable_bytes();
+        assert_eq!(
+            before,
+            packing_test_numeric(&packing_config()).stable_bytes()
+        );
+        let (fixture, peer) = packing_lane_fixture(config, true).await;
+        // Install a genuinely qualified resident key first, so disabling
+        // tight_packing cannot pass merely because the worker lacked packing.
+        assert!(fixture.engine.serving.prepare_packed().await.unwrap());
+        peer.lock().unwrap().requests.clear();
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        assert!(fixture
+            .state
+            .runtime
+            .activity_telemetry
+            .packed_preparations
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            packing_call(&fixture.state, vec![vec![41; 127], vec![42; 129]], None)
+                .await
+                .unwrap(),
+            vec![vec![41.0], vec![42.0]]
+        );
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !matches!(
+                request,
+                WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
+            )));
+        assert_eq!(
+            before,
+            packing_test_numeric(&ModuleConfig::default()).stable_bytes()
+        );
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), false).await;
+        *fixture
+            .state
+            .runtime
+            .profile_check_passes_for_test
+            .lock()
+            .unwrap() = true;
+        assert!(fixture
+            .state
+            .runtime
+            .activity_telemetry
+            .packed_preparations
+            .lock()
+            .unwrap()
+            .is_empty());
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        packing_attempt_settled(&fixture.state).await;
+        assert!(profile_check_passed(&fixture.state, PACKING_TEST_LANE)
+            .unwrap()
+            .is_some());
+        assert!(
+            fixture
+                .state
+                .runtime
+                .activity_telemetry
+                .packed_preparations
+                .lock()
+                .unwrap()[PACKING_TEST_LANE]
+                .state
+                .lock()
+                .unwrap()
+                .finished
+        );
+        assert!(catalog_lane_lock(&fixture.state.runtime, PACKING_TEST_LANE)
+            .try_lock()
+            .is_ok());
+        peer.lock().unwrap().requests.clear();
+        assert_eq!(
+            packing_call(&fixture.state, vec![vec![9; 128]], None)
+                .await
+                .unwrap(),
+            vec![vec![9.0]]
+        );
+        assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedBatch { items, .. } if items.len() == 1 && items[0].n_tokens == 128)));
+        assert!(!peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, WorkerRequest::EmbedPacked { .. })));
+        peer.lock().unwrap().requests.clear();
+        let model = model_slot_snapshot(&fixture.state.runtime, PACKING_TEST_LANE)
+            .unwrap()
+            .loaded
+            .unwrap();
+        let rows = (1..=17).map(|id| vec![id; 127]).collect::<Vec<_>>();
+        let expected = (1..=17).map(|id| vec![id as f32]).collect::<Vec<_>>();
+        assert_eq!(
+            execute_embedding_quanta(
+                &fixture.state.runtime,
+                &model,
+                TokenBatch { items: rows },
+                2159,
+                1,
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        {
+            let requests = peer.lock().unwrap();
+            let executions = requests
+                .requests
+                .iter()
+                .filter_map(|request| match request {
+                    WorkerRequest::EmbedBatch { items, .. }
+                    | WorkerRequest::EmbedPacked { items, .. } => Some(items),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                executions
+                    .iter()
+                    .map(|items| items.len())
+                    .collect::<Vec<_>>(),
+                vec![8, 8, 1]
+            );
+            assert!(executions.iter().all(|items| items
+                .iter()
+                .map(|item| item.n_tokens)
+                .sum::<usize>()
+                <= DEFAULT_ENGINE_BATCH_TOKEN_BUDGET as usize));
+            assert_eq!(
+                requests
+                    .requests
+                    .iter()
+                    .filter(|request| matches!(request, WorkerRequest::EmbedPacked { .. }))
+                    .count(),
+                2
+            );
+        }
+        drop(model);
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_qualification_mismatch_disables_only_packing() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), true).await;
+        peer.lock().unwrap().corrupt = true;
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        packing_attempt_settled(&fixture.state).await;
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, WorkerRequest::EmbedPacked { .. })));
+        peer.lock().unwrap().requests.clear();
+        for _ in 0..2 {
+            assert_eq!(
+                packing_call(&fixture.state, vec![vec![41; 127], vec![42; 129]], None)
+                    .await
+                    .unwrap(),
+                vec![vec![41.0], vec![42.0]]
+            );
+            packing_attempt_settled(&fixture.state).await;
+        }
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !matches!(
+                request,
+                WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
+            )));
+        assert!(profile_check_passed(&fixture.state, PACKING_TEST_LANE)
+            .unwrap()
+            .is_some());
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_admission_contention_keeps_resident_single_deadline_shape_compiling() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), true).await;
+        packing_call(&fixture.state, vec![vec![7]], None)
+            .await
+            .unwrap();
+        let (started, release) = ane_gate();
+        peer.lock().unwrap().admission_gate = Some((started.clone(), release.clone()));
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert!(catalog_lane_lock(&fixture.state.runtime, PACKING_TEST_LANE)
+            .try_lock()
+            .is_ok());
+        assert!(lane_serving_gate(&fixture.state.runtime, PACKING_TEST_LANE)
+            .try_read()
+            .is_ok());
+        let before = peer.lock().unwrap().requests.len();
+        let request = packing_call(
+            &fixture.state,
+            vec![vec![8; 128]],
+            Some(tokio::time::Instant::now() + Duration::from_millis(50)),
+        )
+        .await;
+        assert_eq!(request.unwrap_err().code, "shape_compiling");
+        assert_eq!(
+            peer.lock().unwrap().requests.len(),
+            before,
+            "expired request must not dispatch while compilation holds the stream"
+        );
+        release.notify_one();
+        packing_attempt_settled(&fixture.state).await;
+        peer.lock().unwrap().requests.clear();
+        assert_eq!(
+            packing_call(&fixture.state, vec![vec![8; 128]], None)
+                .await
+                .unwrap(),
+            vec![vec![8.0]]
+        );
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !matches!(
+                request,
+                WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
+            )));
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_budget_defers_until_the_next_idle_transition() {
+        use worker_host::ane_residency::*;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), true).await;
+        let other = packing_test_serving(
+            Arc::new(Mutex::new(PackingPeer::default())),
+            fixture.engine.serving.supervisor.clone(),
+            "other-worker",
+        )
+        .await;
+        let worker: Arc<dyn AneShapeWorker> = other.channel.clone();
+        let mut held = Vec::new();
+        for width in [128, 256, 512] {
+            held.push(
+                other
+                    .supervisor
+                    .lease(&worker, PACKING_TEST_MODEL, width)
+                    .await
+                    .unwrap(),
+            );
+        }
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        packing_attempt_settled(&fixture.state).await;
+        assert!(
+            peer.lock().unwrap().requests.is_empty(),
+            "full leased budget must skip even qualification references"
+        );
+        assert!(
+            !fixture
+                .state
+                .runtime
+                .activity_telemetry
+                .packed_preparations
+                .lock()
+                .unwrap()[PACKING_TEST_LANE]
+                .state
+                .lock()
+                .unwrap()
+                .finished
+        );
+        drop(held);
+        // Releasing budget alone does not compile on behalf of a request. Its
+        // completed standalone exchange supplies the next idle transition.
+        assert!(peer.lock().unwrap().requests.is_empty());
+        packing_call(&fixture.state, vec![vec![1]], None)
+            .await
+            .unwrap();
+        packing_attempt_settled(&fixture.state).await;
+        assert!(
+            fixture
+                .state
+                .runtime
+                .activity_telemetry
+                .packed_preparations
+                .lock()
+                .unwrap()[PACKING_TEST_LANE]
+                .state
+                .lock()
+                .unwrap()
+                .finished
+        );
+        assert_eq!(
+            packing_call(&fixture.state, vec![vec![41; 127], vec![42; 129]], None)
+                .await
+                .unwrap(),
+            vec![vec![41.0], vec![42.0]]
+        );
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, synapse_core::WorkerRequest::EmbedPacked { .. })));
+        other.retire().await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_waits_for_cancelled_request_drain_before_preparation() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), true).await;
+        let (started, release) = ane_gate();
+        peer.lock().unwrap().inference_gate = Some((started.clone(), release.clone()));
+        let request = tokio::spawn({
+            let state = fixture.state.clone();
+            async move { packing_call(&state, vec![vec![1]], None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            fixture
+                .state
+                .runtime
+                .activity_telemetry
+                .by_model
+                .lock()
+                .unwrap()[PACKING_TEST_LANE],
+            1
+        );
+        assert!(
+            !fixture
+                .state
+                .runtime
+                .activity_telemetry
+                .packed_preparations
+                .lock()
+                .unwrap()[PACKING_TEST_LANE]
+                .state
+                .lock()
+                .unwrap()
+                .running
+        );
+        assert!(
+            !peer.lock().unwrap().requests.iter().any(|request| matches!(
+                request,
+                WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
+            ))
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let finished = fixture
+                    .state
+                    .runtime
+                    .activity_telemetry
+                    .packed_preparations
+                    .lock()
+                    .unwrap()[PACKING_TEST_LANE]
+                    .state
+                    .lock()
+                    .unwrap()
+                    .finished;
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!fixture
+            .state
+            .runtime
+            .activity_telemetry
+            .by_model
+            .lock()
+            .unwrap()
+            .contains_key(PACKING_TEST_LANE));
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tight_packing_unpinned_lane_stays_standalone_and_over_width_rows_fall_back() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(packing_config(), true).await;
+        run_lane_check(&fixture.state, PACKING_TEST_LANE)
+            .await
+            .unwrap();
+        packing_attempt_settled(&fixture.state).await;
+        peer.lock().unwrap().requests.clear();
+        assert_eq!(
+            packing_call(
+                &fixture.state,
+                vec![vec![41; 127], vec![42; 129], vec![43; 257]],
+                None
+            )
+            .await
+            .unwrap(),
+            vec![vec![41.0], vec![42.0], vec![43.0]]
+        );
+        assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedPacked { items, .. } if items.len() == 2)));
+        assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedBatch { items, .. } if items.len() == 1 && items[0].n_tokens == 257)));
+        assert!(fixture.engine.serving.prepare_packed().await.unwrap());
+        fixture
+            .state
+            .runtime
+            .activity_telemetry
+            .packed_preparations
+            .lock()
+            .unwrap()
+            .remove(PACKING_TEST_LANE);
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            Arc::get_mut(
+                slots
+                    .get_mut(PACKING_TEST_LANE)
+                    .unwrap()
+                    .loaded
+                    .as_mut()
+                    .unwrap(),
+            )
+            .unwrap()
+            .fingerprint = Fingerprint("unqualified-profile".into());
+        }
+        peer.lock().unwrap().requests.clear();
+        let model = model_slot_snapshot(&fixture.state.runtime, PACKING_TEST_LANE)
+            .unwrap()
+            .loaded
+            .unwrap();
+        start_packed_preparation(&fixture.state.runtime, &model);
+        assert!(fixture
+            .state
+            .runtime
+            .activity_telemetry
+            .packed_preparations
+            .lock()
+            .unwrap()
+            .is_empty());
+        drop(model);
+        assert_eq!(
+            packing_call(&fixture.state, vec![vec![41; 127], vec![42; 129]], None)
+                .await
+                .unwrap(),
+            vec![vec![41.0], vec![42.0]]
+        );
+        assert!(peer
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !matches!(
+                request,
+                WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
+            )));
+        finish_ane_lane_fixture(fixture).await;
+    }
+
     /// Whether a self-check (or unload) holds or is queued for the lane's
     /// serving gate: once a writer is queued, new readers cannot enter.
     #[cfg(unix)]
@@ -22052,6 +23049,33 @@ mod tests {
             .expect_err("unknown fields should fail");
         assert!(matches!(error, ModuleError::Config(_)));
         assert!(error.to_string().contains("typo_field"));
+    }
+
+    #[test]
+    fn module_config_tight_packing_is_opt_in_and_has_no_other_knobs() {
+        for input in ["{}", r#"{"ane_direct":{}}"#] {
+            let config = parse_module_config_json(input, "test", ConfigTier::User).unwrap();
+            assert!(!config.ane_direct.tight_packing);
+        }
+        let config = parse_module_config_json(
+            r#"{"ane_direct":{"tight_packing":true}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .unwrap();
+        assert!(config.ane_direct.tight_packing);
+        assert!(parse_module_config_json(
+            r#"{"ane_direct":{"tight_packing":1}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .is_err());
+        assert!(parse_module_config_json(
+            r#"{"ane_direct":{"width":256}}"#,
+            "test",
+            ConfigTier::User,
+        )
+        .is_err());
     }
 
     #[test]
@@ -28453,7 +29477,9 @@ async fn run_lane_check(
                 format!("model '{model_id}' is not loaded"),
             )
         })?;
-    check_profile_model(state, model, guard).await
+    let model = check_profile_model(state, model, guard).await?;
+    start_packed_preparation(&state.runtime, &model);
+    Ok(model)
 }
 
 /// The numerical self-check's persisted id and key for a profile model.
