@@ -14,6 +14,33 @@ enable it on a device only after the correctness and serving-performance gates.
 The M4 prototype results justify integration, not an unconditional production
 speed claim on the M5 Max.
 
+## Approval decisions
+
+Approved with these rulings, which take precedence over any text below that
+reads otherwise:
+
+1. **Recommendations 1-4 are approved:** worker-local packing within one engine
+   call, distinct packed shape keys inside the single 100-executable budget, bit
+   equality against standalone as the identity gate, and an eight-row first
+   rollout. Recommendation 5 (64-row bulk look-ahead) is a separate later step;
+   it starts only after the eight-row rollout passes its gates on both Macs.
+2. **Packed 256 is prepared at lane load, not in maintenance windows.** After the
+   lane's existing self-check succeeds, the worker admits the packed 256 shape
+   through the supervisor and runs the exact packed-vs-standalone qualification.
+   This happens off the request path and does not hold the lane lock. If the
+   budget has no free capacity and no unleased victim exists, skip it and retry
+   the next time the lane has no requests in flight. A request never waits on
+   packed preparation; until it is qualified, rows run standalone.
+3. **No public identity change.** The lane id, engine identity, numeric profile
+   and fingerprint stay byte-identical. If implementation finds any hashed field
+   must change, stop and escalate; do not hard-code the old hash.
+4. **One off switch, no other knobs.** A module config switch disables packed
+   dispatch and serves standalone with the same fingerprint. Fill thresholds,
+   pass counts and widths are code constants backed by measurements, not config.
+5. **Old workers refuse the packed mode.** The packed execution mode is added to
+   worker protocol v2 so that a worker without it refuses the request by name;
+   it is never interpreted as single-row or batch-axis execution.
+
 ## Evidence and its limits
 
 The source prototype is
