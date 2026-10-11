@@ -78,6 +78,13 @@ class ReleaseChecks(unittest.TestCase):
         self.git('init', '-q')
         self.git('config', 'user.email', 'test@example.com')
         self.git('config', 'user.name', 'test')
+        # The amends and the reset below can trigger git's automatic maintenance,
+        # which newer git runs detached in the background. A background writer can
+        # still be filling .git/objects/pack when the temporary directory is
+        # removed, failing cleanup with "Directory not empty". Keep the test repo
+        # free of background writers.
+        self.git('config', 'maintenance.auto', 'false')
+        self.git('config', 'gc.auto', '0')
         prior = self.root / 'docs/evidence/certification' / ('1' * 40)
         prior.mkdir(parents=True)
         (prior / 'old.json').write_text('{}')
