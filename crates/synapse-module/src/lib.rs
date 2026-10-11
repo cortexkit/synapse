@@ -21,6 +21,8 @@ mod catalog_probe;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
+#[cfg(test)]
+mod rerank_readout_tests;
 // Provider adapters stay module-private so credentials and remote identity checks
 // cannot be bypassed by a second public call path.
 /// Certification probes, immutable fixture batteries and oracles,
@@ -12901,6 +12903,37 @@ async fn execute_embedding_with_catalog_guard(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RerankReadout {
+    Legacy,
+    CatalogLogits,
+    CatalogProbability,
+}
+
+impl RerankReadout {
+    fn select(catalog_owned: bool, identity: &EngineIdentity) -> Self {
+        if !catalog_owned {
+            return Self::Legacy;
+        }
+        // Native Metal returns the classifier's raw logit and needs sigmoid.
+        // Profile-loaded Metal, ANE, CUDA and Vulkan already return probabilities.
+        if identity.engine == "owned-metal" && !identity.build_flags.contains_key("profile") {
+            Self::CatalogLogits
+        } else {
+            Self::CatalogProbability
+        }
+    }
+
+    fn apply(self, mut scores: synapse_core::RerankScores) -> synapse_core::RerankScores {
+        if self == Self::CatalogLogits {
+            for score in &mut scores.scores {
+                *score = 1.0 / (1.0 + (-*score).exp());
+            }
+        }
+        scores
+    }
+}
+
 async fn execute_rerank(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
@@ -13047,7 +13080,11 @@ async fn execute_rerank_with_catalog_guard(
     if result.is_ok() {
         runtime.activity_telemetry.record_completed_tokens(tokens);
     }
-    result
+    // Serving and certification share this boundary. A lane resolved from the
+    // release catalog must return probabilities; an ordinary preload keeps its
+    // engine's bytes. Native catalog lanes have no profile flag, so that flag
+    // cannot distinguish catalog serving from legacy serving.
+    result.map(|scores| RerankReadout::select(catalog_lane, &model.engine_identity).apply(scores))
 }
 
 fn catalog_sequence_ceiling(sequences: &[Vec<u32>]) -> Result<(), WireOperationError> {
@@ -23641,7 +23678,15 @@ mod tests {
                     "rerank.score",
                     json!({"model":lane,"query":"a a","candidates":[boundary_text(8192-overhead)]}),
                 );
-                assert_eq!(result["scores"], json!([0.5]), "{id}/{name}: {result}");
+                // The mock supplies 0.5 before the module's readout. Native
+                // Metal treats it as a logit, so sigmoid(0.5) is 0.62245935;
+                // profile backends treat it as a probability and pass it through.
+                let expected = if id == "gte-reranker-modernbert-base" && *name == "metal" {
+                    json!([0.622459352016449])
+                } else {
+                    json!([0.5])
+                };
+                assert_eq!(result["scores"], expected, "{id}/{name}: {result}");
                 assert_ne!(certify_worker_snapshot(&state.runtime), before);
                 assert_catalog_cold_boundary_refusal(
                     &state,
@@ -27519,7 +27564,6 @@ fn catalog_lane_spec(
         return catalog_profile_lane_spec(state, entry, backend, profile, verify);
     }
     let files = entry.backend_files(&backend.backend);
-    let model = files["model"];
     let tokenizer = files["tokenizer"];
     let max_tokens = backend.max_tokens.expect("validated max_tokens") as usize;
     let tokenizer_path = state.model_cache.blob_path(&tokenizer.sha256);
@@ -27533,10 +27577,36 @@ fn catalog_lane_spec(
     } else {
         format!("sha256:{}", "0".repeat(64))
     };
+    catalog_native_lane_spec(state, entry, backend, sanitized_digest)
+}
+
+fn catalog_native_lane_spec(
+    state: &ModuleState,
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    sanitized_digest: String,
+) -> Result<StoredModelConfig, WireOperationError> {
+    let files = entry.backend_files(&backend.backend);
+    let model = files["model"];
+    let tokenizer = files["tokenizer"];
+    let max_tokens = backend.max_tokens.expect("validated max_tokens") as usize;
+    let tokenizer_path = state.model_cache.blob_path(&tokenizer.sha256);
     let family = OwnedFamily::parse(backend.family.as_deref().expect("validated family"))
         .map_err(|e| artifact_invalid_error(e.to_string()))?;
     let dtype = OwnedDType::parse(backend.dtype.as_deref().expect("validated dtype"))
         .map_err(|e| artifact_invalid_error(e.to_string()))?;
+    let mut identity =
+        engine_identity_with_projections(family, dtype, catalog_projection_dtype(family, dtype));
+    if entry.task == "rerank"
+        && RerankReadout::select(true, &identity) == RerankReadout::CatalogLogits
+    {
+        // The native catalog lane now serves sigmoid scores instead of logits.
+        // Bind that numeric change to its fingerprint without changing the raw
+        // engine head or any legacy preload identity.
+        identity
+            .build_flags
+            .insert("rerank_readout".into(), "sigmoid_classifier_logit".into());
+    }
     let owned = OwnedCatalogConfig {
         family,
         dtype,
@@ -27547,7 +27617,7 @@ fn catalog_lane_spec(
             digest: format!("sha256:{}", f.sha256),
         }),
         extra_locators: Vec::new(),
-        identity_override: None,
+        identity_override: Some(identity),
     };
     let roles = files
         .iter()
