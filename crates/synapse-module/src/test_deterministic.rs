@@ -1,4 +1,11 @@
 //! Deterministic inference double, compiled only for module tests.
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    net::TcpStream,
+    path::PathBuf,
+};
+
 use synapse_core::{
     EmbedEngine, EngineError, EngineIdentity, LoadedModel, RerankEngine, RerankRequest,
     RerankScores, RuntimeConfig, TokenBatch, TokenIds, ValidatedArtifact, Vector, Vectors,
@@ -64,6 +71,39 @@ fn vector_with(ids: &[u32], dims: usize, dense: bool) -> Vector {
     vector
 }
 
+fn wait_on_test_embed_batch_gate() {
+    let Some(gate_dir) = std::env::var_os("SYNAPSE_TEST_DETERMINISTIC_EMBED_GATE_DIR") else {
+        return;
+    };
+    let gate_dir = PathBuf::from(gate_dir);
+    if !gate_dir.join("armed").exists() {
+        return;
+    }
+
+    // Only the first batch after arming waits, so later requests can finish once
+    // the test releases the batch that is holding the execution permit.
+    let _claim = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(gate_dir.join("claimed"))
+    {
+        Ok(claim) => claim,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) => panic!("claim deterministic embed batch gate: {error}"),
+    };
+
+    let gate_addr = std::env::var("SYNAPSE_TEST_DETERMINISTIC_EMBED_GATE_ADDR")
+        .expect("deterministic embed batch gate address");
+    let mut stream = TcpStream::connect(gate_addr).expect("connect deterministic embed batch gate");
+    stream
+        .write_all(b"R")
+        .expect("signal deterministic embed batch entered");
+    let mut release = [0];
+    stream
+        .read_exact(&mut release)
+        .expect("wait for deterministic embed batch release");
+}
+
 impl EmbedEngine for TestDeterministic {
     fn identity(&self) -> EngineIdentity {
         EngineIdentity {
@@ -82,11 +122,13 @@ impl EmbedEngine for TestDeterministic {
         })
     }
     fn embed_batch(&self, _: &LoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
-        // A real engine takes measurable time per batch, and the admission tests
-        // assert on requests that are queued or still running (waiter counts,
-        // concurrent bursts). An instant engine would finish before they could
-        // observe anything, so each batch sleeps briefly; a test can lengthen
-        // the sleep with SYNAPSE_TEST_DETERMINISTIC_DELAY_MS.
+        // The e2e harness arms this cross-process gate only after model setup, so
+        // it can hold one real execution permit without delaying probe batches.
+        wait_on_test_embed_batch_gate();
+
+        // An instant engine can finish before tests observe queued or running
+        // work, so batches sleep briefly; tests can lengthen the delay with
+        // SYNAPSE_TEST_DETERMINISTIC_DELAY_MS.
         let delay = std::env::var("SYNAPSE_TEST_DETERMINISTIC_DELAY_MS")
             .ok()
             .and_then(|value| value.parse().ok())
