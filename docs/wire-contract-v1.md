@@ -204,8 +204,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   `admitted_count`, and `available`. In-process Metal uses no worker IPC, so
   its complete snapshot has empty inventories and request counts and zero admissions.
   CUDA and Vulkan report request counts without ANE placement inventories.
-   Direct ANE reports placement from its residency supervisor. Supervisor
-   observation capture retains every successful
+  Direct ANE reports placement from its residency supervisor. Supervisor
+  observation capture retains every successful
   ADMITTED inventory across eviction and confirmed-exit restart, separately from
   its cumulative admission count. Observation never changes computation.
 - **Certification observation responses** — consumers must not use this surface.
@@ -231,8 +231,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
     pages readable and resumes by item id.
 - **rerank.score** {model, query, candidates[], …} — RAW per-candidate
   scores (no server-side ordering opinions); interactive ≤20 candidates,
-   bulk beyond. Catalog `qwen3-reranker-0.6b` declares ANE, CUDA and Vulkan lanes,
-   but no Metal lane. Free-form local reranking accepts
+  bulk beyond. Catalog `qwen3-reranker-0.6b` declares ANE, CUDA and Vulkan lanes,
+  but no Metal lane. Free-form local reranking accepts
   owned engines only, never llama.cpp.
 - **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
   `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
