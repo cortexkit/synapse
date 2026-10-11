@@ -6647,6 +6647,7 @@ dependencies = [
  "subc-daemon",
  "subc-protocol",
  "subc-transport",
+ "synapse-build-stamp",
  "synapse-certify",
  "synapse-core",
  "synapse-parity",

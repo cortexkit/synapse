@@ -23,3 +23,6 @@ subc-protocol.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
+
+[build-dependencies]
+synapse-build-stamp = { path = "../synapse-build-stamp" }
