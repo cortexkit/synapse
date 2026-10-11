@@ -94,7 +94,7 @@ pub(crate) async fn install(
             Some("failed" | "cancelled") => {
                 return Err(refuse(format!("catalog download refused: {status}")))
             }
-            Some("queued" | "downloading") => {
+            Some("queued" | "downloading" | "verifying") => {
                 success(status)?;
             }
             _ => return Err(refuse(format!("invalid download status: {status}"))),
@@ -390,6 +390,57 @@ mod tests {
                 .contains("check or pin mismatch"));
         }
     }
+    #[tokio::test]
+    async fn verifying_is_polled_through_until_committed() {
+        let catalog = json!({"models":[{"id":"model","task":"embed","backends":[{"backend":"metal","lane_id":"model-metal","fingerprint":"pin","runnable":true}]}]});
+        let mut client = stub(vec![
+            catalog,
+            json!({"job_id":"job","state":"queued"}),
+            json!({"state":"queued"}),
+            json!({"state":"downloading"}),
+            json!({"state":"verifying"}),
+            json!({"state":"committed"}),
+        ]);
+        let got = install(
+            &mut client,
+            "metal-m5",
+            "model",
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.fingerprint, "pin");
+        assert_eq!(client.calls.len(), 6);
+        assert!(client.replies.is_empty());
+        for (method, params, _) in &client.calls[2..] {
+            assert_eq!(method, "model.status");
+            assert_eq!(params, &json!({"job_id":"job"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_download_state_still_refuses() {
+        let catalog = json!({"models":[{"id":"model","task":"embed","backends":[{"backend":"metal","lane_id":"model-metal","fingerprint":"pin","runnable":true}]}]});
+        let mut client = stub(vec![
+            catalog,
+            json!({"job_id":"job"}),
+            json!({"state":"future-download-state"}),
+            json!({"state":"committed"}),
+        ]);
+        let error = install(
+            &mut client,
+            "metal-m5",
+            "model",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("unknown download state must refuse");
+        assert!(error.to_string().contains("invalid download status"));
+        assert_eq!(client.calls.len(), 3);
+        assert_eq!(client.replies.len(), 1);
+    }
+
     #[tokio::test]
     async fn checks_catalog_before_download_and_requires_committed_job() {
         let catalog = json!({"models":[{"id":"model","task":"embed","backends":[{"backend":"metal","lane_id":"model-metal","fingerprint":"pin","runnable":true}]}]});
