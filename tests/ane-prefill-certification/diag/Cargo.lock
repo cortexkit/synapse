@@ -1915,6 +1915,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-build-stamp"
+version = "0.1.0"
+
+[[package]]
 name = "synapse-certify"
 version = "0.1.0"
 dependencies = [
@@ -1982,6 +1986,7 @@ dependencies = [
  "sha2",
  "subc-client-rs",
  "subc-protocol",
+ "synapse-build-stamp",
  "synapse-certify",
  "synapse-core",
  "synapse-engine-owned",
