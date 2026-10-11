@@ -8227,6 +8227,24 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     {
         return remote_embed_query(state, params).await;
     }
+    let catalog_sequences = match preflight_catalog_sequences(
+        &state,
+        params.model.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        None,
+        &[params.text.as_str()],
+    ) {
+        Ok(sequences) => sequences,
+        Err(mut error) => {
+            if let Some(details) = error.details.as_mut() {
+                if error.code == "sequence_too_long" {
+                    details["item_id"] = json!(params.id.as_deref().unwrap_or("query"));
+                }
+            }
+            return result_outcome(error_payload(&state, error));
+        }
+    };
     let alias_table = match state.store.alias_table() {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
@@ -8300,7 +8318,11 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(admission) => admission,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    let mut tokenized = match model.tokenizer.tokenize_batch([params.text.as_str()]) {
+    let mut tokenized = match catalog_sequences
+        .map(|sequences| catalog_embed_batch(&[params.text.as_str()], sequences))
+        .map(Ok)
+        .unwrap_or_else(|| model.tokenizer.tokenize_batch([params.text.as_str()]))
+    {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return failed_admitted_outcome(
@@ -8608,6 +8630,33 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     if items.is_empty() {
         return channel_error("invalid_request", "embed.batch requires at least one item");
     }
+    let text_refs = items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>();
+    let catalog_sequences = match preflight_catalog_sequences(
+        &state,
+        params.model.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        None,
+        &text_refs,
+    ) {
+        Ok(sequences) => sequences,
+        Err(mut error) => {
+            if error.code == "sequence_too_long" {
+                if let Some(details) = error.details.as_mut() {
+                    if let Some(index) = details["item_id"]
+                        .as_str()
+                        .and_then(|id| id.parse::<usize>().ok())
+                    {
+                        details["item_id"] = json!(items[index].id);
+                    }
+                }
+            }
+            return result_outcome(error_payload(&state, error));
+        }
+    };
     if params
         .model
         .as_deref()
@@ -8688,14 +8737,14 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         return result_outcome(error_payload(&state, error));
     }
 
-    let text_refs = items
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect::<Vec<_>>();
     let request_bytes = request_bytes_for_texts(text_refs.iter().copied());
     ane_lane_timing("batch_resolve", &model.model_id, None, resolution_started);
     let tokenize_started = Instant::now();
-    let mut tokenized = match model.tokenizer.tokenize_batch(text_refs) {
+    let mut tokenized = match catalog_sequences
+        .map(|sequences| catalog_embed_batch(&text_refs, sequences))
+        .map(Ok)
+        .unwrap_or_else(|| model.tokenizer.tokenize_batch(text_refs))
+    {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return result_outcome(error_payload(
@@ -9269,6 +9318,23 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             "rerank.score requires at least one candidate",
         );
     }
+    let candidates = params
+        .candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let catalog_pairs = match preflight_catalog_sequences(
+        &state,
+        params.model.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        Some(&params.query),
+        &candidates,
+    ) {
+        Ok(pairs) => pairs,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let catalog_request = catalog_pairs.is_some();
     if params.candidates.len() > state.runtime.inline.max_items {
         return result_outcome(error_payload(
             &state,
@@ -9351,10 +9417,13 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         return result_outcome(error_payload(&state, error));
     }
 
-    let owned_pairs = match owned_rerank_pairs(&model, params.query.as_str(), &params.candidates) {
-        Ok(pairs) => pairs,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
+    let owned_pairs =
+        match catalog_pairs.map(Some).map(Ok).unwrap_or_else(|| {
+            owned_rerank_pairs(&model, params.query.as_str(), &params.candidates)
+        }) {
+            Ok(pairs) => pairs,
+            Err(error) => return result_outcome(error_payload(&state, error)),
+        };
     if let Err(error) =
         ensure_profile_request_certified(state.clone(), &model, certify_deadline).await
     {
@@ -9375,15 +9444,24 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     };
     let mut token_items = tokenized.batch.items.clone();
     let query = token_items.remove(0);
-    let candidate_token_counts = token_items
-        .iter()
-        .map(|candidate| {
-            candidate
-                .len()
-                .saturating_add(query.len())
-                .saturating_add(3) as u64
-        })
-        .sum::<u64>();
+    let candidate_token_counts = if catalog_request {
+        owned_pairs
+            .as_ref()
+            .expect("catalog composed pairs")
+            .iter()
+            .map(|pair| pair.len() as u64)
+            .sum()
+    } else {
+        token_items
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .len()
+                    .saturating_add(query.len())
+                    .saturating_add(3) as u64
+            })
+            .sum::<u64>()
+    };
     if candidate_token_counts > state.runtime.inline.max_tokens {
         return result_outcome(error_payload(
             &state,
@@ -12983,6 +13061,138 @@ fn catalog_sequence_ceiling(sequences: &[Vec<u32>]) -> Result<(), WireOperationE
     Ok(())
 }
 
+// Catalog ownership comes from reserved IDs, not the optional profile flag:
+// native Metal lanes have no profile flag and retain their pinned identities.
+// Count the full composed input before loading a worker or admitting any work.
+fn preflight_catalog_sequences(
+    state: &ModuleState,
+    model_id: Option<&str>,
+    required_fingerprint: Option<&str>,
+    target_fingerprint: Option<&str>,
+    query: Option<&str>,
+    texts: &[&str],
+) -> Result<Option<Vec<Vec<u32>>>, WireOperationError> {
+    if model_id.is_some_and(|id| !state.runtime.release_catalog.is_reserved_id(id)) {
+        return Ok(None);
+    }
+    let task = if query.is_some() {
+        ModelTask::Rerank
+    } else {
+        ModelTask::Embed
+    };
+    let (entry, backend) = select_catalog_lane(
+        state,
+        model_id,
+        task,
+        required_fingerprint,
+        target_fingerprint,
+    )?;
+    let lane = catalog::lane_id(&entry.id, &backend.backend);
+    let loaded = model_slot_snapshot(&state.runtime, &lane).and_then(|slot| slot.loaded);
+    let cold_tokenizer;
+    let tokenizer = if let Some(model) = loaded.as_ref() {
+        &model.tokenizer
+    } else {
+        let files = entry.backend_files(&backend.backend);
+        let file = files["tokenizer"];
+        let path = state.model_cache.blob_path(&file.sha256);
+        let install = current_catalog_install(state, &entry, &backend.backend)?.ok_or_else(||
+            catalog_wire_error("model_not_installed", json!({"catalog_id":entry.id,"lane_id":lane,"download_op":"models.download","download_job_id":null}), "catalog installation disappeared"))?;
+        use store::CatalogBlobCache;
+        let size = CatalogCache(&state.model_cache)
+            .blob_size(&file.sha256)
+            .map_err(catalog_store_error)?;
+        let digest = verified_catalog_file_digest(
+            &state.store,
+            &install,
+            &file.path,
+            &file.sha256,
+            &path,
+            |path| sha256_file(path).ok(),
+        )?;
+        if size != Some(file.size_bytes) || digest.as_deref() != Some(file.sha256.as_str()) {
+            let error = catalog_artifact_error(file, digest, size);
+            state
+                .store
+                .quarantine_catalog_blob(
+                    &file.sha256,
+                    &serde_json::to_value(&error).expect("wire error"),
+                    &CatalogCache(&state.model_cache),
+                    now_ms(),
+                )
+                .map_err(catalog_store_error)?;
+            return Err(error);
+        }
+        cold_tokenizer = SanitizedTokenizer::from_file(
+            path,
+            TokenizerConfig {
+                max_tokens: usize::MAX,
+            },
+        )
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        &cold_tokenizer
+    };
+    let profile = backend
+        .profile
+        .as_deref()
+        .map(CatalogProfile::load)
+        .transpose()
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    let composed = if let Some(query) = query {
+        tokenize_rerank_pairs(tokenizer, profile.as_ref(), query, texts)?
+    } else {
+        let mut sequences = texts
+            .iter()
+            .map(|text| {
+                tokenizer
+                    .tokenizer()
+                    .encode(*text, true)
+                    .map(|encoding| encoding.get_ids().to_vec())
+                    .map_err(|error| artifact_invalid_error(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if backend.family.as_deref() == Some("qwen3-0.6b") {
+            let embed_profile = CatalogProfile::load("qwen3-embedding-0.6b.owned-metal")
+                .map_err(|error| artifact_invalid_error(error.to_string()))?;
+            let terminal = embed_profile.model()["grammar"]["terminal_tokens"][0]["id"]
+                .as_u64()
+                .expect("manifest EOS") as u32;
+            for ids in &mut sequences {
+                if ids.last() != Some(&terminal) {
+                    ids.push(terminal);
+                }
+            }
+        }
+        sequences
+    };
+    catalog_sequence_ceiling(&composed)?;
+    Ok(Some(composed))
+}
+
+fn catalog_embed_batch(texts: &[&str], sequences: Vec<Vec<u32>>) -> TokenizedBatch {
+    let counts = sequences
+        .iter()
+        .map(|ids| ids.len() as u32)
+        .collect::<Vec<_>>();
+    TokenizedBatch {
+        batch: TokenBatch { items: sequences },
+        disclosures: counts
+            .iter()
+            .map(|count| TruncationDisclosure {
+                submitted_tokens: *count,
+                effective_tokens: *count,
+                truncated: false,
+            })
+            .collect(),
+        real_token_counts: counts,
+        embedded_texts: texts.iter().map(|text| (*text).to_string()).collect(),
+        submitted_sha256s: texts
+            .iter()
+            .map(|text| sha256_hex(text.as_bytes()))
+            .collect(),
+    }
+}
+
 fn compose_catalog_embed(
     model: &EmbeddingModel,
     tokenized: &mut TokenizedBatch,
@@ -13024,12 +13234,25 @@ fn owned_rerank_pairs(
     if !matches!(&model.backend, EmbedBackend::Owned(_)) && catalog.is_none() {
         return Ok(None);
     }
-    if let Some(catalog) = &catalog {
+    let candidates = candidates.iter().map(String::as_str).collect::<Vec<_>>();
+    let pairs = tokenize_rerank_pairs(&model.tokenizer, catalog.as_ref(), query, &candidates)?;
+    if catalog.is_some() {
+        catalog_sequence_ceiling(&pairs)?;
+    }
+    Ok(Some(pairs))
+}
+
+fn tokenize_rerank_pairs(
+    tokenizer: &SanitizedTokenizer,
+    catalog: Option<&CatalogProfile>,
+    query: &str,
+    candidates: &[&str],
+) -> Result<Vec<Vec<u32>>, WireOperationError> {
+    if let Some(catalog) = catalog {
         if catalog.model()["grammar"]["kind"] == "template" {
             let template = &catalog.model()["grammar"]["template"];
             let encode = |text: &str| {
-                model
-                    .tokenizer
+                tokenizer
                     .tokenizer()
                     .encode(text, false)
                     .map(|encoding| encoding.get_ids().to_vec())
@@ -13054,16 +13277,14 @@ fn owned_rerank_pairs(
                 ids.extend_from_slice(&suffix);
                 pairs.push(ids);
             }
-            catalog_sequence_ceiling(&pairs)?;
-            return Ok(Some(pairs));
+            return Ok(pairs);
         }
     }
     let inputs = candidates
         .iter()
-        .map(|candidate| (query, candidate.as_str()))
+        .map(|candidate| (query, *candidate))
         .collect::<Vec<_>>();
-    let encodings = model
-        .tokenizer
+    let encodings = tokenizer
         .tokenizer()
         .encode_batch(inputs, true)
         .map_err(|error| {
@@ -13082,10 +13303,7 @@ fn owned_rerank_pairs(
             "owned-metal rerank pair tokenization produced an empty sequence",
         ));
     }
-    if catalog.is_some() {
-        catalog_sequence_ceiling(&pairs)?;
-    }
-    Ok(Some(pairs))
+    Ok(pairs)
 }
 
 async fn execute_generate(
@@ -23026,16 +23244,43 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn catalog_boundary_worker(request: &synapse_core::WorkerRequest, raw: Option<&[u8]>) -> (synapse_core::WorkerResponse, Option<Vec<u8>>) {
+    fn catalog_boundary_worker(
+        request: &synapse_core::WorkerRequest,
+        raw: Option<&[u8]>,
+    ) -> (synapse_core::WorkerResponse, Option<Vec<u8>>) {
         use synapse_core::{WorkerRequest, WorkerResponse};
         match request {
             WorkerRequest::EmbedBatch { req_id, items, .. } => {
                 let ids = synapse_core::decode_i32_frame(raw.unwrap()).unwrap();
-                assert_eq!(ids.len(), items.iter().map(|item| item.n_tokens).sum::<usize>());
-                (WorkerResponse::Vectors { req_id: req_id.clone(), dims: 1, n: items.len() }, Some(synapse_core::encode_f32_frame(&vec![1.0; items.len()])))
+                assert_eq!(
+                    ids.len(),
+                    items.iter().map(|item| item.n_tokens).sum::<usize>()
+                );
+                (
+                    WorkerResponse::Vectors {
+                        req_id: req_id.clone(),
+                        dims: 1,
+                        n: items.len(),
+                    },
+                    Some(synapse_core::encode_f32_frame(&vec![1.0; items.len()])),
+                )
             }
-            WorkerRequest::Rerank { req_id, candidates, .. } => (WorkerResponse::Scores { req_id: req_id.clone() }, Some(synapse_core::encode_f32_frame(&vec![0.5; candidates.len()]))),
-            WorkerRequest::RerankSequences { req_id, sequences, .. } => (WorkerResponse::Scores { req_id: req_id.clone() }, Some(synapse_core::encode_f32_frame(&vec![0.5; sequences.len()]))),
+            WorkerRequest::Rerank {
+                req_id, candidates, ..
+            } => (
+                WorkerResponse::Scores {
+                    req_id: req_id.clone(),
+                },
+                Some(synapse_core::encode_f32_frame(&vec![0.5; candidates.len()])),
+            ),
+            WorkerRequest::RerankSequences {
+                req_id, sequences, ..
+            } => (
+                WorkerResponse::Scores {
+                    req_id: req_id.clone(),
+                },
+                Some(synapse_core::encode_f32_frame(&vec![0.5; sequences.len()])),
+            ),
             other => (WorkerResponse::unsupported_request(other), None),
         }
     }
@@ -23043,19 +23288,50 @@ mod tests {
     #[cfg(unix)]
     fn installed_catalog_boundary_state(id: &str, name: &str) -> (PathBuf, Arc<ModuleState>) {
         use store::{CatalogInstallMember, CatalogInstallRecord, DownloadJobRequest};
-        let (root, mut state) = catalog_runtime_tests::isolated_catalog_state("installed-catalog-boundary", true);
-        Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap().runnable_backends = BTreeSet::from([name.into()]);
-        let entry = state.runtime.release_catalog.entry(id).unwrap();
-        let backend = entry.backend(name).unwrap();
-        let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
-        let seed = catalog_fixture_config(backend.profile.as_deref().unwrap_or(&format!("{id}.owned-metal")));
+        let (root, mut state) =
+            catalog_runtime_tests::isolated_catalog_state("installed-catalog-boundary", true);
+        Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime)
+            .unwrap()
+            .runnable_backends = BTreeSet::from([name.into()]);
+        let seed = {
+            let entry = state.runtime.release_catalog.entry(id).unwrap();
+            let backend = entry.backend(name).unwrap();
+            catalog_fixture_config(
+                backend
+                    .profile
+                    .as_deref()
+                    .unwrap_or(&format!("{id}.owned-metal")),
+            )
+        };
         let mut model = catalog_test_model(&root, &seed);
         let tokenizer_path = root.join("catalog-tokenizer.json");
         if id.starts_with("gte-") {
-            let mut tokenizer: Value = serde_json::from_slice(&fs::read(&tokenizer_path).unwrap()).unwrap();
-            tokenizer["post_processor"] = json!({"type":"BertProcessing", "sep":["unused-2",2], "cls":["unused-3",3]});
+            let mut tokenizer: Value =
+                serde_json::from_slice(&fs::read(&tokenizer_path).unwrap()).unwrap();
+            tokenizer["post_processor"] =
+                json!({"type":"BertProcessing", "sep":["unused-2",2], "cls":["unused-3",3]});
             fs::write(&tokenizer_path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
         }
+        // Use genuine catalog IDs and lane metadata, but bind the test catalog
+        // to the synthetic tokenizer's real checksum for cold-path validation.
+        let bytes = fs::read(&tokenizer_path).unwrap();
+        let runtime = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap();
+        for file in &mut runtime
+            .release_catalog
+            .models
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .files
+        {
+            if file.role == "tokenizer" {
+                file.sha256 = sha256_hex(&bytes);
+                file.size_bytes = bytes.len() as u64;
+            }
+        }
+        let entry = state.runtime.release_catalog.entry(id).unwrap();
+        let backend = entry.backend(name).unwrap();
+        let spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
         let inner = Arc::get_mut(&mut model).unwrap();
         inner.model_id = spec.model_id.clone();
         inner.engine_identity = spec.engine_identity.clone();
@@ -23063,44 +23339,165 @@ mod tests {
         inner.certification_fingerprint = spec.fingerprint.clone();
         inner.numeric_profile_id = spec.numeric_profile_id.clone();
         let owned = stored_owned_profile(&spec).unwrap();
-        inner.tokenizer = SanitizedTokenizer::from_file(&tokenizer_path, TokenizerConfig { max_tokens: if backend.profile.is_some() { usize::MAX } else { owned_tokenizer_max_tokens(spec.max_tokens, owned.as_ref()) } }).unwrap();
+        inner.tokenizer = SanitizedTokenizer::from_file(
+            &tokenizer_path,
+            TokenizerConfig {
+                max_tokens: if backend.profile.is_some() {
+                    usize::MAX
+                } else {
+                    owned_tokenizer_max_tokens(spec.max_tokens, owned.as_ref())
+                },
+            },
+        )
+        .unwrap();
         if id == "qwen3-embedding-0.6b" && backend.profile.is_none() {
-            inner.owned_tokenizer_policy = Some(OwnedTokenizerPolicy { add_special_tokens: true, pad_token_id: 0, terminal_token_id: Some(151643) });
+            inner.owned_tokenizer_policy = Some(OwnedTokenizerPolicy {
+                add_special_tokens: true,
+                pad_token_id: 0,
+                terminal_token_id: Some(151643),
+            });
         }
-        let EmbedBackend::Worker(engine) = &inner.backend else { unreachable!() };
-        engine.lock().unwrap().attach_mock_worker_for_test(catalog_boundary_worker);
-        let job = state.store.admit_download_job(&DownloadJobRequest { request_key: "fixture", request_digest: "fixture", module_generation: 1, params_json: &json!({}), now_ms: 1, result_retention_ttl_ms: 60000, entry_complete: false }).unwrap();
-        state.store.commit_download_job(&job.record().job_id, &[CatalogInstallRecord { catalog_id: id.into(), manifest_digest: entry.manifest_digest(), backend: name.into(), members: entry.backend_files(name).values().map(|file| CatalogInstallMember { path: file.path.clone(), digest: file.sha256.clone() }).collect() }], 2).unwrap();
+        let EmbedBackend::Worker(engine) = &inner.backend else {
+            unreachable!()
+        };
+        engine
+            .lock()
+            .unwrap()
+            .attach_mock_worker_for_test(catalog_boundary_worker);
+        let job = state
+            .store
+            .admit_download_job(&DownloadJobRequest {
+                request_key: "fixture",
+                request_digest: "fixture",
+                module_generation: 1,
+                params_json: &json!({}),
+                now_ms: 1,
+                result_retention_ttl_ms: 60000,
+                entry_complete: false,
+            })
+            .unwrap();
+        state
+            .store
+            .commit_download_job(
+                &job.record().job_id,
+                &[CatalogInstallRecord {
+                    catalog_id: id.into(),
+                    manifest_digest: entry.manifest_digest(),
+                    backend: name.into(),
+                    members: entry
+                        .backend_files(name)
+                        .values()
+                        .map(|file| CatalogInstallMember {
+                            path: file.path.clone(),
+                            digest: file.sha256.clone(),
+                        })
+                        .collect(),
+                }],
+                2,
+            )
+            .unwrap();
+        let blob = state
+            .model_cache
+            .blob_path(&entry.backend_files(name)["tokenizer"].sha256);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::copy(&tokenizer_path, blob).unwrap();
         let (check_id, key) = catalog_self_check_key(&state, entry, backend).unwrap();
         let generation = catalog_check_generation(&state, &check_id, &key).unwrap();
         assert!(catalog_complete_check(&state, &check_id, generation, "passed", None).unwrap());
-        state.runtime.catalog.lock().unwrap().insert(spec.model_id.clone(), ModelSlot { spec, loaded: Some(model), state: ModelRuntimeState::Ready, notify: Arc::new(Notify::new()), last_cold_load_ms: None });
+        state.runtime.catalog.lock().unwrap().insert(
+            spec.model_id.clone(),
+            ModelSlot {
+                spec,
+                loaded: Some(model),
+                state: ModelRuntimeState::Ready,
+                notify: Arc::new(Notify::new()),
+                last_cold_load_ms: None,
+            },
+        );
         (root, state)
     }
 
     #[cfg(unix)]
     fn boundary_text(count: usize) -> String {
-        std::iter::repeat_n("a", count).collect::<Vec<_>>().join(" ")
+        std::iter::repeat_n("a", count)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[cfg(unix)]
     fn boundary_call(state: &Arc<ModuleState>, method: &str, params: Value) -> Value {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        response_result(runtime.block_on(dispatch_request(state.clone(), MethodEnvelope { method: method.into(), params }, None)), method)
+        response_result(
+            runtime.block_on(dispatch_request(
+                state.clone(),
+                MethodEnvelope {
+                    method: method.into(),
+                    params,
+                },
+                None,
+            )),
+            method,
+        )
     }
 
     #[cfg(unix)]
-    fn assert_catalog_boundary_refusal(state: &Arc<ModuleState>, method: &str, params: Value, item: &str) {
+    fn assert_catalog_boundary_refusal(
+        state: &Arc<ModuleState>,
+        method: &str,
+        params: Value,
+        item: &str,
+    ) {
         let before = certify_worker_snapshot(&state.runtime);
         let result = boundary_call(state, method, params);
-        assert_eq!(result["error"]["code"], "sequence_too_long", "catalog pre-admission ceiling: {result}");
+        assert_eq!(
+            result["error"]["code"], "sequence_too_long",
+            "catalog pre-admission ceiling: {result}"
+        );
         assert_eq!(result["error"]["class"], "permanent");
         assert_eq!(result["error"]["safe_to_retry_same_request"], false);
         assert!(result["error"].get("retry_after_ms").is_none());
-        assert_eq!(result["error"]["details"], json!({"tokens":8193,"max_tokens":8192,"item_id":item}));
+        assert_eq!(
+            result["error"]["details"],
+            json!({"tokens":8193,"max_tokens":8192,"item_id":item})
+        );
         assert!(result.get("job_id").is_none());
         assert!(result.get("truncation_disclosures").is_none());
         assert_eq!(certify_worker_snapshot(&state.runtime), before);
+    }
+
+    #[cfg(unix)]
+    fn assert_catalog_cold_boundary_refusal(
+        state: &Arc<ModuleState>,
+        lane: &str,
+        method: &str,
+        params: Value,
+        item: &str,
+    ) {
+        let model = state
+            .runtime
+            .catalog
+            .lock()
+            .unwrap()
+            .get_mut(lane)
+            .unwrap()
+            .loaded
+            .take()
+            .unwrap();
+        let EmbedBackend::Worker(engine) = &model.backend else {
+            unreachable!()
+        };
+        let before = engine.lock().unwrap().request_count().unwrap();
+        assert_catalog_boundary_refusal(state, method, params, item);
+        assert_eq!(engine.lock().unwrap().request_count().unwrap(), before);
+        assert!(state.runtime.catalog.lock().unwrap()[lane].loaded.is_none());
+        state
+            .runtime
+            .catalog
+            .lock()
+            .unwrap()
+            .get_mut(lane)
+            .unwrap()
+            .loaded = Some(model);
     }
 
     #[cfg(unix)]
@@ -23108,16 +23505,39 @@ mod tests {
     fn installed_catalog_embed_boundary_precedes_admission() {
         for id in ["gte-modernbert-base", "qwen3-embedding-0.6b"] {
             for name in ["metal", "ane", "cuda", "vulkan"] {
+                if cfg!(target_os = "macos") && matches!(name, "cuda" | "vulkan") {
+                    continue;
+                }
                 let (root, state) = installed_catalog_boundary_state(id, name);
                 let lane = catalog::lane_id(id, name);
                 let overhead = if id.starts_with("gte-") { 2 } else { 1 };
-                assert_catalog_boundary_refusal(&state, "embed.query", json!({"model":lane,"id":"query-8193","text":boundary_text(8193-overhead)}), "query-8193");
+                assert_catalog_boundary_refusal(
+                    &state,
+                    "embed.query",
+                    json!({"model":lane,"id":"query-8193","text":boundary_text(8193-overhead)}),
+                    "query-8193",
+                );
                 let before = certify_worker_snapshot(&state.runtime);
-                let result = boundary_call(&state, "embed.query", json!({"model":lane,"text":boundary_text(8192-overhead)}));
-                assert_eq!(result["vectors"][0]["vector"], json!([1.0]), "{id}/{name}: {result}");
+                let result = boundary_call(
+                    &state,
+                    "embed.query",
+                    json!({"model":lane,"text":boundary_text(8192-overhead)}),
+                );
+                assert_eq!(
+                    result["vectors"][0]["vector"],
+                    json!([1.0]),
+                    "{id}/{name}: {result}"
+                );
                 assert_eq!(result["real_token_counts"], json!([8192]));
                 assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
                 assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_catalog_cold_boundary_refusal(
+                    &state,
+                    &lane,
+                    "embed.query",
+                    json!({"model":lane,"text":boundary_text(8193-overhead),"deadline_ms":0}),
+                    "query",
+                );
                 drop(state);
                 fs::remove_dir_all(root).unwrap();
             }
@@ -23129,20 +23549,49 @@ mod tests {
     fn installed_catalog_batch_boundary_precedes_job_diversion() {
         for id in ["gte-modernbert-base", "qwen3-embedding-0.6b"] {
             for name in ["metal", "ane", "cuda", "vulkan"] {
+                if cfg!(target_os = "macos") && matches!(name, "cuda" | "vulkan") {
+                    continue;
+                }
                 let (root, state) = installed_catalog_boundary_state(id, name);
                 let lane = catalog::lane_id(id, name);
                 let overhead = if id.starts_with("gte-") { 2 } else { 1 };
                 let item = json!({"id":"row-8193","text":boundary_text(8193-overhead)});
-                assert_catalog_boundary_refusal(&state, "embed.batch", json!({"model":lane,"items":[item.clone()]}), "row-8193");
-                let mut items = vec![json!({"id":"short","text":"a"}); state.runtime.inline.max_items];
+                assert_catalog_boundary_refusal(
+                    &state,
+                    "embed.batch",
+                    json!({"model":lane,"items":[item.clone()]}),
+                    "row-8193",
+                );
+                let mut items =
+                    vec![json!({"id":"short","text":"a"}); state.runtime.inline.max_items];
                 items.push(item);
-                assert_catalog_boundary_refusal(&state, "embed.batch", json!({"model":lane,"items":items}), "row-8193");
+                assert_catalog_boundary_refusal(
+                    &state,
+                    "embed.batch",
+                    json!({"model":lane,"items":items}),
+                    "row-8193",
+                );
                 let before = certify_worker_snapshot(&state.runtime);
-                let result = boundary_call(&state, "embed.batch", json!({"model":lane,"items":[{"id":"row-8192","text":boundary_text(8192-overhead)}]}));
-                assert_eq!(result["vectors"][0]["vector"], json!([1.0]), "{id}/{name}: {result}");
+                let result = boundary_call(
+                    &state,
+                    "embed.batch",
+                    json!({"model":lane,"items":[{"id":"row-8192","text":boundary_text(8192-overhead)}]}),
+                );
+                assert_eq!(
+                    result["vectors"][0]["vector"],
+                    json!([1.0]),
+                    "{id}/{name}: {result}"
+                );
                 assert_eq!(result["real_token_counts"], json!([8192]));
                 assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
                 assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_catalog_cold_boundary_refusal(
+                    &state,
+                    &lane,
+                    "embed.batch",
+                    json!({"model":lane,"items":[{"id":"cold-row","text":boundary_text(8193-overhead)}]}),
+                    "cold-row",
+                );
                 drop(state);
                 fs::remove_dir_all(root).unwrap();
             }
@@ -23152,19 +23601,52 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn installed_catalog_rerank_boundary_precedes_inline_budget() {
-        for (id, names) in [("gte-reranker-modernbert-base", &["metal", "cuda", "vulkan"][..]), ("qwen3-reranker-0.6b", &["ane", "cuda", "vulkan"][..])] {
+        for (id, names) in [
+            (
+                "gte-reranker-modernbert-base",
+                &["metal", "cuda", "vulkan"][..],
+            ),
+            ("qwen3-reranker-0.6b", &["ane", "cuda", "vulkan"][..]),
+        ] {
             for name in names {
+                if cfg!(target_os = "macos") && matches!(*name, "cuda" | "vulkan") {
+                    continue;
+                }
                 let (root, state) = installed_catalog_boundary_state(id, name);
                 let lane = catalog::lane_id(id, name);
-                let overhead = if id.starts_with("gte-") { 5 } else {
-                    let model = state.runtime.catalog.lock().unwrap()[&lane].loaded.clone().unwrap();
-                    owned_rerank_pairs(&model, "a a", &[String::new()]).unwrap().unwrap()[0].len()
+                let overhead = if id.starts_with("gte-") {
+                    5
+                } else {
+                    let model = state.runtime.catalog.lock().unwrap()[&lane]
+                        .loaded
+                        .clone()
+                        .unwrap();
+                    owned_rerank_pairs(&model, "a a", &[String::new()])
+                        .unwrap()
+                        .unwrap()[0]
+                        .len()
                 };
-                assert_catalog_boundary_refusal(&state, "rerank.score", json!({"model":lane,"query":"a a","candidates":[boundary_text(8193-overhead)]}), "0");
+                assert_catalog_boundary_refusal(
+                    &state,
+                    "rerank.score",
+                    json!({"model":lane,"query":"a a","candidates":[boundary_text(8193-overhead)]}),
+                    "0",
+                );
                 let before = certify_worker_snapshot(&state.runtime);
-                let result = boundary_call(&state, "rerank.score", json!({"model":lane,"query":"a a","candidates":[boundary_text(8192-overhead)]}));
+                let result = boundary_call(
+                    &state,
+                    "rerank.score",
+                    json!({"model":lane,"query":"a a","candidates":[boundary_text(8192-overhead)]}),
+                );
                 assert_eq!(result["scores"], json!([0.5]), "{id}/{name}: {result}");
                 assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_catalog_cold_boundary_refusal(
+                    &state,
+                    &lane,
+                    "rerank.score",
+                    json!({"model":lane,"query":"a a","candidates":["a",boundary_text(8193-overhead)]}),
+                    "1",
+                );
                 drop(state);
                 fs::remove_dir_all(root).unwrap();
             }
@@ -24964,7 +25446,10 @@ mod catalog_runtime_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    pub(super) fn isolated_catalog_state(label: &str, runnable: bool) -> (PathBuf, Arc<ModuleState>) {
+    pub(super) fn isolated_catalog_state(
+        label: &str,
+        runnable: bool,
+    ) -> (PathBuf, Arc<ModuleState>) {
         let (root, descriptor) = test_storage_descriptor(label);
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
         let profile = test_machine_profile("catalog-test-os");
@@ -28499,6 +28984,29 @@ async fn run_catalog_embed_job(
             .execution_expires_ms
             .unwrap_or(now_ms())
             .saturating_sub(now_ms());
+        if budget == 0 {
+            return Err(WireOperationError::from_stable(
+                StableError::deadline_exceeded(),
+                "catalog batch execution deadline expired",
+            ));
+        }
+        let parsed: EmbedBatchParams =
+            serde_json::from_value(params).map_err(|e| artifact_invalid_error(e.to_string()))?;
+        let items = batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
+        let texts = items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>();
+        let lane = catalog::lane_id(&entry.id, &backend.backend);
+        let sequences = preflight_catalog_sequences(
+            &state,
+            Some(&lane),
+            parsed.required_fingerprint.as_deref(),
+            parsed.target_fingerprint.as_deref(),
+            None,
+            &texts,
+        )?
+        .expect("catalog job lane");
         let task_state = state.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
         let loading = tokio::spawn(async move {
@@ -28518,14 +29026,8 @@ async fn run_catalog_embed_job(
                     e.to_string(),
                 )
             })??;
-        let parsed: EmbedBatchParams =
-            serde_json::from_value(params).map_err(|e| artifact_invalid_error(e.to_string()))?;
-        let items = batch_items(parsed.items, parsed.texts).map_err(artifact_invalid_error)?;
-        let request_bytes = request_bytes_for_texts(items.iter().map(|i| i.text.as_str()));
-        let mut tokenized = model
-            .tokenizer
-            .tokenize_batch(items.iter().map(|i| i.text.as_str()))
-            .map_err(|e| artifact_invalid_error(e.to_string()))?;
+        let request_bytes = request_bytes_for_texts(texts.iter().copied());
+        let mut tokenized = catalog_embed_batch(&texts, sequences);
         compose_catalog_embed(&model, &mut tokenized)?;
         apply_owned_tokenizer_policy(&model, &mut tokenized);
         let total_tokens = tokenized
