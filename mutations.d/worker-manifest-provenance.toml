@@ -2,8 +2,8 @@
 id = "worker-manifest-provenance"
 guards = "The ANE-direct worker manifest probe returns provenance before the worker can require its socket or launch nonce"
 file = "crates/synapse-worker-ane-direct/src/main.rs"
-old = "if std::env::args_os().skip(1).any(|argument| argument == \"--manifest\") {"
-new = "if std::env::args_os().skip(1).any(|argument| argument == \"--manifest-disabled\") {"
+old = "    if std::env::args_os()\n        .skip(1)\n        .any(|argument| argument == \"--manifest\")\n    {\n        print_manifest();\n        return Ok(());\n    }"
+new = "    if std::env::args_os()\n        .skip(1)\n        .any(|argument| argument == \"--manifest-disabled\")\n    {\n        print_manifest();\n        return Ok(());\n    }"
 edits = []
 test_file = "crates/synapse-worker-ane-direct/tests/manifest.rs"
 runner = "nextest"
