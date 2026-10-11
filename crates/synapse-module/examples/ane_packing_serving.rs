@@ -1247,6 +1247,9 @@ mod gate_tests {
     }
 }
 
+// The worker relay only exists on Unix, where the direct Neural Engine worker
+// connects over a Unix socket; Windows builds have no caller.
+#[cfg(unix)]
 fn relay_frames(
     host: &mut (impl std::io::Read + std::io::Write),
     worker: &mut (impl std::io::Read + std::io::Write),
