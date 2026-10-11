@@ -3870,6 +3870,13 @@ pub mod ane_residency {
         Failed,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum EvictionOutcome {
+        Evicted,
+        Abandoned,
+        Failed,
+    }
+
     struct Slot {
         /// Distinguishes this residency from an earlier one of the same shape,
         /// so a lease or ack from before a restart never touches the new slot.
@@ -4795,7 +4802,7 @@ pub mod ane_residency {
         }
 
         async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
-            self.evict_with_recovery(owner, key, slot_id, true).await
+            self.evict_with_recovery(owner, key, slot_id, true).await == EvictionOutcome::Evicted
         }
 
         async fn evict_with_recovery(
@@ -4804,7 +4811,7 @@ pub mod ane_residency {
             key: ShapeKey,
             slot_id: u64,
             recover_on_failure: bool,
-        ) -> bool {
+        ) -> EvictionOutcome {
             let inner = self.inner.clone();
             let Some(generation) = inner
                 .lock()
@@ -4813,46 +4820,63 @@ pub mod ane_residency {
                 .filter(|slot| slot.id == slot_id)
                 .map(|slot| slot.generation)
             else {
-                return true;
+                return EvictionOutcome::Evicted;
             };
+            let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
             let task = tokio::spawn(async move {
-                match owner
-                    .evict_program(generation, &key.model_ref, key.shape, key.program)
-                    .await
-                {
-                    Ok(()) => {
-                        let mut state = inner.lock();
-                        if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
-                            state.slots.remove(&key);
-                            state.stats.evicted += 1;
-                            state.sample();
+                request_scope(waits, async move {
+                    match owner
+                        .evict_program(generation, &key.model_ref, key.shape, key.program)
+                        .await
+                    {
+                        Ok(()) => {
+                            let mut state = inner.lock();
+                            if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
+                                state.slots.remove(&key);
+                                state.stats.evicted += 1;
+                                state.sample();
+                            }
+                            drop(state);
+                            inner.changed.notify_waiters();
+                            EvictionOutcome::Evicted
                         }
-                        drop(state);
-                        inner.changed.notify_waiters();
-                        true
-                    }
-                    Err(_) if owner.generation() != generation => true,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "worker",
-                            worker_id = owner.worker_id(),
-                            model_ref = %key.model_ref,
-                            shape = key.shape,
-                            error = %error,
-                            "direct-ANE evict failed; restarting the worker"
-                        );
-                        if recover_on_failure {
-                            recover_worker_at_generation(&inner, &owner, generation).await;
+                        Err(AneResidencyError::Abandoned) => {
+                            // No eviction reached the wire, so the worker still owns
+                            // the resident program and its executable charge is unchanged.
+                            let mut state = inner.lock();
+                            if let Some(slot) = state.slots.get_mut(&key).filter(|slot| {
+                                slot.id == slot_id && slot.state == SlotState::Evicting
+                            }) {
+                                slot.state = SlotState::Resident;
+                            }
+                            drop(state);
+                            inner.changed.notify_waiters();
+                            EvictionOutcome::Abandoned
                         }
-                        false
+                        Err(_) if owner.generation() != generation => EvictionOutcome::Evicted,
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "worker",
+                                worker_id = owner.worker_id(),
+                                model_ref = %key.model_ref,
+                                shape = key.shape,
+                                error = %error,
+                                "direct-ANE evict failed; restarting the worker"
+                            );
+                            if recover_on_failure {
+                                recover_worker_at_generation(&inner, &owner, generation).await;
+                            }
+                            EvictionOutcome::Failed
+                        }
                     }
-                }
+                })
+                .await
             });
             match task.await {
                 Ok(evicted) => evicted,
                 Err(error) => {
                     tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
-                    false
+                    EvictionOutcome::Failed
                 }
             }
         }
@@ -4912,6 +4936,10 @@ pub mod ane_residency {
         slot_id: u64,
         error: AneResidencyError,
     ) -> Result<AneShapeLease, AneResidencyError> {
+        if let Err(error) = ensure_request_live() {
+            forget_failed_admission(&supervisor.inner, &key, slot_id);
+            return Err(error);
+        }
         // Keep the failed shape's budget reservation while freeing one physical
         // resident. Selecting and marking the victim under the lock prevents a
         // new lease from racing the eviction; the worker owns partial rollback.
@@ -4920,18 +4948,29 @@ pub mod ane_residency {
             return Err(resource_refusal(error));
         };
         let owner_generation = owner.generation();
-        if !supervisor
+        match supervisor
             .evict_with_recovery(owner.clone(), victim, victim_id, false)
             .await
         {
-            // The admission RPC has finished, but its reservation remains charged.
-            // Recovery must not wait on the operation that is requesting recovery.
-            if owner.worker_id() == worker.worker_id() {
-                mark_failed_admission(&supervisor.inner, &key, slot_id);
+            EvictionOutcome::Evicted => {}
+            EvictionOutcome::Abandoned => {
+                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                return Err(AneResidencyError::Abandoned);
             }
-            recover_worker_at_generation(&supervisor.inner, &owner, owner_generation).await;
+            EvictionOutcome::Failed => {
+                // The admission RPC has finished, but its reservation remains charged.
+                // Recovery must not wait on the operation that is requesting recovery.
+                if owner.worker_id() == worker.worker_id() {
+                    mark_failed_admission(&supervisor.inner, &key, slot_id);
+                }
+                recover_worker_at_generation(&supervisor.inner, &owner, owner_generation).await;
+                forget_failed_admission(&supervisor.inner, &key, slot_id);
+                return Err(resource_refusal(error));
+            }
+        }
+        if let Err(error) = ensure_request_live() {
             forget_failed_admission(&supervisor.inner, &key, slot_id);
-            return Err(resource_refusal(error));
+            return Err(error);
         }
         let Some(generation) = supervisor
             .inner
@@ -8504,6 +8543,82 @@ pub mod ane_residency {
             tokio::time::timeout(Duration::from_secs(3), notify.notified())
                 .await
                 .unwrap();
+        }
+
+        #[tokio::test]
+        async fn cancelled_queued_eviction_restores_residency_without_wire_dispatch() {
+            let peer = Arc::new(Mutex::new(PackedPeer::default()));
+            let serving = packed_peer(false, peer.clone()).await;
+            assert!(serving.prepare_packed().await.unwrap());
+            let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+            let short = serving
+                .supervisor
+                .lease(&worker, PACKED_MODEL, 128)
+                .await
+                .unwrap();
+            drop(
+                serving
+                    .supervisor
+                    .lease(&worker, PACKED_MODEL, 256)
+                    .await
+                    .unwrap(),
+            );
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            peer.lock()
+                .unwrap()
+                .inference_gates
+                .push_back((started.clone(), release.clone()));
+            let packed = tokio::spawn({
+                let serving = serving.clone();
+                async move {
+                    serving
+                        .infer_packed(vec![vec![41; 127], vec![42; 129]])
+                        .await
+                }
+            });
+            notified(&started).await;
+            let before = peer.lock().unwrap().requests.len();
+            let victim = ShapeKey {
+                program: AneProgram::Single,
+                ..AneResidencySupervisor::packed_key(&worker, PACKED_MODEL)
+            };
+            let queued = tokio::spawn({
+                let serving = serving.clone();
+                async move { serving.infer(vec![vec![43; 257]], false).await }
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while serving.supervisor.inner.lock().slots[&victim].state != SlotState::Evicting {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            queued.abort();
+            let _ = queued.await;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while serving.active_requests.load(Ordering::Acquire) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect(
+                "an abandoned queued eviction must stop before another request releases the stream",
+            );
+            assert_eq!(
+                serving.supervisor.inner.lock().slots[&victim].state,
+                SlotState::Resident
+            );
+            assert_eq!(serving.supervisor.inner.lock().reserved_executables(), 84);
+            assert_eq!(peer.lock().unwrap().requests.len(), before);
+            release.notify_one();
+            assert_eq!(packed.await.unwrap().unwrap(), vec![vec![41.0], vec![42.0]]);
+            assert_eq!(
+                peer.lock().unwrap().requests.len(),
+                before,
+                "no eviction or admission may reach the wire after its caller abandons queued work"
+            );
+            drop(short);
         }
 
         #[tokio::test]
