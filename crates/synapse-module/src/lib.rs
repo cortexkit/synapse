@@ -18644,6 +18644,24 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn catalog_resolver_expiry_does_not_describe_a_failed_lane_as_loading() {
+        let fixture = installed_ready_ane_fixture().await;
+        let failure = artifact_invalid_error("catalog load failed");
+        set_model_slot_state(
+            &fixture.state.runtime,
+            ANE_TEST_LANE,
+            ModelRuntimeState::Failed(failure.clone()),
+        );
+        let expired = catalog_resolution_expired(&fixture.state.runtime, ANE_TEST_LANE);
+        finish_ane_lane_fixture(fixture).await;
+        assert_eq!(
+            expired, failure,
+            "a settled load failure must not become model_loading"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn validated_ready_catalog_selection_reuses_readiness_without_the_store_lock() {
         let fixture = installed_ready_ane_fixture().await;
         resolve_ready_ane_request(fixture.state.clone(), 30000)
@@ -30246,14 +30264,25 @@ fn remaining_request_ms(deadline: tokio::time::Instant) -> u64 {
 }
 
 fn catalog_resolution_expired(runtime: &RuntimeState, lane: &str) -> WireOperationError {
-    let ready = model_slot_snapshot(runtime, lane).is_some_and(|slot| {
+    let slot = model_slot_snapshot(runtime, lane);
+    if let Some(ModelSlotSnapshot {
+        state: ModelRuntimeState::Failed(error),
+        ..
+    }) = &slot
+    {
+        tracing::debug!(model_id = %lane, stage = "resolver_expired", branch = "failed",
+            code = %error.code, "catalog resolver");
+        return error.clone();
+    }
+    let ready = slot.is_some_and(|slot| {
         matches!(slot.state, ModelRuntimeState::Ready) && slot.loaded.is_some()
     });
     let checking = runtime
         .lane_checks
         .lock()
         .expect("lane checks")
-        .contains_key(lane);
+        .get(lane)
+        .is_some_and(|outcome| outcome.borrow().is_none());
     let error = if ready && !checking {
         WireOperationError::from_stable(
             StableError::deadline_exceeded(),
