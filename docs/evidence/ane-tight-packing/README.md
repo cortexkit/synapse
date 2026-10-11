@@ -545,3 +545,359 @@ python3 docs/evidence/ane-tight-packing/verify-raw.py \
 if using another clone. It reuses the specified pinned tokenizer/checkpoint and
 the mini's export, unsets `TMPDIR`, and runs exactly one ignored test with one
 test thread. The scratch build/cache is separate from production.
+
+## Module-serving measurement driver
+
+`crates/synapse-module/examples/ane_packing_serving.rs` measures serving rather
+than the earlier worker-only replay. It installs the checksum-pinned Qwen
+catalog lane in a private module/store, with a loopback checkpoint server and
+no daemon discovery. Only `ane_direct.tight_packing` differs between arms;
+the default eight-row engine quantum and 3,072-token quantum budget remain
+unchanged. The export's original 127 calls (up to 64 rows each) run with two
+calls in flight, covering all 6,341 rows exactly once per repetition.
+
+The default order is serial, packed, serial, packed, serial, packed. Each
+fresh private module is warmed before its timed export. A second stratum
+makes 1,000 warm `embed.query` calls while two document-batch callers cycle
+through the export continuously. Query text is deterministically export row
+zero, not chosen to improve a result. All document vectors, including bulk
+background results, and query vectors are compared by `f32::to_bits()` against
+the first serial reference. Reports contain indices, counts, hashes and
+timings, never export text or vector payloads.
+
+Both arms use the same Unix-socket frame relay. It preserves the worker's
+HELLO identity/capabilities and raw frames, records operation names without
+tensor payloads, and passes the inherited global ANE lane-lock descriptor as
+the real worker's stdin. The module still acquires the normal global lock;
+neither `HOME` nor the lock location is overridden. A normal module request
+must send `EMBED_PACKED` after the module's standalone-versus-packed fixture
+checks; successful embeddings alone are not evidence that packing was used.
+The relay also records actual worker call sizes to enforce the eight-row cap.
+
+Packed compilation is reported as the worker-side duration of the first
+`admit-packed` request, from the existing worker profiling log. This includes
+admission/request handling and response writing, not just compiler internals;
+it excludes catalog download, model load, standalone reference generation
+and packed qualification. Later admissions are retained separately so a
+recompile cannot be mistaken for a one-time cost. Profiling and the relay are
+enabled identically in both arms and their overhead is part of serving time.
+
+### Reproduce the module comparison
+
+Obtain approval for the target device before **each** invocation. If another
+Neural Engine client is present, ask its owner rather than stopping it. The
+driver checks both hyphenated and underscored Synapse names and `ckdev` names
+before the run and before each fresh arm. Use an isolated copy of the committed
+source, never a serving checkout or production store. Verify the transfer's
+SHA-256 at the destination. Keep raw JSON, profiles, module logs, private
+configs and stores outside the repository and outside regenerable build trees.
+
+In the isolated source copy, build native macOS binaries (serialized Cargo
+invocations) with Xcode selected:
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+cargo build --release --locked -p synapse-module --features test-support \
+  --bin ck-synapse --example ane_packing_serving
+cargo build --release --locked -p synapse-worker-ane-direct
+```
+
+Copy the example to a `ckdev-ane-packing-serving` alias and ad-hoc sign it:
+
+```sh
+cp "$BUILD_ASSETS/examples/ane_packing_serving" "$RUN_ASSETS/ckdev-ane-packing-serving"
+codesign --force --sign - "$RUN_ASSETS/ckdev-ane-packing-serving"
+codesign --verify --strict "$RUN_ASSETS/ckdev-ane-packing-serving"
+env -u TMPDIR SYNAPSE_PACKING_APPROVED=1 \
+  SYNAPSE_COMPARE_ASSETS="$BUILD_ASSETS" \
+  SYNAPSE_QWEN_WEIGHTS="$PINNED_CHECKPOINT_DIRECTORY" \
+  SYNAPSE_PACKING_INPUT="$FULL_EXPORT_JSONL" \
+  SYNAPSE_PACKING_OUT="$RAW_OUTPUT_JSON" \
+  "$RUN_ASSETS/ckdev-ane-packing-serving"
+```
+
+The driver copies and ad-hoc signs its private module, real worker and relay
+aliases before executing them. The output must not already exist. At least
+three repetitions and 1,000 queries per arm are enforced even when overriding
+`SYNAPSE_PACKING_REPEATS` or `SYNAPSE_PACKING_QUERY_SAMPLES`. A failed acceptance
+gate exits nonzero **after** preserving the measurements; do not change the
+workload or thresholds to make it pass.
+
+Run the driver's hardware-free unit tests and strict lint check:
+
+```sh
+cargo test -p synapse-module --example ane_packing_serving --features test-support
+cargo clippy -p synapse-module --example ane_packing_serving --features test-support -- -D warnings
+```
+
+The tests cover export coverage, ID-based vector restoration, signed-zero bit
+identity, nearest-rank percentiles, median/tolerance gates, refusal of absent
+packed dispatch or an active serial switch, and payload-free socket relaying.
+Forcing `assess`'s `packed_dispatch_and_off_switch` check to return true
+regardless of worker exchanges fails only
+`gate_tests::acceptance_requires_real_packed_dispatch_and_serial_off_switch`;
+the seven other tests in that mutation run remained green.
+
+## First module-serving measurement: failed, incomplete
+
+Measured on Apple M4 on 2026-10-11 at source
+`b755101caef11f00dff9c3dd916fad93c01560fc`. Owner approval covered the device
+and all invocations. Busy checks passed before invocation and each arm. All
+ANE clients were ad-hoc signed `ckdev-*` aliases, with private configuration,
+lease and store roots. A retained `lsof` snapshot shows the module holding the
+global lane lock and both relay and real worker retaining it on descriptor
+zero. No M5 inference or production-store access occurred.
+
+**Acceptance is not passed.** The order was serial/packed/serial/packed/serial/
+packed, but the final packed export failed with `model_loading`. Three serial
+and only two packed arms completed; no extra packed arm was stitched in, no
+failed sample was discarded, and thresholds/workload were not adjusted.
+The completed-arm medians below are descriptive, not a rollout approval.
+
+| Arm | Full export (s) | Outer-call p50 / p99 (ms) | Query-under-bulk p50 / p99 (ms) | First packed admission/compile (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Serial 1 | 225.412 | 3,616.166 / 7,312.260 | 377.943 / 696.911 | — |
+| Packed 1 | 156.940 | 2,559.450 / 4,516.341 | 306.779 / 592.834 | 22,561.678 |
+| Serial 2 | 218.120 | 3,283.177 / 9,960.611 | 378.574 / 897.053 | — |
+| Packed 2 | 164.756 | 2,526.325 / 6,059.445 | 304.478 / 579.562 | 26,497.272 |
+| Serial 3 | 208.078 | 3,305.101 / 6,750.708 | 397.443 / 921.245 | — |
+| Packed 3 | **Failed mid-export** | Not a completed measurement | Not reached | Retained in failed-arm profile |
+
+Each completed export returned 6,341 bit-identical vectors: 31,705 completed
+row comparisons, plus 5,000 identical query vectors and 68,723 identical
+background-bulk vectors, with zero mismatches. Every complete export has the
+same ordered f32-bit digest:
+`412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811`.
+The pinned fingerprint remains
+`5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b`.
+The completed packed exports each sent 825 `EMBED_PACKED` exchanges and 81
+single exchanges; serial exports sent 931 single exchanges and no packed
+exchanges. The largest observed engine call was eight rows. Each complete
+packed arm compiled the packed shape once, with no later packed re-admission;
+median first compile-request wall time was 24,529.475 ms.
+
+Among completed arms only, median export times were 218.120 s serial and
+160.848 s packed (**0.73743×**, below 0.80×). Pooled warm query p50/p99 were
+382.198/844.604 ms serial (3,000 samples) and 305.183/587.734 ms packed
+(2,000 samples), below the respective 420.418/929.064 ms limits. Missing the
+third packed repetition prevents these descriptive successes from clearing
+acceptance.
+
+### Initial incident diagnosis from retained evidence
+
+The final packed arm started at 14:26:12 UTC. Its private store retains one
+passed self-check, generation 1, checked at 14:26:49.403 UTC, with unchanged
+identity. There is one worker profile PID, one `LOAD`, one `PING`, one packed
+admission, and one single-shape eviction during preparation. The 103 completed
+wire exchanges include 65 packed executions and no `ERR` responses. No packed
+eviction, packed re-admission, second load or second worker-profile PID is
+recorded. The retained module log has no resource-exhaustion or recovery
+warning. These observations are not a substitute for a durable crash ledger;
+the private store has no general worker crash/recovery event table.
+
+The slowdown is explicit in module log lines (UTC):
+
+```text
+2026-10-11T14:27:51.281Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-1 lane=ane-direct tokens=2489 wall_ms=844
+2026-10-11T14:28:14.659Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-7 lane=ane-direct tokens=7112 wall_ms=18452
+2026-10-11T14:28:32.325Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-10 lane=ane-direct tokens=1997 wall_ms=13900
+```
+
+The worker profile ends with successful vector-producing exchanges at
+829.583, 1,100.528, 1,582.756 and 1,872.109 ms. The last is `embed-101`,
+completed at Unix microsecond `1791728925474414` (14:28:45.474 UTC). The
+retained module profile records a 4,661.794 ms direct-ANE roundtrip and an
+11,069.915 ms handler interval near the failure. The terminal response was:
+
+```text
+embed.batch: model_loading: catalog lane 'qwen3-embedding-0.6b-ane' is loading
+```
+
+`resolve_serving_model` and `catalog_resolution_guard` in
+`crates/synapse-module/src/lib.rs` cap catalog lifecycle/readiness waits at
+five seconds even with the private 600-second inline deadline. Their timeout
+response uses that exact `model_loading` message. It therefore does **not**
+establish a worker crash or lane reload. The worker exchange timeout is
+separately 30 seconds, not five. The relay's retained `Broken pipe (os error
+32)` can result from aborting the remaining in-flight call when the harness
+exits on the first refusal; it does not establish the initiating cause.
+
+The data supports a catalog-resolution/readiness timeout during the slowdown,
+but does not settle why execution/readiness work slowed, or whether the
+five-second timer expired waiting for the lifecycle lock or the detached
+readiness task. Worker stderr and module stderr are empty. No RSS or system
+memory-pressure samples were collected in this first run, so memory pressure
+on the 16-GB M4 cannot be ruled out. An owner-approved second **full** matched
+comparison adds memory sampling and retained stderr, without changing module
+code, workload, private module configuration, or thresholds.
+
+### Retained first-run evidence and reduction
+
+`module-serving-first.json` is the compact failed-run summary, containing
+hashes, counters and independently recomputed statistics. Full call samples,
+profiles, private logs and selected private-store event rows remain outside
+Git. Input identities:
+
+- Export SHA-256: `1db27b7fd308b1e2d805f034b9f9f990cab5e321d04484f9d6b97980bd5ded4c`.
+- Batch metadata SHA-256: `bfcef3e0035a9854b5bcc92bab3c500b566067885e9b33f02d1411199a83cfa4`.
+- Checkpoint SHA-256: `0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd`.
+- Tokenizer SHA-256: `def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a`.
+- Full first report: 359,744 bytes, SHA-256 `d9cbd980a0682c6a9148217d6f361f47f27718158ad72dd6f8eaaac4cd8b8b8a`.
+- Global-lock observation SHA-256: `7e1bb3c84b429487465a2f8e3b5568c2caca028555ca9f1024d89485581e80ca`.
+
+The reducer refuses incomplete evidence by default. Explicitly preserving an
+incomplete run never marks its acceptance gate as passed:
+
+```sh
+python3 docs/evidence/ane-tight-packing/summarize-serving.py "$FIRST_RAW_REPORT" \
+  --allow-incomplete --out docs/evidence/ane-tight-packing/module-serving-first.json
+python3 docs/evidence/ane-tight-packing/summarize-serving.py --self-test
+```
+
+The independent reducer recomputes medians and nearest-rank percentiles from
+raw samples, checks identity/call counts and real dispatch, and refuses a
+contradictory driver gate claim. Forcing its dispatch check to return true
+fails only `Tests.test_complete_run_and_failed_dispatch_are_computed_from_raw_counters`;
+the four other reducer tests in that mutation run remain green.
+
+For the instrumented comparison, run
+`monitor-serving-memory.py --out "$MEMORY_JSONL" --stop-file "$MONITOR_STOP"`
+beside the driver, and create the stop file only after the driver exits. It
+samples module/worker/relay RSS every three seconds, captures `vm_stat`, and
+uses **only** `memory_pressure -Q` (query mode, never synthetic pressure).
+Every sample has a Unix timestamp for correlation with module/worker profiles.
+The monitor output and full stderr stay outside Git.
+
+## Instrumented full comparison: failed, incomplete
+
+A second full alternating comparison used source
+`78a611b4131cf114842ddf9a80a1683f31d028a8`, the **same** export/checkpoint,
+module configuration, thresholds and 1,000-query strata, with query-only
+memory sampling and append-only worker stderr. It again completed three
+serial and two packed arms. This time the third packed arm aborted during
+warm preparation, before any packed admission, with a harness JSON-reader
+error rather than a recorded module refusal:
+
+```text
+EOF while parsing a string at line 1 column 85
+```
+
+| Arm | Full export (s) | Outer-call p50 / p99 (ms) | Query-under-bulk p50 / p99 (ms) | First packed admission/compile (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Serial 1 | 204.736 | 3,353.987 / 5,479.778 | 369.554 / 709.426 | — |
+| Packed 1 | 170.882 | 2,695.075 / 5,423.585 | 305.530 / 585.851 | 27,489.785 |
+| Serial 2 | 189.574 | 3,114.464 / 6,233.985 | 366.616 / 704.831 | — |
+| Packed 2 | 170.523 | 2,650.436 / 6,215.023 | 308.307 / 591.749 | 51,595.191 |
+| Serial 3 | 226.662 | 3,497.436 / 6,951.202 | 382.970 / 896.262 | — |
+| Packed 3 | **Aborted during warm preparation** | Not reached | Not reached | Not admitted |
+
+Among these completed arms, the serial median was 204.736 s and the packed
+median 170.703 s (**0.83377×**, above 0.80×). Even an arbitrarily fast third
+packed result would leave a three-sample packed median at least 170.523 s,
+above the 163.788 s threshold for the three completed serial arms. No additional
+arm or third comparison was selected to improve these numbers.
+
+All 31,705 completed export rows again compare bit-identical and retain the
+same ordered vector digest as the first run. The 5,000 query vectors and
+68,886 background vectors also compare identically, with zero mismatches.
+Pooled query p50/p99 were 370.421/829.333 ms serial (3,000 samples) and
+307.026/588.260 ms packed (2,000 samples), below the 407.463/912.266 ms limits.
+Each complete packed export again recorded 825 packed worker exchanges and
+81 single exchanges, with an eight-row maximum. Each complete packed arm
+admitted the packed program once; median compile-request cost was 39,542.488 ms.
+
+### Memory observations and remaining diagnosis
+
+The monitor retained **1,147 samples, zero sampling errors**, with no sample
+containing clients from two different arms. The worker and module from each
+arm therefore did not remain as overlapping clients of the next arm in the
+sampled intervals. These process observations do not measure memory retained
+inside the system Neural Engine service or kernel.
+
+| Arm | Peak real-worker RSS (MiB) | Peak module RSS (MiB) |
+| --- | ---: | ---: |
+| Serial 1 | 1,114.438 | 160.719 |
+| Packed 1 | 1,438.047 | 297.828 |
+| Serial 2 | 1,078.047 | 207.141 |
+| Packed 2 | 863.906 | 219.891 |
+| Serial 3 | 1,234.188 | 150.922 |
+| Packed 3 warm-up only | 543.719 | 113.562 |
+
+There is no monotonic growth of sampled per-process RSS across arms; these
+samples do not establish a module/worker process leak. They do establish
+substantial **system-wide paging** on the 16-GiB machine:
+
+- `memory_pressure -Q` free percentage ranged from 14% to 43%. This is Apple's
+  system-wide metric, not simply the physical free-page count.
+- At 16,384 bytes per page, physical free pages reached 1,103 (17.234 MiB), and
+  occupied compressor pages peaked at 523,806 (7.993 GiB).
+- Over the captured interval, `vm_stat` counters increased by 7,153,671 swap-in
+  pages (109.156 GiB) and 8,432,130 swap-out pages (128.664 GiB), alongside
+  63,594,082 page compressions and 59,859,657 decompressions. These are global
+  counter deltas, not attribution of all paging to the embedding worker.
+
+The final arm's initial 64-row warm-up took 79.005 s, compared with 39.382 s
+for the same initial batch in the failed final arm of the first comparison.
+Neither cold warm-up is included in the export medians. Its private module
+log records that warm-up interval:
+
+```text
+2026-10-11T15:45:59.827Z INFO  synapse.admission: job admitted model_id=qwen3-embedding-0.6b-ane job_id=inline-1-0
+2026-10-11T15:47:18.834Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-0 lane=ane-direct tokens=2489 wall_ms=79005
+```
+
+That arm's completed wire log contains one `PING`, one `LOAD`, three single
+shape admissions and 24 standalone embeddings, with no packed admission and
+no `ERR` response. Its last worker response (`embed-27`) finished successfully
+in 276.097 ms at Unix microsecond `1791733640563969`. Full retained worker
+stderr and module stderr are empty. Thus the second termination is not
+evidence of a packed inference crash or numeric mismatch.
+
+A separate harness defect was found: `wire_snapshot` could parse the final
+NDJSON record while the worker relay was still appending it. The writer used
+piecewise formatted writes, and the reader treated an unterminated last line
+as complete JSON. A portable regression reproduces the same EOF error class.
+The final driver serializes each record before writing it and reads only
+newline-terminated observations; malformed **complete** records still fail.
+Removing that boundary check fails only
+`wire_snapshot_tests::concurrent_wire_reader_ignores_only_uncommitted_trailing_records`;
+the ten other driver tests in that mutation run remain green. This repair was
+not used to retcon either measurement or to select a replacement arm.
+
+**The first run's initiating slowdown remains undiagnosed.** System memory
+pressure is now demonstrated in the second comparison and is consistent with
+slow execution/readiness work, but cannot retrospectively prove the cause of
+the first run's catalog timeout. The retained evidence does not show packed
+recompilation, resource-exhaustion responses or a worker reload as its trigger.
+The five-second catalog-resolution/readiness budget and the unexplained
+slowdown require investigation before enabling packing on any device. No
+module or worker implementation was changed to force a pass.
+
+### Final gate disposition and retained second-run evidence
+
+**Rollout gate: NOT PASSED. Keep packing disabled outside private runs.**
+Neither attempt completed three clean repetitions per arm; the second
+completed-arm timing also misses the 0.80× limit. Bit identity and the measured
+query-latency limits passed only for the completed strata. The first failed
+attempt is retained alongside the second, not replaced or pooled with it.
+
+- `module-serving-instrumented.json`: compact second-run statistics; full raw
+  report is 360,243 bytes, SHA-256 `ab97720b0e4d84083a49ffd505ef7694738a4a46897c88a215f08ac68db21748`.
+- `module-serving-memory.json`: compact RSS/paging observations; full memory
+  trace is 2,247,377 bytes, SHA-256 `7b9342eac9c049331ac3932116605fecf543c2102b2b608cc20040c16bcbd38f`.
+- Full call timings, all private-arm profiles/logs, complete stderr and
+  privacy-filtered first-failure store events remain outside Git and outside
+  regenerable build directories. No input text, vectors or machine paths are
+  committed in the new summaries. All test/measurement clients exited and the
+  global lane lock has no remaining measurement client.
+
+Recompute the second attempt's compact summaries with its missing third packed
+repetition explicitly marked incomplete and its acceptance gate kept failed:
+
+```sh
+python3 docs/evidence/ane-tight-packing/summarize-serving.py "$SECOND_RAW_REPORT" \
+  --allow-incomplete --out docs/evidence/ane-tight-packing/module-serving-instrumented.json
+python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py \
+  --summarize "$MEMORY_JSONL" --summary-out docs/evidence/ane-tight-packing/module-serving-memory.json
+python3 docs/evidence/ane-tight-packing/monitor-serving-memory.py --self-test
+```
