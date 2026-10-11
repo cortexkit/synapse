@@ -318,11 +318,9 @@ impl Model {
             let mut executables = Vec::new();
             for layer in 0..self.profile.n("num_hidden_layers") {
                 let (graph, _) = build_graph(self, layer, width, &mode)?;
-                executables.push(
-                    graph
-                        .compile(NSQualityOfService::UserInteractive)
-                        .with_context(|| format!("tight layer {layer}"))?,
-                );
+                executables.push(compile_layer(&graph, layer, |graph| {
+                    graph.compile(NSQualityOfService::UserInteractive)
+                })?);
             }
             Ok(TightProgram {
                 width,
@@ -336,6 +334,14 @@ impl Model {
             })
         })
     }
+}
+
+fn compile_layer(
+    graph: &Graph,
+    layer: usize,
+    compile: impl FnOnce(&Graph) -> std::result::Result<Executable, ane::Error>,
+) -> Result<Executable> {
+    compile(graph).with_context(|| format!("tight layer {layer}"))
 }
 
 impl TightProgram {
@@ -466,6 +472,43 @@ pub fn pack_tight(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn packed_compile_exhaustion_keeps_typed_wire_code_and_layer_context() {
+        let failure = compile_layer(&Graph::new(), 3, |_| {
+            Err(ane::Error::Load(
+                "no ANE resources (transient; retry)".into(),
+            ))
+        })
+        .err()
+        .unwrap();
+        let response = crate::worker::request_error(Some("packed-admit".into()), &failure);
+        match response {
+            synapse_core::WorkerResponse::Err { code, msg, .. } => {
+                assert_eq!(
+                    code, "ane_resources_exhausted",
+                    "packed resource exhaustion must keep its typed wire code"
+                );
+                assert!(
+                    msg.contains("tight layer 3") && msg.contains("no ANE resources"),
+                    "the diagnostic must retain layer and underlying compile context"
+                );
+            }
+            other => panic!("unexpected admission failure: {other:?}"),
+        }
+        for error in [
+            ane::Error::Load("unrelated load failure".into()),
+            ane::Error::Compile("no ANE resources".into()),
+            ane::Error::Evaluate("no ANE resources".into()),
+        ] {
+            let failure = compile_layer(&Graph::new(), 3, |_| Err(error))
+                .err()
+                .unwrap();
+            assert!(
+                matches!(crate::worker::request_error(None, &failure), synapse_core::WorkerResponse::Err { code, .. } if code != "ane_resources_exhausted")
+            );
+        }
+    }
     #[test]
     pub(crate) fn runtime_rope_coefficients_match_actual_graph_constant_bits() {
         for width in [256, 384, 512] {

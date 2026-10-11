@@ -174,6 +174,19 @@ fn error(req_id: Option<String>, message: &str) -> WorkerResponse {
         msg: message.into(),
     }
 }
+
+pub(crate) fn request_error(req_id: Option<String>, failure: &anyhow::Error) -> WorkerResponse {
+    let mut response = error(req_id, &failure.to_string());
+    if let WorkerResponse::Err { code, msg, .. } = &mut response {
+        // Layer context is a diagnostic, not an error class. Inspect the typed
+        // cause even when compilation added one or more contextual messages.
+        if failure.chain().any(|cause| matches!(cause.downcast_ref::<ane::Error>(), Some(ane::Error::Load(message)) if message.contains("no ANE resources"))) {
+            *code = "ane_resources_exhausted".into();
+        }
+        *msg = format!("{failure:#}");
+    }
+    response
+}
 fn os_build() -> Result<String> {
     let output = synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
         .arg("-buildVersion")
@@ -409,7 +422,7 @@ fn request_loop<S: Read + Write>(
             })
         })();
         let (response, output) =
-            result.unwrap_or_else(|e| (error(req_id.clone(), &e.to_string()), None));
+            result.unwrap_or_else(|e| (request_error(req_id.clone(), &e), None));
         write_json_frame(stream, &response, max)?;
         if let Some(output) = output {
             write_frame(stream, &encode_f32_frame(&output), max)?;
