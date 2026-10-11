@@ -1341,6 +1341,8 @@ struct RuntimeState {
     /// the lane's check.
     #[cfg(test)]
     fast_path_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    resolver_ready_delay: Mutex<Option<Duration>>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
     catalog_disk: Mutex<()>,
@@ -2571,6 +2573,8 @@ impl RuntimeState {
             lane_checks: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             profile_check_passes_for_test: Mutex::new(false),
+            #[cfg(test)]
+            resolver_ready_delay: Mutex::new(None),
             #[cfg(test)]
             lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -18340,6 +18344,168 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn installed_ready_ane_fixture() -> AneLaneFixture {
+        let (root, state) = tokio::task::spawn_blocking(|| {
+            installed_catalog_boundary_state("gte-modernbert-base", "ane")
+        })
+        .await
+        .unwrap();
+        let (mut engine, control) =
+            tokio::task::spawn_blocking(worker_host::ane_residency::module_mock_engine_controlled)
+                .await
+                .unwrap();
+        // Transport silence is a separate fault from a request waiting behind work.
+        Arc::get_mut(&mut Arc::get_mut(&mut engine).unwrap().serving)
+            .unwrap()
+            .metadata
+            .timeout = Duration::from_secs(10);
+        let mut slots = state.runtime.catalog.lock().unwrap();
+        let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+        let mut model = slot.loaded.take().unwrap();
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+        slot.loaded = Some(model);
+        drop(slots);
+        AneLaneFixture {
+            root,
+            state,
+            engine,
+            control,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn resolve_ready_ane_request(
+        state: Arc<ModuleState>,
+        budget: u64,
+    ) -> Result<Vectors, WireOperationError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+        let model = resolve_serving_model(
+            state.clone(),
+            Some(ANE_TEST_LANE),
+            ModelTask::Embed,
+            None,
+            None,
+            Some(budget),
+        )
+        .await?;
+        ensure_profile_request_certified(state.clone(), &model, Some(deadline)).await?;
+        execute_embedding(
+            &state.runtime,
+            &model,
+            TokenBatch {
+                items: vec![vec![1]],
+            },
+            Some(deadline),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ready_catalog_exchange_waits_beyond_five_seconds_and_keeps_its_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        resolve_ready_ane_request(fixture.state.clone(), 30000)
+            .await
+            .unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_inference(started.clone(), release.clone());
+        let first = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let long = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        let began = Instant::now();
+        let short = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+        let elapsed = began.elapsed();
+        tokio::time::sleep(Duration::from_millis(5200)).await;
+        let answered_early = long.is_finished();
+        release.notify_one();
+        let first = first.await.unwrap();
+        let long = long.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            !answered_early,
+            "a certified lane must wait for the exchange, not a loading heuristic"
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert!(long.is_ok(), "{long:?}");
+        let error = short.unwrap_err();
+        assert_eq!(error.code, "deadline_exceeded", "{error:?}");
+        assert!(!error.safe_to_retry_same_request);
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn delayed_ready_catalog_resolver_uses_the_request_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(5200));
+        let began = Instant::now();
+        let served = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
+        let elapsed = began.elapsed();
+        // The resolver's readiness task retains the lane lifecycle lock after caller expiry.
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "the readiness delay did not execute: {elapsed:?}"
+        );
+        assert!(
+            served.is_ok(),
+            "a delayed Ready resolver must serve within the request deadline: {served:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unresolved_catalog_resolver_answers_model_loading_at_the_request_deadline() {
+        for lifecycle in [ModelRuntimeState::Unloaded, ModelRuntimeState::Loading] {
+            let fixture = installed_ready_ane_fixture().await;
+            {
+                let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+                let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+                slot.state = lifecycle;
+                slot.loaded = None;
+            }
+            *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+                Some(Duration::from_millis(300));
+            let began = Instant::now();
+            let result = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+            let elapsed = began.elapsed();
+            let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+                .lock_owned()
+                .await;
+            drop(lock);
+            finish_ane_lane_fixture(fixture).await;
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code, "model_loading",
+                "genuine lifecycle work retains the loading response: {error:?}"
+            );
+            assert_eq!(error.retry_after_ms, Some(250));
+            assert!(error.safe_to_retry_same_request);
+            assert_eq!(
+                error.message,
+                format!("catalog lane '{ANE_TEST_LANE}' is loading")
+            );
+            assert!(
+                elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
     fn ane_gate() -> (Arc<Notify>, Arc<Notify>) {
         (Arc::new(Notify::new()), Arc::new(Notify::new()))
     }
@@ -29817,6 +29983,13 @@ async fn ensure_catalog_lane_ready_owned(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     use store::CatalogBlobCache;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
+    #[cfg(test)]
+    {
+        let delay = state.runtime.resolver_ready_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
     if model_slot_snapshot(&state.runtime, &lane).is_none() {
         sync_installed_catalog_slots(&state)?;
     }
