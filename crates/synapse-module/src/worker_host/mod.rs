@@ -6511,6 +6511,7 @@ pub mod ane_residency {
                     .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
                 let (indices, passes) = packed_subset(&plan.passes);
                 let selected = indices.iter().map(|&i| fixture[i].clone()).collect();
+                let fault_generation = worker.generation();
                 let vectors = match self
                     .exchange_sequences_mode(selected, false, None, None, Some(passes))
                     .await
@@ -6520,6 +6521,15 @@ pub mod ane_residency {
                         self.channel
                             .disable_packing("worker refused packed qualification");
                         return Ok(false);
+                    }
+                    Err(error @ AneResidencyError::Channel(_)) => {
+                        // Recovery waits for leases to drain. Release qualification's
+                        // own lease before joining the generation-scoped recovery.
+                        drop(lease);
+                        self.supervisor
+                            .recover_at_generation(&worker, fault_generation)
+                            .await;
+                        return Err(error);
                     }
                     Err(error) => return Err(error),
                 };
@@ -8247,6 +8257,7 @@ pub mod ane_residency {
             refuse_admission: bool,
             refuse_execution: bool,
             corrupt: bool,
+            disconnect_qualification: bool,
             admission_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             eviction_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             inference_gates: VecDeque<(Arc<Notify>, Arc<Notify>)>,
@@ -8342,6 +8353,13 @@ pub mod ane_residency {
                                     }
                                     let packed =
                                         matches!(request, WorkerRequest::EmbedPacked { .. });
+                                    if packed
+                                        && std::mem::take(
+                                            &mut peer.lock().unwrap().disconnect_qualification,
+                                        )
+                                    {
+                                        break;
+                                    }
                                     let admitted = if packed {
                                         resident.contains(&(program, 256))
                                     } else {
@@ -8486,6 +8504,26 @@ pub mod ane_residency {
             tokio::time::timeout(Duration::from_secs(3), notify.notified())
                 .await
                 .unwrap();
+        }
+
+        #[tokio::test]
+        async fn packed_qualification_disconnect_recovers_before_next_standalone() {
+            let peer = Arc::new(Mutex::new(PackedPeer {
+                disconnect_qualification: true,
+                ..Default::default()
+            }));
+            let serving = packed_peer(false, peer.clone()).await;
+            let qualification =
+                tokio::time::timeout(Duration::from_secs(3), serving.prepare_packed())
+                    .await
+                    .expect("qualification recovery must not wait on its own lease");
+            assert!(matches!(qualification, Err(AneResidencyError::Channel(_))));
+            let standalone = serving.infer(vec![vec![41; 1]], false).await;
+            assert!(standalone.is_ok(), "qualification transport failure must recover before the next standalone request: {standalone:?}");
+            assert_eq!(standalone.unwrap(), vec![vec![41.0]]);
+            assert_eq!(serving.channel.generation(), 1);
+            let state = serving.supervisor.inner.lock();
+            assert!(state.slots.iter().all(|(key, slot)| key.program == AneProgram::Single && slot.generation == 1), "failed qualification must release its lease before recovery retires the unqualified reservation");
         }
 
         #[tokio::test]
