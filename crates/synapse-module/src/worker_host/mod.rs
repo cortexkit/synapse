@@ -1463,6 +1463,16 @@ impl WorkerEngine {
         LoadedModel { model_id }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn attach_mock_worker_for_test<F>(&self, respond: F)
+    where
+        F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
+    {
+        self.runtime().block_on(async {
+            tests::attach_mock_worker(&mut self.lock_host().unwrap(), respond);
+        });
+    }
+
     pub(crate) fn embed_batch_with_job(
         &self,
         model: &LoadedModel,
@@ -2986,7 +2996,7 @@ mod tests {
     /// with `respond`. The returned task yields every request (and its raw
     /// frame) once the host drops the connection.
     #[cfg(unix)]
-    fn attach_mock_worker<F>(
+    pub(super) fn attach_mock_worker<F>(
         host: &mut WorkerHost,
         respond: F,
     ) -> tokio::task::JoinHandle<SeenRequests>
@@ -7123,9 +7133,34 @@ pub mod ane_residency {
             inference_frames: u64,
             /// Their request ids, in arrival order.
             inference_ids: Vec<String>,
+            capture_token_ids: bool,
+            captured_token_ids: Vec<Vec<u32>>,
         }
 
         type SharedLedger = Arc<Mutex<Ledger>>;
+
+        fn record_token_ids(
+            ledger: &SharedLedger,
+            lengths: impl Iterator<Item = usize>,
+            raw: &[u8],
+        ) {
+            let mut ledger = ledger.lock().unwrap();
+            if !ledger.capture_token_ids {
+                return;
+            }
+            let ids = synapse_core::decode_i32_frame(raw).unwrap();
+            let mut offset = 0;
+            for length in lengths {
+                ledger.captured_token_ids.push(
+                    ids[offset..offset + length]
+                        .iter()
+                        .map(|id| u32::try_from(*id).unwrap())
+                        .collect(),
+                );
+                offset += length;
+            }
+            assert_eq!(offset, ids.len());
+        }
 
         fn record_residency(ledger: &mut Ledger) {
             let mut per_model: HashMap<&str, usize> = HashMap::new();
@@ -7341,6 +7376,11 @@ pub mod ane_residency {
                             Some(total * 4),
                             "the id frame holds every item's tokens"
                         );
+                        record_token_ids(
+                            &ledger,
+                            items.iter().map(|item| item.n_tokens),
+                            raw.as_ref().unwrap(),
+                        );
                         if rungs
                             .iter()
                             .all(|rung| own.contains(&(model_ref.clone(), *rung)))
@@ -7378,6 +7418,11 @@ pub mod ane_residency {
                         assert_eq!(
                             raw.as_ref().map(Vec::len),
                             Some(sequences.iter().map(|s| s.n_tokens).sum::<usize>() * 4)
+                        );
+                        record_token_ids(
+                            &ledger,
+                            sequences.iter().map(|item| item.n_tokens),
+                            raw.as_ref().unwrap(),
                         );
                         if rungs
                             .iter()
@@ -8601,6 +8646,15 @@ pub mod ane_residency {
 
         #[cfg(unix)]
         impl ModuleMockControl {
+            #[cfg(target_os = "macos")]
+            pub(crate) fn enable_token_capture(&self) {
+                self.0.lock().unwrap().capture_token_ids = true;
+            }
+
+            #[cfg(target_os = "macos")]
+            pub(crate) fn take_token_ids(&self) -> Vec<Vec<u32>> {
+                std::mem::take(&mut self.0.lock().unwrap().captured_token_ids)
+            }
             pub(crate) fn hold_next_admission(&self, started: Arc<Notify>, release: Arc<Notify>) {
                 self.0.lock().unwrap().admit_gate = Some((started, release));
             }
