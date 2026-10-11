@@ -160,6 +160,7 @@ use synapse_engine_owned::{
 };
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
+use tracing::Instrument;
 
 impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
     fn admission_boundary_matches(
@@ -1333,6 +1334,7 @@ struct RuntimeState {
     lane_execution_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Each lane's in-flight numerical self-check, for callers to join.
     lane_checks: Mutex<BTreeMap<String, tokio::sync::watch::Receiver<LaneCheckOutcome>>>,
+    validated_readiness: Mutex<ValidatedReadinessCache>,
     #[cfg(test)]
     profile_check_passes_for_test: Mutex<bool>,
     #[cfg(test)]
@@ -1341,6 +1343,8 @@ struct RuntimeState {
     /// the lane's check.
     #[cfg(test)]
     fast_path_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    resolver_ready_delay: Mutex<Option<Duration>>,
     download_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     download_bytes: Mutex<BTreeMap<String, (u64, u64)>>,
     catalog_disk: Mutex<()>,
@@ -1389,6 +1393,19 @@ struct ModelSlotSnapshot {
     loaded: Option<Arc<EmbeddingModel>>,
     state: ModelRuntimeState,
     notify: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct ValidatedReadinessCache {
+    revision: u64,
+    models: BTreeMap<String, ValidatedReadiness>,
+}
+
+struct ValidatedReadiness {
+    model: std::sync::Weak<EmbeddingModel>,
+    check_id: String,
+    generation: u64,
+    install_validated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2569,8 +2586,11 @@ impl RuntimeState {
             serving_gates: Mutex::new(BTreeMap::new()),
             lane_execution_locks: Mutex::new(BTreeMap::new()),
             lane_checks: Mutex::new(BTreeMap::new()),
+            validated_readiness: Mutex::new(ValidatedReadinessCache::default()),
             #[cfg(test)]
             profile_check_passes_for_test: Mutex::new(false),
+            #[cfg(test)]
+            resolver_ready_delay: Mutex::new(None),
             #[cfg(test)]
             lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -2638,6 +2658,28 @@ impl RuntimeState {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn admit_inline_until(
+        &self,
+        model_id: &str,
+        job_id: Option<&str>,
+        queue_class: QueueClass,
+        request_bytes: u64,
+        deadline: tokio::time::Instant,
+        max_queue_ms: Option<u64>,
+    ) -> Result<InlineAdmission, WireOperationError> {
+        let mut admission = self.admit_inline(
+            model_id,
+            job_id,
+            queue_class,
+            request_bytes,
+            Some(remaining_request_ms(deadline)),
+            max_queue_ms,
+        )?;
+        // Millisecond admission accounting must never extend the request timer.
+        admission.deadline = admission.deadline.min(deadline);
+        Ok(admission)
     }
 
     fn admit_inline(
@@ -4090,7 +4132,11 @@ impl ModuleHandler for SynapseHandler {
             .lock()
             .ok()
             .and_then(|operators| operators.get(&ctx.route_handle()).cloned());
-        let outcome = dispatch_request(state, envelope, approved_by.as_deref()).await;
+        let request_span = tracing::debug_span!("synapse_request", request_id = ctx.corr(),
+            method = %envelope.method);
+        let outcome = dispatch_request(state, envelope, approved_by.as_deref())
+            .instrument(request_span)
+            .await;
         if profiled {
             ane_lane_timing("handle_total", "embed.batch", None, handle_started);
         }
@@ -8375,8 +8421,8 @@ fn copy_source_stream(
 }
 
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let resolution_started = Instant::now();
-    let mut params: EmbedQueryParams = match serde_json::from_value(params) {
+    let request_started = tokio::time::Instant::now();
+    let params: EmbedQueryParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -8414,39 +8460,27 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_serving_model(
+    let request_deadline = request_started
+        + Duration::from_millis(
+            params
+                .deadline_ms
+                .unwrap_or(state.runtime.inline.deadline_ms),
+        );
+    let model = match resolve_serving_model_until(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Embed,
         params.required_fingerprint.as_deref(),
         params.target_fingerprint.as_deref(),
-        params.deadline_ms,
+        request_deadline,
     )
     .await
     {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    // The request's absolute deadline, for profile certification: the budget
-    // (the inline default when none was given) less the time resolution took.
-    // Everything after this point, including tokenization and admission,
-    // counts against it.
-    let certify_deadline = Some(
-        tokio::time::Instant::now()
-            + Duration::from_millis(
-                params
-                    .deadline_ms
-                    .unwrap_or(state.runtime.inline.deadline_ms),
-            )
-            .saturating_sub(resolution_started.elapsed()),
-    );
-    if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
-        let budget = params
-            .deadline_ms
-            .unwrap_or(state.runtime.inline.deadline_ms);
-        params.deadline_ms =
-            Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
-    }
+    // Certification, admission and execution share the deadline used by resolution.
+    let certify_deadline = Some(request_deadline);
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -8472,12 +8506,12 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .activity_telemetry
         .next_inline_job_id(state.module_generation);
     let started = Instant::now();
-    let admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline_until(
         &model.model_id,
         Some(&job_id),
         QueueClass::Interactive,
         request_bytes,
-        params.deadline_ms,
+        request_deadline,
         params.max_queue_ms,
     ) {
         Ok(admission) => admission,
@@ -8771,7 +8805,8 @@ fn sha256_text(text: &str) -> String {
 
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let resolution_started = Instant::now();
-    let mut params: EmbedBatchParams = match serde_json::from_value(params) {
+    let request_started = tokio::time::Instant::now();
+    let params: EmbedBatchParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -8850,39 +8885,27 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_serving_model(
+    let request_deadline = request_started
+        + Duration::from_millis(
+            params
+                .deadline_ms
+                .unwrap_or(state.runtime.inline.deadline_ms),
+        );
+    let model = match resolve_serving_model_until(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Embed,
         params.required_fingerprint.as_deref(),
         params.target_fingerprint.as_deref(),
-        params.deadline_ms,
+        request_deadline,
     )
     .await
     {
         Ok(model) => model,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    // The request's absolute deadline, for profile certification: the budget
-    // (the inline default when none was given) less the time resolution took.
-    // Everything after this point, including tokenization and admission,
-    // counts against it.
-    let certify_deadline = Some(
-        tokio::time::Instant::now()
-            + Duration::from_millis(
-                params
-                    .deadline_ms
-                    .unwrap_or(state.runtime.inline.deadline_ms),
-            )
-            .saturating_sub(resolution_started.elapsed()),
-    );
-    if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
-        let budget = params
-            .deadline_ms
-            .unwrap_or(state.runtime.inline.deadline_ms);
-        params.deadline_ms =
-            Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
-    }
+    // Certification, admission and execution share the deadline used by resolution.
+    let certify_deadline = Some(request_deadline);
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -8987,12 +9010,12 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .activity_telemetry
         .next_inline_job_id(state.module_generation);
     let started = Instant::now();
-    let admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline_until(
         &model.model_id,
         Some(&job_id),
         QueueClass::Bulk,
         request_bytes,
-        params.deadline_ms,
+        request_deadline,
         params.max_queue_ms,
     ) {
         Ok(admission) => admission,
@@ -9454,8 +9477,8 @@ async fn execute_remote_embed_batch_job(
 }
 
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let resolution_started = Instant::now();
-    let mut params: RerankScoreParams = match serde_json::from_value(params) {
+    let request_started = tokio::time::Instant::now();
+    let params: RerankScoreParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
             return channel_error(
@@ -9518,13 +9541,19 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_serving_model(
+    let request_deadline = request_started
+        + Duration::from_millis(
+            params
+                .deadline_ms
+                .unwrap_or(state.runtime.inline.deadline_ms),
+        );
+    let model = match resolve_serving_model_until(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Rerank,
         params.required_fingerprint.as_deref(),
         params.target_fingerprint.as_deref(),
-        params.deadline_ms,
+        request_deadline,
     )
     .await
     {
@@ -9543,26 +9572,8 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         ));
     }
-    // The request's absolute deadline, for profile certification: the budget
-    // (the inline default when none was given) less the time resolution took.
-    // Everything after this point, including tokenization and admission,
-    // counts against it.
-    let certify_deadline = Some(
-        tokio::time::Instant::now()
-            + Duration::from_millis(
-                params
-                    .deadline_ms
-                    .unwrap_or(state.runtime.inline.deadline_ms),
-            )
-            .saturating_sub(resolution_started.elapsed()),
-    );
-    if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
-        let budget = params
-            .deadline_ms
-            .unwrap_or(state.runtime.inline.deadline_ms);
-        params.deadline_ms =
-            Some(budget.saturating_sub(resolution_started.elapsed().as_millis() as u64));
-    }
+    // Certification, admission and execution share the deadline used by resolution.
+    let certify_deadline = Some(request_deadline);
     if let Err(error) = ensure_pre_tokenization_certified(
         &state,
         &model,
@@ -9649,12 +9660,12 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         .activity_telemetry
         .next_inline_job_id(state.module_generation);
     let started = Instant::now();
-    let admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline_until(
         &model.model_id,
         Some(&job_id),
         queue_class,
         request_bytes,
-        params.deadline_ms,
+        request_deadline,
         params.max_queue_ms,
     ) {
         Ok(admission) => admission,
@@ -9742,6 +9753,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
 }
 
 async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let request_started = tokio::time::Instant::now();
     let params: MicroLlmOneshotParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
@@ -9821,13 +9833,19 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Ok(alias_table) => alias_table,
         Err(error) => return channel_error("store_failure", error.to_string()),
     };
-    let model = match resolve_serving_model(
+    let request_deadline = request_started
+        + Duration::from_millis(
+            params
+                .deadline_ms
+                .unwrap_or(state.runtime.inline.deadline_ms),
+        );
+    let model = match resolve_serving_model_until(
         Arc::clone(&state),
         params.model.as_deref(),
         ModelTask::Generate,
         params.required_fingerprint.as_deref(),
         params.target_fingerprint.as_deref(),
-        params.deadline_ms,
+        request_deadline,
     )
     .await
     {
@@ -9890,12 +9908,12 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         .activity_telemetry
         .next_inline_job_id(state.module_generation);
     let started = Instant::now();
-    let admission = match state.runtime.admit_inline(
+    let admission = match state.runtime.admit_inline_until(
         &model.model_id,
         Some(&job_id),
         QueueClass::Interactive,
         request_bytes,
-        params.deadline_ms,
+        request_deadline,
         params.max_queue_ms,
     ) {
         Ok(admission) => admission,
@@ -18337,6 +18355,519 @@ mod tests {
         )
         .await
         .map(drop)
+    }
+
+    #[cfg(unix)]
+    async fn installed_ready_ane_fixture() -> AneLaneFixture {
+        let (root, state) = tokio::task::spawn_blocking(|| {
+            installed_catalog_boundary_state("gte-modernbert-base", "ane")
+        })
+        .await
+        .unwrap();
+        let (mut engine, control) =
+            tokio::task::spawn_blocking(worker_host::ane_residency::module_mock_engine_controlled)
+                .await
+                .unwrap();
+        // Transport silence is a separate fault from a request waiting behind work.
+        Arc::get_mut(&mut Arc::get_mut(&mut engine).unwrap().serving)
+            .unwrap()
+            .metadata
+            .timeout = Duration::from_secs(10);
+        let mut slots = state.runtime.catalog.lock().unwrap();
+        let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+        let mut model = slot.loaded.take().unwrap();
+        Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+        slot.loaded = Some(model);
+        drop(slots);
+        AneLaneFixture {
+            root,
+            state,
+            engine,
+            control,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn resolve_ready_ane_request(
+        state: Arc<ModuleState>,
+        budget: u64,
+    ) -> Result<Vectors, WireOperationError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+        let model = resolve_serving_model(
+            state.clone(),
+            Some(ANE_TEST_LANE),
+            ModelTask::Embed,
+            None,
+            None,
+            Some(budget),
+        )
+        .await?;
+        ensure_profile_request_certified(state.clone(), &model, Some(deadline)).await?;
+        execute_embedding(
+            &state.runtime,
+            &model,
+            TokenBatch {
+                items: vec![vec![1]],
+            },
+            Some(deadline),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ready_catalog_exchange_waits_beyond_five_seconds_and_keeps_its_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        resolve_ready_ane_request(fixture.state.clone(), 30000)
+            .await
+            .unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_inference(started.clone(), release.clone());
+        let first = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let long = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        let began = Instant::now();
+        let short = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+        let elapsed = began.elapsed();
+        tokio::time::sleep(Duration::from_millis(5200)).await;
+        let answered_early = long.is_finished();
+        release.notify_one();
+        let first = first.await.unwrap();
+        let long = long.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            !answered_early,
+            "a certified lane must wait for the exchange, not a loading heuristic"
+        );
+        assert!(first.is_ok(), "{first:?}");
+        assert!(long.is_ok(), "{long:?}");
+        let error = short.unwrap_err();
+        assert_eq!(error.code, "deadline_exceeded", "{error:?}");
+        assert!(!error.safe_to_retry_same_request);
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn delayed_ready_catalog_resolver_uses_the_request_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(5200));
+        let began = Instant::now();
+        let served = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
+        let elapsed = began.elapsed();
+        // The resolver's readiness task retains the lane lifecycle lock after caller expiry.
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "the readiness delay did not execute: {elapsed:?}"
+        );
+        assert!(
+            served.is_ok(),
+            "a delayed Ready resolver must serve within the request deadline: {served:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ready_catalog_lifecycle_wait_uses_the_request_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        let guard = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        let long = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        let short = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+        tokio::time::sleep(Duration::from_millis(5200)).await;
+        let answered_early = long.is_finished();
+        drop(guard);
+        let long = long.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            !answered_early,
+            "a Ready lifecycle waiter must not expire at five seconds"
+        );
+        assert!(long.is_ok(), "{long:?}");
+        let error = short.unwrap_err();
+        assert_eq!(error.code, "deadline_exceeded", "{error:?}");
+        assert!(!error.safe_to_retry_same_request);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn catalog_batch_resolution_and_execution_share_one_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        resolve_ready_ane_request(fixture.state.clone(), 30000)
+            .await
+            .unwrap();
+        let (started, release) = ane_gate();
+        fixture
+            .control
+            .hold_next_inference(started.clone(), release.clone());
+        let first = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(600));
+        let began = Instant::now();
+        let result = response_result(
+            embed_batch(
+                fixture.state.clone(),
+                json!({
+                    "model": ANE_TEST_LANE, "texts": ["test"],
+                    "deadline_ms": 1200, "accept_declared": true,
+                }),
+            )
+            .await,
+            "embed.batch",
+        );
+        let elapsed = began.elapsed();
+        release.notify_one();
+        let first = first.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert_eq!(result["error"]["code"], "deadline_exceeded", "{result}");
+        assert_eq!(result["error"]["safe_to_retry_same_request"], false);
+        assert!(
+            elapsed >= Duration::from_millis(1200) && elapsed < Duration::from_millis(1650),
+            "resolution must consume execution time, not restart the budget: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validated_catalog_readiness_is_fenced_by_model_key_and_generation() {
+        let fixture = installed_ready_ane_fixture().await;
+        let state = &fixture.state;
+        let model = ane_lane_model(state);
+        assert!(validated_model_readiness(state, &model).unwrap());
+        let (id, key) = profile_check_identity(state, &model).unwrap();
+        let previous_generation =
+            state.runtime.validated_readiness.lock().unwrap().models[ANE_TEST_LANE].generation;
+        let generation = catalog_check_generation(state, &id, &key).unwrap();
+        assert!(generation > previous_generation);
+        assert!(
+            !validated_model_readiness(state, &model).unwrap(),
+            "a running generation is not passed"
+        );
+        assert!(!catalog_complete_check(state, &id, previous_generation, "passed", None).unwrap());
+        assert!(!validated_model_readiness(state, &model).unwrap());
+        assert!(catalog_complete_check(state, &id, generation, "passed", None).unwrap());
+        assert!(validated_model_readiness(state, &model).unwrap());
+        state
+            .runtime
+            .validated_readiness
+            .lock()
+            .unwrap()
+            .models
+            .get_mut(ANE_TEST_LANE)
+            .unwrap()
+            .check_id = "obsolete-key".into();
+        assert!(validated_model_readiness(state, &model).unwrap());
+        assert_eq!(
+            state.runtime.validated_readiness.lock().unwrap().models[ANE_TEST_LANE].check_id,
+            id,
+            "readiness must be validated for the current self-check key"
+        );
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Unloaded);
+        assert!(
+            !validated_model_readiness(state, &model).unwrap(),
+            "an unloaded slot cannot reuse readiness"
+        );
+        set_model_slot_state(&state.runtime, ANE_TEST_LANE, ModelRuntimeState::Ready);
+        let mut replacement = catalog_test_model(
+            &fixture.root,
+            &model_slot_snapshot(&state.runtime, ANE_TEST_LANE)
+                .unwrap()
+                .spec,
+        );
+        Arc::get_mut(&mut replacement).unwrap().backend =
+            EmbedBackend::DirectAne(fixture.engine.clone());
+        state
+            .runtime
+            .catalog
+            .lock()
+            .unwrap()
+            .get_mut(ANE_TEST_LANE)
+            .unwrap()
+            .loaded = Some(replacement.clone());
+        assert!(
+            !validated_model_readiness(state, &model).unwrap(),
+            "a replaced instance cannot reuse readiness"
+        );
+        assert!(validated_model_readiness(state, &replacement).unwrap());
+        drop(replacement);
+        drop(model);
+        finish_ane_lane_fixture(fixture).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ready_passed_catalog_lane_still_requires_its_initial_install_validation() {
+        let fixture = installed_ready_ane_fixture().await;
+        fixture
+            .state
+            .store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute("DELETE FROM catalog_install_members", [])?;
+                tx.execute("DELETE FROM catalog_installs", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let result = select_catalog_lane(
+            &fixture.state,
+            Some(ANE_TEST_LANE),
+            ModelTask::Embed,
+            None,
+            None,
+        );
+        finish_ane_lane_fixture(fixture).await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "model_not_installed",
+            "a preloaded Ready model must not bypass initial catalog installation validation"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn catalog_resolver_expiry_does_not_describe_a_failed_lane_as_loading() {
+        let fixture = installed_ready_ane_fixture().await;
+        let failure = artifact_invalid_error("catalog load failed");
+        set_model_slot_state(
+            &fixture.state.runtime,
+            ANE_TEST_LANE,
+            ModelRuntimeState::Failed(failure.clone()),
+        );
+        let expired = catalog_resolution_expired(
+            &fixture.state.runtime,
+            ANE_TEST_LANE,
+            tokio::time::Instant::now(),
+        );
+        finish_ane_lane_fixture(fixture).await;
+        assert_eq!(
+            expired, failure,
+            "a settled load failure must not become model_loading"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validated_ready_catalog_selection_reuses_readiness_without_the_store_lock() {
+        let fixture = installed_ready_ane_fixture().await;
+        resolve_ready_ane_request(fixture.state.clone(), 30000)
+            .await
+            .unwrap();
+        let held = Arc::new(Notify::new());
+        let (release, wait) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking({
+            let state = fixture.state.clone();
+            let held = held.clone();
+            move || {
+                state
+                    .store
+                    .store
+                    .with_conn(|_| {
+                        held.notify_one();
+                        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(())
+                    })
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), held.notified())
+            .await
+            .unwrap();
+        let mut selected = tokio::task::spawn_blocking({
+            let state = fixture.state.clone();
+            move || select_catalog_lane(&state, Some(ANE_TEST_LANE), ModelTask::Embed, None, None)
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut selected).await;
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        if result.is_err() {
+            let _ = selected.await;
+        }
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            matches!(result, Ok(Ok(Ok(_)))),
+            "validated Ready selection must not wait on store work: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unresolved_catalog_resolver_preserves_the_five_second_loading_cap() {
+        for lifecycle in [ModelRuntimeState::Unloaded, ModelRuntimeState::Loading] {
+            let fixture = installed_ready_ane_fixture().await;
+            {
+                let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+                let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+                slot.state = lifecycle;
+                slot.loaded = None;
+            }
+            *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+                Some(Duration::from_millis(6500));
+            let began = Instant::now();
+            let result = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
+            let elapsed = began.elapsed();
+            let load_continues = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+                .try_lock_owned()
+                .is_err();
+            let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+                .lock_owned()
+                .await;
+            drop(lock);
+            finish_ane_lane_fixture(fixture).await;
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code, "model_loading",
+                "genuine lifecycle work retains the loading response: {error:?}"
+            );
+            assert_eq!(error.retry_after_ms, Some(250));
+            assert!(error.safe_to_retry_same_request);
+            assert!(
+                load_continues,
+                "the loading task must retain lifecycle ownership after the capped response"
+            );
+            assert_eq!(
+                error.message,
+                format!("catalog lane '{ANE_TEST_LANE}' is loading")
+            );
+            assert!(
+                elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unresolved_catalog_resolver_uses_deadline_exceeded_when_the_request_budget_runs_out() {
+        let fixture = installed_ready_ane_fixture().await;
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.state = ModelRuntimeState::Unloaded;
+            slot.loaded = None;
+        }
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(300));
+        let began = Instant::now();
+        let result = resolve_ready_ane_request(fixture.state.clone(), 100).await;
+        let elapsed = began.elapsed();
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code, "deadline_exceeded",
+            "the loading cap must not extend the request deadline: {error:?}"
+        );
+        assert!(!error.safe_to_retry_same_request);
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_loading_catalog_resolver_that_observes_ready_uses_the_request_deadline() {
+        let fixture = installed_ready_ane_fixture().await;
+        let model = ane_lane_model(&fixture.state);
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.state = ModelRuntimeState::Loading;
+            slot.loaded = None;
+        }
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(5200));
+        let publish_ready = tokio::spawn({
+            let state = fixture.state.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let mut slots = state.runtime.catalog.lock().unwrap();
+                let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+                slot.loaded = Some(model);
+                slot.state = ModelRuntimeState::Ready;
+            }
+        });
+        let began = Instant::now();
+        let result = resolve_ready_ane_request(fixture.state.clone(), 30000).await;
+        let elapsed = began.elapsed();
+        publish_ready.await.unwrap();
+        finish_ane_lane_fixture(fixture).await;
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "the readiness delay must execute: {elapsed:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "a lane that became Ready must not be described as loading: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_ready_catalog_resolver_that_must_reload_uses_the_loading_cap() {
+        let fixture = installed_ready_ane_fixture().await;
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        *fixture.state.runtime.resolver_ready_delay.lock().unwrap() =
+            Some(Duration::from_millis(6500));
+        let request = tokio::spawn(resolve_ready_ane_request(fixture.state.clone(), 30000));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !request.is_finished(),
+            "resolution must retain its lifecycle wait"
+        );
+        {
+            let mut slots = fixture.state.runtime.catalog.lock().unwrap();
+            let slot = slots.get_mut(ANE_TEST_LANE).unwrap();
+            slot.loaded = None;
+            slot.state = ModelRuntimeState::Unloaded;
+        }
+        let began = Instant::now();
+        drop(lock);
+        let result = request.await.unwrap();
+        let elapsed = began.elapsed();
+        let load_continues = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .try_lock_owned()
+            .is_err();
+        let lock = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE)
+            .lock_owned()
+            .await;
+        drop(lock);
+        finish_ane_lane_fixture(fixture).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.code, "model_loading",
+            "an unload before lifecycle acquisition requires a capped reload: {error:?}"
+        );
+        assert_eq!(error.retry_after_ms, Some(250));
+        assert!(load_continues);
+        assert!(
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+            "{elapsed:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -28539,6 +29070,7 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
             .iter()
             .map(|i| i.manifest_digest.clone())
             .collect::<BTreeSet<_>>();
+        invalidate_validated_readiness(&state.runtime);
         let freed = state
             .store
             .store
@@ -28583,6 +29115,7 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
                 Ok(freed)
             })
             .map_err(catalog_store_error)?;
+        invalidate_validated_readiness(&state.runtime);
         let mut slots = state.runtime.catalog.lock().expect("runtime catalog");
         for b in &entry.backends {
             slots.remove(&catalog::lane_id(&entry.id, &b.backend));
@@ -28941,12 +29474,15 @@ fn catalog_check_generation(
     id: &str,
     key: &Value,
 ) -> Result<u64, WireOperationError> {
-    state.store.store.with_conn_fenced(|tx| {
+    invalidate_validated_readiness(&state.runtime);
+    let result = state.store.store.with_conn_fenced(|tx| {
         tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
         let generation: u64 = tx.query_row("SELECT value FROM self_check_run_seq WHERE id=0",[],|r| r.get(0))?;
         tx.execute("INSERT INTO catalog_self_checks (check_id,catalog_id,manifest_digest,backend,fingerprint,engine_identity_json,os_build,fixture_revision,state,generation,checked_at_ms,reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'running',?9,NULL,NULL) ON CONFLICT(check_id) DO UPDATE SET state='running',generation=excluded.generation,checked_at_ms=NULL,reason=NULL",rusqlite::params![id,key["catalog_id"].as_str(),key["manifest_digest"].as_str(),key["backend"].as_str(),key["fingerprint"].as_str(),key["engine_identity"].to_string(),key["os_build"].as_str(),key["fixture_revision"].as_str(),generation])?;
         Ok(generation)
-    }).map_err(catalog_store_error)
+    }).map_err(catalog_store_error);
+    invalidate_validated_readiness(&state.runtime);
+    result
 }
 fn catalog_complete_check(
     state: &ModuleState,
@@ -28955,14 +29491,17 @@ fn catalog_complete_check(
     status: &str,
     reason: Option<&str>,
 ) -> Result<bool, WireOperationError> {
-    state.store.store.with_conn_fenced(|tx| {
+    invalidate_validated_readiness(&state.runtime);
+    let result = state.store.store.with_conn_fenced(|tx| {
         if status == "pending" {
             tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
             Ok(tx.execute("UPDATE catalog_self_checks SET state='pending',generation=(SELECT value FROM self_check_run_seq WHERE id=0),checked_at_ms=NULL,reason=NULL WHERE check_id=?1 AND state='running' AND generation=?2",rusqlite::params![id,generation])? > 0)
         } else {
             Ok(tx.execute("UPDATE catalog_self_checks SET state=?3,checked_at_ms=?4,reason=?5 WHERE check_id=?1 AND state='running' AND generation=?2",rusqlite::params![id,generation,status,now_ms(),reason])? > 0)
         }
-    }).map_err(catalog_store_error)
+    }).map_err(catalog_store_error);
+    invalidate_validated_readiness(&state.runtime);
+    result
 }
 fn owned_numerical_catalog_check(
     model: &EmbeddingModel,
@@ -29142,6 +29681,37 @@ fn select_catalog_lane(
     {
         return Err(catalog_backend_unavailable(state, entry, Some(backend)));
     }
+    let lane = catalog::lane_id(&entry.id, &backend.backend);
+    let ready_model = model_slot_snapshot(&state.runtime, &lane)
+        .filter(|slot| matches!(slot.state, ModelRuntimeState::Ready))
+        .and_then(|slot| slot.loaded);
+    let ready_passed = ready_model
+        .as_ref()
+        .map(|model| validated_model_readiness(state, model))
+        .transpose()?
+        .unwrap_or(false);
+    if ready_passed {
+        // A numerical check can pass for a config preload even when the catalog's
+        // pinned files were never installed. Skip the install-row lookup only after
+        // this selector has verified it for this model instance. Removal cannot
+        // delete the installation while the model is resident.
+        if state
+            .runtime
+            .validated_readiness
+            .lock()
+            .expect("validated readiness")
+            .models
+            .get(&lane)
+            .is_some_and(|passed| {
+                passed.install_validated
+                    && passed.model.upgrade().is_some_and(|current| {
+                        Arc::ptr_eq(&current, ready_model.as_ref().expect("passed Ready model"))
+                    })
+            })
+        {
+            return Ok((entry.clone(), backend.clone()));
+        }
+    }
     if current_catalog_install(state, entry, &backend.backend)?.is_none() {
         let job = state
             .store
@@ -29152,6 +29722,20 @@ fn select_catalog_lane(
             json!({"catalog_id":entry.id,"lane_id":catalog::lane_id(&entry.id,&backend.backend),"download_op":"models.download","download_job_id":job.map(|j| j.job_id)}),
             "install this model with models.download",
         ));
+    }
+    if ready_passed {
+        let mut cache = state
+            .runtime
+            .validated_readiness
+            .lock()
+            .expect("validated readiness");
+        if let Some(passed) = cache.models.get_mut(&lane) {
+            if passed.model.upgrade().is_some_and(|current| {
+                Arc::ptr_eq(&current, ready_model.as_ref().expect("passed Ready model"))
+            }) {
+                passed.install_validated = true;
+            }
+        }
     }
     let check = catalog_self_check_projection(state, entry, backend)?;
     if check["state"] == "failed" {
@@ -29400,8 +29984,104 @@ fn profile_check_passed(
     else {
         return Ok(None);
     };
-    let (id, _) = profile_check_identity(state, &model)?;
-    Ok((profile_preload_check_status(state, &id)? == "passed").then_some(model))
+    Ok(validated_model_readiness(state, &model)?.then_some(model))
+}
+
+fn invalidate_validated_readiness(runtime: &RuntimeState) {
+    let mut cache = runtime
+        .validated_readiness
+        .lock()
+        .expect("validated readiness");
+    cache.revision = cache.revision.wrapping_add(1);
+    cache.models.clear();
+}
+
+/// Reuse a passed check only for its current key and the same Ready model instance.
+/// Check-generation writes invalidate the cache before and after their transaction,
+/// so a store read racing a new check cannot publish an obsolete passed generation.
+fn validated_model_readiness(
+    state: &ModuleState,
+    model: &Arc<EmbeddingModel>,
+) -> Result<bool, WireOperationError> {
+    use rusqlite::OptionalExtension;
+    let key_started = Instant::now();
+    tracing::debug!(model_id = %model.model_id, stage = "readiness_key_start", "catalog readiness");
+    let id = if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &model.model_id)
+    {
+        catalog_self_check_key(state, entry, backend)?.0
+    } else {
+        profile_check_identity(state, model)?.0
+    };
+    tracing::debug!(model_id = %model.model_id, stage = "readiness_key_finish",
+        wall_ms = key_started.elapsed().as_secs_f64() * 1000.0, "catalog readiness");
+    let same_ready_model = || {
+        model_slot_snapshot(&state.runtime, &model.model_id).is_some_and(|slot| {
+            matches!(slot.state, ModelRuntimeState::Ready)
+                && slot
+                    .loaded
+                    .is_some_and(|current| Arc::ptr_eq(&current, model))
+        })
+    };
+    if !same_ready_model() {
+        return Ok(false);
+    }
+    let revision = {
+        let cache = state
+            .runtime
+            .validated_readiness
+            .lock()
+            .expect("validated readiness");
+        if let Some(passed) = cache.models.get(&model.model_id) {
+            if passed.check_id == id
+                && passed
+                    .model
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, model))
+            {
+                tracing::debug!(model_id = %model.model_id, check_id = %id,
+                    generation = passed.generation, stage = "validated_readiness_reuse",
+                    "catalog readiness");
+                return Ok(true);
+            }
+        }
+        cache.revision
+    };
+    let started = Instant::now();
+    tracing::debug!(model_id = %model.model_id, stage = "readiness_store_start", "catalog readiness");
+    let passed_generation =
+        state
+            .store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+            "SELECT generation FROM catalog_self_checks WHERE check_id=?1 AND state='passed'",
+            [&id], |row| row.get::<_, u64>(0),
+        ).optional()
+            })
+            .map_err(catalog_store_error)?;
+    tracing::debug!(model_id = %model.model_id, check_id = %id, stage = "readiness_store",
+        wall_ms = started.elapsed().as_secs_f64() * 1000.0, "catalog readiness");
+    let Some(generation) = passed_generation else {
+        return Ok(false);
+    };
+    let mut cache = state
+        .runtime
+        .validated_readiness
+        .lock()
+        .expect("validated readiness");
+    if cache.revision != revision || !same_ready_model() {
+        return Ok(false);
+    }
+    cache.models.insert(
+        model.model_id.clone(),
+        ValidatedReadiness {
+            model: Arc::downgrade(model),
+            check_id: id,
+            generation,
+            install_validated: false,
+        },
+    );
+    Ok(true)
 }
 
 type LaneCheckOutcome = Option<Result<Arc<EmbeddingModel>, WireOperationError>>;
@@ -29574,6 +30254,7 @@ async fn check_profile_model(
     Ok(model)
 }
 
+#[cfg(test)]
 async fn resolve_serving_model(
     state: Arc<ModuleState>,
     requested: Option<&str>,
@@ -29581,6 +30262,19 @@ async fn resolve_serving_model(
     required: Option<&str>,
     target: Option<&str>,
     deadline_ms: Option<u64>,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(deadline_ms.unwrap_or(state.runtime.inline.deadline_ms));
+    resolve_serving_model_until(state, requested, task, required, target, deadline).await
+}
+
+async fn resolve_serving_model_until(
+    state: Arc<ModuleState>,
+    requested: Option<&str>,
+    task: ModelTask,
+    required: Option<&str>,
+    target: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     if let Some(model_id) = requested {
         if model_slot_snapshot(&state.runtime, model_id).is_some_and(|slot| {
@@ -29591,7 +30285,12 @@ async fn resolve_serving_model(
                     .build_flags
                     .contains_key("profile")
         }) {
-            return ensure_model_loaded_for_control(state, model_id, deadline_ms).await;
+            return ensure_model_loaded_for_control(
+                state,
+                model_id,
+                Some(remaining_request_ms(deadline)),
+            )
+            .await;
         }
     }
     if task == ModelTask::Generate
@@ -29601,67 +30300,188 @@ async fn resolve_serving_model(
     }
     let (entry, backend) = select_catalog_lane(&state, requested, task, required, target)?;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
-    let budget = deadline_ms.unwrap_or(state.runtime.inline.deadline_ms);
-    if budget == 0 {
-        return Err(catalog_loading_response(&lane, budget));
+    if tokio::time::Instant::now() >= deadline {
+        return Err(catalog_resolution_expired(&state.runtime, &lane, deadline));
     }
+    let mut loading_capped = !catalog_lane_is_ready(&state.runtime, &lane)
+        && !catalog_lane_check_running(&state.runtime, &lane);
+    // Only unresolved loading work has the wire contract's five-second cap.
+    // Both lifecycle queueing and the detached load consume this one cap, which
+    // never extends the request deadline. Ready lanes and running numerical checks
+    // use the request deadline instead.
+    let mut resolution_deadline = if loading_capped {
+        deadline.min(tokio::time::Instant::now() + Duration::from_secs(5))
+    } else {
+        deadline
+    };
+    tracing::debug!(model_id = %lane, stage = "resolver_budget", loading_capped,
+        remaining_ms = remaining_request_ms(resolution_deadline), "catalog resolver");
     let started = std::time::Instant::now();
-    let (guard, waited) = catalog_resolution_guard(&state.runtime, &lane, budget).await?;
+    let mut locked =
+        catalog_resolution_guard_until(&state.runtime, &lane, resolution_deadline, deadline).await;
+    if locked.is_err()
+        && loading_capped
+        && catalog_lane_is_ready(&state.runtime, &lane)
+        && tokio::time::Instant::now() < deadline
+    {
+        locked = catalog_resolution_guard_until(&state.runtime, &lane, deadline, deadline).await;
+    }
+    let (guard, waited) = locked?;
     ane_lane_timing("resolver_lane_wait", &lane, None, started);
+    tracing::debug!(model_id = %lane, stage = "lifecycle_acquired", waited,
+        wall_ms = started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
     if let Some(error) = catalog_failed_load(&state.runtime, &lane, !waited) {
         return Err(error);
     }
-    let remaining = budget
-        .min(5000)
-        .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    // The lifecycle lock may have been held by an unload after selection saw
+    // Ready. Re-evaluate the load budget under that lock before starting work.
+    let needs_load = !catalog_lane_is_ready(&state.runtime, &lane)
+        && !catalog_lane_check_running(&state.runtime, &lane);
+    if needs_load && !loading_capped {
+        loading_capped = true;
+        resolution_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+    } else if !needs_load {
+        loading_capped = false;
+        resolution_deadline = deadline;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(catalog_resolution_expired(&state.runtime, &lane, deadline));
+    }
     let task_state = state.clone();
     // Only the lock owner starts detached work. A timed-out waiter must not
     // stay queued and start a new load after the attempt it was waiting for fails.
-    let handle = tokio::spawn(async move {
-        ensure_catalog_lane_ready_owned(task_state, entry, backend, guard).await
-    });
-    match tokio::time::timeout(Duration::from_millis(remaining), handle).await {
-        Ok(Ok(result)) => result,
+    let owner = tracing::debug_span!("catalog_readiness_owner", model_id = %lane);
+    tracing::debug!(model_id = %lane, stage = "readiness_spawn", "catalog resolver");
+    let mut handle = tokio::spawn(
+        async move {
+            tracing::debug!(stage = "readiness_start", "catalog resolver");
+            let result = ensure_catalog_lane_ready_owned(task_state, entry, backend, guard).await;
+            tracing::debug!(
+                stage = "readiness_finish",
+                wall_ms = started.elapsed().as_secs_f64() * 1000.0,
+                code = result.as_ref().err().map(|error| error.code.as_str()),
+                "catalog resolver"
+            );
+            result
+        }
+        .instrument(owner),
+    );
+    let mut readiness = tokio::time::timeout_at(resolution_deadline, &mut handle).await;
+    // A cold attempt can publish Ready before its bookkeeping task settles.
+    // Once loading has ended, delayed bookkeeping must not masquerade as a load.
+    if readiness.is_err()
+        && loading_capped
+        && catalog_lane_is_ready(&state.runtime, &lane)
+        && tokio::time::Instant::now() < deadline
+    {
+        readiness = tokio::time::timeout_at(deadline, &mut handle).await;
+    }
+    match readiness {
+        Ok(Ok(result)) => {
+            if tokio::time::Instant::now() >= deadline {
+                Err(catalog_resolution_expired(&state.runtime, &lane, deadline))
+            } else {
+                result
+            }
+        }
         Ok(Err(e)) => Err(WireOperationError::from_stable(
             StableError::engine_crashed(Some(250)),
             format!("catalog load task failed: {e}"),
         )),
-        Err(_) => Err(catalog_loading_response(&lane, budget)),
+        Err(_) => Err(catalog_resolution_expired(&state.runtime, &lane, deadline)),
     }
 }
 
-/// The resolver's wait for a catalog lane's lifecycle lock: at most
-/// min(budget, 5 s), answered `model_loading` (or `deadline_exceeded` for short
-/// budgets) when it expires. Returns whether the caller had to wait.
+#[cfg(all(test, unix))]
 async fn catalog_resolution_guard(
     runtime: &RuntimeState,
     lane: &str,
     budget: u64,
 ) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), WireOperationError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+    catalog_resolution_guard_until(runtime, lane, deadline, deadline).await
+}
+
+/// A timed-out waiter leaves the lifecycle queue and cannot start another load.
+/// The loading cap and the request deadline share this same queueing budget.
+async fn catalog_resolution_guard_until(
+    runtime: &RuntimeState,
+    lane: &str,
+    resolution_deadline: tokio::time::Instant,
+    request_deadline: tokio::time::Instant,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), WireOperationError> {
     let lock = catalog_lane_lock(runtime, lane);
+    tracing::debug!(model_id = %lane, stage = "lifecycle_wait", "catalog resolver");
     match lock.clone().try_lock_owned() {
         Ok(guard) => Ok((guard, false)),
         Err(_) => Ok((
-            tokio::time::timeout(Duration::from_millis(budget.min(5000)), lock.lock_owned())
+            tokio::time::timeout_at(resolution_deadline, lock.lock_owned())
                 .await
-                .map_err(|_| catalog_loading_response(lane, budget))?,
+                .map_err(|_| catalog_resolution_expired(runtime, lane, request_deadline))?,
             true,
         )),
     }
 }
 
-fn catalog_loading_response(lane: &str, budget: u64) -> WireOperationError {
-    if budget <= 5000 {
+fn remaining_request_ms(deadline: tokio::time::Instant) -> u64 {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn catalog_lane_is_ready(runtime: &RuntimeState, lane: &str) -> bool {
+    model_slot_snapshot(runtime, lane)
+        .is_some_and(|slot| matches!(slot.state, ModelRuntimeState::Ready) && slot.loaded.is_some())
+}
+
+fn catalog_lane_check_running(runtime: &RuntimeState, lane: &str) -> bool {
+    runtime
+        .lane_checks
+        .lock()
+        .expect("lane checks")
+        .get(lane)
+        .is_some_and(|outcome| outcome.borrow().is_none())
+}
+
+fn catalog_resolution_expired(
+    runtime: &RuntimeState,
+    lane: &str,
+    deadline: tokio::time::Instant,
+) -> WireOperationError {
+    let slot = model_slot_snapshot(runtime, lane);
+    if let Some(ModelSlotSnapshot {
+        state: ModelRuntimeState::Failed(error),
+        ..
+    }) = &slot
+    {
+        tracing::debug!(model_id = %lane, stage = "resolver_expired", branch = "failed",
+            code = %error.code, "catalog resolver");
+        return error.clone();
+    }
+    let ready = slot.is_some_and(|slot| {
+        matches!(slot.state, ModelRuntimeState::Ready) && slot.loaded.is_some()
+    });
+    let checking = catalog_lane_check_running(runtime, lane);
+    let error = if !checking && (ready || tokio::time::Instant::now() >= deadline) {
         WireOperationError::from_stable(
             StableError::deadline_exceeded(),
             "catalog admission deadline expired",
+        )
+    } else if checking {
+        WireOperationError::from_stable(
+            StableError::model_loading(Some(250)),
+            format!("model '{lane}' is running its numerical self-check"),
         )
     } else {
         WireOperationError::from_stable(
             StableError::model_loading(Some(250)),
             format!("catalog lane '{lane}' is loading"),
         )
-    }
+    };
+    tracing::debug!(model_id = %lane, stage = "resolver_expired", ready, checking,
+        code = %error.code, "catalog resolver");
+    error
 }
 
 fn catalog_failed_load(
@@ -29817,11 +30637,34 @@ async fn ensure_catalog_lane_ready_owned(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     use store::CatalogBlobCache;
     let lane = catalog::lane_id(&entry.id, &backend.backend);
+    #[cfg(test)]
+    {
+        let delay = state.runtime.resolver_ready_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    let key_started = Instant::now();
+    if let Some(model) = model_slot_snapshot(&state.runtime, &lane)
+        .filter(|slot| matches!(slot.state, ModelRuntimeState::Ready))
+        .and_then(|slot| slot.loaded)
+    {
+        if validated_model_readiness(&state, &model)? {
+            tracing::debug!(model_id = %lane, branch = "ready_passed", stage = "readiness_return",
+                wall_ms = key_started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
+            return Ok(model);
+        }
+    }
+    tracing::debug!(model_id = %lane, branch = "consult_readiness", stage = "readiness_key",
+        wall_ms = key_started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
     if model_slot_snapshot(&state.runtime, &lane).is_none() {
         sync_installed_catalog_slots(&state)?;
     }
     let (check_id, key) = catalog_self_check_key(&state, &entry, &backend)?;
+    let projection_started = Instant::now();
     let projection = catalog_self_check_projection(&state, &entry, &backend)?;
+    tracing::debug!(model_id = %lane, stage = "readiness_projection",
+        wall_ms = projection_started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
     if projection["state"] == "failed" {
         return Err(catalog_self_check_failed(
             &entry,
@@ -29835,6 +30678,7 @@ async fn ensure_catalog_lane_ready_owned(
     {
         model
     } else {
+        tracing::debug!(model_id = %lane, branch = "cold_load", stage = "validation_start", "catalog resolver");
         set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Validating);
         let verify_state = state.clone();
         let verify_entry = entry.clone();
@@ -29918,7 +30762,10 @@ async fn ensure_catalog_lane_ready_owned(
         let load_lane = lane.clone();
         // The lane guard belongs to this task, not the waiting request. A request
         // timeout cannot allow another load while a blocking engine load runs.
+        let load_started = Instant::now();
         let loaded = load_catalog_model_task(load_state, load_lane).await?;
+        tracing::debug!(model_id = %lane, stage = "load_finish",
+            wall_ms = load_started.elapsed().as_secs_f64() * 1000.0, "catalog resolver");
         loaded
     };
     if backend.profile.is_some() {
