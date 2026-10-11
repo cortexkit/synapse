@@ -1,0 +1,21 @@
+[[control]]
+id = "catalog-quarantine-corrupt-blob"
+guards = "Quarantine unlinks corrupt bytes as well as removing their authority and pins"
+file = "crates/synapse-module/src/store.rs"
+old = """
+let freed = cache
+                .delete_blob(&digest)
+                .map_err(|error| cache_error("delete blob", &digest, error))?;"""
+new = "let freed = 0; // NON-VACUITY BREAK: corrupt bytes retained"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+hub = "Corrupt installed blobs must be unlinked and lose install authority, asserted by store quarantine and wire-level repair contracts."
+hub_targets = ["synapse-module::skeleton_e2e"]
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::quarantine_removes_the_blob_its_installs_members_and_pins_and_fails_holding_jobs"]
+expect_message = "freed_bytes: 4"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

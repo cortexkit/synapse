@@ -1,0 +1,17 @@
+[[control]]
+id = "profile-probe-fail-closed"
+guards = "A failed machine identity probe cannot become a placeholder profile carrying certification authority"
+file = "crates/synapse-core/src/machine_profile.rs"
+old = "let base = collector.collect_base_profile()?;"
+new = 'let base = collector.collect_base_profile().unwrap_or(MachineProfileBase { os_build: "unknown".into(), arch: "unknown".into(), chip_model: "unknown".into(), ram_class: "unknown".into(), ane_subtype: None }); // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-core/src/machine_profile.rs"
+runner = "cargo"
+select = "expected"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["machine_profile::tests::a_probe_refusal_propagates_instead_of_yielding_a_profile"]
+expect_message = "a refused probe must not produce a profile"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

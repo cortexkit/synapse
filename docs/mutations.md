@@ -1,12 +1,18 @@
 # Mutation controls
 
-`mutations.toml` records deliberate breaks of guards whose absence could silently
-lose data, leak authority, or change a consumer's wire/vector-space contract.
+`mutations.d/` holds one control per TOML fragment plus `00-prebuild.toml` for
+shared build prerequisites. It records deliberate breaks of guards whose absence
+could silently lose data, leak authority, or change a consumer's wire/vector-space
+contract.
 Each automated row names the exact test that must fail, and `expect_message`
 ties that failure to the intended property rather than an unrelated panic.
 Use a specific assertion message that is not also part of the test name: failure
 output includes the name, so matching the name can credit an unrelated error.
 Compilation errors and timeouts are not catches.
+
+ckdev-mutate 0.10.0 discovers `mutations.d/` beside its default catalogue path.
+Do not keep both the legacy single-file catalogue and `mutations.d/` in the
+same checkout.
 
 ## Install and replay
 
@@ -14,15 +20,15 @@ Install `cortexkit-mutate` at the commit this catalogue was proved with (the sam
 one CI installs), not the latest release:
 
 ```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev ac214583ad3613765dc1a2d81c744867382c4c2c cortexkit-mutate
-ckdev-mutate --version # 0.9.6
+cargo install --locked --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+ckdev-mutate --version # 0.10.0
 cargo nextest --version
 mkdir -p target/mutations
 ckdev-mutate check
 ckdev-mutate run --all --report target/mutations/all.json
 ckdev-mutate run --diff origin/master --report target/mutations/diff.json
 ckdev-mutate run --only nonce-sync-child --report target/mutations/one.json
-python3 scripts/prepare-mutation-audit.py mutations.toml target/mutations/broad.toml
+python3 scripts/prepare-mutation-audit.py mutations.d target/mutations/broad.toml
 ckdev-mutate --catalogue target/mutations/broad.toml run --all --broad --report target/mutations/broad.json
 ```
 
@@ -82,12 +88,13 @@ not only synthetic snippets handed to their matcher. If a mutant hangs, bound th
 wait in the test so it fails **by name**, assert order/outcome, and retain the row.
 
 Use `features`, `no_default_features`, and `ignored = "include"|"only"` for the
-selection the test actually needs. Declare fixture binary builds in a root
-`prebuild` list with `--locked`; the runner refreshes them after every mutant build
+selection the test actually needs. Declare fixture binary builds in
+`mutations.d/00-prebuild.toml` as root `prebuild` entries with `--locked`; the
+runner refreshes them after every mutant build
 so a stale executable cannot falsely defend a guard. An `equivalent` disposition
 requires an `equivalent_guard` explaining why behavior really cannot differ; a
 green test suite alone is not evidence of equivalence. See the [pinned runner
-README](https://github.com/cortexkit/commons/blob/ac214583ad3613765dc1a2d81c744867382c4c2c/crates/cortexkit-mutate/README.md)
+README](https://github.com/cortexkit/commons/blob/a2db1cfd9149424257bbed675c55434d0915138e/crates/cortexkit-mutate/README.md)
 for multi-edit anchors, command rows, platform selection, and HUB review.
 
 ## Mac replay and desktop-only rows

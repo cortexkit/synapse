@@ -1,0 +1,17 @@
+[[control]]
+id = "catalog-refusal-order"
+guards = "Unavailable backend is reported before missing installation, so clients do not download unusable models"
+file = "crates/synapse-module/src/lib.rs"
+old = "return Err(catalog_backend_unavailable(state, entry, Some(backend)));"
+new = "// NON-VACUITY BREAK: the unavailable backend is not reported first"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["catalog_runtime_tests::catalog_unavailable_backend_precedes_missing_install"]
+expect_message = "backend refusal must precede missing installation"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

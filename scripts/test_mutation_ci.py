@@ -61,6 +61,39 @@ expect_red = ["tests::guard"]
         self.assertEqual(parsed["control"][0]["expect_red"], ["tests::guard"])
         self.assertEqual(parsed["prebuild"], [{"name": "fixture", "command": ["cargo", "build", "--locked"]}])
 
+    def test_directory_fragments_are_loaded_in_filename_order(self):
+        import runpy
+        import tempfile
+        import tomllib
+        from pathlib import Path
+
+        helpers = runpy.run_path("scripts/prepare-mutation-audit.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "last.toml").write_text(
+                '[[control]]\nid = "last"\nselect = "expected"\n',
+                encoding="utf-8",
+            )
+            (source / "00-prebuild.toml").write_text(
+                'prebuild = [{ name = "fixture", command = ["cargo", "build", "--locked"] }]\n',
+                encoding="utf-8",
+            )
+            (source / "first.toml").write_text(
+                '[[control]]\nid = "first"\nselect = "expected"\n',
+                encoding="utf-8",
+            )
+            (source / ".hidden.toml").write_text(
+                '[[control]]\nid = "hidden"\n', encoding="utf-8"
+            )
+            catalogue = helpers["load_source"](source)
+            parsed = tomllib.loads(helpers["prepare"](catalogue))
+
+        self.assertEqual([row["id"] for row in parsed["control"]], ["first", "last"])
+        self.assertEqual(
+            parsed["prebuild"],
+            [{"name": "fixture", "command": ["cargo", "build", "--locked"]}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

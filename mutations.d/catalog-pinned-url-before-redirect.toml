@@ -1,0 +1,17 @@
+[[control]]
+id = "catalog-pinned-url-before-redirect"
+guards = "Hugging Face resolve URLs must pin a revision before redirects can hide a moving branch"
+file = "crates/synapse-module/src/lib.rs"
+old = '.any(|pair| pair[0] == "resolve" && pinned_revision(pair[1]))'
+new = '.any(|pair| pair[0] == "resolve") /* NON-VACUITY BREAK */'
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["catalog_runtime_tests::catalog_endpoint_and_asset_guards_reject_unpinned_network_io"]
+expect_message = "validate_resolved_asset"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

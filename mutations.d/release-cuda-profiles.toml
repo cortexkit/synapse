@@ -1,0 +1,16 @@
+[[control]]
+id = "release-cuda-profiles"
+guards = "Every remaining CUDA catalog model must declare a numerical profile and boundary"
+file = "crates/synapse-release-checks/check.py"
+old = "require({p['model'] for p in profiles} == models, 'missing CUDA profiles')"
+new = "require(True, 'missing CUDA profiles')  # NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-release-checks/test_checks.py"
+runner = "command"
+command = ["python3", "-c", 'import subprocess,sys,unittest; print("MUTATION DIFF STAT:", flush=True); print(subprocess.check_output(["git","diff","--stat"]).decode(), flush=True); sys.path.insert(0,"crates/synapse-release-checks"); unittest.main(module=None, argv=["unittest",sys.argv[1]], verbosity=2)', "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["test_checks.ReleaseChecks.test_removing_cuda_removes_cells_profiles_and_refuses_leftover"]
+expect_message = "ValueError not raised"
+only = false
+timeout_s = 120
+build_timeout_s = 1800

@@ -1,0 +1,19 @@
+[[control]]
+id = "catalog-serving-probability-after-self-check"
+guards = "A passing catalog self-check cannot mask serving responses that omit the shared probability readout"
+file = "crates/synapse-module/src/lib.rs"
+old = "result.map(|scores| RerankReadout::select(catalog_lane, &model.engine_identity).apply(scores))"
+new = "result // NON-VACUITY BREAK: omit serving probability readout"
+edits = []
+test_file = "crates/synapse-module/src/rerank_readout_tests.rs"
+runner = "cargo"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["rerank_readout_tests::catalog_serving_keeps_probability_readout_after_self_check_passes"]
+expect_message = "catalog serving must return fixture probabilities after self-check passes"
+only = false
+# The production executor replay uses an in-memory Unix worker transport.
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

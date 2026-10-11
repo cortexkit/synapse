@@ -1,0 +1,17 @@
+[[control]]
+id = "admission-submitted-text-hash"
+guards = "Truncation must not change the digest echo of the caller-submitted text"
+file = "crates/synapse-core/src/tokenizer.rs"
+old = "let submitted_sha256 = sha256_text(text);"
+new = "let submitted_sha256 = sha256_text(&embedded_text); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-core/src/tokenizer.rs"
+runner = "cargo"
+select = "expected"
+package = "synapse-core"
+target = "--lib"
+expect_red = ["tokenizer::tests::tokenizer_strips_padding_and_reports_our_truncation"]
+expect_message = "truncated items must hash the original submitted text before truncation"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

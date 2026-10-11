@@ -1,0 +1,17 @@
+[[control]]
+id = "nonce-command-source-scan"
+guards = "Every shipped child command must use the credential-stripping helper"
+file = "crates/synapse-module/src/catalog_probe.rs"
+old = "synapse_core::without_launch_nonce(Command::new(worker));"
+new = "Command::new(worker); // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/tests/it/launch_nonce_readers.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--test it"
+expect_red = ["launch_nonce_readers::every_shipped_command_strips_the_launch_nonce"]
+expect_message = "child commands must use without_launch_nonce"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

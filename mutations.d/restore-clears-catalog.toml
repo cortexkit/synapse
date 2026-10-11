@@ -1,0 +1,17 @@
+[[control]]
+id = "restore-clears-catalog"
+guards = "Restore import clears live catalog authority and forces installation verification to be rebuilt"
+file = "crates/synapse-module/src/store.rs"
+old = 'transaction.execute(&format!("DELETE FROM \"{table}\""), [])?;'
+new = 'if !table.starts_with("catalog_") { transaction.execute(&format!("DELETE FROM \"{table}\""), [])?; } // NON-VACUITY BREAK'
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::restore_import_drops_resurrected_certification_and_all_untrusted_state"]
+expect_message = "catalog_"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

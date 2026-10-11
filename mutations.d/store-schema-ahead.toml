@@ -1,0 +1,17 @@
+[[control]]
+id = "store-schema-ahead"
+guards = "An older binary refuses a database written by a longer destructive schema chain"
+file = "crates/synapse-module/src/store.rs"
+old = "if outcome.store_ahead() {"
+new = "if false && outcome.store_ahead() { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/src/store.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["store::tests::open_refuses_a_store_written_by_a_longer_schema_chain"]
+expect_message = "a store ahead of the binary's chain must not open"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

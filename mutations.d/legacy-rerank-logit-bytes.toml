@@ -1,0 +1,17 @@
+[[control]]
+id = "legacy-rerank-logit-bytes"
+guards = "Catalog probability readout must not apply sigmoid to the legacy raw-logit lane or change its output bytes"
+file = "crates/synapse-module/src/lib.rs"
+old = "if self == Self::CatalogLogits {"
+new = "if self == Self::CatalogLogits || self == Self::Legacy { // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/src/rerank_readout_tests.rs"
+runner = "cargo"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["rerank_readout_tests::legacy_rerank_readout_keeps_master_bytes_and_fingerprint"]
+expect_message = "legacy rerank output bytes changed"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

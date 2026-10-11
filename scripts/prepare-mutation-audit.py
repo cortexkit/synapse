@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render mutations.toml for the nightly breadth audit.
+"""Render mutations.d/ for the nightly breadth audit.
 
 Most rows set `select = "expected"` so routine replays run only their listed
 tests. The nightly audit must run every test target to find unexpected
@@ -43,9 +43,23 @@ def prepare(source: str) -> str:
     return rendered
 
 
+def load_source(source: Path) -> str:
+    if not source.is_dir():
+        return source.read_text(encoding="utf-8")
+    fragments = sorted(
+        (
+            path
+            for path in source.iterdir()
+            if path.is_file() and path.suffix == ".toml" and not path.name.startswith(".")
+        ),
+        key=lambda path: path.name.encode("utf-8"),
+    )
+    return "".join(path.read_text(encoding="utf-8") for path in fragments)
+
+
 def main() -> None:
     source, output = map(Path, sys.argv[1:])
-    text = source.read_text(encoding="utf-8")
+    text = load_source(source)
     rendered = prepare(text)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(rendered, encoding="utf-8")

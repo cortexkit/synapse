@@ -1,0 +1,17 @@
+[[control]]
+id = "flow-refuses-mutations"
+guards = "Flow-stamped routes only receive declared queries, never owner mutations"
+file = "crates/synapse-module/src/lib.rs"
+old = "op.name == method && op.kind == ManagementOperationKind::Query"
+new = "op.name == method /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::flow_routes_get_queries_only_and_other_routes_are_unchanged"]
+expect_message = "must be refused on a flow route"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

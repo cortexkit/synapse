@@ -82,8 +82,8 @@ No. It is a manual, ignored test.
   (`.github/workflows/tests.yml:43`). Metal lanes are not run on hosted runners
   (`.github/workflows/tests.yml:55-56`). The only `--ignored` run in a workflow
   is `synapse-core`'s `candidate_workers` (`.github/workflows/release-candidate.yml:235`).
-- `mutations.toml`: it has no control that references the hardware crate, this
-  test, or the baseline.
+- The mutation catalogue fragments in `mutations.d/` contain no control row that
+  references the hardware crate, this test, or the baseline.
 - Release checks: `crates/synapse-release-checks/check.py:194-197` checks only
   that the release notes carry the preload fingerprints. It does not run
   inference.

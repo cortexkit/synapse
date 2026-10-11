@@ -1,0 +1,18 @@
+[[control]]
+id = "catalog-ceiling-production-path"
+guards = "An 8193-token embed is refused before durable-job diversion or worker I/O; 8192 still reaches the worker"
+file = "crates/synapse-module/src/lib.rs"
+old = ".find(|(_, ids)| ids.len() > 8192)"
+new = ".find(|(_, ids)| ids.len() > 8193) /* NON-VACUITY BREAK */"
+edits = []
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::catalog_embed_ceiling_precedes_job_diversion_and_worker_call"]
+expect_message = "sequence_too_long"
+only = false
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
