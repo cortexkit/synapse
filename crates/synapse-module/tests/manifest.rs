@@ -30,6 +30,14 @@ fn manifest_cli_reports_provenance_from_the_compiled_tree() {
         option_env!("SYNAPSE_BUILD_TREE"),
     ) {
         (Some(revision), Some("clean")) => {
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .expect("read the clean source revision");
+            assert!(output.status.success(), "git rev-parse HEAD must succeed");
+            let head = String::from_utf8(output.stdout).expect("git revision is UTF-8");
+            assert_eq!(provenance["build_git_sha"], head.trim());
             assert_eq!(provenance["build_git_sha"], revision);
             assert!(provenance.get("build_git_sha_absence_reason").is_none());
         }
