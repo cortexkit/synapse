@@ -253,14 +253,15 @@ impl Drop for Candidate {
 }
 impl Candidate {
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        // Refusals are classified without copying request text or machine paths into evidence.
+        // Keep the refusal code and diagnostic message, not the request or response payload.
         let response =
             qwen_compare::raw_call(&self.consumer, &self.identity, method, params).await?;
         for error in [&response["error"], &response["result"]["error"]] {
             ensure!(
                 !error.is_object(),
-                "{method}: {}",
-                error["code"].as_str().unwrap_or("unclassified_refusal")
+                "{method}: {}: {}",
+                error["code"].as_str().unwrap_or("unclassified_refusal"),
+                error["message"].as_str().unwrap_or("no error message")
             );
         }
         Ok(response["result"].clone())
@@ -1022,7 +1023,9 @@ fn worker_proxy() -> Result<()> {
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(std::fs::File::create(
+            required_path("SYNAPSE_PACKING_WIRE_LOG")?.with_extension("worker.stderr"),
+        )?)
         .spawn()?;
     let result: Result<()> = (|| {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1046,8 +1049,12 @@ fn worker_proxy() -> Result<()> {
             .open(required_path("SYNAPSE_PACKING_WIRE_LOG")?)?;
         relay_frames(&mut host, &mut worker_stream, &mut log)
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         let _ = child.kill();
+        let _ = std::fs::write(
+            required_path("SYNAPSE_PACKING_WIRE_LOG")?.with_extension("relay.error"),
+            error.to_string(),
+        );
     }
     let status = child.wait()?;
     let _ = std::fs::remove_file(socket);
