@@ -259,9 +259,12 @@ impl Candidate {
         for error in [&response["error"], &response["result"]["error"]] {
             ensure!(
                 !error.is_object(),
-                "{method}: {}: {}",
+                "{method}: {}: {} (unix_us={})",
                 error["code"].as_str().unwrap_or("unclassified_refusal"),
-                error["message"].as_str().unwrap_or("no error message")
+                error["message"].as_str().unwrap_or("no error message"),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_micros()
             );
         }
         Ok(response["result"].clone())
@@ -1015,9 +1018,12 @@ fn worker_proxy() -> Result<()> {
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(std::fs::File::create(
-            required_path("SYNAPSE_PACKING_WIRE_LOG")?.with_extension("worker.stderr"),
-        )?)
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(required_path("SYNAPSE_PACKING_WIRE_LOG")?.with_extension("worker.stderr"))?,
+        )
         .spawn()?;
     let result: Result<()> = (|| {
         let deadline = Instant::now() + Duration::from_secs(20);

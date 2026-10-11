@@ -1,0 +1,187 @@
+{
+  "arms": [
+    {
+      "background_calls": 275,
+      "background_identical_rows": 13677,
+      "background_mismatched_rows": 0,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 3616.165708,
+        "p99_ms": 7312.260208
+      },
+      "export_seconds": 225.412439833,
+      "identical_queries": 1000,
+      "identical_rows": 6341,
+      "max_engine_rows": 8,
+      "mismatched_rows": [],
+      "packed_compile_request_ms": [],
+      "packed_export_worker_calls": 0,
+      "packed_total_worker_calls": 0,
+      "packing": false,
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 377.94325000000003,
+        "p99_ms": 696.910791
+      },
+      "repetition": 0,
+      "single_export_worker_calls": 931,
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811"
+    },
+    {
+      "background_calls": 280,
+      "background_identical_rows": 13913,
+      "background_mismatched_rows": 0,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 2559.4500829999997,
+        "p99_ms": 4516.3406669999995
+      },
+      "export_seconds": 156.940321292,
+      "identical_queries": 1000,
+      "identical_rows": 6341,
+      "max_engine_rows": 8,
+      "mismatched_rows": [],
+      "packed_compile_request_ms": [
+        22561.678333
+      ],
+      "packed_export_worker_calls": 825,
+      "packed_total_worker_calls": 836,
+      "packing": true,
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 306.779375,
+        "p99_ms": 592.83375
+      },
+      "repetition": 0,
+      "single_export_worker_calls": 81,
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811"
+    },
+    {
+      "background_calls": 273,
+      "background_identical_rows": 13578,
+      "background_mismatched_rows": 0,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 3283.176542,
+        "p99_ms": 9960.611
+      },
+      "export_seconds": 218.120002958,
+      "identical_queries": 1000,
+      "identical_rows": 6341,
+      "max_engine_rows": 8,
+      "mismatched_rows": [],
+      "packed_compile_request_ms": [],
+      "packed_export_worker_calls": 0,
+      "packed_total_worker_calls": 0,
+      "packing": false,
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 378.574166,
+        "p99_ms": 897.053167
+      },
+      "repetition": 1,
+      "single_export_worker_calls": 931,
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811"
+    },
+    {
+      "background_calls": 281,
+      "background_identical_rows": 13977,
+      "background_mismatched_rows": 0,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 2526.324792,
+        "p99_ms": 6059.444834
+      },
+      "export_seconds": 164.756181083,
+      "identical_queries": 1000,
+      "identical_rows": 6341,
+      "max_engine_rows": 8,
+      "mismatched_rows": [],
+      "packed_compile_request_ms": [
+        26497.2715
+      ],
+      "packed_export_worker_calls": 825,
+      "packed_total_worker_calls": 836,
+      "packing": true,
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 304.477625,
+        "p99_ms": 579.562041
+      },
+      "repetition": 1,
+      "single_export_worker_calls": 81,
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811"
+    },
+    {
+      "background_calls": 273,
+      "background_identical_rows": 13578,
+      "background_mismatched_rows": 0,
+      "call_latency": {
+        "count": 127,
+        "p50_ms": 3305.100916,
+        "p99_ms": 6750.708125
+      },
+      "export_seconds": 208.077648709,
+      "identical_queries": 1000,
+      "identical_rows": 6341,
+      "max_engine_rows": 8,
+      "mismatched_rows": [],
+      "packed_compile_request_ms": [],
+      "packed_export_worker_calls": 0,
+      "packed_total_worker_calls": 0,
+      "packing": false,
+      "query_latency": {
+        "count": 1000,
+        "p50_ms": 397.443375,
+        "p99_ms": 921.2447080000001
+      },
+      "repetition": 2,
+      "single_export_worker_calls": 931,
+      "vectors_sha256": "412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811"
+    }
+  ],
+  "calls_in_flight": 2,
+  "checkpoint_sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+  "chip": "Apple M4",
+  "complete": false,
+  "completed_packed_arms": 2,
+  "completed_serial_arms": 3,
+  "driver_sha256": "d13198519a2317b9b23eaf4e07ce2fac3438bb450422ac410696ac7cbefe8af2",
+  "engine_quantum_rows": 8,
+  "fingerprint": "5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b",
+  "gates": {
+    "all_vectors_bit_identical": true,
+    "export_time_pass": true,
+    "packed_dispatch_and_off_switch": true,
+    "packed_median_seconds": 160.8482511875,
+    "packed_over_serial": 0.7374300798009438,
+    "packed_queries": {
+      "count": 2000,
+      "p50_ms": 305.182583,
+      "p99_ms": 587.733917
+    },
+    "passed": false,
+    "query_latency_pass": true,
+    "query_p50_limit_ms": 420.4177538,
+    "query_p99_limit_ms": 929.0639424000001,
+    "serial_median_seconds": 218.120002958,
+    "serial_queries": {
+      "count": 3000,
+      "p50_ms": 382.197958,
+      "p99_ms": 844.6035840000001
+    }
+  },
+  "input_sha256": "1db27b7fd308b1e2d805f034b9f9f990cab5e321d04484f9d6b97980bd5ded4c",
+  "meta_sha256": "bfcef3e0035a9854b5bcc92bab3c500b566067885e9b33f02d1411199a83cfa4",
+  "module_sha256": "2dbcaf5930ee1175e52451e3576b7007245b5f83e1ceae52337e152bdfd6b899",
+  "outer_calls": 127,
+  "packed_preparation_first_request_median_ms": 24529.4749165,
+  "query_row": 0,
+  "raw_report_bytes": 359744,
+  "raw_report_sha256": "d9cbd980a0682c6a9148217d6f361f47f27718158ad72dd6f8eaaac4cd8b8b8a",
+  "rows": 6341,
+  "schema": 1,
+  "source_commit": "b755101caef11f00dff9c3dd916fad93c01560fc",
+  "tokenizer_sha256": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+  "worker_sha256": "2fb385b71556092b779b320381aff09a0aa06b4d64cd187e22c07c0dc237d72b"
+}

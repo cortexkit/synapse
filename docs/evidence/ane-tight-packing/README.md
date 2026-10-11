@@ -636,4 +636,134 @@ packed dispatch or an active serial switch, and payload-free socket relaying.
 Forcing `assess`'s `packed_dispatch_and_off_switch` check to return true
 regardless of worker exchanges fails only
 `gate_tests::acceptance_requires_real_packed_dispatch_and_serial_off_switch`;
-the seven other driver tests remain green.
+the seven other tests in that mutation run remained green.
+
+## First module-serving measurement: failed, incomplete
+
+Measured on Apple M4 on 2026-10-11 at source
+`b755101caef11f00dff9c3dd916fad93c01560fc`. Owner approval covered the device
+and all invocations. Busy checks passed before invocation and each arm. All
+ANE clients were ad-hoc signed `ckdev-*` aliases, with private configuration,
+lease and store roots. A retained `lsof` snapshot shows the module holding the
+global lane lock and both relay and real worker retaining it on descriptor
+zero. No M5 inference or production-store access occurred.
+
+**Acceptance is not passed.** The order was serial/packed/serial/packed/serial/
+packed, but the final packed export failed with `model_loading`. Three serial
+and only two packed arms completed; no extra packed arm was stitched in, no
+failed sample was discarded, and thresholds/workload were not adjusted.
+The completed-arm medians below are descriptive, not a rollout approval.
+
+| Arm | Full export (s) | Outer-call p50 / p99 (ms) | Query-under-bulk p50 / p99 (ms) | First packed admission/compile (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Serial 1 | 225.412 | 3,616.166 / 7,312.260 | 377.943 / 696.911 | — |
+| Packed 1 | 156.940 | 2,559.450 / 4,516.341 | 306.779 / 592.834 | 22,561.678 |
+| Serial 2 | 218.120 | 3,283.177 / 9,960.611 | 378.574 / 897.053 | — |
+| Packed 2 | 164.756 | 2,526.325 / 6,059.445 | 304.478 / 579.562 | 26,497.272 |
+| Serial 3 | 208.078 | 3,305.101 / 6,750.708 | 397.443 / 921.245 | — |
+| Packed 3 | **Failed mid-export** | Not a completed measurement | Not reached | Retained in failed-arm profile |
+
+Each completed export returned 6,341 bit-identical vectors: 31,705 completed
+row comparisons, plus 5,000 identical query vectors and 68,723 identical
+background-bulk vectors, with zero mismatches. Every complete export has the
+same ordered f32-bit digest:
+`412b933a40a22143a06325e8df8950ce419e7f7e71bb7369c02720f4067b5811`.
+The pinned fingerprint remains
+`5f7ac7cdbf63e71f04405b2130b2bde8eb7b307e5d929419bcd747b129806a6b`.
+The completed packed exports each sent 825 `EMBED_PACKED` exchanges and 81
+single exchanges; serial exports sent 931 single exchanges and no packed
+exchanges. The largest observed engine call was eight rows. Each complete
+packed arm compiled the packed shape once, with no later packed re-admission;
+median first compile-request wall time was 24,529.475 ms.
+
+Among completed arms only, median export times were 218.120 s serial and
+160.848 s packed (**0.73743×**, below 0.80×). Pooled warm query p50/p99 were
+382.198/844.604 ms serial (3,000 samples) and 305.183/587.734 ms packed
+(2,000 samples), below the respective 420.418/929.064 ms limits. Missing the
+third packed repetition prevents these descriptive successes from clearing
+acceptance.
+
+### Initial incident diagnosis from retained evidence
+
+The final packed arm started at 14:26:12 UTC. Its private store retains one
+passed self-check, generation 1, checked at 14:26:49.403 UTC, with unchanged
+identity. There is one worker profile PID, one `LOAD`, one `PING`, one packed
+admission, and one single-shape eviction during preparation. The 103 completed
+wire exchanges include 65 packed executions and no `ERR` responses. No packed
+eviction, packed re-admission, second load or second worker-profile PID is
+recorded. The retained module log has no resource-exhaustion or recovery
+warning. These observations are not a substitute for a durable crash ledger;
+the private store has no general worker crash/recovery event table.
+
+The slowdown is explicit in module log lines (UTC):
+
+```text
+2026-10-11T14:27:51.281Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-1 lane=ane-direct tokens=2489 wall_ms=844
+2026-10-11T14:28:14.659Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-7 lane=ane-direct tokens=7112 wall_ms=18452
+2026-10-11T14:28:32.325Z INFO  synapse.perf: job done model_id=qwen3-embedding-0.6b-ane job_id=inline-1-10 lane=ane-direct tokens=1997 wall_ms=13900
+```
+
+The worker profile ends with successful vector-producing exchanges at
+829.583, 1,100.528, 1,582.756 and 1,872.109 ms. The last is `embed-101`,
+completed at Unix microsecond `1791728925474414` (14:28:45.474 UTC). The
+retained module profile records a 4,661.794 ms direct-ANE roundtrip and an
+11,069.915 ms handler interval near the failure. The terminal response was:
+
+```text
+embed.batch: model_loading: catalog lane 'qwen3-embedding-0.6b-ane' is loading
+```
+
+`resolve_serving_model` and `catalog_resolution_guard` in
+`crates/synapse-module/src/lib.rs` cap catalog lifecycle/readiness waits at
+five seconds even with the private 600-second inline deadline. Their timeout
+response uses that exact `model_loading` message. It therefore does **not**
+establish a worker crash or lane reload. The worker exchange timeout is
+separately 30 seconds, not five. The relay's retained `Broken pipe (os error
+32)` can result from aborting the remaining in-flight call when the harness
+exits on the first refusal; it does not establish the initiating cause.
+
+The data supports a catalog-resolution/readiness timeout during the slowdown,
+but does not settle why execution/readiness work slowed, or whether the
+five-second timer expired waiting for the lifecycle lock or the detached
+readiness task. Worker stderr and module stderr are empty. No RSS or system
+memory-pressure samples were collected in this first run, so memory pressure
+on the 16-GB M4 cannot be ruled out. An owner-approved second **full** matched
+comparison adds memory sampling and retained stderr, without changing module
+code, workload, private module configuration, or thresholds.
+
+### Retained first-run evidence and reduction
+
+`module-serving-first.json` is the compact failed-run summary, containing
+hashes, counters and independently recomputed statistics. Full call samples,
+profiles, private logs and selected private-store event rows remain outside
+Git. Input identities:
+
+- Export SHA-256: `1db27b7fd308b1e2d805f034b9f9f990cab5e321d04484f9d6b97980bd5ded4c`.
+- Batch metadata SHA-256: `bfcef3e0035a9854b5bcc92bab3c500b566067885e9b33f02d1411199a83cfa4`.
+- Checkpoint SHA-256: `0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd`.
+- Tokenizer SHA-256: `def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a`.
+- Full first report: 359,744 bytes, SHA-256 `d9cbd980a0682c6a9148217d6f361f47f27718158ad72dd6f8eaaac4cd8b8b8a`.
+- Global-lock observation SHA-256: `7e1bb3c84b429487465a2f8e3b5568c2caca028555ca9f1024d89485581e80ca`.
+
+The reducer refuses incomplete evidence by default. Explicitly preserving an
+incomplete run never marks its acceptance gate as passed:
+
+```sh
+python3 docs/evidence/ane-tight-packing/summarize-serving.py "$FIRST_RAW_REPORT" \
+  --allow-incomplete --out docs/evidence/ane-tight-packing/module-serving-first.json
+python3 docs/evidence/ane-tight-packing/summarize-serving.py --self-test
+```
+
+The independent reducer recomputes medians and nearest-rank percentiles from
+raw samples, checks identity/call counts and real dispatch, and refuses a
+contradictory driver gate claim. Forcing its dispatch check to return true
+fails only `Tests.test_complete_run_and_failed_dispatch_are_computed_from_raw_counters`;
+the four other reducer tests in that mutation run remain green.
+
+For the instrumented comparison, run
+`monitor-serving-memory.py --out "$MEMORY_JSONL" --stop-file "$MONITOR_STOP"`
+beside the driver, and create the stop file only after the driver exits. It
+samples module/worker/relay RSS every three seconds, captures `vm_stat`, and
+uses **only** `memory_pressure -Q` (query mode, never synthetic pressure).
+Every sample has a Unix timestamp for correlation with module/worker profiles.
+The monitor output and full stderr stay outside Git.
