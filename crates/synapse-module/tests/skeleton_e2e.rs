@@ -2348,16 +2348,28 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
         }
     })
     .to_string();
+    let gate_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind deterministic embed gate listener");
+    let gate_addr = gate_listener.local_addr().unwrap().to_string();
+    let gate_dir = unique_temp_dir("synapse-admission-execution-gate");
+    std::fs::create_dir_all(&gate_dir).expect("create deterministic embed gate directory");
+    let gate_dir = gate_dir.to_str().expect("gate path is utf-8");
     let daemon = start_daemon().await;
     let module = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
         None,
         Some(&config),
-        &[("SYNAPSE_TEST_DETERMINISTIC_DELAY_MS", "100")],
+        &[
+            ("SYNAPSE_TEST_DETERMINISTIC_EMBED_GATE_DIR", gate_dir),
+            ("SYNAPSE_TEST_DETERMINISTIC_EMBED_GATE_ADDR", &gate_addr),
+        ],
     );
     let (daemon, _module, mut first_consumer, first_route) =
         open_route_for_started_module(daemon, module).await;
     certify_preloaded_models(&mut first_consumer, first_route, 400).await;
+    std::fs::write(Path::new(gate_dir).join("armed"), b"")
+        .expect("arm deterministic embed gate after model setup");
 
     let mut second_consumer = connect_consumer(&daemon.connection_file_path).await;
     wait_for_catalog(&mut second_consumer, MODULE_ID, SETUP_TIMEOUT).await;
@@ -2396,7 +2408,17 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
         )
         .await
     });
-    sleep(Duration::from_millis(5)).await;
+    let (mut gate_stream, _) = tokio::time::timeout(SETUP_TIMEOUT, gate_listener.accept())
+        .await
+        .expect("first batch did not enter the execution gate")
+        .expect("accept deterministic embed gate connection");
+    let mut gate_signal = [0];
+    tokio::time::timeout(SETUP_TIMEOUT, gate_stream.read_exact(&mut gate_signal))
+        .await
+        .expect("first batch did not signal the execution gate")
+        .expect("read deterministic embed gate signal");
+    assert_eq!(gate_signal, *b"R");
+
     let second_task = tokio::spawn(async move {
         route_request(
             &mut second_consumer,
@@ -2422,16 +2444,23 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
         .await;
         let result = &status["result"];
         if result["execution_waiters"].as_u64().unwrap_or(0) > 0 {
-            assert!(result["inline_in_flight_executions"].as_u64().unwrap_or(0) >= 1);
+            assert!(
+                result["inline_in_flight_executions"].as_u64().unwrap_or(0) >= 1,
+                "admission.status reported a waiter without an execution in flight"
+            );
             observed_waiter = true;
             break;
         }
-        sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
     assert!(
         observed_waiter,
         "admission.status never exposed the semaphore waiter"
     );
+    gate_stream
+        .write_all(&[1])
+        .await
+        .expect("release deterministic embed execution gate");
     let _ = first_task.await.unwrap();
     let _ = second_task.await.unwrap();
 }
