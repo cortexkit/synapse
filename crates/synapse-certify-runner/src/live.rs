@@ -985,6 +985,92 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    // Run a short catalog download/load/serve probe against a signed release
+    // module. The runner gives it a ckdev alias and an isolated store/lease root.
+    // Run: CKDEV_RERANK_ASSETS=<release-assets> CKDEV_RERANK_MIRROR=<pinned-mirror>
+    // CKDEV_RERANK_DOMAIN=probabilities cargo test --release --locked
+    // -p synapse-certify-runner catalog_metal_rerank_fixture_readout_probe
+    // -- --ignored --nocapture (use domain=logits to reproduce the old readout).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires signed release module assets and the pinned local mirror"]
+    async fn catalog_metal_rerank_fixture_readout_probe() {
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let options = Options {
+            assets: std::env::var_os("CKDEV_RERANK_ASSETS")
+                .expect("CKDEV_RERANK_ASSETS")
+                .into(),
+            mirror: std::env::var_os("CKDEV_RERANK_MIRROR")
+                .expect("CKDEV_RERANK_MIRROR")
+                .into(),
+            checkout: checkout.clone(),
+        };
+        let domain = std::env::var("CKDEV_RERANK_DOMAIN").expect("logits or probabilities");
+        assert!(matches!(domain.as_str(), "logits" | "probabilities"));
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".live/readout-probe-{}", std::process::id()));
+        let layout = crate::assets::Layout::new(&options.assets, &root, "metal-m5").unwrap();
+        let mirror = crate::mirror::Mirror::start(&options.mirror).await.unwrap();
+        let mut candidate = start(&options, &layout, &mirror.endpoint).await.unwrap();
+        let deadline = tokio::time::Instant::now() + crate::catalog::RUN_BUDGET;
+        let pin = crate::catalog::install(
+            &mut candidate,
+            "metal-m5",
+            "gte-reranker-modernbert-base",
+            deadline,
+        )
+        .await
+        .unwrap();
+        let fingerprint = pin.fingerprint.clone();
+        let mut session = crate::catalog::CertifiedSession::new(&mut candidate, pin, deadline);
+        let bytes = std::fs::read(checkout.join("bench/parity/fixtures/gte-reranker-modernbert-base/gte-reranker-modernbert-base.ref-v1.transformers-5.16.1.seed-0.json")).unwrap();
+        let document: Value = serde_json::from_slice(&bytes).unwrap();
+        let cases = document["cases"].as_array().unwrap();
+        // Keep the original certification request shape: the first 64-item pool.
+        let groups = fixture_requests(cases, "rerank").unwrap();
+        let group = groups
+            .iter()
+            .find(|group| group[0]["id"] == "pool100-000")
+            .unwrap();
+        let (method, params) = group_params(group, "rerank").unwrap();
+        assert_eq!(method, "rerank.score");
+        let response = session.fixture(method, params).await.unwrap();
+        let mut report = Vec::new();
+        for index in [0, 7, 42, 63] {
+            let case = group[index];
+            assert_eq!(
+                response["observation"]["input_ids"][index], case["input_ids"],
+                "{}",
+                case["id"]
+            );
+            let observed = response["scores"][index].as_f64().unwrap();
+            let reference = case["output"].as_f64().unwrap();
+            let sigmoid = 1.0 / (1.0 + (-observed).exp());
+            let comparable = if domain == "logits" {
+                sigmoid
+            } else {
+                observed
+            };
+            assert!(
+                (comparable - reference).abs() < 0.001,
+                "{}: {observed} versus {reference}",
+                case["id"]
+            );
+            if domain == "logits" {
+                assert!((observed - reference).abs() > 0.1);
+            }
+            report.push(json!({"id":case["id"], "reference":reference, "observed":observed, "sigmoid_observed":sigmoid, "abs_error":(observed-reference).abs(), "sigmoid_abs_error":(sigmoid-reference).abs(), "input_ids_match":true}));
+        }
+        candidate.shutdown().await.unwrap();
+        let report = json!({"domain":domain, "fingerprint":fingerprint, "cases":report});
+        println!("{report}");
+        std::fs::write(
+            root.join("readout.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn floor_probe_and_worker_environment_use_one_alias_per_run() {

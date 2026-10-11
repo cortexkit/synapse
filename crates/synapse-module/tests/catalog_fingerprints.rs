@@ -53,7 +53,7 @@ fn metal_lane_fingerprint(
 /// Engine identity of a catalog Metal lane: catalog lanes opt in to f16 weight
 /// projections exactly when they are f16 gte-modernbert, as the module's
 /// `catalog_projection_dtype` decides.
-fn catalog_engine_identity(backend: &Value) -> synapse_core::EngineIdentity {
+fn catalog_engine_identity(entry: &Value, backend: &Value) -> synapse_core::EngineIdentity {
     let family = ModelFamily::parse(backend["family"].as_str().unwrap()).unwrap();
     let dtype = OwnedDType::parse(backend["dtype"].as_str().unwrap()).unwrap();
     let projections = if family == ModelFamily::GteModernBert && dtype == OwnedDType::F16 {
@@ -61,7 +61,13 @@ fn catalog_engine_identity(backend: &Value) -> synapse_core::EngineIdentity {
     } else {
         ProjectionDtype::F32
     };
-    engine_identity_with_projections(family, dtype, projections)
+    let mut identity = engine_identity_with_projections(family, dtype, projections);
+    if entry["task"] == "rerank" {
+        identity
+            .build_flags
+            .insert("rerank_readout".into(), "sigmoid_classifier_logit".into());
+    }
+    identity
 }
 
 #[test]
@@ -85,7 +91,7 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
                 entry,
                 backend,
                 &tokenizers,
-                &catalog_engine_identity(backend),
+                &catalog_engine_identity(entry, backend),
             );
             assert_eq!(
                 backend["fingerprint"], computed,
@@ -120,7 +126,7 @@ fn the_gte_metal_catalog_lane_moved_only_by_its_projection_opt_in() {
         .iter()
         .find(|backend| backend["backend"] == "metal")
         .unwrap();
-    let opted_in = catalog_engine_identity(backend);
+    let opted_in = catalog_engine_identity(entry, backend);
     assert_eq!(opted_in.build_flags["graph_revision"], "5");
     assert_eq!(opted_in.build_flags["projection_dtype"], "f16");
     let without = engine_identity(ModelFamily::GteModernBert, OwnedDType::F16);
@@ -135,6 +141,42 @@ fn the_gte_metal_catalog_lane_moved_only_by_its_projection_opt_in() {
     assert_ne!(
         backend["fingerprint"],
         "b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3"
+    );
+}
+
+#[test]
+fn the_reranker_metal_pin_moved_only_by_probability_readout() {
+    let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
+    let tokenizers: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "gte-reranker-modernbert-base")
+        .unwrap();
+    let backend = entry["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|backend| backend["backend"] == "metal")
+        .unwrap();
+    let identity = catalog_engine_identity(entry, backend);
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &identity),
+        backend["fingerprint"]
+    );
+    let mut legacy_readout = identity;
+    assert_eq!(
+        legacy_readout
+            .build_flags
+            .remove("rerank_readout")
+            .as_deref(),
+        Some("sigmoid_classifier_logit")
+    );
+    assert_eq!(
+        metal_lane_fingerprint(entry, backend, &tokenizers, &legacy_readout),
+        "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9"
     );
 }
 

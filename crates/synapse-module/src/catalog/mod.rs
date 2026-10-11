@@ -2101,8 +2101,8 @@ mod tests {
             // f16 weight projections, recorded in its engine identity as
             // projection_dtype = f16 and graph revision 5. It was
             // b904dd7b9b8b1ca713f489127bde3566467aedfaffe8c3286031a65e1f1027f3
-            // without the opt-in. Every other lane listed here must keep its
-            // fingerprint.
+            // without the opt-in. The reranker also intentionally changes from
+            // logits to probabilities; all other listed lanes retain their pins.
             (
                 "gte-modernbert-base",
                 "metal",
@@ -2116,7 +2116,10 @@ mod tests {
             (
                 "gte-reranker-modernbert-base",
                 "metal",
-                "6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9",
+                // Sigmoid changes the served scores from logits to probabilities,
+                // so rerank_readout in the numeric identity intentionally changes
+                // this pin from 6da1fa7f1dfa0c7c883dd34ca9c3e5d06e50ceaaabbb13d49fd7b7b291b0b9b9.
+                "f6c27197647b9d6302971dcda763d23391d5c7e7d45e78606e826bdf0bac4c4d",
             ),
             (
                 "qwen3-embedding-0.6b",
