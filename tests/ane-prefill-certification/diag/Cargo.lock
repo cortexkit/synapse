@@ -1822,9 +1822,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2019aff42458ad2a23f1e588852e22ddf73a4b6a5c564a54c11a1cc32e3c9074"
+checksum = "a289dc82f587c0e33ef36835b4ae20aabdac96689a854caff187315bc366bab4"
 dependencies = [
  "async-trait",
  "serde",
@@ -1840,9 +1840,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.29.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8074e9632f5ad9a79dcb292abfda670c89f87fb5bb655d72ce09e5bd20e5baf"
+checksum = "85053ab416524b6736ce128d3ff5ad4c32bf88e869f28bb2a0c649b5dbabad7c"
 dependencies = [
  "serde",
  "serde_json",
@@ -1851,19 +1851,20 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.8"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "917c0a82081bb97c431dcd26e46d76c0606d01aadf7228c5aac7059f06984ea9"
+checksum = "a11e335d083934ba54cf8c689252986ea6ca1c6cfac6894b46c83dbc394a8136"
 dependencies = [
  "libc",
  "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "subc-protocol"
-version = "0.30.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bd344068abd716d996c0b0adb897085d14b19e648951564256028a44498e780"
+checksum = "2b6252f827f7763153d01487298f9163d26a58432c5a5d6acba7303ad2390dc2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1871,9 +1872,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f59d2c657e7fdcd9edb16d0eaaa660a169841b0211c6ef6e4a7ea0c9614759ac"
+checksum = "c174608340d9619c9db01ee322a791d7533da98a5655c6aa0d31735a5c89c03c"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
@@ -1881,6 +1882,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-os",
  "subc-protocol",
  "subtle",
  "tokio",

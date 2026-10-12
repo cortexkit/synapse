@@ -1372,12 +1372,13 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-os"
-version = "0.1.8"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "917c0a82081bb97c431dcd26e46d76c0606d01aadf7228c5aac7059f06984ea9"
+checksum = "a11e335d083934ba54cf8c689252986ea6ca1c6cfac6894b46c83dbc394a8136"
 dependencies = [
  "libc",
  "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
