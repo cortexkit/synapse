@@ -103,6 +103,26 @@ later night without a new approval and a separately reviewed window definition.
 Raw reports, logs and private roots stay under `/tmp`, not build directories.
 Compact committed records and raw-file checksums follow after the window.
 
+Preparation verification is retained in `m5-window-preparation.json`: 13 signed
+release example tests, 12 supervisor tests (native Python 3.9.6 and Linux
+Python 3.14.4), six existing reducer tests, two hardware-free stress schema/timing
+tests, strict native example Clippy, scoped formatting, and all input/package
+pins passed. Python diagnostics are current and clean; Rust analyzer coverage
+was pending, so native Clippy and release compilation are the authoritative
+Rust checks. The initial dry run caught a historical-tail partial-record bug;
+it was fixed, regression-tested, and the complete non-ANE dry run then passed.
+Both silent safety fences were mutation-tested: widening the production PID
+exception failed only its named example test (12 others passed), and ignoring
+external workers failed only the supervisor contamination test (11 others
+passed). Both files were staged before mutation and restored to empty unstaged
+diffs afterward. No mutation remains. An isolated `/tmp` Python virtualenv
+contains jsonschema 4.25.1 solely for validating the committed stress schema;
+no manifest or lockfile changed.
+
+The bounded background sleep was launched at 21:05Z with an explicit seven-hour
+process cap. It wakes once at 01:58Z, then invokes the unattended supervisor;
+there is no wall-clock status polling loop.
+
 ## Outcome
 
 Pending the approved window; no Neural Engine measurements have run during

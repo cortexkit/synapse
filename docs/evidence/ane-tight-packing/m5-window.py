@@ -306,7 +306,9 @@ class Window:
                     rows = processes()
                     self.remember(rows, child.pid)
                     self.check_production(rows)
-                    workers = external_workers(rows, self.owned)
+                    live_owned = [pid for pid, identity in self.owned.items() if pid in rows
+                                  and (rows[pid]["identity"], rows[pid]["exe"]) == identity]
+                    workers = external_workers(rows, live_owned)
                     events = self.tail.read()
                     if workers or events:
                         reason = "production ANE activity: workers=" + str(workers) + ", log_events=" + str(len(events))
@@ -444,16 +446,16 @@ class Tests(unittest.TestCase):
         self.assertTrue(window.touched)
         self.assertEqual(rpc.call_args.args[0], "model.unload")
 
-    def simulated_stage(self, worker=False, deadline=False):
+    def simulated_stage(self, worker=False, deadline=False, log_event=False):
         from unittest.mock import Mock, patch
         with tempfile.TemporaryDirectory() as root:
             window = object.__new__(Window)
             window.out = Path(root)
             window.prod = 1
-            window.owned = {}
+            window.owned = {11: ("old", "/bin/ck-synapse-worker-ane-swift")}
             window.record = {"stages": {}}
             window.tail = Mock()
-            window.tail.read.return_value = []
+            window.tail.read.side_effect = [[], [START] if log_event else []]
             window.states = Mock(return_value={lane: "unloaded" for lane in LANES})
             window.check_production = Mock()
             window.event = Mock()
@@ -479,6 +481,11 @@ class Tests(unittest.TestCase):
         valid, result = self.simulated_stage(worker=True)
         self.assertFalse(valid)
         self.assertIn("production ANE activity", result["stopped_reason"])
+
+    def test_stage_voids_arm_on_production_log_activity(self):
+        valid, result = self.simulated_stage(log_event=True)
+        self.assertFalse(valid)
+        self.assertIn("log_events=1", result["stopped_reason"])
 
     def test_stage_stops_at_hard_deadline(self):
         valid, result = self.simulated_stage(deadline=True)
