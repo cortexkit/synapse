@@ -20,6 +20,11 @@ tokio = { workspace = true, features = ["fs"] }
 subc-daemon.workspace = true
 subc-transport.workspace = true
 subc-protocol.workspace = true
+# std::fs::canonicalize returns verbatim `\\?\C:\...` paths on Windows. Those break
+# once a forward-slash suffix is appended to them, as subc-daemon does when it
+# builds the module store path. dunce returns the plain drive-letter form when
+# that is equivalent and does nothing on other platforms.
+dunce = "1"
 
 [dev-dependencies]
 sha2.workspace = true

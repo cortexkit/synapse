@@ -58,9 +58,9 @@ pub(crate) fn worker(row: &str) -> Option<&'static str> {
 }
 impl LiveRunner {
     pub fn new(mut options: Options, source: &str) -> Result<Self> {
-        options.assets = std::fs::canonicalize(&options.assets).map_err(err)?;
-        options.checkout = std::fs::canonicalize(&options.checkout).map_err(err)?;
-        options.mirror = std::fs::canonicalize(&options.mirror).map_err(err)?;
+        options.assets = dunce::canonicalize(&options.assets).map_err(err)?;
+        options.checkout = dunce::canonicalize(&options.checkout).map_err(err)?;
+        options.mirror = dunce::canonicalize(&options.mirror).map_err(err)?;
         Ok(Self {
             options,
             source: source.into(),

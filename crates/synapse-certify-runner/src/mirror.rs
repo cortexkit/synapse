@@ -22,7 +22,9 @@ impl Drop for Mirror {
 }
 impl Mirror {
     pub async fn start(root: &Path) -> Result<Self> {
-        let root = std::fs::canonicalize(root).map_err(|e| refuse(format!("mirror: {e}")))?;
+        // dunce on both this root and each served file (see `path`) keeps the
+        // containment check comparing paths of the same form on Windows.
+        let root = dunce::canonicalize(root).map_err(|e| refuse(format!("mirror: {e}")))?;
         if !root.is_dir() {
             return Err(refuse("mirror must be a directory"));
         }
@@ -73,7 +75,10 @@ fn path(root: &Path, uri: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let file = std::fs::canonicalize(root.join(decoded)).ok()?;
+    // `root` came from dunce::canonicalize too. A file that dunce must leave in
+    // verbatim form (for example a path longer than MAX_PATH under a plain
+    // root) fails `starts_with` and is refused rather than served.
+    let file = dunce::canonicalize(root.join(decoded)).ok()?;
     (file.starts_with(root) && file.is_file()).then_some(file)
 }
 
@@ -145,5 +150,63 @@ mod tests {
         }
         drop(mirror);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Link `link` to the directory `target`: a symlink on Unix, a directory
+    /// junction on Windows (junctions need no symlink privilege).
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            // mklink reads a forward slash as a switch, so both paths must use
+            // backslashes only.
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "mklink /J failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    // The URI filter refuses `..`, `.`, `:` and `\`, so the only way out of the
+    // root is through a link inside it. That case reaches the canonical
+    // containment check, which must refuse it on every OS while still serving
+    // ordinary files under the same root.
+    #[test]
+    fn containment_check_serves_inside_and_refuses_link_escaping_root() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".live")
+            .join(format!("mirror-containment-{}", std::process::id()));
+        let root_dir = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root_dir.join("org/repo/resolve/pin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root_dir.join("org/repo/resolve/pin/model.bin"), b"weights").unwrap();
+        std::fs::write(outside.join("secret.bin"), b"secret").unwrap();
+        link_dir(&outside, &root_dir.join("escape"));
+        // The mirror canonicalizes its root the same way before serving.
+        let root = dunce::canonicalize(&root_dir).unwrap();
+
+        let inside = path(&root, "/org/repo/resolve/pin/model.bin")
+            .expect("a file inside the root is served");
+        assert_eq!(std::fs::read(&inside).unwrap(), b"weights");
+        assert!(inside.starts_with(&root));
+        assert!(
+            std::fs::read(root.join("escape/secret.bin")).is_ok(),
+            "the link resolves, so only the containment check can refuse it"
+        );
+        assert_eq!(path(&root, "/escape/secret.bin"), None);
+
+        #[cfg(windows)]
+        std::fs::remove_dir(root_dir.join("escape")).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
