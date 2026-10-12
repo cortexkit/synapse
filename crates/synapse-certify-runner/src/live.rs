@@ -1,7 +1,12 @@
 //! Executes candidate artifacts against a private in-process daemon.
 use crate::refuse;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
 };
@@ -219,6 +224,43 @@ impl crate::catalog::Client for Session {
     }
 }
 
+fn candidate_command(
+    candidate: &Path,
+    root: &Path,
+    environment: impl IntoIterator<Item = (String, Option<PathBuf>)>,
+    conn_path: &Path,
+    config: &Path,
+    platform: synapse_core::Platform,
+) -> Command {
+    let mut command = synapse_core::without_launch_nonce_tokio(Command::new(candidate));
+    for (name, value) in environment {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    let data_home = root.join("data");
+    let model_cache = root.join("model-cache");
+    command
+        .current_dir(root)
+        .arg("--subc")
+        .arg(conn_path)
+        .env("SUBC_MODULE_ID", "synapse")
+        .env("SYNAPSE_CONFIG_PATH", config)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("CORTEXKIT_MODEL_CACHE", &model_cache)
+        .env("SYNAPSE_MODEL_CACHE_DIR", &model_cache)
+        .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
+        .env("CORTEXKIT_STORE_ROOT", root.join("store"));
+    if platform == synapse_core::Platform::Windows {
+        command.env("LOCALAPPDATA", &data_home);
+    } else {
+        command.env("HOME", root);
+    }
+    command
+}
+
 async fn start(
     options: &Options,
     layout: &crate::assets::Layout,
@@ -256,27 +298,18 @@ async fn start(
         serde_json::to_vec(&crate::assets::config(endpoint)).map_err(err)?,
     )
     .map_err(err)?;
-    let mut command = synapse_core::without_launch_nonce_tokio(Command::new(&layout.candidate));
-    for (name, value) in layout.environment() {
-        if let Some(value) = value {
-            command.env(name, value);
-        } else {
-            command.env_remove(name);
-        }
-    }
-    let child = command
-        .current_dir(root)
-        .arg("--subc")
-        .arg(&conn_path)
-        .env("SUBC_MODULE_ID", "synapse")
-        .env("SYNAPSE_CONFIG_PATH", &config)
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
-        .env("CORTEXKIT_STORE_ROOT", root.join("store"))
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(err)?;
+    let child = candidate_command(
+        &layout.candidate,
+        root,
+        layout.environment(),
+        &conn_path,
+        &config,
+        synapse_core::Platform::current(),
+    )
+    .stderr(std::process::Stdio::inherit())
+    .kill_on_drop(true)
+    .spawn()
+    .map_err(err)?;
     let mut stream = TcpStream::connect(("127.0.0.1", conn.endpoints[0].port))
         .await
         .map_err(err)?;
@@ -983,7 +1016,67 @@ fn machine_non_apple(row: &str, floor: Option<&Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+
+    #[test]
+    fn candidate_command_isolates_data_and_model_cache_roots() {
+        let scratch = std::env::temp_dir().join(format!(
+            "synapse-certify-candidate-env-{}",
+            std::process::id()
+        ));
+        let candidate = scratch.join("ck-synapse");
+        let connection = scratch.join("connection.json");
+        let config = scratch.join("config.json");
+        let inherited_model_cache = std::env::var_os("CORTEXKIT_MODEL_CACHE");
+
+        for platform in [
+            synapse_core::Platform::Linux,
+            synapse_core::Platform::MacOs,
+            synapse_core::Platform::Windows,
+        ] {
+            let command = candidate_command(
+                &candidate,
+                &scratch,
+                std::iter::empty(),
+                &connection,
+                &config,
+                platform,
+            );
+            let data_home = scratch.join("data");
+            let model_cache = scratch.join("model-cache");
+            let mut roots = vec![
+                ("XDG_DATA_HOME", data_home.as_path()),
+                ("CORTEXKIT_MODEL_CACHE", model_cache.as_path()),
+                ("SYNAPSE_MODEL_CACHE_DIR", model_cache.as_path()),
+            ];
+            if platform == synapse_core::Platform::Windows {
+                roots.push(("LOCALAPPDATA", data_home.as_path()));
+            } else {
+                roots.push(("HOME", scratch.as_path()));
+            }
+
+            for (name, expected) in roots {
+                let actual = command
+                    .as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .and_then(|(_, value)| value)
+                    .unwrap_or_else(|| panic!("candidate did not set {name}"));
+                assert_eq!(actual, expected.as_os_str(), "{name}");
+                assert!(Path::new(actual).starts_with(&scratch), "{name}");
+            }
+
+            let configured_model_cache = command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new("CORTEXKIT_MODEL_CACHE"))
+                .and_then(|(_, value)| value);
+            assert_ne!(
+                configured_model_cache,
+                inherited_model_cache.as_deref(),
+                "candidate must override inherited CORTEXKIT_MODEL_CACHE"
+            );
+        }
+    }
 
     // Run a short catalog download/load/serve probe against a signed release
     // module. The runner gives it a ckdev alias and an isolated store/lease root.
