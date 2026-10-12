@@ -44,6 +44,13 @@ use tokio::time::timeout;
 
 const STDERR_RING_BYTES: usize = 8 * 1024;
 
+#[cfg(all(test, unix))]
+mod quarantine_tests;
+
+// Catalog users cannot manually probe and approve a worker to restore serving.
+// A finite ten-minute cool-down lets a desktop lane recover without that step.
+pub(crate) const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
+
 #[derive(Clone, Debug)]
 pub struct CrashBudget {
     pub max_crashes: usize,
@@ -87,6 +94,9 @@ pub struct WorkerHostConfig {
     pub normalize: bool,
     /// Stable catalog model identity attached to forwarded worker diagnostics.
     pub model_id: Option<String>,
+    /// Selected lane ID from the release catalog's reserved-ID lookup, not a
+    /// profile flag or arbitrary model-name convention. None for free-form models.
+    pub catalog_lane: Option<String>,
     /// Shared stdout/stderr forwarding budget for this worker process.
     pub worker_forward_lines_per_sec: u32,
     /// Optional catalog identity used by engines that share this generic host.
@@ -120,6 +130,7 @@ impl WorkerHostConfig {
             pooling: WorkerPooling::Mean,
             normalize: true,
             model_id: None,
+            catalog_lane: None,
             worker_forward_lines_per_sec: 50,
             engine_identity: None,
             isolate_crash_key_by_worker_id: false,
@@ -156,7 +167,10 @@ pub enum WorkerHostError {
         stderr_tail: String,
     },
     #[error("model/config is quarantined after repeated worker crashes: {key}")]
-    Quarantined { key: String },
+    Quarantined {
+        key: String,
+        retry_after_ms: Option<u64>,
+    },
 }
 
 impl WorkerHostError {
@@ -175,13 +189,18 @@ impl WorkerHostError {
                 {
                     Some(ane_residency::ANE_RESOURCES_RETRY_AFTER_MS)
                 }
-                Self::Quarantined { .. } | Self::WorkerErr { .. } | Self::HelloRefused { .. } => {
-                    None
-                }
+                Self::Quarantined { retry_after_ms, .. } => *retry_after_ms,
+                Self::WorkerErr { .. } | Self::HelloRefused { .. } => None,
                 _ => Some(250),
             },
-            safe_to_retry_same_request: matches!(self, Self::EngineCrashed { .. })
-                || matches!(self, Self::WorkerErr {code, ..} if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED),
+            safe_to_retry_same_request: matches!(
+                self,
+                Self::EngineCrashed { .. }
+                    | Self::Quarantined {
+                        retry_after_ms: Some(_),
+                        ..
+                    }
+            ) || matches!(self, Self::WorkerErr {code, ..} if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED),
         }
     }
 
@@ -328,6 +347,9 @@ pub struct WorkerHost {
     connection: Option<WorkerConnection>,
     loaded_models: HashMap<String, LoadedWorkerModel>,
     quarantined: HashSet<String>,
+    quarantine_until: HashMap<String, Instant>,
+    #[cfg(test)]
+    clock: Option<Instant>,
     crashes: HashMap<String, Vec<Instant>>,
     last_placement_share: Option<f64>,
     request_counter: u64,
@@ -347,6 +369,9 @@ impl WorkerHost {
             connection: None,
             loaded_models: HashMap::new(),
             quarantined: HashSet::new(),
+            quarantine_until: HashMap::new(),
+            #[cfg(test)]
+            clock: None,
             crashes: HashMap::new(),
             last_placement_share: None,
             request_counter: 0,
@@ -387,8 +412,8 @@ impl WorkerHost {
                 .isolate_crash_key_by_worker_id
                 .then_some(self.config.worker_id.as_str()),
         );
-        if self.quarantined.contains(&crash_key) {
-            return Err(WorkerHostError::Quarantined { key: crash_key });
+        if let Some(error) = self.quarantine_error(&crash_key) {
+            return Err(error);
         }
 
         let (worker_model_ref, dims, cold_load_ms, buckets) = self
@@ -760,6 +785,11 @@ impl WorkerHost {
         let Some(loaded) = self.loaded_models.remove(&model.model_id) else {
             return Ok(());
         };
+        if self.config.catalog_lane.is_some() {
+            self.quarantined.remove(&loaded.crash_key);
+            self.quarantine_until.remove(&loaded.crash_key);
+            self.crashes.remove(&loaded.crash_key);
+        }
         let Some(worker_model_ref) = loaded.worker_model_ref else {
             return Ok(());
         };
@@ -883,10 +913,8 @@ impl WorkerHost {
             .ok_or_else(|| {
                 WorkerHostError::Protocol(format!("unknown loaded model {}", model.model_id))
             })?;
-        if self.quarantined.contains(&loaded.crash_key) {
-            return Err(WorkerHostError::Quarantined {
-                key: loaded.crash_key,
-            });
+        if let Some(error) = self.quarantine_error(&loaded.crash_key) {
+            return Err(error);
         }
         if self.connection.is_some() {
             if let Some(worker_model_ref) = loaded.worker_model_ref {
@@ -912,10 +940,8 @@ impl WorkerHost {
         cfg: &RuntimeConfig,
         crash_key: &str,
     ) -> Result<(String, usize, u64, Option<Vec<usize>>), WorkerHostError> {
-        if self.quarantined.contains(crash_key) {
-            return Err(WorkerHostError::Quarantined {
-                key: crash_key.to_string(),
-            });
+        if let Some(error) = self.quarantine_error(crash_key) {
+            return Err(error);
         }
         let artifact_path = artifact_path(cfg)?;
         let req_id = self.next_req_id("load");
@@ -1190,12 +1216,54 @@ impl WorkerHost {
         }
     }
 
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return now;
+        }
+        Instant::now()
+    }
+
+    fn quarantine_error(&mut self, key: &str) -> Option<WorkerHostError> {
+        if !self.quarantined.contains(key) {
+            return None;
+        }
+        let retry_after_ms = if self.config.catalog_lane.is_some() {
+            let until = *self
+                .quarantine_until
+                .get(key)
+                .expect("catalog quarantine has expiry");
+            let now = self.now();
+            if now >= until {
+                self.quarantined.remove(key);
+                self.quarantine_until.remove(key);
+                self.crashes.remove(key);
+                return None;
+            }
+            Some(
+                u64::try_from(until.duration_since(now).as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            )
+        } else {
+            None
+        };
+        Some(WorkerHostError::Quarantined {
+            key: key.into(),
+            retry_after_ms,
+        })
+    }
+
     fn record_crash(&mut self, key: String) -> bool {
-        let now = Instant::now();
+        let now = self.now();
         self.prune_crash_windows(now);
         let entries = self.crashes.entry(key.clone()).or_default();
         entries.push(now);
         if entries.len() >= self.config.crash_budget.max_crashes {
+            if self.config.catalog_lane.is_some() {
+                self.quarantine_until
+                    .insert(key.clone(), now + CATALOG_QUARANTINE_COOLDOWN);
+            }
             self.quarantined.insert(key);
             true
         } else {

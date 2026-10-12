@@ -138,6 +138,12 @@ message. A failed download carries `error` beside `state` in its flat status.
   never substitute catalog fingerprints.
 - `engine_crashed` — transient on catalog paths, `retry_after_ms: 250`, safe to
   retry; includes load/runtime failure or the 2000 ms self-check ceiling.
+  A quarantined catalog worker also uses this code, never `probe_required`:
+  `retry_after_ms` is the remaining time in its fixed ten-minute cool-down and
+  `details` is `{lane_id, quarantined: true}`. The next serving request after
+  expiry starts a fresh worker with zero strikes. Unload/reload or a module
+  restart clears catalog quarantine immediately. Legacy/free-form workers keep
+  permanent `probe_required` and their existing recovery contract.
 - `model_loading` — transient, `retry_after_ms: 250`, safe to retry. Inline
   serving waits up to `min(remaining deadline, 5000 ms)` for load/self-check;
   this code is used only when that cap expires with deadline remaining. A
@@ -395,6 +401,14 @@ never read knob assignments or require probes/approvals. The self-check key is
 catalog id, manifest digest, backend, fingerprint, engine identity, OS build and
 fixture revision. Key changes reset it to pending; persisted numerical failure
 refuses without rerunning. Remove and redownload also permits a new check.
+
+Worker quarantine is also a catalog serving error, not a probe/approval gate:
+it returns transient `engine_crashed` with `{lane_id, quarantined: true}` and a
+positive `retry_after_ms` equal to the remaining fixed ten-minute cool-down.
+The lane stays selected; no other backend is substituted. On expiry the next
+serving request starts a fresh worker with zero strikes. Explicit unload/reload
+or module restart clears the cool-down immediately. This automatic recovery is
+catalog-only; legacy/free-form lanes retain `probe_required`.
 
 #### Removed or rejected paths and their replacements
 
