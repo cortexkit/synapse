@@ -34,6 +34,7 @@ cp /root/timing-probe.Cargo.toml /root/timing-probe/Cargo.toml
 cp /root/synapse/Cargo.lock /root/timing-probe/Cargo.lock
 cd /root/timing-probe
 export CARGO_TARGET_DIR=/root/build-target-timing
+cargo generate-lockfile --offline
 cargo fetch --locked
 cargo build --release --locked --offline
 printf 'BUILDS_DONE\n'

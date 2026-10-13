@@ -1,0 +1,23 @@
+{
+  "source_commit": "be6cd118a40cc8cc5e999fad9e1e880e43dcd644",
+  "path": "crates/synapse-module/src/catalog/models.json",
+  "sha256": "f84d80b19b599d3d0ce3292750c712a7fd488622a2c79e05804fd425d2f69966",
+  "pins": {
+    "gte-modernbert-base": {
+      "cuda": "5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010",
+      "vulkan": "9d281846adc39572fcc10bdd06ee43eefd17d45f4702a85a05e0ca285a922182"
+    },
+    "gte-reranker-modernbert-base": {
+      "cuda": "829c20af3757ecd5bb53ab89507ff64d4382225688f5888d6236ffc1670f2d4d",
+      "vulkan": "160e6ae78d2bad1aa4b5a8a4125dc0f2e820e2aea5509057d7ac7cd656426c99"
+    },
+    "qwen3-embedding-0.6b": {
+      "cuda": "9628e6a8b0f30e9eb459f09cfb985306bbbaf2440579d38660e9795c4353554b",
+      "vulkan": "9a33500fe3db4e4ff48e1afd8319f195e18a64a79d955e1dfaa5e4b3ee54aeb9"
+    },
+    "qwen3-reranker-0.6b": {
+      "cuda": "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688",
+      "vulkan": "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7"
+    }
+  }
+}
