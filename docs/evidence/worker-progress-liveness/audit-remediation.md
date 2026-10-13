@@ -192,3 +192,51 @@ production defect described above, and had staged live source before mutation.
 The exact named failures above demonstrate detection. Each restored to empty
 local diff after checkout/touch. Production code delivered
 with this coverage keeps its existing absolute frame deadlines and raw fences.
+
+## Final verification of the completed host fixes
+
+The complete source at `046145fc4d90572361fce3aa972d6b53582d3d6c` was checked
+again after all five host fixes. The preservation-only commit `a3988da8` has
+the same source tree; no interrupted edits were discarded. Linux checks used
+8 vCPUs, rustc/cargo 1.99.0, clippy 0.1.99 and rustfmt 1.10.0-stable:
+
+| Command | Result |
+| --- | --- |
+| `cargo test --locked -p synapse-module --lib` | 734 passed, 14 ignored; 748 total, 68.85 s |
+| `cargo test --locked -p synapse-module --test it` | 26 passed, 245.12 s |
+| `cargo test --locked -p synapse-module --test skeleton_e2e` | 57 passed, 1 profiling test ignored; 126.41 s |
+| `cargo test --locked -p synapse-core --lib worker_protocol` | 16 passed |
+| `cargo test --locked -p synapse-module --test catalog_fingerprints` | 5 passed, 1 pinned-artifact test ignored |
+| `cargo clippy --locked -p synapse-module --all-targets -- -D warnings` | Passed, one package, all targets |
+| `cargo clippy --locked -p synapse-core -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan --all-targets -- -D warnings` | Passed, four portable/feature-off packages, all targets |
+| `cargo fmt --all -- --check` | Passed (silent on success) |
+
+The default `candidate_workers` test invocation ran zero tests and ignored its
+one packaged-binary matrix. It is not counted as a passing deployment check;
+the earlier executed Linux/macOS matrices remain recorded in the hardware
+README and worker-liveness test record.
+
+Windows-target clippy was repeated for `synapse-module --all-targets` using
+the repository's cross-compilation wrappers `scripts/lib/zig-cc-windows.sh`
+and `scripts/lib/zig-ar.sh`, target
+`x86_64-pc-windows-gnu`, `CARGO_BUILD_JOBS=4` and `-D warnings`. It passed with
+the installed Mac Zig 0.16.0 and clippy 0.1.99. This uses the Mac's installed
+cross-toolchain because Zig was unavailable in the Linux build image; it is
+not a substitute for the executed native Windows Vulkan certification.
+
+`ckdev-mutate check` passed with ckdev-mutate 0.12.0, validating the catalogue's
+66 control anchors and exact test names, without replaying mutations. Its
+Mac prebuild warned that Metal developer tools were unavailable; no Metal
+inference is claimed. The archived evidence check also passed with Python
+3.9.6:
+
+```text
+python3 docs/evidence/worker-progress-liveness/summarize_raw.py --raw-root "$HOME/.local/share/cortexkit/synapse/evidence-raw/worker-progress-liveness" --check
+PASS: 5 archived hashes, 4 fixture pins, 80 Ally and 17 M4 requests
+```
+
+These final host checks do not add native CUDA GPU execution or performance
+evidence. The maintainer still needs to validate native execution and compare
+latency/throughput with progress reporting disabled and enabled on rented CUDA
+hardware. The hardware README describes the unmeasured synchronization, event
+and reporting costs.
