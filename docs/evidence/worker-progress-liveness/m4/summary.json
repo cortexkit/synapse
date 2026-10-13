@@ -1,0 +1,156 @@
+{
+  "machine": {
+    "cpu": "Apple M4",
+    "memory_bytes": 17179869184,
+    "os": "macOS 27.0 (26A428)"
+  },
+  "module_source_commit": "97095352fbdb8a7cdd6b41a1b75e9093422de440",
+  "probe_source_commit": "f09beddb1d02a4db75d7238cee43f9474ac91ecf",
+  "private_daemon": true,
+  "exchanges": [
+    {
+      "req_id": "ping-0",
+      "operation": "PING",
+      "max_gap_ms": 0.29279099999999997,
+      "elapsed_ms": 0.32941600000000004
+    },
+    {
+      "req_id": "load-0",
+      "operation": "LOAD",
+      "max_gap_ms": 3432.0558330000003,
+      "elapsed_ms": 3432.056416
+    },
+    {
+      "req_id": "admit-1",
+      "operation": "ANE_ADMIT_SHAPE",
+      "max_gap_ms": 632.0649999999999,
+      "elapsed_ms": 10598.279208,
+      "kind": "admit",
+      "shape": 128
+    },
+    {
+      "req_id": "embed-2",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 1.661,
+      "elapsed_ms": 34.006916,
+      "kind": "row",
+      "shape": 128,
+      "tokens": 4
+    },
+    {
+      "req_id": "embed-3",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 1.05525,
+      "elapsed_ms": 24.925584,
+      "kind": "row",
+      "shape": 128,
+      "tokens": 127
+    },
+    {
+      "req_id": "embed-4",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 1.034458,
+      "elapsed_ms": 24.091542,
+      "kind": "row",
+      "shape": 128,
+      "tokens": 128
+    },
+    {
+      "req_id": "admit-5",
+      "operation": "ANE_ADMIT_SHAPE",
+      "max_gap_ms": 714.661,
+      "elapsed_ms": 14211.54325,
+      "kind": "admit",
+      "shape": 256
+    },
+    {
+      "req_id": "embed-6",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 2.869709,
+      "elapsed_ms": 58.406541,
+      "kind": "row",
+      "shape": 256,
+      "tokens": 129
+    },
+    {
+      "req_id": "embed-7",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 11.769375,
+      "elapsed_ms": 226.597709,
+      "kind": "row",
+      "shape": 128,
+      "tokens": 128
+    },
+    {
+      "req_id": "embed-8",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 0.845416,
+      "elapsed_ms": 22.050667,
+      "kind": "row",
+      "shape": 128,
+      "tokens": 128
+    },
+    {
+      "req_id": "admit-9",
+      "operation": "ANE_ADMIT_SHAPE",
+      "max_gap_ms": 4748.3739590000005,
+      "elapsed_ms": 32438.877167000002,
+      "kind": "admit",
+      "shape": 512
+    },
+    {
+      "req_id": "embed-10",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 17.290125,
+      "elapsed_ms": 277.11475,
+      "kind": "row",
+      "shape": 512,
+      "tokens": 512
+    },
+    {
+      "req_id": "embed-11",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 4.334834,
+      "elapsed_ms": 104.6905,
+      "kind": "row",
+      "shape": 512,
+      "tokens": 512
+    },
+    {
+      "req_id": "evict-12",
+      "operation": "ANE_EVICT_SHAPE",
+      "max_gap_ms": 27.808083,
+      "elapsed_ms": 27.808415999999998
+    },
+    {
+      "req_id": "admit-13",
+      "operation": "ANE_ADMIT_SHAPE",
+      "max_gap_ms": 8930.774917,
+      "elapsed_ms": 177522.483375,
+      "kind": "admit",
+      "shape": 8192
+    },
+    {
+      "req_id": "embed-14",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 373.49904200000003,
+      "elapsed_ms": 9664.305208,
+      "kind": "row",
+      "shape": 8192,
+      "tokens": 8192
+    },
+    {
+      "req_id": "embed-15",
+      "operation": "EMBED_BATCH",
+      "max_gap_ms": 815.670333,
+      "elapsed_ms": 8853.994999999999,
+      "kind": "row",
+      "shape": 8192,
+      "tokens": 8192
+    }
+  ],
+  "gap_windows_ms": {
+    "inference": 120000,
+    "setup": 600000
+  }
+}

@@ -11,10 +11,15 @@ use super::{ensure_req_id, WorkerHostError};
 // INFERENCE_IDLE bounds silence between completed-work signals, not total time.
 // A completed transformer layer renews it even inside a slow 8,192-token row;
 // fixed Core ML batches of <=512 tokens take under 1/70 of this 120s window.
+// Calibration measured <=5.779s on Ally Vulkan and <=0.816s on M4 direct ANE
+// between completions (docs/evidence/worker-progress-liveness), leaving headroom.
 // Supported hardware needing a larger gap requires a measured code change.
 pub(super) const INFERENCE_IDLE: Duration = Duration::from_secs(120);
-// Native model load, CUDA cold setup and one ANE layer compile can be opaque;
-// cold ANE shapes have taken 2-3 minutes overall. Layer completions renew this.
+// SETUP_IDLE allows 600s of silence inside native load/setup/compiler calls
+// that cannot report mid-call. Each completed layer compile renews that timer.
+// M4's 8192 shape took 177.522s overall but its largest compile gap was 8.931s;
+// 600s retains conservative headroom for opaque calls and colder supported hosts.
+// See docs/evidence/worker-progress-liveness for the calibration, not a total cap.
 pub(super) const SETUP_IDLE: Duration = Duration::from_secs(600);
 
 pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
