@@ -12,7 +12,14 @@ fn config(extra: &[&str]) -> (WorkerHostConfig, PathBuf) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("worker-liveness-{}-{id}", std::process::id()));
+    // The worker's Unix socket lives in this folder, and macOS caps a socket
+    // path at 104 bytes. Under the per-user temp folder (/var/folders/.../T/)
+    // a long folder name pushes `wk-<digest>.sock` past that cap, so keep it short.
+    let root = std::env::temp_dir().join(format!(
+        "wl-{}-{:x}",
+        std::process::id(),
+        id % 0x1_0000_0000
+    ));
     std::fs::create_dir_all(&root).unwrap();
     let binary = synapse_core::dev_binary::ckdev_binary(
         env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"),
