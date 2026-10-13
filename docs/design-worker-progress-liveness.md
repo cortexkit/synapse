@@ -272,7 +272,12 @@ response, including errors when associated with a request. Keep the raw-frame
 association with that terminal header. Never let a subsequent caller consume
 the abandoned request's response, even if both operations return the same type.
 Do not reuse a stream after a partial/malformed reply or an aborted owner;
-recovery requires faulting it and confirmed worker exit.
+recovery requires faulting it and confirmed worker exit. The public low-level
+`WorkerHost` async API enforces an interrupted-exchange guard too: dropping its
+future after dispatch marks the connection unusable, and the next call performs
+lifecycle teardown/reload on a fresh generation without charging cancellation
+as a crash. Module caller deadlines do not drop that reader; their detached
+owner remains the preferred drain path.
 
 Drain the already-dispatched RPC in full, even if it contains several rows.
 Do not start further host-side RPCs/buckets for an abandoned request. The

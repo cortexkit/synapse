@@ -90,6 +90,13 @@ fn run_worker<S: Read + Write>(
         std::fs::write(path, std::env::current_exe()?.to_string_lossy().as_bytes())
             .context("record mock worker executable")?;
     }
+    if let Ok(path) = argument("--pid-log") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{}", std::process::id())?;
+    }
     let embed_dims = std::env::var("SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

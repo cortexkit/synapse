@@ -31,6 +31,7 @@ fn peer(host: &mut WorkerHost, generation: u64, crash: bool) -> tokio::task::Joi
         logs: LogRing::new(),
         worker_generation: generation,
         packed: None,
+        unusable: false,
     });
     tokio::spawn(async move {
         while let Ok(request) =

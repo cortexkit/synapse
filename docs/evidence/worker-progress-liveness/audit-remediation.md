@@ -69,3 +69,32 @@ EngineCrashed: no-progress hang ... completed=3 ... idle_window_ms=200
 `git diff --stat`; the corresponding green rerun passed. The renewal test's
 short 200 ms idle window is compiled only in unit tests; production windows
 remain fixed constants.
+
+## 3. Fence a dropped public low-level host exchange
+
+`worker_liveness::cancelled_low_level_host_starts_fresh_worker_without_strike`
+uses the spawned framed fake worker, cancels `host.embed_batch([7])` directly
+after it was written, then requests `[9]` on the same public host. The fake's
+owned PID log independently verifies a new process/generation; the next value
+must be 9. Recorded compute faults and quarantined model counts must stay zero:
+the worker was live, and abandoning a caller's wait is lifecycle management,
+not evidence that its compute path crashed.
+
+```text
+BEFORE: cancelled_low_level_host_starts_fresh_worker_without_strike ... FAILED
+EngineCrashed: expected embed-2, got embed-1
+0 passed; 1 failed; 25 filtered out
+AFTER: same exact test ... ok
+1 passed; 0 failed; 25 filtered out; finished in 3.55s
+```
+
+The generic host now has an exchange-drop guard. An interrupted write/read marks
+the connection unusable immediately. Before reusing a model reference or issuing
+the next request, the host closes/reaps only its owned child, forgets its
+worker-local references, and starts/reloads a fresh worker. That invalidation
+is lifecycle and adds no fault strike. The normal module request path still
+leaves its detached owner draining after caller expiry; it retains the original
+usable generation rather than invoking this low-level cancellation fallback.
+
+The real-transport renewal test still passed (1) and strict module all-targets
+clippy passed after adding the cancellation guard.

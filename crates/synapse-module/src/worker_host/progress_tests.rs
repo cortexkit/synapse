@@ -32,6 +32,7 @@ async fn live_host_with_work(
         logs: LogRing::new(),
         worker_generation: 1,
         packed: None,
+        unusable: false,
     });
     let peer = tokio::spawn(async move {
         let mut inferences = 0;

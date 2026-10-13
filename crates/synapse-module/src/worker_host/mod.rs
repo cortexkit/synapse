@@ -246,6 +246,23 @@ struct WorkerConnection {
     logs: LogRing,
     worker_generation: u64,
     packed: Option<synapse_core::PackedCapability>,
+    unusable: bool,
+}
+
+struct GenericExchangeGuard<'a> {
+    unusable: &'a mut bool,
+    completed: bool,
+}
+
+impl Drop for GenericExchangeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // A dropped future may have written a request or read a partial
+            // reply. Fence reuse now; the next call tears down only this owned
+            // child as lifecycle, not a crash charged to the later caller.
+            *self.unusable = true;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -788,6 +805,7 @@ impl WorkerHost {
     }
 
     pub async fn unload(&mut self, model: &LoadedModel) -> Result<(), WorkerHostError> {
+        self.close_unusable_connection().await;
         let Some(loaded) = self.loaded_models.remove(&model.model_id) else {
             return Ok(());
         };
@@ -897,7 +915,10 @@ impl WorkerHost {
             .filter(|loaded| loaded.worker_model_ref.is_some())
             .count();
         WorkerHostHealth {
-            worker_connected: self.connection.is_some(),
+            worker_connected: self
+                .connection
+                .as_ref()
+                .is_some_and(|connection| !connection.unusable),
             tracked_models: self.loaded_models.len(),
             loaded_worker_models,
             crash_count_window,
@@ -911,6 +932,7 @@ impl WorkerHost {
         &mut self,
         model: &LoadedModel,
     ) -> Result<(String, String), WorkerHostError> {
+        self.close_unusable_connection().await;
         let loaded = self
             .loaded_models
             .get(&model.model_id)
@@ -987,10 +1009,21 @@ impl WorkerHost {
     }
 
     async fn ensure_worker(&mut self) -> Result<(), WorkerHostError> {
+        self.close_unusable_connection().await;
         if self.connection.is_some() {
             return Ok(());
         }
         self.start_worker().await
+    }
+
+    async fn close_unusable_connection(&mut self) {
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.unusable)
+        {
+            self.kill_current().await;
+        }
     }
 
     async fn start_worker(&mut self) -> Result<(), WorkerHostError> {
@@ -1096,6 +1129,7 @@ impl WorkerHost {
             logs,
             worker_generation: worker_generation_from_nonce(&nonce)?,
             packed: hello.packed,
+            unusable: false,
         });
         Ok(())
     }
@@ -1126,6 +1160,10 @@ impl WorkerHost {
         };
         let connection = self.connection.as_mut().expect("connected worker");
         let generation = connection.worker_generation;
+        let mut exchange_guard = GenericExchangeGuard {
+            unusable: &mut connection.unusable,
+            completed: false,
+        };
         let result = liveness::exchange(
             &mut connection.stream,
             &request,
@@ -1135,6 +1173,8 @@ impl WorkerHost {
             idle_override,
         )
         .await;
+        exchange_guard.completed = result.is_ok();
+        drop(exchange_guard);
         match result {
             Ok(value) => {
                 // Only drained serving success proves the compute path healthy.
@@ -3112,6 +3152,7 @@ mod tests {
             logs: LogRing::new(),
             worker_generation: 1,
             packed: None,
+            unusable: false,
         });
         tokio::spawn(async move {
             let mut seen = Vec::new();
