@@ -168,6 +168,12 @@ fn signed_copy(source: &Path, root: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 fn hardware_preflight() -> Result<()> {
+    let unloaded_production_pid = env::var("SYNAPSE_PACKING_UNLOADED_PRODUCTION_PID")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .context("unloaded production PID must be one positive integer")?;
+    ensure!(unloaded_production_pid != Some(0), "invalid production PID");
     let output = Command::new("ps").args(["-axo", "pid=,comm="]).output()?;
     ensure!(output.status.success(), "cannot inspect ANE process owners");
     for line in String::from_utf8(output.stdout)?.lines() {
@@ -178,13 +184,74 @@ fn hardware_preflight() -> Result<()> {
             continue;
         }
         ensure!(
-            !["ck-synapse", "ck_synapse", "ckdev", "synapse-worker"]
-                .iter()
-                .any(|needle| name.contains(needle)),
+            process_is_allowed(pid, &name, unloaded_production_pid),
             "ANE window busy: pid {pid}; ask the owner, never stop or bypass it"
         );
     }
     Ok(())
+}
+
+fn process_is_allowed(pid: &str, name: &str, unloaded_production_pid: Option<u32>) -> bool {
+    // A production daemon may stay alive on the same machine with its ANE lanes
+    // unloaded. The window supervisor verifies unloading and monitors for reloads;
+    // this exception never permits a worker or a second production daemon.
+    if unloaded_production_pid.is_some()
+        && pid.parse::<u32>().ok() == unloaded_production_pid
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some("ck-synapse")
+    {
+        return true;
+    }
+    // Shared Macs also run unrelated ckdev fleets (subc, broca, prefrontal).
+    // Fence Synapse and ANE clients, not those CPU-only development daemons.
+    let executable = Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(name);
+    !(executable.starts_with("ck-synapse")
+        || executable.starts_with("ckdev-synapse")
+        || executable.starts_with("ckdev-ane-packing")
+        || executable.contains("ck_synapse")
+        || executable.contains("synapse-worker")
+        || executable.contains("-worker-ane"))
+}
+
+fn load_averages() -> Result<Vec<f64>> {
+    let output = Command::new("sysctl").args(["-n", "vm.loadavg"]).output()?;
+    ensure!(output.status.success(), "cannot inspect load averages");
+    let loads = String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .filter(|v| *v != "{" && *v != "}")
+        .map(str::parse::<f64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(loads.len() == 3, "expected 1/5/15-minute loads");
+    Ok(loads)
+}
+
+#[cfg(test)]
+mod production_window_tests {
+    use super::process_is_allowed;
+
+    #[test]
+    fn unloaded_production_exception_is_exactly_one_daemon_not_any_worker() {
+        assert!(process_is_allowed("42", "/bin/ck-synapse", Some(42)));
+        assert!(!process_is_allowed("43", "/bin/ck-synapse", Some(42)));
+        assert!(!process_is_allowed("42", "/bin/ck-synapse", None));
+        for name in [
+            "/bin/ck-synapse-worker-ane-direct",
+            "/bin/ck-synapse-worker-ane-swift",
+            "/bin/ck_synapse",
+            "/bin/ckdev-ane-packing-worker",
+        ] {
+            assert!(!process_is_allowed("42", name, Some(42)), "{name}");
+        }
+        assert!(process_is_allowed("43", "/usr/bin/python3", Some(42)));
+        for name in ["ckdev-subc", "ckdev-broca", "ckdev-prefrontal-core"] {
+            assert!(process_is_allowed("43", name, Some(42)), "{name}");
+        }
+        for name in ["ckdev-synapse", "other-worker-ane-swift"] {
+            assert!(!process_is_allowed("43", name, Some(42)), "{name}");
+        }
+    }
 }
 
 async fn checkpoint_server(weights: &Path) -> Result<(String, tokio::task::JoinHandle<()>)> {
@@ -738,6 +805,7 @@ struct Report {
     engine_quantum_rows: usize,
     fingerprint: String,
     query_row: usize,
+    arm_start_loads: Vec<Value>,
     arms: Vec<Arm>,
     gates: Value,
 }
@@ -890,6 +958,7 @@ async fn main() -> Result<()> {
         engine_quantum_rows: 8,
         fingerprint: PIN.into(),
         query_row: 0,
+        arm_start_loads: Vec::new(),
         arms: Vec::new(),
         gates: Value::Null,
     };
@@ -899,7 +968,12 @@ async fn main() -> Result<()> {
     for repetition in 0..repeats {
         for packing in [false, true] {
             let label = format!("{}-{repetition}", if packing { "packed" } else { "serial" });
-            println!("starting {label}");
+            let loads = load_averages()?;
+            println!("starting {label}; load1/5/15={loads:?}");
+            report
+                .arm_start_loads
+                .push(json!({"arm":label,"load_1_5_15":loads}));
+            save(&out, &report)?;
             let candidate = Arc::new(
                 Candidate::start(
                     &parent.join(format!("private-{}-{label}", std::process::id())),
