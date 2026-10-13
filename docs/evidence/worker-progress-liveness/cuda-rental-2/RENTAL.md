@@ -11,7 +11,7 @@ Created with Vast CLI 1.2.1 using the previous rental's image and options:
 ```sh
 vastai create instance 53119697 --image nvidia/cuda:12.8.1-base-ubuntu24.04 \
   --disk 100 --ssh --direct --env '-e NVIDIA_DRIVER_CAPABILITIES=all' \
-  --label mason-cuda-liveness-2-bg_6ac235e863cccc82 --cancel-unavail --raw \
+  --label synapse-cuda-liveness-2 --cancel-unavail --raw \
   --onstart-cmd 'chown root:root /root /root/.ssh /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; echo SSH_KEY_MODES_REPAIRED'
 ```
 
