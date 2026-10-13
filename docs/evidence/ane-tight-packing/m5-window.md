@@ -125,5 +125,83 @@ there is no wall-clock status polling loop.
 
 ## Outcome
 
-Pending the approved window; no Neural Engine measurements have run during
-preparation. Neither benchmark has a verdict yet.
+**Aborted at the required quietness deadline; both experiments NOT RUN.** The
+supervisor began at 02:00:00.002Z and aborted at **02:15:00.062Z** after
+900.060 seconds. No 120-second quiet interval was obtained. The preflight load
+at 01:58Z was 11.64 / 9.98 / 9.90. Neither private module-serving arm nor the
+37-request stress runner started; there are zero completed serial/packed arms,
+no export ratio, no vector-identity/query-latency measurement, and no stress
+completion/resource-failure verdict. An exit-zero supervisor means the planned
+abort and restoration completed, **not** that either acceptance gate passed.
+
+Supported management unload initially returned `unloaded` for GTE at
+02:00:00.194Z and Qwen at 02:00:00.352Z. GTE stayed unloaded during the check.
+Qwen kept reloading with production traffic: 118 unload responses were recorded,
+29 explicitly saying `unloaded`; 89 had no flat `state` in the returned value
+and are not counted as confirmed unloads. Those full response bodies were not
+retained. The supervisor required worker absence and unloaded management states
+independently of these response labels. At the abort snapshot both lanes were
+unloaded and **no direct or Swift ANE workers remained**, but only about 24
+seconds had elapsed since the last explicit Qwen unload. The quiet interval
+was not shortened to use the remaining window.
+
+An independently captured production-log slice, **02:00Z inclusive to 02:15Z
+exclusive**, has 460 Qwen lane events: **230 distinct admitted jobs** (209
+`embed.batch`, 21 `embed.query`), 212 `job done` and **18 `job failed`, all with
+`code=shape_compiling`**. GTE has no lane events in that slice. These are
+production observations during unload/reload churn, not benchmark failures or
+a complete request-arrival audit. The first admission was at 02:00:43.842Z and
+the last at 02:13:48.339Z. The longest gap between observed lane events,
+including the window edges, was **100.633 seconds** (02:11:56.076Z to
+02:13:36.709Z), below the required 120 seconds. Thus the log itself does not
+supply a qualifying quiet interval. No attempt was made to bypass the chip-busy
+condition or continue measuring after the abort.
+
+### Restoration times for AFT retry review
+
+| Production lane | First successful restoration embedding (UTC, 2026-10-13) | Fingerprint prefix | Actual dimensions | Attempts |
+| --- | --- | --- | ---: | ---: |
+| Qwen direct ANE | **02:15:16.429Z** | `5f7ac7cd` | 1024 | 2 |
+| GTE Core ML ANE | **02:15:19.700Z** | `5a2374bc` | 768 | 4 |
+
+The supervisor validated the **returned vectors**, including finite values,
+not merely lane metadata. Both management states were `ready` by
+02:15:19.708Z. Production daemon PID 91767 was unchanged and never signaled;
+a subsequent process snapshot showed its direct and Swift ANE children running
+again. **No private daemon or worker was started or remained**; cleanup
+signaled no process. Restoration happened immediately after the 02:15Z abort,
+not at the nominal 02:50Z end.
+
+### Retained evidence and disposition
+
+`m5-window-result.json` is the compact result and artifact manifest. Raw files
+remain under `/tmp/m5-ane-window-20261013/`, outside the repository and all
+regenerable build directories:
+
+| Raw file | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `window.json` | 30,266 | `fdbc5ebbfdbef51cf7ff8410072729b859beab87d2da3fcb26a797a2a6b547e1` |
+| `supervisor.log` | 21,618 | `ace1d49d80941c5e2baef068b9e9167d4ec5bca7b59d3b796c5d42fe9ec34f08` |
+| `production-lane-window.log` | 78,905 | `9730dac2d2e3792e9034d81f1b7208caaa320a93deff77619680c97115f5db50` |
+
+No benchmark raw report exists because neither driver was launched. The signed
+packed-driver alias is retained in `/tmp/m5-ane-window-20261013/`; its checksum
+is in `m5-window-result.json`. The supervisor source was
+`561e9391aeeeb40fb2666e3a0a6ce83cd92f3621`, based on fetched master
+`f4143a9ad82ea3a44cb69278dc3ab6035a933088`. The machine owner approved the
+example-only adaptation that permits one unloaded production daemon, fences
+Synapse/ANE clients instead of unrelated development fleets, and records
+per-arm load. Prepared native asset hashes are in `m5-window-preparation.json`
+and the raw window record. The Rust/Python acceptance logic, workload, timeouts
+and tolerances were not changed to produce a result. The stress schema was
+validated during preparation but there is no new stress report to validate.
+
+Packing remains off by default. **Neither benchmark ran**, so this abort
+produced no new performance or stress pass/fail verdict. It neither confirms
+nor refutes the M4's partial **packed export wall time / serial export wall
+time = 0.61×** observation. It also does not test the newer 100-live-executable
+budget, scoped Objective-C autorelease pools, or the worker shape-compilation
+lane fix under the committed 37-request stress workload described above. A
+future approved window needs an effective pause of production embedding
+callers: production batch/query requests were still active during the
+**2026-10-13 UTC** window.

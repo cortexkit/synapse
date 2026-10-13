@@ -972,3 +972,23 @@ outside Git and outside regenerable build directories. The raw report is
 `81dab7ed49de4a165a51cf33ea75402b856adb1a4f51f8d9bc8ccc99a510ece7`.
 This rerun does not change either earlier attempt or the rollout disposition:
 packing remains disabled outside private runs.
+
+## M5 Max window: aborted for production traffic, 2026-10-13
+
+The approved 02:00–02:50Z M5 Max window did **not** admit either experiment.
+Both production ANE lanes were unloaded through management, but Qwen callers
+kept reloading the lane. The supervisor aborted at **02:15:00.062Z** as planned:
+the longest production-log-silent interval was 100.633 seconds, below the
+required two minutes. The 15-minute log slice contains 230 admitted Qwen jobs
+(209 batch, 21 query), including 18 `shape_compiling` job failures during churn.
+There are **zero measured serial/packed arms and no new stress result**; this
+is not a passing performance or release-certification verdict.
+
+Production restoration succeeded with actual returned vectors: Qwen
+`5f7ac7cd` / 1024 dimensions at **02:15:16.429Z**, then Core ML GTE
+`5a2374bc` / 768 dimensions at **02:15:19.700Z**. No production process was
+signaled, and no private daemon or worker started or remained. See
+[`m5-window.md`](m5-window.md), the compact
+[`m5-window-result.json`](m5-window-result.json), preparation evidence and the
+unattended [`m5-window.py`](m5-window.py) for the unchanged gates, approved busy
+fence adaptation, checksums and detailed restoration times for AFT retry review.
