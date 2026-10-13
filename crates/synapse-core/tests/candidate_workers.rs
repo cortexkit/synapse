@@ -41,7 +41,14 @@ async fn candidate_hosted_protocol_matrix() {
     }
     for (worker, engine, unsupported) in workers {
         println!("hosted protocol: {worker}");
-        let nonce = format!("candidate-{}-{worker}", std::process::id());
+        // Every worker, including owned decode, requires the same 8-byte hex nonce.
+        let nonce = format!(
+            "{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        );
         let runtime = std::env::temp_dir().join(&nonce);
         let (endpoint, listener) = prepare_listener(&runtime, &nonce).unwrap();
         let mut command = tokio::process::Command::new(
