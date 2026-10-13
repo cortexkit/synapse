@@ -40,7 +40,7 @@ async fn mirror(weights: &Path) -> Result<(String, tokio::task::JoinHandle<()>)>
                     .rsplit('/')
                     .next()
                     .unwrap_or("");
-                if !["model.safetensors", "tokenizer.json"].contains(&name) {
+                if !["model.safetensors", "tokenizer.json", "config.json"].contains(&name) {
                     return;
                 }
                 if let Ok(mut file) = std::fs::File::open(root.join(name)) {
