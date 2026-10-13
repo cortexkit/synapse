@@ -1,7 +1,7 @@
 # Owned Vulkan worker
 
 `ck-synapse-worker-vulkan` serves the four `owned-vulkan` manifest profiles over
-worker protocol v2. The default build needs neither a Vulkan SDK nor a loader;
+worker protocol v3. The default build needs neither a Vulkan SDK nor a loader;
 HELLO and PING do not attempt loader discovery.
 
 Enable the GPU build with Vulkan SDK **1.4.357.0**, setting `VULKAN_SDK` to its

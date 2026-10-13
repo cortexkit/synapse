@@ -1,7 +1,8 @@
-# Synapse engine-worker protocol v1
+# Synapse engine-worker protocol v3
 
-Status: DRAFT for implementation (design-synapse-module.md names this spec a
-prerequisite; SUBC r2 handshake requirements folded).
+Module-internal protocol; deploy the module and every packaged worker together.
+See [worker progress and liveness](design-worker-progress-liveness.md) for the
+completed-work watchdog and engine-specific boundaries.
 
 ## Purpose
 
@@ -30,12 +31,16 @@ exceeding it are module bugs — admission byte budgets cap upstream).
 1. Module spawns worker with args: --socket <path> --nonce <hex16> and env
    SYNAPSE_WORKER_ID.
 2. Worker connects and sends HELLO:
-   {v: 1, nonce: "<hex16>", engine: {name, version, build_flags},
-    pid, max_frame: u32}
-   - v is the protocol version BYTE (integer); module rejects unknown majors.
+   {v: 3, nonce: "<hex16>", engine: {engine, version, build_flags},
+    pid, max_frame: u32, manifest_digest?, kernel_revision?, packed?}
+   - v is the protocol version BYTE (integer); module accepts only an exact match.
+   - Owned embed/rerank workers report their manifest digest and kernel revision.
+     `packed` optionally advertises multi-row execution support. Every v3 worker
+     follows the completed-work protocol/watchdog, even without that capability;
+     short or opaque calls can finish with just a terminal reply (see Requests).
    - nonce must equal the spawn nonce: a stale worker from a previous module
      generation can never answer a new module's socket (launch-nonce pattern).
-3. Module replies HELLO_ACK {v: 1, accept: true, max_frame} or closes.
+3. Module replies HELLO_ACK {v: 3, accept: true, max_frame} or closes.
 4. Anything else before HELLO_ACK = protocol violation, close + worker kill.
 
 ## Requests
@@ -70,6 +75,19 @@ hung request maps to exactly one process to kill). Request/response pairs:
   share so certification can gate quality and placement together.
 - SHUTDOWN {} → worker exits 0 after current request.
 
+Owned rerank uses `RERANK_SEQUENCES` with already-composed token sequences;
+direct ANE also has explicit shape/packed admission and eviction exchanges.
+The complete schemas are in `crates/synapse-core/src/worker_protocol.rs`.
+
+While an exchange runs, a worker can send
+`PROGRESS {req_id, completed: u64, phase: setup | inference | control}`.
+Counters strictly increase for completed work, never for timer ticks or kernel
+submission alone. Each frame belongs to the current request and generation.
+Progress precedes the terminal reply; a VECTORS/SCORES header is immediately
+followed by its raw payload, with no progress frame inserted between them.
+Short or opaque operations can send only their terminal reply within the idle
+window. The host validates IDs, phase transitions and counters before renewal.
+
 Tokenization stays module-side (sanitized tokenizers, padding rules, token
 counts) — workers receive ids only. Pooling is done by the worker's engine
 (llama.cpp builtin pooling where faithful; the padding incident is upstream
@@ -77,25 +95,38 @@ of this boundary and stays fixed there).
 
 ## Timeouts, crash, and recovery
 
-- Per-request deadline set by the module from the scheduler's quantum budget;
-  on expiry: SIGKILL the worker (single-lane means no collateral), classify
-  engine_crashed{stage: timeout}, restart per crash budget.
+- There is no worker-specific total request cap. Caller deadlines stop the
+  caller's wait with `deadline_exceeded`, without killing or striking a live
+  worker. Its reply-reading task keeps running after the caller stops waiting,
+  retaining the connection and lifecycle guards until the full reply drains so
+  a subsequent request cannot consume the abandoned request's result.
+- The idle watchdog starts only after owning the stream and, for inference,
+  its execution permit. Compilation holds no execution permit.
+  All inference has a fixed 120-second silence window; LOAD, shape/packed
+   compilation, eviction and Rust-side CUDA input preparation use 600 seconds.
+   CUDA switches to inference before its opaque forward, so native upload and
+   plan/graph setup share the 120-second window. Completed work
+  renews that window. A no-progress expiry faults/kills the owned worker and
+  counts as a strike, not a caller deadline.
 - Worker exit/socket EOF mid-request → engine_crashed, request fails typed
   (never hangs — the module holds the consumer contract, Oracle F8).
-- Crash budget: N crashes per (model, config) within window → that
-  (model, config) is quarantined (permanent error until re-probe); M crashes
-  across all work → lane degraded, health reflects it (cached, stamped by the
-  supervisor path).
+- Two consecutive genuine crashes, protocol faults or hangs quarantine a lane.
+  Only drained successful serving work clears strikes; LOAD/reload, PING and
+  setup do not. Catalog quarantine is transient `engine_crashed`, with remaining
+  ten-minute cool-down and `{lane_id, quarantined: true}`; after expiry the next
+  request starts a fresh worker with zero strikes. Unload/reload or module
+  restart clears it immediately. Legacy lanes retain `probe_required`.
+  The independent owned-decode supervisor keeps its own policy.
 - Worker stdout/stderr → module log ring buffer, tagged, size-capped; last 8 KiB
   attached to engine_crashed detail for diagnosis.
 
 ## Versioning
 
-v1 is intentionally complete for Lane 1's needs. Additions are new message
-types (old workers ERR unknown_type, module treats as capability absence);
-breaking changes bump v and the module refuses mismatched workers (it ships
-its own worker binaries, so version skew only happens on packaging bugs —
-fail loud, not compatible).
+Version 3 adds mandatory completed-work progress and is a clean cutover from
+v2. Reject v2 at HELLO, not after starting inference. A v3 worker which sends no
+progress during long work times out under its operation's silence window; there
+is no legacy total-cap fallback or heartbeat exemption. Numerical lane
+fingerprints and the separate owned-decode envelope version do not change.
 
 ## Non-goals
 

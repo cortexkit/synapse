@@ -985,6 +985,14 @@ impl Engine {
     }
 
     pub fn infer(&self, sequences: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.infer_progress(sequences, &mut || Ok(()))
+    }
+
+    pub fn infer_progress(
+        &self,
+        sequences: &[Vec<i32>],
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<f32>> {
         ensure!(
             !sequences.is_empty() && sequences.len() <= FLOOR_SEQUENCES as usize,
             "invalid_batch"
@@ -1011,12 +1019,17 @@ impl Engine {
                 lengths: vec![length],
                 width: padded.width,
             };
-            result.extend(self.forward(&sub)?);
+            result.extend(self.forward(&sub, progress)?);
+            progress()?;
         }
         Ok(result)
     }
 
-    fn forward(&self, padded: &Padded) -> Result<Vec<f32>> {
+    fn forward(
+        &self,
+        padded: &Padded,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<f32>> {
         let arch = &self.model.architecture;
         let h = arch.int("hidden_size")? as u32;
         let heads = arch.int("num_attention_heads")? as u32;
@@ -1095,6 +1108,7 @@ impl Engine {
             // The first layer's residual must be the normalized embeddings.
             self.copy("activation:normed", "activation:hidden", rows * h, dummy)?;
         }
+        progress()?;
         for layer in 0..arch.int("num_hidden_layers")? {
             let prefix = format!("layers.{layer}");
             if modern {
@@ -1387,6 +1401,9 @@ impl Engine {
                 true,
             )?;
             self.copy("activation:normed", "activation:hidden", rows * h, dummy)?;
+            // Each dispatch above waits for queue idle. This layer's GPU work
+            // has completed before reporting progress; submission alone is not enough.
+            progress()?;
         }
         self.norm(
             rows,

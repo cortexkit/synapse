@@ -7,3 +7,4 @@ mod launch_nonce_readers;
 mod launch_refusals;
 mod owned_decode_acceptance;
 mod worker_host_timeout;
+mod worker_liveness;

@@ -221,18 +221,34 @@ impl Model {
             .map(Vec::as_slice)
             .with_context(|| format!("tensor_missing:{name}"))
     }
+    /// No-reporting adapter used by offline benchmark examples.
+    #[allow(dead_code)]
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
+        self.admit_progress(shape, os, &mut || Ok(()))
+    }
+
+    pub fn admit_progress(
+        &mut self,
+        shape: usize,
+        os: &str,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<AnePlacementInventory> {
         let profile = crate::profile::LaneProfile::new();
         let cached = self.resident.contains_key(&shape);
         // Compile temporaries retain ANE programs until the autorelease pool drains.
         let result = ane::autoreleasepool(|_| {
-            self.admit_with_compiler(shape, os, |graph, _| {
-                graph.compile(NSQualityOfService::UserInteractive)
-            })
+            self.admit_with_limit_progress(
+                shape,
+                os,
+                PRODUCTION_SHAPE_LIMIT,
+                |graph, _| graph.compile(NSQualityOfService::UserInteractive),
+                progress,
+            )
         });
         profile.finish(serde_json::json!({"kind":"admit", "shape":shape, "cached":cached, "ok":result.is_ok()}));
         result
     }
+    #[cfg(test)]
     fn admit_with_compiler(
         &mut self,
         shape: usize,
@@ -241,12 +257,24 @@ impl Model {
     ) -> Result<AnePlacementInventory> {
         self.admit_with_limit(shape, os, PRODUCTION_SHAPE_LIMIT, compile)
     }
+    #[cfg(test)]
     fn admit_with_limit(
         &mut self,
         shape: usize,
         os: &str,
         limit: usize,
+        compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+    ) -> Result<AnePlacementInventory> {
+        self.admit_with_limit_progress(shape, os, limit, compile, &mut || Ok(()))
+    }
+
+    fn admit_with_limit_progress(
+        &mut self,
+        shape: usize,
+        os: &str,
+        limit: usize,
         mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+        progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<AnePlacementInventory> {
         ensure!(LADDER.contains(&shape), "invalid_shape");
         if let Some(resident) = self.resident.get(&shape) {
@@ -305,6 +333,7 @@ impl Model {
             // The vector stays local until every layer loads. Returning an
             // error drops all previous executables before the worker replies.
             executables.push(result.map_err(|error| admission_error(error, layer))?);
+            progress()?;
         }
         self.resident.insert(
             shape,
@@ -325,9 +354,22 @@ impl Model {
         profile.finish(serde_json::json!({"kind":"evict", "shape":shape}));
     }
 
+    /// No-reporting adapter used by offline benchmark examples.
+    #[allow(dead_code)]
     pub fn run(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        ane::autoreleasepool(|_| self.run_stages(tokens, false))
+        self.run_progress(tokens, &mut || Ok(()))
     }
+
+    pub fn run_progress(
+        &self,
+        tokens: &[u32],
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        ane::autoreleasepool(|_| {
+            self.run_stages_at_rung_progress(tokens, false, rung(tokens.len())?, progress)
+        })
+    }
+    #[cfg(test)]
     fn run_stages(&self, tokens: &[u32], traced: bool) -> Result<Vec<f32>> {
         self.run_stages_at_rung(tokens, traced, rung(tokens.len())?)
     }
@@ -336,6 +378,16 @@ impl Model {
         tokens: &[u32],
         traced: bool,
         shape: usize,
+    ) -> Result<Vec<f32>> {
+        self.run_stages_at_rung_progress(tokens, traced, shape, &mut || Ok(()))
+    }
+
+    fn run_stages_at_rung_progress(
+        &self,
+        tokens: &[u32],
+        traced: bool,
+        shape: usize,
+        progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<Vec<f32>> {
         let mut stages = StageClock::new(traced);
         let mut profile = crate::profile::LaneProfile::new();
@@ -393,6 +445,7 @@ impl Model {
             .copy_from_f32(&padding_mask(tokens, pad, shape));
         stages.emit("mask_copy_fp32_to_fp16");
         profile.phase("mask_pack");
+        progress()?;
         for (layer, executable) in resident.executables.iter().enumerate() {
             let (src, dst) = if layer % 2 == 0 {
                 (&resident.a, &resident.b)
@@ -422,6 +475,7 @@ impl Model {
             } else {
                 executable.run_cached(inputs, &[dst])?;
             }
+            progress()?;
         }
         let surface = if resident.executables.len() % 2 == 0 {
             &resident.a

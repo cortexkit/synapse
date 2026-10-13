@@ -1,4 +1,4 @@
-//! Worker protocol v2 against the built llama worker: HELLO, PING to PONG, and
+//! Worker protocol v3 against the built llama worker: HELLO, PING to PONG, and
 //! the unsupported-request exchange. The llama worker does not serve
 //! `RERANK_SEQUENCES` or `ANE_ADMIT_SHAPE` (only the owned CUDA, Vulkan and
 //! direct-ANE workers do); each must be refused with `unsupported_request`,
@@ -64,7 +64,7 @@ async fn expect_unsupported(stream: &mut WorkerTransportStream, req_id: &str) {
 }
 
 #[tokio::test]
-async fn llama_worker_speaks_protocol_v2_and_refuses_owned_worker_requests() {
+async fn llama_worker_speaks_protocol_v3_and_refuses_owned_worker_requests() {
     let suffix = unique_suffix();
     // macOS temp dirs are too long for a Unix socket path (SUN_LEN), so the
     // socket lives under /tmp there, as the host's own tests do.
@@ -74,7 +74,7 @@ async fn llama_worker_speaks_protocol_v2_and_refuses_owned_worker_requests() {
     let temp_root = std::env::temp_dir();
     let runtime_dir = temp_root.join(format!("synh-llama-v2-{suffix}"));
     let (endpoint, listener) =
-        prepare_listener(&runtime_dir, &format!("llama-protocol-v2-{suffix}")).unwrap();
+        prepare_listener(&runtime_dir, &format!("llama-protocol-v3-{suffix}")).unwrap();
     let nonce = suffix.clone();
     let mut command = tokio::process::Command::new(
         synapse_core::dev_binary::ckdev_binary(
@@ -100,7 +100,7 @@ async fn llama_worker_speaks_protocol_v2_and_refuses_owned_worker_requests() {
         None,
     )
     .await
-    .expect("the llama HELLO at protocol v2 is accepted");
+    .expect("the llama HELLO at protocol v3 is accepted");
 
     ping(&mut stream, "ping-0").await;
 

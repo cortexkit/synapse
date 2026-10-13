@@ -9,12 +9,13 @@ use crate::worker_engine_names::{
 use crate::EngineIdentity;
 
 /// Version every worker HELLO carries in `v`; the host accepts only an exact
-/// match. Version 2 added the HELLO manifest/kernel binding, `RERANK_SEQUENCES`,
-/// the direct-ANE shape admission messages and PONG `ane_resident_shapes`.
+/// match. Version 3 adds completed-work progress frames. synapse-module and
+/// workers deploy together: an older worker is rejected at HELLO rather than
+/// run without progress reporting. Silence, not total elapsed time, detects hangs.
 ///
 /// The owned-decode envelope version (the separate top-level HELLO
 /// `protocol_version`) is independent of this constant.
-pub const WORKER_PROTOCOL_VERSION: u8 = 2;
+pub const WORKER_PROTOCOL_VERSION: u8 = 3;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 /// HELLO engine identities of the owned embed/rerank workers (CUDA, Vulkan and
@@ -495,9 +496,22 @@ impl WorkerRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerProgressPhase {
+    Setup,
+    Inference,
+    Control,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkerResponse {
+    Progress {
+        req_id: String,
+        completed: u64,
+        phase: WorkerProgressPhase,
+    },
     Loaded {
         req_id: String,
         model_ref: String,
@@ -557,6 +571,20 @@ pub enum WorkerResponse {
 }
 
 impl WorkerResponse {
+    pub fn req_id(&self) -> Option<&str> {
+        match self {
+            Self::Progress { req_id, .. }
+            | Self::Loaded { req_id, .. }
+            | Self::Vectors { req_id, .. }
+            | Self::Scores { req_id }
+            | Self::Text { req_id, .. }
+            | Self::Unloaded { req_id }
+            | Self::Admitted { req_id, .. }
+            | Self::Evicted { req_id }
+            | Self::Pong { req_id, .. } => Some(req_id),
+            Self::Err { req_id, .. } => req_id.as_deref(),
+        }
+    }
     /// Whether one raw frame follows this response's JSON frame: the f32
     /// vectors after `VECTORS`, the f32 scores after `SCORES`.
     pub fn carries_raw_frame(&self) -> bool {
@@ -756,8 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_hello_bytes_and_binding_are_unchanged_by_capability() {
-        let bytes = br#"{"v":2,"nonce":"legacy","engine":{"engine":"ane-direct-worker","version":"0.1.0"},"pid":42,"max_frame":16777216,"manifest_digest":"manifest","kernel_revision":"ane-direct-graph-v1"}"#;
+    fn v3_hello_without_packed_keeps_minimal_bytes_and_binding() {
+        let bytes = br#"{"v":3,"nonce":"legacy","engine":{"engine":"ane-direct-worker","version":"0.1.0"},"pid":42,"max_frame":16777216,"manifest_digest":"manifest","kernel_revision":"ane-direct-graph-v1"}"#;
         let mut hello: WorkerHello = serde_json::from_slice(bytes).unwrap();
         assert!(hello.packed.is_none());
         assert_eq!(serde_json::to_vec(&hello).unwrap(), bytes);
@@ -864,14 +892,14 @@ mod tests {
     }
 
     #[test]
-    fn worker_protocol_is_version_two() {
-        assert_eq!(WORKER_PROTOCOL_VERSION, 2);
+    fn worker_protocol_is_version_three() {
+        assert_eq!(WORKER_PROTOCOL_VERSION, 3);
     }
 
     #[test]
     fn hello_binding_fields_are_optional_on_the_wire() {
         let legacy = serde_json::json!({
-            "v": 2,
+            "v": 3,
             "nonce": "0123456789abcdef",
             "engine": {
                 "engine": "llama.cpp-worker",

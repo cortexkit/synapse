@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result};
 use synapse_core::{
     worker_framing_sync::{read_frame, read_json_frame, write_frame, write_json_frame},
-    EngineIdentity, WorkerHello, WorkerHelloAck, WorkerRequest, WorkerResponse,
-    DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    EngineIdentity, WorkerHello, WorkerHelloAck, WorkerProgressPhase, WorkerRequest,
+    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 use synapse_parity::{
     manifest::{Lane, Model, Operation, Profile},
@@ -201,13 +201,25 @@ pub fn request_loop<S: Read + Write>(
                 items,
                 ..
             } => {
-                match infer(
+                let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                    stream, req_id, max_frame,
+                );
+                let result = infer_progress(
                     loaded.as_ref(),
                     model_ref,
                     Operation::Embed,
                     &items.iter().map(|i| i.n_tokens).collect::<Vec<_>>(),
                     raw.as_deref().unwrap(),
-                ) {
+                    &mut || {
+                        writer
+                            .completed(WorkerProgressPhase::Inference)
+                            .map_err(Into::into)
+                    },
+                );
+                if writer.failed() {
+                    return Err(anyhow::anyhow!("progress stream write failed"));
+                }
+                match result {
                     Ok(values) => {
                         let model = loaded.as_ref().unwrap();
                         write_json_frame(
@@ -230,13 +242,25 @@ pub fn request_loop<S: Read + Write>(
                 model_ref,
                 sequences,
             } => {
-                match infer(
+                let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                    stream, req_id, max_frame,
+                );
+                let result = infer_progress(
                     loaded.as_ref(),
                     model_ref,
                     Operation::Rerank,
                     &sequences.iter().map(|s| s.n_tokens).collect::<Vec<_>>(),
                     raw.as_deref().unwrap(),
-                ) {
+                    &mut || {
+                        writer
+                            .completed(WorkerProgressPhase::Inference)
+                            .map_err(Into::into)
+                    },
+                );
+                if writer.failed() {
+                    return Err(anyhow::anyhow!("progress stream write failed"));
+                }
+                match result {
                     Ok(values) => {
                         write_json_frame(
                             stream,
@@ -366,12 +390,13 @@ fn runtime_error_code(error: anyhow::Error) -> String {
     }
 }
 
-fn infer(
+fn infer_progress(
     loaded: Option<&Loaded>,
     model_ref: &str,
     operation: Operation,
     lengths: &[usize],
     raw: &[u8],
+    progress: &mut impl FnMut() -> Result<()>,
 ) -> std::result::Result<Vec<f32>, String> {
     let model = loaded
         .filter(|m| m.model_ref == model_ref)
@@ -401,11 +426,14 @@ fn infer(
         .collect();
     #[cfg(feature = "vulkan")]
     {
-        model.engine.infer(&sequences).map_err(|e| e.to_string())
+        model
+            .engine
+            .infer_progress(&sequences, progress)
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = sequences;
+        let _ = (sequences, progress);
         Err("vulkan_no_device".into())
     }
 }

@@ -217,7 +217,31 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                     Err(error) => Err(format!("read token-id frame: {error}")),
                 };
                 match ids {
-                    Ok(ids) => handle_sequences(&state, req_id, &model_ref, &items, &ids, false),
+                    Ok(ids) => {
+                        let progress_id = req_id.clone();
+                        let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                            stream,
+                            &progress_id,
+                            max_frame,
+                        );
+                        let result = handle_sequences(
+                            &state,
+                            req_id,
+                            &model_ref,
+                            &items,
+                            &ids,
+                            false,
+                            &mut || {
+                                writer
+                                    .completed(synapse_core::WorkerProgressPhase::Inference)
+                                    .map_err(|error| error.to_string())
+                            },
+                        );
+                        if writer.failed() {
+                            anyhow::bail!("progress stream write failed");
+                        }
+                        result
+                    }
                     Err(message) => (
                         error_response(Some(req_id), "invalid_request", &message),
                         None,
@@ -295,7 +319,29 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                                     n_tokens: s.n_tokens,
                                 })
                                 .collect();
-                            handle_sequences(&state, req_id, &model_ref, &items, &ids, true)
+                            let progress_id = req_id.clone();
+                            let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                                stream,
+                                &progress_id,
+                                max_frame,
+                            );
+                            let result = handle_sequences(
+                                &state,
+                                req_id,
+                                &model_ref,
+                                &items,
+                                &ids,
+                                true,
+                                &mut || {
+                                    writer
+                                        .completed(synapse_core::WorkerProgressPhase::Inference)
+                                        .map_err(|error| error.to_string())
+                                },
+                            );
+                            if writer.failed() {
+                                anyhow::bail!("progress stream write failed");
+                            }
+                            result
                         }
                         Err(error) => {
                             (error_response(Some(req_id), "invalid_request", error), None)
@@ -460,6 +506,26 @@ fn handle_load_with_probe(
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn forward_with_progress<T>(
+    progress: &mut dyn FnMut() -> Result<(), String>,
+    forward: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // The RTX 5090 rental measured 8192-token warm RPCs at 0.19/0.23/0.31/0.33 s
+    // and first shape use, including plan/graph setup, at 0.81-0.91 s. A GPU at our
+    // supported compute-capability 7.5 floor is expected to be slower, but not the
+    // >130x first-use or >360x cached-shape slowdown relative to those RTX 5090
+    // timings needed to exhaust the host's 120-second inference idle window.
+    // That margin is reasoning, not a measurement on a floor GPU.
+    // The unchanged native ABI combines upload/setup/compute, so switch to inference
+    // before calling it. Forward already waits for output; report its completion
+    // afterward without adding GPU events, capture callbacks or synchronization.
+    progress()?;
+    let result = forward()?;
+    progress()?;
+    Ok(result)
+}
+
 fn handle_sequences(
     state: &WorkerState,
     req_id: String,
@@ -467,7 +533,10 @@ fn handle_sequences(
     items: &[synapse_core::WorkerTokenItem],
     ids: &[u32],
     rerank: bool,
+    progress: &mut dyn FnMut() -> Result<(), String>,
 ) -> (WorkerResponse, Option<Vec<f32>>) {
+    #[cfg(not(feature = "cuda"))]
+    let _ = progress;
     let Some(model) = state.loaded.as_ref() else {
         return (
             error_response(
@@ -546,7 +615,12 @@ fn handle_sequences(
                 })
                 .collect(),
         };
-        match model.engine.embed_batch(&model.engine_model, batch) {
+        match forward_with_progress(progress, || {
+            model
+                .engine
+                .embed_batch(&model.engine_model, batch)
+                .map_err(|error| error.message)
+        }) {
             Ok(vectors)
                 if vectors.len() == items.len()
                     && vectors.iter().all(|vector| vector.len() == model.dims) =>
@@ -573,10 +647,7 @@ fn handle_sequences(
                 ),
                 None,
             ),
-            Err(error) => (
-                error_response(Some(req_id), "engine_crashed", &error.message),
-                None,
-            ),
+            Err(error) => (error_response(Some(req_id), "engine_crashed", &error), None),
         }
     }
 }
@@ -586,6 +657,74 @@ fn error_response(req_id: Option<String>, code: &str, msg: &str) -> WorkerRespon
         req_id,
         code: code.to_string(),
         msg: msg.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::forward_with_progress;
+    use std::cell::RefCell;
+
+    #[test]
+    fn transition_precedes_forward_and_completion_follows() {
+        let events = RefCell::new(Vec::new());
+        let result = forward_with_progress(
+            &mut || {
+                events.borrow_mut().push("progress");
+                Ok(())
+            },
+            || {
+                assert_eq!(*events.borrow(), ["progress"]);
+                events.borrow_mut().push("forward");
+                Ok(vec![7.0])
+            },
+        )
+        .unwrap();
+        assert_eq!(result, vec![7.0]);
+        assert_eq!(*events.borrow(), ["progress", "forward", "progress"]);
+    }
+
+    #[test]
+    fn failed_forward_reports_transition_without_completion() {
+        let mut progress = 0;
+        let result = forward_with_progress::<()>(
+            &mut || {
+                progress += 1;
+                Ok(())
+            },
+            || Err("forward failed".into()),
+        );
+        assert_eq!(result.unwrap_err(), "forward failed");
+        assert_eq!(progress, 1);
+    }
+
+    #[test]
+    fn failed_transition_does_not_launch_forward() {
+        let mut launched = false;
+        let result = forward_with_progress(&mut || Err("stream closed".into()), || {
+            launched = true;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "stream closed");
+        assert!(!launched);
+    }
+
+    #[test]
+    fn failed_completion_write_rejects_result() {
+        let mut progress = 0;
+        let result = forward_with_progress(
+            &mut || {
+                progress += 1;
+                if progress == 2 {
+                    Err("stream closed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(vec![7.0]),
+        );
+        assert_eq!(result.unwrap_err(), "stream closed");
+        assert_eq!(progress, 2);
     }
 }
 

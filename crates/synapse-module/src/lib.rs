@@ -6481,7 +6481,10 @@ async fn load_catalog_model_task(
             catalog_call_fault(&fault_lane, "load")?;
         }
         load_catalog_model_blocking(
-            spec,
+            CatalogAwareModelSpec {
+                stored: spec,
+                catalog_lane: is_catalog.then_some(fault_lane),
+            },
             model_cache,
             microllm_max_tokens,
             worker_load_timeout,
@@ -6707,8 +6710,15 @@ fn record_owned_package_roles(
         .map_err(|error| io_to_load_error("publish owned package roots", &path, &error))
 }
 
+// Catalog ownership comes from the release registry and stays outside the
+// stored numerical profile, so quarantine policy cannot change fingerprints.
+struct CatalogAwareModelSpec {
+    stored: StoredModelConfig,
+    catalog_lane: Option<String>,
+}
+
 fn load_catalog_model_blocking(
-    spec: StoredModelConfig,
+    spec: CatalogAwareModelSpec,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
     worker_load_timeout: Duration,
@@ -6716,6 +6726,10 @@ fn load_catalog_model_blocking(
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<EmbeddingModel, WireOperationError> {
+    let CatalogAwareModelSpec {
+        stored: spec,
+        catalog_lane,
+    } = spec;
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
     if spec.engine == CUDA_WORKER_ENGINE {
@@ -6832,6 +6846,7 @@ fn load_catalog_model_blocking(
                 worker_load_timeout,
                 worker_forward_lines_per_sec,
                 ane_supervisor,
+                catalog_lane.as_deref(),
             )?;
             (backend, loaded, None)
         }
@@ -6880,6 +6895,7 @@ fn load_catalog_model_blocking(
                 worker_load_timeout,
                 worker_forward_lines_per_sec,
                 ane_supervisor,
+                catalog_lane.as_deref(),
             )?;
             (backend, loaded, None)
         }
@@ -7036,6 +7052,14 @@ fn ane_lane_error_to_wire(
     error: worker_host::ane_residency::AneResidencyError,
     lane: &str,
 ) -> WireOperationError {
+    if let worker_host::ane_residency::AneResidencyError::Quarantined { retry_after_ms } = &error {
+        let mut wire = WireOperationError::from_stable(
+            StableError::engine_crashed(Some(*retry_after_ms)),
+            error.to_string(),
+        );
+        wire.details = Some(json!({"lane_id": lane, "quarantined": true}));
+        return wire;
+    }
     let mut wire = ane_residency_error_to_wire(error);
     if wire.code == worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING {
         if let Some(Value::Object(details)) = wire.details.as_mut() {
@@ -7093,6 +7117,7 @@ fn load_worker_backend_blocking(
     worker_load_timeout: Duration,
     worker_forward_lines_per_sec: u32,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
+    catalog_lane: Option<&str>,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
@@ -7122,9 +7147,10 @@ fn load_worker_backend_blocking(
         .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
         .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    config.load_timeout = worker_load_timeout;
+    let _ = worker_load_timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.model_id = Some(spec.model_id.clone());
+    config.catalog_lane = catalog_lane.map(str::to_owned);
     config.worker_forward_lines_per_sec = worker_forward_lines_per_sec;
     config.engine_identity = Some(spec.engine_identity.clone());
     config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
@@ -7161,8 +7187,8 @@ fn load_worker_backend_blocking(
             ),
         )
     })?;
-    let loaded_model =
-        EmbedEngine::load(&mut engine, artifact, runtime_config).map_err(engine_error_to_wire)?;
+    let loaded_model = EmbedEngine::load(&mut engine, artifact, runtime_config)
+        .map_err(|error| worker_error_to_wire(error, catalog_lane))?;
     Ok((
         EmbedBackend::Worker(Arc::new(Mutex::new(engine))),
         loaded_model,
@@ -10617,7 +10643,7 @@ fn build_supervised_decode_dispatch_for_chain_k(
     host_config.worker_id = format!("synapse-owned-decode-{}", spec.model_id);
     host_config.model_id = Some(spec.model_id.clone());
     host_config.worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
-    host_config.load_timeout = state.runtime.worker_load_timeout;
+
     host_config.request_timeout = Duration::from_millis(deadline_ms.max(1));
     let factory = OwnedDecodeWorkerFactory::new(host_config, artifact, runtime_config);
     let key = QuarantineKey::new(
@@ -12876,6 +12902,52 @@ async fn upfront_execution_permit(
     }
 }
 
+// Dropping the caller's JoinHandle leaves the task reading the worker's reply
+// running. Never abort that task after dispatch: it must drain the entire reply
+// before releasing the shared connection, or the next request could consume it.
+async fn await_worker_completion<T>(
+    handle: tokio::task::JoinHandle<Result<T, EngineError>>,
+    deadline: Option<tokio::time::Instant>,
+    catalog_lane: Option<&str>,
+) -> Result<T, WireOperationError> {
+    let expired = || {
+        WireOperationError::from_stable(
+            StableError::deadline_exceeded(),
+            "caller deadline expired; worker exchange continues draining",
+        )
+    };
+    let joined = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, handle)
+            .await
+            .map_err(|_| expired())?,
+        None => handle.await,
+    };
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(expired());
+    }
+    joined
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("worker owner join failed: {error}"),
+            )
+        })?
+        .map_err(|error| worker_error_to_wire(error, catalog_lane))
+}
+
+fn worker_dispatch_deadline(deadline: Option<tokio::time::Instant>) -> Result<(), EngineError> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(EngineError {
+            stage: EngineErrorStage::Inference,
+            risk_class: synapse_core::EngineRiskClass::AbortSafe,
+            message: "caller deadline expired before worker dispatch".into(),
+            retry_after_ms: None,
+            safe_to_retry_same_request: true,
+        });
+    }
+    Ok(())
+}
+
 async fn execute_embedding_with_catalog_guard(
     runtime: &RuntimeState,
     model: &EmbeddingModel,
@@ -13033,7 +13105,8 @@ async fn execute_embedding_with_catalog_guard(
             let loaded_model = model.loaded_model.clone();
             let submitted_at = Instant::now();
             let job_id = job_id.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
+                let _activity = _activity;
                 let entered_at = Instant::now();
                 if profile {
                     tracing::debug!(
@@ -13046,7 +13119,9 @@ async fn execute_embedding_with_catalog_guard(
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
                 let _lane_execution = lane_execution;
-                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
+                if let Some(id) = fault_lane.as_deref() {
+                    catalog_engine_fault(id, "serve")?;
+                }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
@@ -13063,9 +13138,9 @@ async fn execute_embedding_with_catalog_guard(
                         "mutex_acquired"
                     );
                 }
+                worker_dispatch_deadline(deadline)?;
                 let inference_started = Instant::now();
-                let result =
-                    engine.embed_batch_with_job(&loaded_model, batch, job_id.as_deref());
+                let result = engine.embed_batch_with_job(&loaded_model, batch, job_id.as_deref());
                 if profile {
                     tracing::debug!(
                         target: "perf",
@@ -13076,15 +13151,13 @@ async fn execute_embedding_with_catalog_guard(
                     );
                 }
                 result
-            })
+            });
+            await_worker_completion(
+                handle,
+                deadline,
+                catalog_lane.then_some(model.model_id.as_str()),
+            )
             .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("embedding worker join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
         }
     };
     if result.is_ok() {
@@ -13233,7 +13306,8 @@ async fn execute_rerank_with_catalog_guard(
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             let job_id = job_id.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
+                let _activity = _activity;
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
                 let _lane_execution = lane_execution;
@@ -13255,16 +13329,15 @@ async fn execute_rerank_with_catalog_guard(
                 } else {
                     request
                 };
+                worker_dispatch_deadline(deadline)?;
                 engine.rerank_with_job(&loaded_model, request, job_id.as_deref())
-            })
+            });
+            await_worker_completion(
+                handle,
+                deadline,
+                catalog_lane.then_some(model.model_id.as_str()),
+            )
             .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("rerank worker join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
         }
     };
     if result.is_ok() {
@@ -13571,7 +13644,8 @@ async fn execute_generate(
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             let job_id = job_id.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
+                let _activity = _activity;
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
                 let _lane_execution = lane_execution;
@@ -13585,16 +13659,15 @@ async fn execute_generate(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
+                worker_dispatch_deadline(deadline)?;
                 engine.generate_with_job(&loaded_model, request, job_id.as_deref())
-            })
+            });
+            await_worker_completion(
+                handle,
+                deadline,
+                catalog_lane.then_some(model.model_id.as_str()),
+            )
             .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("generate worker join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
         }
     };
     if let Ok(output) = &result {
@@ -13603,6 +13676,25 @@ async fn execute_generate(
             .record_completed_tokens((output.n_prompt as u64).saturating_add(output.n_gen as u64));
     }
     result
+}
+
+// The generic host uses WorkerCrash only for quarantine on serving calls.
+// Ordinary transport failures use the operation's inference/load stage.
+// Catalog serving retries after a cool-down; it does not require the caller to
+// run a legacy worker probe and record approval before serving can resume.
+fn worker_error_to_wire(error: EngineError, catalog_lane: Option<&str>) -> WireOperationError {
+    if let Some(lane_id) = catalog_lane.filter(|_| error.stage == EngineErrorStage::WorkerCrash) {
+        let retry_after_ms = error
+            .retry_after_ms
+            .unwrap_or(worker_host::CATALOG_QUARANTINE_COOLDOWN.as_millis() as u64);
+        let mut wire = WireOperationError::from_stable(
+            StableError::engine_crashed(Some(retry_after_ms)),
+            error.message,
+        );
+        wire.details = Some(json!({ "lane_id": lane_id, "quarantined": true }));
+        return wire;
+    }
+    engine_error_to_wire(error)
 }
 
 fn engine_error_to_wire(error: EngineError) -> WireOperationError {
@@ -26876,7 +26968,10 @@ mod catalog_runtime_tests {
                 let serving = root.join("s");
                 spec.worker_runtime_dir = Some(serving.clone());
                 let error = load_catalog_model_blocking(
-                    spec,
+                    CatalogAwareModelSpec {
+                        stored: spec,
+                        catalog_lane: None,
+                    },
                     state.model_cache.clone(),
                     8192,
                     Duration::from_secs(10),
@@ -27174,7 +27269,10 @@ mod catalog_runtime_tests {
         spec.worker_runtime_dir = Some(runtime_dir.clone());
         drop(fixture);
         let model = load_catalog_model_blocking(
-            spec,
+            CatalogAwareModelSpec {
+                stored: spec,
+                catalog_lane: None,
+            },
             state.model_cache.clone(),
             8192,
             Duration::from_secs(10),

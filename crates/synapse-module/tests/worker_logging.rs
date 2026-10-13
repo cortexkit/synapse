@@ -69,7 +69,7 @@ async fn start_fixture_worker(
     config.model_id = Some(model_id.to_string());
     config.worker_forward_lines_per_sec = cap;
     config.handshake_timeout = Duration::from_secs(5);
-    config.load_timeout = Duration::from_secs(5);
+
     config.extra_args = vec!["--stderr-lines".to_string(), stderr_lines.to_string()];
     if let Some(delay_ms) = final_delay_ms {
         config
