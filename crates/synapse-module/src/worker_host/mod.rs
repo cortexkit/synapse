@@ -5739,6 +5739,22 @@ pub mod ane_residency {
         where
             P: Future<Output = Result<ExchangePermit, AneResidencyError>>,
         {
+            self.exchange_inference_checked(request, raw, deadline, io_timeout, None, permit)
+                .await
+        }
+
+        async fn exchange_inference_checked<P>(
+            &self,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+            deadline: Option<tokio::time::Instant>,
+            io_timeout: std::time::Duration,
+            expected_dims: Option<usize>,
+            permit: P,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError>
+        where
+            P: Future<Output = Result<ExchangePermit, AneResidencyError>>,
+        {
             let generation = self.generation();
             let expired = |deadline: Option<tokio::time::Instant>| {
                 deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -5789,8 +5805,52 @@ pub mod ane_residency {
             if expired(deadline) {
                 return Err(deadline_expired(None));
             }
-            self.exchange_locked(&mut guard, request, raw, generation, Some(io_timeout))
-                .await
+            let result = self
+                .exchange_locked(&mut guard, request, raw, generation, Some(io_timeout))
+                .await;
+            let result = result.and_then(|(response, raw)| {
+                let serving = match &response {
+                    WorkerResponse::Vectors { dims, .. } => {
+                        if expected_dims.is_some_and(|expected| expected != *dims) {
+                            return Err(AneResidencyError::Channel(
+                                "inference output dimensions do not match the model".into(),
+                            ));
+                        }
+                        true
+                    }
+                    WorkerResponse::Scores { .. } => true,
+                    _ => false,
+                };
+                if serving {
+                    let values =
+                        synapse_core::decode_f32_frame(raw.as_deref().ok_or_else(|| {
+                            AneResidencyError::Channel("missing inference raw frame".into())
+                        })?)
+                        .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+                    if values.iter().any(|value| !value.is_finite()) {
+                        return Err(AneResidencyError::Channel(
+                            "nonfinite inference output".into(),
+                        ));
+                    }
+                    // Validation remains inside the stream lock: a later request
+                    // or recovery cannot turn this generation's rejected result
+                    // into a healthy completion and erase its preceding fault.
+                    if self.generation() == generation && !self.faulted.load(Ordering::Acquire) {
+                        let mut faults = self.faults.lock().unwrap_or_else(|p| p.into_inner());
+                        faults.strikes = 0;
+                        faults.last_generation = None;
+                        faults.until = None;
+                    }
+                }
+                Ok((response, raw))
+            });
+            if matches!(&result, Err(AneResidencyError::Channel(_)))
+                && self.generation() == generation
+                && !self.faulted.swap(true, Ordering::AcqRel)
+            {
+                self.charge_fault(generation);
+            }
+            result
         }
 
         async fn exchange_locked(
@@ -5864,17 +5924,6 @@ pub mod ane_residency {
             match result {
                 Ok((response, raw)) => {
                     exchange_guard.completed = true;
-                    if matches!(
-                        response,
-                        WorkerResponse::Vectors { .. } | WorkerResponse::Scores { .. }
-                    ) && self.generation() == generation
-                        && !self.faulted.load(Ordering::Acquire)
-                    {
-                        let mut faults = self.faults.lock().unwrap_or_else(|p| p.into_inner());
-                        faults.strikes = 0;
-                        faults.last_generation = None;
-                        faults.until = None;
-                    }
                     if matches!(
                         request,
                         WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
@@ -6999,11 +7048,12 @@ pub mod ane_residency {
             };
             let (response, raw) = self
                 .channel
-                .exchange_inference(
+                .exchange_inference_checked(
                     &request,
                     Some(&raw),
                     deadline,
                     self.metadata.timeout,
+                    Some(if rerank { 1 } else { self.metadata.dims }),
                     permit,
                 )
                 .await?;
@@ -8042,6 +8092,7 @@ pub mod ane_residency {
             inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             admit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             fail_inference: bool,
+            invalid_inference: Option<InvalidInference>,
             evict_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             /// Requests currently running on (model_ref, shape); a request
             /// counts itself here only while it holds that shape's lease.
@@ -8074,6 +8125,12 @@ pub mod ane_residency {
         }
 
         type SharedLedger = Arc<Mutex<Ledger>>;
+
+        #[derive(Clone, Copy)]
+        enum InvalidInference {
+            Nonfinite,
+            Dimensions,
+        }
 
         fn record_token_ids(
             ledger: &SharedLedger,
@@ -8321,11 +8378,29 @@ pub mod ane_residency {
                             .iter()
                             .all(|rung| own.contains(&(model_ref.clone(), *rung)))
                         {
-                            let values: Vec<f32> = rungs.iter().map(|rung| *rung as f32).collect();
+                            let invalid = ledger.lock().unwrap().invalid_inference.take();
+                            let dims = if matches!(invalid, Some(InvalidInference::Dimensions)) {
+                                2
+                            } else {
+                                1
+                            };
+                            let values: Vec<f32> = rungs
+                                .iter()
+                                .flat_map(|rung| {
+                                    vec![
+                                        if matches!(invalid, Some(InvalidInference::Nonfinite)) {
+                                            f32::NAN
+                                        } else {
+                                            *rung as f32
+                                        };
+                                        dims
+                                    ]
+                                })
+                                .collect();
                             (
                                 WorkerResponse::Vectors {
                                     req_id: req_id.clone(),
-                                    dims: 1,
+                                    dims,
                                     n: items.len(),
                                 },
                                 Some(encode_f32_frame(&values)),
@@ -10848,6 +10923,47 @@ pub mod ane_residency {
             release.notify_one();
             task.await.unwrap().unwrap();
             assert!(serving.supervisor.resident_shapes().is_empty());
+        }
+
+        async fn rejected_serving_output_is_second_fault(invalid: InvalidInference) {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            ledger.lock().unwrap().fail_inference = true;
+            assert!(matches!(
+                serving.infer(vec![vec![1]], false).await,
+                Err(AneResidencyError::Channel(_))
+            ));
+            assert_eq!(serving.channel.faults.lock().unwrap().strikes, 1);
+            ledger.lock().unwrap().invalid_inference = Some(invalid);
+            assert!(matches!(
+                serving.infer(vec![vec![1]], false).await,
+                Err(AneResidencyError::Channel(_))
+            ));
+            assert_eq!(
+                serving.channel.faults.lock().unwrap().strikes,
+                2,
+                "a correctly framed but rejected serving result must strike, never clear history"
+            );
+            assert_eq!(
+                ledger.lock().unwrap().connects["serving"],
+                2,
+                "quarantine must not replace the second faulty generation"
+            );
+            assert!(matches!(
+                serving.infer(vec![vec![1]], false).await,
+                Err(AneResidencyError::Quarantined { .. })
+            ));
+            serving.retire().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn ane_disconnect_then_nan_result_quarantines() {
+            rejected_serving_output_is_second_fault(InvalidInference::Nonfinite).await;
+        }
+
+        #[tokio::test]
+        async fn ane_disconnect_then_dimension_mismatch_quarantines() {
+            rejected_serving_output_is_second_fault(InvalidInference::Dimensions).await;
         }
 
         #[tokio::test]
