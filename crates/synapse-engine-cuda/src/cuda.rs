@@ -1,79 +1,4 @@
 #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-use std::ffi::c_void;
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-type ProgressCallback = Option<unsafe extern "C" fn(*mut c_void, i32)>;
-
-pub(super) trait ProgressContext {
-    #[cfg(all(feature = "cuda", not(target_os = "macos")))]
-    fn set_progress(
-        &mut self,
-        callback: ProgressCallback,
-        cookie: *mut c_void,
-    ) -> anyhow::Result<()>;
-}
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-struct ProgressState<'a> {
-    callback: &'a mut dyn FnMut(bool) -> Result<(), String>,
-    error: Option<String>,
-}
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-struct ProgressReset<'a, C: ProgressContext>(&'a mut C);
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-impl<C: ProgressContext> Drop for ProgressReset<'_, C> {
-    fn drop(&mut self) {
-        let _ = self.0.set_progress(None, std::ptr::null_mut());
-    }
-}
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-unsafe extern "C" fn completed(cookie: *mut c_void, setup: i32) {
-    // Native code calls synchronously on the forwarding thread, after a CUDA
-    // completion event. The model mutex and with_progress keep this borrow live.
-    let state = unsafe { &mut *cookie.cast::<ProgressState<'_>>() };
-    if state.error.is_none() {
-        state.error = (state.callback)(setup != 0).err();
-    }
-}
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
-pub(super) fn with_progress<C: ProgressContext, T>(
-    context: &mut C,
-    callback: Option<&mut dyn FnMut(bool) -> Result<(), String>>,
-    operation: impl FnOnce(&mut C) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let Some(callback) = callback else {
-        return operation(context);
-    };
-    let mut state = ProgressState {
-        callback,
-        error: None,
-    };
-    context.set_progress(
-        Some(completed),
-        (&mut state as *mut ProgressState<'_>).cast(),
-    )?;
-    let reset = ProgressReset(context);
-    let result = operation(reset.0);
-    drop(reset);
-    if let Some(error) = state.error {
-        return Err(anyhow::anyhow!("progress write failed: {error}"));
-    }
-    result
-}
-
-#[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
-pub(super) fn with_progress<C: ProgressContext, T>(
-    context: &mut C,
-    _: Option<&mut dyn FnMut(bool) -> Result<(), String>>,
-    operation: impl FnOnce(&mut C) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    operation(context)
-}
-
-#[cfg(all(feature = "cuda", not(target_os = "macos")))]
 mod enabled {
     use std::ffi::{c_char, c_void, CStr};
     use std::ptr::NonNull;
@@ -697,49 +622,9 @@ mod enabled {
     /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR` from `cuda.h`.
     const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
-    macro_rules! progress_context {
-        ($context:ty, $setter:ident) => {
-            impl super::ProgressContext for $context {
-                fn set_progress(
-                    &mut self,
-                    callback: super::ProgressCallback,
-                    cookie: *mut c_void,
-                ) -> Result<()> {
-                    // Detaching changes only native CPU fields, even if device
-                    // binding failed. No dangling callback may survive unwinding.
-                    if callback.is_some() {
-                        self.binding.bind()?;
-                    }
-                    unsafe {
-                        $setter(self.raw.as_ptr(), callback, cookie);
-                    }
-                    Ok(())
-                }
-            }
-        };
-    }
-    progress_context!(MiniLmContext, synapse_cuda_set_progress);
-    progress_context!(ModernBertContext, synapse_cuda_modernbert_set_progress);
-    progress_context!(Qwen3Context, synapse_cuda_qwen3_set_progress);
-
     unsafe extern "C" {
 
         fn cudaGetDevice(device: *mut i32) -> i32;
-        fn synapse_cuda_set_progress(
-            context: *mut c_void,
-            callback: super::ProgressCallback,
-            cookie: *mut c_void,
-        );
-        fn synapse_cuda_modernbert_set_progress(
-            context: *mut c_void,
-            callback: super::ProgressCallback,
-            cookie: *mut c_void,
-        );
-        fn synapse_cuda_qwen3_set_progress(
-            context: *mut c_void,
-            callback: super::ProgressCallback,
-            cookie: *mut c_void,
-        );
         fn cudaSetDevice(device: i32) -> i32;
         fn cudaGetErrorString(status: i32) -> *const c_char;
         fn synapse_cuda_context_new(graphs_enabled: i32) -> *mut c_void;
@@ -903,16 +788,3 @@ mod enabled {
 pub use enabled::{
     ensure_available, probe_hardware_floor, MiniLmContext, ModernBertContext, Qwen3Context,
 };
-
-#[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
-macro_rules! stub_progress_context {
-    ($context:ty) => {
-        impl ProgressContext for $context {}
-    };
-}
-#[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
-stub_progress_context!(MiniLmContext);
-#[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
-stub_progress_context!(ModernBertContext);
-#[cfg(not(all(feature = "cuda", not(target_os = "macos"))))]
-stub_progress_context!(Qwen3Context);

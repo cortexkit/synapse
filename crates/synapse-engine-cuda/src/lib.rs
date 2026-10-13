@@ -63,24 +63,24 @@ pub const fn port_provenance() -> [PortSourceProvenance; 5] {
             spike_path: "bench/spikes/unified-rt/src/cuda_minilm.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "9848c050015d7f2ecd0ecc6aa628bb4e4d4280778e4a7eb6590475e937f30375",
-            production_digest: "af4c5ee57da2c59aec4f359d65e6f0e85f3ded9702205e58065d6512b79feb59",
-            reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
+            production_digest: "9848c050015d7f2ecd0ecc6aa628bb4e4d4280778e4a7eb6590475e937f30375",
+            reviewed_difference: "byte-identical",
         },
         PortSourceProvenance {
             production_path: "src/port/cuda_modernbert.cu",
             spike_path: "bench/spikes/unified-rt/src/cuda_modernbert.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "455e4419c0c6996b004153e1709e9d6ef001ca0d865e42bc7af2ad6809b350b9",
-            production_digest: "531bee77abb44a6792d3eea816c8e14a83e6b3e47fc74ef80a12487b296cc065",
-            reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
+            production_digest: "455e4419c0c6996b004153e1709e9d6ef001ca0d865e42bc7af2ad6809b350b9",
+            reviewed_difference: "byte-identical",
         },
         PortSourceProvenance {
             production_path: "src/port/cuda_qwen3.cu",
             spike_path: "bench/spikes/unified-rt/src/cuda_qwen3.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "a4c05d7cf119b39ffe52cdfa77f39859ddee8ac3e18139d8094219fbc8a1588b",
-            production_digest: "26091a5bfd16ad5e81d3e41c535a7f9c2ec215a7f173c340d77d9552e98a088b",
-            reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
+            production_digest: "a4c05d7cf119b39ffe52cdfa77f39859ddee8ac3e18139d8094219fbc8a1588b",
+            reviewed_difference: "byte-identical",
         },
     ]
 }
@@ -262,56 +262,6 @@ impl OwnedCudaEmbedEngine {
     #[must_use]
     pub fn serving(family: ModelFamily) -> Self {
         Self::new(family, resolved_storage_dtype(family))
-    }
-
-    pub fn embed_batch_progress(
-        &self,
-        model_ref: &LoadedModel,
-        batch: TokenBatch,
-        progress: &mut dyn FnMut(bool) -> Result<(), String>,
-    ) -> Result<Vectors, EngineError> {
-        self.embed_batch_inner(model_ref, batch, Some(progress))
-    }
-
-    fn embed_batch_inner(
-        &self,
-        model_ref: &LoadedModel,
-        batch: TokenBatch,
-        progress: Option<&mut dyn FnMut(bool) -> Result<(), String>>,
-    ) -> Result<Vectors, EngineError> {
-        if batch.items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let entry = self.models.get(&model_ref.model_id).ok_or_else(|| {
-            Self::error(
-                EngineErrorStage::Inference,
-                format!("unknown owned-cuda model ref '{}'", model_ref.model_id),
-            )
-        })?;
-        let mut entry = entry.lock().map_err(|_| {
-            Self::error(
-                EngineErrorStage::Inference,
-                "owned-cuda model mutex was poisoned",
-            )
-        })?;
-        match &mut *entry {
-            LoadedFamily::MiniLm { model, context } => {
-                cuda::with_progress(context, progress, |context| {
-                    model.embed(context, &batch.items)
-                })
-            }
-            LoadedFamily::GteModernBert { model, context } => {
-                cuda::with_progress(context, progress, |context| {
-                    model.embed(context, &batch.items, precision(self.dtype))
-                })
-            }
-            LoadedFamily::Qwen3 { model, context } => {
-                cuda::with_progress(context, progress, |context| {
-                    model.embed(context, &batch.items)
-                })
-            }
-        }
-        .map_err(|error| Self::error(EngineErrorStage::Inference, error.to_string()))
     }
 
     #[must_use]
@@ -539,7 +489,29 @@ impl EmbedEngine for OwnedCudaEmbedEngine {
         model_ref: &LoadedModel,
         batch: TokenBatch,
     ) -> Result<Vectors, EngineError> {
-        self.embed_batch_inner(model_ref, batch, None)
+        if batch.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entry = self.models.get(&model_ref.model_id).ok_or_else(|| {
+            Self::error(
+                EngineErrorStage::Inference,
+                format!("unknown owned-cuda model ref '{}'", model_ref.model_id),
+            )
+        })?;
+        let mut entry = entry.lock().map_err(|_| {
+            Self::error(
+                EngineErrorStage::Inference,
+                "owned-cuda model mutex was poisoned",
+            )
+        })?;
+        match &mut *entry {
+            LoadedFamily::MiniLm { model, context } => model.embed(context, &batch.items),
+            LoadedFamily::GteModernBert { model, context } => {
+                model.embed(context, &batch.items, precision(self.dtype))
+            }
+            LoadedFamily::Qwen3 { model, context } => model.embed(context, &batch.items),
+        }
+        .map_err(|error| Self::error(EngineErrorStage::Inference, error.to_string()))
     }
 
     fn embed_one(&self, model: &LoadedModel, ids: TokenIds) -> Result<Vector, EngineError> {

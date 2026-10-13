@@ -103,7 +103,9 @@ of this boundary and stays fixed there).
 - The idle watchdog starts only after owning the stream and, for inference,
   its execution permit. Compilation holds no execution permit.
   All inference has a fixed 120-second silence window; LOAD, shape/packed
-  compilation, eviction and CUDA cold setup use 600 seconds. Completed work
+   compilation, eviction and Rust-side CUDA input preparation use 600 seconds.
+   CUDA switches to inference before its opaque forward, so native upload and
+   plan/graph setup share the 120-second window. Completed work
   renews that window. A no-progress expiry faults/kills the owned worker and
   counts as a strike, not a caller deadline.
 - Worker exit/socket EOF mid-request → engine_crashed, request fails typed

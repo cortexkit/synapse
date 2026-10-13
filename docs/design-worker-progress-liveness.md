@@ -87,7 +87,7 @@ another generation's watchdog.
 | Engine/operation | Progress boundary | Reason |
 | --- | --- | --- |
 | Vulkan inference | After each completed transformer layer and each completed output row; also after input preparation and output readback. | The runtime already waits for `queue_wait_idle` at every shader dispatch. The layer callback therefore describes completed GPU work without adding a new synchronization policy (`crates/synapse-worker-vulkan/src/runtime.rs:430-453,1019-1098,1114-1260`). Reporting only completed rows would leave the entire slow 8,192-token row silent; layer completions show that work is advancing inside that row. |
-| CUDA inference | After each retired layer and completed output sub-batch, plus completed weight-upload/shape-setup milestones. | Rust currently invokes one opaque batch forward C ABI call. Extend that ABI with a progress callback. Use CUDA completion events on the actual execution stream (including captured-graph layers), waited on by the host before reporting; never call socket code during graph capture or mistake kernel submission for retirement (`crates/synapse-engine-cuda/src/cuda.rs:391-431,648-665`; `crates/synapse-engine-cuda/src/port/cuda_modernbert.cu:351-466,485-517`). |
+| CUDA inference | In the Rust worker, after validating/assembling inputs immediately before forward, then after each successful batch forward returns. | Preserve the master kernels and C ABI byte-for-byte. Each current engine batch invokes one opaque forward, including native upload and plan/graph setup; do not split batching or add synchronization to obtain progress. The rental's bounded 8,192-token calls, including first shape use, are far inside 120 seconds. The first frame records completed Rust input preparation and switches to inference; it does not claim GPU upload or a layer has completed. |
 | Direct ANE inference | After each synchronous layer evaluation and output row; packed execution reports layers and completed passes. | Cached executable evaluation already blocks through execution. The callback belongs after that call, not before it (`crates/synapse-worker-ane-direct/src/backend.rs:396-424`; `crates/synapse-worker-ane-direct/src/worker.rs:433-514`). |
 | Direct ANE shape/packed admission | After each layer's graph compilation/load, and after final residency publication. | A whole cold shape can take minutes. One native compiler invocation is opaque, but successive layer completions are observable (`crates/synapse-worker-ane-direct/src/backend.rs:257-320`). |
 | Swift Core ML inference | Keep the existing whole-batch `predictions(fromBatch:)` call and report only its terminal reply. | Product Core ML runs on Apple Silicon with fixed buckets of at most 512 tokens; the approved 120-second window exceeds the slowest served batch by more than 70 times. Do not change batching, throughput or numerics merely to obtain progress. The worker implementation has no mid-call completion callback (`crates/synapse-worker-ane/swift/ane_worker.swift:267-331,413-437`). |
@@ -108,8 +108,8 @@ cannot advertise an `idle_window_ms` value or request a longer watchdog:
 
 | Operation | Maximum silence after dispatch or last valid progress |
 | --- | ---: |
-| All engines' inference, including opaque Core ML/llama calls (CUDA after setup) | 120 seconds |
-| LOAD, first-time shape/packed compilation, eviction and CUDA cold setup | 600 seconds |
+| All engines' inference, including opaque Core ML/llama calls and CUDA from its Rust pre-forward transition | 120 seconds |
+| LOAD, first-time ANE shape/packed compilation, eviction and CUDA input preparation before forward | 600 seconds |
 | PING, UNLOAD and other short control exchanges | 120 seconds |
 
 These are **idle** windows, not total budgets. Replace the 30/180-second generic
@@ -169,13 +169,31 @@ would estimate roughly 666 seconds for an entire row, not a single layer. A
 assume that the whole row finishes in 120 seconds. Vulkan's existing
 per-dispatch queue waits mean a layer completion proves actual GPU retirement.
 No per-layer maximum has yet been measured on the Ally; Phase 2 must record
-the maximum observed progress gap as well as total 8,192-token time. The same
-120-second window for CUDA is an estimate based on synchronized layer-sized
-work, not on an observed slowest CUDA gap; cold graph setup uses the setup
-window until that setup has completed. A CUDA inference exchange starts with
-a 600-second setup allowance; its first completed input/plan-preparation frame
-with `phase: "inference"` switches to 120 seconds. If setup is already cached,
-emit that frame as soon as input preparation completes. The host allows only
+the maximum observed progress gap as well as total 8,192-token time.
+
+The NVIDIA rental at commit `db3b0176` rejected the original per-layer CUDA
+instrumentation: all four cells at `b13add21` failed the first-load self-check
+with "the operation cannot be performed in the present state", while master
+`5f6d7419` passed all four on the same RTX 5090 (driver 595.84, API 13020).
+Per-layer completion events inside captured-graph work are removed, rather than
+changing graph execution or adding another native callback ABI.
+
+That rental measured master 8,192-token warm RPCs at 0.19 s (gte embed), 0.23 s
+(gte rerank), 0.31 s (Qwen3 embed) and 0.33 s (Qwen3 rerank). First use of each
+new shape, including plan and graph setup, took 0.81-0.91 s across those models.
+A compute-7.5 floor card is expected to be slower, but not the more than 130-fold
+cold or 360-fold warm slowdown needed to reach 120 seconds for these bounded
+calls. That is conservative performance reasoning, not a measurement or
+certification on a compute-7.5 card.
+
+A CUDA exchange still starts with the 600-second setup allowance. Its completed
+Rust input validation/assembly emits `phase: "inference"` immediately before the
+opaque forward. The maintainer approved this boundary because the unchanged C
+ABI exposes no post-upload/plan-ready hook: the 120-second window also covers
+native upload and plan/graph setup, whether cold or warm. Forward already waits
+for output, so its successful return provides the next completed-work point
+without any new GPU event, callback or host synchronization. Preserve current
+batch geometry; there are no artificial sub-batches or timer heartbeats. The host allows only
 a one-way setup-to-inference transition for CUDA and does not accept setup
 frames during Vulkan/direct ANE inference. LOAD/admission/eviction use `setup`,
 other inference uses `inference`, and short controls use `control`. A worker

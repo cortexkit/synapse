@@ -7,7 +7,6 @@ fn main() {
 
     for source in [
         "src/port/cuda_family_common.cuh",
-        "src/port/cuda_progress.cuh",
         "src/port/cuda_minilm.h",
         "src/port/cuda_minilm.cu",
         "src/port/cuda_modernbert.cu",

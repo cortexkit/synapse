@@ -101,6 +101,14 @@ clippy passed after adding the cancellation guard.
 
 ## 4. Report CUDA inference phase after input completion, before layer zero
 
+The native instrumentation described below was subsequently rejected by the
+RTX 5090 rental. The current worker instead reports completed Rust input
+preparation immediately before the unchanged opaque forward, then its successful
+completion. Native upload and plan/graph setup now share the 120-second inference
+window. The design note records the measured timing margin and the reason for
+preserving the master C ABI; the historical ordering proof below is not a claim
+that the removed native callbacks worked on a GPU.
+
 All three native ports now report the inference transition in `ShapePlan::run`
 after the plan is ready and the actual H2D input/mask uploads complete, on both
 cached and cold paths, before submitting/waiting on layer zero. The old report

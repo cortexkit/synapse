@@ -205,40 +205,31 @@ python3 docs/evidence/worker-progress-liveness/summarize_raw.py \
   --raw-root "$HOME/.local/share/cortexkit/synapse/evidence-raw/worker-progress-liveness" --check
 ```
 
-## CUDA progress cost: synchronization reasoning, not a GPU benchmark
+## CUDA rental rejection and Rust-only progress
 
-No CUDA GPU was available for this work, so the latency/throughput cost has **not
-been measured**. Native nvcc compilation and API documentation are not a
-performance measurement; the Ally Vulkan and M4 ANE results do not answer it.
+The subsequent NVIDIA rental evidence at commit `db3b0176` reports that all four
+CUDA cells at `b13add21` failed first-load self-check with "the operation cannot
+be performed in the present state". Master `5f6d7419` passed all four on the same
+RTX 5090 (driver 595.84, API 13020); the candidate's four Vulkan cells also passed.
+The failing native API was not identified, so this is a regression observation,
+not proof of a particular CUDA API failure. The maintainer directed removal of
+all per-layer CUDA progress rather than risking another captured-graph change.
 
-The code submits all layers on the context's existing single execution stream
-before entering `SynapseLayerProgress::wait`. Graph mode likewise calls
-`cudaGraphLaunch` before that loop. Waiting on each completion event blocks the
-calling **CPU** thread; it does not insert a host wait between submitting one
-layer and submitting the next. Already queued GPU kernels can continue while
-the CPU waits and reports, so this is not a new submit-layer/wait/submit-next
-scheme, and no cross-stream overlap is removed by those host waits themselves.
-The model mutex already serialized requests on that context before progress
-instrumentation.
+The CUDA kernels, C ABI, Rust native bindings, build configuration and source
+provenance are restored to master. Only the Rust worker reports progress: after
+validating/assembling inputs, immediately before its unchanged batch forward,
+and after that forward successfully returns. The first frame selects the
+120-second inference allowance, including native upload and plan/graph setup;
+it does not assert that upload is complete. The baseline forward already waits
+for output. No new device event, capture callback or GPU synchronization remains,
+and batch geometry is unchanged. The two JSON writes can still add CPU/socket
+cost; no zero-overhead claim is made.
 
-There is nevertheless real added work. With reporting enabled, one host stream
-synchronization confirms the H2D input uploads before emitting the inference
-transition and submitting compute, so a first-layer stall uses the inference
-window rather than setup time. That input-stage host synchronization can delay
-compute submission and has not been benchmarked. In addition: one timing-disabled
-event per layer per shape plan, an event record per layer (external record nodes
-in captured graphs), per-event host synchronization/wake-up and a synchronous
-JSON progress-frame write/flush. The GPU/runtime cost of the extra event nodes and the CPU/socket
-cost must be measured on CUDA hardware. The output D2H copy is enqueued **after**
-the progress wait/report loop, then the original final stream synchronization
-still runs. Slow or backpressured reporting can therefore delay D2H submission
-and extend the locked operation; it is not zero-cost or guaranteed harmless to
-throughput. Without a callback the wait loop returns immediately, but event
-creation/records still exist, so that path also has unmeasured instrumentation
-overhead. No socket callback runs inside graph capture.
-
-The relevant paths are `src/port/cuda_progress.cuh` (`record`/`wait`), each
-family's `ShapePlan::run` and `initialize_and_verify`, `src/cuda.rs`
-(`with_progress`/`completed`), and the worker's progress writer. A CUDA GPU
-comparison of unchanged arithmetic with reporting disabled/enabled is needed
-to put a number on the cost.
+The rental measured master 8,192-token warm RPCs at 0.19/0.23/0.31/0.33 seconds
+for gte embed/rerank and Qwen3 embed/rerank, respectively. First use of new shapes,
+with plan/graph setup included, took 0.81-0.91 seconds. The expectation that a
+compute-7.5 floor card remains comfortably inside 120 seconds is reasoning from
+that large margin, not a measurement on that card. The design note explains the
+approved pre-forward boundary. Certification of the corrected CUDA worker still
+requires the maintainer's next rental run; the rejected build is not certified
+by these source changes or by native compilation.

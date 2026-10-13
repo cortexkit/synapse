@@ -173,7 +173,9 @@ async fn real_transport_progress_renews_multiple_idle_windows() {
 async fn cuda_inference_transition_uses_short_window_before_first_layer() {
     let inference = Duration::from_millis(200);
     let setup = Duration::from_secs(2);
-    let (host, model, peer) = live_host_with_script(1, Duration::from_millis(50), true).await;
+    // CUDA now announces inference before entering the opaque native forward.
+    // A blocked upload, plan setup or first layer must all use the short window.
+    let (host, model, peer) = live_host_with_script(1, Duration::ZERO, true).await;
     let mut host = host.lock().await;
     host.config.engine_identity = Some(EngineIdentity {
         engine: synapse_core::worker_engine_names::CUDA_WORKER_ENGINE.into(),
