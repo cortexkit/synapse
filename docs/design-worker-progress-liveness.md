@@ -168,8 +168,10 @@ would estimate roughly 666 seconds for an entire row, not a single layer. A
 120 seconds of silence per layer is intentionally conservative; it does not
 assume that the whole row finishes in 120 seconds. Vulkan's existing
 per-dispatch queue waits mean a layer completion proves actual GPU retirement.
-No per-layer maximum has yet been measured on the Ally; Phase 2 must record
-the maximum observed progress gap as well as total 8,192-token time.
+On the Ally, the longest gap between completed-work events across all four
+Vulkan cells was 5.78 seconds, including 8,192-token Qwen3 rows that took
+79.7 s (embed) and 94.0 s (rerank) in total
+(docs/evidence/worker-progress-liveness/ally/summary.json).
 
 The NVIDIA rental at commit `db3b0176` rejected the original per-layer CUDA
 instrumentation: all four cells at `b13add21` failed the first-load self-check
