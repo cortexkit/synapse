@@ -1,0 +1,94 @@
+{
+  "schema": 3,
+  "row_id": "vulkan-linux-nvidia",
+  "source_commit": "be6cd118a40cc8cc5e999fad9e1e880e43dcd644",
+  "machine": {
+    "driver": "NVIDIA 595.84",
+    "gpu": {
+      "device_id": "0x2b85",
+      "name": "NVIDIA GeForce RTX 5090",
+      "uuid_sha256": "1c9046a8b9ca73e36590f6daa61f0057cc97d529aae800a50a74927562cde2f0",
+      "vendor_id": "0x10de"
+    },
+    "instance_id": "55712356",
+    "os": "Linux 5.15.0-186-generic #196-Ubuntu SMP Sat Jun 20 16:09:34 UTC 2026",
+    "system_product_name": "Z790 AORUS ELITE AX ICE"
+  },
+  "executed_artifacts": [
+    {
+      "role": "ck-synapse",
+      "file": "linux-x64/ck-synapse",
+      "sha256": "414800932587b9c177afe51141141eaa1a6a8001da92dd7f9ebb62ba7051385f"
+    },
+    {
+      "role": "ck-synapse-worker-vulkan",
+      "file": "linux-x64/ck-synapse-worker-vulkan",
+      "sha256": "93ad0e36427b865ad1b5dfb54daec449a6dc74c57a7665d7c76c23b5082613f1"
+    }
+  ],
+  "model": "qwen3-reranker-0.6b",
+  "operation": "rerank",
+  "profile_id": "qwen3-reranker-0.6b.owned-vulkan",
+  "fingerprint": "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7",
+  "parity": {
+    "model": "qwen3-reranker-0.6b",
+    "operation": "rerank",
+    "profile_id": "qwen3-reranker-0.6b.owned-vulkan",
+    "fingerprint": "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7",
+    "fixture_set_id": "qwen3-reranker-0.6b.ref-v1.transformers-5.16.1.seed-0",
+    "completed_fixtures": 125,
+    "expected_fixtures": 125,
+    "tolerance_class": "fp16",
+    "metrics": {
+      "max_absolute_error": 0.000011801719665638366,
+      "max_norm_error": null,
+      "min_cosine": null,
+      "pools": {
+        "pool-10": {
+          "backend_ties": 0,
+          "concordant": 21,
+          "discordant": 0,
+          "passed": true,
+          "tau": 1.0,
+          "top10": true
+        },
+        "pool-100": {
+          "backend_ties": 0,
+          "concordant": 1924,
+          "discordant": 0,
+          "passed": true,
+          "tau": 1.0,
+          "top10": true
+        }
+      }
+    },
+    "gates": {
+      "complete": true,
+      "cosine": true,
+      "coverage": true,
+      "coverage_8192": true,
+      "dimension": true,
+      "finite": true,
+      "ranking": true,
+      "score": true,
+      "semantics": true,
+      "unit_norm": true
+    },
+    "failures": []
+  },
+  "admission": {
+    "tokens_8192": {
+      "outcome": "processed",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 1
+    },
+    "tokens_8193": {
+      "outcome": "sequence_too_long",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    }
+  },
+  "status": "passed"
+}
