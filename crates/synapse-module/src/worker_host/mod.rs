@@ -10876,7 +10876,13 @@ pub mod ane_residency {
                     .expect("caller cancellation must drain the reply without restarting"),
                 vec![vec![128.0]]
             );
-            assert_eq!(serving.supervisor.stats().restarts, 0);
+            // Cancelling the caller must neither break the next request nor
+            // restart the worker: the detached task drains the reply instead.
+            assert_eq!(
+                serving.supervisor.stats().restarts,
+                0,
+                "caller cancellation must drain the reply without restarting the worker"
+            );
             assert_eq!(serving.supervisor.stats().admitted, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
         }
