@@ -248,3 +248,81 @@ evidence. The maintainer still needs to validate native execution and compare
 latency/throughput with progress reporting disabled and enabled on rented CUDA
 hardware. The hardware README describes the unmeasured synchronization, event
 and reporting costs.
+
+## CUDA native progress removal: verification
+
+Commit `514ec3ae9d0de2129d6e8023f57bd51339bb7a98` removes the rejected native
+instrumentation. The Rust worker now reports the inference transition
+after Rust input validation/assembly and before the opaque forward, with native
+upload and plan/graph setup also covered by 120 seconds. The reason is the
+rental's 0.81-0.91-second first-use 8,192-token calls, not an unobservable claim
+that device upload has already finished. The worker preserves batch geometry
+and emits its next progress only after the original synchronous forward returns
+successfully. All production host liveness and fault-handling code is unchanged.
+
+The native port directory and the entire CUDA engine package were each compared
+against master `5f6d7419`. Both comparisons returned exit zero with no diff output:
+
+```sh
+git diff 5f6d7419 -- crates/synapse-engine-cuda/src/port
+git diff --exit-code 5f6d7419 -- crates/synapse-engine-cuda
+```
+
+The second comparison includes the native C ABI, Rust bindings, build script and
+source provenance, not just the numerical kernels. `cuda_progress.cuh` and all
+native progress setters are absent. No graph-disable workaround was added.
+
+### Gates on the corrected source
+
+Linux checks used 8 vCPUs, rustc/cargo 1.99.0, clippy 0.1.99 and rustfmt
+1.10.0-stable. The CUDA toolkit was assembled offline from the six locally
+downloaded, SHA-256-verified Linux redistributables pinned in
+`.github/workflows/release-candidate.yml`. Compiler: nvcc 13.2.78. Temporary
+download inputs were removed after assembly; no SDK or lockfile is committed.
+
+| Command | Result |
+| --- | --- |
+| `cargo test --locked -p synapse-worker-cuda` | 8 unit and 2 hosted tests passed; no GPU tests executed |
+| `cargo test --locked -p synapse-engine-cuda` | 17 tests passed |
+| `cargo test --locked -p synapse-module --lib cuda_` | 12 passed, 2 ignored, including both short-window CUDA host tests |
+| `cargo build --locked --offline -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda` | Native build passed, three CUDA translation units and one worker binary |
+| `cargo test --locked --offline -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda progress_tests` | 4 native-feature Rust boundary tests passed; no GPU execution |
+| `cargo clippy --locked -p synapse-engine-cuda -p synapse-worker-cuda --all-targets -- -D warnings` | Strict portable check passed, two packages |
+| `cargo test --locked -p synapse-module --lib` | 734 passed, 14 ignored, 70.00 s |
+| `cargo test --locked -p synapse-module --test it` | 26 passed, 244.41 s |
+| `cargo test --locked -p synapse-module --test skeleton_e2e` | 57 passed, 1 profiling test ignored, 123.62 s |
+| `cargo clippy --locked -p synapse-module --all-targets -- -D warnings` | Strict check passed, one package |
+| `cargo test --locked -p synapse-module --test catalog_fingerprints` | 5 passed, 1 pinned-artifact test ignored |
+| `cargo fmt --all -- --check` | Passed, silent on success |
+
+Native-feature all-targets clippy also passed for the engine and worker with
+`--features cuda -- -D warnings -A clippy::too_many_arguments -A
+clippy::arc_with_non_send_sync`. Only those previously recorded native baseline
+lint classes were excluded; no source suppression was added. Portable/module
+clippy remained strict.
+
+Windows-target all-targets clippy passed for the module, CUDA engine and CUDA
+worker using the repository's `zig-cc-windows.sh`/`zig-ar.sh` wrappers and four
+build jobs, target `x86_64-pc-windows-gnu`, Mac Zig 0.16.0 and clippy 0.1.99.
+`ckdev-mutate check` passed with 0.12.0 for the 66 catalogue anchors and exact
+test names, without replaying mutations. Its Mac prebuild warned that Metal
+developer tools were unavailable; no Metal inference is claimed.
+
+### Pre-forward transition negative control
+
+The live worker file was staged and local `git diff --stat` was empty. Removing
+only the first `progress()?` with a `NON-VACUITY BREAK` marker produced
+`crates/synapse-worker-cuda/src/main.rs | 2 +-` (one insertion, one deletion):
+
+```text
+cargo test --locked -p synapse-worker-cuda --bin ck-synapse-worker-cuda progress_tests::transition_precedes_forward_and_completion_follows -- --exact --nocapture
+progress_tests::transition_precedes_forward_and_completion_follows ... FAILED
+assertion left == right failed: left: [], right: ["progress"]
+0 passed; 1 failed; 7 filtered out; no other test failed
+```
+
+`git checkout -- <path> && touch <path>` restored the live file and local diff-stat
+was empty. The restored four `progress_tests` passed, including that exact test,
+and strict worker clippy and fmt passed. This test proves the Rust transition
+precedes forward; it is not a native device timing measurement. Corrected CUDA
+hardware certification remains for the maintainer's next rental run.
