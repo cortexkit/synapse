@@ -8,7 +8,12 @@ Tools: rustc 1.99.0 (b940084d7 2026-09-28), cargo 1.99.0
 (5f94df478 2026-08-27), clippy 0.1.99 (b940084d7e 2026-09-28).
 All acceptance/red controls ran on Linux with 8 vCPUs. The slow worker uses the
 spawned timeout mock over the real host transport, with 45 seconds of work and
-one progress frame per completed one-second unit. Hung cases use the actual
+one progress frame per completed one-second unit. That 45-second process test
+proves the former 30-second total cap is gone; because 45 seconds is less than
+the 120-second idle window, it does not by itself prove renewal. End-to-end
+renewal is defended separately by `real_transport_progress_renews_multiple_idle_windows`
+with a short unit-test-only host window and by removing only the renewal line.
+Hung cases use the actual
 120-second inference window, not a shortened production setting. The deadline
 case uses the production caller-wait helper and real framed Unix stream with a
 45-second exchange owner; its next request must return 9, not the abandoned

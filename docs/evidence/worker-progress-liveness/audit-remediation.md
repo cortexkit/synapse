@@ -39,3 +39,33 @@ dimensions and finite decoded values must pass. Validation errors fault/charge
 the owning generation exactly once, then use existing confirmed-exit recovery.
 An expired caller can still have a later validated detached success clear
 strikes; expiry itself never clears or charges them.
+
+## 2. Defend renewal through the real generic host transport
+
+The 45-second process test is retained and its documentation now limits its
+claim to removing the old 30-second total cap. It is shorter than the production
+120-second idle window, so it cannot prove renewal alone.
+
+`worker_host::progress_tests::real_transport_progress_renews_multiple_idle_windows`
+uses the public host over a real framed Unix stream, a 200 ms unit-test-only
+window and thirty completed 50 ms work units (about 1.53 s, over seven windows).
+It checks distinctive output, no strike and the original generation.
+
+The runtime already renews correctly. To demonstrate the test's new protection,
+only `idle_until = last + window(phase)` was replaced by a marked no-op; the
+initial allowance, protocol and producer stayed unchanged. The implementation
+was staged before mutation and local diff-stat was empty. Applied diff:
+`worker_host/liveness.rs | 2 +-` (1 insertion, 1 deletion).
+
+```text
+BASELINE/GREEN: real_transport_progress_renews_multiple_idle_windows ... ok
+1 passed; finished in 1.53s
+RENEWAL-ONLY CONTROL: the same exact test ... FAILED
+EngineCrashed: no-progress hang ... completed=3 ... idle_window_ms=200
+0 passed; 1 failed; 740 filtered out
+```
+
+`git checkout -- <path> && touch <path>` restored renewal with empty local
+`git diff --stat`; the corresponding green rerun passed. The renewal test's
+short 200 ms idle window is compiled only in unit tests; production windows
+remain fixed constants.

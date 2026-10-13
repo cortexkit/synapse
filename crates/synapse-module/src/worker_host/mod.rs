@@ -350,6 +350,8 @@ pub struct WorkerHost {
     quarantine_until: HashMap<String, Instant>,
     #[cfg(test)]
     clock: Option<Instant>,
+    #[cfg(test)]
+    test_idle_window: Option<Duration>,
     // Consecutive compute faults survive reloads and health PINGs. Only a
     // fully drained successful serving call clears them, never caller expiry.
     crashes: HashMap<String, usize>,
@@ -374,6 +376,8 @@ impl WorkerHost {
             quarantine_until: HashMap::new(),
             #[cfg(test)]
             clock: None,
+            #[cfg(test)]
+            test_idle_window: None,
             crashes: HashMap::new(),
             last_placement_share: None,
             request_counter: 0,
@@ -1110,6 +1114,16 @@ impl WorkerHost {
             .is_some_and(|identity| {
                 identity.engine == synapse_core::worker_engine_names::CUDA_WORKER_ENGINE
             });
+        let idle_override = {
+            #[cfg(test)]
+            {
+                self.test_idle_window
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
         let connection = self.connection.as_mut().expect("connected worker");
         let generation = connection.worker_generation;
         let result = liveness::exchange(
@@ -1118,7 +1132,7 @@ impl WorkerHost {
             raw.as_deref(),
             self.config.max_frame,
             cuda,
-            None,
+            idle_override,
         )
         .await;
         match result {

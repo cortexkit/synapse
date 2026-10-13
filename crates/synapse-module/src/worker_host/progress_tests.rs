@@ -7,6 +7,17 @@ async fn live_host() -> (
     LoadedModel,
     tokio::task::JoinHandle<()>,
 ) {
+    live_host_with_work(45, Duration::from_secs(1)).await
+}
+
+async fn live_host_with_work(
+    units: u64,
+    interval: Duration,
+) -> (
+    Arc<AsyncMutex<WorkerHost>>,
+    LoadedModel,
+    tokio::task::JoinHandle<()>,
+) {
     let (module, mut worker) = tokio::net::UnixStream::pair().unwrap();
     let mut host = WorkerHost::new(WorkerHostConfig::new("/bin/false", std::env::temp_dir()));
     host.connection = Some(WorkerConnection {
@@ -53,8 +64,8 @@ async fn live_host() -> (
                         .sum::<i32>() as f32;
                     inferences += 1;
                     if inferences == 1 {
-                        for completed in 1..=45 {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        for completed in 1..=units {
+                            tokio::time::sleep(interval).await;
                             if write_json(
                                 &mut worker,
                                 &WorkerResponse::Progress {
@@ -108,6 +119,33 @@ async fn live_host() -> (
         .await
         .unwrap();
     (Arc::new(AsyncMutex::new(host)), model, peer)
+}
+
+#[tokio::test]
+async fn real_transport_progress_renews_multiple_idle_windows() {
+    let window = Duration::from_millis(200);
+    let (host, model, peer) = live_host_with_work(30, Duration::from_millis(50)).await;
+    let mut host = host.lock().await;
+    host.test_idle_window = Some(window);
+    let started = Instant::now();
+    let result = host
+        .embed_batch(
+            &model,
+            TokenBatch {
+                items: vec![vec![7]],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() > window * 6,
+        "real exchange must outlive several idle windows"
+    );
+    assert_eq!(result, vec![vec![7.0]]);
+    assert_eq!(host.health_snapshot().crash_count_window, 0);
+    assert_eq!(host.connection.as_ref().unwrap().worker_generation, 1);
+    host.kill_current().await;
+    peer.await.unwrap();
 }
 
 #[tokio::test]
