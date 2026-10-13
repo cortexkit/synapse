@@ -130,3 +130,65 @@ was empty, and the marked control changed `liveness.rs | 2 +-` (1 insertion,
 handled a delivered transition correctly; this negative control defends that
 policy, while native input-stage ordering is separately compiled. No fake host
 test is claimed as a CUDA GPU proof. Finding 6 remains the rental check.
+
+## 5. Real-host fragmented and malformed frame fences
+
+Five public-host/Unix-stream adversarial tests were added:
+
+- `fragmented_progress_crossing_idle_deadline_faults_real_host`: a valid progress
+  JSON frame sent in two-byte writes straddles the original 200 ms deadline.
+  Partial traffic must not count as a completed frame or extend the window.
+- `terminal_short_raw_then_eof_faults_real_host`: a matching header declares four
+  raw bytes, but only two arrive before EOF.
+- `raw_payload_longer_than_terminal_header_faults_real_host`: the raw frame has
+  eight bytes while the valid header declares one float.
+- `progress_between_terminal_header_and_raw_faults_real_host`: a valid progress
+  JSON frame is inserted where the terminal header requires its raw float frame.
+- `terminal_header_does_not_renew_raw_deadline_real_host`: a header arrives near
+  idle expiry, but the raw body arrives after the original absolute deadline.
+
+All names are under `worker_host::framing_tests::`. Every test requires an error,
+no delivered vectors, no reusable connection and one recorded worker fault,
+which counts toward the two-consecutive-fault quarantine threshold.
+A split frame is not intrinsically invalid: the tested fragmentation deliberately
+outlives the idle deadline. Existing production guards already rejected these
+cases; this fix supplies executable adversarial coverage, not an invented parser
+bug or a claim that normal transport segmentation must fail.
+
+```text
+BASELINE/RESTORED: cargo test --locked -p synapse-module --lib worker_host::framing_tests
+5 passed; 0 failed; 743 filtered out; finished in 0.30s
+```
+
+Each requested case was also shown red in a separate one-test run after
+neutralizing the production exchange's owned-child close and fault-accounting
+behavior: it returned the error directly instead of closing and classifying the
+exchange as a worker fault. The fragmented,
+short-EOF, oversized and inserted-progress tests each failed their transport-
+fault assertion, rather than a build or HELLO check. The safe staged-source
+mutation changed `worker_host/mod.rs | 8 ++------` (2 insertions, 6 deletions);
+checkout/touch restored it and local diff-stat became empty.
+
+Targeted additional controls defend the actual byte/deadline boundaries:
+
+```text
+SKIP ONLY TERMINAL/RAW SIZE FENCE:
+raw_payload_longer_than_terminal_header_faults_real_host ... FAILED
+late local decoder saw 2 floats, expected 1 (transport was incorrectly uncharged)
+progress_between_terminal_header_and_raw_faults_real_host ... FAILED
+late local decoder saw 18 floats, expected 1
+OMIT ONLY JSON FRAME DEADLINE:
+fragmented_progress_crossing_idle_deadline_faults_real_host ... FAILED
+partial bytes must not renew original idle deadline (finished 1.18s)
+RESTART RAW DEADLINE AFTER HEADER:
+terminal_header_does_not_renew_raw_deadline_real_host ... FAILED
+unwrap_err on Ok([[7.0]]) (finished 0.30s)
+```
+
+Those were separate named tests with no other test failure in each run. Applied
+local diff-stats were respectively `liveness.rs | 2 +-`, `5 ++---` and `3 ++-`;
+each contained `NON-VACUITY BREAK`, the marker identifying the intentional
+production defect described above, and had staged live source before mutation.
+The exact named failures above demonstrate detection. Each restored to empty
+local diff after checkout/touch. Production code delivered
+with this coverage keeps its existing absolute frame deadlines and raw fences.

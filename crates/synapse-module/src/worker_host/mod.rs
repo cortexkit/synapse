@@ -53,6 +53,8 @@ mod liveness;
 #[cfg(all(test, unix))]
 use synapse_core::{read_raw, write_raw};
 #[cfg(all(test, unix))]
+mod framing_tests;
+#[cfg(all(test, unix))]
 mod progress_tests;
 
 #[derive(Clone, Debug)]
