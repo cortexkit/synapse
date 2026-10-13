@@ -98,3 +98,35 @@ usable generation rather than invoking this low-level cancellation fallback.
 
 The real-transport renewal test still passed (1) and strict module all-targets
 clippy passed after adding the cancellation guard.
+
+## 4. Report CUDA inference phase after input completion, before layer zero
+
+All three native ports now report the inference transition in `ShapePlan::run`
+after the plan is ready and the actual H2D input/mask uploads complete, on both
+cached and cold paths, before submitting/waiting on layer zero. The old report
+outside `run` did not establish input-upload completion. With a callback present,
+this adds one input-stage host stream synchronization; its performance cost is
+unmeasured and is included in the README's CUDA cost discussion. Arithmetic and
+numerical kernel revision remain unchanged; production source digests were
+updated as instrumentation provenance.
+
+Two real-host framed tests use distinct unit-test-only 200 ms inference and
+2-second setup windows. One sends the inference transition then goes silent;
+it must strike around 250 ms, not retain setup. The other delays that transition
+400 ms inside cold setup and must succeed.
+
+```text
+cuda_inference_transition_uses_short_window_before_first_layer ... ok (0.25s)
+cuda_cold_setup_keeps_distinct_initial_silence_allowance ... ok (0.40s)
+TRANSITION-ONLY CONTROL: remove phase = next_phase, keep all initial windows
+cuda_inference_transition_uses_short_window_before_first_layer ... FAILED
+inference transition must not retain the two-second setup allowance: Elapsed(())
+0 passed; 1 failed; 742 filtered out
+```
+
+The production phase assignment was staged before mutation, local diff-stat
+was empty, and the marked control changed `liveness.rs | 2 +-` (1 insertion,
+1 deletion). Checkout/touch restored it with empty local diff. The host already
+handled a delivered transition correctly; this negative control defends that
+policy, while native input-stage ordering is separately compiled. No fake host
+test is claimed as a CUDA GPU proof. Finding 6 remains the rental check.

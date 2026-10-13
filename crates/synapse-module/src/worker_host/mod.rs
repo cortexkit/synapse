@@ -369,6 +369,8 @@ pub struct WorkerHost {
     clock: Option<Instant>,
     #[cfg(test)]
     test_idle_window: Option<Duration>,
+    #[cfg(test)]
+    test_setup_window: Option<Duration>,
     // Consecutive compute faults survive reloads and health PINGs. Only a
     // fully drained successful serving call clears them, never caller expiry.
     crashes: HashMap<String, usize>,
@@ -395,6 +397,8 @@ impl WorkerHost {
             clock: None,
             #[cfg(test)]
             test_idle_window: None,
+            #[cfg(test)]
+            test_setup_window: None,
             crashes: HashMap::new(),
             last_placement_share: None,
             request_counter: 0,
@@ -1152,6 +1156,7 @@ impl WorkerHost {
             #[cfg(test)]
             {
                 self.test_idle_window
+                    .map(|inference| (inference, self.test_setup_window.unwrap_or(inference)))
             }
             #[cfg(not(test))]
             {
@@ -5970,7 +5975,7 @@ pub mod ane_residency {
                         WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneAdmitPacked { .. }
                         | WorkerRequest::AneEvictShape { .. } | WorkerRequest::AneEvictPacked { .. })
                         .then_some(self.shape_rpc_timeout));
-                    super::liveness::exchange(stream, request, raw, max_frame, false, test_idle).await
+                    super::liveness::exchange(stream, request, raw, max_frame, false, test_idle.map(|window| (window, window))).await
                         .map_err(|error| AneResidencyError::Channel(error.to_string()))
                 }=>result
             };

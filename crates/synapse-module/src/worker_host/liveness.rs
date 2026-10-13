@@ -28,7 +28,7 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     raw: Option<&[u8]>,
     max_frame: u32,
     cuda: bool,
-    test_idle: Option<Duration>,
+    test_idle: Option<(Duration, Duration)>,
 ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
     let inference = matches!(
         request,
@@ -57,8 +57,12 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     let _ = test_idle;
     let window = |phase| {
         #[cfg(test)]
-        if let Some(window) = test_idle {
-            return window;
+        if let Some((inference, setup)) = test_idle {
+            return if phase == WorkerProgressPhase::Setup {
+                setup
+            } else {
+                inference
+            };
         }
         if phase == WorkerProgressPhase::Setup {
             SETUP_IDLE
@@ -250,7 +254,7 @@ mod tests {
             Some(&encode_i32_frame(&[9])),
             4096,
             false,
-            Some(Duration::from_millis(400)),
+            Some((Duration::from_millis(400), Duration::from_millis(400))),
         )
         .await;
         drop(module);

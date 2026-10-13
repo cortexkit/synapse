@@ -499,6 +499,12 @@ void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *h
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+    if (context->observer.callback) {
+        // Inputs really finished uploading and this plan is ready. Switch the
+        // host to inference before any first-layer stall can consume setup time.
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        context->observer.report(false);
+    }
     if (context->graphs_enabled) FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     else compute();
     progress.wait(context->observer, false);
@@ -577,7 +583,6 @@ int32_t synapse_cuda_qwen3_forward(
         }
         // Promote successful cache hits after the stream is idle. New plans
         // are already tracked above so a failed run cannot orphan an arena.
-        context->observer.report(false);
         found->second->run(token_ids, attention_mask, output);
         context->touch_plan(key);
         return 0;

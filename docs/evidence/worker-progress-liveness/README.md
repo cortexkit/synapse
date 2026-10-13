@@ -221,10 +221,14 @@ scheme, and no cross-stream overlap is removed by those host waits themselves.
 The model mutex already serialized requests on that context before progress
 instrumentation.
 
-There is nevertheless real added work: one timing-disabled event per layer per
-shape plan, an event record per layer (external record nodes in captured graphs),
-per-event host synchronization/wake-up and a synchronous JSON progress-frame
-write/flush. The GPU/runtime cost of the extra event nodes and the CPU/socket
+There is nevertheless real added work. With reporting enabled, one host stream
+synchronization confirms the H2D input uploads before emitting the inference
+transition and submitting compute, so a first-layer stall uses the inference
+window rather than setup time. That input-stage host synchronization can delay
+compute submission and has not been benchmarked. In addition: one timing-disabled
+event per layer per shape plan, an event record per layer (external record nodes
+in captured graphs), per-event host synchronization/wake-up and a synchronous
+JSON progress-frame write/flush. The GPU/runtime cost of the extra event nodes and the CPU/socket
 cost must be measured on CUDA hardware. The output D2H copy is enqueued **after**
 the progress wait/report loop, then the original final stream synchronization
 still runs. Slow or backpressured reporting can therefore delay D2H submission

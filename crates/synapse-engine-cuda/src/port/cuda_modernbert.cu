@@ -464,6 +464,12 @@ void ShapePlan::run(const void *input, const uint8_t *host_mask, float *host_out
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+    if (context->observer.callback) {
+        // Inputs really finished uploading and this plan is ready. Switch the
+        // host to inference before any first-layer stall can consume setup time.
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        context->observer.report(false);
+    }
     if (context->graphs_enabled) FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     else if (context->f16) compute<half>();
     else compute<float>();
@@ -526,7 +532,6 @@ int32_t synapse_cuda_modernbert_forward(
             plan->initialize_and_verify(input, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
         }
-        context->observer.report(false);
         found->second->run(input, attention_mask, output);
         return 0;
     } catch (const std::exception &error) {

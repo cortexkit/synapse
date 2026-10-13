@@ -63,7 +63,7 @@ pub const fn port_provenance() -> [PortSourceProvenance; 5] {
             spike_path: "bench/spikes/unified-rt/src/cuda_minilm.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "9848c050015d7f2ecd0ecc6aa628bb4e4d4280778e4a7eb6590475e937f30375",
-            production_digest: "9e82e3b3b58588184a0140dcb264a32da4502e7e72b2f7d45e9cdf568222be13",
+            production_digest: "af4c5ee57da2c59aec4f359d65e6f0e85f3ded9702205e58065d6512b79feb59",
             reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
         },
         PortSourceProvenance {
@@ -71,7 +71,7 @@ pub const fn port_provenance() -> [PortSourceProvenance; 5] {
             spike_path: "bench/spikes/unified-rt/src/cuda_modernbert.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "455e4419c0c6996b004153e1709e9d6ef001ca0d865e42bc7af2ad6809b350b9",
-            production_digest: "cf5a5b91c026b30f7a5b65a2092a14a500c25f46ccbf2ea41b0f9e5e7e14710f",
+            production_digest: "531bee77abb44a6792d3eea816c8e14a83e6b3e47fc74ef80a12487b296cc065",
             reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
         },
         PortSourceProvenance {
@@ -79,7 +79,7 @@ pub const fn port_provenance() -> [PortSourceProvenance; 5] {
             spike_path: "bench/spikes/unified-rt/src/cuda_qwen3.cu",
             source_revision: KERNEL_REVISION,
             source_digest: "a4c05d7cf119b39ffe52cdfa77f39859ddee8ac3e18139d8094219fbc8a1588b",
-            production_digest: "893d55b1d61caeb3bd7846ecca747cd08a9aa6cb85972b39e7612bebbd9e8841",
+            production_digest: "26091a5bfd16ad5e81d3e41c535a7f9c2ec215a7f173c340d77d9552e98a088b",
             reviewed_difference: "completed-layer event instrumentation; arithmetic unchanged",
         },
     ]

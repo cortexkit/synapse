@@ -18,6 +18,18 @@ async fn live_host_with_work(
     LoadedModel,
     tokio::task::JoinHandle<()>,
 ) {
+    live_host_with_script(units, interval, false).await
+}
+
+async fn live_host_with_script(
+    units: u64,
+    interval: Duration,
+    stall_after_progress: bool,
+) -> (
+    Arc<AsyncMutex<WorkerHost>>,
+    LoadedModel,
+    tokio::task::JoinHandle<()>,
+) {
     let (module, mut worker) = tokio::net::UnixStream::pair().unwrap();
     let mut host = WorkerHost::new(WorkerHostConfig::new("/bin/false", std::env::temp_dir()));
     host.connection = Some(WorkerConnection {
@@ -82,6 +94,14 @@ async fn live_host_with_work(
                                 return;
                             }
                         }
+                        if stall_after_progress {
+                            // Stop request progress while still observing EOF,
+                            // so owned-child teardown is independently confirmed.
+                            let _ =
+                                read_json::<WorkerRequest, _>(&mut worker, DEFAULT_MAX_FRAME_BYTES)
+                                    .await;
+                            return;
+                        }
                     }
                     write_json(
                         &mut worker,
@@ -145,6 +165,67 @@ async fn real_transport_progress_renews_multiple_idle_windows() {
     assert_eq!(result, vec![vec![7.0]]);
     assert_eq!(host.health_snapshot().crash_count_window, 0);
     assert_eq!(host.connection.as_ref().unwrap().worker_generation, 1);
+    host.kill_current().await;
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn cuda_inference_transition_uses_short_window_before_first_layer() {
+    let inference = Duration::from_millis(200);
+    let setup = Duration::from_secs(2);
+    let (host, model, peer) = live_host_with_script(1, Duration::from_millis(50), true).await;
+    let mut host = host.lock().await;
+    host.config.engine_identity = Some(EngineIdentity {
+        engine: synapse_core::worker_engine_names::CUDA_WORKER_ENGINE.into(),
+        version: "test".into(),
+        build_flags: BTreeMap::new(),
+    });
+    host.config.crash_budget.max_crashes = 1;
+    host.test_idle_window = Some(inference);
+    host.test_setup_window = Some(setup);
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        host.embed_batch(
+            &model,
+            TokenBatch {
+                items: vec![vec![7]],
+            },
+        ),
+    )
+    .await
+    .expect("inference transition must not retain the two-second setup allowance")
+    .unwrap_err();
+    assert!(matches!(error, WorkerHostError::EngineCrashed { .. }));
+    assert!(started.elapsed() >= inference && started.elapsed() < Duration::from_secs(1));
+    assert_eq!(host.health_snapshot().crash_count_window, 1);
+    assert!(host.connection.is_none());
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn cuda_cold_setup_keeps_distinct_initial_silence_allowance() {
+    let (host, model, peer) = live_host_with_work(1, Duration::from_millis(400)).await;
+    let mut host = host.lock().await;
+    host.config.engine_identity = Some(EngineIdentity {
+        engine: synapse_core::worker_engine_names::CUDA_WORKER_ENGINE.into(),
+        version: "test".into(),
+        build_flags: BTreeMap::new(),
+    });
+    host.test_idle_window = Some(Duration::from_millis(200));
+    host.test_setup_window = Some(Duration::from_secs(2));
+    assert_eq!(
+        host.embed_batch(
+            &model,
+            TokenBatch {
+                items: vec![vec![7]]
+            }
+        )
+        .await
+        .unwrap(),
+        vec![vec![7.0]]
+    );
+    assert_eq!(host.health_snapshot().crash_count_window, 0);
     host.kill_current().await;
     peer.await.unwrap();
 }
