@@ -2,9 +2,9 @@
 id = "swift-protocol-source-scan"
 guards = "The Swift HELLO protocol version must agree with the shared Rust wire version"
 file = "crates/synapse-worker-ane/swift/ane_worker.swift"
-old = "private let protocolVersion = 2"
+old = "private let protocolVersion = 3"
 new = """
-private let protocolVersion = 3
+private let protocolVersion = 4
 // NON-VACUITY BREAK"""
 edits = []
 test_file = "crates/synapse-worker-ane/src/main.rs"

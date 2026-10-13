@@ -182,3 +182,20 @@ strike book at all.
 
 Hardware outcomes and measured progress gaps are recorded separately; these
 framed fake-worker tests do not certify an accelerator.
+
+## Swift version invariant after the clean cutover
+
+`ckdev-mutate check` initially found the old Swift control's v2 anchor missing.
+The manifest now mutates the actual v3 declaration to v4 while retaining the
+same guard/test claim. A safe staged-source control on the Mac produced:
+
+```text
+tests::swift_protocol_version_matches_the_worker_protocol_version ... FAILED
+assertion left == right failed: left: 4, right: 3
+test result: FAILED. 0 passed; 1 failed; 1 filtered out; finished in 0.00s
+```
+
+Applied source diff: `crates/synapse-worker-ane/swift/ane_worker.swift | 3 ++-`
+(2 insertions, 1 deletion). After `git checkout -- <path> && touch <path>` the
+local diff-stat was empty and the same test passed (1 passed, 1 filtered out).
+This source-scan check ran no Neural Engine prediction.
