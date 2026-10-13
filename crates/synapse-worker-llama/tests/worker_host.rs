@@ -161,10 +161,7 @@ async fn host_classifies_crashes_and_quarantines_after_budget() {
         .extra_args
         .push("--test-abort-on-request".to_string());
     config.request_timeout = Duration::from_secs(2);
-    config.crash_budget = CrashBudget {
-        max_crashes: 2,
-        window: Duration::from_secs(30),
-    };
+    config.crash_budget = CrashBudget { max_crashes: 2 };
     let mut host = WorkerHost::new(config);
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.values.insert(

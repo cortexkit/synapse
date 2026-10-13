@@ -151,10 +151,7 @@ fn assert_worker_crash_is_quarantined(label: &str, worker_bin: PathBuf) {
     config
         .extra_args
         .push("--test-abort-on-request".to_string());
-    config.crash_budget = CrashBudget {
-        max_crashes: 0,
-        window: Duration::from_secs(60),
-    };
+    config.crash_budget = CrashBudget { max_crashes: 0 };
     let mut engine = WorkerEngine::new(config).expect("worker host should initialize");
     let mut runtime_config = RuntimeConfig::default();
     runtime_config.values.insert(

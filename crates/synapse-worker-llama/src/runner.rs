@@ -370,6 +370,12 @@ fn worker_request_loop<S: Read + Write>(
             } => {
                 let raw = synapse_core::worker_framing_sync::read_frame(stream, max_frame)
                     .context("read GENERATE ids")?;
+                let progress_id = req_id.clone();
+                let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                    stream,
+                    &progress_id,
+                    max_frame,
+                );
                 let response = match handle_generate(
                     &mut state,
                     &req_id,
@@ -377,6 +383,11 @@ fn worker_request_loop<S: Read + Write>(
                     max_tokens,
                     grammar.as_deref(),
                     &raw,
+                    &mut || {
+                        writer
+                            .completed(synapse_core::WorkerProgressPhase::Inference)
+                            .map_err(Into::into)
+                    },
                 ) {
                     Ok(response) => response,
                     Err(error) => WorkerResponse::Err {
@@ -385,6 +396,9 @@ fn worker_request_loop<S: Read + Write>(
                         msg: error.to_string(),
                     },
                 };
+                if writer.failed() {
+                    bail!("progress stream write failed");
+                }
                 synapse_core::worker_framing_sync::write_json_frame(stream, &response, max_frame)?;
             }
             WorkerRequest::Unload { req_id, model_ref } => {
@@ -696,6 +710,7 @@ fn handle_generate(
     max_tokens: u32,
     grammar: Option<&str>,
     raw: &[u8],
+    progress: &mut impl FnMut() -> Result<()>,
 ) -> Result<WorkerResponse> {
     let runtime = state
         .models
@@ -736,6 +751,7 @@ fn handle_generate(
     context
         .decode(&mut prompt_batch)
         .context("llama_decode prompt failed")?;
+    progress()?;
 
     let mut sampler = build_generate_sampler(&runtime.model, grammar_rule)?;
     sampler.accept_many(&prompt_tokens);
@@ -760,6 +776,7 @@ fn handle_generate(
         context
             .decode(&mut next_batch)
             .context("llama_decode generated token failed")?;
+        progress()?;
     }
     let text = decode_generated_text(&runtime.model, &generated)?;
     Ok(WorkerResponse::Text {

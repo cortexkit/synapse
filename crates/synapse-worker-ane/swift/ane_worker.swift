@@ -3,7 +3,7 @@ import CryptoKit
 import Darwin
 import Foundation
 
-private let protocolVersion = 2
+private let protocolVersion = 3
 private let maxFrameBytes = 64 * 1024 * 1024
 private let engineVersion = "coreml-swift-v1"
 

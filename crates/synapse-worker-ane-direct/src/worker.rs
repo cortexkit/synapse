@@ -9,8 +9,9 @@ use synapse_core::worker_framing_sync::{
     read_frame, read_json_frame, write_frame, write_json_frame,
 };
 use synapse_core::{
-    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerHelloAck, WorkerRequest,
-    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    decode_i32_frame, encode_f32_frame, EngineIdentity, WorkerHello, WorkerHelloAck,
+    WorkerProgressPhase, WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
+    WORKER_PROTOCOL_VERSION,
 };
 
 #[derive(Parser)]
@@ -217,6 +218,16 @@ fn request_loop<S: Read + Write>(
             return Ok(());
         }
         let req_id = request.req_id().map(str::to_owned);
+        let mut progress_writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+            stream,
+            req_id.as_deref().unwrap_or_default(),
+            max,
+        );
+        let mut progress = |phase| {
+            progress_writer
+                .completed(phase)
+                .map_err(anyhow::Error::from)
+        };
         let profile = crate::profile::LaneProfile::new();
         let result: Result<(WorkerResponse, Option<Vec<f32>>)> = (|| {
             Ok(match request {
@@ -272,7 +283,9 @@ fn request_loop<S: Read + Write>(
                     let inventory = models
                         .get_mut(&model_ref)
                         .context("model_not_loaded")?
-                        .admit(shape, &os_build()?)?;
+                        .admit_progress(shape, &os_build()?, &mut || {
+                            progress(WorkerProgressPhase::Setup)
+                        })?;
                     (WorkerResponse::Admitted { req_id, inventory }, None)
                 }
                 WorkerRequest::AneAdmitPacked {
@@ -286,7 +299,10 @@ fn request_loop<S: Read + Write>(
                     );
                     let model = models.get(&model_ref).context("model_not_loaded")?;
                     if !packed.contains_key(&model_ref) {
-                        let program = model.compile_tight_packing(synapse_core::PACKED_WIDTH)?;
+                        let program = model.compile_tight_packing_progress(
+                            synapse_core::PACKED_WIDTH,
+                            &mut || progress(WorkerProgressPhase::Setup),
+                        )?;
                         packed.insert(model_ref.clone(), program);
                     }
                     let inventory = synapse_core::AnePlacementInventory {
@@ -334,6 +350,7 @@ fn request_loop<S: Read + Write>(
                         model,
                         &items.iter().map(|i| i.n_tokens).collect::<Vec<_>>(),
                         raw.as_deref().unwrap(),
+                        &mut || progress(WorkerProgressPhase::Inference),
                     )?;
                     (
                         WorkerResponse::Vectors {
@@ -355,6 +372,7 @@ fn request_loop<S: Read + Write>(
                         model,
                         &items.iter().map(|i| i.n_tokens).collect::<Vec<_>>(),
                         raw.as_deref().unwrap(),
+                        &mut || progress(WorkerProgressPhase::Inference),
                     )?;
                     (WorkerResponse::Scores { req_id }, Some(scores))
                 }
@@ -371,12 +389,13 @@ fn request_loop<S: Read + Write>(
                     );
                     let model = models.get(&model_ref).context("model_not_loaded")?;
                     let program = packed.get(&model_ref).context("shape_not_admitted")?;
-                    let vectors = packed_sequences(
+                    let vectors = packed_sequences_progress(
                         model,
                         program,
                         &items.iter().map(|i| i.n_tokens).collect::<Vec<_>>(),
                         &passes,
                         raw.as_deref().unwrap(),
+                        &mut || progress(WorkerProgressPhase::Inference),
                     )?;
                     (
                         WorkerResponse::Vectors {
@@ -421,6 +440,9 @@ fn request_loop<S: Read + Write>(
                 ref other => (WorkerResponse::unsupported_request(other), None),
             })
         })();
+        if progress_writer.failed() {
+            anyhow::bail!("progress stream write failed");
+        }
         let (response, output) =
             result.unwrap_or_else(|e| (request_error(req_id.clone(), &e), None));
         write_json_frame(stream, &response, max)?;
@@ -430,12 +452,24 @@ fn request_loop<S: Read + Write>(
         profile.finish(serde_json::json!({"kind":"request", "req_id":req_id}));
     }
 }
+#[cfg(test)]
 fn packed_sequences(
     model: &Model,
     program: &crate::multirow::tight::TightProgram,
     sizes: &[usize],
     passes: &[Vec<usize>],
     raw: &[u8],
+) -> Result<Vec<f32>> {
+    packed_sequences_progress(model, program, sizes, passes, raw, &mut || Ok(()))
+}
+
+fn packed_sequences_progress(
+    model: &Model,
+    program: &crate::multirow::tight::TightProgram,
+    sizes: &[usize],
+    passes: &[Vec<usize>],
+    raw: &[u8],
+    progress: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<f32>> {
     synapse_core::validate_packed_passes(sizes, passes)?;
     let tokens = decode_i32_frame(raw)?;
@@ -469,14 +503,24 @@ fn packed_sequences(
         .collect();
     let mut output = vec![0.0; hidden * rows.len()];
     for pass in passes {
-        let vectors = program.run(model, &pass.iter().map(|&i| rows[i]).collect::<Vec<_>>())?;
+        let vectors = program.run_progress(
+            model,
+            &pass.iter().map(|&i| rows[i]).collect::<Vec<_>>(),
+            progress,
+        )?;
         for (&index, vector) in pass.iter().zip(vectors) {
             output[index * hidden..(index + 1) * hidden].copy_from_slice(&vector);
         }
+        progress()?;
     }
     Ok(output)
 }
-fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
+fn sequences(
+    model: &Model,
+    sizes: &[usize],
+    raw: &[u8],
+    progress: &mut impl FnMut() -> Result<()>,
+) -> Result<Vec<f32>> {
     let mut profile = crate::profile::LaneProfile::new();
     let tokens = decode_i32_frame(raw)?;
     let total = sizes
@@ -502,7 +546,8 @@ fn sequences(model: &Model, sizes: &[usize], raw: &[u8]) -> Result<Vec<f32>> {
         if profile.enabled() {
             gaps_ms.push(row_started.duration_since(previous).as_secs_f64() * 1000.0);
         }
-        let vector = model.run(&tokens[offset..offset + size])?;
+        let vector = model.run_progress(&tokens[offset..offset + size], progress)?;
+        progress()?;
         previous = Instant::now();
         if profile.enabled() {
             envelopes_ms.push(previous.duration_since(row_started).as_secs_f64() * 1000.0);

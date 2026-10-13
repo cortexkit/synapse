@@ -302,7 +302,7 @@ fn supervised_dispatch(
     );
     config.worker_id = label.to_string();
     config.request_timeout = Duration::from_secs(180);
-    config.load_timeout = Duration::from_secs(180);
+
     config.extra_args = extra_args;
     let runtime_config_digest = "worker-e2e-runtime-v1".to_string();
     let decode_fingerprint = "worker-e2e-qwen3-f16".to_string();

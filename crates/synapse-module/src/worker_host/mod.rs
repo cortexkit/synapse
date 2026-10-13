@@ -28,13 +28,12 @@ use serde::{Deserialize, Serialize};
 use synapse_core::worker_transport::accept_worker_handshake_with_hello;
 use synapse_core::{
     decode_f32_frame, encode_i32_frame, is_owned_worker_hello_engine, prepare_listener, read_json,
-    read_raw, worker_engine_names::LLAMA_WORKER_ENGINE, write_json, write_raw, EmbedEngine,
-    EngineError, EngineErrorStage, EngineIdentity, EngineRiskClass, ExpectedHelloBinding,
-    GenerateEngine, GenerateOutput, GenerateRequest, LoadedModel, ProgressBoundary, RerankEngine,
-    RerankRequest, RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError,
-    ValidatedArtifact, Vector, Vectors, WorkerCandidate, WorkerPooling, WorkerRequest,
-    WorkerResponse, WorkerSequence, WorkerTokenItem, WorkerTransportStream,
-    DEFAULT_MAX_FRAME_BYTES,
+    worker_engine_names::LLAMA_WORKER_ENGINE, write_json, EmbedEngine, EngineError,
+    EngineErrorStage, EngineIdentity, EngineRiskClass, ExpectedHelloBinding, GenerateEngine,
+    GenerateOutput, GenerateRequest, LoadedModel, ProgressBoundary, RerankEngine, RerankRequest,
+    RerankScores, RuntimeConfig, TokenBatch, TokenIds, TransportError, ValidatedArtifact, Vector,
+    Vectors, WorkerCandidate, WorkerPooling, WorkerRequest, WorkerResponse, WorkerSequence,
+    WorkerTokenItem, WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -50,27 +49,28 @@ mod quarantine_tests;
 // Catalog users cannot manually probe and approve a worker to restore serving.
 // A finite ten-minute cool-down lets a desktop lane recover without that step.
 pub(crate) const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
+mod liveness;
+#[cfg(all(test, unix))]
+use synapse_core::{read_raw, write_raw};
+#[cfg(all(test, unix))]
+mod progress_tests;
 
 #[derive(Clone, Debug)]
 pub struct CrashBudget {
     pub max_crashes: usize,
-    pub window: Duration,
 }
 
 impl Default for CrashBudget {
     fn default() -> Self {
-        Self {
-            max_crashes: 2,
-            window: Duration::from_secs(60),
-        }
+        Self { max_crashes: 2 }
     }
 }
 
 /// Crash/quarantine authority for a worker host.
 ///
-/// Legacy workers use the host's per-model rolling window. Owned decode uses
-/// the S3 store-backed `CrashBudget` keyed by machine/decode/runtime identity,
-/// so the generic host must not maintain a second crash book for that worker.
+/// Catalog workers use the host's per-model consecutive faults. Owned decode
+/// persists its own supervisor budget by machine/decode/runtime identity, so the
+/// generic host must not charge a second fault counter for the same worker.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CrashAuthority {
     #[default]
@@ -85,8 +85,8 @@ pub struct WorkerHostConfig {
     pub worker_id: String,
     pub max_frame: u32,
     pub handshake_timeout: Duration,
+    /// Owned-decode envelope only; catalog requests use fixed idle windows.
     pub request_timeout: Duration,
-    pub load_timeout: Duration,
     pub crash_budget: CrashBudget,
     pub crash_authority: CrashAuthority,
     pub extra_args: Vec<String>,
@@ -123,7 +123,7 @@ impl WorkerHostConfig {
             max_frame: DEFAULT_MAX_FRAME_BYTES,
             handshake_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
-            load_timeout: Duration::from_secs(180),
+
             crash_budget: CrashBudget::default(),
             crash_authority: CrashAuthority::WorkerHost,
             extra_args: Vec::new(),
@@ -350,7 +350,9 @@ pub struct WorkerHost {
     quarantine_until: HashMap<String, Instant>,
     #[cfg(test)]
     clock: Option<Instant>,
-    crashes: HashMap<String, Vec<Instant>>,
+    // Consecutive compute faults survive reloads and health PINGs. Only a
+    // fully drained successful serving call clears them, never caller expiry.
+    crashes: HashMap<String, usize>,
     last_placement_share: Option<f64>,
     request_counter: u64,
     model_counter: u64,
@@ -884,8 +886,7 @@ impl WorkerHost {
     }
 
     pub fn health_snapshot(&mut self) -> WorkerHostHealth {
-        self.prune_crash_windows(Instant::now());
-        let crash_count_window = self.crashes.values().map(Vec::len).sum();
+        let crash_count_window = self.crashes.values().sum();
         let loaded_worker_models = self
             .loaded_models
             .values()
@@ -1099,48 +1100,66 @@ impl WorkerHost {
         &mut self,
         request: WorkerRequest,
         raw: Option<Vec<u8>>,
-        expect_raw_response: bool,
+        _expect_raw_response: bool,
     ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
         self.ensure_worker().await?;
-        let max_frame = self.config.max_frame;
-        let request_timeout = request_timeout(&self.config, &request);
-        let result = timeout(request_timeout, async {
-            let connection = self
-                .connection
-                .as_mut()
-                .expect("connection exists after ensure_worker");
-            write_json(&mut connection.stream, &request, max_frame).await?;
-            if let Some(raw) = raw.as_deref() {
-                write_raw(&mut connection.stream, raw, max_frame).await?;
-            }
-            let response: WorkerResponse = read_json(&mut connection.stream, max_frame).await?;
-            let raw_response =
-                if expect_raw_response && !matches!(response, WorkerResponse::Err { .. }) {
-                    Some(read_raw(&mut connection.stream, max_frame).await?)
-                } else {
-                    None
-                };
-            Ok::<_, WorkerHostError>((response, raw_response))
-        })
+        let cuda = self
+            .config
+            .engine_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                identity.engine == synapse_core::worker_engine_names::CUDA_WORKER_ENGINE
+            });
+        let connection = self.connection.as_mut().expect("connected worker");
+        let generation = connection.worker_generation;
+        let result = liveness::exchange(
+            &mut connection.stream,
+            &request,
+            raw.as_deref(),
+            self.config.max_frame,
+            cuda,
+            None,
+        )
         .await;
-
         match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error @ WorkerHostError::Protocol(_)))
-            | Ok(Err(error @ WorkerHostError::ProtocolVersion { .. })) => Err(error),
-            Ok(Err(error)) => {
-                let stderr_tail = self.kill_current().await;
-                Err(WorkerHostError::EngineCrashed {
-                    stage: request_stage(&request).to_string(),
-                    detail: error.to_string(),
-                    stderr_tail,
-                })
+            Ok(value) => {
+                // Only drained serving success proves the compute path healthy.
+                // Internal LOAD/reload, PING and shape setup must not hide a GPU
+                // that crashes on every inference. Caller expiry does not reset
+                // here; a detached owner's eventual serving success does.
+                if matches!(
+                    &value.0,
+                    WorkerResponse::Vectors { .. }
+                        | WorkerResponse::Scores { .. }
+                        | WorkerResponse::Text { .. }
+                ) && self
+                    .connection
+                    .as_ref()
+                    .is_some_and(|c| c.worker_generation == generation)
+                {
+                    let model_ref = match &request {
+                        WorkerRequest::EmbedBatch { model_ref, .. }
+                        | WorkerRequest::EmbedPacked { model_ref, .. }
+                        | WorkerRequest::Rerank { model_ref, .. }
+                        | WorkerRequest::RerankSequences { model_ref, .. }
+                        | WorkerRequest::Generate { model_ref, .. } => Some(model_ref),
+                        _ => None,
+                    };
+                    if let Some(model_ref) = model_ref {
+                        for model in self.loaded_models.values() {
+                            if model.worker_model_ref.as_ref() == Some(model_ref) {
+                                self.crashes.remove(&model.crash_key);
+                            }
+                        }
+                    }
+                }
+                Ok(value)
             }
-            Err(_) => {
+            Err(error) => {
                 let stderr_tail = self.kill_current().await;
                 Err(WorkerHostError::EngineCrashed {
-                    stage: "timeout".to_string(),
-                    detail: format!("request exceeded {} ms", request_timeout.as_millis()),
+                    stage: request_stage(&request).into(),
+                    detail: format!("worker_generation={generation}: {error}"),
                     stderr_tail,
                 })
             }
@@ -1256,10 +1275,9 @@ impl WorkerHost {
 
     fn record_crash(&mut self, key: String) -> bool {
         let now = self.now();
-        self.prune_crash_windows(now);
         let entries = self.crashes.entry(key.clone()).or_default();
-        entries.push(now);
-        if entries.len() >= self.config.crash_budget.max_crashes {
+        *entries += 1;
+        if *entries >= self.config.crash_budget.max_crashes {
             if self.config.catalog_lane.is_some() {
                 self.quarantine_until
                     .insert(key.clone(), now + CATALOG_QUARANTINE_COOLDOWN);
@@ -1269,14 +1287,6 @@ impl WorkerHost {
         } else {
             false
         }
-    }
-
-    fn prune_crash_windows(&mut self, now: Instant) {
-        let window = self.config.crash_budget.window;
-        self.crashes.retain(|_, entries| {
-            entries.retain(|instant| now.duration_since(*instant) <= window);
-            !entries.is_empty()
-        });
     }
 
     fn forget_worker_model_refs(&mut self) {
@@ -2497,14 +2507,6 @@ fn decode_vectors(raw: &[u8], n: usize, dims: usize) -> Result<Vectors, WorkerHo
         .collect::<Vec<_>>())
 }
 
-fn request_timeout(config: &WorkerHostConfig, request: &WorkerRequest) -> Duration {
-    if matches!(request, WorkerRequest::Load { .. }) {
-        config.load_timeout
-    } else {
-        config.request_timeout
-    }
-}
-
 fn request_stage(request: &WorkerRequest) -> &'static str {
     match request {
         WorkerRequest::Load { .. } => "load",
@@ -3017,12 +3019,9 @@ mod tests {
     }
 
     #[test]
-    fn crash_window_health_degrades_then_recovers() {
+    fn fault_health_does_not_recover_with_elapsed_time() {
         let mut config = WorkerHostConfig::new("/bin/false", "/tmp/synh-health");
-        config.crash_budget = CrashBudget {
-            max_crashes: 3,
-            window: Duration::from_millis(2),
-        };
+        config.crash_budget = CrashBudget { max_crashes: 3 };
         let mut host = WorkerHost::new(config);
 
         assert!(!host.health_snapshot().degraded);
@@ -3033,8 +3032,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
         let recovered = host.health_snapshot();
-        assert!(!recovered.degraded);
-        assert_eq!(recovered.crash_count_window, 0);
+        assert!(recovered.degraded);
+        assert_eq!(recovered.crash_count_window, 1);
     }
 
     #[test]
@@ -3482,6 +3481,8 @@ mod tests {
 /// workers are driven through [`AneShapeWorker`], whose connection is held only
 /// for a single exchange ([`AneWorkerChannel`]).
 pub mod ane_residency {
+    #[cfg(test)]
+    mod quarantine_tests;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::future::Future;
     use std::io;
@@ -3493,9 +3494,10 @@ pub mod ane_residency {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
+    #[cfg(test)]
+    use synapse_core::{read_json, read_raw, write_json, write_raw};
     use synapse_core::{
-        read_json, read_raw, write_json, write_raw, AnePlacementInventory, TransportError,
-        WorkerRequest, WorkerResponse, ERR_ANE_LANE_BUSY,
+        AnePlacementInventory, TransportError, WorkerRequest, WorkerResponse, ERR_ANE_LANE_BUSY,
     };
     use thiserror::Error;
     use tokio::io::{AsyncRead, AsyncWrite};
@@ -3694,6 +3696,8 @@ pub mod ane_residency {
         Abandoned,
         #[error("direct-ANE request deadline exceeded")]
         DeadlineExceeded,
+        #[error("model/config is quarantined after repeated worker crashes; retry after {retry_after_ms}ms")]
+        Quarantined { retry_after_ms: u64 },
         #[error("sequence of {n_tokens} tokens exceeds the largest direct-ANE shape {max}")]
         SequenceTooLong { n_tokens: usize, max: usize },
         /// The worker answered `ERR`.
@@ -3725,13 +3729,16 @@ pub mod ane_residency {
                 risk_class: synapse_core::EngineRiskClass::AbortCapable,
                 message: self.to_string(),
                 retry_after_ms: match self {
-                    Self::ResourcesExhausted { retry_after_ms, .. } => Some(*retry_after_ms),
+                    Self::Quarantined { retry_after_ms }
+                    | Self::ResourcesExhausted { retry_after_ms, .. } => Some(*retry_after_ms),
                     Self::ShapeCompiling { .. } => Some(ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
                     _ => None,
                 },
                 safe_to_retry_same_request: matches!(
                     self,
-                    Self::ResourcesExhausted { .. } | Self::ShapeCompiling { .. }
+                    Self::ResourcesExhausted { .. }
+                        | Self::ShapeCompiling { .. }
+                        | Self::Quarantined { .. }
                 ),
             }
         }
@@ -5461,8 +5468,44 @@ pub mod ane_residency {
         }
     }
 
-    /// A direct-ANE worker connection used for one exchange at a time, so a
-    /// admission waits never hold the connection; an exchange or restart locks it.
+    #[derive(Default)]
+    struct ChannelFaults {
+        strikes: usize,
+        last_generation: Option<u64>,
+        until: Option<std::time::Instant>,
+        #[cfg(test)]
+        clock: Option<std::time::Instant>,
+    }
+
+    impl ChannelFaults {
+        fn now(&self) -> std::time::Instant {
+            #[cfg(test)]
+            if let Some(now) = self.clock {
+                return now;
+            }
+            std::time::Instant::now()
+        }
+        fn remaining(&mut self) -> Option<u64> {
+            let until = self.until?;
+            let now = self.now();
+            if now >= until {
+                self.strikes = 0;
+                self.last_generation = None;
+                self.until = None;
+                None
+            } else {
+                Some(
+                    u64::try_from(until.duration_since(now).as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1),
+                )
+            }
+        }
+    }
+
+    /// A serial direct-ANE connection. Waiting for residency capacity must not
+    /// lock the stream and block runnable inference; only wire exchanges and
+    /// recovery that waits for the old process to exit hold that lock.
     pub struct AneWorkerChannel<S> {
         worker_id: String,
         max_frame: u32,
@@ -5470,6 +5513,9 @@ pub mod ane_residency {
         connect: AneWorkerConnector<S>,
         loaded_models: Mutex<BTreeMap<String, WorkerRequest>>,
         faulted: std::sync::atomic::AtomicBool,
+        // Successful LOAD/PING/compile cannot hide broken serving. Only a
+        // drained serving result clears consecutive faults on this generation.
+        faults: Mutex<ChannelFaults>,
         exit_unconfirmed: std::sync::atomic::AtomicBool,
         retired: std::sync::atomic::AtomicBool,
         packed_enabled: std::sync::atomic::AtomicBool,
@@ -5503,6 +5549,7 @@ pub mod ane_residency {
                 connect,
                 loaded_models: Mutex::new(BTreeMap::new()),
                 faulted: std::sync::atomic::AtomicBool::new(false),
+                faults: Mutex::new(ChannelFaults::default()),
                 exit_unconfirmed: std::sync::atomic::AtomicBool::new(false),
                 retired: std::sync::atomic::AtomicBool::new(false),
                 packed_enabled: std::sync::atomic::AtomicBool::new(packed_enabled),
@@ -5523,6 +5570,24 @@ pub mod ane_residency {
         }
 
         /// Prevent replacement spawning while retirement drains existing leases.
+        fn charge_fault(&self, generation: u64) {
+            let mut faults = self.faults.lock().unwrap_or_else(|p| p.into_inner());
+            if faults.last_generation != Some(generation) {
+                faults.last_generation = Some(generation);
+                faults.strikes += 1;
+                if faults.strikes >= 2 {
+                    faults.until = Some(faults.now() + super::CATALOG_QUARANTINE_COOLDOWN);
+                }
+            }
+        }
+
+        fn cooldown_remaining(&self) -> Option<u64> {
+            self.faults
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remaining()
+        }
+
         pub fn begin_retirement(&self) {
             self.retired.store(true, Ordering::Release);
         }
@@ -5597,45 +5662,11 @@ pub mod ane_residency {
             raw: Option<&[u8]>,
             generation: u64,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
-            if matches!(
-                request,
-                WorkerRequest::AneAdmitShape { .. }
-                    | WorkerRequest::AneEvictShape { .. }
-                    | WorkerRequest::AneAdmitPacked { .. }
-                    | WorkerRequest::AneEvictPacked { .. }
-            ) {
-                // `shape_rpc_timeout` bounds a silent worker during an admit
-                // (compile) or evict request. Its expiry faults the channel,
-                // which restarts the worker. Time spent queueing for the stream
-                // behind other work is not the worker being silent, so the
-                // timer starts only once this exchange holds the stream.
-                let mut guard = cancellable_wait(self.stream.lock()).await?;
-                let operation = self.exchange_locked(&mut guard, request, raw, generation);
-                match tokio::time::timeout(self.shape_rpc_timeout, operation).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        if self.generation() == generation {
-                            self.faulted.store(true, Ordering::Relaxed);
-                            self.stop_exchanges.notify_waiters();
-                        }
-                        Err(AneResidencyError::Channel(
-                            "shape exchange deadline exceeded; owner exit required".into(),
-                        ))
-                    }
-                }
-            } else {
-                self.exchange_inner(request, raw, generation).await
-            }
-        }
-
-        async fn exchange_inner(
-            &self,
-            request: &WorkerRequest,
-            raw: Option<&[u8]>,
-            generation: u64,
-        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
-            let mut guard = self.stream.lock().await;
-            self.exchange_locked(&mut guard, request, raw, generation)
+            // Waiting for a stream already used by another request is not
+            // worker inactivity. The background shape-admission task owns the
+            // exchange through its reply even if the waiting caller cancels.
+            let mut guard = cancellable_wait(self.stream.lock()).await?;
+            self.exchange_locked(&mut guard, request, raw, generation, None)
                 .await
         }
 
@@ -5758,14 +5789,8 @@ pub mod ane_residency {
             if expired(deadline) {
                 return Err(deadline_expired(None));
             }
-            tokio::time::timeout(
-                io_timeout,
-                self.exchange_locked(&mut guard, request, raw, generation),
-            )
-            .await
-            .map_err(|_| {
-                AneResidencyError::Channel("inference exchange deadline exceeded".into())
-            })?
+            self.exchange_locked(&mut guard, request, raw, generation, Some(io_timeout))
+                .await
         }
 
         async fn exchange_locked(
@@ -5774,7 +5799,11 @@ pub mod ane_residency {
             request: &WorkerRequest,
             raw: Option<&[u8]>,
             generation: u64,
+            idle_override: Option<std::time::Duration>,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            if let Some(retry_after_ms) = self.cooldown_remaining() {
+                return Err(AneResidencyError::Quarantined { retry_after_ms });
+            }
             let _holder = HolderMark::hold(
                 &self.holder,
                 match request {
@@ -5822,24 +5851,30 @@ pub mod ane_residency {
             let result = tokio::select! {
                 _=stopped=>Err(AneResidencyError::Channel("worker recovery interrupted an active exchange".into())),
                 result=async {
-                write_json(stream, request, max_frame).await?;
-                if let Some(raw) = raw {
-                    write_raw(stream, raw, max_frame).await?;
-                }
-                let response: WorkerResponse = read_json(stream, max_frame).await?;
-                let raw = if response.carries_raw_frame() {
-                    Some(read_raw(stream, max_frame).await?)
-                } else {
-                    None
-                };
-                Ok::<_, AneResidencyError>((response, raw))
-            }=>result
+                    let test_idle = idle_override.or_else(|| matches!(request,
+                        WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneAdmitPacked { .. }
+                        | WorkerRequest::AneEvictShape { .. } | WorkerRequest::AneEvictPacked { .. })
+                        .then_some(self.shape_rpc_timeout));
+                    super::liveness::exchange(stream, request, raw, max_frame, false, test_idle).await
+                        .map_err(|error| AneResidencyError::Channel(error.to_string()))
+                }=>result
             };
             #[cfg(test)]
             drop(compile_clock);
             match result {
                 Ok((response, raw)) => {
                     exchange_guard.completed = true;
+                    if matches!(
+                        response,
+                        WorkerResponse::Vectors { .. } | WorkerResponse::Scores { .. }
+                    ) && self.generation() == generation
+                        && !self.faulted.load(Ordering::Acquire)
+                    {
+                        let mut faults = self.faults.lock().unwrap_or_else(|p| p.into_inner());
+                        faults.strikes = 0;
+                        faults.last_generation = None;
+                        faults.until = None;
+                    }
                     if matches!(
                         request,
                         WorkerRequest::AneAdmitPacked { .. } | WorkerRequest::EmbedPacked { .. }
@@ -5870,7 +5905,10 @@ pub mod ane_residency {
                     Ok((response, raw))
                 }
                 Err(error) => {
-                    self.faulted.store(true, Ordering::Relaxed);
+                    if self.generation() == generation && !self.faulted.swap(true, Ordering::AcqRel)
+                    {
+                        self.charge_fault(generation);
+                    }
                     Err(error)
                 }
             }
@@ -6084,6 +6122,12 @@ pub mod ane_residency {
                         "worker retired during owner exit confirmation".into(),
                     ));
                 }
+                if self.cooldown_remaining().is_some() {
+                    // The old process has exited, so the supervisor may release
+                    // its executable reservations. During the fault cool-down,
+                    // stop here instead of spawning and recompiling a replacement.
+                    return Ok(());
+                }
                 let mut fresh = tokio::time::timeout(self.shape_rpc_timeout, (self.connect)())
                     .await
                     .map_err(|_| {
@@ -6096,15 +6140,22 @@ pub mod ane_residency {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
-                let reload = tokio::time::timeout(self.shape_rpc_timeout, async {
+                let reload = async {
                     for (model_ref, mut request) in models {
                         let req_id = self.next_req_id("reload");
                         if let WorkerRequest::Load { req_id: id, .. } = &mut request {
                             *id = req_id.clone();
                         }
-                        write_json(&mut fresh.stream, &request, self.max_frame).await?;
-                        let response: WorkerResponse =
-                            read_json(&mut fresh.stream, self.max_frame).await?;
+                        let (response, _) = super::liveness::exchange(
+                            &mut fresh.stream,
+                            &request,
+                            None,
+                            self.max_frame,
+                            false,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
                         match response {
                             WorkerResponse::Loaded {
                                 req_id: got,
@@ -6119,14 +6170,15 @@ pub mod ane_residency {
                         }
                     }
                     Ok::<_, AneResidencyError>(())
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(AneResidencyError::Channel(
-                        "pinned model restoration deadline exceeded".into(),
-                    ))
-                });
+                }
+                .await;
                 if let Err(error) = reload {
+                    if matches!(
+                        error,
+                        AneResidencyError::Channel(_) | AneResidencyError::Io(_)
+                    ) {
+                        self.charge_fault(self.generation());
+                    }
                     self.exit_unconfirmed.store(true, Ordering::Relaxed);
                     drop(fresh.stream);
                     tokio::time::timeout(self.owner_exit_timeout, fresh.confirm_exit)
@@ -6243,7 +6295,7 @@ pub mod ane_residency {
             let pooling = config.pooling;
             let normalize = config.normalize;
             let timeout = config.request_timeout;
-            let load_timeout = config.load_timeout;
+            let load_timeout = super::liveness::SETUP_IDLE;
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
                 let config = config.clone();
                 Box::pin(async move {
@@ -6693,6 +6745,16 @@ pub mod ane_residency {
                 let _activity = activity;
                 let lengths: Vec<_> = sequences.iter().map(Vec::len).collect();
                 let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+                if let Some(retry_after_ms) = serving.channel.cooldown_remaining() {
+                    return Err(AneResidencyError::Quarantined { retry_after_ms });
+                }
+                if serving.channel.faulted.load(Ordering::Acquire)
+                    && !serving.supervisor.recover(&worker).await
+                {
+                    return Err(AneResidencyError::Channel(
+                        "worker recovery could not confirm exit".into(),
+                    ));
+                }
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
                 let result = if packing && !rerank {
                     serving
@@ -8339,12 +8401,13 @@ pub mod ane_residency {
             }
         }
 
-        // These are the pre-packing protocol-v2 tags, frozen at 0075afb7.
-        // The peer exits on an unknown tag, so accidentally sending a packed
-        // request tests a real parser failure rather than a permissive mock.
+        // This v3 peer accepts ordinary requests but has no packed request tags.
+        // Short calls can finish without progress frames; longer calls still
+        // use the v3 completed-work watchdog. Unknown tags fail deserialization,
+        // so accidentally sending packed work closes the actual framed peer.
         #[derive(serde::Deserialize)]
         #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
-        enum LegacyV2Request {
+        enum V3WithoutPackedRequest {
             Load {},
             EmbedBatch {},
             Rerank {},
@@ -8371,7 +8434,7 @@ pub mod ane_residency {
         }
 
         const PACKED_MODEL: &str = "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:pinned";
-        const LEGACY_V2_HELLO: &[u8] = br#"{"v":2,"nonce":"frozen","engine":{"engine":"ane-direct-worker","version":"0.1.0","build_flags":{"kernel_revision":"ane-direct-graph-v1","precision":"f16"}},"pid":42,"max_frame":16777216,"manifest_digest":"frozen-manifest","kernel_revision":"ane-direct-graph-v1"}"#;
+        const V3_WITHOUT_PACKED_HELLO: &[u8] = br#"{"v":3,"nonce":"frozen","engine":{"engine":"ane-direct-worker","version":"0.1.0","build_flags":{"kernel_revision":"ane-direct-graph-v1","precision":"f16"}},"pid":42,"max_frame":16777216,"manifest_digest":"frozen-manifest","kernel_revision":"ane-direct-graph-v1"}"#;
 
         async fn packed_peer(
             legacy: bool,
@@ -8384,8 +8447,8 @@ pub mod ane_residency {
                     let task = tokio::spawn(async move {
                         let max = DEFAULT_MAX_FRAME_BYTES;
                         let mut hello: synapse_core::WorkerHello =
-                            serde_json::from_slice(LEGACY_V2_HELLO).unwrap();
-                        assert_eq!(serde_json::to_vec(&hello).unwrap(), LEGACY_V2_HELLO);
+                            serde_json::from_slice(V3_WITHOUT_PACKED_HELLO).unwrap();
+                        assert_eq!(serde_json::to_vec(&hello).unwrap(), V3_WITHOUT_PACKED_HELLO);
                         if !legacy {
                             hello.packed = Some(synapse_core::PackedCapability::tight256());
                         }
@@ -8394,7 +8457,8 @@ pub mod ane_residency {
                             read_json(&mut worker, max).await.unwrap();
                         let mut resident = BTreeSet::new();
                         while let Ok(bytes) = read_raw(&mut worker, max).await {
-                            if legacy && serde_json::from_slice::<LegacyV2Request>(&bytes).is_err()
+                            if legacy
+                                && serde_json::from_slice::<V3WithoutPackedRequest>(&bytes).is_err()
                             {
                                 peer.lock().unwrap().crashed = true;
                                 break;
@@ -9110,7 +9174,7 @@ pub mod ane_residency {
         }
 
         #[tokio::test]
-        async fn packed_legacy_v2_peer_never_receives_packed_and_stays_framed() {
+        async fn packed_v3_peer_without_capability_never_receives_packed_and_stays_framed() {
             let peer = Arc::new(Mutex::new(PackedPeer::default()));
             let serving = packed_peer(true, peer.clone()).await;
             assert!(!serving.prepare_packed().await.unwrap());

@@ -217,7 +217,35 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                     Err(error) => Err(format!("read token-id frame: {error}")),
                 };
                 match ids {
-                    Ok(ids) => handle_sequences(&state, req_id, &model_ref, &items, &ids, false),
+                    Ok(ids) => {
+                        let progress_id = req_id.clone();
+                        let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                            stream,
+                            &progress_id,
+                            max_frame,
+                        );
+                        let result = handle_sequences(
+                            &state,
+                            req_id,
+                            &model_ref,
+                            &items,
+                            &ids,
+                            false,
+                            &mut |setup| {
+                                writer
+                                    .completed(if setup {
+                                        synapse_core::WorkerProgressPhase::Setup
+                                    } else {
+                                        synapse_core::WorkerProgressPhase::Inference
+                                    })
+                                    .map_err(|error| error.to_string())
+                            },
+                        );
+                        if writer.failed() {
+                            anyhow::bail!("progress stream write failed");
+                        }
+                        result
+                    }
                     Err(message) => (
                         error_response(Some(req_id), "invalid_request", &message),
                         None,
@@ -295,7 +323,33 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                                     n_tokens: s.n_tokens,
                                 })
                                 .collect();
-                            handle_sequences(&state, req_id, &model_ref, &items, &ids, true)
+                            let progress_id = req_id.clone();
+                            let mut writer = synapse_core::worker_framing_sync::ProgressWriter::new(
+                                stream,
+                                &progress_id,
+                                max_frame,
+                            );
+                            let result = handle_sequences(
+                                &state,
+                                req_id,
+                                &model_ref,
+                                &items,
+                                &ids,
+                                true,
+                                &mut |setup| {
+                                    writer
+                                        .completed(if setup {
+                                            synapse_core::WorkerProgressPhase::Setup
+                                        } else {
+                                            synapse_core::WorkerProgressPhase::Inference
+                                        })
+                                        .map_err(|error| error.to_string())
+                                },
+                            );
+                            if writer.failed() {
+                                anyhow::bail!("progress stream write failed");
+                            }
+                            result
                         }
                         Err(error) => {
                             (error_response(Some(req_id), "invalid_request", error), None)
@@ -467,7 +521,10 @@ fn handle_sequences(
     items: &[synapse_core::WorkerTokenItem],
     ids: &[u32],
     rerank: bool,
+    progress: &mut dyn FnMut(bool) -> Result<(), String>,
 ) -> (WorkerResponse, Option<Vec<f32>>) {
+    #[cfg(not(feature = "cuda"))]
+    let _ = progress;
     let Some(model) = state.loaded.as_ref() else {
         return (
             error_response(
@@ -546,7 +603,10 @@ fn handle_sequences(
                 })
                 .collect(),
         };
-        match model.engine.embed_batch(&model.engine_model, batch) {
+        match model
+            .engine
+            .embed_batch_progress(&model.engine_model, batch, progress)
+        {
             Ok(vectors)
                 if vectors.len() == items.len()
                     && vectors.iter().all(|vector| vector.len() == model.dims) =>

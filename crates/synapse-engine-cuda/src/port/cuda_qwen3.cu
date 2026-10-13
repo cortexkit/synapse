@@ -1,4 +1,5 @@
 #include "cuda_family_common.cuh"
+#include "cuda_progress.cuh"
 
 #include <cfloat>
 #include <list>
@@ -227,6 +228,7 @@ struct ShapePlan {
     MatmulPlan hq, hkv, qh, hi, ih, qk, pv;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
+    SynapseLayerProgress progress;
 
 
     ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int kvh, int hd, int inter, int layers, float eps, float theta);
@@ -241,6 +243,7 @@ struct QwenContext {
     cublasLtHandle_t lt = nullptr;
     bool graphs_enabled;
     bool weights_loaded = false;
+    SynapseProgressObserver observer;
     int hidden = 0, query_heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0, layer_count = 0;
     std::vector<DeviceLayer> layers;
     DeviceAllocation<float> final_norm;
@@ -330,7 +333,7 @@ struct QwenContext {
 };
 
 ShapePlan::ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int kvh, int hd, int inter, int layers_count, float eps, float theta)
-    : context(owner), batch(b), seq(s), hidden(h), query_heads(qh_count), kv_heads(kvh), head_dim(hd), intermediate(inter), layer_count(layers_count), epsilon(eps) {
+    : context(owner), batch(b), seq(s), hidden(h), query_heads(qh_count), kv_heads(kvh), head_dim(hd), intermediate(inter), layer_count(layers_count), epsilon(eps), progress(layers_count) {
     size_t rows = static_cast<size_t>(batch) * seq;
     size_t hidden_values = rows * hidden;
     size_t q_values = rows * query_heads * head_dim;
@@ -455,6 +458,7 @@ void ShapePlan::compute(StageProfile *profile) {
         begin("pointwise_layout");
         add_residual<<<hidden_blocks, threads, 0, context->stream>>>(projected, x1, x0, hidden_count);
         end();
+        progress.record(index, context->stream);
     }
     begin("final_norm_output");
     rms_norm<<<rows, threads, 0, context->stream>>>(x0, context->final_norm.pointer, x1, hidden, epsilon);
@@ -470,6 +474,7 @@ void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *h
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     StageProfile profile;
     compute(&profile);
+    progress.wait(context->observer, true);
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
     std::unordered_map<std::string, double> stage_ms = profile.collect();
     std::vector<float> uncaptured(output.count);
@@ -481,6 +486,7 @@ void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *h
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+    progress.wait(context->observer, true);
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
     std::vector<float> captured(output.count);
     FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
@@ -495,6 +501,7 @@ void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *h
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     if (context->graphs_enabled) FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     else compute();
+    progress.wait(context->observer, false);
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(host_output, output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost, context->stream));
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
 }
@@ -502,6 +509,11 @@ void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *h
 }  // namespace
 
 extern "C" {
+
+void synapse_cuda_qwen3_set_progress(void* raw, SynapseProgressCallback callback, void* cookie) {
+    auto* context = static_cast<QwenContext*>(raw);
+    context->observer = {callback, cookie, false};
+}
 
 void *synapse_cuda_qwen3_context_new(int32_t graphs_enabled) {
     try {
@@ -547,6 +559,7 @@ int32_t synapse_cuda_qwen3_forward(
         if (upload_weights) context->load_weights(hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, layers, final_norm);
         if (upload_embeddings) context->load_embeddings(embeddings, static_cast<int>(vocab_size), static_cast<int>(hidden));
         if (!context->weights_loaded || !context->embeddings_loaded) throw std::runtime_error("Qwen3 CUDA forward called before weights and embeddings were uploaded");
+        context->observer.report(true);
         std::string key = shape_key(batch, seq);
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
@@ -564,6 +577,7 @@ int32_t synapse_cuda_qwen3_forward(
         }
         // Promote successful cache hits after the stream is idle. New plans
         // are already tracked above so a failed run cannot orphan an arena.
+        context->observer.report(false);
         found->second->run(token_ids, attention_mask, output);
         context->touch_plan(key);
         return 0;

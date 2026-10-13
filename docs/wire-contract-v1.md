@@ -144,6 +144,11 @@ message. A failed download carries `error` beside `state` in its flat status.
   expiry starts a fresh worker with zero strikes. Unload/reload or a module
   restart clears catalog quarantine immediately. Legacy/free-form workers keep
   permanent `probe_required` and their existing recovery contract.
+  Worker crash, protocol fault and no-progress hang each add one consecutive
+  strike; two strikes quarantine. Only fully drained successful serving work
+  (embed, rerank/score or generation) clears strikes. LOAD/reload, PING,
+  admission/eviction and setup never clear them. Caller-deadline expiry on live
+  work neither strikes nor clears; its eventual detached serving success does.
 - `model_loading` — transient, `retry_after_ms: 250`, safe to retry. Inline
   serving waits up to `min(remaining deadline, 5000 ms)` for load/self-check;
   this code is used only when that cap expires with deadline remaining. A
@@ -409,6 +414,15 @@ The lane stays selected; no other backend is substituted. On expiry the next
 serving request starts a fresh worker with zero strikes. Explicit unload/reload
 or module restart clears the cool-down immediately. This automatic recovery is
 catalog-only; legacy/free-form lanes retain `probe_required`.
+
+The same consecutive-fault/cool-down rule applies to direct ANE channels.
+Quarantine closes and confirms the old worker's exit before refunding resident
+shapes, and does not spawn/recompile replacements until recovery is allowed.
+Live work has no worker total-time cap: only lack of completed-work progress
+for 120 seconds during inference (600 during load/compile/setup) is a hang.
+Caller deadlines return `deadline_exceeded` without a strike and submitted work
+drains on its owner so the next request cannot receive a stale reply. Existing
+direct-ANE compile-blocked deadline waits retain `shape_compiling`.
 
 #### Removed or rejected paths and their replacements
 

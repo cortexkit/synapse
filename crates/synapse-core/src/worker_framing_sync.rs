@@ -3,6 +3,51 @@ use std::io::{self, Read, Write};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::{WorkerProgressPhase, WorkerResponse};
+
+/// Serial writer for completed work, sharing the request's terminal-reply stream.
+/// Call only after a native completion fence, never from a timer or graph capture.
+pub struct ProgressWriter<'a, W> {
+    writer: &'a mut W,
+    req_id: &'a str,
+    max_frame: u32,
+    completed: u64,
+    failed: bool,
+}
+
+impl<'a, W: Write> ProgressWriter<'a, W> {
+    pub fn new(writer: &'a mut W, req_id: &'a str, max_frame: u32) -> Self {
+        Self {
+            writer,
+            req_id,
+            max_frame,
+            completed: 0,
+            failed: false,
+        }
+    }
+
+    pub fn completed(&mut self, phase: WorkerProgressPhase) -> io::Result<()> {
+        self.completed = self.completed.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "progress counter overflow")
+        })?;
+        let result = write_json_frame(
+            self.writer,
+            &WorkerResponse::Progress {
+                req_id: self.req_id.into(),
+                completed: self.completed,
+                phase,
+            },
+            self.max_frame,
+        );
+        self.failed |= result.is_err();
+        result
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+}
+
 pub fn read_frame<R: Read>(reader: &mut R, max_frame: u32) -> io::Result<Vec<u8>> {
     let mut len_bytes = [0_u8; 4];
     reader.read_exact(&mut len_bytes)?;

@@ -1,4 +1,5 @@
 #include "cuda_family_common.cuh"
+#include "cuda_progress.cuh"
 
 #include <cfloat>
 #include <cstdio>
@@ -228,6 +229,7 @@ struct ShapePlan {
     MatmulPlan h3h, hh, h2i, ih, qk_plan, pv_plan;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
+    SynapseLayerProgress progress;
 
     ShapePlan(ModernContext *owner, int b, int s, int h, int nh, int inter, int layers, float eps, float global_theta, float local_theta, int half_window);
     ~ShapePlan();
@@ -242,6 +244,7 @@ struct ModernContext {
     bool graphs_enabled;
     bool f16;
     bool weights_loaded = false;
+    SynapseProgressObserver observer;
     int hidden = 0, intermediate = 0, layer_count = 0;
     std::vector<DeviceLayer> layers;
     DeviceAllocation<float> final_norm;
@@ -287,7 +290,7 @@ struct ModernContext {
 };
 
 ShapePlan::ShapePlan(ModernContext *owner, int b, int s, int h, int nh, int inter, int layers_count, float eps, float global_theta, float local_theta, int half_window)
-    : context(owner), batch(b), seq(s), hidden(h), heads(nh), head_dim(h / nh), intermediate(inter), layer_count(layers_count), epsilon(eps) {
+    : context(owner), batch(b), seq(s), hidden(h), heads(nh), head_dim(h / nh), intermediate(inter), layer_count(layers_count), epsilon(eps), progress(layers_count) {
     size_t rows = static_cast<size_t>(batch) * seq;
     size_t hidden_values = rows * hidden;
     size_t scores_count = static_cast<size_t>(batch) * heads * seq * seq;
@@ -405,6 +408,7 @@ void ShapePlan::compute(StageProfile *profile) {
         begin("pointwise_layout");
         add_kernel<<<blocks, threads, 0, context->stream>>>(static_cast<T *>(projected), static_cast<T *>(x1), static_cast<T *>(x0), hidden_count);
         end();
+        progress.record(index, context->stream);
     }
     begin("final_norm_output");
     layer_norm_kernel<<<rows, threads, 0, context->stream>>>(static_cast<T *>(x0), context->final_norm.pointer, static_cast<T *>(x1), hidden, epsilon);
@@ -420,6 +424,7 @@ void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mas
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     StageProfile profile;
     if (context->f16) compute<half>(&profile); else compute<float>(&profile);
+    progress.wait(context->observer, true);
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
     std::unordered_map<std::string, double> stage_ms = profile.collect();
     std::vector<float> uncaptured(output.count);
@@ -431,6 +436,7 @@ void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mas
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+    progress.wait(context->observer, true);
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
     std::vector<float> captured(output.count);
     FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
@@ -461,6 +467,7 @@ void ShapePlan::run(const void *input, const uint8_t *host_mask, float *host_out
     if (context->graphs_enabled) FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
     else if (context->f16) compute<half>();
     else compute<float>();
+    progress.wait(context->observer, false);
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(host_output, output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost, context->stream));
     FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
 }
@@ -468,6 +475,11 @@ void ShapePlan::run(const void *input, const uint8_t *host_mask, float *host_out
 }  // namespace
 
 extern "C" {
+
+void synapse_cuda_modernbert_set_progress(void* raw, SynapseProgressCallback callback, void* cookie) {
+    auto* context = static_cast<ModernContext*>(raw);
+    context->observer = {callback, cookie, false};
+}
 
 void *synapse_cuda_modernbert_context_new(int32_t graphs_enabled, int32_t precision) {
     try {
@@ -506,6 +518,7 @@ int32_t synapse_cuda_modernbert_forward(
         ModernContext *context = static_cast<ModernContext *>(raw_context);
         if (context->f16) context->load_weights<half>(hidden, intermediate, layer_count, layers, final_norm);
         else context->load_weights<float>(hidden, intermediate, layer_count, layers, final_norm);
+        context->observer.report(true);
         std::string key = shape_key(batch, seq);
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
@@ -513,6 +526,7 @@ int32_t synapse_cuda_modernbert_forward(
             plan->initialize_and_verify(input, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
         }
+        context->observer.report(false);
         found->second->run(input, attention_mask, output);
         return 0;
     } catch (const std::exception &error) {

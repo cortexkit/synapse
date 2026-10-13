@@ -13,8 +13,8 @@ use synapse_core::worker_framing_sync::{read_frame, write_frame, write_json_fram
 #[cfg(unix)]
 use synapse_core::WorkerHelloAck;
 use synapse_core::{
-    encode_f32_frame, EngineIdentity, WorkerHello, WorkerRequest, WorkerResponse,
-    DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
+    encode_f32_frame, EngineIdentity, WorkerHello, WorkerProgressPhase, WorkerRequest,
+    WorkerResponse, DEFAULT_MAX_FRAME_BYTES, WORKER_PROTOCOL_VERSION,
 };
 
 fn argument(name: &str) -> Result<String> {
@@ -142,11 +142,36 @@ fn run_worker<S: Read + Write>(
                 )?;
             }
             WorkerRequest::EmbedBatch { req_id, .. } => {
-                let _ = read_frame(stream, max_frame).context("read embed ids")?;
+                let ids = read_frame(stream, max_frame).context("read embed ids")?;
                 if abort_on_embed {
                     return Ok(());
                 }
-                thread::sleep(Duration::from_millis(embed_sleep_ms));
+                let progress_ms = optional_milliseconds("--progress-ms")?;
+                let hang = optional_count("--hang-on-embed")? != 0
+                    || argument("--hang-file")
+                        .ok()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .is_some_and(|value| value == "hang");
+                if progress_ms > 0 || hang {
+                    let mut progress = synapse_core::worker_framing_sync::ProgressWriter::new(
+                        stream, &req_id, max_frame,
+                    );
+                    progress.completed(WorkerProgressPhase::Inference)?;
+                    if hang {
+                        loop {
+                            thread::park();
+                        }
+                    }
+                    let mut remaining = embed_sleep_ms;
+                    while remaining > 0 {
+                        let step = remaining.min(progress_ms);
+                        thread::sleep(Duration::from_millis(step));
+                        remaining -= step;
+                        progress.completed(WorkerProgressPhase::Inference)?;
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(embed_sleep_ms));
+                }
                 write_json_frame(
                     stream,
                     &WorkerResponse::Vectors {
@@ -156,7 +181,12 @@ fn run_worker<S: Read + Write>(
                     },
                     max_frame,
                 )?;
-                let values = vec![1.0_f32; embed_dims.saturating_mul(embed_n)];
+                let value = if optional_count("--echo-tokens")? != 0 {
+                    synapse_core::decode_i32_frame(&ids)?.iter().sum::<i32>() as f32
+                } else {
+                    1.0
+                };
+                let values = vec![value; embed_dims.saturating_mul(embed_n)];
                 write_frame(stream, &encode_f32_frame(&values), max_frame)?;
             }
             WorkerRequest::Generate {

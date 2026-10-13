@@ -1,4 +1,5 @@
 #include "cuda_minilm.h"
+#include "cuda_progress.cuh"
 
 #include <cublasLt.h>
 #include <cuda_fp16.h>
@@ -533,6 +534,7 @@ struct ShapePlan {
     MatmulPlan pv;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
+    SynapseLayerProgress progress;
     double algo_selection_ms = 0.0;
     double warmup_ms = 0.0;
     double capture_ms = 0.0;
@@ -552,6 +554,7 @@ struct CudaContext {
     cublasLtHandle_t lt = nullptr;
     bool graphs_enabled = true;
     bool weights_loaded = false;
+    SynapseProgressObserver observer;
     int hidden = 0;
     int intermediate = 0;
     int layer_count = 0;
@@ -615,7 +618,7 @@ struct CudaContext {
 };
 
 ShapePlan::ShapePlan(CudaContext *owner, int b, int s, int h, int nh, int i, int layers_count, float eps)
-    : context(owner), batch(b), seq(s), hidden(h), heads(nh), head_dim(h / nh), intermediate(i), layer_count(layers_count), epsilon(eps) {
+    : context(owner), batch(b), seq(s), hidden(h), heads(nh), head_dim(h / nh), intermediate(i), layer_count(layers_count), epsilon(eps), progress(layers_count) {
     const size_t rows = static_cast<size_t>(batch) * seq;
     const size_t hidden_values = rows * hidden;
     const size_t head_values = hidden_values;
@@ -713,6 +716,7 @@ void ShapePlan::compute(StageProfile *profile) {
         if (profile) profile->begin("pointwise", context->stream);
         residual_layer_norm<<<rows, threads, 0, context->stream>>>(ffn_output, layer.output_bias.pointer, x1, layer.output_ln_weight.pointer, layer.output_ln_bias.pointer, x0, hidden, epsilon);
         if (profile) profile->end(context->stream);
+        progress.record(index, context->stream);
     }
     if (profile) profile->begin("pool_l2", context->stream);
     mean_pool_l2<<<batch, 256, 0, context->stream>>>(x0, mask.pointer, pooled.pointer, seq, hidden);
@@ -728,6 +732,7 @@ void ShapePlan::initialize_and_verify(const uint16_t *input, const uint8_t *host
     StageProfile profile;
     auto started = std::chrono::steady_clock::now();
     compute(&profile);
+    progress.wait(context->observer, true);
     CUDA_CHECK(cudaStreamSynchronize(context->stream));
     warmup_ms = elapsed_ms(started);
     stage_ms = profile.collect();
@@ -746,6 +751,7 @@ void ShapePlan::initialize_and_verify(const uint16_t *input, const uint8_t *host
     CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
     started = std::chrono::steady_clock::now();
     CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+    progress.wait(context->observer, true);
     CUDA_CHECK(cudaStreamSynchronize(context->stream));
     first_launch_ms = elapsed_ms(started);
     std::vector<float> captured(uncaptured.size());
@@ -781,6 +787,7 @@ void ShapePlan::run(const uint16_t *input, const uint8_t *host_mask, float *outp
     } else {
         compute(nullptr);
     }
+    progress.wait(context->observer, false);
     CUDA_CHECK(cudaMemcpyAsync(output, pooled.pointer, static_cast<size_t>(batch) * hidden * sizeof(float), cudaMemcpyDeviceToHost, context->stream));
     CUDA_CHECK(cudaStreamSynchronize(context->stream));
 }
@@ -792,6 +799,11 @@ std::string shape_key(int batch, int seq) {
 }  // namespace
 
 extern "C" {
+
+void synapse_cuda_set_progress(void* raw, SynapseProgressCallback callback, void* cookie) {
+    auto* context = static_cast<CudaContext*>(raw);
+    context->observer = {callback, cookie, false};
+}
 
 void *synapse_cuda_context_new(int32_t graphs_enabled) {
     try {
@@ -827,6 +839,7 @@ int32_t synapse_cuda_encoder_forward(
         if (hidden % heads != 0 || batch == 0 || seq == 0 || hidden == 0 || layer_count == 0) throw std::runtime_error("CUDA encoder received invalid dimensions");
         CudaContext *context = static_cast<CudaContext *>(raw_context);
         context->load_weights(static_cast<int>(hidden), static_cast<int>(intermediate), static_cast<int>(layer_count), layers);
+        context->observer.report(true);
         std::string key = shape_key(static_cast<int>(batch), static_cast<int>(seq));
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
@@ -834,6 +847,7 @@ int32_t synapse_cuda_encoder_forward(
             plan->initialize_and_verify(input, attention_mask);
             found = context->plans.emplace(key, std::move(plan)).first;
         }
+        context->observer.report(false);
         found->second->run(input, attention_mask, output, context->graphs_enabled);
         return 0;
     } catch (const std::exception &error) {

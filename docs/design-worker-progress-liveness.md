@@ -1,6 +1,9 @@
 # Worker progress and request liveness
 
-Status: proposed; implementation requires approval of this note.
+Status: approved for implementation by the project maintainer. Decisions below
+justify fixed 120-second inference and 600-second setup windows and unchanged
+opaque batching; certification means checking complete pinned numerical fixtures
+and token-bound refusals on the declared hardware.
 
 ## Motivation and scope
 
@@ -87,9 +90,9 @@ another generation's watchdog.
 | CUDA inference | After each retired layer and completed output sub-batch, plus completed weight-upload/shape-setup milestones. | Rust currently invokes one opaque batch forward C ABI call. Extend that ABI with a progress callback. Use CUDA completion events on the actual execution stream (including captured-graph layers), waited on by the host before reporting; never call socket code during graph capture or mistake kernel submission for retirement (`crates/synapse-engine-cuda/src/cuda.rs:391-431,648-665`; `crates/synapse-engine-cuda/src/port/cuda_modernbert.cu:351-466,485-517`). |
 | Direct ANE inference | After each synchronous layer evaluation and output row; packed execution reports layers and completed passes. | Cached executable evaluation already blocks through execution. The callback belongs after that call, not before it (`crates/synapse-worker-ane-direct/src/backend.rs:396-424`; `crates/synapse-worker-ane-direct/src/worker.rs:433-514`). |
 | Direct ANE shape/packed admission | After each layer's graph compilation/load, and after final residency publication. | A whole cold shape can take minutes. One native compiler invocation is opaque, but successive layer completions are observable (`crates/synapse-worker-ane-direct/src/backend.rs:257-320`). |
-| Swift Core ML inference | One row per native prediction call, then report its completed output. Keep the bucket chosen for the original request, existing padding and row order. | Today `predictions(fromBatch:)` submits the whole batch with no progress inside it, and the worker itself has no numeric batch-count bound. Splitting independent rows bounds each opaque call to one fixed model input shape, rather than an arbitrary batch. It does not split a row or change attention semantics (`crates/synapse-worker-ane/swift/ane_worker.swift:267-331,413-437`). |
-| llama embeddings/rerank | One independent sequence/candidate per complete native encode/decode call; report after output extraction. Preserve context sizing, positions, pooling and sequence independence. | Today embedding encodes the whole batch at once; rerank already calls encode per candidate. Never split an encoder's attention sequence into token chunks, which would change the result (`crates/synapse-worker-llama/src/runner.rs:642-681,888-955`). |
-| llama generation | Decode causal prompt prefill in at most 512-token chunks, preserving KV state, then report each completed generated-token decode. | The existing worker has no separate prompt-length ceiling. Causal chunking makes native work bounded without reducing that ceiling or generated-token limit. A loader progress callback or an abort/poll callback is not evidence that a forward pass completed (`crates/synapse-worker-llama/src/runner.rs:704-762`). |
+| Swift Core ML inference | Keep the existing whole-batch `predictions(fromBatch:)` call and report only its terminal reply. | Product Core ML runs on Apple Silicon with fixed buckets of at most 512 tokens; the approved 120-second window exceeds the slowest served batch by more than 70 times. Do not change batching, throughput or numerics merely to obtain progress. The worker implementation has no mid-call completion callback (`crates/synapse-worker-ane/swift/ane_worker.swift:267-331,413-437`). |
+| llama embeddings/rerank | Preserve current batching and native calls; return only the terminal reply. | Catalog embedding/rerank uses the owned Metal, Vulkan, CUDA or ANE backends; these llama operations remain for legacy/free-form API users, not catalog serving. Splitting their calls would change compatibility behavior without improving catalog liveness (`crates/synapse-worker-llama/src/runner.rs:642-681,888-955`). |
+| llama generation | Keep existing prompt prefill exactly as it is; report each completed generated-token decode. | Generation is the product llama path. Token decode boundaries provide progress at negligible cost, but the prompt native call remains opaque. Do not split prefill or use loader/abort polling as evidence of completed forward work (`crates/synapse-worker-llama/src/runner.rs:704-762`). |
 | LOAD/setup, all workers | After each completed artifact verification/upload/model-bucket load or other observable setup stage; final response if the native loader is wholly opaque. | A native Core ML model load or llama model load can remain silent within its setup idle allowance. Do not send timer heartbeats while a loader or graph capture is blocked. |
 
 Completed work is reported at **every** listed boundary, including on requests
@@ -105,8 +108,7 @@ cannot advertise an `idle_window_ms` value or request a longer watchdog:
 
 | Operation | Maximum silence after dispatch or last valid progress |
 | --- | ---: |
-| Vulkan, CUDA (after setup) and direct ANE inference | 120 seconds |
-| Core ML or llama inference with an opaque native forward call | 600 seconds |
+| All engines' inference, including opaque Core ML/llama calls (CUDA after setup) | 120 seconds |
 | LOAD, first-time shape/packed compilation, eviction and CUDA cold setup | 600 seconds |
 | PING, UNLOAD and other short control exchanges | 120 seconds |
 
@@ -128,7 +130,23 @@ same read. The request write and terminal raw-frame transfer must also finish
 within a silence window; a peer stuck mid-frame is not healthy progress.
 
 At idle expiry, fault the connection, kill/reap only the owned worker, and use
-the existing crash-accounting authority and recovery/quarantine policy. The
+the existing crash-accounting authority. Generic worker lanes use consecutive
+faults, not the former 60-second rolling window: a crash, protocol fault or
+no-progress hang adds one strike; two consecutive strikes quarantine with the
+existing quarantine state and recovery policy. Only fully drained successful
+serving work (embed, rerank/score or generation) on the owning generation
+clears strikes. LOAD/reload, PING, admission, eviction and setup do not clear.
+Caller expiry neither strikes nor clears; an abandoned serving request's
+eventual drained success does clear. The
+independent owned-decode supervisor's strike policy is unchanged. The
+catalog disposition is transient `engine_crashed` with the remaining fixed
+ten-minute cool-down and `{lane_id, quarantined: true}`, never `probe_required`.
+After expiry, the next serving request starts a fresh worker with zero strikes;
+explicit unload/reload or module restart clears it immediately. Legacy lanes
+keep `probe_required`. Direct ANE uses the same rule per channel/generation;
+confirmed exit precedes residency refunds and no replacement is spawned during
+its cool-down. The existing health field name `crash_count_window` is retained
+for consumers, but now counts consecutive faults rather than timed history. The
 public error remains `engine_crashed`; diagnostics say which operation and
 worker generation stalled, its last counter, its idle duration and window,
 rather than “request exceeded 30000 ms”. Real exits, broken pipes and malformed
@@ -136,6 +154,12 @@ protocol still follow their existing fault paths. Do not replay a dispatched
 request: it may already have executed.
 
 ### Why these windows
+
+Generic `WorkerHost` supervises catalog and legacy/free-form workers; direct
+ANE uses its specialized channel. Both use consecutive faults. Catalog versus
+legacy identifies consumer recovery policy, not a different fault counter. A
+catalog lane's ten-minute cool-down starts at its second consecutive fault.
+The independently persisted owned-decode supervisor remains outside this policy.
 
 The Ally data measures **requests**, not gaps between layers. Qwen3 takes
 2.6 seconds at 512 tokens; treating all that work as quadratic at 8,192 tokens
@@ -166,17 +190,21 @@ allowance for an individual compile gap. Preserve it as an idle allowance;
 compilation can take longer overall if layers keep completing. A request
 waiting behind that compile has no inference idle timer running.
 
-The 600-second opaque-forward allowance intentionally grants more silence than
-layer-instrumented inference. A token/shape bound is not a mathematical bound
-on native execution time, and neither this repository nor the Windows report
-establishes a worst-case Core ML/llama call duration. Use bounded work per native
-call, report at each completed call, and treat ten minutes as a conservative
-operational estimate, not a measured guarantee. Expose validated, positive
-host configuration overrides for these silence windows so slower supported
-hardware can increase them without reinstating a total request cap. Do not
-allow an individual caller or a progress frame to disable the watchdog.
-Record calibration gaps honestly; an independent timer thread cannot fill
-them with evidence of GPU liveness.
+All inference uses the same 120-second window, including opaque Core ML/llama
+calls. Core ML's fixed product buckets are at most 512 tokens on Apple Silicon;
+the slowest served batch is more than 70 times shorter than this window. llama
+product serving is generation only and emits progress after generated tokens.
+Keep existing batching and prompt prefill unchanged. A shape bound is not a
+mathematical wall-clock guarantee, but a real hang must not block a lane for ten
+minutes merely because its native API is opaque.
+
+Use fixed constants in code, with the reasoning beside them, not configuration
+overrides or caller/worker-supplied extensions. Supporting hardware that needs a
+larger window requires a code change justified by measurements. Record the
+maximum progress gap per engine and operation. If any measured gap exceeds a
+quarter of its window (30 seconds for inference, 150 seconds for setup), stop
+and report it to the maintainer before certifying; do not manufacture timer
+heartbeats to hide it.
 
 ## Decision 3: caller deadline, not a request lifetime limit
 
@@ -302,9 +330,9 @@ worker/direct-ANE serving docs when implementing, not historical evidence.
 
 ## Approval boundary and implementation proof
 
-This commit is a design note only. No timeout, protocol, worker, public contract
-or hardware certification record changes before approval. The estimates above
-are proposed policy defaults, not new hardware measurements.
+The project maintainer approved implementation with fixed windows, unchanged
+Core ML/llama batching and mandatory progress-gap measurements. The 120/600-second
+windows are operational policy defaults, not new hardware measurements.
 
 After maintainer approval of this note, implement and commit at each verified
 green step:
@@ -318,8 +346,8 @@ green step:
      paused-clock unit test for repeated watchdog renewal, but do not use that
      as the only evidence that a real request can exceed 30 seconds.
    - `stalled_progress_worker_strikes_within_idle_window`: complete an initial
-     work unit, then stop progress and remain connected. Use a short injectable
-     idle window, assert detection within that window plus a small scheduler
+     work unit, then stop progress and remain connected. Exercise the fixed
+     inference idle window, assert detection within that window plus a small scheduler
      allowance, exactly one strike, and existing quarantine on repeated hangs.
    - `live_worker_deadline_drains_before_next_correct_response`: expire a short
      caller deadline on live work that continues beyond 30 seconds, assert
@@ -331,6 +359,10 @@ green step:
    wrong IDs, invalid phases, partial frames, header/raw misassociation and
    queued waits cannot keep a hung exchange alive or steal a result. Preserve
    compile-wait `shape_compiling` tests and genuine crash/quarantine tests.
+   Inventory existing host/soak/probe-required quarantine tests before changing
+   crash accounting. Add two sequential hangs quarantine and hang-success-hang
+   does not quarantine, and show both red against rolling-window accounting.
+   Report any changed timing expectation by test name and reason.
 3. Show each named acceptance test green and red with the relevant production
    behavior reverted. Keep v3 handshake/test scaffolding intact so a red run
    cannot be explained by version rejection before reaching inference. Use the
@@ -352,7 +384,18 @@ green step:
    8,193-token refusal/no-worker-dispatch check. Identify CPU/GPU, build SHA and
    binary provenance. Stop only processes started by this work.
 
-If a legitimate measured single work unit approaches its silence window,
-increase or refine the relevant engine window before claiming certification;
-do not add fabricated heartbeats, split noncausal attention, widen token limits,
-or weaken numerical tolerances to make the result green.
+6. Measure direct ANE gaps on the M4 Mac mini (`ssh macmini`, macOS 27, 16 GiB)
+   using only a private daemon. The maintainer approved this conservative
+   substitute because the M5's machine-wide lane lock is held by production.
+   Measure Qwen3 inference at 128, 512 and 8,192 tokens plus first-time shape
+   compilation. Check `pgrep -fl "ane|synapse"` before each run and never stop
+   unrelated processes. The 2026-10-13 allocation ends at 07:00Z. Do not run ANE
+   work on the M5 during its 01:50Z–02:50Z reservation. Record engine,
+   operation, model, sequence length, maximum gap and binary provenance. Stop
+   and report any gap above a quarter of its window before certifying.
+
+If a legitimate measured single work unit exceeds a quarter of its window,
+stop and report it before claiming certification. Timer heartbeats would hide a
+stalled device; splitting noncausal attention changes outputs, widening token
+limits changes the refusal contract, and relaxed tolerances hide numerical
+errors. None is a valid workaround for a slow work unit.

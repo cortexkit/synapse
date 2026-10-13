@@ -1331,10 +1331,10 @@ mod relay_tests {
             relay_frames(&mut host_relay, &mut worker_relay, &mut log).unwrap();
             log
         });
-        let hello = br#"{"v":2,"nonce":"test-secret","pid":7}"#;
+        let hello = br#"{"v":3,"nonce":"test-secret","pid":7}"#;
         write_frame(&mut worker, hello, 1024).unwrap();
         assert_eq!(read_frame(&mut host, 1024).unwrap(), hello);
-        let ack = br#"{"v":2,"accept":true,"max_frame":1024}"#;
+        let ack = br#"{"v":3,"accept":true,"max_frame":1024}"#;
         write_frame(&mut host, ack, 1024).unwrap();
         assert_eq!(read_frame(&mut worker, 1024).unwrap(), ack);
         let request=br#"{"type":"EMBED_PACKED","req_id":"probe","model_ref":"m","program_revision":1,"items":[{"id":"0","n_tokens":1}],"passes":[[0]]}"#;

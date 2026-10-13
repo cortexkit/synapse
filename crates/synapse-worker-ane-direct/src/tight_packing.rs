@@ -303,12 +303,29 @@ impl Model {
     pub fn compile_tight_packing(&self, width: usize) -> Result<TightProgram> {
         supported(self)?;
         validate_width(width)?;
-        self.compile_tight_mode(width, public_mode(&self.profile, width)?)
+        self.compile_tight_mode_progress(width, public_mode(&self.profile, width)?, &mut || Ok(()))
     }
+    pub fn compile_tight_packing_progress(
+        &self,
+        width: usize,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<TightProgram> {
+        self.compile_tight_mode_progress(width, public_mode(&self.profile, width)?, progress)
+    }
+
     pub(super) fn compile_tight_mode(
         &self,
         width: usize,
         mode: OperandMode,
+    ) -> Result<TightProgram> {
+        self.compile_tight_mode_progress(width, mode, &mut || Ok(()))
+    }
+
+    fn compile_tight_mode_progress(
+        &self,
+        width: usize,
+        mode: OperandMode,
+        progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<TightProgram> {
         supported(self)?;
         validate_width(width)?;
@@ -321,6 +338,7 @@ impl Model {
                 executables.push(compile_layer(&graph, layer, |graph| {
                     graph.compile(NSQualityOfService::UserInteractive)
                 })?);
+                progress()?;
             }
             Ok(TightProgram {
                 width,
@@ -359,6 +377,24 @@ impl TightProgram {
         ane::autoreleasepool(|_| self.run_unpooled(model, rows))
     }
     fn run_unpooled(&self, model: &Model, rows: &[&[u32]]) -> Result<Vec<Vec<f32>>> {
+        self.run_unpooled_progress(model, rows, &mut || Ok(()))
+    }
+
+    pub fn run_progress(
+        &self,
+        model: &Model,
+        rows: &[&[u32]],
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<Vec<f32>>> {
+        ane::autoreleasepool(|_| self.run_unpooled_progress(model, rows, progress))
+    }
+
+    fn run_unpooled_progress(
+        &self,
+        model: &Model,
+        rows: &[&[u32]],
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<Vec<Vec<f32>>> {
         supported(model)?;
         let lengths: Vec<usize> = rows.iter().map(|r| r.len()).collect();
         match &self.mode {
@@ -394,6 +430,7 @@ impl TightProgram {
                 self.sin.copy_from_f32(&sin);
             }
         }
+        progress()?;
         for (layer, executable) in self.executables.iter().enumerate() {
             let (src, dst) = if layer % 2 == 0 {
                 (&self.a, &self.b)
@@ -408,6 +445,7 @@ impl TightProgram {
                 OperandMode::Constants(_) => &[src],
             };
             executable.run_cached(inputs, &[dst])?;
+            progress()?;
         }
         let raw = if self.executables.len().is_multiple_of(2) {
             self.a.read_f32()
