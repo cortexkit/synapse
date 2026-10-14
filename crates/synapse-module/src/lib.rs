@@ -20061,51 +20061,63 @@ mod tests {
             .control
             .hold_next_admission(started.clone(), release.clone());
         let model = ane_lane_model(&state);
-        let began = Instant::now();
-        let first = tokio::time::timeout(
-            Duration::from_secs(2),
-            ensure_profile_request_certified(
-                state.clone(),
-                &model,
-                Some(tokio::time::Instant::now() + Duration::from_millis(100)),
-            ),
-        )
-        .await;
-        let waited = began.elapsed();
+        // Drive only the caller's deadline with virtual time. Single polls keep
+        // the clock from auto-advancing while the external mock worker waits.
+        let (first, check_running) = {
+            tokio::time::pause();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let certify = ensure_profile_request_certified(state.clone(), &model, Some(deadline));
+            tokio::pin!(certify);
+            let subscribed = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(certify.as_mut(), cx))
+            })
+            .await;
+            assert!(subscribed.is_pending(), "{subscribed:?}");
+            tokio::time::advance(Duration::from_millis(99)).await;
+            let before_deadline = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(certify.as_mut(), cx))
+            })
+            .await;
+            assert!(before_deadline.is_pending(), "{before_deadline:?}");
+            // Tokio rounds timer deadlines up to its millisecond tick; cross
+            // that tick without spending any wall-clock scheduling budget.
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(certify.as_mut(), cx))
+            })
+            .await;
+            let check_running = state
+                .runtime
+                .lane_checks
+                .lock()
+                .unwrap()
+                .get(ANE_TEST_LANE)
+                .is_some_and(|outcome| outcome.borrow().is_none());
+            tokio::time::resume();
+            (first, check_running)
+        };
+        release.notify_one();
+        until_lane_check_settles(&state).await;
+        // A completed check must have crossed admission, even if the worker
+        // reached it after the caller expired and the release permit was sent.
         let compile_reached =
             tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
-        let check_running = catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
-            .try_lock()
-            .is_err();
-        release.notify_one();
-        let finished = tokio::time::timeout(Duration::from_secs(10), async {
-            while catalog_lane_lock(&state.runtime, ANE_TEST_LANE)
-                .try_lock()
-                .is_err()
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
         let later = tokio::time::Instant::now() + Duration::from_secs(5);
         let second = ensure_profile_request_certified(state.clone(), &model, Some(later)).await;
         let served = embed_on_ane_lane(&state, 1, Some(later)).await;
         drop(model);
         finish_ane_lane_fixture(fixture).await;
         match first {
-            Ok(Err(error)) => assert_eq!(error.code, "model_loading", "{error:?}"),
+            std::task::Poll::Ready(Err(error)) => {
+                assert_eq!(error.code, "model_loading", "{error:?}")
+            }
             other => panic!("the starting request must answer at its deadline: {other:?}"),
         }
-        assert!(
-            waited >= Duration::from_millis(100) && waited < Duration::from_secs(1),
-            "{waited:?}"
-        );
         assert!(
             compile_reached.is_ok(),
             "the check never ran its reference case"
         );
         assert!(check_running, "the check stopped with its starting request");
-        assert!(finished.is_ok(), "the check never completed");
         assert!(second.is_ok(), "{second:?}");
         assert!(served.is_ok(), "{served:?}");
     }
@@ -20162,13 +20174,22 @@ mod tests {
             .load(std::sync::atomic::Ordering::SeqCst);
         release.notify_one();
         until_lane_check_settles(&state).await;
-        let began = Instant::now();
+        // Cached certification must finish in its first poll, not join or start
+        // lane work. A wall-clock bound would measure runner scheduling instead.
         let next = {
             let model = ane_lane_model(&state);
+            tokio::time::pause();
             let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-            ensure_profile_request_certified(state.clone(), &model, Some(deadline)).await
+            let certify = ensure_profile_request_certified(state.clone(), &model, Some(deadline));
+            tokio::pin!(certify);
+            let next = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(certify.as_mut(), cx))
+            })
+            .await;
+            tokio::time::resume();
+            next
         };
-        let certified_in = began.elapsed();
+        let no_check_queued = state.runtime.lane_checks.lock().unwrap().is_empty();
         let served = embed_on_ane_lane(
             &state,
             1,
@@ -20192,8 +20213,8 @@ mod tests {
         }
         assert!(compile_reached.is_ok(), "the check never ran");
         assert_eq!(tasks_during_check, 1, "one check task per lane");
-        assert!(next.is_ok(), "{next:?}");
-        assert!(certified_in < Duration::from_millis(50), "{certified_in:?}");
+        assert!(matches!(next, std::task::Poll::Ready(Ok(()))), "{next:?}");
+        assert!(no_check_queued, "cached certification queued lane work");
         assert!(served.is_ok(), "{served:?}");
         assert_eq!(tasks_after, 1, "a passed check is served without a task");
         assert!(unloaded.get("error").is_none(), "{unloaded}");
@@ -20493,47 +20514,56 @@ mod tests {
             .lock()
             .unwrap() = true;
         let state = fixture.state.clone();
-        let (compiling, finish_compile) = ane_gate();
-        fixture
-            .control
-            .hold_next_admission(compiling.clone(), finish_compile.clone());
-        let later = || Some(tokio::time::Instant::now() + Duration::from_secs(10));
-        let first = tokio::spawn({
-            let state = state.clone();
-            async move {
-                let model = ane_lane_model(&state);
-                ensure_profile_request_certified(state, &model, later()).await
-            }
-        });
-        // The check is running its first reference case.
-        tokio::time::timeout(Duration::from_secs(2), compiling.notified())
-            .await
-            .unwrap();
+        let model = ane_lane_model(&state);
+        // On this current-thread runtime, one poll registers the in-flight
+        // check before its spawned task can run. The second caller can then
+        // find no cached passed result and suspend before joining the check,
+        // without waiting for a notification from the external worker.
+        let first = ensure_profile_request_certified(state.clone(), &model, None);
+        tokio::pin!(first);
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(first.as_mut(), cx))
+        })
+        .await;
+        assert!(first_poll.is_pending(), "{first_poll:?}");
         let (missed, join) = ane_gate();
         *state.runtime.fast_path_gate.lock().unwrap() = Some((missed.clone(), join.clone()));
-        let second = tokio::spawn({
-            let state = state.clone();
-            async move {
-                let model = ane_lane_model(&state);
-                ensure_profile_request_certified(state, &model, later()).await
-            }
-        });
-        // The second caller saw the check pending and is about to join it.
-        tokio::time::timeout(Duration::from_secs(2), missed.notified())
-            .await
-            .unwrap();
-        finish_compile.notify_one();
-        let first = first.await.unwrap();
+        let second = ensure_profile_request_certified(state.clone(), &model, None);
+        tokio::pin!(second);
+        let second_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(second.as_mut(), cx))
+        })
+        .await;
+        assert!(second_poll.is_pending(), "{second_poll:?}");
+        let missed = missed.notified();
+        tokio::pin!(missed);
+        let missed_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(missed.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            missed_poll.is_ready(),
+            "the second caller did not miss the fast path"
+        );
+        // Only now drive the worker. The second future stays suspended until
+        // the passed check has left the in-flight map.
+        let first = tokio::time::timeout(Duration::from_secs(10), first).await;
         until_lane_check_settles(&state).await;
         join.notify_one();
-        let second = tokio::time::timeout(Duration::from_secs(2), second).await;
+        let second = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(second.as_mut(), cx))
+        })
+        .await;
         let tasks = state
             .runtime
             .lane_check_tasks
             .load(std::sync::atomic::Ordering::SeqCst);
         finish_ane_lane_fixture(fixture).await;
-        assert!(first.is_ok(), "{first:?}");
-        assert!(matches!(second, Ok(Ok(Ok(())))), "{second:?}");
+        assert!(matches!(first, Ok(Ok(()))), "{first:?}");
+        assert!(
+            matches!(second, std::task::Poll::Ready(Ok(()))),
+            "{second:?}"
+        );
         assert_eq!(tasks, 1, "a passed check was started again");
     }
 
