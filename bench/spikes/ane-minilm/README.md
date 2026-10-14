@@ -18,21 +18,16 @@ This folder contains the fixed-bucket Core ML proof paths for MiniLM, GTE Modern
 
 ## Requirements
 
-Local conversion / prep machine:
+- macOS on Apple Silicon; macOS 14.4+ for `MLComputePlan`
+- Python 3.12 and `uv` for conversion and input preparation
+- local Hugging Face snapshots for `sentence-transformers/all-MiniLM-L6-v2`,
+  `Qdrant/all-MiniLM-L6-v2-onnx` (model and tokenizer), and
+  `Qwen/Qwen3-Embedding-0.6B` when using the Qwen converter/reference
 
-- macOS on Apple Silicon
-- Python 3.12
-- `uv`
-- Hugging Face cache entries already present locally:
-  - `sentence-transformers/all-MiniLM-L6-v2`
-  - `Qdrant/all-MiniLM-L6-v2-onnx` (for `model.onnx` + `tokenizer.json`)
-  - `Qwen/Qwen3-Embedding-0.6B` (for the Wave 2 Qwen converter and reference runner)
-
-Bench host requirements:
-
-- macOS 14.4+ (for `MLComputePlan`)
-- no Xcode project required
-- no Python required on the remote box if you rsync the prepared JSONL and ORT reference vectors from the local machine
+Conversion and inference may run on different compatible machines. The Swift
+runner needs compiled models and prepared JSONL inputs, not a Python environment.
+Reserve exclusive Neural Engine access before hardware measurements; do not
+interrupt another hardware user to obtain it.
 
 ## Local setup
 
@@ -47,8 +42,8 @@ uv pip install -r requirements.txt
 ## Qwen3-Embedding-0.6B fixed-bucket workflow
 
 Qwen3 requires `transformers` 4.51.3, so use its separate requirements file
-rather than changing the Wave 1 environment. The converter is export-only;
-trace-built packages are not a valid Qwen parity path.
+rather than changing the MiniLM conversion environment. The converter supports
+`torch.export` only; trace-built packages are not supported.
 
 ```bash
 cd bench/spikes/ane-minilm
@@ -73,7 +68,7 @@ longer-token reference vector.
 
 ## Convert the 256 and 512 bucket variants
 
-The converter accepts only `--frontend export`. Trace conversion is intentionally unavailable because the trace-built seq512 variant missed parity catastrophically.
+The converter accepts only `--frontend export`; trace conversion is intentionally unsupported.
 
 ```bash
 cd bench/spikes/ane-minilm
@@ -81,13 +76,13 @@ source .venv/bin/activate
 
 python convert_minilm_to_coreml.py \
   --seq-len 256 \
-  --out ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlpackage \
-  --report-json ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.report.json
+  --out /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq256.mlpackage \
+  --report-json /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq256.report.json
 
 python convert_minilm_to_coreml.py \
   --seq-len 512 \
-  --out ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq512.mlpackage \
-  --report-json ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq512.report.json
+  --out /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq512.mlpackage \
+  --report-json /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq512.report.json
 ```
 
 ## Build the Swift CLI
@@ -113,17 +108,17 @@ source .venv/bin/activate
 
 python prep_tokenized_jsonl.py \
   --bucket 256 \
-  --input corpus/aft-chunks.jsonl \
-  --text-field embed_text \
+  --input /path/to/corpus.jsonl \
+  --text-field text \
   --limit 1000 \
-  --output ~/bench-tools/ane-spike/data/aft-1000-b256.jsonl
+  --output /tmp/ane-encoder/data/sample-1000-b256.jsonl
 
 python prep_tokenized_jsonl.py \
   --bucket 512 \
-  --input corpus/aft-chunks.jsonl \
-  --text-field embed_text \
+  --input /path/to/corpus.jsonl \
+  --text-field text \
   --limit 1000 \
-  --output ~/bench-tools/ane-spike/data/aft-1000-b512.jsonl
+  --output /tmp/ane-encoder/data/sample-1000-b512.jsonl
 ```
 
 ## Produce the ORT fp32 reference locally
@@ -133,146 +128,42 @@ cd bench/spikes/ane-minilm
 source .venv/bin/activate
 
 python ort_reference.py \
-  --model ~/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/manual/model.onnx \
-  --input ~/bench-tools/ane-spike/data/aft-1000-b256.jsonl \
-  --output ~/bench-tools/ane-spike/reference/ort-1000-b256.jsonl \
-  --stats-out ~/bench-tools/ane-spike/reference/ort-1000-b256.stats.json
+  --model /path/to/minilm-onnx/model.onnx \
+  --input /tmp/ane-encoder/data/sample-1000-b256.jsonl \
+  --output /tmp/ane-encoder/reference/ort-1000-b256.jsonl \
+  --stats-out /tmp/ane-encoder/reference/ort-1000-b256.stats.json
 
 python ort_reference.py \
-  --model ~/.cache/huggingface/hub/models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/manual/model.onnx \
-  --input ~/bench-tools/ane-spike/data/aft-1000-b512.jsonl \
-  --output ~/bench-tools/ane-spike/reference/ort-1000-b512.jsonl \
-  --stats-out ~/bench-tools/ane-spike/reference/ort-1000-b512.stats.json
+  --model /path/to/minilm-onnx/model.onnx \
+  --input /tmp/ane-encoder/data/sample-1000-b512.jsonl \
+  --output /tmp/ane-encoder/reference/ort-1000-b512.jsonl \
+  --stats-out /tmp/ane-encoder/reference/ort-1000-b512.stats.json
 ```
 
 ## Optional local smoke / parity check
 
 ```bash
 ./bench/spikes/ane-minilm/.build/ane-coreml compile \
-  --model ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlpackage \
-  --out ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlmodelc
+  --model /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq256.mlpackage \
+  --out /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq256.mlmodelc
 
 ./bench/spikes/ane-minilm/.build/ane-coreml embed \
-  --model ~/bench-tools/ane-spike/models/all-MiniLM-L6-v2-seq256.mlmodelc \
-  --input ~/bench-tools/ane-spike/data/aft-1000-b256.jsonl \
-  --output ~/bench-tools/ane-spike/results/coreml-1000-b256.jsonl \
-  --stats-out ~/bench-tools/ane-spike/results/coreml-1000-b256.stats.json \
-  --placement-out ~/bench-tools/ane-spike/results/coreml-1000-b256.placement.json \
+  --model /tmp/ane-encoder/models/all-MiniLM-L6-v2-seq256.mlmodelc \
+  --input /tmp/ane-encoder/data/sample-1000-b256.jsonl \
+  --output /tmp/ane-encoder/results/coreml-1000-b256.jsonl \
+  --stats-out /tmp/ane-encoder/results/coreml-1000-b256.stats.json \
+  --placement-out /tmp/ane-encoder/results/coreml-1000-b256.placement.json \
   --batch-size 8
 
 cargo build --release -p synapse-bench
 ./target/release/synapse-bench parity \
-  --reference ~/bench-tools/ane-spike/reference/ort-1000-b256.jsonl \
-  --candidate ~/bench-tools/ane-spike/results/coreml-1000-b256.jsonl \
+  --reference /tmp/ane-encoder/reference/ort-1000-b256.jsonl \
+  --candidate /tmp/ane-encoder/results/coreml-1000-b256.jsonl \
   --k 10 \
   --stride 4
-```
-
-## M1 bench-box workflow
-
-### 1) Sync the bundle
-
-Build locally, then rsync the source, binaries, model packages, prepared JSONL, and ORT references to the M1 box:
-
-```bash
-ssh $SYNAPSE_BENCH_HOST 'rm -rf ~/bench-tools/ane-spike && mkdir -p ~/bench-tools/ane-spike/{src,bin,models,data,reference,results}'
-
-rsync -av bench/spikes/ane-minilm/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/src/
-rsync -av bench/spikes/ane-minilm/.build/ane-coreml $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/bin/
-rsync -av target/release/synapse-bench $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/bin/
-rsync -av ~/bench-tools/ane-spike/models/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/models/
-rsync -av ~/bench-tools/ane-spike/data/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/data/
-rsync -av ~/bench-tools/ane-spike/reference/ $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/reference/
-```
-
-### 2) Compile the `.mlpackage` models on the M1 box
-
-The remote host does not need `coremlcompiler`; the Swift CLI's `compile` subcommand calls `MLModel.compileModel(at:)` directly.
-
-```bash
-ssh $SYNAPSE_BENCH_HOST '
-set -euo pipefail
-cd ~/bench-tools/ane-spike
-bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq256.mlpackage --out models/all-MiniLM-L6-v2-seq256.mlmodelc
-bin/ane-coreml compile --model models/all-MiniLM-L6-v2-seq512.mlpackage --out models/all-MiniLM-L6-v2-seq512.mlmodelc
-'
-```
-
-### 3) Placement reports on the M1 box
-
-```bash
-ssh $SYNAPSE_BENCH_HOST '
-set -euo pipefail
-cd ~/bench-tools/ane-spike
-head -n 1 data/aft-1000-b256.jsonl > data/aft-1-b256.jsonl
-head -n 1 data/aft-1000-b512.jsonl > data/aft-1-b512.jsonl
-bin/ane-coreml embed \
-  --model models/all-MiniLM-L6-v2-seq256.mlmodelc \
-  --input data/aft-1-b256.jsonl \
-  --output results/placement-b256.jsonl \
-  --stats-out results/placement-b256.stats.json \
-  --placement-out results/placement-b256.report.json \
-  --batch-size 1 > /dev/null
-bin/ane-coreml embed \
-  --model models/all-MiniLM-L6-v2-seq512.mlmodelc \
-  --input data/aft-1-b512.jsonl \
-  --output results/placement-b512.jsonl \
-  --stats-out results/placement-b512.stats.json \
-  --placement-out results/placement-b512.report.json \
-  --batch-size 1 > /dev/null
-'
-```
-
-### 4) Locked timed runs + powermetrics on the M1 box
-
-Prime `sudo` with the operator-provided password, then keep the lock only for the timed embed runs themselves:
-
-```bash
-ssh $SYNAPSE_BENCH_HOST '
-set -euo pipefail
-cd ~/bench-tools/ane-spike
-cleanup() {
-  if [ -n "${PM_PID:-}" ]; then
-    kill "$PM_PID" >/dev/null 2>&1 || true
-    wait "$PM_PID" 2>/dev/null || true
-  fi
-  rmdir $SYNAPSE_BENCH_ROOT/bench.lock >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-until mkdir $SYNAPSE_BENCH_ROOT/bench.lock 2>/dev/null; do sleep 30; done
-for bucket in 256 512; do
-  echo "<operator-provided sudo password>" | sudo -S -p "" true >/dev/null
-  rm -f "results/powermetrics-b${bucket}.txt"
-  sudo -n powermetrics -i 500 -s ane_power,gpu_power,cpu_power > "results/powermetrics-b${bucket}.txt" 2>/dev/null &
-  PM_PID=$!
-  bin/ane-coreml embed \
-    --model "models/all-MiniLM-L6-v2-seq${bucket}.mlmodelc" \
-    --input "data/aft-1000-b${bucket}.jsonl" \
-    --output "results/coreml-1000-b${bucket}.jsonl" \
-    --stats-out "results/coreml-1000-b${bucket}.stats.json" \
-    --batch-size 8 > /dev/null
-  kill "$PM_PID" >/dev/null 2>&1 || true
-  wait "$PM_PID" 2>/dev/null || true
-  unset PM_PID
-  bin/synapse-bench parity \
-    --reference "reference/ort-1000-b${bucket}.jsonl" \
-    --candidate "results/coreml-1000-b${bucket}.jsonl" \
-    --k 10 \
-    --stride 4 \
-    > "results/parity-1000-b${bucket}.json"
-done
-'
-```
-
-### 5) Pull the results back
-
-```bash
-rsync -av $SYNAPSE_BENCH_HOST:~/bench-tools/ane-spike/results/ /tmp/ane-m1-results/
 ```
 
 ## Notes
 
 - The Swift runner writes stats JSON with `cold_load_s`, `infer_wall_s`, `docs_per_s`, and `tokens_per_s`.
 - `placement-*.report.json` uses `dispatchable_device_share` as the meaningful residency number. `unknown` ops are Core ML `const` nodes with no runtime dispatch.
-- The M1 measurement box used for the committed spike did not have local Python / `uv` / developer tools; that is why the remote instructions rsync prepared inputs and ORT references instead of recreating them on-host.
-- Do **not** record the operator-provided sudo password in git-tracked files or result docs.

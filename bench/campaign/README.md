@@ -64,11 +64,12 @@ The controller performs these stages in order:
 4. Start 12 fresh decode processes. Each gets one distinct fixture selected by
    the fixed stride-seven schedule, so the measured slot cannot replay one
    prompt. Package/executable preparation occurs eagerly at process load and is
-   outside `decode_wall_s`, matching decode wave 1. The controller recomputes
+    outside `decode_wall_s`, so decode timing excludes process-load preparation.
+   The controller recomputes
    each sample as `64 / decode_wall_s`, verifies the binary's reported rate,
    and reports the median of all 12 samples.
 
-The verdict has this shape:
+The illustrative verdict below shows the field shape, not a measured result:
 
 ```json
 {
@@ -76,7 +77,7 @@ The verdict has this shape:
   "hooks_passed": true,
   "samples": [40.0],
   "median_tok_s": 40.0,
-  "baseline_note": "Frozen master baseline: 40.55 tok/s ...",
+  "baseline_note": "Configured baseline and pinned fixture protocol.",
   "workspace_commit": "0123456789abcdef0123456789abcdef01234567"
 }
 ```
@@ -88,14 +89,14 @@ the numeric `median_tok_s` and the process exit status, not the JSON booleans:
 `0` = valid measurement, `3` = candidate rejected (gate or hook failure),
 `1` = harness refused to run (environment/integrity problem), `2` = usage
 error. The JSON booleans remain as human-readable diagnostics.
-Acceptance thresholds remain campaign policy. The registration supplies a 5%
-baseline stability width and 5% control drift tolerance, plus a one-minute load
-threshold of 2.5 that makes the controller pause and requeue noisy work.
+Acceptance thresholds, baseline stability, control drift tolerance and the load
+admission limit are registration policy. Keep those inputs fixed when comparing
+candidate measurements.
 
 ## Offline rig preparation
 
 A candidate build has no network egress. Configure all required public
-Dependencies before applying candidate patches or entering the sandbox, then
+dependencies before applying candidate patches or entering the sandbox, then
 prepare the controller image from that hydrated base:
 
 ```sh
@@ -110,102 +111,48 @@ by the harness. Do not run
 `cargo fetch` from the harness: it would both touch candidate metadata outside
 the runner and make a supposedly offline measurement depend on egress.
 
-## Local checks and M1 dry-run
+## Local checks and invocation
 
 Parsing and integrity checks do not need model weights:
 
 ```sh
-bench/campaign/decode-harness.sh --self-test
+bash bench/campaign/decode-harness.sh --self-test
 ```
 
-A full run is valid only on the M1 while both measurement locks are free. The
-result path must not already exist. A pass-through runner can simulate the
-campaign argv contract without simulating its sandbox identity:
+For a full measurement, provide the pinned snapshot and a configured candidate
+runner on compatible hardware with exclusive measurement access. Keep the
+controller's measurement locks and load/power admission checks in place; do not
+interrupt another hardware user to obtain access. The result path must not exist.
 
 ```sh
-test ! -e $SYNAPSE_BENCH_ROOT/bench.lock
-test ! -e /tmp/aft-measure.lock
-! pgrep -f '[R]unner.Worker'
-mkdir $SYNAPSE_BENCH_ROOT/bench.lock
-trap 'rmdir $SYNAPSE_BENCH_ROOT/bench.lock' EXIT INT TERM HUP
-
-cat >/tmp/pass-through-runner <<'SH'
-#!/bin/sh
-exec "$@"
-SH
-chmod 755 /tmp/pass-through-runner
-
-SYNAPSE_CAMPAIGN_MODEL="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca" \
-  bench/campaign/decode-harness.sh \
-  /path/to/pristine/synapse /tmp/pass-through-runner /tmp/decode-result.json
+SYNAPSE_CAMPAIGN_MODEL=/path/to/pinned/qwen3-snapshot \
+  bash bench/campaign/decode-harness.sh \
+  "$PWD" /path/to/candidate-runner /path/to/new-decode-result.json
 ```
-
-### Reference run
-
-On 2026-07-15 the controller ran against pristine commit
-`f99215ce199e26c76e9bb5ce911571e847f612ad` on
-`<bench-host>` (M1 Max). The two lock paths were absent, no
-`Runner.Worker` was active, one-minute load was 1.88 at admission, the Cargo
-registry had been prewarmed from that frozen base, and the pass-through runner
-above was used. The complete cold-target harness took 146.662 seconds, so the
-registered 300-second action timeout is approximately twice the observed pass.
-The result file had mode `0600`:
-
-```json
-{
-  "baseline_note": "Configured baseline; 12 fresh processes with varied prompts.",
-  "gate_passed": true,
-  "hooks_passed": true,
-  "median_tok_s": 40.58197703061707,
-  "samples": [
-    40.61547678127424,
-    40.54847727995989,
-    40.52563221637361,
-    40.798810986991796,
-    40.9538110600726,
-    40.90184195233265,
-    40.236030439075066,
-    40.36020644253163,
-    40.4882108445747,
-    40.36831569341907,
-    40.62757006278733,
-    40.6594507526227
-  ],
-  "workspace_commit": "f99215ce199e26c76e9bb5ce911571e847f612ad"
-}
-```
-
-The median is 0.08% above the frozen 40.55 tok/s reference and therefore within
-normal run noise.
 
 ## ANE direct-API embedding campaign
 
 [`ane-direct-embed-harness.sh`](ane-direct-embed-harness.sh) builds the standalone
-probe against `crates/synapse-worker-ane-direct/vendor/ane`, the same binding used
-by the production direct-ANE worker, so the staged workspace needs no external
-clone or `SYNAPSE_CAMPAIGN_ANE_BINDING` setting. Its upstream provenance and local
-fixes are recorded in the binding's `VENDORED.md`; the local copy is not
-byte-identical to the upstream revision.
+probe against `crates/synapse-worker-ane-direct/vendor/ane`, the binding shared
+with the direct-ANE worker. The staged workspace needs no external clone or
+`SYNAPSE_CAMPAIGN_ANE_BINDING` setting; the binding's `VENDORED.md` records its
+license and provenance.
 
-The harness pins `.cargo-checksum.json` itself and verifies every listed file,
-the inventory, and the absence of symlinks before admission and again after
-staging, refusing changes by file name. The binding tree and probe manifest and
-lockfile are protected alongside the existing rows, comparator, and gate wiring.
-The registration template records the checksum manifest pin as
-`SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256`; the live lab registry must use the matching
-harness blob and pins before another campaign starts.
+The objective is aggregate active-token throughput at sequence 512; sequences
+1024 and 2048 are reported controls. Each row must meet the minimum cosine gate
+of 0.999 against the protected in-process fp32 reference and repeat byte-identically.
+Aggregate throughput weights rows by their active tokens rather than taking a
+median of per-row rates. The controller reconciles reported correctness, row
+identity and token accounting before accepting a speed value.
 
-| protected input | SHA-256 |
-|---|---|
-| harness | `5559c4f37acfab7f15ffc01d57074bb1003ef2f1423f3929e05ac863e0a782a9` |
-| probe `Cargo.toml` | `08fa29887f44c848dc65b0eaee1c20b851984d6d3bc2a70b5c8d0df953d34a71` |
-| probe `Cargo.lock` | `d538c5e8a902f6270c44115b289c9cc98cba75cfeee119300a95aa8257841566` |
-| vendor `.cargo-checksum.json` | `5bdccf21d6a17a7f7028df00758b89bcd4d0d14c4c4d24cc16dd7fa4edc9c4df` |
+The harness pins `.cargo-checksum.json` and verifies every listed file, the
+inventory and the absence of symlinks before admission and after staging,
+refusing changes by file name. The binding tree, probe manifest/lockfile, rows,
+comparator and gate wiring remain protected. Registration must supply matching
+harness and input digests; the template records the vendor checksum as
+`SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256`.
 
 Run `bash bench/campaign/ane-direct-embed-harness.sh --self-test .` without model
-weights to check the unchanged contract and load gate, named refusals for edited,
-missing, added, or symlinked binding files, the checksum manifest and dependency
-path, and acceptance of the unmodified workspace and staged copy.
-
-The throughput baseline must be re-measured before the next campaign because
-the binding is now the vendored copy rather than upstream ec54af9.
+weights to check the contract and load gate, named refusals for edited, missing,
+added or symlinked binding files, checksum/dependency-path integrity, and
+acceptance of the unmodified workspace and staged copy.

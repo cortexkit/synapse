@@ -18,11 +18,6 @@ families use the same masking and commit order:
 The unconstrained branch still calls the original `top_logits` implementation.
 It does not build a vocabulary index or execute constraint code.
 
-This change is spike-first. `crates/synapse-engine-owned` currently contains
-encoder/reranker inference but no causal decode controller, KV generation loop,
-or CPU-visible pre-commit logits surface to port. The production copy therefore
-has not diverged from this decode path; a later production generation API can
-move the controller and constraint module together.
 
 ## CLI
 
@@ -157,78 +152,6 @@ Unsupported keywords or combinations are rejected at schema load. This includes
 schemas. The schema used by the gate is a closed object with required `result`
 and `score` keys, a hostile string enum, and a number field.
 
-## Correctness gates
-
-Measurements were taken on 2026-07-15/16 on a contended Apple M5 Max MacBook
-Pro (128 GB), using the debug owned-runtime binary and local model snapshots.
-The checked-in 15 prompts explicitly ask the model to refuse, emit prose/XML or
-Markdown, omit required keys, use the wrong enum/type, add fields, or leave JSON
-unterminated. Running them once on each family gives 30 adversarial generations.
-
-| Family and local weights | Prompts | Generated tokens | JSON parsed | Schema valid |
-|---|---:|---:|---:|---:|
-| Qwen3-0.6B, Metal f16 explicit | 15 | 647 | 15/15 | 15/15 |
-| LFM2-350M, Metal f16 lazy | 15 | 678 | 15/15 | 15/15 |
-| **Total** | **30** | **1,325** | **30/30** | **30/30** |
-
-The runner performs the parse and schema checks before writing each successful
-result; `constraint_valid_prompts` was 15 in both result files.
-
-### Unconstrained token-exact regression
-
-The pinned campaign fixtures were not changed. Running Qwen3 without either
-constraint flag against
-`bench/campaign/decode-fixtures/{decode-prompts,reference-tokens}.jsonl`
-produced:
-
-- exact prompts: **20/20**;
-- exact generated tokens: **1,280/1,280**;
-- accepted near ties: **0**.
-
-This gate was rerun after the final decode-loop changes.
-
-### Unit and instrumentation hooks
-
-`cargo test -p spike-unified-rt --bin spike-unified-rt` passed **49 tests** with
-4 pre-existing ignored tests and no failures. The five decode instrumentation
-hooks all passed:
-
-- `token_stream_tap_observes_before_commit_without_changing_tokens`;
-- `paused_state_resumes_to_uninterrupted_tokens`;
-- `splice_matches_prefilling_the_concatenated_sequence`;
-- `greedy_argmax_uses_lowest_token_id_for_exact_ties`;
-- `addressable_weight_regions_are_byte_identical_across_loads`.
-
-A new controller test makes an invalid prose token the highest logit and proves
-that masking selects `{}` before the pre-commit tap, then gates EOS. JSON/vocab
-unit tests cover token boundary straddling, split UTF-8, escapes and surrogate
-pairs, schema key/enum prefixes, key order and required fields, number progress,
-negative-infinity mask application, and EOS gating. A one-prompt LFM2 run with
-both `--decode-json-schema` and `--verify-decode-cache` also passed, proving that
-cached and full-reprefill decode choose the same constrained tokens.
-
-## Performance
-
-The same 15 hostile prompts and `max_new_tokens=128` were run with and without
-the schema constraint. Constrained generations stop at EOS as soon as the JSON
-root is complete, so token counts and cache-position distributions differ; the
-tok/s comparison is an end-to-end serving observation, not an isolated claim
-that masking accelerates the model.
-
-| Family | Constraint | Generated tokens | Decode wall | Decode tok/s | Measured constraint path |
-|---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | none | 1,920 | 33.767 s | 56.86 | — |
-| Qwen3-0.6B | JSON schema | 647 | 9.468 s | 68.33 | **0.245 ms/token** |
-| LFM2-350M | none | 1,736 | 131.981 s | 13.15 | — |
-| LFM2-350M | JSON schema | 678 | 45.913 s | 14.77 | **0.157 ms/token** |
-
-`constraint_wall_s` times mask lookup/construction, masked top-k selection, and
-constraint state advance. It is therefore a conservative upper bound on mask
-machinery rather than an incremental subtraction from unconstrained sampling.
-At Qwen3's **151,669-id** actual tokenizer vocabulary, the measured aggregate is
-0.245 ms/token, below the 0.5 ms/token target and well below the 2 ms stop point.
-The LFM2 vocabulary contains 64,400 ids. Results are contended development-host
-numbers; locked-hardware serving measurements remain future work.
 
 ## Adding regex or CFG constraints
 

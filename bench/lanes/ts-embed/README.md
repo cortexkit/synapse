@@ -47,6 +47,6 @@ bun main.mjs \
   --model-label "Qdrant/all-MiniLM-L6-v2-onnx@ort-node-fp32"
 ```
 
-`onnxruntime-node` ran under Bun in this environment. If a local Bun build fails to load the native binding, rerun the same command with `node main.mjs`.
+If a local Bun build fails to load the native `onnxruntime-node` binding, rerun the same command with `node main.mjs`.
 
 `--dtype default` maps to `q8` so the benchmark matches the shipped MiniLM production profile; use `--dtype fp32` for the unquantized comparison.

@@ -1,8 +1,8 @@
 # Direct-API GTE ModernBERT probe
 
-This standalone Cargo workspace drives `_ANEInMemoryModel` directly. It is not a
-member of the repository workspace because the private-API binding comes from a
-separate MIT-licensed checkout.
+This standalone Cargo workspace drives `_ANEInMemoryModel` directly using the
+vendored binding under `crates/synapse-worker-ane-direct/vendor/ane`, shared with
+the direct-ANE worker.
 
 ## Full-model correctness probe
 
@@ -48,9 +48,8 @@ between predictions, so arms alternate and share drift in machine load. Each
 prediction is compared bit for bit with its row's correctness-phase vector.
 `--per-call-out PATH` writes every prediction's wall time, measured sleep and
 per-dispatch times, and each block's one- and five-minute load. `gap_ab.sh`
-wraps a run with a load and rig-claim wait, a load monitor and a copy of the
-production Synapse log for the run window; `gap_analysis.py` summarizes the
-per-call file. Historical experiment results are kept privately.
+coordinates admission and load monitoring; `gap_analysis.py` summarizes the
+per-call file. Reserve exclusive Neural Engine access before collecting timings.
 
 `rows.jsonl` contains four short real-text rows and four repeated-prose rows near
 each of the 512, 1024, and 2048 shape limits. Its SHA-256 is
@@ -61,10 +60,9 @@ each of the 512, 1024, and 2048 shape limits. Its SHA-256 is
 `modernbert_rerank` reuses the ModernBERT encoder graph builders for
 `Alibaba-NLP/gte-reranker-modernbert-base`. It loads the checkpoint's `model.*`
 encoder weights and performs masked mean pooling, dense, exact-erf GELU, layer
-norm, and classifier (including classifier bias) on CPU in fp32. It is a spike,
-not a served lane. The retained 20-pair evaluation **failed** the required
-sigmoid-score fidelity gate; do not use this binary's scores as an accepted
-benchmark arm. Score fidelity must be established independently before use.
+norm, and classifier (including classifier bias) on CPU in fp32. It is an
+experimental binary, not a served lane or an accepted benchmark arm. Establish
+sigmoid-score fidelity independently before using its scores.
 
 ```sh
 env -u TMPDIR cargo run --release --bin modernbert_rerank -- "$MODEL_SNAPSHOT" < pairs.jsonl
@@ -83,9 +81,9 @@ loading. Pooling is included in CPU-head time. Optional `reference_pool` input
 and returned `reference_head_logit` isolate head arithmetic from encoder error;
 returned `pooled` values support private fidelity diagnosis.
 
-The caller must check the read-only `campaign_rig_claim` table before inference
-and between queries, waiting until no campaign holds the Neural Engine. All
-reported timing is ambient wall time, not isolated device execution time.
+Reserve exclusive Neural Engine access before inference and between queries;
+do not interrupt another hardware user to obtain it. All reported timing is
+ambient wall time, not isolated device execution time.
 
 ### Formula and layer diagnosis
 

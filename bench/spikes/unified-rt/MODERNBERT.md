@@ -37,27 +37,7 @@ An ignored integration test, `modernbert_400_chunk_parity_gate`, asserts the sam
 
 Static weights are cached as Metal buffers by source pointer. Graph plans are cached by shape and attention pattern. RoPE tables and the additive local band are precomputed per sequence-length bucket in Rust. Each batch combines that band with its key-padding mask. Full and local masks are fed separately, so alternating layers select the right mask without a CPU/device boundary.
 
-The Metal graph is intentionally fp32. The existing MiniLM MPSGraph f16 experiment was slower on M1, and this lane's required reference is fp32.
-
-## Parity results
-
-Reference vectors came from `lane-ort-embed` using the cached gte fp32 ONNX export, `--pooling cls`, max length 512, and the first 400 rows of `bench/data/corpus-v2.jsonl`. The subset contains 62,838 post-tokenization input tokens. Both owned paths used length-sorted batching with a 4,000,000 attention-unit budget.
-
-| Backend | Mean cosine vs ORT fp32 | Mean top-10 overlap | Gate |
-|---|---:|---:|---|
-| CPU / Accelerate fp32 | 0.9999999999973957 | 1.0000 | pass |
-| Metal / MPSGraph resident fp32 | 0.9999999999970659 | 1.0000 | pass |
-
-## M1 throughput
-
-Timed runs were made only on `$SYNAPSE_BENCH_HOST`, under `$SYNAPSE_BENCH_ROOT/bench.lock`, over the same 400 chunks and length-sorted batching policy. “Warm” is an immediate second process run, so it includes the effect of OS and Metal shader caches while rebuilding process-local graph plans.
-
-| Backend | First-run tok/s | Warm tok/s | First infer time | Warm infer time |
-|---|---:|---:|---:|---:|
-| CPU / Accelerate fp32 | 1,066.2 | 1,068.9 | 58.934 s | 58.787 s |
-| Metal / MPSGraph resident fp32 | 12,405.3 | 14,564.3 | 5.065 s | 4.315 s |
-
-Metal was about 11.6x faster than CPU on the first run and 13.6x faster warm. The first/warm difference is material for Metal and negligible for CPU.
+The Metal graph uses fp32 for its reference arithmetic.
 
 ## Reproduction notes
 
@@ -67,7 +47,7 @@ The gte Hugging Face snapshot must contain `config.json`, `tokenizer.json`, and 
 spike-unified-rt \
   --model /path/to/gte-modernbert-base \
   --tokenizer /path/to/gte-modernbert-base/tokenizer.json \
-  --corpus bench/data/corpus-v2.jsonl \
+  --corpus /path/to/corpus.jsonl \
   --limit 400 \
   --device metal --dtype f32 \
   --reference /tmp/gte-ort-400.jsonl \

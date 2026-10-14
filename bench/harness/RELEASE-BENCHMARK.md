@@ -167,8 +167,7 @@ composed input length, returning `lane` and `composed_length: 512`. The two conf
 must pin distinct served fingerprints. Both 23-sample series execute in one row
 session on the same machine. `ane-transition.json` records both raw series,
 paired per-index machine load records, both medians and `bar_met` using the exact
-`direct <= 1.05 * coreml` inequality. ANE burst slowdowns of about 20% are noted in
-the measured cells. Dropped Qwen3 cells copy `drop_cause` from the model's
+`direct <= 1.05 * coreml` inequality. Dropped Qwen3 cells copy `drop_cause` from the model's
 configured `certification_record` and, for a
 latency drop, both raw series; their metrics remain null.
 

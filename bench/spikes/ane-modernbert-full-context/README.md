@@ -1,6 +1,6 @@
 # GTE ModernBERT 8192-token ANE feasibility spike
 
-This standalone spike tests fixed-shape, full-context `Alibaba-NLP/gte-modernbert-base` embedding on Apple Neural Engine hardware. It is export and measurement evidence only: it does not change the production Swift worker, routing, fleet configuration, or product fallback policy.
+This standalone spike tests fixed-shape, full-context `Alibaba-NLP/gte-modernbert-base` embedding on Apple Neural Engine hardware. It is a standalone export/measurement tool and does not change the production Swift worker or routing.
 
 ## Preserved model semantics
 
@@ -10,7 +10,7 @@ The export path splits both heads and query positions. With sequence length `S` 
 
 The independent reference uses online softmax over bounded query and key blocks. It sees every permitted key/value without allocating an 8192 × 8192 dense baseline.
 
-## Set up the current measured toolchain
+## Set up conversion tools
 
 From this directory:
 
@@ -20,7 +20,7 @@ uv pip install --python ../../../.venv/bin/python -r requirements.txt
 ./build_placement.sh
 ```
 
-The direct dependency versions in `requirements.txt` are the versions actually installed for this M5/macOS 27 spike on 2026-09-08; they are not copied from the older Wave 1 environment. Every report also records the runtime package versions and a canonical toolchain digest.
+`requirements.txt` pins the conversion environment. Every report records the runtime package versions and a canonical toolchain digest.
 
 ## CPU and static checks first
 
@@ -54,17 +54,17 @@ The driver samples owned-child RSS plus system free and wired memory. Defaults r
 
 ## Diagnose a 1024 parity failure
 
-`diagnose_1024.py` emits sampled checkpoints at raw embeddings, embedding normalization, every attention residual, every layer output, and final normalization for positions 0, 63, 64, 255, 256, and 1023. Its `ranges` command records full-tensor activation maxima, non-finite counts, values beyond the fp16 range, and fp16 spacing at each layer. Its `reference`, `export`, and `reload` subcommands keep conversion/save separate from model reload. Run them through `run_guarded` (as demonstrated in the committed 1024 evidence) and compare both `cpu-and-ne` and `cpu-only`; do not continue longer stages until the failed gate is understood. The reference report also compares full-model pooling against Hugging Face on the exact stage input and independently reconstructs 1024 masks and RoPE.
+`diagnose_1024.py` emits sampled checkpoints at raw embeddings, embedding normalization, every attention residual, every layer output, and final normalization for positions 0, 63, 64, 255, 256, and 1023. Its `ranges` command records full-tensor activation maxima, non-finite counts, values beyond the fp16 range, and fp16 spacing at each layer. Its `reference`, `export`, and `reload` subcommands keep conversion/save separate from model reload. Run diagnostics through `run_guarded` and compare both `cpu-and-ne` and `cpu-only`; do not continue longer stages until the failed gate is understood. The reference report also compares full-model pooling against Hugging Face on the exact stage input and independently reconstructs 1024 masks and RoPE.
 
 `norm_reproducer.py` is the smaller normalization control. `capture` saves the actual full-context row's 1024x768 token-embedding values and `embeddings.norm.weight`. `export` creates FLOAT16 or FLOAT32 packages without loading them; `reload` separately measures CPU_ONLY or CPU_AND_NE. One package compares native `layer_norm` with explicit mean/variance normalization for sequence-last input, channel-layout input, and a gather of the captured rows. Reports include raw values, digests, eager/export parity, MIL axes/dtypes/cast boundaries, and exact runtime errors. coremltools 9.0 has no public arbitrary-input MIL interpreter, so reports mark MIL execution unavailable rather than substituting a package prediction.
 
-The optional `--fp32-islands final-norm|residual` export control keeps only the selected full-model operations in float32. It is diagnostic, not a production policy or a parity-threshold override. Broader norm and norm-plus-residual controls were removed because they emitted zero vectors and therefore were invalid experiments, not precision evidence.
+The optional `--fp32-islands final-norm|residual` export control keeps only the selected full-model operations in float32. It is diagnostic, not a production policy or a parity-threshold override.
 
-`--rotation hadamard --rotation-seed 0` applies the reference ModernBERT exporter's residual-stream conditioning. It centers the canonical residual stream, converts bias-free LayerNorm to parameter-free RMSNorm, and folds a reproducible randomized Hadamard basis change into the token embeddings and paired projection weights. The only additional runtime projections are ANE-friendly 1x1 convolutions for the first residual branch and final unrotation. The transformation is output-preserving in exact arithmetic; the seed fixes the reference implementation's otherwise-random sign draw for reproducible package hashes. `run_stages.py --start-at 2048` can resume ordered staging after a separately verified 1024 result.
+`--rotation hadamard --rotation-seed 0` applies deterministic residual-stream conditioning, specified in `bench/parity/src/hadamard.rs` and `bench/parity/src/convert.rs`. It centers the canonical residual stream, converts bias-free LayerNorm to parameter-free RMSNorm, and folds a reproducible randomized Hadamard basis change into the token embeddings and paired projection weights. The only additional runtime projections are ANE-friendly 1x1 convolutions for the first residual branch and final unrotation. The transformation is output-preserving in exact arithmetic; the seed fixes the sign draw for reproducible package hashes. `run_stages.py --start-at 2048` can resume ordered staging after a separately verified 1024 result.
 
 Run `pyright -p pyrightconfig.json` from the repository root. The local `.venv` declared by that config contains the optional research dependencies; source files do not suppress missing-import or type diagnostics.
 
-## Durable evidence
+## Report fields
 
 Target-only packages, vectors, and verbose logs stay outside git. Compact JSON reports include:
 
@@ -76,12 +76,4 @@ Target-only packages, vectors, and verbose logs stay outside git. Compact JSON r
 - system free/wired memory and owned-child peak RSS around every process;
 - complete operator/device counts, expensive-op placement (`matmul`/`einsum`, `softmax`, convolution, normalization, reductions), non-ANE operations, and exact errors.
 
-Historical rotation-conditioning measurements and source analysis are kept privately; the current deterministic construction is specified in `bench/parity/src/hadamard.rs` and `bench/parity/src/convert.rs`.
-
 `CPU_AND_NE` excludes GPU but does not by itself prove ANE residency. Stage summaries distinguish mixed/CPU attention placement from successful CPU+NE prediction whose attention operators are preferred on ANE. The latter combines runtime success with `MLComputePlan`; the plan is still static preferred-placement evidence, not a runtime dispatch trace.
-
-## Prior-art boundary
-
-At `smpanaro/ModernBERT-AppleNeuralEngine` commit `d0268940c0af4ffe2bca0f9eb3842fd05984215c`, `split_einsum_attn` tiles queries while retaining full keys/values, but its default query chunk size is 8192 and floor division drops a non-multiple tail. This spike uses ceiling-style half-open ranges, an explicit 256-token default, and tile-local masks.
-
-The failure discussed in `john-rocky/CoreML-LLM` PR 169 was an un-tiled, fixed-8192, full-bidirectional Perplexity `pplx-embed` Qwen3-0.6B encoder on an M4 Max running macOS 26. It failed inference with `ANEProgramProcessRequestDirect status=0x15`. That is useful evidence about that model and graph; it is not proof that tiled ModernBERT on M5 is impossible.

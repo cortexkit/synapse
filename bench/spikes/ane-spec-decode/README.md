@@ -1,16 +1,10 @@
-# ANE speculative decode: Phase A
+# ANE stateless speculative decode
 
 This spike measures a **stateless fixed-window** Qwen3-0.6B causal language
-model on the local Apple Silicon host. It is a feasibility measurement, not a
+model on Apple Silicon. It is a feasibility measurement, not a
 serving path. The graph accepts left-padded `input_ids` and an
 `attention_mask`, re-encodes the complete window, and returns logits for the
 last `K` positions. There is no mutable KV state.
-
-The stateless choice is deliberate. The neighboring LFM2 spike converted its
-stateful buffers successfully, but Core ML 8.3 failed at the first ANE token
-with `ANEProgramProcessRequestDirect` error 8 / status `0x1d`. This environment
-has coremltools 8.3.0, not a newer release, so Phase A does not spend time on a
-stateful retry.
 
 ## Contents
 
@@ -28,15 +22,12 @@ stateful retry.
 - `measure_phase_b.py` — drives the Metal-step verifier with the persistent
   ANE JSONL draft server, checks the 20 pinned fixtures plus depth-470, and
   emits baseline/speculative latency and break-even metrics.
-- `results/phase-a-raw.json` — compact committed raw matrix, placement
-  summaries, power aggregates, and parity counts. Detailed MLComputePlan
-  operations and macmon JSONL remain in the ignored work directory after a
-  run.
 
-## Reproduce on the local M5
+## Setup and measurement
 
-Do not run this workflow on the campaign-locked M1. The model snapshot must be
-available locally; the commands below do not download it.
+Use compatible Apple Silicon hardware with exclusive Neural Engine access.
+The model snapshot must already be available locally; these commands do not
+download it. Do not interrupt another hardware user to obtain a measurement slot.
 
 ```bash
 cd bench/spikes/ane-spec-decode
@@ -45,7 +36,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ./build_runner.sh
 ```
 
-Convert the complete last-K matrix (each package is about 1.5 GB):
+Convert the complete last-K matrix; allow space for each model package:
 
 ```bash
 MODEL="$HOME/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<revision>"
@@ -59,7 +50,7 @@ for W in 32 64 128; do
 done
 ```
 
-Convert the Phase-C W32/K4 autoregressive package:
+Convert the W32/K4 autoregressive package:
 
 ```bash
 .venv/bin/python convert_qwen3_to_coreml.py \
@@ -80,7 +71,7 @@ approximately 30 seconds per cell:
   --calls 200 --warmup 20 --power-seconds 30
 ```
 
-For the Phase-C timing cell, use the same harness with the unrolled package:
+For the unrolled timing cell, use the same harness with the autoregressive package:
 
 ```bash
 .venv/bin/python measure_spec_decode.py \
@@ -95,10 +86,10 @@ runtime, or missing power sample as a hole. It never turns a failed cell into a
 zero rate. The `CPU_ONLY` rows intentionally report zero ANE share and zero ANE
 watts.
 
-## Phase B composition measurement
+## Composition measurement
 
-Build the Swift runner, compile the W32/K4 package from Phase A, then use the
-owned Metal-step binary and the local M5 only:
+Build the Swift runner, compile the W32/K4 package, then use the
+owned Metal-step binary on compatible hardware with exclusive ANE access:
 
 ```bash
 python3 measure_phase_b.py \
@@ -112,6 +103,5 @@ The ANE `serve` command consumes one JSONL request containing up to 32 recent
 token IDs and returns four drafts. It performs four sequential stateless calls,
 using only the final-position argmax of the K4 package on each call. The K4
 package's other output positions are logits for already-supplied input tokens,
-not independent future proposals. This preserves correctness but makes the
-Phase A 465 tok/s scheduled-K figure inapplicable to autoregressive drafting;
-the report records the measured compute and IPC portions separately.
+not independent future proposals. This preserves the autoregressive dependency;
+report drafting compute and IPC costs separately from last-K output throughput.

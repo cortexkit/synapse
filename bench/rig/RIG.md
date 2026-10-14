@@ -33,7 +33,7 @@ The candidate never receives reference vectors or scores, corpus IDs, the reason
 
 ## Measurement and gates
 
-The rig loads and limits the corpus or rerank requests before starting the candidate. It sanitizes the tokenizer by disabling baked-in padding and installing the requested truncation limit. Canonical real-token counts use attention-mask positions, not encoded buffer lengths, which keeps the known 4.21% padded-token trap outside candidate control. Qwen3 terminal-token handling and ModernBERT pair encoding follow the existing owned-runtime rules.
+The rig loads and limits the corpus or rerank requests before starting the candidate. It sanitizes the tokenizer by disabling baked-in padding and installing the requested truncation limit. Canonical real-token counts use attention-mask positions, not encoded buffer lengths, so padding cannot inflate the throughput numerator. Qwen3 appends its terminal token after stripping tokenizer padding; ModernBERT reranking uses pair encoding for `[CLS] query [SEP] document [SEP]`.
 
 Embedding rows remain length-sorted and use the existing exact or bucket-policy-v1 planner. Each pass wall begins immediately before the first batch is assembled and ends after the final response is reconciled; labels remain `first`, `warm`, and (for the last of at least three passes) `steady`. Rerank request walls retain pair tokenization, planning, transport, and inference. Load walls include process startup, model/provider load, and the existing warmup or eager shape preparation. The subprocess boundary is therefore part of rig-measured inference.
 
@@ -51,16 +51,5 @@ The existing embedding and rerank result fields retain their names and meanings.
 
 Exit status `0` means all protocol checks, reconciliation checks, and requested gates passed and the result was written. Status `1` means argument, load, protocol, reconciliation, parity, ranking, rerank, candidate-exit, or output failure. Executors must accept only status `0`, parse the result file rather than stdout, and verify both rig pin fields before publishing it.
 
-## Semantics-drift verification
-
-The split was checked locally on CPU with the `all-MiniLM-L6-v2` snapshot and a deterministic 400-row MiniLM semantics corpus. The legacy in-process path emitted the reference vectors; both paths then ran over the same rows, tokenizer, exact-shape policy, maximum length, attention budget, and reference.
-
-- canonical and candidate token totals were exactly equal at 6,439, with zero reconciliation divergence;
-- legacy and rig real/padded totals were exactly equal at 6,439 / 6,448;
-- mean cosine was exactly equal at `0.999999999998994`;
-- mean top-10 overlap was exactly equal at `1.0`;
-- both parity gates passed.
-
-The subprocess path produced a different wall-derived throughput, as expected. That timing delta is intentionally not retained as a performance claim: the local run was a semantics check, and subprocess transport is now part of the blessed boundary.
 
 `tests/full_loop.rs` independently creates a tiny tokenizer, 12-row corpus, and reference, spawns the fixture candidate through the framed protocol, runs three passes, reconciles tokens, executes both parity gates, checks first/warm/steady labels, and validates the emitted pin metadata.

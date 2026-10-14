@@ -8,7 +8,7 @@ existing device-resident step engine continues greedy decode.
 The explicit outputs avoid `MLState`; the stateful ANE path remains unsupported.
 The W128 model is the semantically valid arm. W32x4 deliberately applies the
 same stateless W32 graph to four independent chunks, packs their tensors at
-positions 0...127, and is retained as a measured control. It cannot propagate
+positions 0...127, and is retained as a control. It cannot propagate
 attention context between chunks, so correctness—not only latency—must be
 reported for that arm.
 
@@ -55,25 +55,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cargo build --release --manifest-path Cargo.toml
 ```
 
-## Locked-M1 measurement
+## Hardware access
 
-The measurement command must run on `<bench-host>` only after its
-`Runner.Worker` is absent. `--locked` atomically creates
-`$SYNAPSE_BENCH_ROOT/bench.lock`, refuses an active worker or battery power, and removes
-the lock in a `finally` block.
-
-```bash
-.venv/bin/python measure_prefill_split.py \
-  --model "$MODEL" \
-  --runner "$PWD/.build/ane-prefill-runner" \
-  --harness "$PWD/target/release/ane-prefill-split-harness" \
-  --models-dir "$PWD/artifacts" \
-  --prompts ../unified-rt/decode-prompts.jsonl \
-  --work-dir "$PWD/artifacts/locked-m1" \
-  --out "$PWD/artifacts/locked-m1-result.json" \
-  --locked
-```
-
-Large model packages, compiled bundles, binary cache dumps, logs, and raw power
-samples remain under ignored `artifacts/`. Only the compact locked-M1 result is
-committed under `results/`.
+Reserve exclusive Neural Engine access before conversion or inference and keep
+measurement locks in place. Do not interrupt other hardware users to obtain a
+slot. Model packages, compiled bundles, cache dumps, logs and raw power samples
+belong in ignored `artifacts/`, not in source control.
