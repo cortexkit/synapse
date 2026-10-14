@@ -13,6 +13,7 @@ launch credentials are removed from child environments: authenticating a worker
 must not delegate the module's launch authority.
 
 Checks: `worker_host::tests::rejects_stale_worker_nonce` in the module library;
+`wrong_engine_identity_and_old_protocol_are_rejected` in core Unix transport tests;
 `stripped_child_environment_contains_neither_launch_nonce_variable` and
 `stripped_tokio_child_environment_contains_neither_launch_nonce_variable` in
 `crates/synapse-core/tests/child_process.rs`.
