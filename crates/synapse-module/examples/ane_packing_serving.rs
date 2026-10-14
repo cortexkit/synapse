@@ -1,5 +1,12 @@
-//! Matched full-export serving measurements against an isolated catalog ANE lane.
-//! Use an exclusive Neural Engine slot and a properly signed worker; never bypass a live lane's hardware lock.
+//! Times a full embedding export through the module's direct Neural Engine
+//! catalog lane twice, serial and packed, on the same rows, and checks that
+//! both produce the same vectors.
+//!
+//! Run it only while no other process uses the Neural Engine: one process can
+//! hold only a limited number of compiled executables, so a second compiler
+//! forces recompiles and spoils both timings. Never bypass a live lane's
+//! hardware lock to get that slot. Sign the worker binary before running, so
+//! macOS's first-launch security scan doesn't land inside a timed run.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
