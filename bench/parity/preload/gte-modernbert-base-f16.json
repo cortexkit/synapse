@@ -14,7 +14,7 @@
       "version": "owned-metal-v1"
     },
     "numeric_profile_id": "567b4f9bc8edbd3ab1b0f2550653ba62dc3434d0860b1b11e3bc8fedc83cfe21",
-    "source": "production module stored config (models table) and models.list, 2026-10-02"
+    "source": "Canonical preload fingerprint regression fixture"
   },
   "engine": "owned-metal",
   "expected_fingerprint": "24cc5271f42dbc2d154f963e2d67d1adef322cbdfbb541b3eddfaa8ae8859dfb",
