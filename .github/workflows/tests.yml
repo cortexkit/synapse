@@ -202,6 +202,11 @@ jobs:
         working-directory: synapse
         run: bash scripts/public-banlist-check.sh
 
+      - name: CortexKit layout
+        if: matrix.name == 'linux'
+        working-directory: synapse
+        run: bash scripts/check-cortexkit-layout.sh
+
       # Crates from other CortexKit repos come from crates.io or a pinned git
       # commit, never a path into a sibling checkout, whose releases would
       # leave Cargo.lock stale. The self-test proves the check can refuse.

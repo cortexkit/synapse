@@ -1034,10 +1034,14 @@ fi
 # file, so nothing here may assume this repository's layout: each preflight
 # runs only when its script exists, and the header line names which ones ran
 # so a repository with none is distinguishable from one whose block was
-# deleted. This repository's two are the governed-docs gates gated-push.sh
-# runs; both are read-only here (scripts/align-governed-docs.sh is the
-# writing half and stays the remedy, not something this script performs).
+# deleted. These checks are read-only; repairing generated documentation or
+# relocating internal files must happen before the train starts.
 preflights_ran=()
+if [ -f "$REPO/scripts/check-cortexkit-layout.sh" ]; then
+  bash "$REPO/scripts/check-cortexkit-layout.sh" \
+    || refuse "CortexKit layout check failed — repair ignore rules or untrack internal files"
+  preflights_ran+=(cortexkit-layout)
+fi
 if [ -f "$REPO/scripts/audit-v049-agent-surface.ts" ]; then
   bun "$REPO/scripts/audit-v049-agent-surface.ts" \
     || refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"

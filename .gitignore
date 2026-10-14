@@ -5,16 +5,15 @@
 target/
 bench/results/
 bench/data/*.jsonl
-.cortexkit/alfonso/task-outputs/
 
-# Local operational artifacts and private benchmark corpora are never release inputs.
-# .cortexkit stays ignored wholesale because it accumulates operator-specific
-# material: rig hostnames and SSH host keys, sibling checkout paths, worker
-# prompts, consult output. Skills are the exception by fleet rule — they are
-# project knowledge a contributor needs, so they are un-ignored explicitly
-# rather than by relaxing the whole directory.
-.cortexkit/*
-!.cortexkit/skills/
+# Keep internal records and tool state local; publishable guidance and release
+# inputs remain trackable through the explicit exceptions below.
+# CortexKit layout: see WORKSPACE.md "Where files go"
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
 # Anchored to the top level on purpose: this excludes the operator's calibration
 # records and certification policies, NOT docs/evidence, which is published
 # measurement evidence and is tracked. An unanchored rule matches at any depth,

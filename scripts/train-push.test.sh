@@ -980,6 +980,53 @@ expect_out "package=escape" "the local gate names the escaping package"
 [ -z "$(origin_ref "$dir" refs/heads/train/external-path-dependency)" ] ||
   fail "the external path dependency preflight pushed a train branch"
 
+# The real layout checker must refuse before a train branch is pushed; stubbing
+# it green would not prove either the ignore controls or the tracked-file fence.
+install_layout_fixture() {
+  local work="$1"
+  cp "$SCRIPT_DIR/check-cortexkit-layout.sh" "$work/scripts/check-cortexkit-layout.sh"
+  # Internal records are ignored, while publishable guidance and release inputs
+  # stay eligible for tracking through the explicit exceptions.
+  cat > "$work/.gitignore" <<'IGNORE'
+# CortexKit layout: see WORKSPACE.md "Where files go"
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md
+IGNORE
+  git -C "$work" add .gitignore scripts/check-cortexkit-layout.sh
+}
+
+dir="$(new_fixture layout-clean)"
+install_layout_fixture "$dir/work"
+git -C "$dir/work" commit -qm "install layout controls"
+run_train "$dir" layout-clean
+expect_rc 0 "a clean CortexKit layout permits the train"
+expect_out "preflights: cortexkit-layout" "the preflight header names the layout gate"
+
+dir="$(new_fixture layout-internal)"
+install_layout_fixture "$dir/work"
+mkdir -p "$dir/work/.cortexkit/internal-docs/audits"
+echo "internal fixture" > "$dir/work/.cortexkit/internal-docs/audits/control.md"
+git -C "$dir/work" add -f .cortexkit/internal-docs/audits/control.md
+git -C "$dir/work" commit -qm "track an internal document"
+run_train "$dir" layout-internal
+expect_rc 2 "tracked internal material refuses the train"
+expect_out ".cortexkit/internal-docs/audits/control.md" "the layout refusal names the internal file"
+[ -z "$(origin_ref "$dir" refs/heads/train/layout-internal)" ] ||
+  fail "the layout preflight pushed a train with internal material"
+
+dir="$(new_fixture layout-blind)"
+cp "$SCRIPT_DIR/check-cortexkit-layout.sh" "$dir/work/scripts/check-cortexkit-layout.sh"
+git -C "$dir/work" add scripts/check-cortexkit-layout.sh
+git -C "$dir/work" commit -qm "install checker without ignore controls"
+run_train "$dir" layout-blind
+expect_rc 2 "missing ignore controls refuse the train"
+expect_out "BLIND:" "the layout refusal distinguishes a missing ignore block"
+[ -z "$(origin_ref "$dir" refs/heads/train/layout-blind)" ] ||
+  fail "the layout preflight pushed a train without ignore controls"
+
 # --- green: lands on main, train branch cleaned up -------------------------
 dir="$(new_fixture green)"
 add_train_commit "$dir/work" "green"
