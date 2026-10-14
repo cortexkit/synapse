@@ -149,7 +149,7 @@ The harness pins `.cargo-checksum.json` and verifies every listed file, the
 inventory and the absence of symlinks before admission and after staging,
 refusing changes by file name. The binding tree, probe manifest/lockfile, rows,
 comparator and gate wiring remain protected. Registration must supply matching
-harness and input digests; the template records the vendor checksum as
+harness and input digests, including the vendor checksum as
 `SYNAPSE_CAMPAIGN_ANE_VENDOR_SHA256`.
 
 Run `bash bench/campaign/ane-direct-embed-harness.sh --self-test .` without model
