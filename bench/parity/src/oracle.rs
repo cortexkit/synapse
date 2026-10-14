@@ -2,9 +2,12 @@
 //! card states them.
 //!
 //! The oracle is a committed copy of the model card at the pinned revision
-//! (`oracles/qwen3-reranker-0.6b-README.md`). The card's Transformers usage
-//! example defines the template as Python literals; this module reads them
-//! from the first such example:
+//! (`oracles/qwen3-reranker-0.6b-README.md`).
+//! The file is an unmodified upstream snapshot retained for its digest and
+//! template; its performance and model claims belong to the upstream authors.
+//!
+//! The card's Transformers usage example defines the template as Python
+//! literals; this module reads them from the first such example:
 //!
 //! - `instruction = '...'`, the default instruction inside `format_instruction`;
 //! - the `"<Instruct>: ...".format(...)` body string;

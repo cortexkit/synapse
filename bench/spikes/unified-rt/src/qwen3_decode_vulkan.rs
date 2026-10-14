@@ -188,8 +188,8 @@ mod tests {
     //! produce logits bit-identical to K sequential single-token steps, because
     //! batching only shares the per-layer weight read across the K positions and
     //! never reorders one dot product's accumulation. These tests prove that on
-    //! whatever Vulkan GPU runs them. Performance is measured separately on the
-    //! Ally (the Vulkan decode timing authority documented in VULKAN-DECODE.md).
+    //! whatever Vulkan GPU runs them. Performance must be measured separately
+    //! under controlled load; correctness alone is not a throughput claim.
 
     use super::{VulkanDecoder, VulkanKvCache};
     use crate::quant::WeightQuantization;
@@ -391,9 +391,8 @@ mod tests {
 
     /// Per-token batched-verify cost curve. Prints the median wall time per
     /// verify_batch(K) call and the per-token (wall/K) figure for K in
-    /// {1,2,4,8,16,24,32,48,64}. The authoritative numbers are measured on the
-    /// project's designated benchmark GPU, the Ally (see VULKAN-DECODE.md); on
-    /// any other GPU this still works as a functional timing harness. Select weights with
+    /// {1,2,4,8,16,24,32,48,64}. Compare runs only with the same GPU, build,
+    /// weights and controlled load; this is not hardware certification. Select weights with
     /// SYNAPSE_VULKAN_BATCHED_PROBE_QUANT=f16|q8 (default q8).
     fn timing_probe(weight_quant: WeightQuantization) {
         with_decoder(weight_quant, |_model, decoder| {

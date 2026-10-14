@@ -15,9 +15,6 @@ This folder contains the fixed-bucket Core ML proof paths for MiniLM, GTE Modern
   - `compile` — `.mlpackage`/`.mlmodel` -> permanent `.mlmodelc`
   - `run` (`embed` alias) — load `.mlmodelc`, select graph/mean/CLS pooling or pair scoring, emit JSONL, and optionally dump MLComputePlan placement
 - `build_runner.sh` — builds the Swift CLI to `.build/ane-coreml`.
-- `SPIKE.md` — original MiniLM results and verdict.
-- `ANE-WAVE1.md` — ModernBERT wave-1 conversion, parity, placement, power, throughput, and latency evidence.
-- `ANE-WAVE2-QWEN3.md` — Qwen3-Embedding-0.6B wave-2 conversion, locked-M1 ANE evidence, fingerprint verdict, and product recommendation.
 
 ## Requirements
 

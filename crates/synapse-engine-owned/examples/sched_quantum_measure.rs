@@ -100,10 +100,9 @@ mod imp {
     const ARRIVAL_PERIOD: Duration = Duration::from_millis(200);
     /// Prefill chunk size in tokens for the batched prefill path. Each chunk
     /// is ONE bounded command buffer (mat-mat, weights streamed once per
-    /// layer, ~40-50 ms on the M5), so prefill is quantum-bounded: the
-    /// scheduler can yield between chunks. 16 is the batched-verify sweet
-    /// spot for f16 (campaign BATCHED-VERIFY.md: f16 improves monotonically
-    /// through K=16) and the largest column count the kernels template.
+    /// layer), so prefill is quantum-bounded: the scheduler can yield between
+    /// chunks. 16 is the largest column count the kernels template, bounding
+    /// each span's work without changing per-token accumulation order.
     const PREFILL_CHUNK_TOKENS: usize = 16;
     /// Cancellation-latency bound from the workload record.
     const CANCELLATION_BOUND_MS: f64 = 400.0;

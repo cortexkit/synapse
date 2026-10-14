@@ -810,10 +810,8 @@ mod tests {
     //! produce logits bit-identical to K sequential single-token steps, because
     //! batching only shares the per-layer weight read across the K positions and
     //! never reorders one dot product's accumulation. These tests prove that on
-    //! whatever GPU runs them. Performance is measured separately on the project's
-    //! M1 reference machine (the decode timing authority documented in
-    //! METAL-STEP.md), which also settles the completion-06 fixture canary that
-    //! drifts on other machines' Metal compilers.
+    //! whatever GPU runs them. Performance must be measured separately under
+    //! controlled load; a correctness pass alone is not a throughput claim.
 
     use super::{MetalStepDecoder, MetalStepKvCache};
     use crate::quant::WeightQuantization;
@@ -1056,10 +1054,9 @@ mod tests {
 
     /// Per-token batched-verify cost curve. Prints the median wall time per
     /// verify_batch(K) call and the per-token (wall/K) figure for K in
-    /// {1,2,4,8,16}. The authoritative numbers are taken on the project's M1
-    /// reference machine (the decode timing authority; see METAL-STEP.md and
-    /// BATCHED-VERIFY.md); on any other GPU this still works as a functional
-    /// timing harness. Select weights with SYNAPSE_METAL_STEP_BATCHED_PROBE_QUANT
+    /// {1,2,4,8,16}. Compare runs only with the same GPU, build, weights and
+    /// controlled load; the probe does not certify a hardware performance baseline.
+    /// Select weights with SYNAPSE_METAL_STEP_BATCHED_PROBE_QUANT
     /// =f16|q8 (default q8).
     fn timing_probe(weight_quant: WeightQuantization) {
         with_decoder(weight_quant, |_model, decoder| {
@@ -1080,9 +1077,8 @@ mod tests {
             println!("BATCHED_VERIFY_PROBE quant={weight_quant:?} prompt_len={base_position}");
             // Single-token reference: sequential greedy `advance` (the unchanged
             // per-token decode path). Running it in this same harness and build
-            // gives a direct baseline beside the batched numbers and confirms the
-            // additive batched path does not perturb the existing per-token path
-            // (it reproduces the documented f16 decode rate; see BATCHED-VERIFY.md).
+            // gives a same-process timing control beside the batched numbers;
+            // byte-identity tests separately guard the per-token arithmetic.
             {
                 let steps = 64;
                 let iterations = 8;

@@ -24,7 +24,6 @@ reported for that arm.
   the 512-token-bucket f16 cache upload, and 64-token greedy continuation.
 - `measure_prefill_split.py`: fixed-128-token 20-prompt battery, lock checks,
   macmon power capture, and compact result aggregation.
-- `ANE-PREFILL-SPLIT.md`: locked-M1 evidence and verdict.
 
 `MLModel.prediction` is an opaque Core ML boundary and may itself include
 framework-owned output materialization. `kv_copy_layout_ms` starts only after

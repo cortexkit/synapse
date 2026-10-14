@@ -9,10 +9,9 @@
 //!
 //! Scope of this increment: the convolution step kernel and its rolling-cache
 //! model, proven bit-exact and deterministic against the `lfm2.rs` CPU reference
-//! (`decode_conv`) on real LFM2-1.2B dimensions. End-to-end hybrid orchestration
-//! (chaining the conv step with the reused attention/matvec/RMSNorm kernels into
-//! a full token-exact decoder), the Q8 path, the 20x64 sha256 fixtures, and the
-//! authoritative M1 timing are tracked as follow-ups in LFM2-METAL-STEP.md.
+//! (`decode_conv`) on real LFM2-1.2B dimensions. The real-model gates below
+//! separately check hybrid orchestration and Q8 arithmetic against pinned
+//! CPU-reference fixtures; timing probes do not replace those correctness gates.
 #![cfg(target_os = "macos")]
 // The convolution step engine is not yet wired into the binary decode path
 // (end-to-end hybrid orchestration is a follow-up); its only consumer right now
@@ -927,9 +926,8 @@ mod tests {
     // token-exactness. If the two agree on every prompt, the literal CPU
     // reference is a valid 20/20 oracle for the f16 engine; if they diverge, the
     // f16 engine's oracle must be the f16-weight CPU reference and the divergent
-    // prompts are listed. The result is printed (run with `--nocapture`) and
-    // recorded in LFM2-METAL-STEP.md; it is the f16 policy the end-to-end gate
-    // builds on.
+    // prompts are listed. Run with `--nocapture` to inspect which CPU-weight
+    // policy is suitable before selecting an end-to-end f16 oracle.
     // ---------------------------------------------------------------------
 
     use crate::lfm2::{Mixer, Model};
@@ -1702,7 +1700,7 @@ mod tests {
 
     /// Structural-invariant ceiling on the Q8-oracle top-2 logit gap at a certified
     /// fork. Derived from the measured ~0.051 vocab-wide Q8 engine-vs-oracle logit
-    /// error (see q8_hybrid_step_logit_error_probe and LFM2-METAL-STEP.md stage D):
+    /// error checked by `q8_hybrid_step_logit_error_probe`:
     /// a fork whose oracle top-2 gap is below this band is a rounding coin-flip
     /// (the engine's per-logit error of <= ~0.051 on each of the top two can flip
     /// the order, so flips are possible up to ~2x0.051 ~= 0.10), not a real
@@ -2089,9 +2087,9 @@ mod tests {
     // attention softmax, rsqrt in rmsnorm) round differently on different Apple
     // GPUs even compiled IEEE-strict. Observed: the M5 build host forks
     // completion-15 / step 17 (CPU top-2 gap 0.0004); the M1 authority forks
-    // completion-05 / step 8 (gap 0.0073). This mirrors the documented Qwen3 f16
-    // precedent (METAL-STEP.md: the completion-06 near-tie drifts on the M5 Metal
-    // compiler; the M1 is the fixture authority). The oracle (the pinned CPU
+    // completion-05 / step 8 (gap 0.0073). A top-2 swap is therefore checked
+    // against both the gap ceiling and the device's pinned fork signature,
+    // not accepted merely because two implementations agree. The oracle (the pinned CPU
     // fixture) is machine-independent and untouched; only the engine's coin-flip
     // resolution is machine-dependent, bounded by the band invariant below.
     //
@@ -2106,7 +2104,7 @@ mod tests {
 
     /// Structural-invariant ceiling on the CPU top-2 logit gap at a certified
     /// fork. Justified by the measured ~0.03 vocab-wide f16 logit error vs the f32
-    /// oracle (see LFM2-METAL-STEP.md stage C): a fork whose CPU top-2 gap is
+    /// oracle: a fork whose CPU top-2 gap is
     /// below this band is a rounding coin-flip, not a real divergence. 0.05 leaves
     /// margin over the observed ~0.03 error.
     const NEAR_TIE_BAND: f32 = 0.05;
@@ -2128,9 +2126,9 @@ mod tests {
     const M5_CANARY_PROMPT: &str = "completion-15";
     const M5_CANARY_STEP: usize = 17;
 
-    /// Whether this process runs on the M1 fixture/timing authority
-    /// (LFM2-DECODE-BASELINES.md rig: <bench-host>, Apple M1 Max,
-    /// MacBookPro18,2). The f16 near-tie coin-flips resolve differently on other
+    /// Whether this process uses the pinned MacBookPro18,2 divergence tuple
+    /// (prompt, decode step, engine token, CPU-oracle token).
+    /// The f16 near-tie coin-flips resolve differently on other
     /// Apple GPUs, so the exact fork signature is pinned only here; elsewhere the
     /// structural band invariant is the gate. An explicit env override
     /// (SYNAPSE_LFM2_STEP_AUTHORITY=m1) covers a relocated bench.
@@ -2362,12 +2360,10 @@ mod tests {
 
     /// Single-stream decode throughput cell (run in `--release`). For each prompt
     /// it prefills (untimed) then times one chained 64-token greedy decode -- the
-    /// sustained step-engine decode rate, comparable to the `Decode tok/s` column
-    /// of LFM2-DECODE-BASELINES.md (owned MPSGraph f16 6.345, llama.cpp Metal F16
-    /// 130.74, Q8_0 203.65 on this rig). Reports the median over the twenty
-    /// prompts x two repeats plus min/max and warm ms/token. This is the
-    /// authoritative number only on the locked M1 (see LFM2-METAL-STEP.md stage
-    /// C); on the M5 build host it is advisory. Run with:
+    /// sustained step-engine decode rate, excluding prefill. Reports the median
+    /// over twenty prompts x two repeats plus min/max and warm ms/token.
+    /// Compare only runs with matching hardware, build, weights and controlled
+    /// load; the timing probe does not certify a performance baseline. Run with:
     ///
     /// ```text
     /// SYNAPSE_UNIFIED_RT_LFM2_1_2B=<snapshot> cargo test -p spike-unified-rt \

@@ -23,8 +23,6 @@ verdict.
   `c1899de289a04d12100db370d81485cdf75e47ca`, f16 safetensors storage.
 - Canonical snapshot content SHA-256:
   `0d7d1359007f579fba9f6eceef44c87b947362da893cc565d27656284e4d6f86`.
-- Baseline: **40.55 tok/s** on the locked M1 from
-  [`DECODE-WAVE1.md`](../spikes/unified-rt/DECODE-WAVE1.md).
 - Decode: Metal, f16, greedy raw completion, cache bucket 512, top-five tap,
   64 new tokens.
 
@@ -155,7 +153,7 @@ The result file had mode `0600`:
 
 ```json
 {
-  "baseline_note": "Frozen master baseline: 40.55 tok/s on locked M1 (DECODE-WAVE1.md); N=12 fresh processes with varied prompts.",
+  "baseline_note": "Configured baseline; 12 fresh processes with varied prompts.",
   "gate_passed": true,
   "hooks_passed": true,
   "median_tok_s": 40.58197703061707,

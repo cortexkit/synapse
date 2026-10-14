@@ -6,15 +6,16 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 
-// Wave 5 batched mat-mat (Q8_0): one weight-row read feeds K column dot
+// Batched mat-mat (Q8_0): one weight-row read feeds K column dot
 // products. This is the Vulkan port of the Metal batched-verify Q8 mat-mat
-// kernels (BATCHED-VERIFY.md). The column count K is a SPECIALIZATION
+// kernels used to verify multiple token positions. K is a SPECIALIZATION
 // CONSTANT so the driver specializes it at pipeline creation; the K
 // accumulators stay register-resident and each column's accumulation keeps
 // the exact ascending block/element order of the K=1 decode_matvec_q8_0
-// shader. A runtime column count would spill the accumulators and let the
-// compiler fold products before adding them to the running sum — the same
-// reordering that broke the Metal byte-exact gate before the template fix.
+// shader. A runtime column count can spill the accumulators and let the
+// compiler fold products before adding them to the running sum, changing
+// floating-point rounding. Batched and sequential verification must produce
+// bit-identical f32 logits, not just the same argmax.
 //
 // The accumulators are declared as explicit scalars per K branch (not an
 // array indexed by a loop variable) so the glslc compiler keeps them in

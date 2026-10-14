@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BASELINE_TOK_S = 592.8694799258782
-# Frozen Qwen3-0.6B Q8_0 quality profile from QUANT-DECODE.md; the 13/20 and
-# 54.5 profile belongs to the separate LFM2-1.2B row.
+# Pin the Qwen3-0.6B Q8_0 quality floor separately: the 13/20 and 54.5
+# profile belongs to LFM2-1.2B, not this model's fixtures.
 QUALITY_BASELINE_EXACT = 10
 QUALITY_BASELINE_MEDIAN_DEPTH = 59.0
 EXPECTED_MODEL_DIGEST = "0d7d1359007f579fba9f6eceef44c87b947362da893cc565d27656284e4d6f86"
@@ -1418,7 +1418,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         )
         baseline_note = (
             f"Frozen master baseline: {baseline:.1f} tok/s on RTX 4090 Q8_0 "
-            f"(QUANT-DECODE.md); short N={SAMPLE_COUNT} fresh processes with varied prompts; "
+            f"with pinned CPU-fp32 token fixtures; short N={SAMPLE_COUNT} fresh processes with varied prompts; "
             f"deep N={DEEP_SAMPLE_COUNT} x {DEEP_REPEAT_COUNT} worse-of-two per tier, "
             f"470={deep470_median:.3f} tok/s (control {deep470_baseline:.3f}), "
             f"900={deep900_median:.3f} tok/s (control {deep900_baseline:.3f}); "

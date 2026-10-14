@@ -50,7 +50,7 @@ Policy v2 retains the v1 sequence ladder and padding semantics but makes the row
 | 8 | 448 | 8 | 1,605,632 |
 | 9 | 512 | 8 | 2,097,152 |
 
-The locked result in [M1-BUCKET-MATRIX.md](M1-BUCKET-MATRIX.md#policy-v2--rejected) rejects this ladder unchanged: MiniLM wastes 17.71% and gte-ModernBERT wastes 18.45%, both above the strict 15% gate. The implementation remains selectable so the failed candidate and its `bucket-policy-v2` cache identity are reproducible; v1 remains the default.
+Policy v1 remains the default. Select v2 explicitly to compare its row ladder and distinct `bucket-policy-v2` cache identity.
 
 ## Distribution justification
 
@@ -111,7 +111,7 @@ Raw result JSON is retained in `results/bucket-policy/`.
 
 ## Locked-M1 follow-up — completed
 
-The locked matrix is retained in [M1-BUCKET-MATRIX.md](M1-BUCKET-MATRIX.md). It completed every planned check:
+The measurement protocol checks:
 
 - [x] Cleared each versioned package root and recorded bucketed MISS `cold_load_s`, package count/bytes, and all three in-process pass rows, then repeated from a fresh HIT process.
 - [x] Ran exact mode beside bucketed mode for the three standard corpora and one fresh-root MC MISS, keeping exact compilation in pass 1.

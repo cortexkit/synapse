@@ -21,22 +21,21 @@
 //!    layer. Batching parallelizes ACROSS positions; it never reorders the
 //!    accumulation WITHIN one dot product (the mat-mat kernels are templated
 //!    on the compile-time column count so the per-column accumulators stay
-//!    register-resident in single-token order — the campaign gate that
-//!    caught the runtime-column-count reordering lives in
-//!    `bench/spikes/unified-rt/BATCHED-VERIFY.md`). These tests re-gate the
+//!    register-resident in single-token order; a runtime column count can let
+//!    the compiler reorder those sums). These tests re-gate the
 //!    production port: full f32 logits from the batched path must be
 //!    bit-for-bit equal to sequential single-token `advance` logits at the
 //!    same positions, for f16 and Q8_0, across K in {1,2,4,8,16} and prompt
 //!    depths {1,5,33,128,469}. This is the arithmetic-identity fixture
 //!    evidence that lets prefill use the batched path by default; if it ever
 //!    fails, batched prefill is a different token function and must be
-//!    treated as an arithmetic-identity rotation, not silently shipped.
+//!    versioned and certified as a different arithmetic implementation, not
+//!    silently shipped under the existing identity.
 //!
 //! The batched-verify kernels (`.metal`), the Objective-C driver (`.m`), and
-//! the FFI entry are byte-identical to the spike port; the gates mirror the
-//! spike's campaign gates (`batched_verify_logits_are_byte_identical_to_sequential_*`,
-//! `batched_verify_is_deterministic_*`,
-//! `batched_verify_forced_rejection_preserves_continuation_*`).
+//! the FFI entry are byte-identical to the spike port. The gates check batched
+//! versus sequential logits, repeated-call determinism, and continuation after
+//! rejecting a draft and rewinding the cache.
 //!
 //! Env vars:
 //! - `SYNAPSE_OWNED_DECODE_QWEN3_0_6B`: path to the Qwen3-Embedding-0.6B snapshot

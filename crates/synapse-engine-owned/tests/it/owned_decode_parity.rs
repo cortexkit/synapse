@@ -1,9 +1,8 @@
 //! Spike-vs-production A/B parity test for the four decode lanes.
 //!
-//! This test verifies the acceptance criterion: "direct M5 spike-harness
-//! comparisons produce byte-identical token streams for all four lanes."
-//! It loads the same model checkpoints, runs the same 20-prompt x 64-token
-//! fixture protocol, and compares the production owned-decode-engine's token
+//! The lanes are Qwen3 and LFM2, each with f16 or Q8_0 weights. The tests
+//! load the same model checkpoints, run the same 20-prompt x 64-token
+//! fixture protocol, and compare the production owned-decode-engine's token
 //! streams against the spike harness's reference fixtures byte-for-byte.
 //!
 //! Checkpoint-gated: set the model path env vars to run. The test is
@@ -15,13 +14,11 @@
 //! of any Metal engine). The Qwen3 lanes compare against the spike Metal
 //! step engine's recorded output — a port-fidelity oracle (valid because the
 //! `.metal`/`.m`/FFI surface is byte-identical to the spike). The
-//! CPU-oracle-backed exactness chain for the spike engine's Qwen3 arithmetic
-//! lives in the spike's own gate history: `bench/spikes/unified-rt/
-//! DECODE-FOUNDATIONS.md` ("Token-exact gate", `reference_qwen3_decode.py`,
-//! transformers 4.51.0 + torch 2.13.0 CPU fp32 oracle, 20/20 prompts and
-//! 1280/1280 tokens exact, zero near-tie exemptions). The streams pinned
-//! here were recorded by that same spike engine on the Qwen3-Embedding-0.6B
-//! variant; they are pinned in `bench/spikes/unified-rt/fixtures/` with
+//! spike's separate Qwen3-0.6B correctness gate uses `reference_qwen3_decode.py`
+//! with Transformers 4.51.0 and torch 2.13.0 CPU fp32 and requires all
+//! 20 prompts and 1,280 tokens to match with zero near-tie exemptions. The
+//! streams pinned here were recorded by the spike Metal engine on the
+//! Qwen3-Embedding-0.6B variant; they are pinned in `bench/spikes/unified-rt/fixtures/` with
 //! their sha256 recorded below, so neither engine can silently drift the
 //! reference, and they are never regenerated from the production engine.
 //!
@@ -125,10 +122,9 @@ fn load_reference_fixture(name: &str) -> HashMap<String, Vec<u32>> {
 /// `bench/spikes/unified-rt/fixtures/`. The sha256 of the exact pinned bytes
 /// is recorded in the call site: any modification or regeneration of the
 /// reference — by either engine — fails the gate until the hash is
-/// deliberately re-pinned. The CPU-oracle-backed exactness chain behind the
-/// streams lives in the spike's gate history (DECODE-FOUNDATIONS.md,
-/// "Token-exact gate"); this test never regenerates the reference from the
-/// production engine.
+/// deliberately re-pinned. The spike's independent CPU-fp32 oracle checks
+/// token exactness without near-tie exemptions; this test never regenerates
+/// the reference from the production engine.
 fn load_spike_qwen3_output(name: &str, pinned_sha256: &str) -> HashMap<String, Vec<u32>> {
     let spike_dir = std::env::var_os("SYNAPSE_OWNED_DECODE_SPIKE_QWEN3_REFERENCES")
         .map(PathBuf::from)
@@ -423,13 +419,12 @@ fn parity_qwen3_q8() {
 /// (prompt id, step, production token, CPU-oracle token). GPU transcendental
 /// rounding differs per Apple Silicon generation, so each machine flips a
 /// DIFFERENT near-tie and every certified machine records its exact signature
-/// here (the program's two-tier model: pinned signatures per machine +
-/// structural band everywhere):
-/// - M5 Max (dev box): completion-15/step 17, engine 523 vs oracle 518,
+/// here. Every accepted fork must also be a swap of the CPU oracle's top two
+/// tokens within the fixed logit-gap ceiling; the signature alone is not enough:
+/// - M5 Max: completion-15/step 17, engine 523 vs oracle 518,
 ///   CPU top-2 (518, 523), gap 0.000362.
-/// - M1 Max (historical CI runner, historical authority): completion-05/
-///   step 8, engine 7693 vs oracle 1827, CPU top-2 (1827, 7693), gap 0.00727
-///   (LFM2-METAL-STEP.md, stage-C certification).
+/// - M1 Max: completion-05/step 8, engine 7693 vs oracle 1827,
+///   CPU top-2 (1827, 7693), gap 0.00727.
 ///
 /// The spike's Metal step engine produces the same fork as the production
 /// engine on each machine. A fork not in this list fails the gate.

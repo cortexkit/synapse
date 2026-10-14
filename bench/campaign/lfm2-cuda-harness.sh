@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 BASELINE_TOK_S = 361.8
-# Frozen LFM2-1.2B Q8_0 profile from QUANT-DECODE.md. This controller is
-# deliberately separate from the sibling Qwen3 campaign profile.
+# Pin the LFM2-1.2B Q8_0 quality floor separately: its fixture match depth and
+# exact-prompt count are not interchangeable with the Qwen3 profile.
 QUALITY_BASELINE_EXACT = 13
 QUALITY_BASELINE_MEDIAN_DEPTH = 54.5
 EXPECTED_MODEL_DIGEST = "afd99d6cc2a5a6ff6c57ceca2d03f1f73d58d31f3528eadca3035f4164a2009d"
@@ -1100,7 +1100,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
         selected_samples = repeat_samples[selected_index]
         baseline_note = (
             f"Frozen master baseline: {baseline:.2f} tok/s on RTX 4090 Q8_0 "
-            f"(QUANT-DECODE.md); N={SAMPLE_COUNT} x {SAMPLE_REPEAT_COUNT} fresh processes "
+            f"with pinned LFM2 CPU-fp32 token fixtures; N={SAMPLE_COUNT} x {SAMPLE_REPEAT_COUNT} fresh processes "
             f"with varied prompts, worse-of-two repeat median; repeat medians="
             f"{', '.join(f'{value:.6f}' for value in repeat_medians)}, selected={median_tok_s:.6f}. "
             f"{sibling_note} {cuda_note} "

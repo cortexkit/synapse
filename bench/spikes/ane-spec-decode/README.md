@@ -28,7 +28,6 @@ stateful retry.
 - `measure_phase_b.py` — drives the Metal-step verifier with the persistent
   ANE JSONL draft server, checks the 20 pinned fixtures plus depth-470, and
   emits baseline/speculative latency and break-even metrics.
-- `SPIKE-A.md` — decision table and Phase B/C recommendation.
 - `results/phase-a-raw.json` — compact committed raw matrix, placement
   summaries, power aggregates, and parity counts. Detailed MLComputePlan
   operations and macmon JSONL remain in the ignored work directory after a

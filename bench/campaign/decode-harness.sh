@@ -947,7 +947,7 @@ def run_harness(workspace_arg: str, runner_arg: str, result_arg: str) -> int:
             raise CandidateRejected("measurement median is not finite and positive")
         baseline_note = (
             f"Frozen master baseline: {baseline:.2f} tok/s on locked M1 "
-            f"(DECODE-WAVE1.md); N={SAMPLE_COUNT} fresh processes with varied prompts. "
+            f"with pinned CPU-fp32 token fixtures; N={SAMPLE_COUNT} fresh processes with varied prompts. "
             f"{power_note} {sibling_note}"
         )
         writer.write(

@@ -38,7 +38,7 @@ The LFM2 metallib includes a reused IEEE-strict copy of the Qwen3 step kernels f
 
 ## M5 advisory fork signature (LFM2 f16)
 
-The M5 build host forks at completion-15/step17: engine emits 523 where the CPU oracle emits 518 (CPU top-2 gap 0.000362). This is the documented M5 canary fork (LFM2-METAL-STEP.md). The M1 authority's fork signature is pinned at completion-05/step8 (different near-tie, different machine). This M5 run is advisory; M1 constants are not re-pinned.
+The M5 build host forks at completion-15/step17: engine emits 523 where the CPU oracle emits 518 (CPU top-2 gap 0.000362). The M1 authority's fork signature is pinned at completion-05/step8 (different near-tie, different machine). This M5 run is advisory; M1 constants are not re-pinned.
 
 ## Addendum: batched-verify Rust exposure for quantum-bounded prefill
 
