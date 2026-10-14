@@ -245,7 +245,7 @@ fn capture_cases(assets: &Path) -> Vec<Value> {
 // tokenizer bytes are checksum-verified; expected ids are not computed by the
 // request path under test.
 #[test]
-#[ignore = "requires checksum-named pinned tokenizer/config files; see docs/evidence/catalog-token-identity.md"]
+#[ignore = "requires checksum-pinned upstream tokenizer/config files in SYNAPSE_TOKEN_IDENTITY_ASSETS; fetch with scripts/fetch-token-identity-assets.py"]
 fn catalog_boundary_token_ids_match_master() {
     let golden: Value = serde_json::from_str(include_str!(
         "../tests/fixtures/catalog-master-token-ids.json"

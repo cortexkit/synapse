@@ -7,14 +7,14 @@
     // ---- Candidate graph construction ----
     { "path": "bench/spikes/ane-direct-probe/src/bin/modernbert_full.rs", "ranges": [[376, 401], [403, 419], [437, 463], [483, 609], [657, 727]], "role": "patch_target" },
 
-    // ---- Per-layer attribution and the 53x batched-attention correction ----
-    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[47, 74]], "role": "doc" },
+    // ---- Tensor axes and independent reference boundary ----
+    { "path": "docs/ane-graph-layout.md", "ranges": [[7, 18]], "role": "doc" },
 
-    // ---- Closed attention negatives: operand baking, transposes, and head grouping ----
-    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[83, 189]], "role": "doc" },
+    // ---- Head separation, local attention and softmax axes ----
+    { "path": "docs/ane-graph-layout.md", "ranges": [[20, 41]], "role": "doc" },
 
-    // ---- Leading question: sequence scaling, plus the bounded fusion lead ----
-    { "path": "docs/evidence/ane-direct-api-m5/README.md", "ranges": [[212, 220], [289, 416]], "role": "doc" },
+    // ---- Layer dependencies and qualification boundary ----
+    { "path": "docs/ane-graph-layout.md", "ranges": [[43, 66]], "role": "doc" },
 
     // ---- Harness contract and protected comparator context ----
     { "path": "bench/campaign/ane-direct-embed-harness.sh", "ranges": "whole", "role": "reference" },

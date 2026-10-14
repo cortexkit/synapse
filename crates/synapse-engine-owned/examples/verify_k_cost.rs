@@ -59,8 +59,8 @@
 //!   rounds; proves the harness works, its numbers are not a result), or
 //!   `trace` (batched K in {1, 8} only, one uninterrupted phase per
 //!   (depth, K) with two idle seconds around it, meant to run under
-//!   `xctrace record --template 'Metal System Trace'`; see
-//!   `docs/evidence/verify-k-cost-m5/`).
+//!   `xctrace record --template 'Metal System Trace'`; each draft is checked
+//!   against sequential logits and tokens before any timing).
 //! - `SYNAPSE_VERIFY_K_LANES`: comma list of `f16`, `q8` (default `f16,q8`).
 //! - `SYNAPSE_VERIFY_K_ROUNDS`: override the number of timed rounds (or, in
 //!   trace mode, calls per phase).

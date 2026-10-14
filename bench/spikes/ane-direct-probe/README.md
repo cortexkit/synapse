@@ -50,7 +50,7 @@ prediction is compared bit for bit with its row's correctness-phase vector.
 per-dispatch times, and each block's one- and five-minute load. `gap_ab.sh`
 wraps a run with a load and rig-claim wait, a load monitor and a copy of the
 production Synapse log for the run window; `gap_analysis.py` summarizes the
-per-call file. Results are in `docs/evidence/ane-dispatch-gap/`.
+per-call file. Historical experiment results are kept privately.
 
 `rows.jsonl` contains four short real-text rows and four repeated-prose rows near
 each of the 512, 1024, and 2048 shape limits. Its SHA-256 is
@@ -64,8 +64,7 @@ encoder weights and performs masked mean pooling, dense, exact-erf GELU, layer
 norm, and classifier (including classifier bias) on CPU in fp32. It is a spike,
 not a served lane. The retained 20-pair evaluation **failed** the required
 sigmoid-score fidelity gate; do not use this binary's scores as an accepted
-benchmark arm. See the Neural Engine follow-up in
-`docs/evidence/rerank-eval-2026-09/README.md`.
+benchmark arm. Score fidelity must be established independently before use.
 
 ```sh
 env -u TMPDIR cargo run --release --bin modernbert_rerank -- "$MODEL_SNAPSHOT" < pairs.jsonl

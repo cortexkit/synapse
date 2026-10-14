@@ -43,4 +43,4 @@ All fixture hashes were verified on the Ally with `certutil -hashfile ... SHA256
 | ModernBERT F16 GGUF | `2cda419ce09e87b1dd5294177a1c7d563e9536700e33652a9bb9e9c503c4e437` |
 | Qwen3 embedding F16 GGUF | `421a27e58d165478cc7acb984a688c2aa41404968b0203e7cd743ece44c54340` |
 
-Raw LaneResult files and the machine fingerprint are under `results/vulkan-wave2/`.
+Raw results are kept privately.

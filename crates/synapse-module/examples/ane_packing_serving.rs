@@ -1,5 +1,5 @@
 //! Matched full-export serving measurements against an isolated catalog ANE lane.
-//! See docs/evidence/ane-tight-packing/README.md for approval and signing requirements.
+//! Use an exclusive Neural Engine slot and a properly signed worker; never bypass a live lane's hardware lock.
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

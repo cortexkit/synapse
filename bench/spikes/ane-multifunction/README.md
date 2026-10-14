@@ -2,7 +2,7 @@
 
 These scripts measure whether one multi-function Core ML package holding the
 gte-modernbert-base 128/256/512 buckets can replace the three single-bucket
-packages. The results are in `docs/evidence/ane-coreml-multifunction/README.md`.
+packages. Historical experiment results are kept privately.
 
 Artifacts (packages, compiled bundles, vectors, raw reports) go under
 `~/.local/share/cortexkit/synapse/ane-multifunction/`, not into git.

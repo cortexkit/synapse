@@ -19,8 +19,8 @@
 //! `converted_package_digest`.
 //!
 //! ModernBERT residual-stream rotation (scope `modernbert-residual-stream-v1`,
-//! after the reference construction measured in
-//! docs/evidence/ane-modernbert-rotation-conditioning/README.md). Weights use
+//! which centers the residual stream and folds normalization scales into
+//! the surrounding projections). Weights use
 //! the checkpoint's `[out, in]` layout, applied as `y = x Wᵀ` to row vectors;
 //! `Q` is the `d × d` matrix `hadamard::generate` builds, `C = I − 11ᵀ/d`, and `γ` are the
 //! LayerNorm scales:

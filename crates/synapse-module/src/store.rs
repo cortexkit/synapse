@@ -4578,8 +4578,8 @@ impl SynapseStore {
     /// This answers "was it ever certified", which is the other half an operator
     /// needs: together they separate a lane that was certified and then had its
     /// profile rotate from one that was never probed. Without it the decode
-    /// branch has only one fact and both states render identically -- see
-    /// `docs/audits/meaning-serving-gates.md`.
+    /// branch cannot distinguish a changed machine profile from a lane that
+    /// has never had certification evidence.
     pub fn latest_owned_decode_measurement_row(
         &self,
         model_id: &str,

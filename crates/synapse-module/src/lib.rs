@@ -2376,11 +2376,10 @@ struct PerfBenchResult {
 
 struct SystemClock;
 
-/// Use eight rows for ANE because the paired-sweep benchmark identified eight
-/// as the recommended fixed batch size. With fixed sequence buckets, the
-/// corresponding token budget is the row count multiplied by the model's
-/// maximum sequence length; see `bench/results/mc-paired-sweep-20260720.md`
-/// for the measurements.
+/// Fixed-row ANE advice bounds the caller's batch size independently of token
+/// length. With fixed sequence buckets, its token budget is the row count
+/// multiplied by the model's maximum sequence length. This is scheduling advice,
+/// not a promise that a batch executes as one hardware pass.
 fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<RecommendedBatch> {
     match engine {
         // Every owned embed/rerank engine shares the module's batch planner,
@@ -15961,16 +15960,11 @@ fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidenc
 
 /// Reference similarity margin below which a neighbour swap counts as a near tie.
 ///
-/// An f16 lane's pairwise similarities differ from its fp32 reference by f16
-/// rounding error. For the owned-Metal gte-modernbert f16 graph (with f32
-/// matmuls), the mean |similarity error| against its f32 graph was 1.98e-4 over
-/// 6,341 code chunks x 500 query chunks (p99 about 6.6e-4 over all pairs of a
-/// 1,500-chunk sample); the graph with f16 matmuls measured 1.99e-4
-/// (docs/evidence/metal-fixed-cost/README.md). Two
-/// neighbours whose reference similarities differ by less than about 2.5x that
-/// mean error can trade places from rounding alone, so such a swap does not
-/// measure ranking quality. Lanes with a larger rounding error than this
-/// measured one are not covered by that basis.
+/// An f16 lane's similarities can differ from its fp32 reference through
+/// rounding alone. When the reference barely separates two neighbours, their
+/// order can change without a meaningful ranking-quality change. This margin
+/// treats only those near ties as overlap; it does not establish numerical
+/// equivalence or replace a lane's independent parity and certification gates.
 const RANK_OVERLAP_NEAR_TIE_MARGIN: f64 = 5e-4;
 
 /// Mean and worst-decile top-k neighbour overlap of `left` against `right`, the

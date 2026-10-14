@@ -1,7 +1,7 @@
 
 # Each row is a deliberate one-line break of a safety or compatibility guard that
 # would otherwise fail silently, plus the tests that must fail when it is applied.
-# Add rows with `ckdev-mutate prove` from the pinned runner (see docs/mutations.md);
+# Add rows with `ckdev-mutate prove` from the pinned runner (see docs/development.md);
 # a mutant that fails to compile or times out does not count as caught.
 # Integration tests launch the ck-synapse binary, so it is rebuilt with the
 # test-support feature after each mutant; otherwise a stale, unmutated binary

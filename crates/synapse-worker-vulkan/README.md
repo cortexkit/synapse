@@ -102,9 +102,9 @@ GPU_PARITY qwen3-reranker-0.6b max_score_error=0.000005623 min_kendall_tau=1.000
 GPU_PARITY qwen3-reranker-0.6b long-8192 tokens=8192 score_error=0.000013232
 ```
 
-`docs/evidence/vulkan-attention-scaling/` has every length row, the outputs
-compared with those of the previous attention kernel, and the time per row at
-512-8192 tokens.
+The attention kernel shares tiled key/value loads across queries and preserves
+causal and local-window masking. Kernel changes must pass the independent
+fixture parity checks; a successful shader build alone is not numerical proof.
 
 As a hardware regression control, disabling the shader's local-attention window
 lowered the GTE embedding minimum cosine to `0.952105393` (`0.952105542` with the

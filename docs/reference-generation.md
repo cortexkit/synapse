@@ -1,82 +1,21 @@
 # CPU fp32 reference generation
 
-The single reference implementation is `bench/parity/reference/generate_reference.py`.
+The reference generator is `bench/parity/reference/generate_reference.py`.
 It uses Transformers 5.16.1, Torch 2.14.0, seed 0, CPU fp32, eager attention,
-one intra-op thread, one inter-op thread, and deterministic algorithms.
-The script sets `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` before importing
-Torch or Transformers; callers need not supply those settings. These settings
-are recorded in each parity fixture's `reference` metadata.
+single-threaded reductions and deterministic algorithms. Thread settings are
+established before importing the numerical libraries and recorded in fixture
+metadata. Model revisions and file digests come from `bench/parity/models.json`;
+each declared SHA-256 is checked before loading.
 
-Model files come from the pinned revisions in `bench/parity/models.json`.
-The generator checks each declared file's SHA-256 before loading the model.
-Use `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` to prohibit model downloads.
+## Stage two independent generations
 
-## Deterministic re-seal comparison (2026-10-06)
-
-Two complete generations into separate temporary directories, with a fresh
-Python process for each model, produced byte-identical fixture files and
-byte-identical `fixtures/index.json`. Both generations used:
+Use a cache containing the pinned checkpoint files and run from the repository
+root. Offline settings prohibit model downloads, not installation of the pinned
+Python tools themselves. Write into fresh staging directories rather than
+replacing committed references:
 
 ```sh
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  uv run --no-project --python 3.12 \
-  --with transformers==5.16.1 --with torch==2.14.0 python ...
-```
-
-The Python harness copied `bench/parity/models.json` into each temporary
-root, imported the generator, and called
-`run(["--hf-cache", cache, "--model", slug], parity_dir=temporary_root)`.
-The cache was `~/.cache/huggingface/hub`; no model files were copied or
-modified. File reads follow the cache symlinks to their contents.
-
-Compared with the previously committed fixtures:
-
-| Model | Maximum absolute difference | Minimum cosine | Ranking changes |
-| --- | ---: | ---: | --- |
-| gte-modernbert-base | 8.016359061002731e-7 | 0.9999999999766092 | Not applicable |
-| gte-reranker-modernbert-base | 8.255243301391602e-6 | 0.9999999999982356 | None |
-| qwen3-embedding-0.6b | 5.513429641723633e-7 | 0.9999999999928043 | Not applicable |
-| qwen3-reranker-0.6b | 1.1920928955078125e-7 | 0.9999999999999996 | None |
-
-All non-output case fields, including token IDs, matched. Embedding cosine
-was measured per case. Reranker cosine and descending score order were
-measured separately for each category and each candidate pool, preserving
-input order for ties. No group changed order. All absolute differences were
-below 1e-5. The comparison includes every case, including the padded batch
-and the 8192-token cases.
-
-SHA-256 values reproduced in both runs:
-
-| Model | Deterministic fixture SHA-256 |
-| --- | --- |
-| gte-modernbert-base | ec179ee4a8fb4dc759676751de717cfbabe30fc5009f732353bff1d226fe552f |
-| gte-reranker-modernbert-base | 241c7c058148bba3a2e3f1d5a33b25013d688ed320c9bb3dc4f901b8f1a2c083 |
-| qwen3-embedding-0.6b | fe401fff207c0b67841dbd6a653020bcf32d2cc5998c728b3252132698a27a3b |
-| qwen3-reranker-0.6b | b34adc4106321bb00665d90503a28b4b1f1eaa5fe3deca5f6ca8ae05fb47ff95 |
-
-The old fixtures did not record thread or attention settings. Explicit eager
-attention and single-threaded reductions change fp32 rounding slightly; the
-comparison above establishes that the deterministic re-seal retains numeric
-and ranking behavior. The certification library embeds small subsets of these
-cases for profile self-checks. Their source digests and copied outputs must be
-regenerated when the full fixtures change. The direct-ANE padding golden also
-records source digests that must be refreshed.
-
-After regenerating the direct-ANE padding golden with its existing generator,
-only the 12 `source_sha256` provenance fields changed. All token IDs, padded
-IDs and mask values were unchanged (maximum expected-value difference: 0).
-Separately, `subsets_are_exact_copies_of_the_sealed_source_cases` passed,
-confirming that the certification self-check subsets retain the full fixtures'
-metadata and the exact selected case contents.
-
-## Generating references
-
-Run from the repository root. Stage the generated parity fixture JSON files
-before comparing or re-sealing them; each run writes a model fixture under
-`fixtures/<model>/` and its digest entry in `fixtures/index.json` under the
-staging root. For example, to reproduce all four models twice:
-
-```sh
+: "${HF_CACHE:?set the pinned Hugging Face cache directory}"
 first=$(mktemp -d)
 second=$(mktemp -d)
 for output in "$first" "$second"; do
@@ -86,91 +25,63 @@ for output in "$first" "$second"; do
       uv run --no-project --python 3.12 \
       --with transformers==5.16.1 --with torch==2.14.0 \
       python bench/parity/reference/generate_reference.py \
-      --hf-cache ~/.cache/huggingface/hub --model "$model" --output-dir "$output"
+      --hf-cache "$HF_CACHE" --model "$model" --output-dir "$output"
   done
 done
 diff -r "$first/fixtures" "$second/fixtures"
 ```
 
-To stage `crates/synapse-module/src/catalog/models.json` (inputs and reference
-outputs used to check newly loaded catalog lanes):
+Verify complete fixture files and `fixtures/index.json`, not only aggregate
+cosine values. Review input IDs, case coverage, readout and ranking order as well
+as output values. Never derive a candidate's expected values with the same
+unproved implementation being checked.
+
+## Stage catalog references
 
 ```sh
-output=$(mktemp -d)
+catalog_output=$(mktemp -d)
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   uv run --no-project --python 3.12 \
   --with transformers==5.16.1 --with torch==2.14.0 \
   python bench/parity/reference/generate_reference.py \
-  --hf-cache ~/.cache/huggingface/hub --catalog --output-dir "$output"
+  --hf-cache "$HF_CACHE" --catalog --output-dir "$catalog_output"
 ```
 
-The catalog mode reads its input texts and query/candidate groups from the
-committed catalog JSON, preserves their order and unrelated
-metadata, and writes that same relative path under the output root. Omit
-`--output-dir` only when ready to overwrite the committed outputs. Catalog mode
-does not add a self-check to entries that have none, including Qwen3 reranker.
+Catalog mode preserves committed input texts, query/candidate order and unrelated
+metadata, writing the same relative catalog path beneath the staging root. It
+does not add a self-check to an entry that has none. Qwen3 catalog inputs include
+the required terminal EOS; parity cases keep their existing token IDs. GTE rerank
+scores use the double-precision sigmoid of the fp32 classifier logit.
 
-Catalog embedding references use the same CPU backend as parity, without
-padding. Qwen3 catalog inputs include the terminal EOS required by the
-catalog's owned tokenizer policy; parity cases retain their existing token
-IDs. GTE reranker catalog scores use a double-precision sigmoid of the fp32
-classifier logit: each stored score equals `1 / (1 + exp(-raw_logit))`.
+## Verify derived references before publication
 
-## Catalog consolidation comparison (2026-10-06)
+Replacing full fixtures requires regenerating their digest index, the sealed
+certification self-check subsets, and direct-ANE padding provenance with their
+existing generators. Verify that the subsets retain exact source cases and seals:
 
-The measurements below compare the previously committed catalog self-check
-outputs (produced by the libraries in the second column) with the unified
-generator's deterministic Transformers 5.16.1 / Torch 2.14.0 CPU fp32 outputs.
+```sh
+cargo test --locked -p synapse-certify --lib
+cargo test --locked --manifest-path bench/parity/Cargo.toml
+```
 
-| Model | Previous reference generator libraries | Maximum absolute difference | Minimum cosine |
-| --- | --- | ---: | ---: |
-| gte-modernbert-base | Transformers 5.17.0 / Torch 2.14.0 | 0 | 1.0 |
-| gte-reranker-modernbert-base | Transformers 5.17.0 / Torch 2.14.0 | 0 | 1.0 |
-| qwen3-embedding-0.6b | Candle Transformers 0.10.2 CPU f32 | 7.262907800661966e-7 | 0.9999999999901454 |
+`self_check::tests::subsets_are_exact_copies_of_the_sealed_source_cases` and
+`self_check::tests::tampered_subset_digest_refuses_and_names_profile` guard the
+copy and seal boundaries. A reference refresh is not permission to widen
+numerical tolerances or omit expensive certification cases.
 
-Cosine was measured per embedding vector and per reranker query's score row.
-Qwen3 reranker has no catalog
-self-check and therefore no catalog comparison. The three catalog self-checks
-listed in the table use fixture revision 2 so installed lanes re-check against
-the new provenance and references. Catalog manifest digests depend only on upstream and file
-pins, not self-check data, and remain unchanged.
+## Reverse a staged run
 
-## Verification (2026-10-06)
+Staging does not modify tracked fixtures. Once comparison is complete, remove
+only the temporary directories created above:
 
-The final generator was run again through its CLI for all four parity models
-and catalog mode. All six generated files (four parity fixtures, their
-index, and catalog JSON) were byte-identical to the
-new committed outputs. This also verifies that adding catalog mode did not
-change the deterministic parity outputs.
+```sh
+: "${first:?}" "${second:?}"
+rm -rf "$first" "$second"
+if [ -n "${catalog_output:-}" ]; then
+  rm -rf "$catalog_output"
+fi
+unset first second catalog_output
+```
 
-Toolchain: Python 3.12.12, uv 0.12.2, rustc 1.99.0
-(`b940084d7`, 2026-09-28), cargo 1.99.0, rustfmt 1.10.0-stable,
-clippy 0.1.99. Rust checks ran sequentially, not as parallel workspace builds.
-
-| Command | Result |
-| --- | --- |
-| `cargo test --locked -p synapse-module --lib catalog` | Passed: 92 tests; 1 ignored release hardware-evidence test |
-| `cargo test --locked -p synapse-module --test catalog_fingerprints` | Passed: 1 test |
-| `cargo test --locked --manifest-path bench/parity/Cargo.toml` | Passed: 55 tests; 1 ignored cached-checkpoint test |
-| `cargo test --locked -p synapse-certify` | Passed: 22 tests; 1 ignored live hardware test |
-| `cargo test --locked -p synapse-worker-ane-direct` | Passed: 12 tests; 12 ignored hardware tests |
-| `uv run --no-project --python 3.12 --with transformers==5.16.1 --with torch==2.14.0 python -m unittest discover -s bench/parity/reference -v` | Passed: 13 tests |
-| `cargo fmt --all -- --check` | Passed (exit 0) |
-| `cargo clippy --locked -p synapse-module -p synapse-certify --all-targets -- -D warnings` | Passed; both packages and all targets checked |
-
-The first catalog test run caught the old fixture-revision and library-version
-assertions, and a negative test whose hardcoded revision 2 became valid.
-The assertions now pin the authorized revision/version; the negative test
-increments the current revision to keep testing stale-evidence rejection.
-No rejection contract was removed or inverted.
-
-Changing the generator's actual inter-op thread setter from 1 to 2 caused
-only `test_torch_configuration_precedes_loading_and_all_models_use_eager`
-to fail; all 12 other Python tests stayed green. Restoring the live code
-returned the suite to 13 passing tests.
-
-The scoped Rust diagnostics were clean. Python diagnostics outside the uv
-environment could not resolve Torch/Transformers; the pinned uv environment
-ran the full generator and tests successfully. Cargo reported unavailable
-Metal developer tools and the pre-existing `block 0.1.6` future-compatibility
-warning; no hardware evidence was claimed. Neither Cargo lockfile changed.
+Omit `--output-dir` only after reviewing and authorizing replacement of the
+committed references and all derived seals.

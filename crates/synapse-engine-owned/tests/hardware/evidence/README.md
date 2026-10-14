@@ -38,8 +38,9 @@ from master commit `d49576a7664d333e4d173adfa8758d850745d317` in a **debug**
 build. Optimized builds differ from it in 123 of 125 logits by at most 2.21e-5,
 because LLVM merges the separate `sin` and `cos` calls in the ModernBERT RoPE
 tables into one `__sincosf_stret` call only when optimizing. Both are equally
-close to the fp32 CPU reference and rank both candidate pools identically. See
-`docs/reports/gte-reranker-logit-baseline.md`.
+close to the fp32 CPU reference and rank both candidate pools identically.
+The build mode is part of baseline provenance: compare optimized bytes with an
+optimized baseline rather than treating debug/release rounding as model drift.
 
 No parity defect was found, so no inference fix was needed after the hardware
 runs. Selecting full Xcode instead of Command Line Tools and rebuilding the

@@ -10,7 +10,7 @@ bench/                      benchmark and research tree
   fixtures/                 shared bench fixtures
   harness/                  synapse-bench: corpus, idle gate, telemetry, parity, results schema
   lanes/                    one runner per backend under test (Rust, Python, JS)
-  results/                  saved bench outputs
+  results/                  ignored local bench outputs
   rig/                      synapse-rig: candidate supervisor over framed stdio
   spikes/                   research prototypes (unified-rt, ane-*, laya-owned, stt-bias)
 contracts/                  interface contracts and their validators
@@ -27,9 +27,11 @@ crates/                     production Rust crates
   synapse-worker-decode/    owned Metal generation worker (macOS)
   synapse-worker-llama/     llama.cpp worker for GGUF models
   synapse-worker-vulkan/    Vulkan embedding and reranking worker (AMD and NVIDIA)
-docs/                       design notes, wire contract, audits, measured evidence
+docs/                       flat public architecture, contracts and operator guides
+  evidence/certification/   tracked machine-readable public certification records
+.cortexkit/internal-docs/   ignored internal designs, investigations, audits, research and ledgers
 manifests/                  component manifests (ane-prefill-split, semantic-sidecar-v1)
-results/                    saved measurement outputs from tests/ scripts
+results/                    tracked independent token-capture instrumentation patch
 scripts/                    packaging, CI watch, train landing, git hooks
 tests/                      standalone certification and attribution scripts (outside cargo test)
 tools/                      gather-distill (Bun/TS dataset and SFT harness), stt-voice-test

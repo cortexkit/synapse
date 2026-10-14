@@ -619,7 +619,7 @@ def main() -> int:
     parser.add_argument(
         "--evidence-out",
         type=Path,
-        default=REPO_ROOT / "docs" / "evidence" / "ane-coreml-multifunction" / "EVIDENCE.json",
+        default=REPO_ROOT / ".cortexkit" / "internal-docs" / "research" / "ane-coreml-multifunction" / "EVIDENCE.json",
     )
     args = parser.parse_args()
     root: Path = args.root

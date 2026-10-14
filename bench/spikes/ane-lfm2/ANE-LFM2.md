@@ -175,7 +175,7 @@ On this diagnostic, Core ML hidden-state prefill is 16.5x the owned path's
 serving prefill token rate and reduces compute-rail power by 19%, while leaving
 the GPU effectively untouched. The result demonstrates the hardware upside;
 it does not override Core ML's failed parity gate. The older repository
-baselines remain useful context: `decision-1-runtime.md` records
+baselines remain useful context: the archived runtime measurements recorded
 LFM2.5-230M q8_0 at 30,278 combined tok/s and 1,171 decode tok/s on
 llama-server Metal, while `LFM2-BACKBONE.md` records the owned 1.2B f16 M5
 development floor at 6.5 prefill tok/s and 3.17 decode tok/s.

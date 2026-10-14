@@ -917,6 +917,43 @@ fn historical_schema_two_records_keep_the_same_refusal_without_rental_ids() {
 }
 
 #[test]
+fn public_certification_records_omit_rental_instance_ids() {
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/evidence/certification");
+    let mut checked = 0;
+    for source in std::fs::read_dir(directory).unwrap() {
+        let source = source.unwrap();
+        if !source.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for row in std::fs::read_dir(source.path()).unwrap() {
+            let row = row.unwrap();
+            if !row.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(row.path()).unwrap() {
+                let path = file.unwrap().path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert!(
+                    record["machine"].get("instance_id").is_none(),
+                    "public certification record exposes a rental instance_id: {}",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 10,
+        "public certification records were not inspected"
+    );
+}
+
+#[test]
 fn validator_refuses_fixture_and_checkout_index_changed_together() {
     let assets = Assets::new();
     let record = produce(

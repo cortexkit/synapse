@@ -1,11 +1,15 @@
 # Synapse wire contract v1 (consumer snapshot)
 
 Status: SNAPSHOT of v1.1 with explicit catalog installation and owned-only local embedding/reranking.
-Authoritative examples: crates/synapse-module/tests/skeleton_e2e.rs and
-tests/soak.rs. This doc restates the contract for consumer integration (AFT,
-MC); on any disagreement, the e2e tests win and this doc gets fixed.
+Authoritative examples: `crates/synapse-module/tests/skeleton_e2e.rs` and
+`crates/synapse-module/tests/soak.rs`. This document restates the consumer contract;
+on disagreement, fix the document against the executable API tests.
 
-## Envelope (inference payloads)
+## 1. Envelope (inference payloads)
+
+Checks: `embed_query_preloaded_minilm_returns_vectors_and_envelope`,
+`embed_batch_preloaded_minilm_preserves_order_and_envelope` (skeleton e2e), and
+`tests::wire_contract_documents_every_embed_vector_field` (module library).
 
 Management responses wrap operation payloads as `{"result": <payload>}`.
 The fields below describe inference payloads, not every management result.
@@ -32,7 +36,11 @@ Download statuses are flat inside `result`.
   and `vectors` with `id`, `vector`, `content_sha256`, and `submitted_sha256`
   (see Divergence detector below).
 
-## Errors (stable codes, typed recovery)
+## 2. Errors (stable codes, typed recovery)
+
+Checks: `stable_errors_are_exhaustively_documented_and_keep_wire_names`
+(`wire_contract` integration target), `remote_error_classes_are_frozen` (core),
+and `embed_query_deadline_one_returns_typed_rejection` (skeleton e2e).
 
 Every error: {code, class: transient|permanent, retry_after_ms?,
 safe_to_retry_same_request, message, details?}. `details` is an optional object.
@@ -176,7 +184,10 @@ message. A failed download carries `error` beside `state` in its flat status.
 - `idempotency_conflict` — permanent, not safe to retry unchanged; replace a
   download key bound to a different digest.
 
-## Common request fields (acceptance constraints)
+## 3. Common request fields (acceptance constraints)
+
+Checks: `embed_query_deadline_one_returns_typed_rejection` (skeleton e2e) and
+`catalog_multi_backend_resolver_refuses_substitution_before_load` (catalog e2e).
 
 deadline_ms (absolute budget), max_queue_ms (fast-fail bound — admission is
 atomic accept-or-reject against it), required_fingerprint,
@@ -184,7 +195,10 @@ allow_equivalent (default false: hard substitution rejection),
 required_epoch, target_fingerprint (embed.query: route only to a matching or
 certified-equivalent profile, else substitution_rejected/not_certified).
 
-## Flow-scoped routes
+## 4. Flow-scoped routes
+
+Checks: `tests::flow_routes_get_queries_only_and_other_routes_are_unchanged` and
+`tests::the_flow_refusal_names_the_method_and_the_flow` (module library).
 
 Synapse does not declare the `flow-scopes/v1` capability, so the daemon keeps
 routes whose scope carries a `flow_id` away from it. If such a route is bound
@@ -193,7 +207,13 @@ management registry. Every other method, including the mutations and any
 undeclared name, gets the channel-level error `flow_scope_refused`, naming the
 method and the flow. Routes without a `flow_id` are unaffected.
 
-## Ops
+## 5. Operations
+
+Checks: `management_registry_matches_wire_contract`,
+`inventory_parse_survives_a_crlf_checkout`, and
+`drift_scanner_detects_added_ops_and_missing_documentation` (`wire_contract`
+integration target). The operation-specific skeleton and catalog e2e tests prove
+runtime behavior; inventory checks alone do not prove numerical execution.
 
 The management registry in this snapshot is `embed.query`, `embed.batch`,
 `embed.result`, `job.resume`, `rerank.score`, `microllm.oneshot`,
@@ -805,7 +825,10 @@ server recomputes the row's semantic digest in the same transaction.
   This approvals-table rollback does not itself invoke `owned_decode.revoke` or
   terminate already active serving sessions.
 
-## Divergence detector (content_sha256 and submitted_sha256)
+## 6. Divergence detector (content_sha256 and submitted_sha256)
+
+Check: `embed_query_row_over_ceiling_reports_submitted_and_content_hashes`
+(skeleton e2e) proves submitted versus effective content disclosure.
 
 Each embed item response echoes both `content_sha256` and `submitted_sha256`.
 `submitted_sha256` is the SHA-256 hex digest of the exact received text bytes
@@ -821,18 +844,23 @@ mean nothing was dropped; different hashes mean the row was truncated.
 This field is additive and backwards-compatible; existing consumers reading only
 `content_sha256` are unaffected.
 
-## Consumer patterns (as agreed)
+## 7. Consumer integration
 
-- AFT: persist envelope fingerprint verbatim + (fingerprint, table_epoch) in
-  index headers; check_index at index commit; job-tier cold builds keyed by
-  item id with request_key resumption.
-- MC: no client batch knob (recommended_batch advisory + admission);
-  fingerprint mismatch = hard reject (allow_equivalent stays false until MC
-  opts in); content_sha256 mismatch = reject-vector + log-loud; free-text
-  oneshot with fail-closed parsing for the dreamer A/B, grammar as a later
-  third arm.
+Checks: `job_resume_respawns_remote_job_and_pages_are_readable` and
+`embed_query_row_over_ceiling_reports_submitted_and_content_hashes` (skeleton e2e).
 
-## Operational notes
+- Persist the envelope fingerprint verbatim and the alias-table epoch with an
+  index. Treat a different fingerprint as a different vector space unless an
+  explicitly accepted certified equivalence permits it.
+- Resume durable work with the same request key and bound digest, and collect
+  every committed page by item ID rather than assuming page order.
+- Verify transport input against `submitted_sha256`; use `content_sha256` and
+  truncation disclosures to identify the text actually represented by a vector.
+
+## 8. Operational notes
+
+Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host) and
+`job_resume_respawns_remote_job_and_pages_are_readable` (skeleton e2e).
 
 - Crash domain: llama.cpp runs in supervised single-lane workers; engine
   crashes are typed (engine_crashed, transient with budget → quarantine as
@@ -847,7 +875,11 @@ This field is additive and backwards-compatible; existing consumers reading only
   re-poll jobs (prior-generation jobs are terminal module_restarted).
 
 
-## Additive wire contract v1.1: remote gateway and durable pages
+## 9. Additive wire contract v1.1: remote gateway and durable pages
+
+Checks: `remote_gateway_declares_calibrates_checkpoints_trips_and_recovers` and
+`job_resume_respawns_remote_job_and_pages_are_readable` (skeleton e2e);
+`credential_failure_dispositions_follow_class_not_code` (remote runtime library).
 
 All v1.1 fields are additive. Local responses retain their existing shapes unless
 this section explicitly aligns durable-page behavior across both lanes.
@@ -865,8 +897,8 @@ optional sibling of `engine`:
     "build_flags": {}
   },
   "remote": {
-    "provider": "openai",
-    "deployment": "api.openai.com",
+    "provider": "example-provider",
+    "deployment": "api.example.org",
     "assurance": "declared"
   }
 }
@@ -958,7 +990,11 @@ maps to transient `provider_unavailable`; `vault_locked` or `needs_reauth`
 enters the pause path for jobs and returns inline `needs_reauth` for inline
 operations.
 
-## Changelog
+## 10. Compatibility and load-time verification
+
+Checks: `tests::wire_contract_documents_every_management_operation` (module
+library), `all_sixteen_profiles_have_sealed_model_specific_subsets` and
+`tampered_subset_digest_refuses_and_names_profile` (certification self-checks).
 
 ### 2026-08-29: complete management-operation coverage
 
@@ -976,9 +1012,8 @@ when applicable, the original owned-decode refusal remains available as additive
 `underlying_owned_decode_refusal_id` provenance. Constrained requests remain
 owned-only: they never fall back to llama GBNF or retry unconstrained.
 
-**Consumer notice:** consumers matching the legacy
-`grammar_unavailable_in_build` string (ALF sidekicks and the persona plane) must
-switch to `grammar_disabled` before deploy; the legacy code is no longer emitted.
+**Consumer notice:** callers matching the legacy `grammar_unavailable_in_build`
+string must switch to `grammar_disabled`; the legacy code is no longer emitted.
 
 ### Profile preload load-time checks
 

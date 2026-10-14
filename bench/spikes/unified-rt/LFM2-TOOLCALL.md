@@ -16,9 +16,7 @@ rendered prompts, but a smaller LFM2.5 checkpoint.
 
 ## Format contract
 
-The captured Leap/LFM2 data contract in
-[`docs/leap-finetune-assessment.md`](../../../docs/leap-finetune-assessment.md#tool-calling-data-contract)
-is:
+The captured Leap/LFM2 data format is:
 
 - Definitions are in the system turn. The canonical content includes
   `List of tools: <|tool_list_start|>[{...}]<|tool_list_end|>`.

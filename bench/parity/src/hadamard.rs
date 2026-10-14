@@ -27,12 +27,11 @@
 //! f64. Every entry is exactly `±(1.0 / √768)` with both operations correctly
 //! rounded IEEE f64, so the bytes do not depend on platform or compiler.
 //!
-//! This is not the numpy-generated matrix used in the measurements under
-//! docs/evidence/ane-modernbert-rotation-conditioning/, hence the `-v2` id.
+//! The SHA-256 sign generator differs from a NumPy RNG stream, so the `-v2`
+//! identity prevents mixing packages built with different rotation bytes.
 //! Any orthonormal rotation preserves the model's output in exact
 //! arithmetic, so only the f16 rounding behaviour can differ; the direct-ANE
-//! profiles' parity is measured on the converted package, not inherited from
-//! that evidence.
+//! profiles' parity is measured on the converted package itself.
 
 use sha2::{Digest, Sha256};
 

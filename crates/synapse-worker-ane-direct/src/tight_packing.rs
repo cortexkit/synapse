@@ -7,10 +7,10 @@
 use super::*;
 use crate::backend::Profile;
 
-/// Fastest tested width for Qwen3-Embedding-0.6B on a 6,341-row recorded
-/// code-search export (docs/evidence/ane-tight-packing). Every packed output
-/// was bit-identical to the same row embedded alone; the audit's pass bar was
-/// cosine 0.9999 against that standalone output.
+/// Default fixed tensor width for variable-length row planning. Sharing a
+/// dispatch amortizes per-pass work without allowing attention across rows.
+/// Serving must qualify the packed program against standalone fixture outputs
+/// before using this planning width; the width alone is not a parity guarantee.
 pub const RECOMMENDED_TIGHT_WIDTH: usize = 256;
 
 /// A first-fit-decreasing plan. Indices refer to the caller's input order.

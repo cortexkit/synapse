@@ -718,10 +718,10 @@ fn attention_graph(
         // (width) axis: [1, heads, queries, keys] is transposed to
         // [1, keys, heads, queries], normalized on axis 1, and transposed back
         // so the value matmul sees its original layout. The math is the same
-        // and only fp16 rounding differs; the channel-axis reduction measured
-        // faster on the M5 Neural Engine at sequence 512 and still passes the
-        // cosine gate at every sequence (see
-        // docs/evidence/ane-direct-api-m5/fuse-and-channel-softmax.md).
+        // and only fp16 rounding differs. The key dimension must remain the
+        // reduction axis after transposition; swapping another dimension would
+        // normalize across heads or queries and change attention. Every sequence
+        // must therefore retain its independent CPU-reference cosine gate.
         let channel_logits = graph.transpose(masked, [0, 3, 1, 2]);
         let channel_probabilities = graph.soft_max(channel_logits, 1);
         let probabilities = graph.transpose(channel_probabilities, [0, 2, 3, 1]);
@@ -799,8 +799,8 @@ fn compile_model(
     let mask_shape = shape(sequence_length, 1);
     // At sequence 512 two layers are compiled into each executable whatever
     // the caller asked for: it halves the number of executable dispatches, returned
-    // vectors byte-identical to the one-layer graph, and it measured faster
-    // (docs/evidence/ane-direct-api-m5/fuse-and-channel-softmax.md). Three
+    // vectors byte-identical to the one-layer graph, and preserves the same
+    // attention and residual dependencies between layers. Three
     // layers per executable compile but crash at runtime, so two is the cap.
     // Longer sequences keep the caller's grouping, so a sequence-512 gain
     // cannot come from moving work into the longer shapes. The report's

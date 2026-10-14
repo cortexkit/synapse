@@ -1,154 +1,69 @@
-# Synapse workspace
+# Synapse
 
-This workspace contains the Synapse SubC module, supervised inference workers, and benchmark lanes described in `STRUCTURE.md` and `ARCHITECTURE.md`.
+Synapse is a local inference service on the subc bus. It provides embedding,
+reranking and small-model generation through the `synapse` module, with explicit
+model installation, stable numerical identity, bounded scheduling and durable
+result pages. Owned engines and supervised workers isolate inference from the
+management surface. Configured remote profiles require explicit identity opt-in.
+A missing local backend produces a typed refusal, not an automatic CPU fallback.
 
-## Synapse crates
+## Workspace crates
 
-Product and development crates live under `crates/`. The current catalog ships
-Metal embedding/reranking on supported Macs, with explicit `models.download`
-installation and automatic self-check. Unsupported hosts have no runnable catalog
-backend or CPU fallback; ONNX Runtime is bench-only. Decode routing is unchanged.
-See [the wire contract](docs/wire-contract-v1.md) for operations and migration.
+Production and supporting workspace members live under `crates/`. A worker's
+presence in source does not imply that a release ships it; the catalog and release
+matrix determine supported backends and published assets.
 
-- `synapse-build-stamp`: standard-library-only build dependency for shared clean/dirty Git provenance stamps.
-- `synapse-core`: shared protocol, error, cache, fingerprint, scheduler, and tokenizer types.
-- `synapse-native-probe`: safe wrappers for the Windows system calls the machine profile reads (version, architecture, memory), keeping unsafe code out of `synapse-core`.
-- `synapse-certify`: daemon-free schema-2 records, self-check references and offline 32-combination candidate validator.
-- `synapse-certify-runner`: non-shipped `ckdev-synapse-certify` live certification producer with a private daemon; executes the exact candidate assets through hard links.
-- `synapse-engine-owned`: primary in-process Metal/MPSGraph engine for Apple Silicon (embedding, reranking, direct Metal step decode), with the supervised decode worker state machine in its `synapse-engine-owned/owned-decode-worker` subcrate.
-- `synapse-engine-cuda`: development CUDA engine (`owned-cuda-v1`, PTX kernel ports, f16 storage); not a shipped catalog backend.
-- `synapse-module`: SubC management surface, model cache, durable jobs, and worker host. Builds the `ck-synapse` binary (fleet `ck-*` naming convention for Activity Monitor grouping; `module_id` stays `synapse`).
-- `synapse-opctl`: operator CLI (`ck-synapse-opctl`) for catalog, probes, admission stats, approvals, and paged results over the fleet daemon.
-- `synapse-worker-llama`, `synapse-worker-ane`, `synapse-worker-ane-direct`, `synapse-worker-decode`: supervised worker binaries (`ck-synapse-worker-*`) over Unix sockets (named pipes on Windows). The owned-decode stack remains compiled/tested with its certification, probe and serving-approval gates, not the default decode lane.
-- `synapse-worker-cuda`: development/manual-gate worker, not shipped by the release matrix. Linux/Windows releases contain the module, opctl and llama worker only.
-- `synapse-worker-vulkan`: owned Vulkan embedding and reranking worker for AMD and NVIDIA GPUs; development worker, not yet shipped by the release matrix.
+| Member under `crates/` | Responsibility |
+|---|---|
+| `synapse-build-stamp` | Shared clean/dirty Git build provenance. |
+| `synapse-core` | Protocol, errors, fingerprints, tokenizer, cache and scheduler types. |
+| `synapse-native-probe` | Safe native platform-profile probes. |
+| `synapse-certify` | Schema-3 certification records, self-checks and offline validation. |
+| `synapse-certify-runner` | Non-shipped hardware evidence producer with isolated run state. |
+| `synapse-engine-owned` | Owned Metal embedding/reranking and decode kernels. |
+| `synapse-engine-owned/owned-decode-worker` | Owned-decode supervisor, protocol and crash budget. |
+| `synapse-engine-cuda` | Owned CUDA engine and hardware-floor checks. |
+| `synapse-module` | Management operations, model cache, durable jobs and worker host; `ck-synapse`. |
+| `synapse-opctl` | Operator client; `ck-synapse-opctl`. |
+| `synapse-worker-llama` | Supervised GGUF worker. |
+| `synapse-worker-ane` | Rust launcher and Swift Core ML worker. |
+| `synapse-worker-ane-direct` | Direct Neural Engine compilation, admission and inference worker. |
+| `synapse-worker-decode` | Supervised owned-generation worker. |
+| `synapse-worker-cuda` | Owned CUDA worker. |
+| `synapse-worker-vulkan` | Owned Vulkan embedding/reranking worker. |
 
-### Metal build requirement
+## Build and test
 
-`synapse-engine-owned` compiles Metal shaders and Objective-C MPSGraph drivers, which need the full Xcode Metal toolchain on macOS. Command Line Tools alone can make `xcrun` fail to find `metal` or `metallib`, producing confusing build failures.
+Use the committed `Cargo.lock`. The workspace requires Rust 1.89 or newer and
+native tools appropriate to the selected package. Apple Metal builds need full
+Xcode, not only Command Line Tools; verify `xcrun --find metal` on macOS.
 
-Use an explicit developer directory when building the Metal crates or the full workspace on affected hosts:
+From the repository root:
 
-```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p synapse-engine-owned
+```sh
+cargo build --locked -p synapse-module -p synapse-opctl
+cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
+cargo check --locked -p synapse-module --features test-support
+cargo test --locked -p synapse-module --features test-support --lib --test it --test skeleton_e2e --test wire_contract
+cargo test --locked -p synapse-certify --lib --test records
+cargo fmt --all --check
+bash scripts/public-banlist-check.sh
+bash scripts/check-cortexkit-layout.sh
 ```
 
-Do not auto-set `DEVELOPER_DIR` in scripts; configure the host or invocation so Cargo uses the intended Xcode installation.
+The feature-off GPU workers above are test fixtures, not GPU certification.
+Hardware and checkpoint-dependent tests are separate from portable tests; a skip
+is not a hardware pass. See [development verification](docs/development.md) and
+[backend certification](docs/backend-certification.md) for those boundaries.
 
-### Module config (`synapse.jsonc`)
+## Documentation
 
-Example user-tier `~/.config/cortexkit/synapse.jsonc` (project configs must omit the user-only chain setting):
+- [Architecture](docs/architecture.md) and [configuration](docs/configuration.md).
+- [Wire contract](docs/wire-contract-v1.md) and [worker protocol](docs/worker-protocol.md).
+- [Direct ANE serving](docs/ane-serving.md) and [graph layout](docs/ane-graph-layout.md).
+- [Reference generation](docs/reference-generation.md) and [token identity](docs/catalog-token-identity.md).
+- [Contributing](CONTRIBUTING.md), [security reporting](SECURITY.md), and [third-party notices](THIRD-PARTY-NOTICES.md).
 
-```jsonc
-{
-  // performance | balanced | quiet
-  "knob": "balanced",
-  "microllm_max_tokens": 512,
-  "grammar_enabled": false,
-  // Free-text chain span (1..=16); grammar stays at K=1. Values above 1
-  // change free-text execution shape only after certification covers the span.
-  "decode_chain_k": 1,
-  "cache_max_bytes": 34359738368,
-  "alias_admin_enabled": false,
-  "worker": {
-    "load_timeout_ms": 180000
-  },
-  "preload_models": [],
-  "inline": {
-    "max_items": 64,
-    "max_tokens": 8192,
-    "byte_budget": 67108864,
-    "max_queue_ms": 5000,
-    "deadline_ms": 30000,
-    "estimated_execution_ms": 25,
-    "max_concurrent_workers": 2
-  },
-  "jobs": {
-    "ttl_ms": 86400000,
-    "result_page_bytes": 524288,
-    "bulk_quantum_tokens": 3072
-  },
-  "probe": {
-    "mean_cosine_threshold": 0.999,
-    "worst_decile_rank_overlap_threshold": 0.9,
-    "ane_placement_threshold": 0.9
-  }
-}
-```
-
-Tests can point at a file with `SYNAPSE_CONFIG_PATH`. Only one synapse module
-per machine (singleton lease); a second instance refuses to start.
-
-### Development owned-CUDA hardware floor
-
-The CUDA worker and the manual package below are development surfaces, not
-published release assets or runnable backends in this release's model catalog.
-
-`ck-synapse-worker-cuda` implements `--probe-floor` (hidden, like the
-`--test-abort*` surfaces). It prints one JSON object and exits 0:
-
-```json
-{"driver_api": 13030, "compute_capability": {"major": 8, "minor": 9}}
-```
-
-The module probes the configured `worker_bin`, the engine's worker-binary
-environment override, or the sibling `ck-synapse-worker-cuda`, in that order.
-It caches one result per process unless both environment readings parse
-successfully. The child wait is bounded to 10 seconds; stdout is capped at
-4096 bytes and each pipe completion wait is bounded to another 100 ms.
-A missing binary, non-zero exit, timeout, or invalid output produces
-`HardwareUnavailable`. Refusal and model evidence carry diagnostic context,
-including the last 4096 bytes of stderr when available, under `observed`.
-Failed probes do not fabricate numeric hardware readings.
-
-The environment overrides the probe only as a complete, parseable pair.
-Otherwise both readings come from the probe; partial overrides are not merged:
-
-- `SYNAPSE_CUDA_DRIVER_API` (alias `CUDA_DRIVER_API`) — the raw CUDA **driver
-  API** integer from `cuDriverGetVersion()`, not the marketing driver version.
-  For example, a measured driver API value is `13030`. `610.88` is not a valid
-  API integer; without a parseable alias, it causes fallback to the probe.
-- `SYNAPSE_CUDA_COMPUTE_CAPABILITY` (alias `CUDA_COMPUTE_CAPABILITY`) — device
-  0's compute capability as `major.minor`, for example `8.9`.
-- `SYNAPSE_CUDA_PACKAGING_DRIVER` — optional; the driver string a packaging
-  build was tested against, carried into the refusal for diagnostics.
-
-### Manual Windows owned-CUDA package
-
-The manual Windows CUDA gate packages the worker with runtime DLLs derived
-from the same pinned `cuda_cudart` and `libcublas` redistribution archives
-used for compilation. `scripts/package-owned-cuda.ps1` places the executable
-and DLLs at the ZIP root, includes component licenses, and records source
-components and SHA-256 hashes in `manifest.json`. The NVIDIA driver is not
-bundled and must already be installed.
-
-Windows worker builds require CUDA 13. The build script rejects other toolkit
-major versions before linking, because this package resolves CUDA 13 DLL names.
-
-`scripts/test-owned-cuda-package.ps1 -Archive <zip> -RequireGpu` extracts a
-fresh copy, verifies hashes, and checks no-sidecar `--version`, actionable
-missing-library refusal, and a real hardware-floor probe with adjacent DLLs
-and CUDA removed from PATH. Without `-RequireGpu`, a runner without NVIDIA
-hardware may report an explicit driver/device refusal; this is not a GPU
-execution pass. Neither mode loads model weights or certifies embeddings.
-
-The worker delays its cuBLASLt import and checks runtime library loading
-before CUDA calls. No global PATH changes or extra DLL search directories
-are needed. Release-matrix publication remains separate from this manual
-gate artifact.
-
-This delay-loading behavior is Windows-only. The Linux ELF worker requires
-exactly the CUDA runtime sonames `libcudart.so.13`, `libcublas.so.13` and
-`libcublasLt.so.13` on the library search path. Missing any of them prevents
-even `--probe-floor` from reaching the driver-only probe. The driver library
-`libcuda.so.1` is resolved at runtime, not a load-time dependency. The worker
-requires NVIDIA driver API >= 13020 (the raw `cuDriverGetVersion()` integer),
-the driver API of the CUDA 13.2 toolkit used to build the worker and the
-`cuda_min_driver_api` floor every CUDA profile in `bench/parity/models.json`
-declares. Because the worker ships PTX, an older driver cannot JIT-compile it.
-
-The `release-candidate` workflow builds these workers from an exact source
-commit and uploads immutable assets to a draft `candidate-<S>` release, where
-`S` is the full 40-character source commit identifier, for hardware
-certification. Hosted protocol checks and missing-runtime checks
-are not embedding or reranking certification.
+`ARCHITECTURE.md` and `STRUCTURE.md` remain root code/session maps. Public
+certification artifacts are tracked because release tooling reads them; internal
+research and operational records are not part of the public documentation set.

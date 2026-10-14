@@ -76,7 +76,7 @@ Target-only packages, vectors, and verbose logs stay outside git. Compact JSON r
 - system free/wired memory and owned-child peak RSS around every process;
 - complete operator/device counts, expensive-op placement (`matmul`/`einsum`, `softmax`, convolution, normalization, reductions), non-ANE operations, and exact errors.
 
-Rotation-conditioning measurements and source analysis are committed under `docs/evidence/ane-modernbert-rotation-conditioning/`.
+Historical rotation-conditioning measurements and source analysis are kept privately; the current deterministic construction is specified in `bench/parity/src/hadamard.rs` and `bench/parity/src/convert.rs`.
 
 `CPU_AND_NE` excludes GPU but does not by itself prove ANE residency. Stage summaries distinguish mixed/CPU attention placement from successful CPU+NE prediction whose attention operators are preferred on ANE. The latter combines runtime success with `MLComputePlan`; the plan is still static preferred-placement evidence, not a runtime dispatch trace.
 

@@ -1,11 +1,10 @@
-//! Module-side cost of one AFT-shaped `embed.batch` call (64 rows, 1,024-dim
+//! Module-side cost of a synthetic `embed.batch` call (64 rows, 1,024-dim
 //! vectors, about 120 tokens per row) with an engine that does almost no work.
 //!
 //! The deterministic test engine replaces the Neural Engine, so whatever time
 //! remains is module, transport and client codec cost. The profiling run is
 //! an ignored test because its numbers only mean something in a release build
-//! on a quiet machine; see
-//! docs/evidence/embed-batch-module-cost/README.md for the method.
+//! on a quiet machine; debug execution and contention would distort attribution.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -246,7 +245,7 @@ fn summarize(label: &str, mut values: Vec<f64>) -> Value {
 // "skipping" line, and the numbers only mean something in a release build on a
 // quiet machine. Run it with `--ignored` as the evidence README describes.
 #[tokio::test]
-#[ignore = "profiling run: release build on a quiet machine, see docs/evidence/embed-batch-module-cost"]
+#[ignore = "profiling run: needs a release build and quiet host; writes fresh module/transport/codec stage measurements"]
 async fn embed_batch_module_cost_profile() {
     let runs = std::env::var("SYNAPSE_MODULE_COST_RUNS")
         .ok()

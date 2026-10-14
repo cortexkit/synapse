@@ -6,7 +6,7 @@ Thanks for looking at Synapse. This page says how a change gets in, and what a c
 
 **Every change starts as an issue, and a pull request follows only after a maintainer says go.** Label it `bug` for something that is broken, or `design discussion` for anything that adds, removes, or changes behaviour.
 
-This is not process for its own sake. Synapse serves live traffic on several hardware lanes, and most of the cost of a change is in the parts a diff does not show: which lane certification it invalidates, whether a vector-space fingerprint rotates and forces consumers to re-embed, what a worker's crash budget does with a new failure, whether a platform we cannot build on CI still compiles. A maintainer can tell you that in a comment. Finding it out after you have written the code wastes your time, and we would rather spend it agreeing on the shape.
+Changes can invalidate lane certification, rotate a vector-space fingerprint and require re-embedding, or change worker recovery on a platform not exercised by hosted CI. Agreeing on those consequences before implementation avoids a patch that solves the local symptom but breaks a consumer boundary.
 
 A good issue says what is wrong or missing, how you noticed, and what you would do about it. If you already have a patch, say so — that is useful information, not a reason to skip the step.
 
@@ -28,9 +28,30 @@ What a review checks:
 
 Claims in a PR description get verified against the source, and numbers get re-measured where we can. That is not distrust — it is the same standard we hold our own changes to, and it is why a merged change here can be relied on.
 
+## Verify the change
+
+Run from the repository root with the committed lockfile:
+
+```sh
+cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
+cargo check --locked -p synapse-module --features test-support
+cargo test --locked -p synapse-module --features test-support --lib --test it --test skeleton_e2e --test wire_contract
+cargo fmt --all --check
+bash scripts/public-banlist-check.sh
+bash scripts/check-cortexkit-layout.sh
+```
+
+Use the relevant package and evidence gates in
+[development verification](docs/development.md) and
+[backend certification](docs/backend-certification.md). Explain platform or
+checkpoint skips explicitly; a portable pass is not hardware certification.
+Public documentation belongs in flat topic files under `docs/`; release evidence
+consumed by code stays tracked at its declared paths. See
+[third-party notices](THIRD-PARTY-NOTICES.md) before importing adapted source.
+
 ## Security
 
-Do not open a public issue for a vulnerability. Use private vulnerability reporting on this repository's Security tab, which reaches the maintainers without disclosing anything.
+Use the private reporting procedure in [SECURITY.md](SECURITY.md); do not open a public issue for a vulnerability.
 
 ## License
 

@@ -8,11 +8,11 @@
 //! its executables, so the shared executable budget stays the caller's
 //! responsibility (28 extra executables per Qwen3 shape).
 //!
-//! Measured on an Apple M4 (`docs/evidence/ane-multirow-dispatch`), a pass
-//! costs roughly what its total width costs, with 256 columns the cheapest per
-//! column. Rows gain most when they are much shorter than their rung and are
-//! packed into narrow slots; [`RowLayout::WidthFolded`] was the fastest layout
-//! and its outputs were bit-identical to the single-row path.
+//! Packing short rows into width slots shares dispatch work and avoids padding
+//! each row to a separate ladder rung. [`RowLayout::WidthFolded`] folds row
+//! segments alongside heads on the channel axis while keeping their attention
+//! independent. Layout changes must be checked against each row run alone;
+//! compilation success does not prove numerical correctness.
 //!
 //! Every layout keeps each row's attention inside that row. Qwen3 attention is
 //! causal and rows are right-padded, so a real token never sees a padding
@@ -1069,9 +1069,9 @@ mod tests {
 }
 
 /// Neural Engine measurement of one multi-row shape against the single-row
-/// path, in one process. Ignored by default; the "Reproduce on the Mac mini"
-/// section of `docs/evidence/ane-multirow-dispatch/README.md` has the full
-/// procedure. Never run it on a machine whose production Synapse serves from
+/// path, in one process. Ignored by default; provide the pinned packages,
+/// tokenizer and input paths listed below, and use an exclusive hardware slot.
+/// Never run it on a machine whose production Synapse serves from
 /// the Neural Engine: it compiles 56 or more executables (28 per Qwen3 shape,
 /// single-row plus multi-row), and the Neural Engine holds a limited number
 /// of compiled programs, so a second compiling process can leave production
