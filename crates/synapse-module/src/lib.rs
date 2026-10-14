@@ -20217,13 +20217,23 @@ mod tests {
         fixture
             .control
             .hold_next_admission(started.clone(), release.clone());
+        // Freeze the caller's clock so subscribing cannot consume its budget.
+        // A zero-duration timeout can poll again after rescheduling; poll exactly
+        // once to start the check and subscribe without waiting for its result.
+        tokio::time::pause();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         let certify = ensure_profile_preload_ready(state.clone(), ANE_TEST_LANE, Some(deadline));
         tokio::pin!(certify);
-        // One poll starts the check and subscribes to it.
-        assert!(tokio::time::timeout(Duration::ZERO, &mut certify)
-            .await
-            .is_err());
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(certify.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "the check must still be pending: {:?}",
+            first_poll.map(|answer| answer.map(drop))
+        );
+        tokio::time::resume();
         let mut outcome = state
             .runtime
             .lane_checks
@@ -20232,15 +20242,17 @@ mod tests {
             .get(ANE_TEST_LANE)
             .cloned()
             .expect("a check is in flight");
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .unwrap();
         tokio::time::sleep_until(deadline + Duration::from_millis(20)).await;
         release.notify_one();
         let published =
             tokio::time::timeout(Duration::from_secs(10), outcome.wait_for(Option::is_some))
                 .await
                 .map(|outcome| outcome.map(|outcome| outcome.clone().unwrap().is_ok()));
+        // The release permit can precede admission on a busy runner. Once the
+        // check has published, admission must have consumed it and signalled.
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
         let answered = certify.await.map(drop);
         finish_ane_lane_fixture(fixture).await;
         assert!(
