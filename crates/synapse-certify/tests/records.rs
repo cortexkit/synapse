@@ -860,6 +860,63 @@ fn validator_refuses_schema_two() {
 }
 
 #[test]
+fn historical_schema_two_records_keep_the_same_refusal_without_rental_ids() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let sources = [
+        "dd7412b0409eb3c97d026c1bdd38797669813752",
+        "ff24e6715e1bb58ad6ba0c120b889ef7431ca6c3",
+    ];
+    let mut checked = 0;
+    for source in sources {
+        let directory = checkout.join("docs/evidence/certification").join(source);
+        let mut rows = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.file_name());
+        for row in rows {
+            let mut files = std::fs::read_dir(row.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file| file.file_name());
+            for file in files {
+                let original: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+                assert_eq!(original["schema"], 2);
+                let assets = Assets::new();
+                let relative = file.path().strip_prefix(&checkout).unwrap().to_path_buf();
+                let destination = assets.0.join(&relative);
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                let mut redacted = original.clone();
+                redacted["machine"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("instance_id");
+                // Historical records must remain historical: removing rental metadata
+                // must neither admit an obsolete schema nor mask its schema refusal.
+                for (label, value) in [("original", original), ("redacted", redacted)] {
+                    std::fs::write(&destination, serde_json::to_vec(&value).unwrap()).unwrap();
+                    let refusal =
+                        validate_checkout(&assets.0, &assets.0, source, &catalog()).unwrap_err();
+                    assert_eq!(
+                        refusal.to_string(),
+                        "certification_refused: record_schema_mismatch"
+                    );
+                    println!(
+                        "{} {label} instance_id={} -> {refusal}",
+                        relative.display(),
+                        value["machine"].get("instance_id").is_some()
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 8);
+}
+
+#[test]
 fn validator_refuses_fixture_and_checkout_index_changed_together() {
     let assets = Assets::new();
     let record = produce(
