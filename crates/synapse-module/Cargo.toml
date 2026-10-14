@@ -60,6 +60,8 @@ cortexkit-log = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Let self-check deadline tests pause time during their initial subscription poll.
+tokio = { workspace = true, features = ["test-util"] }
 syn = { version = "2", features = ["full", "visit"] }
 rusqlite = { workspace = true }
 subc-daemon = { workspace = true }
