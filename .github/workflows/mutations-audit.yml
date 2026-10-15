@@ -53,9 +53,15 @@ jobs:
             cargo install --locked --force --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
           fi
           test "$(ckdev-mutate --version)" = "$want"
+      # synapse-module tests launch these binaries to assert feature-off refusal;
+      # compiling those tests alone does not build the worker executables.
+      - name: Build feature-off GPU worker refusal fixtures
+        shell: bash
+        run: cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
       - name: Audit all package test targets
         shell: bash
         run: |
+          python -m unittest scripts.test_mutation_ci.MutationAuditTests -v
           mkdir -p target/mutations
           python scripts/prepare-mutation-audit.py mutations.d target/mutations/broad.toml
           ckdev-mutate --catalogue target/mutations/broad.toml check
