@@ -27,9 +27,9 @@ Tests and development drivers use `ckdev-*` executable names. Cargo's own test
 harness filenames are unaffected. `synapse_core::dev_binary::ckdev_binary` makes
 an atomic content-addressed copy under `$TMPDIR/synapse-exec/<sha256-prefix>/`
 only when the `TMPDIR` value as written is absolute and both that path and its
-written is absolute and both that path and its filesystem-resolved canonical
-path are outside macOS's `/var/folders` and `/private/var/folders` trees; checking
-both catches `/var` links into `/private/var`. Otherwise it uses
+filesystem-resolved canonical path are outside macOS's `/var/folders` and
+`/private/var/folders` trees; checking both catches `/var` links into
+`/private/var`. Otherwise it uses
 `/tmp/synapse-exec/<sha256-prefix>/`. These directories are private to the
 current user, and callers with identical bytes reuse the same copy. Windows
 keeps its existing artifact-adjacent location. Certification uses
