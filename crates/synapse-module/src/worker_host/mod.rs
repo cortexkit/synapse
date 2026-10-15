@@ -6314,7 +6314,8 @@ pub mod ane_residency {
 
     /// A `Stdio` for a direct-ANE worker's stdin that duplicates the locked
     /// descriptor. The duplicate shares the lock, so the lock is released only
-    /// when this process and every worker it spawned have closed it.
+    /// when every copy of the open file description has been closed, including
+    /// worker stdin and unrelated forked children's copies before exec.
     pub fn inheritable_lock_stdio(lock: &std::fs::File) -> io::Result<Stdio> {
         Ok(Stdio::from(lock.try_clone()?))
     }
@@ -6335,10 +6336,9 @@ pub mod ane_residency {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(ANE_DIRECT_LOCK_HOME_PATH))
         }
 
-        /// Takes the lock without waiting. While any other open description of
-        /// the file holds it (another module process, or a direct-ANE worker
-        /// that inherited it and has not exited yet), fails with
-        /// `ane_lane_busy`.
+        /// Takes the lock without waiting. Fails with `ane_lane_busy` while an
+        /// open file description holds the lock, including copies inherited by
+        /// direct-ANE workers or unrelated children between fork and exec.
         // `File::try_lock` is a `flock` and avoids the unsafe code a direct call would need.
         pub fn acquire(path: &Path) -> Result<Self, AneResidencyError> {
             if let Some(parent) = path.parent() {
@@ -12015,6 +12015,27 @@ pub mod ane_residency {
         #[cfg(unix)]
         #[test]
         fn second_holder_is_busy_until_the_holder_and_its_workers_exit() {
+            const CHILD: &str = "SYNAPSE_ANE_LANE_LOCK_TEST_CHILD";
+            const TEST: &str = "worker_host::ane_residency::tests::second_holder_is_busy_until_the_holder_and_its_workers_exit";
+            if std::env::var_os(CHILD).is_none() {
+                // A sibling test can fork with our locked description open. CLOEXEC
+                // closes that copy only at exec, not when our worker is reaped.
+                // Run the lifetime assertion without other test threads spawning.
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains(&format!("test {TEST} ... ok")),
+                    "isolated lane-lock test did not pass: {}\n{stdout}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
             let dir = std::env::temp_dir().join(format!(
                 "synapse-ane-lock-{}-{}",
                 std::process::id(),
