@@ -1,0 +1,21 @@
+# Paths engram backs up for this checkout. Each one is ignored by git, so
+# without this file it would exist only on this disk. List only what git
+# doesn't hold: no caches, build output or task outputs.
+
+# Internal designs, investigations, audits, research and ledgers.
+.cortexkit/internal-docs/
+
+# Head working material: worker briefs, spec drafts, plans, review and audit
+# records, and rig setup.
+.cortexkit/alfonso/prompts/
+.cortexkit/alfonso/drafts/
+.cortexkit/alfonso/plans/
+.cortexkit/alfonso/specs/
+.cortexkit/alfonso/audit/
+.cortexkit/alfonso/review/
+.cortexkit/alfonso/rigs/
+
+# Local agent and campaign configuration.
+.cortexkit/alfonso.jsonc
+.cortexkit/campaign-lab.jsonc
+.cortexkit/campaign-packs/
