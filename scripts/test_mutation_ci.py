@@ -37,6 +37,30 @@ class MutationCiTests(unittest.TestCase):
 
 
 class MutationAuditTests(unittest.TestCase):
+    def test_nightly_builds_feature_off_gpu_workers_before_audit(self):
+        from pathlib import Path
+        import yaml
+
+        workflow = yaml.safe_load(Path(".github/workflows/mutations-audit.yml").read_text())
+        steps = workflow["jobs"]["audit"]["steps"]
+        audit_index = next(
+            i for i, step in enumerate(steps)
+            if step.get("name") == "Audit all package test targets"
+        )
+        fixture_command = (
+            "cargo build --locked --no-default-features "
+            "-p synapse-worker-cuda -p synapse-worker-vulkan"
+        )
+        self.assertTrue(
+            any(
+                step.get("run", "").strip() == fixture_command
+                and step.get("shell") == "bash"
+                and "if" not in step
+                for step in steps[:audit_index]
+            ),
+            "every nightly platform needs feature-off worker binaries before the baseline",
+        )
+
     def test_expected_selection_is_removed_without_changing_anchors(self):
         import runpy
         import tomllib
