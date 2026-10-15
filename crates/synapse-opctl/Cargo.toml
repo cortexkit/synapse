@@ -20,3 +20,8 @@ sha2 = { workspace = true }
 subc-client-rs = { workspace = true }
 subc-protocol = { workspace = true }
 tokio = { workspace = true }
+
+# tests/connection_discovery.rs compiles synapse-core's dev_binary.rs from
+# source, which checks the owner of its executable folder through rustix.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }

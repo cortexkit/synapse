@@ -6771,6 +6771,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "rustix 1.1.4",
  "serde_json",
  "sha2",
  "subc-client-rs",
