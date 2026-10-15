@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,15 +22,79 @@ class Refused(ValueError):
     """An input cannot be used to build or certify a release candidate."""
 
 
+def _development_binary_base(tmpdir, canonical_tmpdir):
+    """Choose a stable Unix temp root without macOS's transient folder tree."""
+    if tmpdir is None:
+        return Path("/tmp")
+    written = Path(tmpdir)
+
+    def is_macos_transient_directory(path):
+        parts = path.parts
+        return parts[:3] == ("/", "var", "folders") or parts[:4] == (
+            "/", "private", "var", "folders"
+        )
+
+    if (
+        not written.is_absolute()
+        or canonical_tmpdir is None
+        or is_macos_transient_directory(written)
+        or is_macos_transient_directory(Path(canonical_tmpdir))
+    ):
+        return Path("/tmp")
+    return written
+
+
+def _development_binary_tmp_root():
+    tmpdir = os.environ.get("TMPDIR")
+    try:
+        canonical_tmpdir = Path(tmpdir).resolve(strict=True) if tmpdir is not None else None
+    except OSError:
+        canonical_tmpdir = None
+    return _development_binary_base(tmpdir, canonical_tmpdir)
+
+
+def _ensure_private_directory(directory):
+    try:
+        os.mkdir(directory, 0o700)
+    except FileExistsError:
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise Refused(f"development executable directory is not private: {directory}")
+        os.chmod(directory, 0o700)
+
+
+def _content_digest(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 @contextmanager
 def ckdev_binary(worker):
     """Yield a temporary `ckdev-` link to an extracted binary for a smoke run.
 
     A `ck-` executable name is reserved for installed binaries, so smoke runs
     of extracted release assets execute a `ckdev-` hard link (or a copy when
-    the scratch dir is on another volume) instead.
+    the scratch dir is on another volume) instead. Unix aliases stay under the
+    same safe temp root used by development test binaries.
     """
-    with tempfile.TemporaryDirectory() as scratch:
+    if os.name == "nt":
+        scratch_context = tempfile.TemporaryDirectory()
+    else:
+        root = _development_binary_tmp_root()
+        exec_root = root / "synapse-exec"
+        _ensure_private_directory(exec_root)
+        digest_dir = exec_root / _content_digest(worker)[:16]
+        _ensure_private_directory(digest_dir)
+        scratch_context = tempfile.TemporaryDirectory(dir=digest_dir)
+
+    with scratch_context as scratch:
         name = worker.name[3:] if worker.name.startswith("ck-") else worker.name
         alias = Path(scratch) / ("ckdev-" + name)
         try:
@@ -139,8 +204,29 @@ class GuardSelfTests(unittest.TestCase):
                 self.assertEqual(alias.name, "ckdev-synapse-worker-vulkan.exe")
                 self.assertEqual(alias.read_bytes(), b"built image")
                 self.assertTrue(os.path.samefile(built, alias))
+                if os.name != "nt":
+                    self.assertIn(_development_binary_tmp_root() / "synapse-exec", alias.parents)
             self.assertFalse(alias.exists())
             self.assertEqual(built.read_bytes(), b"built image")
+
+    @unittest.skipIf(os.name == "nt", "Unix temp-directory rules do not apply on Windows")
+    def test_development_binary_temp_root_selection(self):
+        ordinary = Path("/tmp/synapse-check")
+        self.assertEqual(_development_binary_base(None, None), Path("/tmp"))
+        self.assertEqual(_development_binary_base("relative", Path("/tmp/relative")), Path("/tmp"))
+        self.assertEqual(
+            _development_binary_base("/var/folders/aa", Path("/private/var/folders/aa")),
+            Path("/tmp"),
+        )
+        self.assertEqual(
+            _development_binary_base("/private/var/folders/aa", Path("/private/var/folders/aa")),
+            Path("/tmp"),
+        )
+        self.assertEqual(_development_binary_base(ordinary, ordinary), ordinary)
+        self.assertEqual(
+            _development_binary_base("/tmp/temp-link", Path("/private/var/folders/aa")),
+            Path("/tmp"),
+        )
 
     def test_source_commit_equality(self):
         source = "a" * 40

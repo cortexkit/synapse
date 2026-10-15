@@ -11,9 +11,10 @@ use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// Publish a content-addressed executable copy beside the built binary under a
-/// development name. The scratch argument is retained for callers but is no
-/// longer used; calls with identical bytes reuse one published copy.
+/// Publish a content-addressed executable copy under a development name. Unix
+/// copies live in a safe temporary directory; Windows keeps its existing layout.
+/// The scratch argument is retained for callers but is no longer used; calls
+/// with identical bytes reuse one published copy.
 pub fn ckdev_binary(binary: impl AsRef<Path>, _scratch: impl AsRef<Path>) -> io::Result<PathBuf> {
     content_addressed_copy(binary.as_ref())
 }
@@ -97,6 +98,18 @@ fn development_name(binary: &Path) -> io::Result<&str> {
 }
 
 fn content_addressed_copy(binary: &Path) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    let base = current_development_binary_base();
+    #[cfg(not(unix))]
+    let base = binary
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    content_addressed_copy_at(binary, &base)
+}
+
+fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> {
     let name = development_name(binary)?;
     let mut source = File::open(binary)?;
     let source_size = source.metadata()?.len();
@@ -110,9 +123,7 @@ fn content_addressed_copy(binary: &Path) -> io::Result<PathBuf> {
         hasher.update(&buffer[..read]);
     }
     let digest = hex::encode(hasher.finalize());
-    let parent = binary.parent().unwrap_or_else(|| Path::new("."));
-    let dir = parent.join("ckdev-exec").join(&digest[..16]);
-    fs::create_dir_all(&dir)?;
+    let dir = copy_directory(base, &digest)?;
     let destination = dir.join(format!("ckdev-{name}"));
 
     if destination_exists_with_size(&destination, source_size)? {
@@ -165,6 +176,80 @@ fn content_addressed_copy(binary: &Path) -> io::Result<PathBuf> {
     }
     publication?;
     Ok(destination)
+}
+
+#[cfg(unix)]
+fn current_development_binary_base() -> PathBuf {
+    let tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
+    let canonical_tmpdir = tmpdir
+        .as_deref()
+        .and_then(|path| fs::canonicalize(path).ok());
+    development_binary_base(tmpdir.as_deref(), canonical_tmpdir.as_deref())
+}
+
+#[cfg(unix)]
+fn development_binary_base(tmpdir: Option<&Path>, canonical_tmpdir: Option<&Path>) -> PathBuf {
+    fn is_macos_transient_directory(path: &Path) -> bool {
+        path.starts_with("/var/folders") || path.starts_with("/private/var/folders")
+    }
+
+    match (tmpdir, canonical_tmpdir) {
+        (Some(written), Some(canonical))
+            if written.is_absolute()
+                && !is_macos_transient_directory(written)
+                && !is_macos_transient_directory(canonical) =>
+        {
+            written.to_path_buf()
+        }
+        _ => PathBuf::from("/tmp"),
+    }
+}
+
+#[cfg(unix)]
+fn copy_directory(base: &Path, digest: &str) -> io::Result<PathBuf> {
+    let exec_root = base.join("synapse-exec");
+    ensure_private_directory(&exec_root)?;
+    let directory = exec_root.join(&digest[..16]);
+    ensure_private_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn copy_directory(base: &Path, digest: &str) -> io::Result<PathBuf> {
+    let directory = base.join("ckdev-exec").join(&digest[..16]);
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(directory)?;
+            if !metadata.is_dir()
+                || metadata.uid() != effective_user_id()
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "development executable directory is not private: {}",
+                        directory.display()
+                    ),
+                ));
+            }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 fn destination_exists_with_size(destination: &Path, expected_size: u64) -> io::Result<bool> {
@@ -274,6 +359,69 @@ fn hard_link_alias(binary: &Path, scratch: &Path) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn development_binary_base_uses_only_an_absolute_safe_tmpdir() {
+        let ordinary = Path::new("/tmp/synapse-check");
+        assert_eq!(development_binary_base(None, None), Path::new("/tmp"));
+        assert_eq!(
+            development_binary_base(
+                Some(Path::new("relative")),
+                Some(Path::new("/tmp/relative"))
+            ),
+            Path::new("/tmp")
+        );
+        assert_eq!(
+            development_binary_base(
+                Some(Path::new("/var/folders/task")),
+                Some(Path::new("/tmp/canonical-safe-path"))
+            ),
+            Path::new("/tmp")
+        );
+        assert_eq!(
+            development_binary_base(
+                Some(Path::new("/private/var/folders/task")),
+                Some(Path::new("/private/var/folders/task"))
+            ),
+            Path::new("/tmp")
+        );
+        assert_eq!(
+            development_binary_base(Some(ordinary), Some(ordinary)),
+            ordinary
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_tmpdir_canonicalizing_into_private_var_folders_uses_tmp() {
+        let written_link = Path::new("/tmp/synapse-temp-link");
+        let canonical_target = Path::new("/private/var/folders/task");
+        assert_eq!(
+            development_binary_base(Some(written_link), Some(canonical_target)),
+            Path::new("/tmp")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_group_or_world_writable_content_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("unsafe-directory");
+        let source = root.join("ck-synapse");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, b"unsafe directory test").unwrap();
+        let digest = hex::encode(Sha256::digest(b"unsafe directory test"));
+        let directory = root.join("synapse-exec").join(&digest[..16]);
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = content_addressed_copy_at(&source, &root).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn aliases_preserve_bytes_names_and_extensions() {
         let root = test_root("names");
@@ -281,7 +429,7 @@ mod tests {
         for name in ["ck-synapse", "ck-synapse-worker-cuda.exe", "mock-worker"] {
             let source = root.join(name);
             fs::write(&source, b"built image").unwrap();
-            let alias = ckdev_binary(&source, &root).unwrap();
+            let alias = content_addressed_copy_at(&source, &root).unwrap();
             assert_eq!(
                 alias.file_name().unwrap().to_str().unwrap(),
                 format!("ckdev-{}", name.strip_prefix("ck-").unwrap_or(name))
@@ -306,12 +454,26 @@ mod tests {
         let source = root.join("ck-synapse");
         fs::write(&source, b"one build image").unwrap();
 
-        let first = ckdev_binary(&source, &root).unwrap();
-        let second = ckdev_binary(&source, &root).unwrap();
+        let first = content_addressed_copy_at(&source, &root).unwrap();
+        let second = content_addressed_copy_at(&source, &root).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(fs::read(&first).unwrap(), b"one build image");
         assert_eq!(fs::read_dir(first.parent().unwrap()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for directory in [
+                first.parent().unwrap().parent().unwrap(),
+                first.parent().unwrap(),
+            ] {
+                assert_eq!(
+                    fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -324,8 +486,8 @@ mod tests {
         fs::write(&first_source, b"first image").unwrap();
         fs::write(&second_source, b"second image").unwrap();
 
-        let first = ckdev_binary(&first_source, &root).unwrap();
-        let second = ckdev_binary(&second_source, &root).unwrap();
+        let first = content_addressed_copy_at(&first_source, &root).unwrap();
+        let second = content_addressed_copy_at(&second_source, &root).unwrap();
 
         assert_ne!(first.parent(), second.parent());
         assert_eq!(fs::read(first).unwrap(), b"first image");
@@ -343,9 +505,10 @@ mod tests {
 
         let digest = hex::encode(Sha256::digest(&bytes));
         let destination = root
-            .join("ckdev-exec")
+            .join("synapse-exec")
             .join(&digest[..16])
             .join("ckdev-synapse");
+
         let expected_size = bytes.len() as u64;
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let partial_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -374,7 +537,7 @@ mod tests {
                 let start = std::sync::Arc::clone(&start);
                 std::thread::spawn(move || {
                     start.wait();
-                    ckdev_binary(source, root)
+                    content_addressed_copy_at(&source, &root)
                 })
             })
             .collect::<Vec<_>>();
