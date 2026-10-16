@@ -2676,8 +2676,9 @@ impl RuntimeState {
             Some(remaining_request_ms(deadline)),
             max_queue_ms,
         )?;
-        // Millisecond admission accounting must never extend the request timer.
-        admission.deadline = admission.deadline.min(deadline);
+        // Admission accounts in whole milliseconds, but execution must retain
+        // the original timer rather than shorten or restart the request budget.
+        admission.deadline = deadline;
         Ok(admission)
     }
 
@@ -6390,6 +6391,15 @@ async fn ensure_model_loaded_for_control(
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let timeout_ms = request_deadline_ms.unwrap_or(MODEL_LOAD_CONTROL_TIMEOUT_MS);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    ensure_model_loaded_until(state, model_id, deadline, timeout_ms).await
+}
+
+async fn ensure_model_loaded_until(
+    state: Arc<ModuleState>,
+    model_id: &str,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
+) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     let Some(snapshot) = model_slot_snapshot(&state.runtime, model_id) else {
         return Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
@@ -18590,6 +18600,79 @@ mod tests {
         assert!(!error.safe_to_retry_same_request);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_inline_admission_preserves_fractional_budget() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), Vec::new()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        tokio::time::advance(Duration::from_micros(600_250)).await;
+        let admission = runtime
+            .admit_inline_until("test-model", None, QueueClass::Bulk, 1, deadline, None)
+            .unwrap();
+        assert_eq!(admission.deadline(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_remaining_milliseconds_round_up() {
+        let now = tokio::time::Instant::now();
+        for (remaining_ns, expected_ms) in [
+            (0, 0),
+            (1, 1),
+            (999_999, 1),
+            (1_000_000, 1),
+            (1_000_001, 2),
+            (599_750_000, 600),
+        ] {
+            assert_eq!(
+                remaining_request_ms(now + Duration::from_nanos(remaining_ns)),
+                expected_ms,
+                "remaining_ns={remaining_ns}"
+            );
+        }
+        assert_eq!(remaining_request_ms(now - Duration::from_nanos(1)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_profile_resolution_keeps_submillisecond_budget() {
+        let (root, descriptor) = test_storage_descriptor("profile-resolution-deadline");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("test-os");
+        store.observe_profile(&profile, 10, 1).unwrap();
+        let state = test_module_state(store, profile);
+        {
+            let mut catalog = state.runtime.catalog.lock().unwrap();
+            let slot = catalog.get_mut("stuck-model").unwrap();
+            slot.spec
+                .engine_identity
+                .build_flags
+                .insert("profile".to_string(), "test".to_string());
+            // An in-progress load stays pending without spawning a real worker.
+            slot.state = ModelRuntimeState::Loading;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_micros(500);
+        {
+            let resolution = resolve_serving_model_until(
+                state.clone(),
+                Some("stuck-model"),
+                ModelTask::Embed,
+                None,
+                None,
+                deadline,
+            );
+            tokio::pin!(resolution);
+            tokio::select! {
+                biased;
+                _ = &mut resolution => panic!("model resolution expired before its deadline"),
+                _ = std::future::ready(()) => {}
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let error = resolution.await.err().expect("the load must time out");
+            assert_eq!(error.code, "model_loading");
+            assert!(tokio::time::Instant::now() >= deadline);
+        }
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn catalog_batch_resolution_and_execution_share_one_deadline() {
@@ -30419,10 +30502,11 @@ async fn resolve_serving_model_until(
                     .build_flags
                     .contains_key("profile")
         }) {
-            return ensure_model_loaded_for_control(
+            return ensure_model_loaded_until(
                 state,
                 model_id,
-                Some(remaining_request_ms(deadline)),
+                deadline,
+                remaining_request_ms(deadline),
             )
             .await;
         }
@@ -30558,9 +30642,12 @@ async fn catalog_resolution_guard_until(
 }
 
 fn remaining_request_ms(deadline: tokio::time::Instant) -> u64 {
+    // A fractional millisecond is still usable budget. Round up only for
+    // millisecond accounting; timers continue to use the absolute deadline.
     deadline
         .saturating_duration_since(tokio::time::Instant::now())
-        .as_millis()
+        .as_nanos()
+        .div_ceil(1_000_000)
         .min(u64::MAX as u128) as u64
 }
 
