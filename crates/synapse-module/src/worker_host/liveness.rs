@@ -114,7 +114,10 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
                 ));
             }
             max_gap = max_gap.max(last.elapsed());
-            tracing::info!(target: "worker_liveness", operation = request.wire_type(), req_id,
+            // Trace, not info: a direct-ANE worker reports once per layer of every
+            // row, about 300 lines per embed call, which filled gigabytes of log a
+            // day at info. Raise `worker_liveness=trace` in CK_LOG to measure gaps.
+            tracing::trace!(target: "worker_liveness", operation = request.wire_type(), req_id,
                 phase = ?phase, gap_ms = last.elapsed().as_secs_f64() * 1000.0,
                 completed = next, "completed work received");
             completed = next;
@@ -192,7 +195,9 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             ));
         }
         max_gap = max_gap.max(last.elapsed());
-        tracing::info!(target: "worker_liveness", operation = request.wire_type(), req_id,
+        // Debug: the per-request "job done" line already reports each request at
+        // info; this one adds the gap measurements for investigating hangs.
+        tracing::debug!(target: "worker_liveness", operation = request.wire_type(), req_id,
             progress_units = completed, max_gap_ms = max_gap.as_secs_f64() * 1000.0,
             phase = ?phase, gap_ms = last.elapsed().as_secs_f64() * 1000.0,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "worker exchange drained");

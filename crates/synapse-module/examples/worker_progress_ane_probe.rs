@@ -127,6 +127,9 @@ async fn main() -> Result<()> {
     std::env::set_var("SYNAPSE_ANE_PROFILE_CATALOG", "1");
     std::env::set_var("SYNAPSE_ANE_PROFILE_ENDPOINT", endpoint);
     std::env::set_var("CORTEXKIT_MODEL_CACHE", root.join("model-cache"));
+    // Per-frame progress lines are trace-level, so the candidate module (which
+    // inherits this environment) must raise worker_liveness to record the gaps.
+    std::env::set_var("CK_LOG", "info,worker_liveness=trace");
     let candidate = qwen_compare::Candidate::start(
         &std::env::current_dir()?,
         &assets,
