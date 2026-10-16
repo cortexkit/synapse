@@ -25,9 +25,9 @@ Before submitting a change for merge, run `bash scripts/land-gates.sh` for fast
 static checks and targeted test feedback.
 Use `--plan` to inspect its changed-target selection or `--base REF` to choose
 the comparison base. `--full` retains the serial portable module landing set;
-it is not hardware certification. See [gate timing and policy](ci-gate-timings.md)
-for measurements, retained boundaries and the explicit caught-late cost of checks
-delegated to CI or nightly runs.
+it is not hardware certification. Train CI no longer runs the whole-process
+`skeleton_e2e` suite: it runs on the daily schedule, on manual dispatch and in
+`--full`, so an end-to-end-only regression can surface after landing.
 
 ## Execute development binaries without confusing installed ones
 
