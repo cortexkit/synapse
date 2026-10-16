@@ -4353,6 +4353,18 @@ pub mod ane_residency {
             Ok(lock.as_ref().map(AneDirectLaneLock::inheritable))
         }
 
+        /// Core ML can borrow an owned descriptor without depending on direct-ANE
+        /// ownership. An absent or released lock is not a Core ML load refusal.
+        #[cfg(unix)]
+        pub(crate) fn held_lane_lock(&self) -> Option<Arc<std::fs::File>> {
+            self.inner
+                .lane_lock
+                .lock()
+                .expect("lane lock")
+                .as_ref()
+                .map(AneDirectLaneLock::inheritable)
+        }
+
         /// Release only after every owner has confirmed shutdown. A retained
         /// parent-side descriptor means shutdown has not yet freed the hardware.
         #[cfg(unix)]

@@ -1,0 +1,71 @@
+[[control]]
+id = "coreml-cold-load-never-acquires-direct-lock"
+guards = "A cold CoreML load succeeds while another process owns the configured direct-ANE lock"
+file = "crates/synapse-module/src/lib.rs"
+old = """
+if matches!(engine, "ane" | "ane-coreml-worker") {
+        return runtime
+            .ane_supervisor
+            .lock()
+            .map(|shared| shared.clone())
+            .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"));
+    }"""
+new = """
+if matches!(engine, "ane" | "ane-coreml-worker") {
+        // NON-VACUITY BREAK: CoreML must load while another process owns this
+        // lock; requiring acquisition incorrectly refuses that independent load.
+        #[cfg(unix)]
+        return acquire_runtime_ane_supervisor(runtime).map(Some).map_err(ane_residency_error_to_wire);
+        #[cfg(not(unix))]
+        return Ok(None);
+    }"""
+edits = []
+test_file = "crates/synapse-module/src/coreml_load_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::coreml_load_tests::cold_coreml_load_ignores_another_direct_ane_lock_holder"]
+expect_message = "ane_lane_busy"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "coreml-released-lock-is-not-a-load-refusal"
+guards = "CoreML loads do not require a supervisor's released direct-ANE lock"
+file = "crates/synapse-module/src/lib.rs"
+old = "config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());"
+new = """
+// NON-VACUITY BREAK: require direct-ANE ownership for an optional CoreML inheritance.
+        config.inherited_lane_lock = ane_supervisor.as_ref().map(|s| s.inherited_lane_lock())
+            .transpose().map_err(ane_residency_error_to_wire)?.flatten();"""
+edits = []
+test_file = "crates/synapse-module/src/coreml_load_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::coreml_load_tests::coreml_load_does_not_reacquire_a_released_supervisor_lock"]
+expect_message = "ane_lane_busy"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "coreml-inherits-only-already-held-descriptor"
+guards = "CoreML reload after pause inherits an already-held descriptor without acquiring one"
+file = "crates/synapse-module/src/lib.rs"
+old = "config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());"
+new = "// NON-VACUITY BREAK: drop the already-held descriptor instead of inheriting it."
+edits = []
+test_file = "crates/synapse-module/src/coreml_load_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::coreml_load_tests::coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock"]
+expect_message = "right: true"
+only = false
+timeout_s = 60
+build_timeout_s = 1800

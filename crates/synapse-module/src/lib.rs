@@ -1323,6 +1323,17 @@ impl AdmissionTelemetry {
     }
 }
 
+#[cfg(all(test, unix))]
+// Portable Core ML tests replace only process creation. The ordinary load path
+// still selects the supervisor and exchanges LOAD frames with a real host.
+type CoreMlTestWorkerFactory = Arc<
+    dyn Fn(
+            worker_host::WorkerHostConfig,
+        ) -> Result<worker_host::WorkerEngine, worker_host::WorkerHostError>
+        + Send
+        + Sync,
+>;
+
 struct RuntimeState {
     certify_observation: bool,
     ane_direct: AneDirectConfig,
@@ -1370,6 +1381,8 @@ struct RuntimeState {
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
+    #[cfg(all(test, unix))]
+    coreml_test_worker_factory: Mutex<Option<CoreMlTestWorkerFactory>>,
     /// Captured at startup for production; unit tests must configure a path in
     /// their store fixture instead of falling back to the machine-wide lock.
     #[cfg(unix)]
@@ -2628,6 +2641,8 @@ impl RuntimeState {
             execution,
             execution_stats,
             ane_supervisor: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            coreml_test_worker_factory: Mutex::new(None),
             #[cfg(all(unix, not(test)))]
             ane_lane_lock_path: worker_host::ane_residency::AneDirectLaneLock::default_path(),
             #[cfg(all(test, unix))]
@@ -6512,6 +6527,18 @@ async fn load_catalog_model_task(
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
+    let worker_load_context =
+        WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec);
+    #[cfg(all(test, unix))]
+    let worker_load_context = WorkerLoadContext {
+        coreml_worker_factory: state
+            .runtime
+            .coreml_test_worker_factory
+            .lock()
+            .unwrap()
+            .clone(),
+        ..worker_load_context
+    };
     let ane_supervisor = direct_ane_supervisor(&state.runtime, &spec.engine);
     let is_catalog = state.runtime.release_catalog.is_reserved_id(&model_id);
     let fault_lane = model_id.clone();
@@ -6523,11 +6550,10 @@ async fn load_catalog_model_task(
             CatalogAwareModelSpec {
                 stored: spec,
                 catalog_lane: is_catalog.then_some(fault_lane),
+                worker_load_context,
             },
             model_cache,
             microllm_max_tokens,
-            worker_load_timeout,
-            worker_forward_lines_per_sec,
             owned_decode_q8,
             ane_supervisor?,
         )
@@ -6749,25 +6775,44 @@ fn record_owned_package_roles(
         .map_err(|error| io_to_load_error("publish owned package roots", &path, &error))
 }
 
+#[derive(Clone)]
+struct WorkerLoadContext {
+    timeout: Duration,
+    forward_lines_per_sec: u32,
+    #[cfg(all(test, unix))]
+    coreml_worker_factory: Option<CoreMlTestWorkerFactory>,
+}
+
+impl WorkerLoadContext {
+    fn new(timeout: Duration, forward_lines_per_sec: u32) -> Self {
+        Self {
+            timeout,
+            forward_lines_per_sec,
+            #[cfg(all(test, unix))]
+            coreml_worker_factory: None,
+        }
+    }
+}
+
 // Catalog ownership comes from the release registry and stays outside the
 // stored numerical profile, so quarantine policy cannot change fingerprints.
 struct CatalogAwareModelSpec {
     stored: StoredModelConfig,
     catalog_lane: Option<String>,
+    worker_load_context: WorkerLoadContext,
 }
 
 fn load_catalog_model_blocking(
     spec: CatalogAwareModelSpec,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
-    worker_load_timeout: Duration,
-    worker_forward_lines_per_sec: u32,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let CatalogAwareModelSpec {
         stored: spec,
         catalog_lane,
+        worker_load_context,
     } = spec;
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -6882,8 +6927,7 @@ fn load_catalog_model_blocking(
                 &spec,
                 &artifact,
                 &runtime_config,
-                worker_load_timeout,
-                worker_forward_lines_per_sec,
+                worker_load_context,
                 ane_supervisor,
                 catalog_lane.as_deref(),
             )?;
@@ -6931,8 +6975,7 @@ fn load_catalog_model_blocking(
                 &spec,
                 &artifact,
                 &runtime_config,
-                worker_load_timeout,
-                worker_forward_lines_per_sec,
+                worker_load_context,
                 ane_supervisor,
                 catalog_lane.as_deref(),
             )?;
@@ -7114,7 +7157,16 @@ fn direct_ane_supervisor(
     runtime: &RuntimeState,
     engine: &str,
 ) -> Result<Option<worker_host::ane_residency::AneResidencySupervisor>, WireOperationError> {
-    if !matches!(engine, "ane-direct-worker" | "ane" | "ane-coreml-worker") {
+    // Core ML may inherit an already-held descriptor, but a model load must
+    // never acquire or re-acquire the direct-ANE lock on its behalf.
+    if matches!(engine, "ane" | "ane-coreml-worker") {
+        return runtime
+            .ane_supervisor
+            .lock()
+            .map(|shared| shared.clone())
+            .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"));
+    }
+    if engine != "ane-direct-worker" {
         return Ok(None);
     }
     if !cfg!(target_os = "macos") {
@@ -7201,14 +7253,20 @@ fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
-    worker_load_timeout: Duration,
-    worker_forward_lines_per_sec: u32,
+    worker_load_context: WorkerLoadContext,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
     catalog_lane: Option<&str>,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
-    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !cfg!(target_os = "macos") {
+    #[cfg(all(test, unix))]
+    let coreml_test_worker_factory = worker_load_context
+        .coreml_worker_factory
+        .filter(|_| spec.engine == "ane");
+    let macos_available = cfg!(target_os = "macos");
+    #[cfg(all(test, unix))]
+    let macos_available = macos_available || coreml_test_worker_factory.is_some();
+    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !macos_available {
         return Err(artifact_invalid_error(format!(
             "{} model '{}' is only supported on macOS",
             spec.engine, spec.model_id
@@ -7234,11 +7292,11 @@ fn load_worker_backend_blocking(
         .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
         .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    let _ = worker_load_timeout;
+    let _ = worker_load_context.timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.model_id = Some(spec.model_id.clone());
     config.catalog_lane = catalog_lane.map(str::to_owned);
-    config.worker_forward_lines_per_sec = worker_forward_lines_per_sec;
+    config.worker_forward_lines_per_sec = worker_load_context.forward_lines_per_sec;
     config.engine_identity = Some(spec.engine_identity.clone());
     config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
     config.pooling =
@@ -7267,14 +7325,16 @@ fn load_worker_backend_blocking(
     let _ = ane_supervisor;
     #[cfg(unix)]
     if matches!(spec.engine.as_str(), "ane" | "ane-coreml-worker") {
-        config.inherited_lane_lock = ane_supervisor
-            .as_ref()
-            .map(|s| s.inherited_lane_lock())
-            .transpose()
-            .map_err(ane_residency_error_to_wire)?
-            .flatten();
+        config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());
     }
-    let mut engine = WorkerEngine::new(config).map_err(|error| {
+    #[cfg(all(test, unix))]
+    let engine = match coreml_test_worker_factory {
+        Some(factory) => factory(config),
+        None => WorkerEngine::new(config),
+    };
+    #[cfg(not(all(test, unix)))]
+    let engine = WorkerEngine::new(config);
+    let mut engine = engine.map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
             format!(
@@ -18095,6 +18155,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    mod coreml_load_tests {
+        include!("coreml_load_tests.rs");
+    }
+    #[cfg(unix)]
     mod lane_pause_tests {
         include!("lane_pause_tests.rs");
     }
@@ -27216,11 +27280,10 @@ mod catalog_runtime_tests {
                     CatalogAwareModelSpec {
                         stored: spec,
                         catalog_lane: None,
+                        worker_load_context: WorkerLoadContext::new(Duration::from_secs(10), 0),
                     },
                     state.model_cache.clone(),
                     8192,
-                    Duration::from_secs(10),
-                    0,
                     Arc::new(Mutex::new(
                         owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
                     )),
@@ -27517,11 +27580,10 @@ mod catalog_runtime_tests {
             CatalogAwareModelSpec {
                 stored: spec,
                 catalog_lane: None,
+                worker_load_context: WorkerLoadContext::new(Duration::from_secs(10), 0),
             },
             state.model_cache.clone(),
             8192,
-            Duration::from_secs(10),
-            0,
             Arc::new(Mutex::new(
                 owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
             )),
