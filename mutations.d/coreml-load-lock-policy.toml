@@ -1,5 +1,7 @@
 [[control]]
 id = "coreml-cold-load-never-acquires-direct-lock"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "A cold CoreML load succeeds while another process owns the configured direct-ANE lock"
 file = "crates/synapse-module/src/lib.rs"
 old = """
@@ -33,6 +35,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "coreml-released-lock-is-not-a-load-refusal"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "CoreML loads do not require a supervisor's released direct-ANE lock"
 file = "crates/synapse-module/src/lib.rs"
 old = "config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());"
@@ -54,6 +58,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "coreml-inherits-only-already-held-descriptor"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "CoreML reload after pause inherits an already-held descriptor without acquiring one"
 file = "crates/synapse-module/src/lib.rs"
 old = "config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());"

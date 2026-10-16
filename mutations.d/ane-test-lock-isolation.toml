@@ -1,5 +1,7 @@
 [[control]]
 id = "ane-runtime-configured-lock-path"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Cold production-load supervisor acquisition uses the runtime's fixture-configured lock path"
 file = "crates/synapse-module/src/lib.rs"
 old = "AneDirectLaneLock::acquire(runtime_ane_lock_path(runtime)?)?"
@@ -18,6 +20,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "ane-cold-pause-configured-lock-path"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Cold pause expiry and resume acquire the same configured fixture lock as model loading"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "*shared = Some(acquire_runtime_ane_supervisor(runtime)?);"
@@ -40,6 +44,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "ane-unit-test-production-path-guard"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "The unit-test path guard rejects the production lock path without opening any file"
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = """
@@ -63,6 +69,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "ane-unit-test-requires-runtime-fixture"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "An unconfigured module unit test fails closed before resolving a production lock path"
 file = "crates/synapse-module/src/lib.rs"
 old = """

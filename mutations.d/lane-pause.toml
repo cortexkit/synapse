@@ -1,5 +1,7 @@
 [[control]]
 id = "lane-pause-refusal"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Paused lanes answer lane_paused before any loading or admission"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "return Err(refusal(runtime, lane, pause));"
@@ -18,6 +20,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-unaffected"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "The ANE pause does not refuse Metal or rerank work"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "if !affected(runtime, lane) {\n        return Ok(None);\n    }"
@@ -36,6 +40,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-admitted-finish"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Already admitted requests complete rather than being refused after inference"
 file = "crates/synapse-module/src/lib.rs"
 old = "let reply_started = Instant::now();\n    let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;"
@@ -60,6 +66,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-unload-after-drain"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Workers are unloaded after the detached inference reply drains"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "unload_embedding_model_blocking(model.clone())?;"
@@ -78,6 +86,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-release-global-lock"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Hardware-free status means a fresh open can acquire the global ANE lock"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "supervisor\n            .release_lane()\n            .map_err(ane_residency_error_to_wire)?;"
@@ -96,6 +106,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-auto-expiry"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "The monotonic deadline opens admission without a resume call"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "tokio::time::sleep_until(deadline) => {}"
@@ -114,6 +126,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-duration-cap"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "The module refuses a 121-minute pause"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "const MAX_DURATION_MS: u64 = 120 * 60 * 1000;"
@@ -132,6 +146,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-reacquire-contention"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Admission stays paused until the global lock has been re-acquired"
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = "*lock = Some(AneDirectLaneLock::acquire(path)?);"
@@ -150,6 +166,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-no-load"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "A paused refusal must not schedule a background model load"
 file = "crates/synapse-module/src/lib.rs"
 old = """
@@ -184,6 +202,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-no-self-check"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "A paused refusal must not start a numerical self-check"
 file = "crates/synapse-module/src/lib.rs"
 old = """
@@ -218,6 +238,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-coreml-scope"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Cold legacy CoreML ANE lanes are included without loading for identity"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "matches!(engine, \"ane\" | \"ane-coreml-worker\" | \"ane-direct-worker\")"
@@ -236,6 +258,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-durable-retry"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Already queued catalog batches preserve retryability when they encounter a pause"
 file = "crates/synapse-module/src/lib.rs"
 old = "Err(e) => fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e),"
@@ -254,6 +278,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-coreml-confirm-exit"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "CoreML worker teardown closes both child and parent inherited lock descriptors"
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = "host.config.inherited_lane_lock.take();"
@@ -272,6 +298,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-served-fingerprint"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Pause details carry the same pinned fingerprint as a successful reply on that lane"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "details[\"fingerprint\"] = json!(fingerprint);"
@@ -290,6 +318,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-no-early-hardware-free"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Hardware-free status is not published while cancelled inference is still draining"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = """
@@ -319,6 +349,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-failed-drain-deadline"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Persistent drain failures cannot extend the pause beyond its deadline"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = """
@@ -353,6 +385,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-resume-during-drain"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Resume wakes the bounded drain wait before its original deadline"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "_ = notified => {},"
@@ -371,6 +405,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-residency-refund"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Confirmed pause shutdown refunds the old worker's executable reservations before the next generation"
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = """
@@ -397,6 +433,8 @@ build_timeout_s = 1800
 
 [[control]]
 id = "lane-pause-detached-unload-readiness"
+# The expected tests are Unix-only (cfg(unix)), so the row cannot replay on Windows.
+platforms = ["linux", "macos"]
 guards = "Cancelling a drain wait never leaves its retired model selectable by resumed requests"
 file = "crates/synapse-module/src/lane_pause.rs"
 old = "set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);"
