@@ -1370,6 +1370,12 @@ struct RuntimeState {
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
+    /// Captured at startup for production; unit tests must configure a path in
+    /// their store fixture instead of falling back to the machine-wide lock.
+    #[cfg(unix)]
+    ane_lane_lock_path: Option<PathBuf>,
+    #[cfg(all(test, unix))]
+    ane_lane_test_root: Option<PathBuf>,
     lane_pause: lane_pause::LanePause,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
@@ -2622,6 +2628,12 @@ impl RuntimeState {
             execution,
             execution_stats,
             ane_supervisor: Mutex::new(None),
+            #[cfg(all(unix, not(test)))]
+            ane_lane_lock_path: worker_host::ane_residency::AneDirectLaneLock::default_path(),
+            #[cfg(all(test, unix))]
+            ane_lane_lock_path: None,
+            #[cfg(all(test, unix))]
+            ane_lane_test_root: None,
             lane_pause: lane_pause::LanePause::default(),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
@@ -7117,14 +7129,8 @@ fn direct_ane_supervisor(
             .lock()
             .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"))?;
         if shared.is_none() {
-            let mut supervisor = worker_host::ane_residency::AneResidencySupervisor::acquire_lane(
-                Default::default(),
-            )
-            .map_err(ane_residency_error_to_wire)?;
-            if runtime.certify_observation {
-                supervisor.enable_observations();
-            }
-            *shared = Some(supervisor);
+            *shared =
+                Some(acquire_runtime_ane_supervisor(runtime).map_err(ane_residency_error_to_wire)?);
         }
         if let Some(supervisor) = shared.as_ref() {
             supervisor
@@ -7140,6 +7146,55 @@ fn direct_ane_supervisor(
             "direct-ANE is only supported on macOS",
         ))
     }
+}
+
+#[cfg(unix)]
+fn runtime_ane_lock_path(
+    runtime: &RuntimeState,
+) -> Result<&Path, worker_host::ane_residency::AneResidencyError> {
+    #[cfg(test)]
+    {
+        let root = runtime
+            .ane_lane_test_root
+            .as_ref()
+            .expect("module tests must configure an ANE lock fixture root");
+        let path = runtime
+            .ane_lane_lock_path
+            .as_ref()
+            .expect("module tests must configure an ANE lock fixture path");
+        assert!(
+            path.starts_with(root)
+                && !path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir),
+            "module test ANE lock must stay under its fixture root"
+        );
+        worker_host::ane_residency::assert_test_ane_lock_path(path);
+    }
+    runtime.ane_lane_lock_path.as_deref().ok_or_else(|| {
+        worker_host::ane_residency::AneResidencyError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME is not set, so the ANE lane lock has no location",
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn acquire_runtime_ane_supervisor(
+    runtime: &RuntimeState,
+) -> Result<
+    worker_host::ane_residency::AneResidencySupervisor,
+    worker_host::ane_residency::AneResidencyError,
+> {
+    use worker_host::ane_residency::{AneDirectLaneLock, AneResidencySupervisor};
+    let mut supervisor = AneResidencySupervisor::with_lane_lock(
+        Default::default(),
+        AneDirectLaneLock::acquire(runtime_ane_lock_path(runtime)?)?,
+    );
+    if runtime.certify_observation {
+        supervisor.enable_observations();
+    }
+    Ok(supervisor)
 }
 
 fn load_worker_backend_blocking(
@@ -20840,6 +20895,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn cold_ane_supervisor_uses_the_runtime_fixture_lock_path() {
+        let (root, descriptor) = test_storage_descriptor("ane-runtime-lock-path");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("ane-runtime-lock-path-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store, profile);
+        let path = runtime_ane_lock_path(&state.runtime).unwrap().to_path_buf();
+        assert!(path.starts_with(&root));
+        assert!(state.runtime.ane_supervisor.lock().unwrap().is_none());
+        let first = if cfg!(target_os = "macos") {
+            direct_ane_supervisor(&state.runtime, "ane-direct-worker")
+                .unwrap()
+                .unwrap()
+        } else {
+            acquire_runtime_ane_supervisor(&state.runtime).unwrap()
+        };
+        assert!(
+            worker_host::ane_residency::AneDirectLaneLock::acquire(&path).is_err(),
+            "runtime acquisition must hold the configured fixture lock"
+        );
+        drop((first, state));
+        let released = worker_host::ane_residency::AneDirectLaneLock::acquire(&path).unwrap();
+        drop(released);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unconfigured_ane_runtime_cannot_resolve_a_production_lock_in_tests() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime_ane_lock_path(
+                &runtime
+            )))
+            .is_err(),
+            "an unconfigured unit test must fail before resolving a production lock path"
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn direct_ane_models_reuse_one_runtime_supervisor() {
         let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
@@ -21613,10 +21709,30 @@ mod tests {
             .expect("test profile state reads")
             .profile_activation_epoch
             .expect("test profile is activated");
-        let runtime = Arc::new(
-            RuntimeState::from_catalog(config, vec![stuck_model_spec()])
-                .expect("test runtime initializes"),
-        );
+        let runtime = RuntimeState::from_catalog(config, vec![stuck_model_spec()])
+            .expect("test runtime initializes");
+        #[cfg(unix)]
+        let runtime = {
+            let mut runtime = runtime;
+            // Cold loads and pause expiry must use the same per-store lock on
+            // every test platform, including when no supervisor was installed.
+            let database = store
+                .store
+                .with_conn(|conn| {
+                    Ok(PathBuf::from(
+                        conn.path().expect("test store has a database file"),
+                    ))
+                })
+                .expect("test database path");
+            let root = database
+                .parent()
+                .expect("test database has a fixture root")
+                .to_path_buf();
+            runtime.ane_lane_lock_path = Some(root.join("ane-direct.lock"));
+            runtime.ane_lane_test_root = Some(root);
+            runtime
+        };
+        let runtime = Arc::new(runtime);
         let remote_gateway = Arc::new(
             RemoteGateway::new(
                 Arc::clone(&store),

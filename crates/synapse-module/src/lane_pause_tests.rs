@@ -1,5 +1,5 @@
 use super::*;
-use worker_host::ane_residency::{AneDirectLaneLock, AneResidencySupervisor};
+use worker_host::ane_residency::AneDirectLaneLock;
 
 async fn call(state: &Arc<ModuleState>, method: &str, params: Value) -> Value {
     response_result(
@@ -50,12 +50,12 @@ async fn end_pause(state: &Arc<ModuleState>) {
 }
 
 fn install_lock(fixture: &AneLaneFixture) -> PathBuf {
-    let path = fixture.root.join("ane.lock");
+    let path = runtime_ane_lock_path(&fixture.state.runtime)
+        .unwrap()
+        .to_path_buf();
+    assert!(path.starts_with(&fixture.root));
     *fixture.state.runtime.ane_supervisor.lock().unwrap() =
-        Some(AneResidencySupervisor::with_lane_lock(
-            Default::default(),
-            AneDirectLaneLock::acquire(&path).unwrap(),
-        ));
+        Some(acquire_runtime_ane_supervisor(&fixture.state.runtime).unwrap());
     path
 }
 
@@ -585,6 +585,17 @@ async fn pause_reacquire_contention_keeps_refusing_instead_of_serving() {
 #[tokio::test]
 async fn pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint() {
     let fixture = installed_ready_ane_fixture().await;
+    assert!(fixture
+        .state
+        .runtime
+        .ane_supervisor
+        .lock()
+        .unwrap()
+        .is_none());
+    let path = runtime_ane_lock_path(&fixture.state.runtime)
+        .unwrap()
+        .to_path_buf();
+    assert!(path.starts_with(&fixture.root));
     let mut spec = model_slot_snapshot(&fixture.state.runtime, ANE_TEST_LANE)
         .unwrap()
         .spec;
@@ -625,6 +636,10 @@ async fn pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint() {
         0
     );
     end_pause(&fixture.state).await;
+    assert!(
+        AneDirectLaneLock::acquire(&path).is_err(),
+        "cold resume must hold the fixture's lane lock"
+    );
     finish_ane_lane_fixture(fixture).await;
 }
 

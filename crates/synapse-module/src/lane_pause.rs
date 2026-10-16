@@ -543,19 +543,14 @@ async fn run_pause(state: Arc<ModuleState>) {
 #[cfg(unix)]
 fn reacquire(runtime: &RuntimeState) -> Result<(), worker_host::ane_residency::AneResidencyError> {
     let shared = runtime.ane_supervisor.lock().expect("ANE supervisor");
-    // Even a cold module must acquire the lock on expiry. Otherwise its first
-    // load could answer lane-busy instead of retaining the retryable pause.
-    #[cfg(target_os = "macos")]
+    // Even a cold module must acquire the runtime-configured lock on expiry.
+    // Unit tests exercise this Unix path on Linux too, so isolation cannot hide
+    // behind the macOS hardware gate.
+    #[cfg(any(target_os = "macos", test))]
     let shared = {
         let mut shared = shared;
         if shared.is_none() {
-            let mut supervisor = worker_host::ane_residency::AneResidencySupervisor::acquire_lane(
-                Default::default(),
-            )?;
-            if runtime.certify_observation {
-                supervisor.enable_observations();
-            }
-            *shared = Some(supervisor);
+            *shared = Some(acquire_runtime_ane_supervisor(runtime)?);
         }
         shared
     };

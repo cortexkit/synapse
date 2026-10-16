@@ -6442,6 +6442,26 @@ pub mod ane_residency {
         path: PathBuf,
     }
 
+    /// Unit tests may inspect the production path to check this guard, but must
+    /// never open it: another process may be using the machine's Neural Engine.
+    #[cfg(all(test, unix))]
+    pub(crate) fn assert_test_ane_lock_path(path: &Path) {
+        fn resolved(path: &Path) -> PathBuf {
+            path.parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .zip(path.file_name())
+                .map(|(parent, name)| parent.join(name))
+                .unwrap_or_else(|| path.to_path_buf())
+        }
+        if let Some(production) = AneDirectLaneLock::default_path() {
+            assert_ne!(
+                resolved(path),
+                resolved(&production),
+                "module tests must not open the production ANE lane lock"
+            );
+        }
+    }
+
     #[cfg(unix)]
     impl AneDirectLaneLock {
         /// `~/Library/Caches/ck-synapse/ane-direct.lock`.
@@ -6454,6 +6474,8 @@ pub mod ane_residency {
         /// direct-ANE workers or unrelated children between fork and exec.
         // `File::try_lock` is a `flock` and avoids the unsafe code a direct call would need.
         pub fn acquire(path: &Path) -> Result<Self, AneResidencyError> {
+            #[cfg(test)]
+            assert_test_ane_lock_path(path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -8206,6 +8228,16 @@ pub mod ane_residency {
         use tokio::io::DuplexStream;
 
         const LAYERS: u32 = 4;
+        #[test]
+        #[cfg(unix)]
+        fn module_tests_reject_the_production_lock_path_without_opening_it() {
+            let production = AneDirectLaneLock::default_path().expect("test HOME is set");
+            assert!(
+                std::panic::catch_unwind(|| assert_test_ane_lock_path(&production)).is_err(),
+                "production lock guard must reject the machine-wide path before any file open"
+            );
+        }
+
         struct MockChannel(AneWorkerChannel<DuplexStream>);
         impl std::ops::Deref for MockChannel {
             type Target = AneWorkerChannel<DuplexStream>;
