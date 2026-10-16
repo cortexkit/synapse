@@ -20903,7 +20903,10 @@ mod tests {
         store.activate_profile(&profile, 1, 1000).unwrap();
         let state = test_module_state(store, profile);
         let path = runtime_ane_lock_path(&state.runtime).unwrap().to_path_buf();
-        assert!(path.starts_with(&root));
+        assert_eq!(
+            path.parent().unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
         assert!(state.runtime.ane_supervisor.lock().unwrap().is_none());
         let first = if cfg!(target_os = "macos") {
             direct_ane_supervisor(&state.runtime, "ane-direct-worker")

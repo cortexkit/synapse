@@ -49,11 +49,20 @@ async fn end_pause(state: &Arc<ModuleState>) {
     wait_phase(state, "running").await;
 }
 
-fn install_lock(fixture: &AneLaneFixture) -> PathBuf {
+fn fixture_lock_path(fixture: &AneLaneFixture) -> PathBuf {
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
         .to_path_buf();
-    assert!(path.starts_with(&fixture.root));
+    // SQLite may canonicalize macOS's /var -> /private/var temp-directory alias.
+    assert_eq!(
+        path.parent().unwrap().canonicalize().unwrap(),
+        fixture.root.canonicalize().unwrap()
+    );
+    path
+}
+
+fn install_lock(fixture: &AneLaneFixture) -> PathBuf {
+    let path = fixture_lock_path(fixture);
     *fixture.state.runtime.ane_supervisor.lock().unwrap() =
         Some(acquire_runtime_ane_supervisor(&fixture.state.runtime).unwrap());
     path
@@ -592,10 +601,7 @@ async fn pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint() {
         .lock()
         .unwrap()
         .is_none());
-    let path = runtime_ane_lock_path(&fixture.state.runtime)
-        .unwrap()
-        .to_path_buf();
-    assert!(path.starts_with(&fixture.root));
+    let path = fixture_lock_path(&fixture);
     let mut spec = model_slot_snapshot(&fixture.state.runtime, ANE_TEST_LANE)
         .unwrap()
         .spec;
