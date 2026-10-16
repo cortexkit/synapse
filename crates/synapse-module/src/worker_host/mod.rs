@@ -2637,12 +2637,21 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "worker_host::tests::pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock", "--test-threads=1"])
                 .env(PROBE, "1").output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            if !output.status.success() {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Lead with the child's own panic message: the full libtest output
+                // starts with "running 1 test", which hides why the child failed.
+                let reason = combined
+                    .lines()
+                    .skip_while(|line| !line.contains("panicked at"))
+                    .nth(1)
+                    .unwrap_or("isolated child failed without a panic message");
+                panic!("{reason}\n{combined}");
+            }
             return;
         }
         use ane_residency::{inheritable_lock_stdio, AneDirectLaneLock};
