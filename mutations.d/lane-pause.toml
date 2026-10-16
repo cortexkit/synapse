@@ -373,8 +373,16 @@ build_timeout_s = 1800
 id = "lane-pause-residency-refund"
 guards = "Confirmed pause shutdown refunds the old worker's executable reservations before the next generation"
 file = "crates/synapse-module/src/worker_host/mod.rs"
-old = "state.slots.retain(|_, slot| slot.worker.worker_id() != id);"
-new = "// NON-VACUITY BREAK: retain the exited worker's executable reservations."
+old = """
+// Reservations are summed from these slots by reserved_executables.
+            // Refund only this owner, and only after its process exit is confirmed;
+            // the next worker instance must not inherit a retired owner's charge.
+            state.slots.retain(|_, slot| slot.worker.worker_id() != id);"""
+new = """
+// Reservations are summed from these slots by reserved_executables.
+            // Refund only this owner, and only after its process exit is confirmed;
+            // the next worker instance must not inherit a retired owner's charge.
+            // NON-VACUITY BREAK: retain the exited worker's executable reservations."""
 edits = []
 test_file = "crates/synapse-module/src/lane_pause_tests.rs"
 runner = "nextest"
