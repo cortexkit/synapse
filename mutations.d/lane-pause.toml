@@ -235,15 +235,11 @@ timeout_s = 60
 build_timeout_s = 1800
 
 [[control]]
-id = "lane-pause-durable-batch"
-guards = "Already queued catalog batches fail transiently at the pause fence before loading"
+id = "lane-pause-durable-retry"
+guards = "Already queued catalog batches preserve retryability when they encounter a pause"
 file = "crates/synapse-module/src/lib.rs"
-old = """
-let _pause_guard = lane_pause::admit(
-            &state.runtime,
-            &catalog::lane_id(&entry.id, &backend.backend),
-        )?;"""
-new = "// NON-VACUITY BREAK: let queued work proceed into catalog loading."
+old = "Err(e) => fail_job_with_wire_error(&state, &job, e.class == ErrorClass::Transient, e),"
+new = "Err(e) => fail_job_with_wire_error(&state, &job, false, e), // NON-VACUITY BREAK"
 edits = []
 test_file = "crates/synapse-module/src/lane_pause_tests.rs"
 runner = "nextest"
@@ -251,7 +247,7 @@ select = "expected"
 package = "synapse-module"
 target = "--lib"
 expect_red = ["tests::lane_pause_tests::queued_catalog_batch_gets_retryable_pause_without_loading"]
-expect_message = "lane_paused"
+expect_message = "failed_transient"
 only = false
 timeout_s = 60
 build_timeout_s = 1800
