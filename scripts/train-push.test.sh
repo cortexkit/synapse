@@ -61,6 +61,9 @@ cat > "$BIN_DIR/gh" <<'STUB'
 set -u
 STATE="${TRAIN_PUSH_TEST_STATE:?gh stub needs TRAIN_PUSH_TEST_STATE}"
 printf '%s\n' "$*" >> "$STATE/gh-calls"
+if [ -d "$STATE/runs" ]; then
+  exec python3 "$(dirname "$0")/stack-gh.py" "$@"
+fi
 
 # A rerun changes the attempt number without changing the run id. The state
 # transition is controllable so recovery tests can prove they watched the new
@@ -78,6 +81,23 @@ if [ "${1:-}" = "run" ] && [ "${2:-}" = "rerun" ]; then
   fi
   echo completed > "$STATE/recorded_status"
   exit 0
+fi
+
+# `gh run view` has its own option set; reject API-only flags instead of letting
+# this fixture silently accept a command that real gh would refuse.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ]; then
+  option_value=""
+  for arg in "$@"; do
+    if [ -n "$option_value" ]; then
+      option_value=""
+      continue
+    fi
+    case "$arg" in
+      --repo|--json|--jq|--attempt|--job) option_value="$arg" ;;
+      --log|--log-failed|--exit-status|--verbose|--web) ;;
+      --*) echo "unknown flag: $arg" >&2; exit 2 ;;
+    esac
+  done
 fi
 
 hook="$STATE/on-watch.sh"
@@ -108,30 +128,103 @@ if [ "$log_failed" -eq 1 ]; then
   exit 0
 fi
 
-# Job log (`run view --job <id> --log`): the fixture's log_tail file stands in
-# for the failing job's whole log; the script judges only its last lines.
+# Keep a response for `run view --job <id> --log` so the fake can expose any
+# regression that bypasses the logs API route assertion.
 job_id=""
 for arg in "$@"; do
   [ "$prev" = "--job" ] && job_id="$arg"
   prev="$arg"
 done
 if [ -n "$job_id" ]; then
+  if [ -f "$STATE/fail_job_log" ]; then
+    echo 'HTTP 500: job log unavailable' >&2
+    exit 1
+  fi
   cat "$STATE/log_tail" 2>/dev/null || true
   exit 0
 fi
 
-# The jobs API the skew check reads step names from.
+# The jobs API supplies failed step names; the logs endpoint supplies output.
 if [ "${1:-}" = "api" ]; then
+  api_path=""
+  for arg in "$@"; do
+    case "$arg" in
+      repos/*/actions/jobs/*/logs) api_path="$arg" ;;
+    esac
+  done
+  if [ -n "$api_path" ]; then
+    if [ -f "$STATE/fail_job_log" ]; then
+      echo 'HTTP 500: job log unavailable' >&2
+      exit 1
+    fi
+    cat "$STATE/log_tail" 2>/dev/null || true
+    exit 0
+  fi
   cat "$STATE/job_steps" 2>/dev/null || true
   exit 0
 fi
 
-# Fault injection: a field listed in fail_json makes every `run view` query
-# for it exit nonzero with no output, the way gh behaves on a network, rate
-# limit or auth error. The verdict path must fail closed on it.
+# Inject one transient rate-limit response, or a permanent stream of network
+# errors, only after watch-ci has completed its own green-run query.
+if [ "$json" = "databaseId,headSha,headBranch" ] && [ -f "$STATE/watch_seen" ]; then
+  if [ -f "$STATE/fail_rate_limit_once" ] && [ ! -f "$STATE/rate_limit_seen" ]; then
+    : > "$STATE/rate_limit_seen"
+    echo 'API rate limit exceeded' >&2
+    exit 1
+  fi
+  if [ -f "$STATE/fail_network_always" ]; then
+    echo 'dial tcp: i/o timeout' >&2
+    exit 1
+  fi
+fi
+
+# Fault injection: a field listed in fail_json makes the combined `run view`
+# response omit that field's usable value, standing in for a completed-run
+# payload whose conclusion or job list could not be read.
 if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ] && [ -f "$STATE/fail_json" ] &&
   grep -qxF "$json" "$STATE/fail_json"; then
   exit 1
+fi
+
+if [ "$json" = "status,conclusion,jobs,url" ]; then
+  : > "$STATE/watch_seen"
+  watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
+  printf '%s\n' "$watch_status" > "$STATE/recorded_status"
+  if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
+    cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
+  fi
+  combined_conclusion="$(cat "$STATE/conclusion")"
+  combined_jobs="$(cat "$STATE/failed_job" 2>/dev/null || true)"
+  combined_count="$(cat "$STATE/job_count" 2>/dev/null || echo 3)"
+  fail_conclusion=0
+  fail_jobs=0
+  if [ -f "$STATE/fail_json" ]; then
+    grep -qxF conclusion "$STATE/fail_json" && fail_conclusion=1 || true
+    grep -qxF jobs "$STATE/fail_json" && fail_jobs=1 || true
+  fi
+  python3 - "$watch_status" "$combined_conclusion" "$combined_jobs" "$combined_count" \
+    "$fail_conclusion" "$fail_jobs" "$(cat "$STATE/run_id")" <<'PY'
+import json, sys
+status, conclusion, failed, count, fail_conclusion, fail_jobs, run_id = sys.argv[1:]
+jobs = [
+    {"name": f"Unit {index + 1}", "databaseId": 9100 + index, "conclusion": "success"}
+    for index in range(int(count))
+]
+if failed:
+    name, _, job_id = failed.partition("|")
+    jobs.append({"name": name, "databaseId": int(job_id or 0), "conclusion": "failure"})
+if fail_conclusion == "1":
+    conclusion = None
+if fail_jobs == "1":
+    jobs = []
+print(json.dumps({
+    "status": status,
+    "conclusion": conclusion,
+    "jobs": jobs,
+    "url": f"https://github.com/example/repo/actions/runs/{run_id}",
+}))
+PY
+  exit 0
 fi
 
 case "$json" in
@@ -168,7 +261,11 @@ case "$json" in
     if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
       cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
     fi
-    cat "$STATE/watch_status" 2>/dev/null || echo "completed"
+    watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
+    # Both queries describe one run. Once the watch sees completion, a later
+    # status+conclusion lookup must not keep returning the old running status.
+    printf '%s\n' "$watch_status" > "$STATE/recorded_status"
+    printf '%s\n' "$watch_status"
     ;;
   jobs)
     case "$jq_arg" in
@@ -210,6 +307,7 @@ write_tests_workflow() {
   } > "$work/.github/workflows/tests.yml"
 }
 
+checks=0
 failures=0
 fail() {
   printf 'train-push.test.sh: FAIL — %s\n' "$1" >&2
@@ -218,7 +316,20 @@ fail() {
   fi
   failures=$((failures + 1))
 }
-ok() { printf 'train-push.test.sh: ok — %s\n' "$1"; }
+ok() { checks=$((checks + 1)); printf 'train-push.test.sh: ok — %s\n' "$1"; }
+
+if [ "${TRAIN_PUSH_TEST_CASE:-}" = "unused-source-export" ]; then
+  if grep -q 'TRAIN_PUSH_SOURCE=' "$TRAIN_PUSH"; then
+    fail 'the unused TRAIN_PUSH_SOURCE export is absent'
+  else
+    ok 'the unused TRAIN_PUSH_SOURCE export is absent'
+  fi
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+  echo "train-push.test.sh: isolated unused source export check passed"
+  exit 0
+fi
 
 # Build a fixture: a bare repo playing origin, a work clone holding the train,
 # and a second clone that stands in for whoever else pushes to main.
@@ -244,6 +355,19 @@ new_fixture() {
   cp "$SCRIPT_DIR/check-path-deps.py" "$dir/work/scripts/check-path-deps.py"
   cp "$SCRIPT_DIR/lib/operator-gh.sh" "$dir/work/scripts/lib/operator-gh.sh"
   cp "$SCRIPT_DIR/lib/workflow-gates.py" "$dir/work/scripts/lib/workflow-gates.py"
+  cat > "$dir/work/scripts/align-governed-docs.sh" <<'ALIGN'
+#!/usr/bin/env bash
+set -euo pipefail
+echo called >> "$TRAIN_PUSH_TEST_STATE/align-calls"
+printf 'fresh alignment\n' > docs/v0.49-agent-surface-manifest.json
+git add docs/v0.49-agent-surface-manifest.json
+git commit -qm "Align governed publication manifests"
+printf 'fresh release manifest\n' > docs/v0.49-release-manifest.json
+printf 'fresh release evidence\n' > docs/v0.49-release-evidence.json
+git add docs/v0.49-release-manifest.json docs/v0.49-release-evidence.json
+git commit -qm "Align release manifest and evidence"
+ALIGN
+  chmod +x "$dir/work/scripts/align-governed-docs.sh"
   git -C "$dir/work" add base.txt .github/workflows/tests.yml scripts
   git -C "$dir/work" commit -qm "base"
   git -C "$dir/work" remote add origin "$dir/origin.git"
@@ -252,7 +376,7 @@ new_fixture() {
   git -C "$dir/work" remote set-head origin -a >/dev/null
 
   mkdir -p "$dir/ci-state"
-  echo "4242" > "$dir/ci-state/run_id"
+  echo "42424242424" > "$dir/ci-state/run_id"
   echo "success" > "$dir/ci-state/conclusion"
   echo "completed" > "$dir/ci-state/recorded_status"
   echo "1" > "$dir/ci-state/attempt"
@@ -297,6 +421,20 @@ advance_origin_main() {
 
 LAST_OUT=""
 LAST_RC=0
+# A stacked train runs in the background, and its output is otherwise read only
+# after it exits. TRAIN_PUSH_TEST_LIVE also copies it to a file as it is
+# printed, so a test can wait on a line the train itself announces.
+run_train_command() {
+  if [ -n "${TRAIN_PUSH_TEST_LIVE:-}" ]; then
+    (
+      set -o pipefail
+      "$TRAIN_PUSH" "$@" 2>&1 | tee -a "$TRAIN_PUSH_TEST_LIVE"
+    )
+  else
+    "$TRAIN_PUSH" "$@" 2>&1
+  fi
+}
+
 run_train() {
   local dir="$1"
   shift
@@ -308,11 +446,15 @@ run_train() {
       TRAIN_PUSH_TEST_BRANCH="train/${1:-}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_GH_RETRY_DELAYS="${TRAIN_PUSH_TEST_GH_RETRY_DELAYS:-30 60 120 240}" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
-      WATCH_CI_RESOLVE_SLEEP=0 \
-      TRAIN_PUSH_PROBE_ATTEMPTS=2 \
-      TRAIN_PUSH_PROBE_SLEEP=0 \
-      "$TRAIN_PUSH" "$@" 2>&1
+       WATCH_CI_RESOLVE_SLEEP=0 \
+       WATCH_CI_POLL_SLEEP=0.02 \
+       TRAIN_PUSH_PARENT_ATTEMPTS="${TRAIN_PUSH_TEST_PARENT_ATTEMPTS:-200}" \
+       TRAIN_PUSH_PARENT_SLEEP=0.02 \
+       TRAIN_PUSH_PROBE_ATTEMPTS=2 \
+       TRAIN_PUSH_PROBE_SLEEP=0 \
+       run_train_command "$@"
   )"
   LAST_RC=$?
   set -e
@@ -389,7 +531,7 @@ test_same_sha_failed_rerun_message() {
   echo "failure|9199" > "$dir/ci-state/rerun_jobs"
   echo "success" > "$dir/ci-state/rerun_conclusion"
   run_train "$dir" same-sha-failed-rerun-message
-  expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  expect_out "sha already ran in https://github.com/example/repo/actions/runs/42424242424 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
     "same-sha failed-run rerun result"
 }
 
@@ -401,6 +543,892 @@ if [ "${TRAIN_PUSH_TEST_CASE:-}" = "same-sha-failed-rerun-message" ]; then
   echo "train-push.test.sh: isolated same-sha failed rerun passed"
   exit 0
 fi
+
+# A push creates an independent, initially running CI record for that exact sha
+# and branch. Only the test driver completes it; gh cannot invent a green run.
+# Repushing a new sha creates another run, just as the real push workflow does.
+cat > "$BIN_DIR/stack-gh.py" <<'PY'
+import json, os, pathlib, re, sys
+state = pathlib.Path(os.environ['TRAIN_PUSH_TEST_STATE'])
+args = sys.argv[1:]
+def option(name):
+    return args[args.index(name) + 1] if name in args else ''
+field, query = option('--json'), option('--jq')
+runs = [json.loads(p.read_text()) for p in (state / 'runs').glob('*.json')]
+if args[:2] == ['run', 'rerun']:
+    (state / 'reruns').write_text('unexpected rerun\n')
+    sys.exit(1)
+if args[:2] == ['run', 'list']:
+    sha = re.search(r'headSha=="([0-9a-f]+)"', query).group(1)
+    branch = re.search(r'headBranch=="([^"]+)"', query).group(1)
+    if branch == 'train/parent' and (state / 'fail_parent_query_network').exists():
+        print('dial tcp: i/o timeout while resolving parent CI run', file=sys.stderr)
+        sys.exit(1)
+    matches = [r for r in runs if r['sha'] == sha and r['branch'] == branch]
+    if matches:
+        print(max(matches, key=lambda r: r['id'])['id'])
+    sys.exit(0)
+if args[:2] != ['run', 'view']:
+    sys.exit('unexpected fake CI query: ' + repr(args))
+run = next(r for r in runs if str(r['id']) == args[2])
+if '--log-failed' in args:
+    print('FAIL [   0.10s] canned::stack_failure')
+elif field == 'status,conclusion,jobs,url':
+    jobs = [{
+        'name': 'Unit',
+        'databaseId': 9001,
+        'conclusion': 'failure' if run['conclusion'] == 'failure' else 'success',
+    }]
+    print(json.dumps({
+        'status': run['status'],
+        'conclusion': run['conclusion'],
+        'jobs': jobs,
+        'url': 'https://github.com/example/repo/actions/runs/' + str(run['id']),
+    }))
+elif field == 'url':
+    print('https://github.com/example/repo/actions/runs/' + str(run['id']))
+elif field == 'status,conclusion':
+    print(run['status'] + '\t' + run['conclusion'])
+elif field in ('status', 'conclusion'):
+    print(run[field])
+elif field == 'jobs':
+    if run['conclusion'] == 'failure':
+        print('Unit|9001')
+elif field == 'attempt':
+    print(1)
+else:
+    sys.exit('unexpected fake CI field: ' + field)
+PY
+
+new_stack_fixture() {
+  local dir
+  dir="$(new_fixture "$1")"
+  mkdir -p "$dir/ci-state/runs"
+  cat > "$dir/origin.git/hooks/post-receive" <<HOOK
+#!/usr/bin/env python3
+import json, pathlib, sys
+state = pathlib.Path('$dir/ci-state')
+for line in sys.stdin:
+    old, sha, ref = line.split()
+    if ref == 'refs/heads/$DEFAULT_BRANCH':
+        with (state / 'landings').open('a') as f:
+            f.write(sha + '\\n')
+    if not ref.startswith('refs/heads/train/') or set(sha) == {'0'}:
+        continue
+    rid = len(list((state / 'runs').glob('*.json'))) + 5000
+    run = dict(id=rid, sha=sha, branch=ref[len('refs/heads/'):], status='in_progress', conclusion='')
+    path = state / 'runs' / (str(rid) + '.json')
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(run))
+    tmp.replace(path)
+HOOK
+  chmod +x "$dir/origin.git/hooks/post-receive"
+  printf '%s\n' "$dir"
+}
+
+stack_worktree() {
+  git -C "$1/work" worktree add -qb "$2" "$1/$2" "$3"
+}
+
+stack_commit() {
+  echo "$2" > "$1/$2.txt"
+  git -C "$1" add "$2.txt"
+  git -C "$1" commit -qm "$2"
+}
+
+complete_stack_ci() {
+  python3 - "$1/ci-state" "$2" "$3" <<'PY'
+import json, pathlib, sys
+state, branch, conclusion = sys.argv[1:]
+runs = [p for p in pathlib.Path(state, 'runs').glob('*.json')
+        if json.loads(p.read_text())['branch'] == 'train/' + branch]
+assert runs, 'cannot complete a run that a push has not started'
+path = max(runs, key=lambda p: json.loads(p.read_text())['id'])
+run = json.loads(path.read_text())
+run.update(status='completed', conclusion=conclusion)
+tmp = path.with_suffix('.tmp')
+tmp.write_text(json.dumps(run))
+tmp.replace(path)
+PY
+}
+
+# Background only inside the harness: the driver has useful work (completing
+# independent runs) before joining every train. A bounded poll prevents a broken
+# train from leaving this suite hanging forever.
+start_stack_train() {
+  local dir="$1" worktree="$2" name="$3"
+  shift 3
+  (
+    TRAIN_PUSH_TEST_LIVE="$dir/$name.live" TRAIN_PUSH_TEST_CWD="$dir/$worktree" run_train "$dir" "$name" "$@"
+    printf '%s\n' "$LAST_OUT" > "$dir/$name.out"
+    printf '%s\n' "$LAST_RC" > "$dir/$name.rc"
+  ) &
+  STACK_PID=$!
+}
+
+wait_stack_push() {
+  local i
+  for i in $(seq 1 100); do
+    [ -n "$(origin_ref "$1" "refs/heads/train/$2")" ] &&
+      [ -n "$(python3 - "$1/ci-state/runs" "$2" <<'PY'
+import json, pathlib, sys
+print('yes' if any(json.loads(p.read_text())['branch'] == 'train/' + sys.argv[2]
+                   for p in pathlib.Path(sys.argv[1]).glob('*.json')) else '')
+PY
+)" ] && return 0
+    [ -f "$1/$2.rc" ] && break
+    sleep 0.02
+  done
+  LAST_OUT="$(cat "$1/$2.out" 2>/dev/null || true)"
+  fail "stack fixture $2 never pushed and started CI"
+  return 1
+}
+
+join_stack_train() {
+  wait "$2" || true
+  LAST_OUT="$(cat "$1/$3.out")"
+  LAST_RC="$(cat "$1/$3.rc")"
+}
+
+stack_child_fixture() {
+  local dir base
+  dir="$(new_stack_fixture "$1")"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  stack_worktree "$dir" child "$(git -C "$dir/parent" rev-parse HEAD)"
+  stack_commit "$dir/child" child
+  printf '%s\n' "$dir"
+}
+
+test_stack_base_not_on_main() {
+  local dir pid base
+  dir="$(stack_child_fixture stack-base)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
+    [[ "$LAST_OUT" == *"waiting for parent parent"* ]] && [[ "$LAST_OUT" == *"wait limit"* ]]; then
+    ok "stacked child cannot land before its base is on main"
+  else
+    fail "stacked child cannot land before its base is on main"
+  fi
+}
+
+test_stack_parent_red() {
+  local dir pid base
+  dir="$(stack_child_fixture stack-red)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  complete_stack_ci "$dir" parent failure
+  start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"CI green:"* ]] &&
+    [[ "$LAST_OUT" == *"parent parent is red; fix and repush it, then restack child"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "parent red blocks a green stacked child with the restack remedy"
+  else
+    fail "parent red blocks a green stacked child with the restack remedy"
+  fi
+}
+
+test_stack_changed_parent() {
+  local dir pid old_parent new_parent old_child child_sha
+  dir="$(stack_child_fixture stack-changed)"
+  old_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  # Record the child's original stack, then finish its own run while its parent
+  # is still running. The timeout is recoverable; CI keeps the green result.
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  stack_commit "$dir/parent" parent-fix
+  new_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  complete_stack_ci "$dir" parent success
+  TRAIN_PUSH_TEST_CWD="$dir/parent" run_train "$dir" parent --land
+  expect_rc 0 "repushed parent lands its new green sha"
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child --land
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"--restack"* ]] &&
+    [[ "$LAST_OUT" == *"base $old_parent"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$new_parent" ]; then
+    ok "a parent landed at a different sha refuses the child's old green"
+  else
+    fail "a parent landed at a different sha refuses the child's old green"
+  fi
+  # Restack removes the old parent range, replays only child commits, and must
+  # push a new sha with a fresh run instead of spending the previous green.
+  rm -f "$dir/child.rc" "$dir/child.out"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  for _ in $(seq 1 100); do
+    child_sha="$(origin_ref "$dir" refs/heads/train/child)"
+    [ "$child_sha" != "$old_child" ] &&
+      [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import json, pathlib, sys
+print(sum(json.loads(p.read_text())['branch'] == 'train/child' for p in pathlib.Path(sys.argv[1]).glob('*.json')))
+PY
+)" = 2 ] && break
+    [ -f "$dir/child.rc" ] && ! kill -0 "$pid" 2>/dev/null && break
+    sleep 0.02
+  done
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  expect_rc 0 "restack repushes, retests, and lands on the parent's new sha"
+  [ "$(git -C "$dir/child" rev-list --count "$new_parent..HEAD")" = 1 ] ||
+    fail "restack replayed parent commits instead of only the child"
+  [ -f "$dir/child/parent-fix.txt" ] || fail "restack lost the parent's fix"
+}
+
+test_stack_align_restack() {
+  local dir pid new_parent old_align_one old_align_two hand_subject old_child child_sha pushed
+  dir="$(stack_child_fixture stack-align)"
+  mkdir -p "$dir/child/docs"
+  printf 'child manifest\n' > "$dir/child/docs/v0.49-agent-surface-manifest.json"
+  git -C "$dir/child" add docs/v0.49-agent-surface-manifest.json
+  git -C "$dir/child" commit -qm "Align governed publication manifests"
+  old_align_one="$(git -C "$dir/child" rev-parse HEAD)"
+  printf 'child release manifest\n' > "$dir/child/docs/v0.49-release-manifest.json"
+  git -C "$dir/child" add docs/v0.49-release-manifest.json
+  git -C "$dir/child" commit -qm "Align release manifest and evidence"
+  old_align_two="$(git -C "$dir/child" rev-parse HEAD)"
+  printf 'manual work\n' > "$dir/child/manual.txt"
+  git -C "$dir/child" add manual.txt
+  git -C "$dir/child" commit -qm "Align governed publication manifests"
+
+  # Record the original parent base and let the child finish its first CI run.
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=2 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+
+  # The new parent tip changes the same governed files as both generated commits.
+  mkdir -p "$dir/parent/docs"
+  printf 'parent manifest\n' > "$dir/parent/docs/v0.49-agent-surface-manifest.json"
+  printf 'parent release manifest\n' > "$dir/parent/docs/v0.49-release-manifest.json"
+  git -C "$dir/parent" add docs/v0.49-agent-surface-manifest.json docs/v0.49-release-manifest.json
+  git -C "$dir/parent" commit -qm "parent: refresh governed manifests"
+  new_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  complete_stack_ci "$dir" parent success
+  TRAIN_PUSH_TEST_CWD="$dir/parent" run_train "$dir" parent --land
+  expect_rc 0 "parent with refreshed governed manifests lands before child restack"
+
+  rm -f "$dir/child.rc" "$dir/child.out"
+  rm -f "$dir/ci-state/runs"/*.json
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  pushed=0
+  for _ in $(seq 1 100); do
+    child_sha="$(origin_ref "$dir" refs/heads/train/child)"
+    if [ -n "$child_sha" ] && [ "$child_sha" != "$old_child" ] &&
+      [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import json, pathlib, sys
+print(sum(json.loads(p.read_text())['branch'] == 'train/child' for p in pathlib.Path(sys.argv[1]).glob('*.json')))
+PY
+)" -gt 0 ]; then
+      pushed=1
+      break
+    fi
+    [ -f "$dir/child.rc" ] && break
+    sleep 0.02
+  done
+  if [ "$pushed" -ne 1 ]; then
+    join_stack_train "$dir" "$pid" child
+    fail "restacking conflicting generated Align commits succeeds"
+    return
+  fi
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" -eq 0 ]; then
+    ok "restacking conflicting generated Align commits succeeds"
+  else
+    fail "restacking conflicting generated Align commits succeeds"
+    return
+  fi
+  [ "$(python3 - "$dir/child" "$new_parent" <<'PY'
+import subprocess, sys
+repo, base = sys.argv[1:]
+allowed = {
+    'docs/v0.49-agent-prefix-capture.json',
+    'docs/v0.49-agent-surface-manifest.json',
+    'docs/v0.49-legacy-vocabulary-allowlist.json',
+    'docs/v0.49-release-evidence.json',
+    'docs/v0.49-release-manifest.json',
+}
+commits = subprocess.check_output(['git', '-C', repo, 'rev-list', '--reverse', f'{base}..HEAD'], text=True).splitlines()
+count = 0
+for commit in commits:
+    subject = subprocess.check_output(['git', '-C', repo, 'show', '-s', '--format=%s', commit], text=True).strip()
+    paths = subprocess.check_output(['git', '-C', repo, 'diff-tree', '--root', '--no-commit-id', '--no-renames', '--name-only', '-r', commit], text=True).splitlines()
+    if subject in {'Align governed publication manifests', 'Align release manifest and evidence'} and paths and set(paths) <= allowed:
+        count += 1
+print(count)
+PY
+)" = 0 ] ||
+    fail "restack leaves no generated Align commits"
+  [ ! -f "$dir/ci-state/align-calls" ] ||
+    fail "restack never runs the obsolete governed-doc aligner"
+  hand_subject="$(git -C "$dir/child" log -1 --format=%s HEAD -- manual.txt)"
+  if [ -f "$dir/child/manual.txt" ] && [ "$hand_subject" = "Align governed publication manifests" ]; then
+    ok "an exact-subject hand commit touching an ungoverned file is retained"
+  else
+    fail "an exact-subject hand commit touching an ungoverned file is retained"
+  fi
+  ! git -C "$dir/child" merge-base --is-ancestor "$old_align_one" HEAD &&
+    ! git -C "$dir/child" merge-base --is-ancestor "$old_align_two" HEAD ||
+    fail "the old generated Align commits are not replayed"
+}
+
+test_stack_chain() {
+  local dir base p1 p2 p3 s1 s2 s3
+  dir="$(new_stack_fixture stack-chain)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  s1="$(git -C "$dir/parent" rev-parse HEAD)"
+  start_stack_train "$dir" parent parent; p1="$STACK_PID"
+  if ! wait_stack_push "$dir" parent; then join_stack_train "$dir" "$p1" parent; return; fi
+  stack_worktree "$dir" child "$s1"
+  stack_commit "$dir/child" child
+  s2="$(git -C "$dir/child" rev-parse HEAD)"
+  # No --on here: detect the nearest pending train tip as the parent.
+  start_stack_train "$dir" child child; p2="$STACK_PID"
+  if ! wait_stack_push "$dir" child; then
+    complete_stack_ci "$dir" parent success
+    join_stack_train "$dir" "$p1" parent; join_stack_train "$dir" "$p2" child; return
+  fi
+  stack_worktree "$dir" grandchild "$s2"
+  stack_commit "$dir/grandchild" grandchild
+  s3="$(git -C "$dir/grandchild" rev-parse HEAD)"
+  start_stack_train "$dir" grandchild grandchild; p3="$STACK_PID"
+  if wait_stack_push "$dir" grandchild; then complete_stack_ci "$dir" grandchild success; fi
+  complete_stack_ci "$dir" child success
+  # Green descendants cannot land while their parent is running. Wait until
+  # the child itself reports that it is waiting at the parent landing guard
+  # before letting the parent finish; otherwise the parent can land first and
+  # the child never reaches that wait. The parent's own CI watch issues the
+  # same gh queries, so only the child's announcement is a reliable signal.
+  # The deadline only guards against a hang.
+  reached_guard=0
+  for _ in $(seq 1 3000); do
+    if grep -q 'waiting for parent parent' "$dir/child.live" 2>/dev/null; then
+      reached_guard=1
+      break
+    fi
+    sleep 0.02
+  done
+  if [ "$reached_guard" -ne 1 ]; then
+    fail "stacked child reached the parent landing guard within 60 s"
+  fi
+  if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
+    kill -0 "$p1" && kill -0 "$p2" && kill -0 "$p3"; then
+    ok "stacked child waits while parent CI runs; all three CI runs started in parallel"
+  else
+    fail "stacked child waits while parent CI runs; all three CI runs started in parallel"
+  fi
+  complete_stack_ci "$dir" parent success
+  join_stack_train "$dir" "$p1" parent; expect_rc 0 "stack chain parent lands"
+  join_stack_train "$dir" "$p2" child; expect_rc 0 "stacked child lands without a rerun after parent lands"
+  expect_out "waiting for parent parent" "stacked child reports its bounded parent wait"
+  expect_no_out "round 2" "stacked child spends its original green without requeue"
+  join_stack_train "$dir" "$p3" grandchild; expect_rc 0 "three-deep grandchild lands"
+  expect_out "detected parent child at $s2" "auto-detection chooses the nearest pending train in a three-deep chain"
+  if [ "$(cat "$dir/ci-state/landings")" = "$(printf '%s\n' "$s1" "$s2" "$s3")" ] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$s3" ] &&
+    [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import pathlib, sys
+print(len(list(pathlib.Path(sys.argv[1]).glob('*.json'))))
+PY
+)" = 3 ] &&
+    [ ! -s "$dir/ci-state/reruns" ]; then
+    ok "three-deep chain lands in order at the exact tested shas with one CI run each"
+  else
+    fail "three-deep chain lands in order at the exact tested shas with one CI run each"
+  fi
+}
+
+test_stack_abandoned_parent() {
+  local dir pid base old_child
+  dir="$(stack_child_fixture stack-abandoned)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  git -C "$dir/parent" push -q origin --delete train/parent
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child --land
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent is abandoned"* ]] &&
+    [[ "$LAST_OUT" == *"--restack"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "an abandoned parent blocks the child's recorded green"
+  else
+    fail "an abandoned parent blocks the child's recorded green"
+  fi
+  rm -f "$dir/child.rc" "$dir/child.out"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  for _ in $(seq 1 100); do
+    [ "$(origin_ref "$dir" refs/heads/train/child)" != "$old_child" ] && break
+    [ -f "$dir/child.rc" ] && break
+    sleep 0.02
+  done
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 0 ] && [ "$(git -C "$dir/child" rev-list --count "$base..HEAD")" = 1 ] &&
+    [ ! -f "$dir/child/parent.txt" ] && [ -f "$dir/child/child.txt" ]; then
+    ok "restacking an abandoned parent onto main removes only the parent range and retests"
+  else
+    fail "restacking an abandoned parent onto main removes only the parent range and retests"
+  fi
+}
+
+test_stack_name_lock() {
+  local dir pid base
+  dir="$(new_stack_fixture stack-name-lock)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  start_stack_train "$dir" parent parent
+  pid="$STACK_PID"
+  if ! wait_stack_push "$dir" parent; then join_stack_train "$dir" "$pid" parent; return; fi
+  stack_worktree "$dir" duplicate "$(git -C "$dir/parent" rev-parse HEAD)"
+  TRAIN_PUSH_TEST_CWD="$dir/duplicate" run_train "$dir" parent
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"train parent is RUNNING as pid"* ]]; then
+    ok "one train name cannot be driven concurrently from different worktrees"
+  else
+    fail "one train name cannot be driven concurrently from different worktrees"
+  fi
+  complete_stack_ci "$dir" parent success
+  join_stack_train "$dir" "$pid" parent
+  expect_rc 0 "the original train retains its name lock and lands"
+}
+
+# Name-lock recovery must be serialized in the shared git directory, not in
+# whichever linked worktree happens to be recovering it. An interrupted reaper
+# is an intentional fail-closed condition; another worktree must not bypass it.
+test_stack_name_lock_recovery() {
+  local dir base key lock
+  dir="$(new_fixture stack-name-recovery)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" child "$base"
+  stack_commit "$dir/child" child
+  key="$(printf '%s' child | git -C "$dir/work" hash-object --stdin)"
+  lock="$dir/work/.git/train-push-locks/by-name-$key"
+  mkdir -p "$lock/held" "$lock/reap"
+  printf '2147483000 gone\n' > "$lock/held/owner"
+  printf '2147483000\n' > "$lock/reap/owner"
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"train lock recovery left behind"* ]] &&
+    [ -f "$lock/reap/owner" ] && [ -f "$lock/held/owner" ] &&
+    [ -z "$(origin_ref "$dir" refs/heads/train/child)" ]; then
+    ok "a linked worktree cannot bypass interrupted shared name-lock recovery"
+  else
+    fail "a linked worktree cannot bypass interrupted shared name-lock recovery"
+  fi
+}
+
+# Inject the errors Git emits when linked worktrees update shared remote refs.
+# The real fetch still runs on successful attempts; auth/permission failures
+# are separate controls and must never be mistaken for a ref-update race.
+install_fetch_faults() {
+  local dir="$1" real_git
+  real_git="$(command -v git)"
+  mkdir -p "$dir/fixturebin"
+  cat > "$dir/fixturebin/git" <<SHIM
+#!/usr/bin/env bash
+if [ -f "$dir/ci-state/polling" ]; then
+  for arg in "\$@"; do
+    if [ "\$arg" = "refs/heads/train/parent" ]; then
+      case "\$(cat "$dir/ci-state/fetch-fault")" in
+        remote-error) echo 'fatal: Authentication failed for origin' >&2; exit 128 ;;
+        remote-empty) exit 0 ;;
+      esac
+    fi
+  done
+fi
+for arg in "\$@"; do
+  if [ "\$arg" = push ] && [ "\$(cat "$dir/ci-state/fetch-fault")" = recover ] &&
+    [ ! -f "$dir/ci-state/successful-fetches" ]; then
+    touch "$dir/ci-state/pushed-before-fetch-recovery"
+  fi
+  if [ "\$arg" = fetch ]; then
+    count=0
+    [ ! -f "$dir/ci-state/fetch-count" ] || read -r count < "$dir/ci-state/fetch-count"
+    count=\$((count + 1))
+    printf '%s\\n' "\$count" > "$dir/ci-state/fetch-count"
+    mode=\$(cat "$dir/ci-state/fetch-fault")
+    case "\$mode" in
+      recover)
+        if [ "\$count" = 1 ]; then
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+          exit 1
+        elif [ "\$count" = 2 ]; then
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': Unable to create 'common/refs/remotes/origin/$DEFAULT_BRANCH.lock': File exists." >&2
+          exit 1
+        fi
+        ;;
+      persistent)
+        echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+        exit 1
+        ;;
+      permission)
+        echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': Unable to create 'common/refs/remotes/origin/$DEFAULT_BRANCH.lock': Permission denied" >&2
+        exit 1
+        ;;
+      transport)
+        echo 'fatal: Authentication failed for origin' >&2
+        exit 128
+        ;;
+      polling)
+        if [ -f "$dir/ci-state/polling" ]; then
+          echo fetched > "$dir/ci-state/fetched-while-polling"
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+          exit 1
+        fi
+        ;;
+    esac
+    printf '%s\\n' "\$count" >> "$dir/ci-state/successful-fetches"
+    break
+  fi
+done
+exec "$real_git" "\$@"
+SHIM
+  chmod +x "$dir/fixturebin/git"
+}
+
+test_fetch_race_retry() {
+  local dir
+  dir="$(new_fixture fetch-recovery)"
+  stack_worktree "$dir" child "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_commit "$dir/child" child
+  echo recover > "$dir/ci-state/fetch-fault"
+  install_fetch_faults "$dir"
+  PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child
+  if [ "$LAST_RC" = 0 ] && [[ "$LAST_OUT" == *"shared ref update race; retrying"* ]] &&
+    [ "$(head -1 "$dir/ci-state/successful-fetches" 2>/dev/null)" = 3 ] &&
+    [ ! -f "$dir/ci-state/pushed-before-fetch-recovery" ] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/child" rev-parse HEAD)" ]; then
+    ok "a linked-worktree train retries ref-lock and compare-and-swap fetch failures and lands"
+  else
+    fail "a linked-worktree train retries ref-lock and compare-and-swap fetch failures and lands"
+  fi
+}
+
+test_fetch_failure_boundaries() {
+  local dir mode want
+  for mode in persistent permission transport; do
+    dir="$(new_fixture "fetch-$mode")"
+    add_train_commit "$dir/work" "fetch-$mode"
+    echo "$mode" > "$dir/ci-state/fetch-fault"
+    install_fetch_faults "$dir"
+    PATH="$dir/fixturebin:$PATH" run_train "$dir" "fetch-$mode"
+    want=1
+    [ "$mode" != persistent ] || want=5
+    if [ "$LAST_RC" = 2 ] && [ "$(cat "$dir/ci-state/fetch-count")" = "$want" ] &&
+      [ -z "$(origin_ref "$dir" "refs/heads/train/fetch-$mode")" ]; then
+      ok "$mode fetch failures refuse before push after exactly $want attempt(s)"
+    else
+      fail "$mode fetch failures refuse before push after exactly $want attempt(s)"
+    fi
+  done
+}
+
+test_stack_poll_without_fetch() {
+  local dir pid
+  dir="$(stack_child_fixture stack-polling)"
+  echo polling > "$dir/ci-state/fetch-fault"
+  install_fetch_faults "$dir"
+  PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then
+    touch "$dir/ci-state/polling"
+    complete_stack_ci "$dir" child success
+  fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent has not landed"* ]] &&
+    [ ! -f "$dir/ci-state/fetched-while-polling" ]; then
+    ok "a stacked child polls remote parent refs without fetching shared tracking refs"
+  else
+    fail "a stacked child polls remote parent refs without fetching shared tracking refs"
+  fi
+}
+
+test_stack_unseen_remote_head() {
+  local dir pid old_main new_main=""
+  dir="$(stack_child_fixture stack-unseen-head)"
+  old_main="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then
+    # The peer is a separate clone, so this object is not yet in the linked
+    # worktrees' shared object database when the child starts polling.
+    advance_origin_main "$dir" peer-after-child-push
+    new_main="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+    if git -C "$dir/child" cat-file -e "$new_main^{commit}" 2>/dev/null; then
+      fail "unseen-head fixture unexpectedly already has the peer's commit"
+    fi
+    complete_stack_ci "$dir" child success
+  fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent has not landed"* ]] &&
+    git -C "$dir/child" cat-file -e "$new_main^{commit}" 2>/dev/null &&
+    [ "$(git -C "$dir/child" rev-parse "origin/$DEFAULT_BRANCH")" = "$old_main" ]; then
+    ok "a child downloads an unseen remote head without changing shared tracking refs"
+  else
+    fail "a child downloads an unseen remote head without changing shared tracking refs"
+  fi
+}
+
+test_stack_remote_read_failures() {
+  local dir pid mode
+  for mode in remote-error remote-empty; do
+    dir="$(stack_child_fixture "stack-$mode")"
+    echo "$mode" > "$dir/ci-state/fetch-fault"
+    install_fetch_faults "$dir"
+    PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+    pid="$STACK_PID"
+    if wait_stack_push "$dir" child; then
+      touch "$dir/ci-state/polling"
+      complete_stack_ci "$dir" child success
+    fi
+    join_stack_train "$dir" "$pid" child
+    if [ "$LAST_RC" = 4 ] && [[ "$LAST_OUT" == *"CI green, but landing failed"* ]] &&
+      [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/child" rev-parse HEAD~2)" ]; then
+      ok "$mode while reading parent heads fails closed without landing"
+    else
+      fail "$mode while reading parent heads fails closed without landing"
+    fi
+  done
+}
+
+test_stack_parent_query_network_failure() {
+  local dir pid query_count
+  dir="$(stack_child_fixture stack-parent-query-error)"
+  : > "$dir/ci-state/fail_parent_query_network"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 \
+    start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  query_count="$(grep -c 'headBranch=="train/parent"' "$dir/ci-state/gh-calls")"
+  if [ "$LAST_RC" -eq 5 ] && [[ "$LAST_OUT" == *'could not query CI runs for'* ]] &&
+    [[ "$LAST_OUT" == *'dial tcp: i/o timeout while resolving parent CI run'* ]] &&
+    [ "$query_count" -eq 5 ]; then
+    ok 'a persistent parent-run network error exits 5 after bounded retries'
+  else
+    fail "a persistent parent-run network error exits 5 after bounded retries (rc=$LAST_RC calls=$query_count)"
+  fi
+}
+
+test_ci_conclusion_guard() {
+  local dir base
+  dir="$(new_fixture ci-conclusion)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  add_train_commit "$dir/work" ci-conclusion
+  # watch-ci's all-jobs-passed fallback can return zero for this non-success
+  # summary. The landing contract still requires the run to conclude success.
+  echo cancelled > "$dir/ci-state/conclusion"
+  run_train "$dir" ci-conclusion
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"did not conclude success; not landing"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "a non-success run summary cannot authorize landing even if the watcher returns zero"
+  else
+    fail "a non-success run summary cannot authorize landing even if the watcher returns zero"
+  fi
+}
+
+run_stack_tests() {
+  test_stack_base_not_on_main
+  test_stack_parent_red
+  test_stack_changed_parent
+  test_stack_align_restack
+  test_stack_abandoned_parent
+  test_stack_name_lock
+  test_stack_name_lock_recovery
+  test_stack_poll_without_fetch
+  test_stack_unseen_remote_head
+  test_stack_remote_read_failures
+  test_stack_parent_query_network_failure
+  test_fetch_race_retry
+  test_fetch_failure_boundaries
+  test_stack_chain
+  test_ci_conclusion_guard
+}
+
+test_skew_log_query_fallback() {
+  local dir
+  dir="$(new_fixture skew-log-query-fallback)"
+  add_train_commit "$dir/work" skew-log-query-fallback
+  echo 'Unit (ubuntu-latest)|9007' > "$dir/ci-state/failed_job"
+  echo failure > "$dir/ci-state/conclusion"
+  printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+  : > "$dir/ci-state/fail_job_log"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" skew-log-query-fallback
+  if [ "$LAST_RC" -eq 1 ] && [[ "$LAST_OUT" == *'skew check skipped'* ]] &&
+    [[ "$LAST_OUT" == *'Unit (ubuntu-latest)'* ]] &&
+    [[ "$LAST_OUT" != *'version/lock skew'* ]]; then
+    ok 'a failed skew-log query skips classification and preserves the ordinary CI-red exit'
+  else
+    fail "a failed skew-log query skips classification and preserves the ordinary CI-red exit (rc=$LAST_RC)"
+  fi
+  if grep -Fq -- 'api --allow-escape-sequences repos/example/repo/actions/jobs/9007/logs' \
+    "$dir/ci-state/gh-calls"; then
+    ok 'the failed skew-log query uses gh api with ANSI escapes allowed'
+  else
+    fail 'the failed skew-log query uses gh api with ANSI escapes allowed'
+  fi
+}
+
+test_gh_query_retry() {
+  local dir query_count
+
+  dir="$(new_fixture gh-rate-limit-retry)"
+  add_train_commit "$dir/work" gh-rate-limit-retry
+  : > "$dir/ci-state/fail_rate_limit_once"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" gh-rate-limit-retry
+  if [ "$LAST_RC" -eq 0 ] && [[ "$LAST_OUT" == *'failed transiently; retrying (attempt 2 of 5 after 0s)'* ]]; then
+    ok 'a GitHub rate-limit response retries and the successful query can land'
+  else
+    fail "a GitHub rate-limit response retries and the successful query can land (rc=$LAST_RC)"
+  fi
+
+  dir="$(new_fixture gh-network-retry)"
+  add_train_commit "$dir/work" gh-network-retry
+  : > "$dir/ci-state/fail_network_always"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" gh-network-retry
+  query_count="$(grep -c -- '--json databaseId,headSha,headBranch' "$dir/ci-state/gh-calls")"
+  if [ "$LAST_RC" -eq 5 ] && [[ "$LAST_OUT" == *'could not query CI runs for'* ]] &&
+    [[ "$LAST_OUT" == *'dial tcp: i/o timeout'* ]] && [ "$query_count" -eq 6 ]; then
+    ok 'a persistent network error retries four times then exits 5 with the upstream error'
+  else
+    fail "a persistent network error retries four times then exits 5 with the upstream error (rc=$LAST_RC calls=$query_count)"
+  fi
+}
+
+test_race_lock() {
+  # Both racers rendezvous after attempting to create the lock directory and
+  # before the exclusive owner-file claim. This forces the interleaving that
+  # exposed non-exclusive directory creation; the slow ls-remote keeps the winner
+  # alive while the loser verifies that no train ref was pushed.
+  local dir real_git racer_a racer_b race_owner race_loser
+  dir="$(new_fixture race)"
+  add_train_commit "$dir/work" "race"
+  mkdir -p "$dir/fixturebin" "$dir/lock-barrier"
+  cat > "$dir/lock-create-hook.sh" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "$TRAIN_PUSH_TEST_LOCK_PATH" ] || exit 0
+printf '%s\n' ready > "$TRAIN_PUSH_TEST_LOCK_BARRIER/$2"
+for _ in {1..500}; do
+  if [ -f "$TRAIN_PUSH_TEST_LOCK_BARRIER/racer-a" ] && [ -f "$TRAIN_PUSH_TEST_LOCK_BARRIER/racer-b" ]; then
+    exit 0
+  fi
+  sleep 0.01
+done
+printf 'lock race barrier timed out for %s\n' "$2" >&2
+exit 1
+HOOK
+  chmod +x "$dir/lock-create-hook.sh"
+  real_git="$(command -v git)"
+  printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "ls-remote" ] && sleep 0.5; done\nexec %s "$@"\n' "$real_git" > "$dir/fixturebin/git"
+  chmod +x "$dir/fixturebin/git"
+  (
+    cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+      OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_TEST_LOCK_CREATE_HOOK="$dir/lock-create-hook.sh" \
+      TRAIN_PUSH_TEST_LOCK_PATH="$dir/work/.git/train-push-locks/held" \
+      TRAIN_PUSH_TEST_LOCK_BARRIER="$dir/lock-barrier" \
+      WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+      "$TRAIN_PUSH" racer-a > "$dir/racer-a.out" 2>&1
+  ) &
+  racer_a=$!
+  (
+    cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+      OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_TEST_LOCK_CREATE_HOOK="$dir/lock-create-hook.sh" \
+      TRAIN_PUSH_TEST_LOCK_PATH="$dir/work/.git/train-push-locks/held" \
+      TRAIN_PUSH_TEST_LOCK_BARRIER="$dir/lock-barrier" \
+      WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+      "$TRAIN_PUSH" racer-b > "$dir/racer-b.out" 2>&1
+  ) &
+  racer_b=$!
+  wait "$racer_a" || true
+  wait "$racer_b" || true
+  race_owner="$(head -1 "$dir/work/.git/train-push-locks/held/owner" 2>/dev/null || true)"
+  case "$race_owner" in
+    *" racer-a") race_loser="racer-b" ;;
+    *" racer-b") race_loser="racer-a" ;;
+    *) race_loser="" ;;
+  esac
+  if [ -n "$race_loser" ]; then
+    if grep -Eq 'a train is already running|train lock is held with no readable owner' "$dir/$race_loser.out"; then
+      ok "the loser ($race_loser) was refused, not admitted"
+    else
+      fail "the loser ($race_loser) was admitted alongside the winner"
+      printf '%s\n' '--- racer-a output ---' >&2
+      printf '%s\n' "$(<"$dir/racer-a.out")" >&2
+      printf '%s\n' '--- racer-b output ---' >&2
+      printf '%s\n' "$(<"$dir/racer-b.out")" >&2
+    fi
+    if [ -z "$(origin_ref "$dir" "refs/heads/train/$race_loser")" ]; then
+      ok "the refused racer ($race_loser) pushed no train ref"
+    else
+      fail "the refused racer ($race_loser) pushed a train ref"
+    fi
+  else
+    fail "the lock owner is not a single racer: '$race_owner'"
+  fi
+}
+
+case "${TRAIN_PUSH_TEST_CASE:-}" in
+  stack-base) test_stack_base_not_on_main ;;
+  stack-red) test_stack_parent_red ;;
+  stack-changed) test_stack_changed_parent ;;
+  stack-align) test_stack_align_restack ;;
+  stack-chain) test_stack_chain ;;
+  stack-abandoned) test_stack_abandoned_parent ;;
+  stack-name-lock) test_stack_name_lock ;;
+  stack-name-recovery) test_stack_name_lock_recovery ;;
+  stack-polling) test_stack_poll_without_fetch ;;
+  stack-unseen-head) test_stack_unseen_remote_head ;;
+  stack-remote-errors) test_stack_remote_read_failures ;;
+  stack-parent-query-error) test_stack_parent_query_network_failure ;;
+  fetch-retry) test_fetch_race_retry ;;
+  fetch-boundaries) test_fetch_failure_boundaries ;;
+  ci-conclusion) test_ci_conclusion_guard ;;
+  skew-log-fallback) test_skew_log_query_fallback ;;
+  gh-retry) test_gh_query_retry ;;
+  race-lock) test_race_lock ;;
+  stacked) run_stack_tests ;;
+esac
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
+  [ "$failures" = 0 ] || exit 1
+  if [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
+    echo "train-push.test.sh: race-lock case passed ($checks checks)"
+  else
+    echo "train-push.test.sh: stacked cases passed ($checks checks)"
+  fi
+  exit 0
+fi
+run_stack_tests
+
+# --- refusal: no train name ------------------------------------------------
+dir="$(new_fixture no-path-checker)"
+add_train_commit "$dir/work" "no-path-checker"
+git -C "$dir/work" rm -q scripts/check-path-deps.py
+git -C "$dir/work" commit -qm "drop the path checker"
+run_train "$dir" no-path-checker
+expect_rc 2 "a missing path-dependency checker refuses"
+expect_out "scripts/check-path-deps.py not found" "the refusal names the missing checker"
+expect_no_out "dependency path resolves outside" "a missing checker is not reported as a path verdict"
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
@@ -583,8 +1611,8 @@ add_train_commit "$dir/work" "probe"
 run_train "$dir" probe
 expect_rc 0 "the first train probes the trigger and lands"
 expect_out "first train in this repo" "first run announces the probe"
-expect_out "trigger proven by run 4242" "first run records the run that proved it"
-grep -q "run 4242" "$dir/work/.git/train-push-proven" ||
+expect_out "trigger proven by run 42424242424" "first run records the run that proved it"
+grep -q "run 42424242424" "$dir/work/.git/train-push-proven" ||
   fail "probe marker does not carry the run id"
 [ -z "$(origin_ref "$dir" refs/heads/train/trigger-probe)" ] ||
   fail "probe left its branch behind on origin"
@@ -693,11 +1721,17 @@ add_train_commit "$dir/work" "skew-log"
 echo "Build and test (macOS)|9004" > "$dir/ci-state/failed_job"
 echo "failure" > "$dir/ci-state/conclusion"
 printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
-printf 'compile ok\nunit tests ok\nerror: Cargo.lock has drifted from the committed manifests; run cargo update -w\n' > "$dir/ci-state/log_tail"
+printf 'compile ok\nunit tests ok\n\033[31merror: Cargo.lock has drifted from the committed manifests; run cargo update -w\033[0m\n' > "$dir/ci-state/log_tail"
 run_train "$dir" skew-log
 expect_rc 1 "a log-tail skew red exits 1"
 expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
   "a lockfile drift line in the failing log's tail is classed as skew"
+if grep -Fq -- 'api --allow-escape-sequences repos/example/repo/actions/jobs/9004/logs' \
+  "$dir/ci-state/gh-calls"; then
+  ok "ANSI-colored job logs are read through gh api with escape sequences allowed"
+else
+  fail "ANSI-colored job logs are read through gh api with escape sequences allowed"
+fi
 
 # --- red that is a plain test failure: never classed as skew ----------------
 dir="$(new_fixture skew-not)"
@@ -939,7 +1973,7 @@ echo "failure" > "$dir/ci-state/conclusion"
 run_train "$dir" red
 expect_rc 1 "red CI exits 1"
 expect_out "Unit (ubuntu-latest)" "red CI names the failing job"
-expect_out "actions/runs/4242" "red CI prints the run url"
+expect_out "actions/runs/42424242424" "red CI prints the run url"
 [ -n "$(origin_ref "$dir" refs/heads/train/red)" ] ||
   fail "red CI deleted the train branch instead of leaving it to fix"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/work" rev-parse HEAD~1)" ] ||
@@ -979,53 +2013,6 @@ expect_rc 2 "external path dependency refuses before pushing"
 expect_out "package=escape" "the local gate names the escaping package"
 [ -z "$(origin_ref "$dir" refs/heads/train/external-path-dependency)" ] ||
   fail "the external path dependency preflight pushed a train branch"
-
-# The real layout checker must refuse before a train branch is pushed; stubbing
-# it green would not prove either the ignore controls or the tracked-file fence.
-install_layout_fixture() {
-  local work="$1"
-  cp "$SCRIPT_DIR/check-cortexkit-layout.sh" "$work/scripts/check-cortexkit-layout.sh"
-  # Internal records are ignored, while publishable guidance and release inputs
-  # stay eligible for tracking through the explicit exceptions.
-  cat > "$work/.gitignore" <<'IGNORE'
-# CortexKit layout: see WORKSPACE.md "Where files go"
-/.cortexkit/*
-!/.cortexkit/release-notes/
-!/.cortexkit/skills/
-!/.cortexkit/rules/
-!/.cortexkit/WORKER.md
-IGNORE
-  git -C "$work" add .gitignore scripts/check-cortexkit-layout.sh
-}
-
-dir="$(new_fixture layout-clean)"
-install_layout_fixture "$dir/work"
-git -C "$dir/work" commit -qm "install layout controls"
-run_train "$dir" layout-clean
-expect_rc 0 "a clean CortexKit layout permits the train"
-expect_out "preflights: cortexkit-layout" "the preflight header names the layout gate"
-
-dir="$(new_fixture layout-internal)"
-install_layout_fixture "$dir/work"
-mkdir -p "$dir/work/.cortexkit/internal-docs/audits"
-echo "internal fixture" > "$dir/work/.cortexkit/internal-docs/audits/control.md"
-git -C "$dir/work" add -f .cortexkit/internal-docs/audits/control.md
-git -C "$dir/work" commit -qm "track an internal document"
-run_train "$dir" layout-internal
-expect_rc 2 "tracked internal material refuses the train"
-expect_out ".cortexkit/internal-docs/audits/control.md" "the layout refusal names the internal file"
-[ -z "$(origin_ref "$dir" refs/heads/train/layout-internal)" ] ||
-  fail "the layout preflight pushed a train with internal material"
-
-dir="$(new_fixture layout-blind)"
-cp "$SCRIPT_DIR/check-cortexkit-layout.sh" "$dir/work/scripts/check-cortexkit-layout.sh"
-git -C "$dir/work" add scripts/check-cortexkit-layout.sh
-git -C "$dir/work" commit -qm "install checker without ignore controls"
-run_train "$dir" layout-blind
-expect_rc 2 "missing ignore controls refuse the train"
-expect_out "BLIND:" "the layout refusal distinguishes a missing ignore block"
-[ -z "$(origin_ref "$dir" refs/heads/train/layout-blind)" ] ||
-  fail "the layout preflight pushed a train without ignore controls"
 
 # --- green: lands on main, train branch cleaned up -------------------------
 dir="$(new_fixture green)"
@@ -1098,7 +2085,7 @@ heartbeat="$dir/work/.git/train-push-watch-signal.watch"
   exec env PATH="$BIN_DIR:$PATH" REPO=example/repo \
     OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
     TRAIN_PUSH_TEST_STATE="$dir/ci-state" WATCH_CI_HEARTBEAT="$heartbeat" \
-    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 4242 > "$dir/watch-signal.out" 2>&1
+    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 42424242424 > "$dir/watch-signal.out" 2>&1
 ) &
 watcher_pid=$!
 sleep_child=""
@@ -1148,7 +2135,7 @@ expect_no_out "Unable to read current working directory" "landing does not ask g
 mutant_dir="$TMP_ROOT/cwd-mutant-scripts"
 cp -R "$SCRIPT_DIR" "$mutant_dir"
 mutant="$mutant_dir/train-push.sh"
-sed 's/git -C "$REPO" fetch -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
+sed 's/fetch_remote -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
 chmod +x "$mutant"
 grep -q '^  git fetch -q "$remote" "$default_branch"' "$mutant" ||
   fail "cwd mutation did not restore a bare post-watch git call"
@@ -1183,7 +2170,7 @@ run_train "$dir" removed-repo
 expect_rc 4 "a repository removed after green exits in the landing-failed state"
 expect_out "repository path" "a removed repository root is identified distinctly"
 expect_out "no longer exists" "a removed repository root says what disappeared"
-expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+expect_out "green run: https://github.com/example/repo/actions/runs/42424242424" \
   "removed-repository failure preserves the green run"
 expect_out "train sha: $train_sha" "removed-repository failure preserves the verified sha"
 expect_out "scripts/train-push.sh removed-repo --land" \
@@ -1203,7 +2190,7 @@ expect_out "landed previously-verified sha $train_sha" "the recovery names the e
 expect_no_out "creating origin/train/existing-green" "recorded green skips creating the train branch"
 expect_no_out "updating origin/train/existing-green" "recorded green skips updating the train branch"
 expect_no_out "watching CI" "recorded green skips the watch"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   fail "recorded green invoked watch-ci instead of spending the verdict"
 else
   ok "recorded green did not invoke watch-ci"
@@ -1275,7 +2262,7 @@ run_train "$dir" existing-running
 expect_rc 0 "an existing running train is watched and landed"
 expect_out "attaching to CI for existing origin/train/existing-running at $train_sha" \
   "the running recovery attaches to the exact train tip"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   ok "running recovery invoked watch-ci"
 else
   fail "running recovery landed without attaching watch-ci"
@@ -1292,11 +2279,11 @@ echo "failure|9101" > "$dir/ci-state/rerun_jobs"
 echo "failure" > "$dir/ci-state/rerun_conclusion"
 run_train "$dir" existing-red
 expect_rc 1 "an existing red train refuses to land"
-expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+expect_out "sha already ran in https://github.com/example/repo/actions/runs/42424242424 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
   "an existing failed sha announces the rerun and new attempt"
 expect_out "fix, commit, and re-run: scripts/train-push.sh existing-red" \
   "recorded red preserves the fix-and-repush instruction"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --failed" ] ||
   fail "an existing failed run was not rerun through the operator gh bypass"
 grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
   fail "an existing failed run was not watched at attempt 2"
@@ -1317,9 +2304,9 @@ run_train "$dir" existing-failed-rerun-green
 expect_rc 0 "a failed existing run reruns and lands when the new attempt passes"
 expect_out "(failure); rerunning its failed and cancelled jobs (attempt 2)" \
   "failed recovery identifies the new attempt"
-expect_out "CI_DONE run=4242 conclusion=success attempt=2" \
+expect_out "CI_DONE run=42424242424 conclusion=success attempt=2" \
   "recovery reports the new attempt's success"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --failed" ] ||
   fail "the failed existing run did not request a failed-jobs rerun"
 grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
   fail "the successful retry was not watched at attempt 2"
@@ -1340,8 +2327,8 @@ run_train "$dir" existing-cancelled-job
 expect_rc 0 "a cancelled job is rerun and its new attempt lands"
 expect_out "(cancelled); rerunning its failed and cancelled jobs (attempt 3)" \
   "cancelled recovery announces the new attempt"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --job 9102
-bypass=operator run rerun 4242 --job 9104" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --job 9102
+bypass=operator run rerun 42424242424 --job 9104" ] ||
   fail "cancelled jobs were not rerun by job id through the operator gh bypass"
 grep -q -- '--attempt 3' "$dir/ci-state/gh-calls" ||
   fail "the cancelled-job recovery did not watch attempt 3"
@@ -1377,7 +2364,7 @@ git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green-mutant"
 TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
 run_train "$dir" existing-green-mutant --land
 TRAIN_PUSH="$TRAIN_PUSH_SAVED"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   ok "ignoring the recorded verdict wrongly invokes watch-ci (proves the green recovery arm bites)"
 else
   fail "the recorded-verdict mutant did not invoke watch-ci"
@@ -1583,7 +2570,7 @@ run_train "$dir" protected
 expect_rc 4 "a protection refusal after green exits in the landing-failed state"
 expect_out "refused: $protected_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
   "protection refusal prints the merge-as-a-train remedy"
-expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+expect_out "green run: https://github.com/example/repo/actions/runs/42424242424" \
   "post-CI failure names the green run"
 expect_out "train sha: $protected_sha" "post-CI failure names the verified train sha"
 expect_out "scripts/train-push.sh protected --land" \
@@ -1648,24 +2635,23 @@ else
   ok "nothing was pushed after the preflight refused"
 fi
 
-# --- the governed-docs gate still runs where its script exists ------------
-# The existence check must not turn into a skip: with the audit script present
-# and failing, the train refuses. `bun` is the harness's exit-0 stub on PATH, so
-# this fixture shadows it with a failing one for the run.
+# --- the publication input gate still runs where its script exists --------
+# The existence check must not turn into a skip: a failing input gate refuses
+# the train before push. Shadow the harness's green node stub for this run.
 dir="$(new_fixture auditfails)"
 mkdir -p "$dir/work/scripts" "$dir/failbin"
-: > "$dir/work/scripts/audit-v049-agent-surface.ts"
-git -C "$dir/work" add scripts/audit-v049-agent-surface.ts
-git -C "$dir/work" commit -qm "carry the audit script"
+: > "$dir/work/scripts/release-gate-v049.mjs"
+git -C "$dir/work" add scripts/release-gate-v049.mjs
+git -C "$dir/work" commit -qm "carry the publication input gate"
 add_train_commit "$dir/work" "audited"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/failbin/bun"
-chmod +x "$dir/failbin/bun"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/failbin/node"
+chmod +x "$dir/failbin/node"
 saved_bin="$BIN_DIR"
 BIN_DIR="$dir/failbin:$saved_bin"
 run_train "$dir" audited
 BIN_DIR="$saved_bin"
-expect_rc 2 "a present, failing governed-surface audit refuses the train"
-expect_out "governed-surface audit failed" "the refusal names the gate"
+expect_rc 2 "a present, failing publication input gate refuses the train"
+expect_out "publication input check failed" "the refusal names the gate"
 
 # --- the gating workflow is a parameter, not this repository's filename ----
 # Lifts whose gate is ci.yml refused at "no .github/workflows/tests.yml" while
@@ -1837,52 +2823,13 @@ run_train "$dir" leftover
 expect_rc 0 "a leftover ref with no live train proceeds"
 expect_out "git push origin --delete train/abandoned" "the leftover ref's delete is composed"
 expect_out "cannot race this train" "the run says why it proceeds"
-# test_two_trains_started_together_cannot_both_be_admitted: against a local bare
-# origin `ls-remote` is microseconds, so two processes never land in a window
-# that genuinely exists; a git shim that makes ls-remote take 0.5 s widens the
-# real race rather than inventing one. Exactly one name may own the lock and
-# the other must have been refused.
-dir="$(new_fixture race)"
-add_train_commit "$dir/work" "race"
-mkdir -p "$dir/fixturebin"
-real_git="$(command -v git)"
-printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "ls-remote" ] && sleep 0.5; done\nexec %s "$@"\n' "$real_git" > "$dir/fixturebin/git"
-chmod +x "$dir/fixturebin/git"
-(
-  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
-    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
-    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
-    "$TRAIN_PUSH" racer-a > "$dir/racer-a.out" 2>&1
-) &
-racer_a=$!
-(
-  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
-    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
-    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
-    "$TRAIN_PUSH" racer-b > "$dir/racer-b.out" 2>&1
-) &
-racer_b=$!
-wait "$racer_a" || true
-wait "$racer_b" || true
-race_owner="$(owner_line "$dir")"
-case "$race_owner" in
-  *" racer-a") race_loser="racer-b" ;;
-  *" racer-b") race_loser="racer-a" ;;
-  *) race_loser="" ;;
-esac
-if [ -n "$race_loser" ]; then
-  ok "exactly one racer owns the lock (${race_owner#* })"
-  if grep -q "a train is already running" "$dir/$race_loser.out"; then
-    ok "the loser ($race_loser) was refused, not admitted"
-  else
-    fail "the loser ($race_loser) was admitted alongside the winner"
-  fi
-else
-  fail "the lock owner is not a single racer: '$race_owner'"
-fi
+# test_two_trains_started_together_cannot_both_be_admitted: both racers meet at
+# the lock-claim barrier after attempting directory creation; a git shim slows
+# ls-remote so the winner remains active while the other proves it was refused.
+test_race_lock
 
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
   exit 1
 fi
-echo "train-push.test.sh: passed"
+echo "train-push.test.sh: passed ($checks checks)"
