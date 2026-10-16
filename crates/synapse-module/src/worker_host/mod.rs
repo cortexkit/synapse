@@ -8310,6 +8310,8 @@ pub mod ane_residency {
         #[derive(Default)]
         struct Ledger {
             loads: Vec<WorkerRequest>,
+            // Read only by the Unix-only pause tests.
+            #[cfg(unix)]
             confirmed_exits: u32,
             inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             admit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
@@ -10803,6 +10805,7 @@ pub mod ane_residency {
                 self.0.lock().unwrap().loads.len()
             }
 
+            #[cfg(unix)]
             pub(crate) fn confirmed_exits(&self) -> u32 {
                 self.0.lock().unwrap().confirmed_exits
             }
@@ -10877,7 +10880,10 @@ pub mod ane_residency {
                                 started.notify_one();
                                 release.notified().await;
                             }
-                            ledger.lock().unwrap().confirmed_exits += 1;
+                            #[cfg(unix)]
+                            {
+                                ledger.lock().unwrap().confirmed_exits += 1;
+                            }
                             Ok(())
                         }),
                     })
