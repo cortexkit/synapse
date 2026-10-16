@@ -236,13 +236,14 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   `phase: "draining"` means admitted requests are finishing normally. The module
   then unloads affected workers and releases the global direct-ANE lock.
   The duration starts at acceptance and includes draining; it is never extended
-  to compensate for a slow drain. A drain past expiry immediately re-acquires
-  the lock instead of starting an additional hardware-free window.
+  to compensate for a slow or failed drain. Expiry stops waiting for drain and
+  immediately re-acquires the lock instead of starting another hardware-free window.
   Wait for `lanes.status` to report `phase: "paused", hardware_free: true` before
   starting a private measurement daemon. Metal, rerank on non-ANE engines, and
   other unaffected lanes continue serving.
 - **lanes.resume** {} — mutate. Requests early expiry; idempotent when running.
-  Returns the same status shape. It does not interrupt an in-progress drain.
+  Returns the same status shape. It stops waiting for drain immediately, without
+  cutting off admitted requests or abandoning an unload's lifecycle guards.
 - **lanes.status** {} — query. Returns the pause status above, or
   `{phase: "running", hardware_free: false, lane_ids: []}` with the pause fields
   absent. Expiry is automatic using a monotonic timer, even without another call.
@@ -252,6 +253,17 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
   loaded without the lock. The pause is not persisted: a module restart ends it.
   `models.list` adds `paused_until_ms` and `pause_reason` on affected lane rows
   only while paused, including drain and lock-reacquisition time.
+  `phase: "drain_failed"` reports an unsuccessful drain with
+  `drain_error: {lane_id, stage, code, message}` (`lane_id: null` for the global
+  lock). It always has `hardware_free: false`; measurement scripts must not start
+  on this status. Retained lock descriptors are retried until expiry or resume.
+  Unload failures cannot be treated as confirmed worker exit and do not release
+  the global lock. The deadline/resume ends either failure state, logs the blocked
+  lane or global stage and error, then proceeds through lock re-acquisition and
+  clears the pause. An unload already running keeps its lane non-ready and its
+  lifecycle/serving guards until it finishes. Resumed callers use ordinary model
+  loading/deadline errors for that lane rather than an indefinitely extended
+  `lane_paused`. `hardware_free` is never reported for an incomplete drain.
 
 While a lane is paused, inference is refused before admission, loading, numerical
 self-checks, or shape compilation with stable code `lane_paused`, class

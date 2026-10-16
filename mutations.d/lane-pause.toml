@@ -292,8 +292,19 @@ build_timeout_s = 1800
 id = "lane-pause-no-early-hardware-free"
 guards = "Hardware-free status is not published while cancelled inference is still draining"
 file = "crates/synapse-module/src/lane_pause.rs"
-old = "let gate = state.runtime.lane_pause.gate.clone().write_owned().await;"
-new = "phase(&state.runtime, \"paused\"); /* NON-VACUITY BREAK */ let gate = state.runtime.lane_pause.gate.clone().write_owned().await;"
+old = """
+let gate = until_pause_end(
+        &state.runtime,
+        state.runtime.lane_pause.gate.clone().write_owned(),
+    )
+    .await;"""
+new = """
+phase(&state.runtime, "paused"); // NON-VACUITY BREAK
+    let gate = until_pause_end(
+        &state.runtime,
+        state.runtime.lane_pause.gate.clone().write_owned(),
+    )
+    .await;"""
 edits = []
 test_file = "crates/synapse-module/src/lane_pause_tests.rs"
 runner = "nextest"
@@ -302,6 +313,94 @@ package = "synapse-module"
 target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_unloads_only_after_cancelled_request_reply_drains"]
 expect_message = "assertion"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "lane-pause-failed-drain-deadline"
+guards = "Persistent drain failures cannot extend the pause beyond its deadline"
+file = "crates/synapse-module/src/lane_pause.rs"
+old = """
+let deadline = runtime
+            .lane_pause
+            .current
+            .lock()
+            .expect("pause state")
+            .as_ref()
+            .expect("active pause")
+            .deadline;"""
+new = """
+let deadline = runtime
+            .lane_pause
+            .current
+            .lock()
+            .expect("pause state")
+            .as_ref()
+            .expect("active pause")
+            .deadline + Duration::from_secs(600); // NON-VACUITY BREAK"""
+edits = []
+test_file = "crates/synapse-module/src/lane_pause_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::lane_pause_tests::failed_pause_drain_expires_and_serves_again_with_global_lock_held"]
+expect_message = "running"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "lane-pause-resume-during-drain"
+guards = "Resume wakes the bounded drain wait before its original deadline"
+file = "crates/synapse-module/src/lane_pause.rs"
+old = "_ = notified => {},"
+new = "_ = std::future::pending::<()>() => {}, // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/synapse-module/src/lane_pause_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::lane_pause_tests::resume_ends_pause_while_admitted_request_is_still_draining"]
+expect_message = "running"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "lane-pause-residency-refund"
+guards = "Confirmed pause shutdown refunds the old worker's executable reservations before the next generation"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "state.slots.retain(|_, slot| slot.worker.worker_id() != id);"
+new = "// NON-VACUITY BREAK: retain the exited worker's executable reservations."
+edits = []
+test_file = "crates/synapse-module/src/lane_pause_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::lane_pause_tests::pause_shutdown_refunds_reserved_executables_before_next_worker_generation"]
+expect_message = "reserved_executables"
+only = false
+timeout_s = 60
+build_timeout_s = 1800
+
+[[control]]
+id = "lane-pause-detached-unload-readiness"
+guards = "Cancelling a drain wait never leaves its retired model selectable by resumed requests"
+file = "crates/synapse-module/src/lane_pause.rs"
+old = "set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);"
+new = "// NON-VACUITY BREAK: leave the retired model published as Ready."
+edits = []
+test_file = "crates/synapse-module/src/lane_pause_tests.rs"
+runner = "nextest"
+select = "expected"
+package = "synapse-module"
+target = "--lib"
+expect_red = ["tests::lane_pause_tests::resume_detaches_unload_without_publishing_a_retired_model_or_releasing_the_lock"]
+expect_message = "retired model"
 only = false
 timeout_s = 60
 build_timeout_s = 1800

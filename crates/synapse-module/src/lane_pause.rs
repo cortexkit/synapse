@@ -10,6 +10,10 @@ pub(super) struct LanePause {
     current: Mutex<Option<Pause>>,
     gate: Arc<RwLock<()>>,
     changed: Notify,
+    #[cfg(test)]
+    pub(super) drain_failure: Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    pub(super) drain_attempts: std::sync::atomic::AtomicUsize,
 }
 
 struct Pause {
@@ -18,6 +22,10 @@ struct Pause {
     reason: String,
     lanes: Vec<String>,
     phase: &'static str,
+    drain_lane: Option<String>,
+    drain_stage: &'static str,
+    drain_error: Option<Value>,
+    retry_drain: bool,
 }
 
 #[derive(Deserialize)]
@@ -210,8 +218,14 @@ pub(super) fn admit_request(
 pub(super) fn status(runtime: &RuntimeState) -> Value {
     let current = runtime.lane_pause.current.lock().expect("pause state");
     match current.as_ref() {
-        Some(p) => json!({"paused_until_ms":p.until_ms,"reason":p.reason,"lane_ids":p.lanes,
-            "phase":p.phase,"hardware_free":p.phase == "paused"}),
+        Some(p) => {
+            let mut status = json!({"paused_until_ms":p.until_ms,"reason":p.reason,"lane_ids":p.lanes,
+                "phase":p.phase,"hardware_free":p.phase == "paused"});
+            if let Some(error) = &p.drain_error {
+                status["drain_error"] = error.clone();
+            }
+            status
+        }
         None => json!({"phase":"running","hardware_free":false,"lane_ids":[]}),
     }
 }
@@ -268,6 +282,10 @@ pub(super) async fn pause(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             reason: params.reason,
             lanes,
             phase: "draining",
+            drain_lane: None,
+            drain_stage: "waiting_for_admitted_requests",
+            drain_error: None,
+            retry_drain: true,
         });
     }
     let task_state = state.clone();
@@ -306,12 +324,50 @@ fn phase(runtime: &RuntimeState, phase: &'static str) {
 }
 
 async fn drain(state: &Arc<ModuleState>) -> Result<(), WireOperationError> {
+    #[cfg(test)]
+    if let Some((lane, message)) = state
+        .runtime
+        .lane_pause
+        .drain_failure
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
+        drain_progress(&state.runtime, Some(lane), "injected_failure", true);
+        state
+            .runtime
+            .lane_pause
+            .drain_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return Err(WireOperationError::from_stable(
+            StableError::engine_crashed(Some(1000))
+                .with_details(serde_json::from_value(json!({"lane_id":lane})).unwrap()),
+            message,
+        ));
+    }
     // The global fence covers the interval between resolution and execution.
     // Per-lane locks additionally cover detached loads, checks and reply drains.
     for lane in lane_ids(&state.runtime) {
+        drain_progress(
+            &state.runtime,
+            Some(&lane),
+            "waiting_for_lane_lifecycle",
+            true,
+        );
         let lifecycle = catalog_lane_lock(&state.runtime, &lane).lock_owned().await;
+        drain_progress(
+            &state.runtime,
+            Some(&lane),
+            "waiting_for_lane_serving",
+            true,
+        );
         let serving = lane_serving_gate(&state.runtime, &lane).write_owned().await;
         if let Some(model) = model_slot_snapshot(&state.runtime, &lane).and_then(|s| s.loaded) {
+            drain_progress(&state.runtime, Some(&lane), "unloading_worker", false);
+            // A deadline can detach the blocking unload. Publish non-readiness
+            // before starting it, and let its owner retain both lane guards until
+            // completion, so a resumed caller never selects the retired model.
+            set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);
             tokio::task::spawn_blocking(move || {
                 let _guards = (lifecycle, serving);
                 unload_embedding_model_blocking(model.clone())?;
@@ -326,9 +382,9 @@ async fn drain(state: &Arc<ModuleState>) -> Result<(), WireOperationError> {
             })
             .await
             .map_err(|e| transient_model_load_error(format!("pause unload: {e}")))??;
-            set_model_slot_state(&state.runtime, &lane, ModelRuntimeState::Unloaded);
         }
     }
+    drain_progress(&state.runtime, None, "releasing_global_lock", true);
     #[cfg(unix)]
     if let Some(supervisor) = state
         .runtime
@@ -344,24 +400,37 @@ async fn drain(state: &Arc<ModuleState>) -> Result<(), WireOperationError> {
     Ok(())
 }
 
-async fn run_pause(state: Arc<ModuleState>) {
-    let gate = state.runtime.lane_pause.gate.clone().write_owned().await;
+fn drain_progress(runtime: &RuntimeState, lane: Option<&str>, stage: &'static str, retry: bool) {
+    let mut current = runtime.lane_pause.current.lock().expect("pause state");
+    let pause = current.as_mut().expect("active pause");
+    pause.drain_lane = lane.map(str::to_owned);
+    pause.drain_stage = stage;
+    pause.retry_drain = retry;
+}
+
+fn drain_failed(runtime: &RuntimeState, error: &WireOperationError) -> bool {
+    let mut current = runtime.lane_pause.current.lock().expect("pause state");
+    let pause = current.as_mut().expect("active pause");
+    tracing::warn!(lane_id = ?pause.drain_lane, stage = pause.drain_stage,
+        code = %error.code, message = %error.message, "Neural Engine pause drain failed");
+    pause.phase = "drain_failed";
+    pause.drain_error = Some(json!({"lane_id":pause.drain_lane,"stage":pause.drain_stage,
+        "code":error.code,"message":error.message}));
+    pause.retry_drain
+}
+
+/// Keep one drain attempt alive across notifications, but stop waiting at its
+/// current deadline. Resume moves that deadline to now and wakes this wait.
+async fn until_pause_end<T>(
+    runtime: &RuntimeState,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(work);
     loop {
-        match drain(&state).await {
-            Ok(()) => break,
-            Err(error) => {
-                tracing::warn!(code = %error.code, message = %error.message, "Neural Engine pause still draining");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-    phase(&state.runtime, "paused");
-    loop {
-        let notified = state.runtime.lane_pause.changed.notified();
+        let notified = runtime.lane_pause.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let deadline = state
-            .runtime
+        let deadline = runtime
             .lane_pause
             .current
             .lock()
@@ -370,9 +439,79 @@ async fn run_pause(state: Arc<ModuleState>) {
             .expect("active pause")
             .deadline;
         if tokio::time::Instant::now() >= deadline {
-            break;
+            return None;
         }
-        tokio::select! { _ = tokio::time::sleep_until(deadline) => {}, _ = notified => {} }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return None,
+            _ = notified => {},
+            result = &mut work => return Some(result),
+        }
+    }
+}
+
+async fn run_pause(state: Arc<ModuleState>) {
+    let gate = until_pause_end(
+        &state.runtime,
+        state.runtime.lane_pause.gate.clone().write_owned(),
+    )
+    .await;
+    let drained = if gate.is_some() {
+        until_pause_end(&state.runtime, async {
+            loop {
+                match drain(&state).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        if drain_failed(&state.runtime, &error) {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else {
+                            // A failed unload may already have retired its worker.
+                            // Do not mistake an emptied slot for confirmed exit on
+                            // the next retry and release the hardware lock.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .is_some()
+    } else {
+        false
+    };
+    if drained {
+        phase(&state.runtime, "paused");
+        loop {
+            let notified = state.runtime.lane_pause.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let deadline = state
+                .runtime
+                .lane_pause
+                .current
+                .lock()
+                .expect("pause state")
+                .as_ref()
+                .expect("active pause")
+                .deadline;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! { _ = tokio::time::sleep_until(deadline) => {}, _ = notified => {} }
+        }
+    } else {
+        let current = state
+            .runtime
+            .lane_pause
+            .current
+            .lock()
+            .expect("pause state");
+        let pause = current.as_ref().expect("active pause");
+        let error = pause.drain_error.clone().unwrap_or_else(|| json!({
+            "code":"drain_interrupted", "message":"deadline or resume reached before drain completed"}));
+        tracing::warn!(lane_id = ?pause.drain_lane, lane_ids = ?pause.lanes,
+            stage = pause.drain_stage, %error,
+            "Neural Engine pause drain ended at deadline or resume without freeing hardware");
     }
     phase(&state.runtime, "waiting_for_lock");
     loop {

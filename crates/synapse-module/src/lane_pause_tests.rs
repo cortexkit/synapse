@@ -364,6 +364,182 @@ async fn pause_auto_expires_with_tokio_time_without_resume() {
 }
 
 #[tokio::test]
+async fn failed_pause_drain_expires_and_serves_again_with_global_lock_held() {
+    let fixture = pause_fixture().await;
+    let path = install_lock(&fixture);
+    assert!(query(&fixture.state).await.get("error").is_none());
+    *fixture
+        .state
+        .runtime
+        .lane_pause
+        .drain_failure
+        .lock()
+        .unwrap() = Some((
+        ANE_TEST_LANE.into(),
+        "injected persistent unload failure".into(),
+    ));
+    tokio::time::pause();
+    start_pause(&fixture.state).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        fixture
+            .state
+            .runtime
+            .lane_pause
+            .drain_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    );
+    let status = lane_pause::status(&fixture.state.runtime);
+    assert_eq!(status["hardware_free"], false);
+    assert_eq!(status["phase"], "drain_failed");
+    assert_eq!(status["drain_error"]["lane_id"], ANE_TEST_LANE);
+    assert_eq!(
+        status["drain_error"]["message"],
+        "injected persistent unload failure"
+    );
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["phase"],
+        "running"
+    );
+    assert!(AneDirectLaneLock::acquire(&path).is_err());
+    tokio::time::resume();
+    let reply = query(&fixture.state).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    finish_ane_lane_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn resume_ends_pause_while_admitted_request_is_still_draining() {
+    let fixture = pause_fixture().await;
+    let path = install_lock(&fixture);
+    let admitted = lane_pause::admit(&fixture.state.runtime, ANE_TEST_LANE).unwrap();
+    tokio::time::pause();
+    start_pause(&fixture.state).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["phase"],
+        "draining"
+    );
+    call(&fixture.state, "lanes.resume", json!({})).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["phase"],
+        "running"
+    );
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["hardware_free"],
+        false
+    );
+    assert!(AneDirectLaneLock::acquire(&path).is_err());
+    drop(admitted);
+    tokio::time::resume();
+    let reply = query(&fixture.state).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    finish_ane_lane_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn resume_detaches_unload_without_publishing_a_retired_model_or_releasing_the_lock() {
+    let fixture = pause_fixture().await;
+    let path = install_lock(&fixture);
+    let (started, release) = ane_gate();
+    fixture
+        .control
+        .hold_next_exit(started.clone(), release.clone());
+    start_pause(&fixture.state).await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let selected_before_resume = model_slot_snapshot(&fixture.state.runtime, ANE_TEST_LANE)
+        .unwrap()
+        .loaded
+        .is_some();
+    call(&fixture.state, "lanes.resume", json!({})).await;
+    wait_phase(&fixture.state, "running").await;
+    let selected_after_resume = model_slot_snapshot(&fixture.state.runtime, ANE_TEST_LANE)
+        .unwrap()
+        .loaded
+        .is_some();
+    let lifecycle = catalog_lane_lock(&fixture.state.runtime, ANE_TEST_LANE);
+    let still_draining = lifecycle.try_lock().is_err();
+    let lock_held = AneDirectLaneLock::acquire(&path).is_err();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.control.confirmed_exits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !selected_before_resume && !selected_after_resume,
+        "a retired model must not be selectable after cancelling drain"
+    );
+    assert!(
+        still_draining,
+        "the detached unload must keep its lifecycle guard"
+    );
+    assert!(lock_held);
+    assert!(
+        AneDirectLaneLock::acquire(&path).is_err(),
+        "a detached drain must not release the resumed module's lock"
+    );
+    finish_ane_lane_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn retained_lock_descriptor_cannot_extend_pause_past_its_deadline() {
+    let fixture = pause_fixture().await;
+    let path = install_lock(&fixture);
+    let retained = fixture
+        .state
+        .runtime
+        .ane_supervisor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .inherited_lane_lock()
+        .unwrap()
+        .unwrap();
+    start_pause(&fixture.state).await;
+    wait_phase(&fixture.state, "drain_failed").await;
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["drain_error"]["stage"],
+        "releasing_global_lock"
+    );
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["hardware_free"],
+        false
+    );
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["phase"],
+        "running"
+    );
+    assert!(lane_pause::admit(&fixture.state.runtime, ANE_TEST_LANE).is_ok());
+    assert!(AneDirectLaneLock::acquire(&path).is_err());
+    drop(retained);
+    tokio::time::resume();
+    finish_ane_lane_fixture(fixture).await;
+}
+
+#[tokio::test]
 async fn pause_rejects_121_minutes() {
     let fixture = installed_ready_ane_fixture().await;
     let outcome = dispatch_request(
@@ -522,5 +698,144 @@ async fn queued_catalog_batch_gets_retryable_pause_without_loading() {
         .unwrap();
     assert!(matches!(replay, JobAdmission::Admitted(_)));
     assert_ne!(replay.record().job_id, record.job_id);
+    finish_ane_lane_fixture(fixture).await;
+}
+
+async fn resident_generation(
+    fixture: &AneLaneFixture,
+    generation: &str,
+) -> Vec<(
+    Arc<worker_host::ane_residency::DirectAneEngine>,
+    worker_host::ane_residency::ModuleMockControl,
+)> {
+    let state = fixture.state.clone();
+    let root = fixture.root.join(generation);
+    let generation = generation.to_owned();
+    let supervisor = state
+        .runtime
+        .ane_supervisor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    tokio::task::spawn_blocking(move || {
+        [
+            ("gte-modernbert-base.ane-direct-worker", ANE_TEST_LANE),
+            (
+                "qwen3-embedding-0.6b.ane-direct-worker",
+                "qwen3-embedding-0.6b-ane",
+            ),
+        ]
+        .into_iter()
+        .map(|(profile, lane)| {
+            let mut spec = catalog_fixture_config(profile);
+            spec.model_id = lane.into();
+            let mut model = catalog_test_model(&root.join(lane), &spec);
+            let (engine, control) = worker_host::ane_residency::module_mock_engine_resident(
+                supervisor.clone(),
+                &format!("{generation}-{lane}"),
+                profile,
+            );
+            Arc::get_mut(&mut model).unwrap().backend = EmbedBackend::DirectAne(engine.clone());
+            state.runtime.catalog.lock().unwrap().insert(
+                lane.into(),
+                ModelSlot {
+                    spec,
+                    loaded: Some(model),
+                    state: ModelRuntimeState::Ready,
+                    notify: Arc::new(Notify::new()),
+                    last_cold_load_ms: None,
+                },
+            );
+            (engine, control)
+        })
+        .collect()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pause_shutdown_refunds_reserved_executables_before_next_worker_generation() {
+    let fixture = ane_lane_fixture("pause-residency-generations", true).await;
+    let path = install_lock(&fixture);
+    let original = fixture.engine.clone();
+    tokio::task::spawn_blocking(move || original.unload())
+        .await
+        .unwrap()
+        .unwrap();
+    let supervisor = fixture
+        .state
+        .runtime
+        .ane_supervisor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let old = resident_generation(&fixture, "generation-N").await;
+    for (engine, _) in &old {
+        for shape in [128, 256] {
+            engine
+                .serving
+                .infer(vec![vec![1; shape]], false)
+                .await
+                .unwrap();
+        }
+    }
+    // The pinned gte-modernbert-base and qwen3-embedding-0.6b profiles have 22
+    // and 28 layers. Each shape reserves one executable per layer: 2*22+2*28=100.
+    // The snapshot reads State::reserved_executables, not historical admission totals.
+    assert_eq!(supervisor.reservation_snapshot(), (100, 0));
+    let (started, release) = ane_gate();
+    old[0].1.hold_next_exit(started.clone(), release.clone());
+    start_pause(&fixture.state).await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let during_exit = supervisor.reservation_snapshot();
+    assert_eq!(
+        lane_pause::status(&fixture.state.runtime)["hardware_free"],
+        false
+    );
+    release.notify_one();
+    assert_eq!(
+        during_exit,
+        (100, 0),
+        "reservations must remain charged until exit confirmation"
+    );
+    wait_phase(&fixture.state, "paused").await;
+    assert_eq!(
+        supervisor.reservation_snapshot(),
+        (0, 0),
+        "confirmed pause shutdown must refund reserved_executables"
+    );
+    assert!(supervisor.resident_shapes().is_empty());
+    assert!(old
+        .iter()
+        .all(|(_, control)| control.confirmed_exits() == 1));
+    end_pause(&fixture.state).await;
+    assert!(AneDirectLaneLock::acquire(&path).is_err());
+    let next = resident_generation(&fixture, "generation-N+1").await;
+    for (engine, _) in &next {
+        for shape in [128, 256] {
+            let result = engine.serving.infer(vec![vec![1; shape]], false).await;
+            assert!(
+                result.is_ok(),
+                "next generation must fit the full 100-executable budget: {result:?}"
+            );
+        }
+    }
+    assert_eq!(supervisor.reservation_snapshot(), (100, 0));
+    assert_eq!(
+        supervisor.stats().evicted,
+        0,
+        "no eviction against old worker reservations"
+    );
+    start_pause(&fixture.state).await;
+    wait_phase(&fixture.state, "paused").await;
+    end_pause(&fixture.state).await;
+    drop((old, next));
     finish_ane_lane_fixture(fixture).await;
 }

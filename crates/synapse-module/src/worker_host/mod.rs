@@ -4451,6 +4451,9 @@ pub mod ane_residency {
             }
             shutdown.await?;
             let mut state = self.inner.lock();
+            // Reservations are summed from these slots by reserved_executables.
+            // Refund only this owner, and only after its process exit is confirmed;
+            // the next worker instance must not inherit a retired owner's charge.
             state.slots.retain(|_, slot| slot.worker.worker_id() != id);
             state.recovering.remove(&id);
             drop(state);
@@ -8188,7 +8191,7 @@ pub mod ane_residency {
     #[cfg(all(test, unix))]
     pub(crate) use tests::{
         module_mock_engine, module_mock_engine_admission, module_mock_engine_controlled,
-        ModuleMockControl,
+        module_mock_engine_resident, ModuleMockControl,
     };
 
     #[cfg(test)]
@@ -10759,6 +10762,10 @@ pub mod ane_residency {
             pub(crate) fn confirmed_exits(&self) -> u32 {
                 self.0.lock().unwrap().confirmed_exits
             }
+
+            pub(crate) fn hold_next_exit(&self, started: Arc<Notify>, release: Arc<Notify>) {
+                self.0.lock().unwrap().exit_gate = Some((started, release));
+            }
         }
 
         #[cfg(unix)]
@@ -10772,6 +10779,34 @@ pub mod ane_residency {
 
         #[cfg(unix)]
         fn module_mock_engine_for(ledger: SharedLedger) -> Arc<DirectAneEngine> {
+            module_mock_engine_for_owner(
+                ledger,
+                AneResidencySupervisor::new(Default::default()),
+                "module-mock",
+                "gte-modernbert-base.ane-direct-worker",
+            )
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn module_mock_engine_resident(
+            supervisor: AneResidencySupervisor,
+            owner: &str,
+            profile: &str,
+        ) -> (Arc<DirectAneEngine>, ModuleMockControl) {
+            let ledger = SharedLedger::default();
+            (
+                module_mock_engine_for_owner(ledger.clone(), supervisor, owner, profile),
+                ModuleMockControl(ledger),
+            )
+        }
+
+        #[cfg(unix)]
+        fn module_mock_engine_for_owner(
+            ledger: SharedLedger,
+            supervisor: AneResidencySupervisor,
+            owner: &str,
+            profile: &str,
+        ) -> Arc<DirectAneEngine> {
             let runtime = Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -10779,15 +10814,12 @@ pub mod ane_residency {
                     .build()
                     .unwrap(),
             );
+            let owner_id = owner.to_owned();
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
                 let ledger = ledger.clone();
+                let owner_id = owner_id.clone();
                 Box::pin(async move {
-                    *ledger
-                        .lock()
-                        .unwrap()
-                        .connects
-                        .entry("module-mock".into())
-                        .or_default() += 1;
+                    *ledger.lock().unwrap().connects.entry(owner_id).or_default() += 1;
                     let (stream, server) = tokio::net::UnixStream::pair().unwrap();
                     let task = tokio::spawn(serve_mock(server, ledger.clone()));
                     Ok(AneWorkerSession {
@@ -10796,6 +10828,11 @@ pub mod ane_residency {
                         confirm_exit: Box::pin(async move {
                             task.await
                                 .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
+                            let gate = ledger.lock().unwrap().exit_gate.take();
+                            if let Some((started, release)) = gate {
+                                started.notify_one();
+                                release.notified().await;
+                            }
                             ledger.lock().unwrap().confirmed_exits += 1;
                             Ok(())
                         }),
@@ -10805,7 +10842,7 @@ pub mod ane_residency {
             let channel = Arc::new(
                 runtime
                     .block_on(AneWorkerChannel::connect(
-                        "module-mock",
+                        owner,
                         synapse_core::DEFAULT_MAX_FRAME_BYTES,
                         connector,
                     ))
@@ -10814,10 +10851,9 @@ pub mod ane_residency {
             let serving = Arc::new(
                 AneServing::new(
                     channel,
-                    AneResidencySupervisor::new(Default::default()),
+                    supervisor,
                     AneServingMetadata {
-                        model_ref: "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:test"
-                            .into(),
+                        model_ref: format!("ane-direct:{profile}:sha256:test"),
                         dims: 1,
                         buckets: ANE_SHAPE_LADDER.to_vec(),
                         pooling: synapse_core::WorkerPooling::Mean,
