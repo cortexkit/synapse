@@ -1718,6 +1718,25 @@ impl WorkerEngine {
             let _ = self.runtime().block_on(host.kill_current());
         }
     }
+
+    /// Pause draining has already fenced inference. Confirm process exit before
+    /// releasing the inherited hardware lock; an UNLOAD acknowledgement alone
+    /// leaves the worker process (and its descriptor) alive.
+    pub(crate) fn shutdown_for_pause(&self) -> Result<(), WorkerHostError> {
+        let mut host = self.lock_host()?;
+        self.runtime().block_on(async {
+            if let Some(connection) = host.connection.as_mut() {
+                if connection.child.try_wait()?.is_none() {
+                    connection.child.start_kill()?;
+                }
+                connection.child.wait().await?;
+            }
+            host.connection.take();
+            host.forget_worker_model_refs();
+            host.config.inherited_lane_lock.take();
+            Ok(())
+        })
+    }
 }
 
 /// How long a drop waits for its worker child to be killed and reaped.
@@ -2609,6 +2628,57 @@ fn worker_generation_from_nonce(nonce: &str) -> Result<u64, WorkerHostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock() {
+        const PROBE: &str = "SYNAPSE_PAUSE_SHUTDOWN_LOCK_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            // Isolate the file descriptor from concurrent test threads that fork.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "worker_host::tests::pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock", "--test-threads=1"])
+                .env(PROBE, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use ane_residency::{inheritable_lock_stdio, AneDirectLaneLock};
+        let root = std::env::temp_dir().join(format!("synapse-pause-shutdown-{}", nonce_hex16()));
+        let path = root.join("ane.lock");
+        let holder = AneDirectLaneLock::acquire(&path).unwrap();
+        let mut config = WorkerHostConfig::new("unused-worker", &root);
+        config.inherited_lane_lock = Some(holder.inheritable());
+        let engine = WorkerEngine::new(config).unwrap();
+        let peer = engine.runtime().block_on(async {
+            let (stream, peer) = tokio::net::UnixStream::pair().unwrap();
+            let child = Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .stdin(inheritable_lock_stdio(&holder.inheritable()).unwrap())
+                .spawn()
+                .unwrap();
+            engine.lock_host().unwrap().connection = Some(WorkerConnection {
+                stream,
+                child,
+                logs: LogRing::new(),
+                worker_generation: 1,
+                packed: None,
+                unusable: false,
+            });
+            peer
+        });
+        drop(holder);
+        assert!(AneDirectLaneLock::acquire(&path).is_err());
+        engine.shutdown_for_pause().unwrap();
+        let replacement = AneDirectLaneLock::acquire(&path)
+            .expect("confirmed exit must free the inherited descriptor");
+        drop((peer, engine, replacement));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn nonce_is_hex16() {
         let nonce = nonce_hex16();
@@ -4152,7 +4222,9 @@ pub mod ane_residency {
         #[cfg(test)]
         lease_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
         #[cfg(unix)]
-        lane_lock: Option<AneDirectLaneLock>,
+        lane_lock: Mutex<Option<AneDirectLaneLock>>,
+        #[cfg(unix)]
+        lane_path: Option<PathBuf>,
     }
 
     impl Inner {
@@ -4224,12 +4296,15 @@ pub mod ane_residency {
                     #[cfg(test)]
                     lease_decision_gate: Mutex::new(None),
                     #[cfg(unix)]
-                    lane_lock: None,
+                    lane_lock: Mutex::new(None),
+                    #[cfg(unix)]
+                    lane_path: None,
                 }),
             }
         }
 
-        /// A supervisor holding the lane lock for as long as it lives.
+        /// A supervisor that initially owns the lane lock; a drained pause may
+        /// release it and re-acquire it before admitting new work.
         #[cfg(unix)]
         pub fn with_lane_lock(limits: AneResidencyLimits, lock: AneDirectLaneLock) -> Self {
             Self {
@@ -4243,7 +4318,8 @@ pub mod ane_residency {
                     admission_gate: None,
                     #[cfg(test)]
                     lease_decision_gate: Mutex::new(None),
-                    lane_lock: Some(lock),
+                    lane_path: Some(lock.path().to_path_buf()),
+                    lane_lock: Mutex::new(Some(lock)),
                 }),
             }
         }
@@ -4267,8 +4343,54 @@ pub mod ane_residency {
         /// The held lane lock; spawned direct-ANE workers must inherit it
         /// (see [`inheritable_lock_stdio`]).
         #[cfg(unix)]
-        pub fn lane_lock(&self) -> Option<&AneDirectLaneLock> {
-            self.inner.lane_lock.as_ref()
+        pub fn inherited_lane_lock(&self) -> Result<Option<Arc<std::fs::File>>, AneResidencyError> {
+            let lock = self.inner.lane_lock.lock().expect("lane lock");
+            if lock.is_none() {
+                if let Some(path) = &self.inner.lane_path {
+                    return Err(AneResidencyError::LaneBusy { path: path.clone() });
+                }
+            }
+            Ok(lock.as_ref().map(AneDirectLaneLock::inheritable))
+        }
+
+        /// Core ML can borrow an owned descriptor without depending on direct-ANE
+        /// ownership. An absent or released lock is not a Core ML load refusal.
+        #[cfg(unix)]
+        pub(crate) fn held_lane_lock(&self) -> Option<Arc<std::fs::File>> {
+            self.inner
+                .lane_lock
+                .lock()
+                .expect("lane lock")
+                .as_ref()
+                .map(AneDirectLaneLock::inheritable)
+        }
+
+        /// Release only after every owner has confirmed shutdown. A retained
+        /// parent-side descriptor means shutdown has not yet freed the hardware.
+        #[cfg(unix)]
+        pub fn release_lane(&self) -> Result<(), AneResidencyError> {
+            let mut lock = self.inner.lane_lock.lock().expect("lane lock");
+            if let Some(held) = lock.as_ref() {
+                if Arc::strong_count(&held.file) != 1 {
+                    return Err(AneResidencyError::LaneBusy {
+                        path: held.path.clone(),
+                    });
+                }
+            }
+            lock.take();
+            Ok(())
+        }
+
+        /// Reopen the lane lock path through a fresh file description before new loads.
+        #[cfg(unix)]
+        pub fn reacquire_lane(&self) -> Result<(), AneResidencyError> {
+            let mut lock = self.inner.lane_lock.lock().expect("lane lock");
+            if lock.is_none() {
+                if let Some(path) = &self.inner.lane_path {
+                    *lock = Some(AneDirectLaneLock::acquire(path)?);
+                }
+            }
+            Ok(())
         }
 
         /// Enable capture before the first admission; existing events are not reconstructed.
@@ -4341,6 +4463,9 @@ pub mod ane_residency {
             }
             shutdown.await?;
             let mut state = self.inner.lock();
+            // Reservations are summed from these slots by reserved_executables.
+            // Refund only this owner, and only after its process exit is confirmed;
+            // the next worker instance must not inherit a retired owner's charge.
             state.slots.retain(|_, slot| slot.worker.worker_id() != id);
             state.recovering.remove(&id);
             drop(state);
@@ -6329,6 +6454,26 @@ pub mod ane_residency {
         path: PathBuf,
     }
 
+    /// Unit tests may inspect the production path to check this guard, but must
+    /// never open it: another process may be using the machine's Neural Engine.
+    #[cfg(all(test, unix))]
+    pub(crate) fn assert_test_ane_lock_path(path: &Path) {
+        fn resolved(path: &Path) -> PathBuf {
+            path.parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .zip(path.file_name())
+                .map(|(parent, name)| parent.join(name))
+                .unwrap_or_else(|| path.to_path_buf())
+        }
+        if let Some(production) = AneDirectLaneLock::default_path() {
+            assert_ne!(
+                resolved(path),
+                resolved(&production),
+                "module tests must not open the production ANE lane lock"
+            );
+        }
+    }
+
     #[cfg(unix)]
     impl AneDirectLaneLock {
         /// `~/Library/Caches/ck-synapse/ane-direct.lock`.
@@ -6341,6 +6486,8 @@ pub mod ane_residency {
         /// direct-ANE workers or unrelated children between fork and exec.
         // `File::try_lock` is a `flock` and avoids the unsafe code a direct call would need.
         pub fn acquire(path: &Path) -> Result<Self, AneResidencyError> {
+            #[cfg(test)]
+            assert_test_ane_lock_path(path);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -6393,7 +6540,6 @@ pub mod ane_residency {
                 .cloned()
                 .ok_or_else(|| AneResidencyError::Channel("missing artifact path".into()))?;
             config.worker_id = format!("{}-{}", config.worker_id, super::nonce_hex16());
-            config.inherited_lane_lock = supervisor.lane_lock().map(AneDirectLaneLock::inheritable);
             let runtime = Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -6407,9 +6553,12 @@ pub mod ane_residency {
             let normalize = config.normalize;
             let timeout = config.request_timeout;
             let load_timeout = super::liveness::SETUP_IDLE;
+            let connector_supervisor = supervisor.clone();
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
-                let config = config.clone();
+                let mut config = config.clone();
+                let inherited = connector_supervisor.inherited_lane_lock();
                 Box::pin(async move {
+                    config.inherited_lane_lock = inherited?;
                     let mut host = super::WorkerHost::new(config);
                     host.ping()
                         .await
@@ -8076,7 +8225,7 @@ pub mod ane_residency {
     #[cfg(all(test, unix))]
     pub(crate) use tests::{
         module_mock_engine, module_mock_engine_admission, module_mock_engine_controlled,
-        ModuleMockControl,
+        module_mock_engine_resident, ModuleMockControl,
     };
 
     #[cfg(test)]
@@ -8091,6 +8240,16 @@ pub mod ane_residency {
         use tokio::io::DuplexStream;
 
         const LAYERS: u32 = 4;
+        #[test]
+        #[cfg(unix)]
+        fn module_tests_reject_the_production_lock_path_without_opening_it() {
+            let production = AneDirectLaneLock::default_path().expect("test HOME is set");
+            assert!(
+                std::panic::catch_unwind(|| assert_test_ane_lock_path(&production)).is_err(),
+                "production lock guard must reject the machine-wide path before any file open"
+            );
+        }
+
         struct MockChannel(AneWorkerChannel<DuplexStream>);
         impl std::ops::Deref for MockChannel {
             type Target = AneWorkerChannel<DuplexStream>;
@@ -8151,6 +8310,7 @@ pub mod ane_residency {
         #[derive(Default)]
         struct Ledger {
             loads: Vec<WorkerRequest>,
+            confirmed_exits: u32,
             inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             admit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
             fail_inference: bool,
@@ -10638,6 +10798,18 @@ pub mod ane_residency {
             pub(crate) fn worker_starts(&self) -> u32 {
                 self.0.lock().unwrap().connects.values().sum()
             }
+
+            pub(crate) fn loads(&self) -> usize {
+                self.0.lock().unwrap().loads.len()
+            }
+
+            pub(crate) fn confirmed_exits(&self) -> u32 {
+                self.0.lock().unwrap().confirmed_exits
+            }
+
+            pub(crate) fn hold_next_exit(&self, started: Arc<Notify>, release: Arc<Notify>) {
+                self.0.lock().unwrap().exit_gate = Some((started, release));
+            }
         }
 
         #[cfg(unix)]
@@ -10651,6 +10823,34 @@ pub mod ane_residency {
 
         #[cfg(unix)]
         fn module_mock_engine_for(ledger: SharedLedger) -> Arc<DirectAneEngine> {
+            module_mock_engine_for_owner(
+                ledger,
+                AneResidencySupervisor::new(Default::default()),
+                "module-mock",
+                "gte-modernbert-base.ane-direct-worker",
+            )
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn module_mock_engine_resident(
+            supervisor: AneResidencySupervisor,
+            owner: &str,
+            profile: &str,
+        ) -> (Arc<DirectAneEngine>, ModuleMockControl) {
+            let ledger = SharedLedger::default();
+            (
+                module_mock_engine_for_owner(ledger.clone(), supervisor, owner, profile),
+                ModuleMockControl(ledger),
+            )
+        }
+
+        #[cfg(unix)]
+        fn module_mock_engine_for_owner(
+            ledger: SharedLedger,
+            supervisor: AneResidencySupervisor,
+            owner: &str,
+            profile: &str,
+        ) -> Arc<DirectAneEngine> {
             let runtime = Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
@@ -10658,23 +10858,26 @@ pub mod ane_residency {
                     .build()
                     .unwrap(),
             );
+            let owner_id = owner.to_owned();
             let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
                 let ledger = ledger.clone();
+                let owner_id = owner_id.clone();
                 Box::pin(async move {
-                    *ledger
-                        .lock()
-                        .unwrap()
-                        .connects
-                        .entry("module-mock".into())
-                        .or_default() += 1;
+                    *ledger.lock().unwrap().connects.entry(owner_id).or_default() += 1;
                     let (stream, server) = tokio::net::UnixStream::pair().unwrap();
-                    let task = tokio::spawn(serve_mock(server, ledger));
+                    let task = tokio::spawn(serve_mock(server, ledger.clone()));
                     Ok(AneWorkerSession {
                         packed: None,
                         stream,
                         confirm_exit: Box::pin(async move {
                             task.await
                                 .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
+                            let gate = ledger.lock().unwrap().exit_gate.take();
+                            if let Some((started, release)) = gate {
+                                started.notify_one();
+                                release.notified().await;
+                            }
+                            ledger.lock().unwrap().confirmed_exits += 1;
                             Ok(())
                         }),
                     })
@@ -10683,7 +10886,7 @@ pub mod ane_residency {
             let channel = Arc::new(
                 runtime
                     .block_on(AneWorkerChannel::connect(
-                        "module-mock",
+                        owner,
                         synapse_core::DEFAULT_MAX_FRAME_BYTES,
                         connector,
                     ))
@@ -10692,10 +10895,9 @@ pub mod ane_residency {
             let serving = Arc::new(
                 AneServing::new(
                     channel,
-                    AneResidencySupervisor::new(Default::default()),
+                    supervisor,
                     AneServingMetadata {
-                        model_ref: "ane-direct:gte-modernbert-base.ane-direct-worker:sha256:test"
-                            .into(),
+                        model_ref: format!("ane-direct:{profile}:sha256:test"),
                         dims: 1,
                         buckets: ANE_SHAPE_LADDER.to_vec(),
                         pooling: synapse_core::WorkerPooling::Mean,

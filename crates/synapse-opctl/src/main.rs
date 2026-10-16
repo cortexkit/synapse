@@ -39,6 +39,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Temporarily lend Neural Engine lanes to a private measurement daemon.
+    Lanes {
+        #[command(subcommand)]
+        command: LanesCommand,
+    },
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
@@ -73,6 +78,82 @@ enum Command {
 enum ModelsCommand {
     /// List the catalog and current model states.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum LanesCommand {
+    /// Fence ANE admission, drain requests, unload workers, and release the lock.
+    Pause {
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=120))]
+        minutes: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// End the pause early; admission opens only after the lock is re-acquired.
+    Resume,
+    /// Wait for hardware_free=true before starting a private daemon.
+    Status,
+}
+
+fn lane_request(command: &LanesCommand) -> (&'static str, Value) {
+    match command {
+        LanesCommand::Pause { minutes, reason } => (
+            "lanes.pause",
+            json!({
+                "scope": "neural_engine", "duration_ms": minutes * 60_000, "reason": reason,
+            }),
+        ),
+        LanesCommand::Resume => ("lanes.resume", json!({})),
+        LanesCommand::Status => ("lanes.status", json!({})),
+    }
+}
+
+#[cfg(test)]
+mod lane_command_tests {
+    use super::*;
+
+    #[test]
+    fn pause_resume_status_encode_management_operations() {
+        for (args, method, params) in [
+            (
+                vec![
+                    "opctl",
+                    "lanes",
+                    "pause",
+                    "--minutes",
+                    "45",
+                    "--reason",
+                    "measurement",
+                ],
+                "lanes.pause",
+                json!({"scope":"neural_engine","duration_ms":2_700_000,"reason":"measurement"}),
+            ),
+            (vec!["opctl", "lanes", "resume"], "lanes.resume", json!({})),
+            (vec!["opctl", "lanes", "status"], "lanes.status", json!({})),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Lanes { command } = cli.command else {
+                panic!("not a lanes command")
+            };
+            assert_eq!(lane_request(&command), (method, params));
+        }
+    }
+
+    #[test]
+    fn pause_minutes_have_a_hard_cli_cap() {
+        for duration in ["0", "121", "18446744073709551615"] {
+            assert!(Cli::try_parse_from([
+                "opctl",
+                "lanes",
+                "pause",
+                "--minutes",
+                duration,
+                "--reason",
+                "measurement"
+            ])
+            .is_err());
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -242,6 +323,10 @@ async fn execute(
     command: &Command,
 ) -> Result<CommandOutput> {
     match command {
+        Command::Lanes { command } => {
+            let (method, params) = lane_request(command);
+            call(consumer, identity, method, params).await
+        }
         Command::Models {
             command: ModelsCommand::List,
         } => call(consumer, identity, "models.list", json!({})).await,

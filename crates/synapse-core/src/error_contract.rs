@@ -15,6 +15,7 @@ pub enum StableErrorCode {
     SequenceTooLong,
     DeadlineExceeded,
     ModelLoading,
+    LanePaused,
     NotCertified,
     SubstitutionRejected,
     ArtifactInvalid,
@@ -45,11 +46,12 @@ pub enum StableErrorCode {
 
 impl StableErrorCode {
     /// Every stable error code in declaration order.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::QueueFull,
         Self::SequenceTooLong,
         Self::DeadlineExceeded,
         Self::ModelLoading,
+        Self::LanePaused,
         Self::NotCertified,
         Self::SubstitutionRejected,
         Self::ArtifactInvalid,
@@ -406,7 +408,7 @@ mod tests {
 
     #[test]
     fn stable_error_code_all_covers_every_variant() {
-        const VARIANT_COUNT: usize = 30;
+        const VARIANT_COUNT: usize = 31;
 
         // This match is intentionally exhaustive so enum additions update the
         // enumeration and its expected cardinality together.
@@ -416,6 +418,7 @@ mod tests {
                 | StableErrorCode::SequenceTooLong
                 | StableErrorCode::DeadlineExceeded
                 | StableErrorCode::ModelLoading
+                | StableErrorCode::LanePaused
                 | StableErrorCode::NotCertified
                 | StableErrorCode::SubstitutionRejected
                 | StableErrorCode::ArtifactInvalid

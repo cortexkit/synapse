@@ -18,6 +18,7 @@ mod ane_artifact;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
+mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
@@ -1322,6 +1323,17 @@ impl AdmissionTelemetry {
     }
 }
 
+#[cfg(all(test, unix))]
+// Portable Core ML tests replace only process creation. The ordinary load path
+// still selects the supervisor and exchanges LOAD frames with a real host.
+type CoreMlTestWorkerFactory = Arc<
+    dyn Fn(
+            worker_host::WorkerHostConfig,
+        ) -> Result<worker_host::WorkerEngine, worker_host::WorkerHostError>
+        + Send
+        + Sync,
+>;
+
 struct RuntimeState {
     certify_observation: bool,
     ane_direct: AneDirectConfig,
@@ -1339,6 +1351,8 @@ struct RuntimeState {
     profile_check_passes_for_test: Mutex<bool>,
     #[cfg(test)]
     lane_check_tasks: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    model_load_tasks: std::sync::atomic::AtomicUsize,
     /// Holds a certification caller between its fast-path miss and joining
     /// the lane's check.
     #[cfg(test)]
@@ -1367,6 +1381,15 @@ struct RuntimeState {
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
+    #[cfg(all(test, unix))]
+    coreml_test_worker_factory: Mutex<Option<CoreMlTestWorkerFactory>>,
+    /// Captured at startup for production; unit tests must configure a path in
+    /// their store fixture instead of falling back to the machine-wide lock.
+    #[cfg(unix)]
+    ane_lane_lock_path: Option<PathBuf>,
+    #[cfg(all(test, unix))]
+    ane_lane_test_root: Option<PathBuf>,
+    lane_pause: lane_pause::LanePause,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
@@ -1535,7 +1558,8 @@ impl ActivityTelemetry {
             if let (Some(runtime), Some(model)) =
                 (preparation.runtime.upgrade(), preparation.model.upgrade())
             {
-                let current = model_slot_snapshot(&runtime, &model_id).is_some_and(|slot| {
+                let pause_guard = lane_pause::admit(&runtime, &model_id);
+                let current = pause_guard.is_ok() && model_slot_snapshot(&runtime, &model_id).is_some_and(|slot| {
                     matches!(slot.state, ModelRuntimeState::Ready)
                         && slot.loaded.is_some_and(|loaded| Arc::ptr_eq(&loaded, &model))
                 });
@@ -2593,6 +2617,8 @@ impl RuntimeState {
             #[cfg(test)]
             lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            model_load_tasks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             fast_path_gate: Mutex::new(None),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
@@ -2615,6 +2641,15 @@ impl RuntimeState {
             execution,
             execution_stats,
             ane_supervisor: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            coreml_test_worker_factory: Mutex::new(None),
+            #[cfg(all(unix, not(test)))]
+            ane_lane_lock_path: worker_host::ane_residency::AneDirectLaneLock::default_path(),
+            #[cfg(all(test, unix))]
+            ane_lane_lock_path: None,
+            #[cfg(all(test, unix))]
+            ane_lane_test_root: None,
+            lane_pause: lane_pause::LanePause::default(),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4211,6 +4246,9 @@ async fn dispatch_request(
     approved_by: Option<&str>,
 ) -> HandlerOutcome {
     match request.method.as_str() {
+        "lanes.pause" => lane_pause::pause(state, request.params).await,
+        "lanes.resume" => lane_pause::resume(state).await,
+        "lanes.status" => result_outcome(lane_pause::status(&state.runtime)),
         "models.catalog" => models_catalog(state, request.params).await,
         "models.download" => models_download(state, request.params).await,
         "models.download.cancel" => models_download_cancel(state, request.params).await,
@@ -6015,6 +6053,10 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ),
         ));
     }
+    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     if let Err(message) = validate_model_load_request(&params).and_then(|_| {
         resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint).map(|_| ())
     }) {
@@ -6423,6 +6465,7 @@ async fn wait_for_model_loaded(
     timeout_ms: u64,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     loop {
+        drop(lane_pause::admit(runtime, model_id)?);
         let Some(snapshot) = model_slot_snapshot(runtime, model_id) else {
             return Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
@@ -6456,6 +6499,11 @@ async fn load_catalog_model_task(
     state: Arc<ModuleState>,
     model_id: String,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    #[cfg(test)]
+    state
+        .runtime
+        .model_load_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _permit = state
         .runtime
         .control_loads
@@ -6468,6 +6516,13 @@ async fn load_catalog_model_task(
                 "control load queue is closed",
             )
         })?;
+    let _pause_guard = match lane_pause::admit(&state.runtime, &model_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Unloaded);
+            return Err(error);
+        }
+    };
     set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Loading);
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
         return Err(WireOperationError::from_stable(
@@ -6482,6 +6537,18 @@ async fn load_catalog_model_task(
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
+    let worker_load_context =
+        WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec);
+    #[cfg(all(test, unix))]
+    let worker_load_context = WorkerLoadContext {
+        coreml_worker_factory: state
+            .runtime
+            .coreml_test_worker_factory
+            .lock()
+            .unwrap()
+            .clone(),
+        ..worker_load_context
+    };
     let ane_supervisor = direct_ane_supervisor(&state.runtime, &spec.engine);
     let is_catalog = state.runtime.release_catalog.is_reserved_id(&model_id);
     let fault_lane = model_id.clone();
@@ -6493,11 +6560,10 @@ async fn load_catalog_model_task(
             CatalogAwareModelSpec {
                 stored: spec,
                 catalog_lane: is_catalog.then_some(fault_lane),
+                worker_load_context,
             },
             model_cache,
             microllm_max_tokens,
-            worker_load_timeout,
-            worker_forward_lines_per_sec,
             owned_decode_q8,
             ane_supervisor?,
         )
@@ -6719,25 +6785,44 @@ fn record_owned_package_roles(
         .map_err(|error| io_to_load_error("publish owned package roots", &path, &error))
 }
 
+#[derive(Clone)]
+struct WorkerLoadContext {
+    timeout: Duration,
+    forward_lines_per_sec: u32,
+    #[cfg(all(test, unix))]
+    coreml_worker_factory: Option<CoreMlTestWorkerFactory>,
+}
+
+impl WorkerLoadContext {
+    fn new(timeout: Duration, forward_lines_per_sec: u32) -> Self {
+        Self {
+            timeout,
+            forward_lines_per_sec,
+            #[cfg(all(test, unix))]
+            coreml_worker_factory: None,
+        }
+    }
+}
+
 // Catalog ownership comes from the release registry and stays outside the
 // stored numerical profile, so quarantine policy cannot change fingerprints.
 struct CatalogAwareModelSpec {
     stored: StoredModelConfig,
     catalog_lane: Option<String>,
+    worker_load_context: WorkerLoadContext,
 }
 
 fn load_catalog_model_blocking(
     spec: CatalogAwareModelSpec,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
-    worker_load_timeout: Duration,
-    worker_forward_lines_per_sec: u32,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let CatalogAwareModelSpec {
         stored: spec,
         catalog_lane,
+        worker_load_context,
     } = spec;
     let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -6852,8 +6937,7 @@ fn load_catalog_model_blocking(
                 &spec,
                 &artifact,
                 &runtime_config,
-                worker_load_timeout,
-                worker_forward_lines_per_sec,
+                worker_load_context,
                 ane_supervisor,
                 catalog_lane.as_deref(),
             )?;
@@ -6901,8 +6985,7 @@ fn load_catalog_model_blocking(
                 &spec,
                 &artifact,
                 &runtime_config,
-                worker_load_timeout,
-                worker_forward_lines_per_sec,
+                worker_load_context,
                 ane_supervisor,
                 catalog_lane.as_deref(),
             )?;
@@ -7084,6 +7167,15 @@ fn direct_ane_supervisor(
     runtime: &RuntimeState,
     engine: &str,
 ) -> Result<Option<worker_host::ane_residency::AneResidencySupervisor>, WireOperationError> {
+    // Core ML may inherit an already-held descriptor, but a model load must
+    // never acquire or re-acquire the direct-ANE lock on its behalf.
+    if matches!(engine, "ane" | "ane-coreml-worker") {
+        return runtime
+            .ane_supervisor
+            .lock()
+            .map(|shared| shared.clone())
+            .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"));
+    }
     if engine != "ane-direct-worker" {
         return Ok(None);
     }
@@ -7099,14 +7191,13 @@ fn direct_ane_supervisor(
             .lock()
             .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"))?;
         if shared.is_none() {
-            let mut supervisor = worker_host::ane_residency::AneResidencySupervisor::acquire_lane(
-                Default::default(),
-            )
-            .map_err(ane_residency_error_to_wire)?;
-            if runtime.certify_observation {
-                supervisor.enable_observations();
-            }
-            *shared = Some(supervisor);
+            *shared =
+                Some(acquire_runtime_ane_supervisor(runtime).map_err(ane_residency_error_to_wire)?);
+        }
+        if let Some(supervisor) = shared.as_ref() {
+            supervisor
+                .reacquire_lane()
+                .map_err(ane_residency_error_to_wire)?;
         }
         Ok(shared.clone())
     }
@@ -7119,18 +7210,73 @@ fn direct_ane_supervisor(
     }
 }
 
+#[cfg(unix)]
+fn runtime_ane_lock_path(
+    runtime: &RuntimeState,
+) -> Result<&Path, worker_host::ane_residency::AneResidencyError> {
+    #[cfg(test)]
+    {
+        let root = runtime
+            .ane_lane_test_root
+            .as_ref()
+            .expect("module tests must configure an ANE lock fixture root");
+        let path = runtime
+            .ane_lane_lock_path
+            .as_ref()
+            .expect("module tests must configure an ANE lock fixture path");
+        assert!(
+            path.starts_with(root)
+                && !path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir),
+            "module test ANE lock must stay under its fixture root"
+        );
+        worker_host::ane_residency::assert_test_ane_lock_path(path);
+    }
+    runtime.ane_lane_lock_path.as_deref().ok_or_else(|| {
+        worker_host::ane_residency::AneResidencyError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME is not set, so the ANE lane lock has no location",
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn acquire_runtime_ane_supervisor(
+    runtime: &RuntimeState,
+) -> Result<
+    worker_host::ane_residency::AneResidencySupervisor,
+    worker_host::ane_residency::AneResidencyError,
+> {
+    use worker_host::ane_residency::{AneDirectLaneLock, AneResidencySupervisor};
+    let mut supervisor = AneResidencySupervisor::with_lane_lock(
+        Default::default(),
+        AneDirectLaneLock::acquire(runtime_ane_lock_path(runtime)?)?,
+    );
+    if runtime.certify_observation {
+        supervisor.enable_observations();
+    }
+    Ok(supervisor)
+}
+
 fn load_worker_backend_blocking(
     spec: &StoredModelConfig,
     artifact: &ValidatedArtifact,
     runtime_config: &RuntimeConfig,
-    worker_load_timeout: Duration,
-    worker_forward_lines_per_sec: u32,
+    worker_load_context: WorkerLoadContext,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
     catalog_lane: Option<&str>,
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
-    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !cfg!(target_os = "macos") {
+    #[cfg(all(test, unix))]
+    let coreml_test_worker_factory = worker_load_context
+        .coreml_worker_factory
+        .filter(|_| spec.engine == "ane");
+    let macos_available = cfg!(target_os = "macos");
+    #[cfg(all(test, unix))]
+    let macos_available = macos_available || coreml_test_worker_factory.is_some();
+    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !macos_available {
         return Err(artifact_invalid_error(format!(
             "{} model '{}' is only supported on macOS",
             spec.engine, spec.model_id
@@ -7156,11 +7302,11 @@ fn load_worker_backend_blocking(
         .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
         .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
     let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    let _ = worker_load_timeout;
+    let _ = worker_load_context.timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.model_id = Some(spec.model_id.clone());
     config.catalog_lane = catalog_lane.map(str::to_owned);
-    config.worker_forward_lines_per_sec = worker_forward_lines_per_sec;
+    config.worker_forward_lines_per_sec = worker_load_context.forward_lines_per_sec;
     config.engine_identity = Some(spec.engine_identity.clone());
     config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
     config.pooling =
@@ -7187,7 +7333,18 @@ fn load_worker_backend_blocking(
     }
     #[cfg(not(unix))]
     let _ = ane_supervisor;
-    let mut engine = WorkerEngine::new(config).map_err(|error| {
+    #[cfg(unix)]
+    if matches!(spec.engine.as_str(), "ane" | "ane-coreml-worker") {
+        config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());
+    }
+    #[cfg(all(test, unix))]
+    let engine = match coreml_test_worker_factory {
+        Some(factory) => factory(config),
+        None => WorkerEngine::new(config),
+    };
+    #[cfg(not(all(test, unix)))]
+    let engine = WorkerEngine::new(config);
+    let mut engine = engine.map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
             format!(
@@ -7842,6 +7999,14 @@ fn model_load_owned_profile(
 }
 
 async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
+    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
+        Ok(guard) => guard,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, true, error);
+            clear_job_progress(&state.runtime, &job_id);
+            return;
+        }
+    };
     if !matches!(
         state
             .store
@@ -8456,6 +8621,10 @@ fn copy_source_stream(
 }
 
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Embed) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: EmbedQueryParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -8839,6 +9008,10 @@ fn sha256_text(text: &str) -> String {
 }
 
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Embed) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let resolution_started = Instant::now();
     let request_started = tokio::time::Instant::now();
     let params: EmbedBatchParams = match serde_json::from_value(params) {
@@ -9512,6 +9685,10 @@ async fn execute_remote_embed_batch_job(
 }
 
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Rerank) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: RerankScoreParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -9788,6 +9965,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
 }
 
 async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Generate) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: MicroLlmOneshotParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -11745,6 +11926,14 @@ async fn execute_embed_batch_job(
         }
     };
 
+    let _pause_guard = match lane_pause::admit(&state.runtime, &work.model.model_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, true, error);
+            return;
+        }
+    };
+
     if !enforce_checkpoint_continuity(
         &state,
         &job_id,
@@ -12883,7 +13072,7 @@ async fn lane_execution_guards(
 > {
     let serving = match held_guard {
         Some(held) => Some(LaneServingGuard::Exclusive(held)),
-        None if catalog_lane => {
+        None if catalog_lane || lane_pause::uses_ane_model(model) => {
             Some(acquire_lane_serving(runtime, &model.model_id, deadline).await?)
         }
         None => None,
@@ -14156,7 +14345,15 @@ async fn execute_probe_job(
         .unwrap_or_default();
     let mut selected_models = Vec::new();
     let mut lane_results = Vec::new();
+    let mut pause_guards = Vec::new();
     for model_id in selected_model_ids {
+        match lane_pause::admit(&state.runtime, &model_id) {
+            Ok(guard) => pause_guards.push(guard),
+            Err(error) => {
+                fail_job_with_wire_error(&state, &job_id, true, error);
+                return;
+            }
+        }
         let model = match ensure_model_loaded_for_control(
             Arc::clone(&state),
             &model_id,
@@ -17474,6 +17671,7 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
         if let Err(error) = catalog_list_row(state, &mut row) {
             return error_payload(state, error);
         }
+        lane_pause::project(&state.runtime, &mut row);
         models.push(row);
     }
     models.extend(state.remote_gateway.catalog_entries());
@@ -17551,6 +17749,9 @@ fn management_operations() -> Vec<ManagementOperation> {
 
     vec![
         op("certify.observations", Query),
+        op("lanes.pause", Mutate),
+        op("lanes.resume", Mutate),
+        op("lanes.status", Query),
         op("embed.query", Query),
         op("embed.batch", Query),
         op("embed.result", Query),
@@ -17963,6 +18164,14 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod coreml_load_tests {
+        include!("coreml_load_tests.rs");
+    }
+    #[cfg(unix)]
+    mod lane_pause_tests {
+        include!("lane_pause_tests.rs");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn failing_admitted_embed_and_rerank_log_closing_perf_lines() {
@@ -20833,6 +21042,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn cold_ane_supervisor_uses_the_runtime_fixture_lock_path() {
+        let (root, descriptor) = test_storage_descriptor("ane-runtime-lock-path");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let profile = test_machine_profile("ane-runtime-lock-path-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store, profile);
+        let path = runtime_ane_lock_path(&state.runtime).unwrap().to_path_buf();
+        assert_eq!(
+            path.parent().unwrap().canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert!(state.runtime.ane_supervisor.lock().unwrap().is_none());
+        let first = if cfg!(target_os = "macos") {
+            direct_ane_supervisor(&state.runtime, "ane-direct-worker")
+                .unwrap()
+                .unwrap()
+        } else {
+            acquire_runtime_ane_supervisor(&state.runtime).unwrap()
+        };
+        assert!(
+            worker_host::ane_residency::AneDirectLaneLock::acquire(&path).is_err(),
+            "runtime acquisition must hold the configured fixture lock"
+        );
+        drop((first, state));
+        let released = worker_host::ane_residency::AneDirectLaneLock::acquire(&path).unwrap();
+        drop(released);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unconfigured_ane_runtime_cannot_resolve_a_production_lock_in_tests() {
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime_ane_lock_path(
+                &runtime
+            )))
+            .is_err(),
+            "an unconfigured unit test must fail before resolving a production lock path"
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn direct_ane_models_reuse_one_runtime_supervisor() {
         let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
@@ -21606,10 +21859,30 @@ mod tests {
             .expect("test profile state reads")
             .profile_activation_epoch
             .expect("test profile is activated");
-        let runtime = Arc::new(
-            RuntimeState::from_catalog(config, vec![stuck_model_spec()])
-                .expect("test runtime initializes"),
-        );
+        let runtime = RuntimeState::from_catalog(config, vec![stuck_model_spec()])
+            .expect("test runtime initializes");
+        #[cfg(unix)]
+        let runtime = {
+            let mut runtime = runtime;
+            // Cold loads and pause expiry must use the same per-store lock on
+            // every test platform, including when no supervisor was installed.
+            let database = store
+                .store
+                .with_conn(|conn| {
+                    Ok(PathBuf::from(
+                        conn.path().expect("test store has a database file"),
+                    ))
+                })
+                .expect("test database path");
+            let root = database
+                .parent()
+                .expect("test database has a fixture root")
+                .to_path_buf();
+            runtime.ane_lane_lock_path = Some(root.join("ane-direct.lock"));
+            runtime.ane_lane_test_root = Some(root);
+            runtime
+        };
+        let runtime = Arc::new(runtime);
         let remote_gateway = Arc::new(
             RemoteGateway::new(
                 Arc::clone(&store),
@@ -27090,11 +27363,10 @@ mod catalog_runtime_tests {
                     CatalogAwareModelSpec {
                         stored: spec,
                         catalog_lane: None,
+                        worker_load_context: WorkerLoadContext::new(Duration::from_secs(10), 0),
                     },
                     state.model_cache.clone(),
                     8192,
-                    Duration::from_secs(10),
-                    0,
                     Arc::new(Mutex::new(
                         owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
                     )),
@@ -27391,11 +27663,10 @@ mod catalog_runtime_tests {
             CatalogAwareModelSpec {
                 stored: spec,
                 catalog_lane: None,
+                worker_load_context: WorkerLoadContext::new(Duration::from_secs(10), 0),
             },
             state.model_cache.clone(),
             8192,
-            Duration::from_secs(10),
-            0,
             Arc::new(Mutex::new(
                 owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
             )),
@@ -31165,6 +31436,10 @@ async fn run_catalog_embed_job(
 ) {
     let job = record.job_id.clone();
     let prepared = async {
+        let _pause_guard = lane_pause::admit(
+            &state.runtime,
+            &catalog::lane_id(&entry.id, &backend.backend),
+        )?;
         let budget = record
             .execution_expires_ms
             .unwrap_or(now_ms())
