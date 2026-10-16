@@ -18,6 +18,7 @@ mod ane_artifact;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
+mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
@@ -1339,6 +1340,8 @@ struct RuntimeState {
     profile_check_passes_for_test: Mutex<bool>,
     #[cfg(test)]
     lane_check_tasks: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    model_load_tasks: std::sync::atomic::AtomicUsize,
     /// Holds a certification caller between its fast-path miss and joining
     /// the lane's check.
     #[cfg(test)]
@@ -1367,6 +1370,7 @@ struct RuntimeState {
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
+    lane_pause: lane_pause::LanePause,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
     job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
@@ -1535,7 +1539,8 @@ impl ActivityTelemetry {
             if let (Some(runtime), Some(model)) =
                 (preparation.runtime.upgrade(), preparation.model.upgrade())
             {
-                let current = model_slot_snapshot(&runtime, &model_id).is_some_and(|slot| {
+                let pause_guard = lane_pause::admit(&runtime, &model_id);
+                let current = pause_guard.is_ok() && model_slot_snapshot(&runtime, &model_id).is_some_and(|slot| {
                     matches!(slot.state, ModelRuntimeState::Ready)
                         && slot.loaded.is_some_and(|loaded| Arc::ptr_eq(&loaded, &model))
                 });
@@ -2593,6 +2598,8 @@ impl RuntimeState {
             #[cfg(test)]
             lane_check_tasks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            model_load_tasks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             fast_path_gate: Mutex::new(None),
             download_locks: Mutex::new(BTreeMap::new()),
             download_bytes: Mutex::new(BTreeMap::new()),
@@ -2615,6 +2622,7 @@ impl RuntimeState {
             execution,
             execution_stats,
             ane_supervisor: Mutex::new(None),
+            lane_pause: lane_pause::LanePause::default(),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
             job_progress: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4210,6 +4218,9 @@ async fn dispatch_request(
     approved_by: Option<&str>,
 ) -> HandlerOutcome {
     match request.method.as_str() {
+        "lanes.pause" => lane_pause::pause(state, request.params).await,
+        "lanes.resume" => lane_pause::resume(state).await,
+        "lanes.status" => result_outcome(lane_pause::status(&state.runtime)),
         "models.catalog" => models_catalog(state, request.params).await,
         "models.download" => models_download(state, request.params).await,
         "models.download.cancel" => models_download_cancel(state, request.params).await,
@@ -6014,6 +6025,10 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             ),
         ));
     }
+    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     if let Err(message) = validate_model_load_request(&params).and_then(|_| {
         resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint).map(|_| ())
     }) {
@@ -6413,6 +6428,7 @@ async fn wait_for_model_loaded(
     timeout_ms: u64,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
     loop {
+        drop(lane_pause::admit(runtime, model_id)?);
         let Some(snapshot) = model_slot_snapshot(runtime, model_id) else {
             return Err(WireOperationError::from_stable(
                 StableError::artifact_invalid(),
@@ -6446,6 +6462,11 @@ async fn load_catalog_model_task(
     state: Arc<ModuleState>,
     model_id: String,
 ) -> Result<Arc<EmbeddingModel>, WireOperationError> {
+    #[cfg(test)]
+    state
+        .runtime
+        .model_load_tasks
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _permit = state
         .runtime
         .control_loads
@@ -6458,6 +6479,13 @@ async fn load_catalog_model_task(
                 "control load queue is closed",
             )
         })?;
+    let _pause_guard = match lane_pause::admit(&state.runtime, &model_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Unloaded);
+            return Err(error);
+        }
+    };
     set_model_slot_state(&state.runtime, &model_id, ModelRuntimeState::Loading);
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &model_id) else {
         return Err(WireOperationError::from_stable(
@@ -7074,7 +7102,7 @@ fn direct_ane_supervisor(
     runtime: &RuntimeState,
     engine: &str,
 ) -> Result<Option<worker_host::ane_residency::AneResidencySupervisor>, WireOperationError> {
-    if engine != "ane-direct-worker" {
+    if !matches!(engine, "ane-direct-worker" | "ane" | "ane-coreml-worker") {
         return Ok(None);
     }
     if !cfg!(target_os = "macos") {
@@ -7097,6 +7125,11 @@ fn direct_ane_supervisor(
                 supervisor.enable_observations();
             }
             *shared = Some(supervisor);
+        }
+        if let Some(supervisor) = shared.as_ref() {
+            supervisor
+                .reacquire_lane()
+                .map_err(ane_residency_error_to_wire)?;
         }
         Ok(shared.clone())
     }
@@ -7177,6 +7210,15 @@ fn load_worker_backend_blocking(
     }
     #[cfg(not(unix))]
     let _ = ane_supervisor;
+    #[cfg(unix)]
+    if matches!(spec.engine.as_str(), "ane" | "ane-coreml-worker") {
+        config.inherited_lane_lock = ane_supervisor
+            .as_ref()
+            .map(|s| s.inherited_lane_lock())
+            .transpose()
+            .map_err(ane_residency_error_to_wire)?
+            .flatten();
+    }
     let mut engine = WorkerEngine::new(config).map_err(|error| {
         WireOperationError::from_stable(
             StableError::engine_crashed(Some(100)),
@@ -7832,6 +7874,14 @@ fn model_load_owned_profile(
 }
 
 async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
+    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
+        Ok(guard) => guard,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, true, error);
+            clear_job_progress(&state.runtime, &job_id);
+            return;
+        }
+    };
     if !matches!(
         state
             .store
@@ -8446,6 +8496,10 @@ fn copy_source_stream(
 }
 
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Embed) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: EmbedQueryParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -8829,6 +8883,10 @@ fn sha256_text(text: &str) -> String {
 }
 
 async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Embed) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let resolution_started = Instant::now();
     let request_started = tokio::time::Instant::now();
     let params: EmbedBatchParams = match serde_json::from_value(params) {
@@ -9502,6 +9560,10 @@ async fn execute_remote_embed_batch_job(
 }
 
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Rerank) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: RerankScoreParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -9778,6 +9840,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
 }
 
 async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
+    let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Generate) {
+        Ok(guard) => guard,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
     let request_started = tokio::time::Instant::now();
     let params: MicroLlmOneshotParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -11735,6 +11801,14 @@ async fn execute_embed_batch_job(
         }
     };
 
+    let _pause_guard = match lane_pause::admit(&state.runtime, &work.model.model_id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            fail_job_with_wire_error(&state, &job_id, true, error);
+            return;
+        }
+    };
+
     if !enforce_checkpoint_continuity(
         &state,
         &job_id,
@@ -12873,7 +12947,7 @@ async fn lane_execution_guards(
 > {
     let serving = match held_guard {
         Some(held) => Some(LaneServingGuard::Exclusive(held)),
-        None if catalog_lane => {
+        None if catalog_lane || lane_pause::uses_ane_model(model) => {
             Some(acquire_lane_serving(runtime, &model.model_id, deadline).await?)
         }
         None => None,
@@ -14146,7 +14220,15 @@ async fn execute_probe_job(
         .unwrap_or_default();
     let mut selected_models = Vec::new();
     let mut lane_results = Vec::new();
+    let mut pause_guards = Vec::new();
     for model_id in selected_model_ids {
+        match lane_pause::admit(&state.runtime, &model_id) {
+            Ok(guard) => pause_guards.push(guard),
+            Err(error) => {
+                fail_job_with_wire_error(&state, &job_id, true, error);
+                return;
+            }
+        }
         let model = match ensure_model_loaded_for_control(
             Arc::clone(&state),
             &model_id,
@@ -17464,6 +17546,7 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
         if let Err(error) = catalog_list_row(state, &mut row) {
             return error_payload(state, error);
         }
+        lane_pause::project(&state.runtime, &mut row);
         models.push(row);
     }
     models.extend(state.remote_gateway.catalog_entries());
@@ -17541,6 +17624,9 @@ fn management_operations() -> Vec<ManagementOperation> {
 
     vec![
         op("certify.observations", Query),
+        op("lanes.pause", Mutate),
+        op("lanes.resume", Mutate),
+        op("lanes.status", Query),
         op("embed.query", Query),
         op("embed.batch", Query),
         op("embed.result", Query),
@@ -17953,6 +18039,10 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod lane_pause_tests {
+        include!("lane_pause_tests.rs");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn failing_admitted_embed_and_rerank_log_closing_perf_lines() {
@@ -31078,6 +31168,10 @@ async fn run_catalog_embed_job(
 ) {
     let job = record.job_id.clone();
     let prepared = async {
+        let _pause_guard = lane_pause::admit(
+            &state.runtime,
+            &catalog::lane_id(&entry.id, &backend.backend),
+        )?;
         let budget = record
             .execution_expires_ms
             .unwrap_or(now_ms())

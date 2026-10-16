@@ -225,7 +225,55 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
-`approvals.emergency_rollback`, and `certify.observations`.
+`approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
+`lanes.resume`, and `lanes.status`.
+
+- **lanes.pause** {scope: "neural_engine", duration_ms, reason} — mutate. Starts
+  a volatile pause of every direct-ANE and Core ML ANE lane, including cold lanes.
+  `duration_ms` must be positive and at most 7,200,000 (120 minutes); a blank
+  reason, unknown scope, or a second active pause is `invalid_request`.
+  Returns `{paused_until_ms, reason, lane_ids, phase, hardware_free}` immediately.
+  `phase: "draining"` means admitted requests are finishing normally. The module
+  then unloads affected workers and releases the global direct-ANE lock.
+  The duration starts at acceptance and includes draining; it is never extended
+  to compensate for a slow drain. A drain past expiry immediately re-acquires
+  the lock instead of starting an additional hardware-free window.
+  Wait for `lanes.status` to report `phase: "paused", hardware_free: true` before
+  starting a private measurement daemon. Metal, rerank on non-ANE engines, and
+  other unaffected lanes continue serving.
+- **lanes.resume** {} — mutate. Requests early expiry; idempotent when running.
+  Returns the same status shape. It does not interrupt an in-progress drain.
+- **lanes.status** {} — query. Returns the pause status above, or
+  `{phase: "running", hardware_free: false, lane_ids: []}` with the pause fields
+  absent. Expiry is automatic using a monotonic timer, even without another call.
+  After expiry or resume the module re-acquires the global lock **before** opening
+  admission. If a private daemon still holds it, `phase: "waiting_for_lock"`
+  remains paused and a warning is logged on each one-second retry. No worker is
+  loaded without the lock. The pause is not persisted: a module restart ends it.
+  `models.list` adds `paused_until_ms` and `pause_reason` on affected lane rows
+  only while paused, including drain and lock-reacquisition time.
+
+While a lane is paused, inference is refused before admission, loading, numerical
+self-checks, or shape compilation with stable code `lane_paused`, class
+`transient`, `safe_to_retry_same_request: true`. `retry_after_ms` is the remaining
+pause duration, with a minimum of 1000 (also used while waiting for the global
+lock after expiry). Details are `{lane_id, fingerprint, paused_until_ms, reason}`.
+`lane_id` is the exact serving model/lane id, not a backend label or worker id.
+For catalog lanes `fingerprint` is the pinned catalog fingerprint, the same value
+as a successful reply, readable without loading. For legacy lanes it is omitted
+if not known while paused; absence means **not known while paused**, not null or
+a different identity. Callers may use `lane_id` plus `fingerprint` to confirm the
+pause is for their lane. Semantic refusals use the normal result error envelope.
+New durable `embed.batch` submissions are refused before job diversion. Already
+queued jobs that encounter the fence fail transiently with the same `lane_paused`
+error; admitted execution drains normally. Replay the identical `embed.batch`
+request (same `request_key` and content) after the pause clears to start a fresh
+attempt and reuse retained checkpoints. `job.resume` is for re-authentication,
+not lane pauses. Checkpoint reuse is bounded by job result retention.
+Pause/resume are mutate operations and therefore refused on flow-scoped routes.
+
+Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measurement`,
+`ck-synapse-opctl --json lanes status`, `ck-synapse-opctl lanes resume`.
 
 - **certify.observations** {} — query, certification-only surface. Consumers
   must not use this operation or depend on its output. It refuses with the typed

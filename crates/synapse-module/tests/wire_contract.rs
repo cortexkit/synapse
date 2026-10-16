@@ -55,6 +55,7 @@ fn stable_name(code: StableErrorCode) -> &'static str {
         SequenceTooLong => "sequence_too_long",
         DeadlineExceeded => "deadline_exceeded",
         ModelLoading => "model_loading",
+        LanePaused => "lane_paused",
         NotCertified => "not_certified",
         SubstitutionRejected => "substitution_rejected",
         ArtifactInvalid => "artifact_invalid",
