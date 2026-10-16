@@ -21,6 +21,14 @@ hardware execution. Checkpoint-dependent or ignored tests are separate gates.
 To reverse a source change, restore the compatible source and rerun the same
 narrow tests; a passing unrelated package is not a substitute.
 
+Before submitting a change for merge, run `bash scripts/land-gates.sh` for fast
+static checks and targeted test feedback.
+Use `--plan` to inspect its changed-target selection or `--base REF` to choose
+the comparison base. `--full` retains the serial portable module landing set;
+it is not hardware certification. See [gate timing and policy](ci-gate-timings.md)
+for measurements, retained boundaries and the explicit caught-late cost of checks
+delegated to CI or nightly runs.
+
 ## Execute development binaries without confusing installed ones
 
 Tests and development drivers use `ckdev-*` executable names. Cargo's own test
@@ -74,6 +82,12 @@ ckdev-mutate run --diff origin/master --report target/mutations/diff.json
 runner restores source bytes; never check out a target while a mutant is running,
 or you may erase the deliberate break and manufacture a passing proof. Keep any
 evidence needed for review outside regenerable build directories after replay.
+
+Train CI checks catalogue validity but does not replay mutants. The separate
+master workflow replays all rows after landing; the nightly breadth audit uses
+four independent shards per OS. Run the command above explicitly when a change
+needs pre-landing mutation evidence rather than waiting for those asynchronous
+checks.
 
 ## Add a proved control
 

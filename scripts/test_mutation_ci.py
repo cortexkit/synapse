@@ -21,10 +21,10 @@ class ProductionEngineGuardTests(unittest.TestCase):
 
 
 class MutationCiTests(unittest.TestCase):
-    def test_touched_rows_are_required(self):
-        # Run the real precondition checker over the real tests.yml. A fixture
-        # alone would not prove that deleting the CI step that replays the
-        # mutations touched by a change is refused before that change lands.
+    def test_catalogue_check_is_required(self):
+        # Run the checker against the real tests.yml to verify that removing
+        # required catalogue validation is refused before merging. A fixture
+        # alone would not test the live workflow; replay runs asynchronously.
         result = subprocess.run(
             ["bash", "scripts/check-train-preconditions.sh"],
             env=dict(os.environ, PYTHON=sys.executable),
@@ -37,6 +37,18 @@ class MutationCiTests(unittest.TestCase):
 
 
 class MutationAuditTests(unittest.TestCase):
+    def test_nightly_shards_have_separate_evidence(self):
+        from pathlib import Path
+        import yaml
+
+        workflow = yaml.safe_load(Path(".github/workflows/mutations-audit.yml").read_text())
+        audit = workflow["jobs"]["audit"]
+        self.assertEqual(audit["strategy"]["matrix"]["shard"], ["1/4", "2/4", "3/4", "4/4"])
+        run = next(s["run"] for s in audit["steps"] if s.get("name") == "Audit all package test targets")
+        self.assertIn("--shard '${{ matrix.shard }}'", run)
+        evidence = next(s["with"]["name"] for s in audit["steps"] if s.get("name") == "Retain breadth evidence")
+        self.assertIn("strategy.job-index", evidence)
+
     def test_nightly_builds_feature_off_gpu_workers_before_audit(self):
         from pathlib import Path
         import yaml

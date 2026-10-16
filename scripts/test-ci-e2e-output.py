@@ -14,10 +14,11 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
 STEPS = WORKFLOW["jobs"]["test"]["steps"]
+E2E_STEPS = WORKFLOW["jobs"]["e2e"]["steps"]
 
 
 def step(name):
-    return next(s for s in STEPS if s.get("name") == name)
+    return next(s for s in STEPS + E2E_STEPS if s.get("name") == name)
 
 
 class E2eOutputTests(unittest.TestCase):
@@ -58,13 +59,15 @@ class E2eOutputTests(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_suite_partitions_run_once_and_guard_reuses_output(self):
+    def test_push_and_nightly_partition_once_and_guard_reuses_output(self):
         for platform in ("linux", "windows"):
             with self.subTest(platform=platform):
                 (self.root / "calls.jsonl").unlink(missing_ok=True)
                 run = self.run_step("nextest", platform)
                 self.assertEqual(run.returncode, 0, run.stderr)
                 self.assertIn("skipping optional worker checkpoint", run.stdout)
+                e2e = self.run_step("skeleton e2e", platform)
+                self.assertEqual(e2e.returncode, 0, e2e.stderr)
                 guard = self.run_step("Assert no silently-skipped e2e", platform)
                 self.assertEqual(guard.returncode, 0, guard.stderr)
                 calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
@@ -73,11 +76,13 @@ class E2eOutputTests(unittest.TestCase):
                                  ["not binary(skeleton_e2e)", "binary(skeleton_e2e)"])
                 for call in calls:
                     self.assertEqual("--release" in call, platform == "windows")
-                self.assertIn("--no-capture", calls[1])
+                self.assertIn("--no-capture", calls[1], "whole-process fixtures must remain serial")
+                for call in calls:
+                    self.assertIn("--locked", call)
 
     def test_fixture_skip_is_refused(self):
         self.env["FAKE_SKIP"] = "1"
-        run = self.run_step("nextest")
+        run = self.run_step("skeleton e2e")
         self.assertEqual(run.returncode, 0, run.stderr)
         guard = self.run_step("Assert no silently-skipped e2e")
         self.assertNotEqual(guard.returncode, 0, "a skipping first run must fail the guard")
@@ -85,7 +90,7 @@ class E2eOutputTests(unittest.TestCase):
 
     def test_nextest_failure_survives_tee(self):
         self.env["FAKE_STATUS"] = "42"
-        run = self.run_step("nextest")
+        run = self.run_step("skeleton e2e")
         self.assertEqual(run.returncode, 42, run.stderr)
 
     def test_missing_transcript_is_refused(self):

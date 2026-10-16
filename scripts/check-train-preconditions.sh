@@ -22,10 +22,13 @@ from pathlib import Path
 import yaml
 
 
-# These manual GPU gates are intentionally dispatch-only. The test matrix keeps
-# CPU coverage on pushes, while these expensive platform-specific builds remain
-# available as explicit gates without delaying or weakening a train push.
+# Only these exact event-only conditions may differ from a push. CPU contracts
+# remain push-gated; whole-process fixtures and GPU builds run outside that path.
 ALLOWED_JOB_CONDITIONS = {
+    "e2e": (
+        "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+        "Whole-process fixture tests run nightly or explicitly, not on the train's push path.",
+    ),
     "linux-llama-cuda-manual": (
         "github.event_name == 'workflow_dispatch'",
         "The CUDA build is an explicit manual gate, not a push-triggered train gate.",
@@ -67,8 +70,8 @@ def check(workflow: object) -> list[str]:
         branches = [branches]
     if not isinstance(branches, list) or "train/**" not in branches:
         failures.append("train precondition failed: push trigger does not include branch train/**")
-    # Master replays the catalogue as well as the ordinary platform gates. Keep
-    # the train's touched-row step identical so its green SHA proves the same checks.
+    # Train and master use the same blocking checks. Replay is asynchronous in
+    # the separate master/nightly workflows; catalogue validity still blocks both.
     if not isinstance(branches, list) or "master" not in branches:
         failures.append("train precondition failed: push trigger does not include branch master")
 
@@ -105,8 +108,8 @@ def check(workflow: object) -> list[str]:
                     f"job '{job_id}', step '{step_name}': {rendered}"
                 )
 
-    # Keep the allow-list tied to the exact manual-only jobs and expressions so
-    # removing a manual gate's guard cannot silently turn it into a push job.
+    # Keep the allow-list tied to exact jobs and expressions so removing an
+    # event-only guard cannot silently turn an expensive audit into a push job.
     for job_id, (expected_condition, _reason) in ALLOWED_JOB_CONDITIONS.items():
         job = jobs.get(job_id)
         actual_condition = (
@@ -124,12 +127,12 @@ def check(workflow: object) -> list[str]:
             )
 
     steps = jobs.get("test", {}).get("steps", [])
-    touched = [s for s in steps if isinstance(s, dict) and s.get("name") == "Replay touched mutation controls"]
-    if len(touched) != 1 or touched[0].get("if") is not None or not any(
-        line.strip() == "ckdev-mutate run --diff origin/master --report target/mutations/diff.json"
-        for line in str(touched[0].get("run", "")).splitlines()
+    catalogue = [s for s in steps if isinstance(s, dict) and s.get("name") == "Check mutation catalogue"]
+    if len(catalogue) != 1 or catalogue[0].get("if") is not None or not any(
+        line.strip() == "ckdev-mutate check"
+        for line in str(catalogue[0].get("run", "")).splitlines()
     ):
-        failures.append("train precondition failed: touched mutation replay must be unconditional and compare origin/master")
+        failures.append("train precondition failed: mutation catalogue check must be unconditional")
 
     concurrency = workflow.get("concurrency") if isinstance(workflow, dict) else None
     group = concurrency.get("group") if isinstance(concurrency, dict) else None
@@ -145,7 +148,7 @@ def control_workflow() -> dict:
     """A minimal workflow that satisfies every precondition."""
     jobs: dict = {"test": {"steps": [
         {"name": "build", "run": "true"},
-        {"name": "Replay touched mutation controls", "run": "ckdev-mutate run --diff origin/master --report target/mutations/diff.json"},
+        {"name": "Check mutation catalogue", "run": "ckdev-mutate check"},
     ]}}
     for job_id, (condition, _reason) in ALLOWED_JOB_CONDITIONS.items():
         jobs[job_id] = {"if": condition, "steps": [{"run": "true"}]}
@@ -192,8 +195,8 @@ def self_test() -> list[str]:
     arms = [
         (no_train, "push trigger does not include branch train/**"),
         (no_master, "push trigger does not include branch master"),
-        (no_mutations, "touched mutation replay must be unconditional"),
-        (conditional_mutations, "touched mutation replay must be unconditional"),
+        (no_mutations, "mutation catalogue check must be unconditional"),
+        (conditional_mutations, "mutation catalogue check must be unconditional"),
         (job_if, "path-dependent if at job 'test':"),
         (step_if, "path-dependent if at job 'test', step 'build'"),
         (gate_drift, f"manual gate allow-list drift at job '{manual_job}'"),
