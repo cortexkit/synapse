@@ -104,12 +104,14 @@ expect_red = ["tests::guard"]
 
         # The breadth audit drops each row's expected-test selection, so every
         # cargo or nextest row runs its whole package test suite, and rows with
-        # the same runner, package and features share a single baseline run.
-        # ckdev-mutate runs that shared baseline under the timeout_s of the first
-        # such row in the shard, and reports a timeout as a baseline failure on
-        # every row sharing it. A row sized for its own few tests (60 s against a
-        # module suite that takes about 315 s on GitHub's Linux runner) therefore
-        # breaks the whole group whenever sharding makes it the first row.
+        # the same build command share a single baseline run. ckdev-mutate runs
+        # that shared baseline under the timeout_s of the first such row in the
+        # shard and reports its timeout as a baseline failure on every row that
+        # shares it. A row sized for its own few tests (60 s, against a module
+        # suite that takes about 330 s on GitHub's Linux runner) therefore breaks
+        # the whole group whenever sharding makes it the first row. Grouping by
+        # package rather than the exact build command is deliberately stricter:
+        # each row's own mutant run is held to the same whole-suite duration.
         helpers = runpy.run_path("scripts/prepare-mutation-audit.py")
         catalogue = tomllib.loads(helpers["prepare"](helpers["load_source"](Path("mutations.d"))))
         timeouts = {}
