@@ -97,6 +97,35 @@ expect_red = ["tests::guard"]
         self.assertEqual(parsed["control"][0]["expect_red"], ["tests::guard"])
         self.assertEqual(parsed["prebuild"], [{"name": "fixture", "command": ["cargo", "build", "--locked"]}])
 
+    def test_rows_running_the_same_package_suite_share_one_timeout(self):
+        import runpy
+        import tomllib
+        from pathlib import Path
+
+        # The breadth audit drops each row's expected-test selection, so every
+        # cargo or nextest row runs its whole package test suite, and rows with
+        # the same runner, package and features share a single baseline run.
+        # ckdev-mutate runs that shared baseline under the timeout_s of the first
+        # such row in the shard, and reports a timeout as a baseline failure on
+        # every row sharing it. A row sized for its own few tests (60 s against a
+        # module suite that takes about 315 s on GitHub's Linux runner) therefore
+        # breaks the whole group whenever sharding makes it the first row.
+        helpers = runpy.run_path("scripts/prepare-mutation-audit.py")
+        catalogue = tomllib.loads(helpers["prepare"](helpers["load_source"](Path("mutations.d"))))
+        timeouts = {}
+        for row in catalogue["control"]:
+            if row.get("runner") not in ("cargo", "nextest"):
+                continue
+            suite = (
+                row["runner"],
+                row.get("package"),
+                repr(row.get("features")),
+                repr(row.get("ignored")),
+            )
+            timeouts.setdefault(suite, {}).setdefault(row["timeout_s"], []).append(row["id"])
+        mixed = {suite: rows for suite, rows in timeouts.items() if len(rows) > 1}
+        self.assertEqual(mixed, {}, "rows that share a package suite need one timeout_s")
+
     def test_directory_fragments_are_loaded_in_filename_order(self):
         import runpy
         import tempfile

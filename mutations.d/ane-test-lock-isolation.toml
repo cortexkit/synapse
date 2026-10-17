@@ -15,7 +15,7 @@ target = "--lib"
 expect_red = ["tests::cold_ane_supervisor_uses_the_runtime_fixture_lock_path"]
 expect_message = "configured fixture lock"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -39,7 +39,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint"]
 expect_message = "cold resume must hold the fixture"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -64,7 +64,7 @@ target = "--lib"
 expect_red = ["worker_host::ane_residency::tests::module_tests_reject_the_production_lock_path_without_opening_it"]
 expect_message = "production lock guard must reject"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -92,5 +92,5 @@ target = "--lib"
 expect_red = ["tests::unconfigured_ane_runtime_cannot_resolve_a_production_lock_in_tests"]
 expect_message = "unconfigured unit test must fail"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800

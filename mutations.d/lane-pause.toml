@@ -15,7 +15,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::paused_lane_refuses_before_load_or_self_check_with_the_served_fingerprint"]
 expect_message = "lane_paused"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -35,7 +35,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::paused_ane_does_not_block_metal_embeddings_or_rerank"]
 expect_message = "lane_paused"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -61,7 +61,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::request_admitted_before_pause_finishes_normally"]
 expect_message = "lane_paused"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -81,7 +81,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_unloads_only_after_cancelled_request_reply_drains"]
 expect_message = "assertion"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -101,7 +101,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_releases_fresh_open_global_lock_and_resume_holds_it_again"]
 expect_message = "hardware must be free"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -121,7 +121,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_auto_expires_with_tokio_time_without_resume"]
 expect_message = "running"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -141,7 +141,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_rejects_121_minutes"]
 expect_message = "invalid_request"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -161,7 +161,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_reacquire_contention_keeps_refusing_instead_of_serving"]
 expect_message = "waiting_for_lock"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -197,7 +197,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::paused_lane_refuses_before_load_or_self_check_with_the_served_fingerprint"]
 expect_message = "assertion"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -233,7 +233,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::paused_lane_refuses_before_load_or_self_check_with_the_served_fingerprint"]
 expect_message = "assertion"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -253,7 +253,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint"]
 expect_message = "legacy-coreml"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -273,7 +273,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::queued_catalog_batch_gets_retryable_pause_without_loading"]
 expect_message = "failed_transient"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -293,7 +293,7 @@ target = "--lib"
 expect_red = ["worker_host::tests::pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock"]
 expect_message = "confirmed exit"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -313,7 +313,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::paused_lane_refuses_before_load_or_self_check_with_the_served_fingerprint"]
 expect_message = "wrong-pin"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -344,7 +344,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_unloads_only_after_cancelled_request_reply_drains"]
 expect_message = "assertion"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -380,7 +380,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::failed_pause_drain_expires_and_serves_again_with_global_lock_held"]
 expect_message = "running"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -400,7 +400,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::resume_ends_pause_while_admitted_request_is_still_draining"]
 expect_message = "running"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -428,7 +428,7 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::pause_shutdown_refunds_reserved_executables_before_next_worker_generation"]
 expect_message = "reserved_executables"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
@@ -448,5 +448,5 @@ target = "--lib"
 expect_red = ["tests::lane_pause_tests::resume_detaches_unload_without_publishing_a_retired_model_or_releasing_the_lock"]
 expect_message = "retired model"
 only = false
-timeout_s = 60
+timeout_s = 600
 build_timeout_s = 1800
