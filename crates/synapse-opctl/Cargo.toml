@@ -21,7 +21,11 @@ subc-client-rs = { workspace = true }
 subc-protocol = { workspace = true }
 tokio = { workspace = true }
 
-# tests/connection_discovery.rs compiles synapse-core's dev_binary.rs from
-# source, which checks the owner of its executable folder through rustix.
+# tests/connection_discovery.rs compiles synapse-core's dev_binary.rs and
+# child_process.rs from source: the first checks the owner of its executable
+# folder through rustix, the second names the launch-nonce variables via subc-os.
+[dev-dependencies]
+subc-os = { workspace = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }

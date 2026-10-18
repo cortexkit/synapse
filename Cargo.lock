@@ -6775,6 +6775,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
+ "subc-os",
  "subc-protocol",
  "tokio",
 ]

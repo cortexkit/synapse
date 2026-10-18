@@ -277,7 +277,7 @@ fn strip_and_sign_macos_with_tools(
 #[cfg(target_os = "macos")]
 fn run_macos_tool(tool: &Path, arguments: &[&str], target: &Path) -> io::Result<()> {
     let command_arguments = arguments.join(" ");
-    let output = std::process::Command::new(tool)
+    let output = super::child_process::without_launch_nonce(std::process::Command::new(tool))
         .args(arguments)
         .arg(target)
         .output()

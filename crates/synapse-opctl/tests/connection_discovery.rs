@@ -4,6 +4,12 @@
 #[allow(dead_code)]
 mod dev_binary;
 
+// dev_binary.rs strips the daemon launch nonce from the strip and codesign
+// children it runs through this sibling module.
+#[path = "../../synapse-core/src/child_process.rs"]
+#[allow(dead_code)]
+mod child_process;
+
 use std::{
     fs,
     path::{Path, PathBuf},
