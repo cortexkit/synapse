@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "macos")]
+const MACOS_STRIPPED_COPY_FORMAT: &[u8] = b"macos-strip-debug-map-adhoc-sign/1\0";
+
 /// Publish a content-addressed executable copy under a development name. Unix
 /// copies live in a safe temporary directory; Windows keeps its existing layout.
 /// The scratch argument is retained for callers but is no longer used; calls
@@ -110,10 +113,35 @@ fn content_addressed_copy(binary: &Path) -> io::Result<PathBuf> {
 }
 
 fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        content_addressed_copy_at_with_processor(binary, base, Some(&strip_and_sign_macos))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        content_addressed_copy_at_with_processor(binary, base, None)
+    }
+}
+
+fn content_addressed_copy_at_with_processor(
+    binary: &Path,
+    base: &Path,
+    macos_processor: Option<&dyn Fn(&Path) -> io::Result<()>>,
+) -> io::Result<PathBuf> {
     let name = development_name(binary)?;
+    #[cfg(target_os = "macos")]
+    let is_macho = is_macho_binary(binary)?;
+    #[cfg(not(target_os = "macos"))]
+    let is_macho = false;
+
     let mut source = File::open(binary)?;
     let source_size = source.metadata()?.len();
     let mut hasher = Sha256::new();
+    let mut source_hasher = Sha256::new();
+    #[cfg(target_os = "macos")]
+    if is_macho {
+        hasher.update(MACOS_STRIPPED_COPY_FORMAT);
+    }
     let mut buffer = [0; 64 * 1024];
     loop {
         let read = source.read(&mut buffer)?;
@@ -121,12 +149,19 @@ fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> 
             break;
         }
         hasher.update(&buffer[..read]);
+        source_hasher.update(&buffer[..read]);
     }
+    let source_digest = hex::encode(source_hasher.finalize());
     let digest = hex::encode(hasher.finalize());
     let dir = copy_directory(base, &digest)?;
     let destination = dir.join(format!("ckdev-{name}"));
 
-    if destination_exists_with_size(&destination, source_size)? {
+    let cached_copy_exists = if is_macho {
+        destination_exists(&destination)?
+    } else {
+        destination_exists_with_size(&destination, source_size)?
+    };
+    if cached_copy_exists {
         return Ok(destination);
     }
 
@@ -144,7 +179,7 @@ fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> 
             copied_hasher.update(&buffer[..read]);
             copied_size += read as u64;
         }
-        if copied_size != source_size || hex::encode(copied_hasher.finalize()) != digest {
+        if copied_size != source_size || hex::encode(copied_hasher.finalize()) != source_digest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "executable changed while its development copy was being made",
@@ -154,14 +189,35 @@ fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> 
         set_executable_permissions(binary, &temporary_path)?;
         drop(temporary);
 
-        if destination_exists_with_size(&destination, source_size)? {
+        #[cfg(target_os = "macos")]
+        if is_macho {
+            let processor = macos_processor.ok_or_else(|| {
+                io::Error::other("macOS Mach-O publication has no strip-and-sign processor")
+            })?;
+            processor(&temporary_path)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = macos_processor;
+
+        let output_size = fs::metadata(&temporary_path)?.len();
+        let already_published = if is_macho {
+            destination_exists(&destination)?
+        } else {
+            destination_exists_with_size(&destination, output_size)?
+        };
+        if already_published {
             fs::remove_file(&temporary_path)?;
             return Ok(());
         }
         match fs::rename(&temporary_path, &destination) {
             Ok(()) => Ok(()),
             Err(rename_error) => {
-                if destination_exists_with_size(&destination, source_size)? {
+                let already_published = if is_macho {
+                    destination_exists(&destination)?
+                } else {
+                    destination_exists_with_size(&destination, output_size)?
+                };
+                if already_published {
                     fs::remove_file(&temporary_path)?;
                     Ok(())
                 } else {
@@ -176,6 +232,77 @@ fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> 
     }
     publication?;
     Ok(destination)
+}
+
+#[cfg(target_os = "macos")]
+fn is_macho_binary(binary: &Path) -> io::Result<bool> {
+    let mut source = File::open(binary)?;
+    let mut magic = [0; 4];
+    match source.read_exact(&mut magic) {
+        Ok(()) => Ok(matches!(
+            magic,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        )),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn strip_and_sign_macos(copy: &Path) -> io::Result<()> {
+    strip_and_sign_macos_with_tools(
+        copy,
+        Path::new("/usr/bin/strip"),
+        Path::new("/usr/bin/codesign"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn strip_and_sign_macos_with_tools(
+    copy: &Path,
+    strip_tool: &Path,
+    codesign_tool: &Path,
+) -> io::Result<()> {
+    run_macos_tool(strip_tool, &["-S"], copy)?;
+    run_macos_tool(codesign_tool, &["-f", "-s", "-"], copy)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_tool(tool: &Path, arguments: &[&str], target: &Path) -> io::Result<()> {
+    let command_arguments = arguments.join(" ");
+    let output = std::process::Command::new(tool)
+        .args(arguments)
+        .arg(target)
+        .output()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "{} {} {} failed: could not start: {error}; stderr: (none)",
+                tool.display(),
+                command_arguments,
+                target.display()
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let stderr = if stderr.is_empty() { "(empty)" } else { stderr };
+    Err(io::Error::other(format!(
+        "{} {} {} failed: {}; stderr: {stderr}",
+        tool.display(),
+        command_arguments,
+        target.display(),
+        output.status
+    )))
 }
 
 #[cfg(unix)]
@@ -258,6 +385,18 @@ fn destination_exists_with_size(destination: &Path, expected_size: u64) -> io::R
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "existing development executable copy has a different size",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn destination_exists(destination: &Path) -> io::Result<bool> {
+    match fs::metadata(destination) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "existing development executable copy is not a file",
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -563,6 +702,115 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn published_macho_copy_has_no_stabs_and_keeps_function_symbols() {
+        let source = std::env::current_exe().unwrap();
+        let copy = ckdev_binary(&source, Path::new("unused-scratch")).unwrap();
+        let unversioned_digest = hex::encode(Sha256::digest(fs::read(&source).unwrap()));
+        let published_directory = copy
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_ne!(
+            published_directory,
+            &unversioned_digest[..16],
+            "Mach-O publications must not reuse the old unstripped cache key"
+        );
+        let symbols = nm_symbols(&copy);
+        let stab_entries = symbols
+            .lines()
+            .filter(|line| line.split_whitespace().nth(1) == Some("-"))
+            .collect::<Vec<_>>();
+        assert!(
+            stab_entries.is_empty(),
+            "debug map entries remain: {stab_entries:?}"
+        );
+
+        let source_symbols = nm_symbols(&source);
+        let retained_function = source_symbols
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() >= 3 && matches!(fields[1], "T" | "t") {
+                    Some(fields[2])
+                } else {
+                    None
+                }
+            })
+            .find(|symbol| {
+                symbols
+                    .lines()
+                    .any(|line| line.split_whitespace().last() == Some(*symbol))
+            });
+        assert!(
+            retained_function.is_some(),
+            "no function symbol survived strip -S"
+        );
+
+        let verification = std::process::Command::new("/usr/bin/codesign")
+            .arg("-v")
+            .arg(&copy)
+            .output()
+            .unwrap();
+        assert!(
+            verification.status.success(),
+            "codesign -v {} failed: {}",
+            copy.display(),
+            String::from_utf8_lossy(&verification.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_strip_names_tool_and_file_and_does_not_publish() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("strip-failure");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("ck-strip-failure");
+        fs::copy(std::env::current_exe().unwrap(), &source).unwrap();
+        let failing_strip = root.join("failing-strip");
+        fs::write(
+            &failing_strip,
+            b"#!/bin/sh\nprintf '%s\\n' 'deliberate strip failure' >&2\nexit 17\n",
+        )
+        .unwrap();
+        fs::set_permissions(&failing_strip, fs::Permissions::from_mode(0o700)).unwrap();
+        let processor = |copy: &Path| {
+            strip_and_sign_macos_with_tools(copy, &failing_strip, Path::new("/usr/bin/codesign"))
+        };
+
+        let error = content_addressed_copy_at_with_processor(&source, &root, Some(&processor))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("failing-strip"),
+            "missing tool name: {error}"
+        );
+        assert!(
+            error.contains("ckdev-strip-failure"),
+            "missing file name: {error}"
+        );
+        assert!(
+            error.contains("deliberate strip failure"),
+            "missing stderr: {error}"
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(MACOS_STRIPPED_COPY_FORMAT);
+        hasher.update(fs::read(&source).unwrap());
+        let digest = hex::encode(hasher.finalize());
+        let directory = root.join("synapse-exec").join(&digest[..16]);
+        assert!(!directory.join("ckdev-strip-failure").exists());
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn certification_alias_still_uses_the_built_inode() {
@@ -572,9 +820,18 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let source = root.join("ck-synapse");
         fs::write(&source, b"built image").unwrap();
+        let candidate_digest = hex::encode(Sha256::digest(fs::read(&source).unwrap()));
 
         let alias = ckdev_binary_hard_link(&source, &root).unwrap();
 
+        assert_eq!(
+            hex::encode(Sha256::digest(fs::read(&source).unwrap())),
+            candidate_digest
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(fs::read(&alias).unwrap())),
+            candidate_digest
+        );
         assert_eq!(
             fs::metadata(&source).unwrap().ino(),
             fs::metadata(alias).unwrap().ino()
@@ -647,5 +904,21 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn nm_symbols(binary: &Path) -> String {
+        let output = std::process::Command::new("/usr/bin/nm")
+            .args(["-a"])
+            .arg(binary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "nm -a {} failed: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }
