@@ -7,10 +7,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// These rebuild entries keep their durable names but declare no path: current
-// certification evidence lives in the database and decode-worker scratch lives
-// outside the module data root.
-const CATALOG: &[u8] = br#"{"schema_version":1,"module_id":"synapse","entries":[{"entry_id":"synapse/store","class":"portable","mechanism":"whole-db","path":"store.db","writer_interaction":"backup-api-live"},{"entry_id":"synapse/certification","class":"rebuild","mechanism":"filetree"},{"entry_id":"synapse/decode-worker","class":"rebuild","mechanism":"filetree"},{"entry_id":"synapse/logs","class":"excluded","mechanism":"filetree","path":"logs","reason":"Operational logs are disposable diagnostics, not module data."}]}"#;
+// The first three entries reproduce the descriptor Engram has captured since
+// before the module wrote it, byte for byte, so their ids and paths stay stable.
+// `decode-worker` is where a deployed config points `worker_runtime_dir` (crash
+// budgets and worker sockets); `certification` holds older probe evidence.
+// Both are rebuildable, so Engram never copies their contents.
+const CATALOG: &[u8] = br#"{"schema_version":1,"module_id":"synapse","entries":[{"entry_id":"synapse/store","class":"portable","mechanism":"whole-db","path":"store.db","writer_interaction":"backup-api-live"},{"entry_id":"synapse/certification","class":"rebuild","mechanism":"filetree","path":"certification"},{"entry_id":"synapse/decode-worker","class":"rebuild","mechanism":"filetree","path":"decode-worker"},{"entry_id":"synapse/logs","class":"excluded","mechanism":"filetree","path":"logs","reason":"Operational logs are disposable diagnostics, not module data."}]}"#;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
