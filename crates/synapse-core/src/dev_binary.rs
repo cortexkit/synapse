@@ -123,10 +123,13 @@ fn content_addressed_copy_at(binary: &Path, base: &Path) -> io::Result<PathBuf> 
     }
 }
 
+/// Post-processes a staged Mach-O copy (strip and re-sign) before it is published.
+type CopyProcessor<'a> = &'a dyn Fn(&Path) -> io::Result<()>;
+
 fn content_addressed_copy_at_with_processor(
     binary: &Path,
     base: &Path,
-    macos_processor: Option<&dyn Fn(&Path) -> io::Result<()>>,
+    macos_processor: Option<CopyProcessor<'_>>,
 ) -> io::Result<PathBuf> {
     let name = development_name(binary)?;
     #[cfg(target_os = "macos")]
