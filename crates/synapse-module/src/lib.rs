@@ -18,6 +18,7 @@ mod ane_artifact;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
+mod engram_catalog;
 mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
@@ -293,6 +294,14 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     };
     let _logger = cortexkit_log::init(logger_config)
         .map_err(|error| ModuleError::Config(format!("initialize fleet logger: {error}")))?;
+    if let Err(error) = write_startup_engram_catalog(&module_id) {
+        tracing::warn!(
+            target: "lifecycle",
+            module = %module_id,
+            error = %error,
+            "failed to write Engram catalog; startup continues"
+        );
+    }
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone(), connection_file);
@@ -17714,6 +17723,20 @@ fn resolve_storage_descriptor(
     }
 
     default_storage_descriptor_with_environment(module_id, |key| env::var_os(key))
+}
+
+fn write_startup_engram_catalog(module_id: &str) -> Result<(), String> {
+    let descriptor = default_storage_descriptor_with_environment(module_id, |key| env::var_os(key))
+        .map_err(|error| error.to_string())?;
+    let StorageBackend::Sqlite { path } = descriptor.backend else {
+        return Err("native store resolver did not select SQLite".to_string());
+    };
+    let data_root = Path::new(&path)
+        .parent()
+        .ok_or_else(|| format!("store path has no parent: {path}"))?;
+    engram_catalog::write(data_root)
+        .map(|_| ())
+        .map_err(|error| format!("{}: {error}", data_root.display()))
 }
 
 fn default_storage_descriptor_with_environment(

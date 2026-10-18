@@ -81,6 +81,39 @@ fn unsupervised_launch_gets_past_the_logger() {
         "the logger should have opened a segment under {}",
         segments.display()
     );
+
+    let catalog = home.join("data/cortexkit/synapse/engram-catalog.json");
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(catalog).expect("startup writes the catalog"))
+            .expect("startup catalog is JSON");
+    assert_eq!(descriptor["module_id"], "synapse");
+}
+
+#[test]
+fn catalog_write_failure_warns_once_and_does_not_block_startup() {
+    let home = isolated_home("catalog-write-failure");
+    let catalog_path = home.join("data/cortexkit/synapse/engram-catalog.json");
+    std::fs::create_dir_all(&catalog_path).expect("block catalog file with a directory");
+
+    let output = launch(&home, &[]);
+    let logs = home.join("data/cortexkit/synapse/logs");
+    let logged = std::fs::read_dir(logs)
+        .expect("logger writes to its data-root log directory")
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<String>();
+
+    assert_eq!(
+        logged
+            .matches("failed to write Engram catalog; startup continues")
+            .count(),
+        1,
+        "catalog failure is reported by one warning; got: {logged}"
+    );
+    assert!(
+        output.contains("missing required --subc connection file path"),
+        "startup must continue to the next precondition; got: {output}"
+    );
 }
 
 #[test]
