@@ -1338,7 +1338,7 @@ fn relay_frames(
 ) -> Result<()> {
     use synapse_core::{
         worker_framing_sync::{read_frame, write_frame},
-        WorkerRequest, DEFAULT_MAX_FRAME_BYTES,
+        WorkerRequest, WorkerResponse, DEFAULT_MAX_FRAME_BYTES,
     };
     let hello = read_frame(worker, DEFAULT_MAX_FRAME_BYTES)?;
     write_frame(host, &hello, DEFAULT_MAX_FRAME_BYTES)?;
@@ -1370,9 +1370,18 @@ fn relay_frames(
         if matches!(request, WorkerRequest::Shutdown {}) {
             break;
         }
-        let response = read_frame(worker, max)?;
-        let parsed: Value = serde_json::from_slice(&response)?;
-        let raw = if parsed["type"] == "VECTORS" || parsed["type"] == "SCORES" {
+        let mut progress_frames = 0;
+        let (response, parsed) = loop {
+            let response = read_frame(worker, max)?;
+            let parsed: WorkerResponse = serde_json::from_slice(&response)?;
+            if matches!(parsed, WorkerResponse::Progress { .. }) {
+                progress_frames += 1;
+                write_frame(host, &response, max)?;
+            } else {
+                break (response, parsed);
+            }
+        };
+        let raw = if parsed.carries_raw_frame() {
             Some(read_frame(worker, max)?)
         } else {
             None
@@ -1383,7 +1392,8 @@ fn relay_frames(
             }
             _ => 0,
         };
-        let record = json!({"req_id":request.req_id(),"operation":request.wire_type(),"rows":rows,"response":parsed["type"],"wall_ms":start.elapsed().as_secs_f64()*1000.0});
+        let response_type = serde_json::to_value(&parsed)?["type"].clone();
+        let record = json!({"req_id":request.req_id(),"operation":request.wire_type(),"rows":rows,"response":response_type,"progress_frames":progress_frames,"wall_ms":start.elapsed().as_secs_f64()*1000.0});
         std::io::Write::write_all(log, format!("{record}\n").as_bytes())?;
         write_frame(host, &response, max)?;
         if let Some(raw) = raw {
@@ -1437,6 +1447,54 @@ mod relay_tests {
         assert!(log.contains("EMBED_PACKED"));
         assert!(!log.contains("secret"));
         assert_eq!(log.lines().count(), 1);
+    }
+
+    #[test]
+    fn socket_relay_forwards_progress_before_terminal_and_logs_the_exchange() {
+        let (mut host, mut host_relay) = UnixStream::pair().unwrap();
+        let (mut worker, mut worker_relay) = UnixStream::pair().unwrap();
+        for stream in [&host, &host_relay, &worker, &worker_relay] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        let relay = std::thread::spawn(move || {
+            let mut log = Vec::new();
+            relay_frames(&mut host_relay, &mut worker_relay, &mut log).unwrap();
+            log
+        });
+        let hello = br#"{"v":3,"nonce":"test-secret","pid":7}"#;
+        write_frame(&mut worker, hello, 1024).unwrap();
+        assert_eq!(read_frame(&mut host, 1024).unwrap(), hello);
+        let ack = br#"{"v":3,"accept":true,"max_frame":1024}"#;
+        write_frame(&mut host, ack, 1024).unwrap();
+        assert_eq!(read_frame(&mut worker, 1024).unwrap(), ack);
+
+        let request = br#"{"type":"ANE_ADMIT_SHAPE","req_id":"probe","model_ref":"m","shape":128}"#;
+        write_frame(&mut host, request, 1024).unwrap();
+        assert_eq!(read_frame(&mut worker, 1024).unwrap(), request);
+        let progress_setup =
+            br#"{"type":"PROGRESS","req_id":"probe","completed":1,"phase":"setup"}"#;
+        let progress_inference =
+            br#"{"type":"PROGRESS","req_id":"probe","completed":2,"phase":"inference"}"#;
+        let terminal = br#"{"type":"ADMITTED","req_id":"probe","inventory":{"executables":[],"cpu_stages":[]}}"#;
+        for frame in [&progress_setup[..], &progress_inference[..], &terminal[..]] {
+            write_frame(&mut worker, frame, 1024).unwrap();
+        }
+        assert_eq!(read_frame(&mut host, 1024).unwrap(), progress_setup);
+        assert_eq!(read_frame(&mut host, 1024).unwrap(), progress_inference);
+        assert_eq!(read_frame(&mut host, 1024).unwrap(), terminal);
+
+        let shutdown = br#"{"type":"SHUTDOWN"}"#;
+        write_frame(&mut host, shutdown, 1024).unwrap();
+        assert_eq!(read_frame(&mut worker, 1024).unwrap(), shutdown);
+        let log = String::from_utf8(relay.join().unwrap()).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        let record: Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(record["response"], "ADMITTED");
+        assert_eq!(record["progress_frames"], 2);
+        assert!(record["wall_ms"].as_f64().is_some());
+        assert!(!log.contains("secret"));
     }
 }
 
