@@ -2,10 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Direct ANE development stress measurement",
   "type": "object",
-  "required": ["schema", "kind", "harness_profile", "source_commit", "machine", "os", "load_1_5_15_start", "load_1_5_15_end", "request_count", "completed_count", "request_errors", "sample_count", "samples", "max_resident_per_model", "max_resident_total", "admitted_count", "evicted_count", "shape_not_admitted_count", "leased_evict_count", "no_ane_resources", "ane_lane_busy", "metal_ranking_check", "reranker_pool_check"],
+  "required": ["schema", "case", "wall_time_ms", "admission_wait_bound_ms", "admission_timeline", "kind", "harness_profile", "source_commit", "machine", "os", "load_1_5_15_start", "load_1_5_15_end", "request_count", "completed_count", "request_errors", "sample_count", "samples", "max_resident_per_model", "max_resident_total", "admitted_count", "evicted_count", "shape_not_admitted_count", "leased_evict_count", "no_ane_resources", "ane_lane_busy", "metal_ranking_check", "reranker_pool_check"],
   "additionalProperties": false,
   "properties": {
-    "schema": {"type": "integer", "const": 1},
+    "schema": {"type": "integer", "const": 2},
+    "case": {"type": "string", "enum": ["residency_safety", "cold_throughput"]},
+    "wall_time_ms": {"type": "number", "minimum": 0},
+    "admission_wait_bound_ms": {"type": "integer", "const": 2100000},
+    "admission_timeline": {"type": "array", "items": {"type": "object", "required": ["event", "at_ms", "request_id", "model", "shape"], "additionalProperties": false, "properties": {
+      "event": {"type": "string", "enum": ["queue_entry", "reservation", "stream_grant", "rpc_start", "rpc_end", "eviction_dispatch", "eviction_ack", "lease_grant"]},
+      "at_ms": {"type": "number", "minimum": 0},
+      "request_id": {"type": "string", "minLength": 1},
+      "model": {"type": "string", "minLength": 1},
+      "shape": {"type": "integer", "enum": [128, 256, 512, 1024, 2048, 4096, 8192]},
+      "ticket": {"type": "integer", "minimum": 0}
+    }}},
     "kind": {"type": "string", "const": "development"},
     "harness_profile": {"type": "string", "enum": ["debug", "release"]},
     "source_commit": {"type": "string", "minLength": 40, "maxLength": 40},

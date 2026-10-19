@@ -88,3 +88,57 @@ temporary directory (`env -u TMPDIR` for hardware commands).
 To reverse a serving change, restore the compatible module/worker pair and its
 matching certified identity. Do not reuse approvals or vector-space identity
 from a different binary, model, conversion policy or OS build.
+
+## Admission fairness and eviction
+
+The supervisor reserves at most **100 layer executables**, including pending
+admissions and evictions. A leased shape is never an eviction candidate. Eviction
+refunds its charge only after the worker acknowledges release; a busy stream is
+not permission to refund early or to unlock a request before its reply.
+
+When a single-flight admission completes, the tickets that actually joined it
+during compilation receive a closed handoff cohort. They may take their first
+leases ahead of a starved budget head. The shape is protected until every cohort
+member leases or leaves the queue, or **250 ms after admission completion**,
+whichever comes first. A suspended joiner cannot pin residency forever: expiry
+wakes the budget queue even without another worker event. Requests arriving after
+completion cannot join or extend the cohort. Outside that bounded exception,
+resident traffic still yields to the starved FIFO budget head.
+
+Among unleased, non-handoff resident candidates, eviction prefers an **idle worker
+stream**, then a shape with **no queued demand**, then a non-smallest rung, then
+LRU. A model at its shape limit must evict one of its own shapes. Idle candidates
+are reclaimed first, repeating if more executable budget is needed; a busy-stream
+victim remains available when idle candidates cannot free the required budget.
+Stream idleness is a scheduling hint, not an ownership guarantee: the actual RPC
+still acquires the stream mutex and holds it for the entire request/reply exchange.
+
+Portable checks include `joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers`,
+`suspended_joiner_handoff_expires_without_an_external_wakeup`,
+`eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends`, and
+`eviction_uses_a_busy_stream_when_it_is_the_only_option`.
+
+### Development hardware stress cases
+
+`crates/synapse-worker-ane-direct/tests/run_stress.py --case residency-safety`
+runs the ignored 37-request concurrent residency-safety workload, including its
+numerical, leased-eviction, budget and hardware-resource-refusal checks.
+`--case cold-throughput` runs the same cold workload as characterization: its
+report records completions, errors and wall time without a throughput assertion.
+Run either only in an exclusive hardware window; neither is release certification.
+
+Both use a **test-only 2100 s admission-wait backstop**, not a production deadline
+change. The measured `qwen3-embedding-0.6b` admission path ended at 528.815 s
+with 492.198 s spent in five compile/load RPCs. `gte-modernbert-base` then needed
+another 118.356 s, already beyond 600 s with ten model/shape keys still unmeasured.
+Three times that 647.171 s path, rounded up, budgets safety coverage rather than
+predicting a full cold run. Production admission waiting remains bounded at 600 s.
+
+Schema **2** adds the case, wall time, test admission bound and a payload-free
+admission timeline. Events record monotonic milliseconds since test start,
+request id, model reference, shape and ticket when available: queue entry,
+reservation, stream grant, RPC start/end, eviction dispatch/acknowledgement and
+lease grant. Detached exchanges retain the initiating request's identity; eviction
+events identify the victim's model and shape. Stream grant is distinct from queue
+entry, so a compile's RPC duration does not hide stream contention. Schema 1
+reports remain historical artifacts, not schema 2 inputs.
