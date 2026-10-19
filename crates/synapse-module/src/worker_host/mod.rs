@@ -3658,6 +3658,12 @@ pub mod ane_residency {
     /// Bound admission queue waits; worker admit/evict exchanges finish separately
     /// so a timed-out waiter cannot leave an unaccounted partially admitted shape.
     pub const ANE_ADMISSION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    // A closed cohort of single-flight joiners gets a scheduling turn, not an
+    // indefinite residency pin. Late requests cannot renew this 250 ms grace.
+    const ADMISSION_HANDOFF: std::time::Duration = std::time::Duration::from_millis(250);
+    #[cfg(test)]
+    mod admission_trace;
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// A request's deadline expired while the lane's worker was compiling a
@@ -3913,6 +3919,11 @@ pub mod ane_residency {
     pub trait AneShapeWorker: Send + Sync {
         /// Stable id of this worker; shapes are dropped per worker on restart.
         fn worker_id(&self) -> &str;
+        /// A scheduling hint only: the stream remains locked for the full RPC.
+        /// Unknown transports conservatively report busy and remain fallbacks.
+        fn stream_idle(&self) -> bool {
+            false
+        }
         fn admit_program<'a>(
             &'a self,
             generation: u64,
@@ -4105,6 +4116,17 @@ pub mod ane_residency {
         executables: usize,
         generation: u64,
         packed_qualified: bool,
+        joined: BTreeSet<u64>,
+        handoff_until: Option<tokio::time::Instant>,
+    }
+
+    impl Slot {
+        fn handing_off(&self) -> bool {
+            !self.joined.is_empty()
+                && self
+                    .handoff_until
+                    .is_some_and(|until| tokio::time::Instant::now() < until)
+        }
     }
 
     #[derive(Default)]
@@ -4166,6 +4188,9 @@ pub mod ane_residency {
             let queued = self.waiters.len();
             self.waiters.retain(|waiter| *waiter != ticket);
             self.waiter_keys.remove(&ticket);
+            for slot in self.slots.values_mut() {
+                slot.joined.remove(&ticket);
+            }
             if self.starved_head == Some(ticket) {
                 self.starved_head = None;
             }
@@ -4196,6 +4221,15 @@ pub mod ane_residency {
                 (Some(head), Some(own)) => head < own,
                 _ => false,
             }
+        }
+
+        fn eviction_rank(&self, key: &ShapeKey, slot: &Slot) -> (bool, bool, bool, u64) {
+            (
+                !slot.worker.stream_idle(),
+                self.waiter_keys.values().any(|waiting| waiting == key),
+                self.is_pinned(key),
+                slot.last_used,
+            )
         }
 
         fn sample(&mut self) {
@@ -4582,6 +4616,8 @@ pub mod ane_residency {
             }
             let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
             let ticket = QueueTicket::enqueue(&self.inner);
+            #[cfg(test)]
+            admission_trace::queue(ticket.id, model_ref, shape);
             loop {
                 if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
@@ -4611,13 +4647,19 @@ pub mod ane_residency {
                     Step::Retired => {
                         return Err(AneResidencyError::Channel("worker is retired".into()))
                     }
-                    Step::Leased(lease) => return Ok(lease),
+                    Step::Leased(lease) => {
+                        #[cfg(test)]
+                        admission_trace::event("lease_grant", model_ref, shape);
+                        return Ok(lease);
+                    }
                     Step::Admit(slot_id) => {
                         // The slot is Admitting from here on: a deadline that
                         // expires now expires on this shape's compile.
                         enter_wait(WaitPhase::Compile(key.shape));
                         let shape = key.shape;
                         let lease = self.admit(worker.clone(), key, slot_id).await?;
+                        #[cfg(test)]
+                        admission_trace::event("lease_grant", model_ref, shape);
                         if request_deadline
                             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                         {
@@ -4636,20 +4678,38 @@ pub mod ane_residency {
                     }
                     Step::Wait(compiling) => {
                         enter_wait(compiling.map_or(WaitPhase::Other, WaitPhase::Compile));
+                        // Wake even if a suspended joiner neither claims nor cancels
+                        // its handoff; expiry must not need an unrelated notification.
+                        let handoff = self
+                            .inner
+                            .lock()
+                            .slots
+                            .values()
+                            .filter(|slot| slot.handing_off())
+                            .filter_map(|slot| slot.handoff_until)
+                            .min();
+                        let wake = async {
+                            if let Some(until) = handoff {
+                                tokio::select! {
+                                    _ = notified => {},
+                                    _ = tokio::time::sleep_until(until) => {},
+                                }
+                            } else {
+                                notified.await;
+                            }
+                        };
                         let wait_deadline =
                             request_deadline.map_or(deadline, |request| request.min(deadline));
-                        let timed_out = match tokio::time::timeout_at(
-                            wait_deadline,
-                            cancellable_wait(notified),
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                result?;
-                                false
-                            }
-                            Err(_) => true,
-                        };
+                        let timed_out =
+                            match tokio::time::timeout_at(wait_deadline, cancellable_wait(wake))
+                                .await
+                            {
+                                Ok(result) => {
+                                    result?;
+                                    false
+                                }
+                                Err(_) => true,
+                            };
                         if timed_out {
                             if request_deadline
                                 .is_some_and(|request| tokio::time::Instant::now() >= request)
@@ -4928,9 +4988,16 @@ pub mod ane_residency {
                 // flight to settle (one compile per shape), or, if resident,
                 // leases it at once so it cannot be evicted while it waits.
                 if slot_state == SlotState::Admitting {
+                    state.slots.get_mut(key).unwrap().joined.insert(ticket);
                     return Step::Wait(Some(key.shape));
                 }
-                if slot_state != SlotState::Resident || state.behind_starved_head(ticket) {
+                let handoff = state
+                    .slots
+                    .get(key)
+                    .is_some_and(|slot| slot.handing_off() && slot.joined.contains(&ticket));
+                if slot_state != SlotState::Resident
+                    || (!handoff && state.behind_starved_head(ticket))
+                {
                     return Step::Wait(None);
                 }
                 let now = state.tick();
@@ -4970,25 +5037,31 @@ pub mod ane_residency {
                         executables,
                         generation: worker.generation(),
                         packed_qualified: false,
+                        joined: BTreeSet::new(),
+                        handoff_until: None,
                     },
                 );
                 state.leave_queue(ticket);
                 self.inner.changed.notify_waiters();
+                #[cfg(test)]
+                admission_trace::event("reservation", &key.model_ref, key.shape);
                 return Step::Admit(id);
             }
             // When the model is at its own limit only one of its shapes frees
             // the slot it needs; otherwise any model's shape does. A model's
-            // smallest rung goes last.
+            // idle stream refunds promptly; queued demand and then the smallest
+            // rung break ties before LRU. Busy streams remain a last resort.
             let victim = state
                 .slots
                 .iter()
                 .filter(|(candidate, slot)| {
                     slot.state == SlotState::Resident
                         && slot.leases == 0
+                        && !slot.handing_off()
                         && !state.recovering.contains(slot.worker.worker_id())
                         && (!model_full || candidate.model_ref == key.model_ref)
                 })
-                .min_by_key(|(candidate, slot)| (state.is_pinned(candidate), slot.last_used))
+                .min_by_key(|(candidate, slot)| state.eviction_rank(candidate, slot))
                 .map(|(candidate, slot)| (candidate.clone(), slot.id, slot.worker.clone()));
             let Some((victim, slot_id, owner)) = victim else {
                 state.starved_head = Some(ticket);
@@ -5027,8 +5100,10 @@ pub mod ane_residency {
             // if the waiting request is dropped part way through.
             let supervisor = self.clone();
             let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
+            #[cfg(test)]
+            let trace = admission_trace::current();
             let task = tokio::spawn(async move {
-                request_scope(waits, async move {
+                let operation = request_scope(waits, async move {
                     #[cfg(test)]
                     let _serial_admission = match &inner.admission_gate {
                         Some(gate) => Some(gate.lock().await),
@@ -5064,8 +5139,10 @@ pub mod ane_residency {
                             Err(error)
                         }
                     }
-                })
-                .await
+                });
+                #[cfg(test)]
+                let operation = admission_trace::scope(trace, operation);
+                operation.await
             });
             task.await.map_err(|error| {
                 AneResidencyError::Channel(format!("shape admission task failed: {error}"))
@@ -5094,13 +5171,19 @@ pub mod ane_residency {
                 return EvictionOutcome::Evicted;
             };
             let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
+            #[cfg(test)]
+            let trace = admission_trace::current();
+            #[cfg(test)]
+            admission_trace::event("eviction_dispatch", &key.model_ref, key.shape);
             let task = tokio::spawn(async move {
-                request_scope(waits, async move {
+                let operation = request_scope(waits, async move {
                     match owner
                         .evict_program(generation, &key.model_ref, key.shape, key.program)
                         .await
                     {
                         Ok(()) => {
+                            #[cfg(test)]
+                            admission_trace::event("eviction_ack", &key.model_ref, key.shape);
                             let mut state = inner.lock();
                             if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
                                 state.slots.remove(&key);
@@ -5140,8 +5223,10 @@ pub mod ane_residency {
                             EvictionOutcome::Failed
                         }
                     }
-                })
-                .await
+                });
+                #[cfg(test)]
+                let operation = admission_trace::scope(trace, operation);
+                operation.await
             });
             match task.await {
                 Ok(evicted) => evicted,
@@ -5161,9 +5246,10 @@ pub mod ane_residency {
             .filter(|(_, slot)| {
                 slot.state == SlotState::Resident
                     && slot.leases == 0
+                    && !slot.handing_off()
                     && !state.recovering.contains(slot.worker.worker_id())
             })
-            .min_by_key(|(key, slot)| (state.is_pinned(key), slot.last_used))
+            .min_by_key(|(key, slot)| state.eviction_rank(key, slot))
             .map(|(key, slot)| (key.clone(), slot.id, slot.worker.clone()));
         if let Some((key, _, _)) = &victim {
             state.slots.get_mut(key).unwrap().state = SlotState::Evicting;
@@ -5304,6 +5390,7 @@ pub mod ane_residency {
         };
         let inventory = Arc::new(inventory);
         slot.state = SlotState::Resident;
+        slot.handoff_until = Some(tokio::time::Instant::now() + ADMISSION_HANDOFF);
         slot.leases = 1;
         slot.last_used = now;
         slot.inventory = Some(inventory.clone());
@@ -5862,6 +5949,8 @@ pub mod ane_residency {
             // worker inactivity. The background shape-admission task owns the
             // exchange through its reply even if the waiting caller cancels.
             let mut guard = cancellable_wait(self.stream.lock()).await?;
+            #[cfg(test)]
+            admission_trace::rpc_event("stream_grant", request);
             self.exchange_locked(&mut guard, request, raw, generation, None)
                 .await
         }
@@ -6104,6 +6193,8 @@ pub mod ane_residency {
             #[cfg(test)]
             let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
                 .then(|| CompileRpcClock(std::time::Instant::now()));
+            #[cfg(test)]
+            let rpc_clock = admission_trace::Rpc::start(request);
             let result = tokio::select! {
                 _=stopped=>Err(AneResidencyError::Channel("worker recovery interrupted an active exchange".into())),
                 result=async {
@@ -6117,6 +6208,8 @@ pub mod ane_residency {
             };
             #[cfg(test)]
             drop(compile_clock);
+            #[cfg(test)]
+            drop(rpc_clock);
             match result {
                 Ok((response, raw)) => {
                     exchange_guard.completed = true;
@@ -6166,6 +6259,9 @@ pub mod ane_residency {
     {
         fn worker_id(&self) -> &str {
             &self.worker_id
+        }
+        fn stream_idle(&self) -> bool {
+            self.stream.try_lock().is_ok()
         }
         #[cfg(test)]
         fn classify_gate(&self) -> Option<Arc<ClassifyGate>> {
@@ -7524,6 +7620,9 @@ pub mod ane_residency {
             model_ref: String,
         }
         impl AneShapeWorker for Observed {
+            fn stream_idle(&self) -> bool {
+                self.channel.stream_idle()
+            }
             fn worker_id(&self) -> &str {
                 self.channel.worker_id()
             }
@@ -7820,12 +7919,13 @@ pub mod ane_residency {
         }
         #[test]
         fn stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes() {
-            let mut valid = json!({"schema":1,"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
+            let mut valid = json!({"schema":2,"case":"residency_safety","wall_time_ms":1,"admission_wait_bound_ms":2100000,"admission_timeline":[],"kind":"development","harness_profile":"debug","source_commit":"1".repeat(40),"machine":{"model_identifier":"test"},"os":{"version":"test","build":"test"},"load_1_5_15_start":[0,0,0],"load_1_5_15_end":[0,0,0],"request_count":37,"completed_count":37,"request_errors":[],"sample_count":1,"samples":[{"m":[128]}],"max_resident_per_model":1,"max_resident_total":1,"admitted_count":1,"evicted_count":0,"shape_not_admitted_count":0,"leased_evict_count":0,"no_ane_resources":{"count":0},"ane_lane_busy":{"status":"tested"},"metal_ranking_check":{"status":"skipped","reason":"test"},"reranker_pool_check":{"finite":"passed","byte_identical_repeats":"passed"}});
             let schema = stress_schema();
             assert!(
                 schema_validate(&valid, &schema).is_ok(),
-                "historical reports without timing fields remain valid"
+                "version 2 reports may omit the older optional timing summaries"
             );
+            valid["admission_timeline"] = json!([{"event":"queue_entry","at_ms":0,"request_id":"r","model":"m","shape":128,"ticket":0}]);
             valid["compile_duration_ms_by_model"] = json!({"gte-modernbert-base":{"count":1,"min":10,"median":10,"max":10,"samples":[{"shape":128,"elapsed_ms":10,"admitted":true}]}});
             valid["request_wait_times"]=json!((0..37).map(|index|json!({"model":"gte-modernbert-base","request_id":format!("request-{index}"),"admission_wait_ms":12,"waits":[{"shape":128,"elapsed_ms":12,"admitted":true}]})).collect::<Vec<_>>());
             assert!(schema_validate(&valid, &schema).is_ok());
@@ -7838,7 +7938,31 @@ pub mod ane_residency {
                 ("samples", json!([{"m":[17]}])),
                 ("samples", json!([{"m":[128,128]}])),
                 ("completed_count", json!("37")),
-                ("schema", json!(2)),
+                ("schema", json!(1)),
+                ("case", json!("unknown")),
+                ("wall_time_ms", json!(-1)),
+                ("admission_wait_bound_ms", json!(600000)),
+                ("admission_timeline", json!([{"event":"rpc_start"}])),
+                (
+                    "admission_timeline",
+                    json!([{"event":"payload","at_ms":0,"request_id":"r","model":"m","shape":128}]),
+                ),
+                (
+                    "admission_timeline",
+                    json!([{"event":"queue_entry","at_ms":-1,"request_id":"r","model":"m","shape":128}]),
+                ),
+                (
+                    "admission_timeline",
+                    json!([{"event":"queue_entry","at_ms":0,"request_id":"r","model":"m","shape":17}]),
+                ),
+                (
+                    "admission_timeline",
+                    json!([{"event":"queue_entry","at_ms":0,"request_id":"r","model":"m","shape":128,"ticket":-1}]),
+                ),
+                (
+                    "admission_timeline",
+                    json!([{"event":"queue_entry","at_ms":0,"request_id":"r","model":"m","shape":128,"payload":"forbidden"}]),
+                ),
                 ("sample_count", json!(-1)),
                 ("source_commit", json!("short")),
                 ("request_wait_times", json!([])),
@@ -7867,16 +7991,22 @@ pub mod ane_residency {
         fn spawn_stress_request(
             tasks: &mut tokio::task::JoinSet<Result<(), AneResidencyError>>,
             waits: &RequestWaits,
+            timeline: &Arc<admission_trace::Timeline>,
             model: String,
             request_id: String,
             request: impl std::future::Future<Output = Result<(), AneResidencyError>> + Send + 'static,
         ) {
             let samples = AdmissionWaits::default();
+            let context =
+                admission_trace::Context::new(timeline.clone(), format!("{model}/{request_id}"));
             waits
                 .lock()
                 .unwrap()
                 .insert((model, request_id), samples.clone());
-            tasks.spawn(ADMISSION_WAITS.scope(samples, request));
+            tasks.spawn(admission_trace::scope(
+                Some(context),
+                ADMISSION_WAITS.scope(samples, request),
+            ));
         }
 
         fn compile_duration_summary(samples: &BTreeMap<String, Vec<Value>>) -> Value {
@@ -7934,7 +8064,18 @@ pub mod ane_residency {
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         #[ignore = "real four-worker stress; load1<16 and load5<20 required"]
-        async fn real_direct_ane_residency_stress() {
+        async fn real_direct_ane_residency_safety() {
+            run_direct_ane_stress("residency_safety").await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "cold-throughput characterization; exclusive ANE access required"]
+        async fn real_direct_ane_cold_throughput() {
+            run_direct_ane_stress("cold_throughput").await;
+        }
+
+        async fn run_direct_ane_stress(case: &str) {
+            let timeline = admission_trace::Timeline::new();
             let load_start = load_averages();
             assert_eq!(load_start.len(), 3);
             assert!(
@@ -7947,6 +8088,12 @@ pub mod ane_residency {
             let factory = Factory::new(root.clone(), &lock);
             let mut supervisor =
                 AneResidencySupervisor::with_lane_lock(AneResidencyLimits::default(), lock);
+            // QE's five measured RPCs took 492.198 s and ended at 528.815 s;
+            // GE then needed 118.356 s, reaching 647.171 s before ten unmeasured
+            // keys. Allow 3 * (528.815 + 118.356) = 1941.513 s, rounded up to
+            // 2100 s for safety coverage, not a throughput promise. Both cases
+            // use this test-only backstop; production remains 600 s.
+            Arc::get_mut(&mut supervisor.inner).unwrap().wait_timeout = Duration::from_secs(2100);
             // Serialize shape compiles only in this test to isolate concurrency effects from residency limits.
             if std::env::var_os("ANE_STRESS_SERIALIZE_ADMISSION").is_some() {
                 Arc::get_mut(&mut supervisor.inner).unwrap().admission_gate =
@@ -7976,6 +8123,7 @@ pub mod ane_residency {
                     spawn_stress_request(
                         &mut tasks,
                         &request_waits,
+                        &timeline,
                         worker.slug.clone(),
                         format!("admit-{shape}"),
                         async move {
@@ -7997,6 +8145,7 @@ pub mod ane_residency {
                 spawn_stress_request(
                     &mut tasks,
                     &request_waits,
+                    &timeline,
                     worker.slug.clone(),
                     format!("embed-{index}"),
                     async move {
@@ -8025,6 +8174,7 @@ pub mod ane_residency {
             spawn_stress_request(
                 &mut tasks,
                 &request_waits,
+                &timeline,
                 worker.slug.clone(),
                 "reranker-pool".into(),
                 async move {
@@ -8084,7 +8234,7 @@ pub mod ane_residency {
             let clean = {
                 let ledger = ledger.lock().unwrap();
 
-                let report = json!({"schema":1, "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "compile_duration_ms_by_model":compile_duration_summary(&ledger.compile_samples),"request_wait_times":request_wait_summary(&request_waits), "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
+                let report = json!({"schema":2, "case":case, "wall_time_ms":timeline.elapsed_ms(), "admission_wait_bound_ms":2100000, "admission_timeline":timeline.snapshot(), "kind":"development", "harness_profile":if cfg!(debug_assertions) {"debug"} else {"release"}, "source_commit":output("git", &["rev-parse", "HEAD"]), "machine":{"model_identifier":output("sysctl", &["-n", "hw.model"])}, "os":{"version":output("sw_vers", &["-productVersion"]), "build":output("sw_vers", &["-buildVersion"])}, "load_1_5_15_start":load_start, "load_1_5_15_end":load_averages(), "request_count":37, "completed_count":completed, "request_errors":errors, "sample_count":samples.len(), "samples":samples, "max_resident_per_model":stats.max_resident_per_model, "max_resident_total":stats.max_resident_total, "admitted_count":ledger.admitted, "evicted_count":ledger.evicted, "compile_duration_ms_by_model":compile_duration_summary(&ledger.compile_samples),"request_wait_times":request_wait_summary(&request_waits), "shape_not_admitted_count":ledger.shape_not_admitted, "leased_evict_count":ledger.leased_evicts, "no_ane_resources":{"count":ledger.no_ane_resources}, "ane_lane_busy":{"status":"covered_by_killed_holder_test"}, "metal_ranking_check":{"status":"skipped", "reason":"Metal rerank package/lane unavailable in isolated worktree; missing2048-rung parity fixture is a parity-crate follow-up"}, "reranker_pool_check":{"finite":if pool_passed {"passed"} else {"failed"}, "byte_identical_repeats":if pool_passed {"passed"} else {"failed"}, "scores_by_rung":pool_results.iter().map(|(shape, score)|json!({"shape":shape, "score":score})).collect::<Vec<_>>()}});
                 let out = std::env::var_os("ANE_STRESS_OUT")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
@@ -8101,12 +8251,27 @@ pub mod ane_residency {
                     && ledger.no_ane_resources == 0
                     && stats.max_resident_per_model <= 4
                     && stats.max_resident_total <= 8
+                    && samples.iter().all(|sample| {
+                        sample
+                            .iter()
+                            .map(|(model, shapes)| {
+                                let worker = workers
+                                    .iter()
+                                    .find(|worker| worker.model_ref == *model)
+                                    .unwrap();
+                                shapes.len() * worker.executable_count(model).unwrap()
+                            })
+                            .sum::<usize>()
+                            <= ANE_RESIDENT_EXECUTABLES_TOTAL
+                    })
             };
             drop(workers);
             drop(supervisor);
             factory.stop().await;
             std::fs::remove_dir_all(root).unwrap();
-            assert!(clean, "stress failed; see ANE_STRESS_OUTPUT above");
+            if case == "residency_safety" {
+                assert!(clean, "stress failed; see ANE_STRESS_OUTPUT above");
+            }
         }
         struct StoppedWorker(Option<u32>);
         impl Drop for StoppedWorker {
@@ -8267,6 +8432,9 @@ pub mod ane_residency {
             }
         }
         impl AneShapeWorker for MockChannel {
+            fn stream_idle(&self) -> bool {
+                self.0.stream_idle()
+            }
             fn worker_id(&self) -> &str {
                 self.0.worker_id()
             }
@@ -9731,6 +9899,8 @@ pub mod ane_residency {
             inner.wait_timeout = wait;
             supervisor
         }
+
+        include!("admission_tests.rs");
 
         #[tokio::test]
         async fn executable_budget_refuses_before_hardware_limit() {

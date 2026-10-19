@@ -11,6 +11,8 @@ import time
 ROOT = Path(__file__).resolve().parents[3]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--out", type=Path, help="JSON output path; defaults to a temporary file")
+parser.add_argument("--case", choices=("residency-safety", "cold-throughput"),
+                    default="residency-safety", help="safety assertions or cold-throughput characterization")
 parser.add_argument("--timeout", type=int, default=3600, help="hard timeout in seconds, including any load wait")
 parser.add_argument("--wait-for-load", action="store_true", help="queue until load1<16 and load5<20")
 parser.add_argument("--driver", type=Path, help="prebuilt supervisor test executable; skips Cargo")
@@ -67,7 +69,9 @@ while load[0] >= 16 or load[1] >= 20:
     threading.Event().wait(min(60, remaining))
     load = load_averages()
 print(f"STRESS_LOAD_BEFORE={load}", flush=True)
+test = {"residency-safety": "real_direct_ane_residency_safety",
+        "cold-throughput": "real_direct_ane_cold_throughput"}[args.case]
 try:
-    run([executable, "--ignored", "--exact", "worker_host::ane_residency::hardware_tests::real_direct_ane_residency_stress", "--nocapture"], ROOT / "crates/synapse-module")
+    run([executable, "--ignored", "--exact", f"worker_host::ane_residency::hardware_tests::{test}", "--nocapture"], ROOT / "crates/synapse-module")
 finally:
     print(f"STRESS_LOAD_AFTER={load_averages()}", flush=True)
