@@ -6,8 +6,7 @@
 .cortexkit/internal-docs/
 
 # Head working material: worker briefs, spec drafts, plans, review and audit
-# records, and rig setup. The folder is moving from `alfonso` to `prefrontal`;
-# both are listed until the move is done, and Engram skips whichever is absent.
+# records, and rig setup.
 .cortexkit/prefrontal/prompts/
 .cortexkit/prefrontal/drafts/
 .cortexkit/prefrontal/plans/
@@ -15,16 +14,8 @@
 .cortexkit/prefrontal/audit/
 .cortexkit/prefrontal/review/
 .cortexkit/prefrontal/rigs/
-.cortexkit/alfonso/prompts/
-.cortexkit/alfonso/drafts/
-.cortexkit/alfonso/plans/
-.cortexkit/alfonso/specs/
-.cortexkit/alfonso/audit/
-.cortexkit/alfonso/review/
-.cortexkit/alfonso/rigs/
 
 # Local agent and campaign configuration.
 .cortexkit/prefrontal.jsonc
-.cortexkit/alfonso.jsonc
 .cortexkit/campaign-lab.jsonc
 .cortexkit/campaign-packs/
