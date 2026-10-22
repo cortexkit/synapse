@@ -913,6 +913,203 @@ require_ci_success() {
   [ "$verdict" = $'completed\tsuccess' ] || refuse "CI run $rid for $sha did not conclude success; not landing"
 }
 
+# Branch protection can require checks from more than the workflow run watched
+# above. Read every required context for this exact sha before either landing
+# path pushes it; a missing result is pending, not evidence of a green check.
+REQUIRED_CONTEXTS=()
+REQUIRED_CONTEXTS_ERROR=""
+CHECK_RUN_RESULTS=""
+COMMIT_STATUS_RESULTS=""
+REQUIRED_MISSING=()
+REQUIRED_PENDING=()
+REQUIRED_FAILED=()
+REQUIRED_SUCCESS=()
+
+read_required_contexts() {
+  local output context existing found
+  REQUIRED_CONTEXTS=()
+  REQUIRED_CONTEXTS_ERROR=""
+  if output="$(gh_query_or_refuse "branch protection required checks for $remote/$default_branch" \
+      "$OPERATOR_GH" api "repos/$repo_slug/branches/$default_branch/protection/required_status_checks" \
+      --jq 'if ((.checks // []) | length) > 0 then .checks[].context else .contexts[]? end' 2>&1)"; then
+    while IFS= read -r context; do
+      [ -n "$context" ] || continue
+      found=0
+      if [ "${#REQUIRED_CONTEXTS[@]}" -gt 0 ]; then
+        for existing in "${REQUIRED_CONTEXTS[@]}"; do
+          [ "$existing" = "$context" ] && found=1 && break
+        done
+      fi
+      [ "$found" -eq 1 ] || REQUIRED_CONTEXTS+=("$context")
+    done <<< "$output"
+    return 0
+  fi
+  REQUIRED_CONTEXTS_ERROR="$(printf '%s' "$output" | tr '\n' ' ')"
+  return 1
+}
+
+read_required_check_results() {
+  local sha="$1"
+  CHECK_RUN_RESULTS="$(gh_query_or_refuse "check runs for required contexts on $sha" "$OPERATOR_GH" \
+    api --paginate "repos/$repo_slug/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // "-"), (.created_at // "")] | @tsv')" || return "$?"
+  COMMIT_STATUS_RESULTS="$(gh_query_or_refuse "commit statuses for required contexts on $sha" "$OPERATOR_GH" \
+    api --paginate "repos/$repo_slug/commits/$sha/status?per_page=100" \
+    --jq '.statuses[] | [(.context // ""), (.state // ""), (.created_at // "")] | @tsv')" || return "$?"
+}
+
+# The same context can be reported by multiple runs on one sha. Use the newest
+# result, and prefer pending or failure over success when timestamps tie.
+LATEST_REQUIRED_TIME=""
+LATEST_REQUIRED_STATE=""
+record_latest_required_state() {
+  local candidate_time="$1" candidate_state="$2"
+  if [ -z "$LATEST_REQUIRED_STATE" ] || [[ "$candidate_time" > "$LATEST_REQUIRED_TIME" ]]; then
+    LATEST_REQUIRED_TIME="$candidate_time"
+    LATEST_REQUIRED_STATE="$candidate_state"
+  elif [ "$candidate_time" = "$LATEST_REQUIRED_TIME" ]; then
+    case "$LATEST_REQUIRED_STATE:$candidate_state" in
+      success:pending|success:failed|pending:failed)
+        LATEST_REQUIRED_STATE="$candidate_state"
+        ;;
+    esac
+  fi
+}
+
+classify_required_check_results() {
+  local context result_name result_status result_conclusion result_created_at result_state
+  REQUIRED_MISSING=()
+  REQUIRED_PENDING=()
+  REQUIRED_FAILED=()
+  REQUIRED_SUCCESS=()
+  for context in "${REQUIRED_CONTEXTS[@]}"; do
+    LATEST_REQUIRED_TIME=""
+    LATEST_REQUIRED_STATE=""
+    while IFS=$'\t' read -r result_name result_status result_conclusion result_created_at; do
+      [ "$result_name" = "$context" ] || continue
+      if [ "$result_status" = "completed" ]; then
+        if [ "$result_conclusion" = "success" ]; then
+          result_state="success"
+        else
+          result_state="failed"
+        fi
+      else
+        result_state="pending"
+      fi
+      record_latest_required_state "$result_created_at" "$result_state"
+    done <<< "$CHECK_RUN_RESULTS"
+    while IFS=$'\t' read -r result_name result_status result_created_at; do
+      [ "$result_name" = "$context" ] || continue
+      case "$result_status" in
+        success) result_state="success" ;;
+        failure|error) result_state="failed" ;;
+        *) result_state="pending" ;;
+      esac
+      record_latest_required_state "$result_created_at" "$result_state"
+    done <<< "$COMMIT_STATUS_RESULTS"
+    case "$LATEST_REQUIRED_STATE" in
+      failed) REQUIRED_FAILED+=("$context") ;;
+      pending) REQUIRED_PENDING+=("$context") ;;
+      success) REQUIRED_SUCCESS+=("$context") ;;
+      *) REQUIRED_MISSING+=("$context") ;;
+    esac
+  done
+}
+
+join_contexts() {
+  local separator="" context
+  for context in "$@"; do
+    printf '%s%s' "$separator" "$context"
+    separator=", "
+  done
+}
+
+required_check_state_details() {
+  local details=""
+  if [ "${#REQUIRED_FAILED[@]}" -gt 0 ]; then
+    details="failed: $(join_contexts "${REQUIRED_FAILED[@]}")"
+  fi
+  if [ "${#REQUIRED_PENDING[@]}" -gt 0 ]; then
+    [ -z "$details" ] || details+=", "
+    details+="pending: $(join_contexts "${REQUIRED_PENDING[@]}")"
+  fi
+  if [ "${#REQUIRED_MISSING[@]}" -gt 0 ]; then
+    [ -z "$details" ] || details+=", "
+    details+="missing: $(join_contexts "${REQUIRED_MISSING[@]}")"
+  fi
+  if [ -z "$details" ] && [ "${#REQUIRED_SUCCESS[@]}" -gt 0 ]; then
+    details="successful: $(join_contexts "${REQUIRED_SUCCESS[@]}")"
+  fi
+  printf '%s' "${details:-no required check states were available}"
+}
+
+wait_for_required_status_checks() {
+  local sha="$1"
+  local run_url="$2"
+  local attempts="${TRAIN_PUSH_REQUIRED_CHECK_ATTEMPTS:-360}"
+  local wait_seconds="${TRAIN_PUSH_REQUIRED_CHECK_SLEEP:-10}"
+  local result_rc attempt details contexts
+
+  if ! read_required_contexts; then
+    say "could not read branch protection required checks for $remote/$default_branch; continuing with existing CI-only landing behavior (${REQUIRED_CONTEXTS_ERROR:-query failed})"
+    return 0
+  fi
+  if [ "${#REQUIRED_CONTEXTS[@]}" -eq 0 ]; then
+    say "no required status checks reported for $remote/$default_branch; continuing with existing CI-only landing behavior"
+    return 0
+  fi
+  [[ "$attempts" =~ ^[0-9]+$ ]] && [ "$attempts" -gt 0 ] ||
+    refuse "TRAIN_PUSH_REQUIRED_CHECK_ATTEMPTS must be a positive integer"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] ||
+    refuse "TRAIN_PUSH_REQUIRED_CHECK_SLEEP must be a nonnegative integer"
+
+  contexts="$(join_contexts "${REQUIRED_CONTEXTS[@]}")"
+  for attempt in $(seq 1 "$attempts"); do
+    if read_required_check_results "$sha"; then
+      :
+    else
+      result_rc=$?
+      landing_failed "could not read required check results for $sha (gh query exit $result_rc)" "$sha" "$run_url"
+    fi
+    classify_required_check_results
+    if [ "${#REQUIRED_FAILED[@]}" -gt 0 ]; then
+      landing_failed "required checks not all green on $sha ($(required_check_state_details))" "$sha" "$run_url"
+    fi
+    if [ "${#REQUIRED_PENDING[@]}" -eq 0 ] && [ "${#REQUIRED_MISSING[@]}" -eq 0 ]; then
+      say "required status checks green on $sha: $contexts"
+      return 0
+    fi
+    if [ "$attempt" -eq 1 ]; then
+      say "waiting for required status checks on $sha ($(required_check_state_details)); bounded wait is $attempts polls"
+    fi
+    [ "$attempt" -lt "$attempts" ] && sleep "$wait_seconds"
+  done
+  details="$(required_check_state_details)"
+  landing_failed "required checks did not all complete successfully on $sha before the wait limit ($details)" "$sha" "$run_url"
+}
+
+required_check_failure_reason() {
+  local sha="$1" result_rc details
+  if ! read_required_contexts; then
+    printf 'refused: required checks not all green on %s (branch protection requirements could not be read: %s)' \
+      "$sha" "${REQUIRED_CONTEXTS_ERROR:-query failed}"
+    return
+  fi
+  if [ "${#REQUIRED_CONTEXTS[@]}" -eq 0 ]; then
+    printf 'refused: required checks not all green on %s (branch protection reported no required contexts)' "$sha"
+    return
+  fi
+  if read_required_check_results "$sha"; then
+    classify_required_check_results
+    details="$(required_check_state_details)"
+    printf 'refused: required checks not all green on %s (%s)' "$sha" "$details"
+  else
+    result_rc=$?
+    printf 'refused: required checks not all green on %s (could not read required check states; gh query exit %s)' \
+      "$sha" "$result_rc"
+  fi
+}
+
 is_governed_align_commit() {
   local commit="$1" subject path count=0
   subject="$(git -C "$REPO" show -s --format=%s "$commit")" || return 1
@@ -1022,6 +1219,7 @@ land_verified_sha() {
     refuse_non_fast_forward "$sha"
   fi
 
+  wait_for_required_status_checks "$sha" "$run_url"
   say "landing CI-verified $sha on $remote/$default_branch"
   set +e
   git -C "$REPO" push "$remote" "$sha:refs/heads/$default_branch" 2>&1 | tee "$push_log"
@@ -1030,7 +1228,7 @@ land_verified_sha() {
   if [ "$land_rc" -ne 0 ]; then
     land_reason="push of $sha to $remote/$default_branch failed; $remote/$train_ref still holds the tested sha"
     if grep -qE 'GH006|equired status check|rotected branch update failed' "$push_log"; then
-      land_reason="refused: $sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
+      land_reason="$(required_check_failure_reason "$sha"); merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
     fi
     landing_failed "$land_reason" "$sha" "$run_url"
   fi
@@ -1405,6 +1603,20 @@ if ! python3 "$REPO/scripts/check-path-deps.py"; then
   refuse "dependency path resolves outside the repository"
 fi
 
+# .cortexkit/ is private CortexKit working space: Git may track only the paths
+# the ignore rules re-include there. CI's Landing policy job runs
+# scripts/check-cortexkit-tracking.sh; this block repeats its Git query inline
+# (so train-push.sh needs no extra file) because this checkout's
+# .git/info/exclude can ignore files that a fresh CI clone does not.
+# The tree is clean at this point, so the index is exactly what gets pushed.
+if ! cortexkit_tracked="$(git -C "$REPO" ls-files -ci --exclude-standard -- .cortexkit)"; then
+  refuse "could not list tracked files under .cortexkit/"
+fi
+if [ -n "$cortexkit_tracked" ]; then
+  printf '%s\n' "$cortexkit_tracked" | sed 's/^/  /' >&2
+  refuse "ignored files are tracked under .cortexkit/ (stop tracking them with git rm --cached <path>, which keeps the working copy)"
+fi
+
 # A local main behind origin/main means an unstacked train was built on a stale
 # base. A stacked worktree instead names its exact parent base, and --restack
 # just replayed onto a fetched base; neither needs the idle local main moved.
@@ -1745,6 +1957,7 @@ fi
 if [ -n "$parent_name" ]; then
   wait_for_parent "$verified_sha" "$run_url"
 fi
+wait_for_required_status_checks "$head_sha" "$run_url"
 say "landing $head_sha on $remote/$default_branch"
 set +e
 git -C "$REPO" push "$remote" "$head_sha:refs/heads/$default_branch" 2>&1 | tee "$push_log"
@@ -1756,7 +1969,7 @@ if [ "$land_rc" -ne 0 ]; then
   # operator to decode GH006.
   land_reason="push of $head_sha to $remote/$default_branch failed; $remote/$train_ref still holds the tested sha"
   if grep -qE 'GH006|equired status check|rotected branch update failed' "$push_log"; then
-    land_reason="refused: $head_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
+    land_reason="$(required_check_failure_reason "$head_sha"); merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
   fi
   landing_failed "$land_reason" "$head_sha" "$run_url"
 fi

@@ -150,16 +150,79 @@ if [ "${1:-}" = "api" ]; then
   for arg in "$@"; do
     case "$arg" in
       repos/*/actions/jobs/*/logs) api_path="$arg" ;;
+      repos/*/branches/*/protection/required_status_checks) api_path="$arg" ;;
+      repos/*/commits/*/check-runs?*) api_path="$arg" ;;
+      repos/*/commits/*/status?*) api_path="$arg" ;;
     esac
   done
-  if [ -n "$api_path" ]; then
-    if [ -f "$STATE/fail_job_log" ]; then
-      echo 'HTTP 500: job log unavailable' >&2
-      exit 1
-    fi
-    cat "$STATE/log_tail" 2>/dev/null || true
-    exit 0
-  fi
+  case "$api_path" in
+    repos/*/actions/jobs/*/logs)
+      if [ -f "$STATE/fail_job_log" ]; then
+        echo 'HTTP 500: job log unavailable' >&2
+        exit 1
+      fi
+      cat "$STATE/log_tail" 2>/dev/null || true
+      exit 0
+      ;;
+  esac
+  case "$api_path" in
+    repos/*/branches/*/protection/required_status_checks)
+      if [ -f "$STATE/protection_unreadable" ]; then
+        echo 'HTTP 403: Resource not accessible by integration' >&2
+        exit 1
+      fi
+      if [ ! -f "$STATE/required_contexts" ]; then
+        echo 'HTTP 404: Not Found' >&2
+        exit 1
+      fi
+      cat "$STATE/required_contexts"
+      exit 0
+      ;;
+    repos/*/commits/*/check-runs?*)
+      requested_sha="${api_path#*/commits/}"
+      requested_sha="${requested_sha%%/*}"
+      printf 'check-runs %s\n' "$requested_sha" >> "$STATE/required-check-queries"
+      poll_count="$(cat "$STATE/required_check_polls" 2>/dev/null || echo 0)"
+      poll_count=$((poll_count + 1))
+      printf '%s\n' "$poll_count" > "$STATE/required_check_polls"
+      initial_polls="$(cat "$STATE/required_initial_polls" 2>/dev/null || echo 0)"
+      if [ "$poll_count" -le "$initial_polls" ]; then
+        results_file="$STATE/required_check_runs.initial"
+      else
+        results_file="$STATE/required_check_runs.final"
+      fi
+      if [[ "$jq_arg" == *'(.conclusion // "-")'* ]]; then
+        python3 - "$results_file" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1])
+if source.exists():
+    for line in source.read_text().splitlines():
+        fields = line.split('\t')
+        while len(fields) < 4:
+            fields.append('')
+        if not fields[2]:
+            fields[2] = '-'
+        print('\t'.join(fields))
+PY
+      else
+        cat "$results_file" 2>/dev/null || true
+      fi
+      exit 0
+      ;;
+    repos/*/commits/*/status?*)
+      requested_sha="${api_path#*/commits/}"
+      requested_sha="${requested_sha%%/*}"
+      printf 'statuses %s\n' "$requested_sha" >> "$STATE/required-check-queries"
+      poll_count="$(cat "$STATE/required_check_polls" 2>/dev/null || echo 0)"
+      initial_polls="$(cat "$STATE/required_initial_polls" 2>/dev/null || echo 0)"
+      if [ "$poll_count" -le "$initial_polls" ]; then
+        cat "$STATE/required_statuses.initial" 2>/dev/null || true
+      else
+        cat "$STATE/required_statuses.final" 2>/dev/null || true
+      fi
+      exit 0
+      ;;
+  esac
   cat "$STATE/job_steps" 2>/dev/null || true
   exit 0
 fi
@@ -452,6 +515,8 @@ run_train() {
        WATCH_CI_POLL_SLEEP=0.02 \
        TRAIN_PUSH_PARENT_ATTEMPTS="${TRAIN_PUSH_TEST_PARENT_ATTEMPTS:-200}" \
        TRAIN_PUSH_PARENT_SLEEP=0.02 \
+       TRAIN_PUSH_REQUIRED_CHECK_ATTEMPTS="${TRAIN_PUSH_TEST_REQUIRED_CHECK_ATTEMPTS:-360}" \
+       TRAIN_PUSH_REQUIRED_CHECK_SLEEP="${TRAIN_PUSH_TEST_REQUIRED_CHECK_SLEEP:-0}" \
        TRAIN_PUSH_PROBE_ATTEMPTS=2 \
        TRAIN_PUSH_PROBE_SLEEP=0 \
        run_train_command "$@"
@@ -555,6 +620,19 @@ def option(name):
     return args[args.index(name) + 1] if name in args else ''
 field, query = option('--json'), option('--jq')
 runs = [json.loads(p.read_text()) for p in (state / 'runs').glob('*.json')]
+if args[:1] == ['api']:
+    endpoint = next((arg for arg in args[1:] if arg.startswith('repos/')), '')
+    if '/branches/' in endpoint and endpoint.endswith('/protection/required_status_checks'):
+        contexts = state / 'required_contexts'
+        if not contexts.exists():
+            print('HTTP 404: Not Found', file=sys.stderr)
+            sys.exit(1)
+        print(contexts.read_text(), end='')
+        sys.exit(0)
+    if '/commits/' in endpoint and ('/check-runs?' in endpoint or '/status?' in endpoint):
+        print('')
+        sys.exit(0)
+    sys.exit('unexpected fake API query: ' + repr(args))
 if args[:2] == ['run', 'rerun']:
     (state / 'reruns').write_text('unexpected rerun\n')
     sys.exit(1)
@@ -1245,6 +1323,146 @@ test_ci_conclusion_guard() {
   fi
 }
 
+test_required_check_waits_for_every_context() {
+  local dir sha polls
+  dir="$(new_fixture required-check-wait)"
+  add_train_commit "$dir/work" required-check-wait
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
+  printf '1\n' > "$dir/ci-state/required_initial_polls"
+  printf 'linux\tin_progress\t\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_check_runs.initial"
+  printf 'windows\tpending\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
+  printf 'windows\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
+
+  run_train "$dir" required-check-wait
+  polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" -eq 0 ] && [ "$polls" -ge 2 ] &&
+    [[ "$LAST_OUT" == *"waiting for required status checks on $sha"* ]] &&
+    [[ "$LAST_OUT" == *"required status checks green on $sha: linux, windows"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ] &&
+    grep -qx "check-runs $sha" "$dir/ci-state/required-check-queries" &&
+    grep -qx "statuses $sha" "$dir/ci-state/required-check-queries"; then
+    ok 'the landing waits for every required context on the exact train sha'
+  else
+    fail "the landing waits for every required context on the exact train sha (rc=$LAST_RC polls=$polls)"
+  fi
+}
+
+test_required_check_waits_on_land_recovery() {
+  local dir sha polls
+  dir="$(new_fixture required-check-land)"
+  add_train_commit "$dir/work" required-check-land
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  git -C "$dir/work" push -q origin "HEAD:refs/heads/train/required-check-land"
+  printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
+  printf '1\n' > "$dir/ci-state/required_initial_polls"
+  printf 'linux\tin_progress\t\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_check_runs.initial"
+  printf 'windows\tpending\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
+  printf 'windows\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
+
+  run_train "$dir" required-check-land --land
+  polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" -eq 0 ] && [ "$polls" -ge 2 ] &&
+    [[ "$LAST_OUT" == *"waiting for required status checks on $sha"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'the --land recovery path waits for required contexts before pushing'
+  else
+    fail "the --land recovery path waits for required contexts before pushing (rc=$LAST_RC polls=$polls)"
+  fi
+}
+
+test_required_check_failure_is_red() {
+  local dir base
+  dir="$(new_fixture required-check-failure)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  add_train_commit "$dir/work" required-check-failure
+  printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
+  printf 'linux\tcompleted\tcancelled\t2026-01-02T00:00:00Z\nwindows\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.final"
+  run_train "$dir" required-check-failure
+  if [ "$LAST_RC" -eq 4 ] && [[ "$LAST_OUT" == *'failed: linux'* ]] &&
+    [[ "$LAST_OUT" == *'green run: https://github.com/example/repo/actions/runs/42424242424'* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok 'a cancelled required context is red by name and preserves the green run URL'
+  else
+    fail "a cancelled required context is red by name and preserves the green run URL (rc=$LAST_RC)"
+  fi
+}
+
+test_required_check_uses_latest_run_state() {
+  local dir sha
+  dir="$(new_fixture required-check-latest)"
+  add_train_commit "$dir/work" required-check-latest
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  printf 'linux\n' > "$dir/ci-state/required_contexts"
+  printf 'linux\tcompleted\tfailure\t2026-01-01T00:00:00Z\nlinux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.final"
+  run_train "$dir" required-check-latest
+  if [ "$LAST_RC" -eq 0 ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'a newer successful run supersedes an older failure for the same context'
+  else
+    fail "a newer successful run supersedes an older failure for the same context (rc=$LAST_RC)"
+  fi
+}
+
+test_required_check_newer_pending_waits() {
+  local dir sha polls
+  dir="$(new_fixture required-check-newer-pending)"
+  add_train_commit "$dir/work" required-check-newer-pending
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  printf 'linux\n' > "$dir/ci-state/required_contexts"
+  printf '1\n' > "$dir/ci-state/required_initial_polls"
+  printf 'linux\tcompleted\tsuccess\t2026-01-01T00:00:00Z\nlinux\tin_progress\t\t2026-01-02T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.initial"
+  printf 'linux\tcompleted\tsuccess\t2026-01-03T00:00:00Z\n' \
+    > "$dir/ci-state/required_check_runs.final"
+  run_train "$dir" required-check-newer-pending
+  polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" -eq 0 ] && [ "$polls" -ge 2 ] &&
+    [[ "$LAST_OUT" == *"waiting for required status checks on $sha"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'a newer pending run keeps the same required context pending until success'
+  else
+    fail "a newer pending run keeps the same required context pending until success (rc=$LAST_RC polls=$polls)"
+  fi
+}
+
+test_required_check_missing_times_out() {
+  local dir base polls
+  dir="$(new_fixture required-check-missing)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  add_train_commit "$dir/work" required-check-missing
+  printf 'linux\nwindows\n' > "$dir/ci-state/required_contexts"
+  printf 'linux\tcompleted\tsuccess\t2026-01-02T00:00:00Z\n' > "$dir/ci-state/required_check_runs.final"
+  TRAIN_PUSH_TEST_REQUIRED_CHECK_ATTEMPTS=2 run_train "$dir" required-check-missing
+  polls="$(cat "$dir/ci-state/required_check_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" -eq 4 ] && [[ "$LAST_OUT" == *'missing: windows'* ]] &&
+    [ "$polls" -eq 2 ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok 'a required context that never appears is named after the bounded wait'
+  else
+    fail "a required context that never appears is named after the bounded wait (rc=$LAST_RC polls=$polls)"
+  fi
+}
+
+test_protection_unreadable_falls_back() {
+  local dir sha
+  dir="$(new_fixture protection-unreadable)"
+  add_train_commit "$dir/work" protection-unreadable
+  sha="$(git -C "$dir/work" rev-parse HEAD)"
+  : > "$dir/ci-state/protection_unreadable"
+  run_train "$dir" protection-unreadable
+  if [ "$LAST_RC" -eq 0 ] &&
+    [[ "$LAST_OUT" == *'could not read branch protection required checks'* ]] &&
+    [[ "$LAST_OUT" == *'continuing with existing CI-only landing behavior'* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$sha" ]; then
+    ok 'an unreadable protection API states the fallback and preserves the old landing path'
+  else
+    fail "an unreadable protection API states the fallback and preserves the old landing path (rc=$LAST_RC)"
+  fi
+}
+
 run_stack_tests() {
   test_stack_base_not_on_main
   test_stack_parent_red
@@ -1261,6 +1479,13 @@ run_stack_tests() {
   test_fetch_failure_boundaries
   test_stack_chain
   test_ci_conclusion_guard
+  test_required_check_waits_for_every_context
+  test_required_check_waits_on_land_recovery
+  test_required_check_failure_is_red
+  test_required_check_uses_latest_run_state
+  test_required_check_newer_pending_waits
+  test_required_check_missing_times_out
+  test_protection_unreadable_falls_back
 }
 
 test_skew_log_query_fallback() {
@@ -1404,15 +1629,24 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   fetch-retry) test_fetch_race_retry ;;
   fetch-boundaries) test_fetch_failure_boundaries ;;
   ci-conclusion) test_ci_conclusion_guard ;;
+  required-check-wait) test_required_check_waits_for_every_context ;;
+  required-check-land) test_required_check_waits_on_land_recovery ;;
+  required-check-failure) test_required_check_failure_is_red ;;
+  required-check-latest) test_required_check_uses_latest_run_state ;;
+  required-check-newer-pending) test_required_check_newer_pending_waits ;;
+  required-check-missing) test_required_check_missing_times_out ;;
+  protection-unreadable) test_protection_unreadable_falls_back ;;
   skew-log-fallback) test_skew_log_query_fallback ;;
   gh-retry) test_gh_query_retry ;;
   race-lock) test_race_lock ;;
   stacked) run_stack_tests ;;
 esac
-if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == required-check-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = protection-unreadable ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
   [ "$failures" = 0 ] || exit 1
   if [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
     echo "train-push.test.sh: race-lock case passed ($checks checks)"
+  elif [[ "${TRAIN_PUSH_TEST_CASE:-}" == required-check-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = protection-unreadable ]; then
+    echo "train-push.test.sh: required-check case passed ($checks checks)"
   else
     echo "train-push.test.sh: stacked cases passed ($checks checks)"
   fi
@@ -1429,6 +1663,30 @@ run_train "$dir" no-path-checker
 expect_rc 2 "a missing path-dependency checker refuses"
 expect_out "scripts/check-path-deps.py not found" "the refusal names the missing checker"
 expect_no_out "dependency path resolves outside" "a missing checker is not reported as a path verdict"
+
+# --- refusal: an ignored file is tracked under .cortexkit/ -----------------
+dir="$(new_fixture cortexkit-tracked)"
+printf '/.cortexkit/*\n!/.cortexkit/WORKER.md\n' > "$dir/work/.gitignore"
+mkdir -p "$dir/work/.cortexkit/alfonso/drafts"
+echo "worker guide" > "$dir/work/.cortexkit/WORKER.md"
+echo "private draft" > "$dir/work/.cortexkit/alfonso/drafts/plan.md"
+git -C "$dir/work" add .gitignore .cortexkit/WORKER.md
+git -C "$dir/work" add -f .cortexkit/alfonso/drafts/plan.md
+git -C "$dir/work" commit -qm "track a private draft"
+add_train_commit "$dir/work" "cortexkit-tracked"
+main_before="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+run_train "$dir" cortexkit-tracked
+expect_rc 2 "a tracked ignored file under .cortexkit refuses"
+expect_out ".cortexkit/alfonso/drafts/plan.md" "the refusal lists the tracked ignored file"
+expect_out "ignored files are tracked under .cortexkit/" "the refusal names the reason"
+expect_no_out ".cortexkit/WORKER.md" "a re-included tracked file is not listed"
+# A train that got through would push train/cortexkit-tracked and then land it
+# on main (deleting the train ref), so check both refs.
+if [ -z "$(origin_ref "$dir" refs/heads/train/cortexkit-tracked)" ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$main_before" ]; then
+  ok "nothing is pushed or landed when a private file is tracked"
+else
+  fail "a train with a tracked private file was pushed or landed"
+fi
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
@@ -2552,12 +2810,15 @@ git -C "$dir/origin.git" cat-file -e "$DEFAULT_BRANCH:other.txt" 2>/dev/null ||
 dir="$(new_fixture protected)"
 add_train_commit "$dir/work" "protected"
 protected_sha="$(git -C "$dir/work" rev-parse HEAD)"
+printf 'Unit\n' > "$dir/ci-state/required_contexts"
+printf 'Unit\tsuccess\t2026-01-01T00:00:00Z\n' > "$dir/ci-state/required_statuses.final"
 cat > "$dir/origin.git/hooks/pre-receive" <<HOOK
 #!/bin/sh
 # Stand in for GitHub branch protection: the default branch only accepts a sha
 # that already carries a check.
 while read -r _old _new ref; do
   if [ "\$ref" = "refs/heads/$DEFAULT_BRANCH" ]; then
+    printf 'Unit\tpending\t2026-01-02T00:00:00Z\\n' > "\$TRAIN_PUSH_TEST_STATE/required_statuses.final"
     echo 'error: GH006: Protected branch update failed for refs/heads/$DEFAULT_BRANCH.' >&2
     echo 'error: Required status check Unit is expected.' >&2
     exit 1
@@ -2568,8 +2829,8 @@ HOOK
 chmod +x "$dir/origin.git/hooks/pre-receive"
 run_train "$dir" protected
 expect_rc 4 "a protection refusal after green exits in the landing-failed state"
-expect_out "refused: $protected_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
-  "protection refusal prints the merge-as-a-train remedy"
+expect_out "refused: required checks not all green on $protected_sha (pending: Unit); merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
+  "protection refusal reports the required context state and merge-as-a-train remedy"
 expect_out "green run: https://github.com/example/repo/actions/runs/42424242424" \
   "post-CI failure names the green run"
 expect_out "train sha: $protected_sha" "post-CI failure names the verified train sha"
