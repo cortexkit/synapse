@@ -40,13 +40,17 @@ Local compatibility changes:
   each layer program's compiler temp directory (`<temp>/<hex identifier>/`,
   holding `model.mil`, `weights/weight.bin` and the compiler's `net.plist` and
   `data`) once the program has loaded, and also when writing the files, the
-  compile or the load fails. Upstream never removes it, so every cold compile
-  left about twice the layer's weight size in the per-user temp folder. Only
+  compile or the load fails. Before this change the client never removed it:
+  a directory stayed at least while its program was loaded, and processes
+  that ended without unloading left them behind for good. Only
   that exact path is removed, never by pattern, because other applications
-  share the private compiler and temp folder. Compiles of the same program
-  share the directory under a shared `flock`; the last one to finish removes
-  it. The `client::tests` unit tests cover this with a stand-in for the
-  private compile and load.
+  share the private compiler and temp folder. On macOS 27.0 (26A428) every
+  compile received a fresh identifier; in case two compiles ever share a
+  directory, each holds a shared `flock` on it and the last one to finish
+  removes it. On an M4 under that build, deleting the directories after load
+  left every inference output byte-identical, across eviction, recompilation
+  and unload. The `client::tests` unit tests cover the removal with a
+  stand-in for the private compile and load.
 
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).

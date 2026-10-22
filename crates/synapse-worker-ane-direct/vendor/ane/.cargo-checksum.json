@@ -1,7 +1,7 @@
 {
   "files": {
     "Cargo.toml": "bb70d7a091b3272101ca3de7dbde0242ab84405fc307cba5f9dd42b86786d8cd",
-    "VENDORED.md": "4568081ea9f1e6a82d7ed1b4eeefabf0f1dcbc20044ede9e24431194ea1e01de",
+    "VENDORED.md": "b8729b999069a16c468145d61b30415096516ccf17ea308785af134905a8865a",
     "build.rs": "d5339f906b4cb1c86b2b7d539729f74c8bc7b3a79f950bf4fffbd312842e8c59",
     "src/ane_client.rs": "9aabbf44811f23a0f13f56349b0f981be55aafe328608c65094a6ba2b681ebf1",
     "src/ane_in_memory_model.rs": "3f1dfa4c49585cb2d9ab200f0fb9dd7e3a99cae6e70efa3533c90c46c8658683",
@@ -9,7 +9,7 @@
     "src/ane_io_surface_object.rs": "709bfd167328f5be0651060c07b07f8323e5526f36ad3fc1a827bfbd583582ba",
     "src/ane_performance_stats.rs": "7f70b58b585d3a132b94172ad8445b45e1adccac82da8241feef8f7ee13062d4",
     "src/ane_request.rs": "093610a2160edfc9ea5fac926deb4d8be5b71bd2cd9bf8fdbb8fcdec1cd2abe2",
-    "src/client.rs": "2c43416b0cf21592682710c4ae62e6a922875d3af6ab2782f0bc40482790e08b",
+    "src/client.rs": "c5936ba1560fd78efc5bf5ab1307d798c294cd700f8a10946ca6ef26202d7227",
     "src/coreml.rs": "c237c707543a1f34e35faa385b54566c05c0a52c62896ddc5aed632d9794d426",
     "src/diagnostics.rs": "ad02488bde9f1e9a50cc0be8b22d001eb3a7eb177443b651bd2371bd6837f9b5",
     "src/error.rs": "2f4fc3dbb6a28f98a4822c3a507b98c45e69a39c08d09190cd97152f571d14f3",

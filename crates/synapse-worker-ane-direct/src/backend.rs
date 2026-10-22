@@ -1782,12 +1782,12 @@ fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
 /// Free space the temp volume must have before a shape compile starts: 2 GiB.
 ///
 /// Each layer's compile writes its MIL, its weights and the compiler's own
-/// output of the same size into the per-user temp folder, about 60 MB per
-/// layer for the Qwen3 and GTE profiles (1.7 GB per Qwen3 shape and 1.3 GB per
-/// GTE shape when nothing is removed). The vendored client removes each
-/// layer's directory once the layer loads, so a compile holds roughly one
-/// layer's worth at a time and the module runs at most four admissions at
-/// once: about 0.25 GB. 2 GiB covers that several times over and still holds a
+/// output of the same size into the per-user temp folder. Measured on an M4 at
+/// widths 128 and 256: 63 MB per Qwen3 layer (1.77 GB per shape when nothing
+/// is removed) and 20 MB per GTE layer (0.45 GB per shape). The vendored
+/// client removes each layer's directory once the layer loads, so a compile
+/// holds about one layer's worth at a time and the module runs at most four
+/// admissions at once: about 0.25 GB. 2 GiB covers that several times over and still holds a
 /// whole Qwen3 shape if a removal fails. Refusing up front is better than a
 /// compile that fails part-way on a full disk, which would also starve every
 /// other process writing to the same volume.

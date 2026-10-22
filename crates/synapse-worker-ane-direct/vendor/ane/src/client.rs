@@ -116,20 +116,25 @@ pub fn compile_network(
 /// The compiler reads the program's MIL text and weights from
 /// `<temp_root>/<identifier>/` (`model.mil` and `weights/weight.bin`) and
 /// writes its own outputs (`net.plist` and a `data` file as large as the
-/// weights) beside them. A loaded program does not read that directory again,
-/// so it is removed after the load, and also when writing the files, the
-/// compile or the load fails. Left in place, every cold compile would keep
-/// about twice the layer's weight size on disk indefinitely.
+/// weights) beside them. A loaded program does not read that directory again:
+/// on an M4 with macOS 27.0 (26A428), outputs stayed byte-identical after the
+/// directories were deleted, including across eviction, recompilation and
+/// unload. So the directory is removed right after the load, and also when
+/// writing the files, the compile or the load fails. Left in place, it stays
+/// on disk at least as long as the program stays loaded (about 1.7 GB per
+/// resident Qwen3 shape), and processes that ended without unloading their
+/// programs left such directories behind for good.
 ///
 /// Only this exact path is removed, never anything found by name or pattern:
 /// other applications use the same private compiler and the same per-user
 /// temp folder.
 ///
-/// The identifier is a content hash, so two compiles of the same program (two
-/// worker processes admitting the same shape, for example) share one
-/// directory. Each compile holds a shared `flock` on the directory while it
-/// uses it. Whoever finishes last can take the lock exclusively and removes
-/// the directory; a compile that finds it still shared leaves it to the other.
+/// On that OS build every compile got a fresh identifier, even for an
+/// identical program, so two compiles normally never share a directory.
+/// Nothing guarantees that, so each compile holds a shared `flock` on the
+/// directory while it uses it. If two compiles ever share one, whoever
+/// finishes last can take the lock exclusively and removes it; a compile that
+/// finds it still shared leaves it to the other.
 pub(crate) fn with_compile_dir<T>(
     temp_root: &Path,
     identifier: Option<&str>,
@@ -143,7 +148,8 @@ pub(crate) fn with_compile_dir<T>(
     };
     let dir = CompileDir::acquire(temp_root, identifier)?;
     dir.write_sources(mil_text, weight_bytes)?;
-    // `dir` is dropped, and the directory removed, after this returns.
+    // `dir` is dropped after this returns; dropping it removes the directory
+    // unless another compile of the same program still holds it.
     compile_and_load()
 }
 
