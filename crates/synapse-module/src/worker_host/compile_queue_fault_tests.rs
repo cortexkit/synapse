@@ -1384,3 +1384,41 @@ async fn closed_worker_refuses_recovery_and_requests_at_once() {
     assert_eq!(broken.generation(), generation, "a closed worker was restarted again");
     assert_eq!(supervisor.inner.lock().reserved_executables(), 22, "its slot stays charged");
 }
+
+/// A mailbox kept busier than the scheduler can drain does not stop it from
+/// deciding and from taking finished operations: a cold compile still starts,
+/// finishes and is answered while the flood goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_mailbox_does_not_starve_decisions_or_completions() {
+    let compiler = SharedCompiler::new(0.01);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    // Each nudge costs the scheduler 1 ms; the flood sends about three per ms.
+    *supervisor.inner.slow_nudges.lock().unwrap() = Some(Duration::from_millis(1));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooder = std::thread::spawn({
+        let inner = supervisor.inner.clone();
+        let stop = stop.clone();
+        move || {
+            while !stop.load(Ordering::SeqCst) {
+                for _ in 0..3 {
+                    inner.nudge();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+    let leased = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor.lease(&worker, QUEUE_GTE, 128),
+    )
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    flooder.join().unwrap();
+    *supervisor.inner.slow_nudges.lock().unwrap() = None;
+    assert!(
+        matches!(leased, Ok(Ok(_))),
+        "a busy mailbox starved the scheduler: {:?}",
+        leased.map(|lease| lease.err())
+    );
+}

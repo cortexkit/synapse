@@ -31,6 +31,10 @@ use tokio::task::JoinSet;
 pub(super) const EXIT_CONFIRMATION_GIVE_UP: std::time::Duration =
     std::time::Duration::from_secs(35);
 
+/// How many queued messages the scheduler handles between two passes, on top
+/// of the one that woke it.
+const MESSAGES_PER_PASS: usize = 64;
+
 /// A request's admission trace context in tests; empty otherwise.
 #[derive(Clone, Default)]
 pub(super) struct Trace {
@@ -289,7 +293,13 @@ enum OpDone {
         finished: tokio::time::Instant,
     },
     Evict(Result<(), AneResidencyError>),
-    Recover(Result<(), AneResidencyError>),
+    /// `exited`: the old process's exit was confirmed during the restart. It
+    /// is also reported early by `Msg::ExitConfirmed`, but the completion
+    /// carries it too, so it does not depend on which one is handled first.
+    Recover {
+        result: Result<(), AneResidencyError>,
+        exited: bool,
+    },
 }
 
 pub(super) type RecoverReply = oneshot::Sender<Result<(), AneResidencyError>>;
@@ -412,8 +422,25 @@ impl Scheduler {
                 }
                 _ = sleep_until_option(wake) => {}
             }
-            while let Ok(message) = self.rx.try_recv() {
+            // At most a bounded number of further messages per pass, and every
+            // operation that has already finished, so that a busy mailbox can
+            // starve neither completions nor the timers the next pass checks.
+            let mut drained = false;
+            for _ in 0..MESSAGES_PER_PASS {
+                let Ok(message) = self.rx.try_recv() else {
+                    drained = true;
+                    break;
+                };
                 self.handle(message, tokio::time::Instant::now());
+            }
+            while let Some(done) = self.ops.try_join_next_with_id() {
+                self.finish(done, tokio::time::Instant::now());
+            }
+            if !drained {
+                // With the mailbox still full this task would never wait, so
+                // the operations it spawned on the same thread (compiles,
+                // evictions, restarts) would never run. Let them.
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -436,6 +463,14 @@ impl Scheduler {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if matches!(message, Msg::Nudge) {
+            // Outside the state lock, so only the scheduler is slowed.
+            let cost = *inner.slow_nudges.lock().unwrap();
+            if let Some(cost) = cost {
+                std::thread::sleep(cost);
+            }
+        }
         let mut effects = Effects::default();
         {
             let mut state = inner.lock();
@@ -1564,12 +1599,14 @@ impl Scheduler {
         let operation = async move {
             let (exited, exit) = oneshot::channel();
             let forward = async move {
-                if exit.await.is_ok() {
+                let exited = exit.await.is_ok();
+                if exited {
                     let _ = report.send(Msg::ExitConfirmed {
                         worker_id: reported,
                         generation,
                     });
                 }
+                exited
             };
             // The restart runs as its own task so that a panic in it (for
             // example while the replacement starts) cannot drop the
@@ -1578,12 +1615,15 @@ impl Scheduler {
             let restart = AbortOnDrop(tokio::spawn(async move {
                 worker.restart_with_exit_signal(exited).await
             }));
-            let (result, ()) = tokio::join!(restart.join(), forward);
-            OpDone::Recover(result.unwrap_or_else(|error| {
-                Err(AneResidencyError::Panicked(format!(
-                    "worker recovery task failed: {error}"
-                )))
-            }))
+            let (result, exited) = tokio::join!(restart.join(), forward);
+            OpDone::Recover {
+                result: result.unwrap_or_else(|error| {
+                    Err(AneResidencyError::Panicked(format!(
+                        "worker recovery task failed: {error}"
+                    )))
+                }),
+                exited,
+            }
         };
         let task = self.ops.spawn(operation).id();
         self.op_kinds.insert(task, OpKind::Recover { worker_id });
@@ -1787,13 +1827,24 @@ impl Scheduler {
                     }
                 }
                 OpKind::Recover { worker_id } => {
-                    let result = match done {
-                        Ok(OpDone::Recover(result)) => result,
+                    let (result, exited) = match done {
+                        Ok(OpDone::Recover { result, exited }) => (result, exited),
                         Ok(_) => return,
-                        Err(error) => Err(AneResidencyError::Panicked(format!(
-                            "worker recovery task failed: {error}"
-                        ))),
+                        Err(error) => (
+                            Err(AneResidencyError::Panicked(format!(
+                                "worker recovery task failed: {error}"
+                            ))),
+                            false,
+                        ),
                     };
+                    if exited {
+                        if let Some(recovery) = self.recoveries.get_mut(&worker_id) {
+                            if !recovery.exit_confirmed {
+                                recovery.exit_confirmed = true;
+                                release_exited_worker(&mut state, &worker_id);
+                            }
+                        }
+                    }
                     self.recovered(&mut state, &worker_id, result, now, &mut effects);
                 }
             }

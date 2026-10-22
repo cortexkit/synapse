@@ -4796,6 +4796,10 @@ pub mod ane_residency {
         /// two.
         #[cfg(test)]
         wait_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        /// Makes the scheduler take this long over each `Nudge` message, so a
+        /// test can keep its mailbox busier than it can drain.
+        #[cfg(test)]
+        slow_nudges: Mutex<Option<std::time::Duration>>,
         #[cfg(unix)]
         lane_lock: Mutex<Option<AneDirectLaneLock>>,
         #[cfg(unix)]
@@ -4829,6 +4833,8 @@ pub mod ane_residency {
                 lease_decision_gate: Mutex::new(None),
                 #[cfg(test)]
                 wait_decision_gate: Mutex::new(None),
+                #[cfg(test)]
+                slow_nudges: Mutex::new(None),
                 #[cfg(unix)]
                 lane_lock: Mutex::new(None),
                 #[cfg(unix)]
