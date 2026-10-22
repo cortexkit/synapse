@@ -165,22 +165,29 @@ message. A failed download carries `error` beside `state` in its flat status.
   Never returned because another request is executing or a Neural Engine
   shape is compiling.
   Admitted batch jobs wait within their execution budget and never fail with it.
-- `shape_compiling` — transient, `retry_after_ms: 1000`, safe to retry the same
-  request. Direct Neural Engine lanes only. The worker compiles each padded
-  sequence shape the first time it is used (tens of seconds) and cannot run any
-  inference while it compiles. A request waits through a compile as long as its
-  own deadline allows; this code is returned only when that deadline expires
-  while the request is blocked on a compile: either the shape it needs is
-  being compiled (several requests share one compile), or it was waiting for
-  the lane's worker while another shape's compile occupied it at some point of
-  that wait. When the module can no longer tell (more than 16 compiles since
-  the wait began), it answers `shape_compiling`. `details`: `{lane_id, shape}`,
+- `shape_compiling` — transient, `retry_after_ms` at least 1000, safe to retry
+  the same request. Direct Neural Engine lanes only. The worker compiles each
+  padded sequence shape the first time it is used (seconds to minutes) and
+  cannot run any inference while it compiles. The module compiles one shape at
+  a time across all direct-ANE lanes, cheapest first. A request waits through a
+  compile as long as its own deadline allows.
+  This code is returned when that deadline expires while the request is
+  blocked on a compile: the shape it needs is being compiled (several requests
+  share one compile) or is queued for its compile, or it was waiting for the
+  lane's worker while another shape's compile occupied it at some point of
+  that wait. It is also returned before the deadline, as soon as the module
+  predicts the shape cannot be ready by then (or within its 600 s admission
+  bound). `retry_after_ms` is the module's predicted time until the shape is
+  ready, and never less than 1000. When the module can no longer tell (more
+  than 16 compiles since the wait began), it answers `shape_compiling`.
+  `details`: `{lane_id, shape}`,
   where `shape` is the shape being compiled. Waits that expire on anything else
   keep `deadline_exceeded`.
   **Consumer disposition:** the model is loaded; retry after `retry_after_ms`.
   The compile continues without the request, so a retry joins it or finds the
-  shape ready. A deadline that covers a first-time compile (about 30 s) avoids
-  this code.
+  shape ready. A queued compile that nobody retries is dropped after twice the
+  promised delay. A deadline that covers a first-time compile (about 30 s for
+  short inputs, minutes for 4096 tokens and more) avoids this code.
 - `idempotency_conflict` — permanent, not safe to retry unchanged; replace a
   download key bound to a different digest.
 

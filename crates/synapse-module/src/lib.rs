@@ -7114,11 +7114,15 @@ fn ane_residency_error_to_wire(
     if let AneResidencyError::PermitUnavailable(message) = &error {
         return WireOperationError::from_stable(StableError::queue_full(Some(100)), message);
     }
-    if let AneResidencyError::ShapeCompiling { shape } = &error {
+    if let AneResidencyError::ShapeCompiling {
+        shape,
+        retry_after_ms,
+    } = &error
+    {
         return WireOperationError {
             code: worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING.to_owned(),
             class: ErrorClass::Transient,
-            retry_after_ms: Some(worker_host::ane_residency::ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
+            retry_after_ms: Some(*retry_after_ms),
             safe_to_retry_same_request: true,
             message: error.to_string(),
             details: Some(json!({ "shape": shape })),

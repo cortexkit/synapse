@@ -1,6 +1,8 @@
 # Design: one cold compile at a time on the direct Neural Engine lane
 
-Status: **proposed, not implemented.** Nothing in this document changes code yet.
+Status: **approved and implemented**, with option A of section 3, the orphan
+expiry rule of section 1, and the changes recorded under "Changes during
+implementation" at the end. The hardware check on the M4 mini is pending.
 
 ## Why
 
@@ -56,6 +58,14 @@ small:
    is compiled or its worker retires; requests only attach to it. Single flight
    bounds the number of entries to the distinct (worker, model, shape, program)
    keys, about 30 for four models.
+5. **Orphaned entries expire.** An entry is kept for its requests' sake only
+   when the last of them was answered `shape_compiling` (refused early, or its
+   deadline expired while it waited on the compile). A caller that simply went
+   away (cancelled or disconnected) gets no promise, and its entry is dropped
+   with it. A kept entry no request is attached to expires once twice the
+   `retry_after_ms` it last promised has passed, measured from that promise,
+   and at once when its worker retires. Otherwise demand from a caller that
+   never retries would keep compiling and evicting shapes other requests use.
 
 ### Cost estimate
 
@@ -213,30 +223,31 @@ behaviour: GTE@128 (22 × 0.21 s) beside Qwen3@4096 (28 × 3.02 s) takes about
 
 | Test | Asserts | Why current code fails |
 |---|---|---|
-| `small_compile_beside_wide_finishes_in_its_standalone_time` | Qwen3@4096 requested, then GTE@128 1 ms later on another worker: GTE@128 is resident within 1.1× its standalone time, and Qwen3@4096 within its standalone time plus GTE@128's | both compile together; GTE@128 takes about 70 s |
-| `at_most_one_cold_compile_runs_across_workers` | the fake records the peak number of overlapping compile RPCs across four workers and seven shapes each: exactly 1 | today four run at once |
-| `queued_compiles_start_cheapest_first` | while one compile runs, queue Qwen3@4096 then GTE@256 then Qwen3@128; start order is GTE@256, Qwen3@128, Qwen3@4096 | today they start in arrival order, and at once |
-| `wide_compile_starts_after_its_aging_window` | a wide compile under a steady stream of small arrivals starts at the point its start key predicts; the exact start order is asserted | today it starts at once beside the small ones, so the order and overlap differ |
-| `queued_compile_holds_no_executable_budget` | with three compiles queued, reserved executables are those of resident shapes plus one admitting shape | today every started compile reserves at once |
-| `predicted_overrun_refuses_early_with_honest_retry` | a request with a 30 s deadline queued behind a predicted 90 s compile is answered at virtual time 0 with `shape_compiling` and `retry_after_ms` within 10% of the prediction; its compile still runs, and a retry after that time leases without a compile | today it is answered at 30 s with `retry_after_ms: 1000` |
-| `queue_beyond_600s_refuses_early_without_a_deadline` | a request without a deadline whose predicted completion is beyond 600 s is refused at once with `shape_compiling` | today it waits 600 s and gets `ane_resources_exhausted` |
-| `deadline_while_queued_for_compile_answers_shape_compiling` | the prediction is made wrong on purpose (the fake runs slower than learned); the deadline answer is `shape_compiling` and the entry stays queued | today queued waits answer `deadline_exceeded`, and the entry is dropped |
-| `machine_factor_corrects_unseen_shape_predictions` | after one compile 1.3× slower than the table, the prediction for an unseen shape is scaled by 1.3 | no prediction exists |
+| `small_compile_beside_wide_finishes_in_its_standalone_time` | Qwen3@4096 requested, then GTE@128 1 ms later on another worker: GTE@128 is resident within 1.1× its standalone time, and Qwen3@4096 within its standalone time plus GTE@128's | both compile together; GTE@128 took 71.1 s |
+| `at_most_one_cold_compile_runs_across_workers` | the fake records the peak number of overlapping compiles across four workers and three shapes each: exactly 1 | four ran at once |
+| `queued_compiles_start_cheapest_first` | while Qwen3@2048 runs, queue Qwen3@4096, GTE@512, Qwen3@128; start order is GTE@512, Qwen3@128, Qwen3@4096 | they started in arrival order, at once |
+| `wide_compile_starts_after_its_aging_window` | under a stream of small compiles, every small one whose start key is earlier than the wide one's starts before it, and every later one after it | the wide compile started at once, beside the small ones |
+| `queued_compile_holds_no_executable_budget` | with three compiles queued behind Qwen3@2048, 28 executables are reserved | 100 were reserved |
+| `predicted_overrun_refuses_early_with_honest_retry` | a GTE@128 request with a 30 s deadline queued behind Qwen3@4096 is answered at once with `shape_compiling` and `retry_after_ms` within 10% of the prediction; its compile still runs, and a retry then leases without a second compile | it waited 70.1 s |
+| `queue_beyond_600s_refuses_early_without_a_deadline` | of eight Qwen3@4096 requests without a deadline, the eighth (predicted at 676 s) is refused at once with `shape_compiling`; the other seven succeed | the eighth succeeded at 676 s |
+| `deadline_while_queued_for_compile_answers_shape_compiling` | the fake runs twice as slowly as predicted; the queued request is answered `shape_compiling` exactly at its deadline, and a retry within the promised delay is served by one compile that starts after the running one | answered after 73.8 s |
+| `machine_factor_corrects_unseen_shape_predictions` | after one compile 1.3× slower than the table, a request is refused at once with a prediction scaled by 1.3 | not refused |
+| `orphaned_entry_expires_after_twice_its_promise` | a refused request's compile, which nobody retries, is dropped before its turn when twice its promise passes, and never compiles | not refused; waited 212 s |
 
-Each will be run once against the base commit to record its failure, and that
-evidence goes with the change.
+All ten were run against the base commit, `2c1774c3`, with only the test file
+added, and all ten failed; the right-hand column quotes those failures.
 
-**An existing test changes meaning.**
-`eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends`
-asserts that a second worker's compile is dispatched while another compile runs.
-That is exactly what this design forbids. Its eviction claim stays (the idle
-stream is evicted before the long compile ends); its admission claim is
-reversed. The plan is to rename it to
-`eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends` and
-assert that the admission starts after the long compile. The FIFO statements in
+**An existing test changes meaning.** It was
+`eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends`. It
+asserted that a second worker's compile is dispatched while another compile runs,
+which this design forbids. Its eviction claim stays: the idle stream is evicted
+before the long compile ends. Its admission claim is reversed: the admission
+starts after the long compile. The test is now
+`eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends`, and the
+mutation catalogue row that names it is updated. The FIFO statements in
 `docs/ane-serving.md` ("Admission fairness and eviction") and in the
 `ane_residency` module comment are updated to match. The handoff and busy-stream
-eviction tests should pass unchanged.
+eviction tests pass unchanged.
 
 ### Hardware check on the M4 mini
 
@@ -264,10 +275,26 @@ Every arm also requires zero `ane_resources_exhausted` errors. The kit reports
 pass or fail per arm and keeps the raw timelines. A hardware run needs your
 approval and exclusive use of the mini's Neural Engine.
 
-## Open questions
+## Changes during implementation
 
-1. Section 3: option A, and amending the two sentences in
-   `docs/wire-contract-v1.md` §2 (`retry_after_ms` becomes the prediction, and
-   the code may be returned before the deadline)?
-2. Section 5: renaming and reversing the admission claim of
-   `eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends`?
+- **Decisions:** option A of section 3. The two sentences in
+  `docs/wire-contract-v1.md` §2 are amended. The renamed test above is
+  approved. The orphan-expiry rule (section 1, item 5) was added at approval.
+- **Gathering window.** A compile that arrives while nothing is compiling
+  would otherwise start at once, so a wide compile requested 1 ms before a small
+  one would hold the small one up for its full length. A compile with a known
+  cost therefore waits 50 ms after its request before it may start, so compiles
+  requested together start cheapest first. This adds 50 ms to a compile of 4 s
+  or more. Packed programs skip it; they are prepared only while nothing else
+  is queued.
+- **Remaining time of the running compile** is `predicted cost − elapsed`, but
+  at least one layer's share. The per-layer progress frames are not wired into
+  the supervisor yet. The machine factor corrects predictions after the first
+  measured compile, not during it.
+- **Accepted requests keep their bound.** A request predicted to be served in
+  time records its bound. A new compile is ordered behind that entry if going
+  first would push the entry past the bound.
+- **Unknown cost.** A worker whose seed is zero has an unknown cost: it
+  queues in arrival order, never gathers, and is never refused early. Test
+  channels backed by instant mock workers use that; production seeds always
+  come from the pinned manifest.

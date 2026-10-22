@@ -91,6 +91,30 @@ from a different binary, model, conversion policy or OS build.
 
 ## Admission fairness and eviction
 
+Apple's Neural Engine compiler serves one layer at a time for the whole
+machine, so shape compiles run side by side gain no throughput and make a
+small shape wait one wide layer per layer of its own. The supervisor therefore
+runs **at most one cold shape compile at a time** across all direct-ANE
+workers. Queued compiles start in order of a fixed start key, their arrival
+plus their predicted cost: cheapest first, and a wide compile is passed only by
+compiles that arrive less than its own cost after it. A compile with a known
+cost waits **50 ms** after arrival before it may start, so compiles requested
+together start cheapest first. The predicted cost is the worker's seed estimate
+(layers times a measured per-layer time for the model's width), replaced by the
+measured time once a shape has compiled and scaled for unmeasured shapes by
+how much slower this machine compiled so far. A queued compile reserves no
+executable budget until it starts; the queue's head may evict while the
+running compile finishes, so its compile starts at once.
+
+A request whose shape is predicted to be ready only after its deadline, or after
+its 600 s admission bound, is answered at once with `shape_compiling` and the
+predicted delay as `retry_after_ms`. Its compile stays queued, so the retry
+finds the shape ready. A queued compile no request waits for any more is
+dropped after **twice** the delay it last promised, and at once when its worker
+retires, so a caller that never retries does not keep compiling and evicting
+shapes others use. A new compile is not ordered ahead of a queued one if that
+would make an accepted request miss its bound.
+
 The supervisor reserves at most **100 layer executables**, including pending
 admissions and evictions. A leased shape is never an eviction candidate. Eviction
 refunds its charge only after the worker acknowledges release; a busy stream is
@@ -115,8 +139,10 @@ still acquires the stream mutex and holds it for the entire request/reply exchan
 
 Portable checks include `joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers`,
 `suspended_joiner_handoff_expires_without_an_external_wakeup`,
-`eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends`, and
-`eviction_uses_a_busy_stream_when_it_is_the_only_option`.
+`eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends`, and
+`eviction_uses_a_busy_stream_when_it_is_the_only_option`. The compile queue is
+checked against a stand-in for the shared per-layer compiler, on a paused clock,
+by the tests in `crates/synapse-module/src/worker_host/compile_queue_tests.rs`.
 
 ### Development hardware stress cases
 

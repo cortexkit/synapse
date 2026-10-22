@@ -74,8 +74,14 @@ async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers
     );
 }
 
+/// Eviction still picks the idle stream while another worker's compile runs,
+/// so the head's budget is ready when its turn comes. Its own compile, though,
+/// waits for the running one to end: this test used to assert the opposite
+/// (that the head admitted before the long compile ended), which is exactly
+/// the side-by-side compiling the compile queue removes, because Apple's
+/// compiler serves one layer at a time machine-wide.
 #[tokio::test]
-async fn eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends() {
+async fn eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends() {
     let busy_ledger = SharedLedger::default();
     let idle_ledger = SharedLedger::default();
     let busy: Arc<dyn AneShapeWorker> = mock_channel("busy", &busy_ledger).await;
@@ -112,10 +118,20 @@ async fn eviction_prefers_an_idle_stream_and_admits_before_the_long_compile_ends
     release.notify_one();
     drop(compile.await.unwrap().unwrap());
     assert!(
-        before_compile_end.is_ok() && idle_chosen && still_compiling,
+        idle_chosen && still_compiling,
         "budget head queued eviction behind the long compile instead of choosing the idle stream"
     );
-    drop(before_compile_end.unwrap().unwrap().unwrap());
+    assert!(
+        before_compile_end.is_err(),
+        "a second compile was admitted while another was still running"
+    );
+    drop(
+        tokio::time::timeout(Duration::from_secs(2), head)
+            .await
+            .expect("the head's compile starts once the long compile ends")
+            .unwrap()
+            .unwrap(),
+    );
 }
 
 #[tokio::test]
