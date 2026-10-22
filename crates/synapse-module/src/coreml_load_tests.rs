@@ -68,7 +68,8 @@ fn lock_owners(path: &Path) -> String {
     }
 }
 
-/// Takes the lane lock, or fails naming who holds it.
+/// Takes the lane lock, or fails with what is known about its holders
+/// (on Linux: the kernel's lock entry and the processes with it open).
 fn acquire_or_report(path: &Path, context: &str) -> AneDirectLaneLock {
     AneDirectLaneLock::acquire(path)
         .unwrap_or_else(|error| panic!("{context}: {error}; {}", lock_owners(path)))

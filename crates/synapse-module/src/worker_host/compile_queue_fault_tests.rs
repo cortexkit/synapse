@@ -1536,9 +1536,9 @@ async fn expiry_before_the_first_decision_is_answered_after_it() {
     let now = tokio::time::Instant::now();
     let (reply, answer) = tokio::sync::oneshot::channel();
     let (expired, expiry) = tokio::sync::oneshot::channel();
-    // Both messages are in the mailbox before the scheduler runs again. As
-    // `lease_until` sends it, the bound is the request's deadline, which has
-    // already passed.
+    // Both messages are in the mailbox before the scheduler runs again. The
+    // Want's bound is its deadline, as `lease_until` would set it, and that
+    // deadline has already passed.
     supervisor
         .inner
         .send(scheduler::Msg::Want(scheduler::Want {
