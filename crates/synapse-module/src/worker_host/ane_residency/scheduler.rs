@@ -986,6 +986,14 @@ impl Scheduler {
             .map(|(id, _)| *id)
             .collect();
         for id in due {
+            // A request is decided once before its bound can expire it, so
+            // the answer reflects what it waits for (a queued compile is
+            // `shape_compiling`, not a bare deadline). The pass then runs
+            // again at the same instant and expires it.
+            if !self.waiters[&id].classified {
+                effects.progress = true;
+                continue;
+            }
             let error = self.expiry_answer(state, id, now, false);
             self.answer(state, id, Answer::Failed(error), effects);
         }

@@ -1531,9 +1531,11 @@ async fn expiry_before_the_first_decision_is_answered_after_it() {
     until(|| supervisor.inner.lock().compile_running()).await;
     let other = fake_worker(&compiler, "other");
     let now = tokio::time::Instant::now();
-    let (reply, _answer) = tokio::sync::oneshot::channel();
+    let (reply, answer) = tokio::sync::oneshot::channel();
     let (expired, expiry) = tokio::sync::oneshot::channel();
-    // Both messages are in the mailbox before the scheduler runs again.
+    // Both messages are in the mailbox before the scheduler runs again. As
+    // `lease_until` sends it, the bound is the request's deadline, which has
+    // already passed.
     supervisor
         .inner
         .send(scheduler::Msg::Want(scheduler::Want {
@@ -1541,7 +1543,7 @@ async fn expiry_before_the_first_decision_is_answered_after_it() {
             key: queue_key("other", QUEUE_GTE, 128),
             worker: other,
             executables: 22,
-            bound: Some(now + Duration::from_secs(600)),
+            bound: Some(now),
             deadline: Some(now),
             reply: scheduler::Reply::Lease(reply),
             trace: scheduler::Trace::current(),
@@ -1558,6 +1560,13 @@ async fn expiry_before_the_first_decision_is_answered_after_it() {
     assert!(
         matches!(kind, scheduler::AnswerKind::ShapeCompiling { .. }),
         "an expiry decided before its request was classified: {kind:?}"
+    );
+    assert!(
+        matches!(
+            answer.await.unwrap(),
+            scheduler::Answer::Failed(AneResidencyError::ShapeCompiling { .. })
+        ),
+        "a request whose bound had passed was expired before it was decided"
     );
     assert!(running_answer.await.unwrap().ok());
 }

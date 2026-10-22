@@ -291,3 +291,20 @@ expect_message = "a late exit confirmation removed the replacement's compiling s
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-decide-before-bound-expiry"
+guards = "A new request is decided once before its bound can expire it, so a request queued behind a compile is told shape_compiling even when its bound has already passed"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            if !self.waiters[&id].classified {"
+new = "            if false && !self.waiters[&id].classified { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::expiry_before_the_first_decision_is_answered_after_it"]
+expect_message = "an expiry decided before its request was classified"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
