@@ -394,9 +394,10 @@ Operations report back by finishing, and a compile also sends a "dispatched at"
 message. A panic or `JoinError` therefore always reaches the scheduler, whoever
 asked for the work.
 
-Resident leases are the one piece of state shared with requests (6.3). They sit
-in a small residency table behind a short mutex. The scheduler is the only
-writer of slot states; requests only add or drop leases.
+Resident leases are the main state shared with requests (6.3). They sit in a
+small residency table behind a short mutex. The scheduler is the only writer of
+slot states. Requests add and drop leases and write a few ranking and cohort
+fields under the same mutex; 6.10 lists them and why that is safe.
 
 ### 6.2 Requests never drive the queue
 
@@ -571,9 +572,22 @@ error.
 - **Where the state lives.** Queue entries, slots and learning state stay in the
   supervisor's shared `State` behind its mutex, so the lease fast path,
   statistics and tests can read them. Only the scheduler task changes queue
-  entries, waiters, promises and slot lifecycles. Requests change nothing but
-  their own leases. Waiters' reply channels live in the scheduler task, so they
-  close if it stops.
+  entries, waiters, promises and slot lifecycles (states, reservations,
+  removal). Requests write a few other fields, always under the same mutex and
+  never across an await:
+  - their own leases, and the slot's LRU tick (`last_used`) when they lease;
+  - `joined`: a cohort member removes itself when it leases through the
+    handoff, or when it leaves without leasing;
+  - `smallest_rungs`: the serving path records each model's smallest rung,
+    which eviction preference reads;
+  - `packed_qualified`: packed preparation marks a packed program qualified
+    after its output matched.
+
+  These are safe because none of them changes what the scheduler owns: a
+  request can only shrink a cohort (and wakes the scheduler when it empties),
+  and the LRU tick, rung table and qualification flag only rank or allow a
+  later lease of a slot that is already `Resident`. Waiters' reply channels
+  live in the scheduler task, so they close if it stops.
 - **Where the scheduler runs.** The module's supervisor (`with_lane_lock`) runs
   its scheduler on a thread with its own runtime, because direct-ANE engines each
   have their own runtime and any of them may be unloaded. A supervisor built with

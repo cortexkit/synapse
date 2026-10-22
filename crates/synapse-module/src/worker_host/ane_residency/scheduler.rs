@@ -11,7 +11,10 @@
 //! instant. The queue state lives in the shared `State` behind the
 //! supervisor's mutex so the lease fast path, statistics and tests can read
 //! it; only this task changes queue entries, waiters, promises and slot
-//! lifecycles. Requests only add and drop leases.
+//! lifecycles. Requests add and drop leases and, under the same mutex, write
+//! a slot's LRU tick, its handoff cohort (`joined`, only to leave it), the
+//! per-model smallest rung and the packed-qualified flag; none of these
+//! changes a slot's state or reservation.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
