@@ -24,6 +24,56 @@ fn unique_label(label: &str) -> String {
     format!("{label}-{nanos:x}")
 }
 
+/// Who holds or has open the lane lock file at `path`, for a failure message:
+/// the kernel's lock table entry for its inode and every process with a
+/// descriptor on it (Linux only).
+fn lock_owners(path: &Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = fs::metadata(path) else {
+            return "the lock file is missing".into();
+        };
+        let inode = format!(":{} ", meta.ino());
+        let locks: Vec<String> = fs::read_to_string("/proc/locks")
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(&inode))
+            .map(str::to_owned)
+            .collect();
+        let mut open_by = Vec::new();
+        for process in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            for fd in fs::read_dir(process.path().join("fd")).into_iter().flatten().flatten() {
+                if fs::read_link(fd.path()).is_ok_and(|target| target == path) {
+                    let command = fs::read_to_string(process.path().join("cmdline"))
+                        .unwrap_or_default()
+                        .replace('\0', " ");
+                    open_by.push(format!(
+                        "pid {} fd {}: {command}",
+                        process.file_name().to_string_lossy(),
+                        fd.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+        format!(
+            "this test process is pid {}; /proc/locks: {locks:?}; open by: {open_by:?}",
+            std::process::id()
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        "lock owners are inspected only on Linux".into()
+    }
+}
+
+/// Takes the lane lock, or fails naming who holds it.
+fn acquire_or_report(path: &Path, context: &str) -> AneDirectLaneLock {
+    AneDirectLaneLock::acquire(path)
+        .unwrap_or_else(|error| panic!("{context}: {error}; {}", lock_owners(path)))
+}
+
 fn fixture(label: &str) -> CoreMlFixture {
     let (root, descriptor) = test_storage_descriptor(label);
     let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
@@ -151,7 +201,7 @@ async fn cold_coreml_load_ignores_another_direct_ane_lock_holder() {
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
         .to_path_buf();
-    let holder = AneDirectLaneLock::acquire(&path).unwrap();
+    let holder = acquire_or_report(&path, "the test could not take the lane lock");
     assert!(fixture
         .state
         .runtime
@@ -186,7 +236,7 @@ async fn cold_coreml_load_ignores_another_direct_ane_lock_holder() {
     assert_eq!(vectors, vec![vec![1.0]]);
     drop(holder);
     let replacement =
-        AneDirectLaneLock::acquire(&path).expect("CoreML worker must not have acquired the lock");
+        acquire_or_report(&path, "CoreML worker must not have acquired the lock");
     drop((model, replacement));
     finish(fixture).await;
 }
@@ -200,14 +250,14 @@ async fn coreml_load_does_not_reacquire_a_released_supervisor_lock() {
     let supervisor = acquire_runtime_ane_supervisor(&fixture.state.runtime).unwrap();
     supervisor.release_lane().unwrap();
     *fixture.state.runtime.ane_supervisor.lock().unwrap() = Some(supervisor.clone());
-    let holder = AneDirectLaneLock::acquire(&path).unwrap();
+    let holder = acquire_or_report(&path, "the test could not take the released lock");
     let model = load(&fixture).await;
     assert_eq!(fixture.loads.load(Ordering::SeqCst), 1);
     assert!(supervisor.held_lane_lock().is_none());
     assert!(AneDirectLaneLock::acquire(&path).is_err());
     drop(holder);
-    let replacement = AneDirectLaneLock::acquire(&path)
-        .expect("CoreML must not have re-acquired the released lock");
+    let replacement =
+        acquire_or_report(&path, "CoreML must not have re-acquired the released lock");
     drop((replacement, model));
     finish(fixture).await;
 }
@@ -261,8 +311,7 @@ async fn coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock() {
         .unwrap()
         .loaded
         .is_none());
-    let private =
-        AneDirectLaneLock::acquire(&path).expect("pause confirmed the CoreML worker's exit");
+    let private = acquire_or_report(&path, "pause confirmed the CoreML worker's exit");
     drop(private);
     resume(&fixture.state).await;
     assert!(AneDirectLaneLock::acquire(&path).is_err());
@@ -271,8 +320,7 @@ async fn coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock() {
     assert_eq!(fixture.loads.load(Ordering::SeqCst), 2);
     pause_and_drain(&fixture.state).await;
     assert_eq!(fixture.unloads.load(Ordering::SeqCst), 2);
-    let private =
-        AneDirectLaneLock::acquire(&path).expect("pause must also close the inherited descriptor");
+    let private = acquire_or_report(&path, "pause must also close the inherited descriptor");
     drop(private);
     resume(&fixture.state).await;
     drop((first, second));
