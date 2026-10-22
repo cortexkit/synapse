@@ -142,3 +142,34 @@ lease grant. Detached exchanges retain the initiating request's identity; evicti
 events identify the victim's model and shape. Stream grant is distinct from queue
 entry, so a compile's RPC duration does not hide stream contention. Schema 1
 reports remain historical artifacts, not schema 2 inputs.
+
+## Compiled programs survive a worker restart
+
+macOS's `aned` keeps compiled Neural Engine programs on disk, keyed by the
+program's content identifier (hashes of its MIL text, weights and options) and
+the worker's code-signing identifier. The vendored binding emits constants in a
+fixed order, so the same layer at the same shape always has the same identifier.
+When aned already holds that program, the worker loads it without writing
+sources or compiling: on an M6 mini a cached layer loaded in 3.5–45 ms against
+0.37 s (width 128) to 15.8 s (width 4096) to compile it, with byte-identical
+output. Otherwise, or if that load fails, the layer is compiled as before.
+
+Only a compile writes to the per-user temp folder, so `ane_temp_space_low` is
+checked before each layer that must be compiled, never before a cached load.
+Each shape admission writes one stderr line, which the module logs at INFO:
+
+```text
+ane-direct shape admission: shape=128 layers_loaded=22 cache_hit=22 compiled=0 total_ms=95.3 outcome=admitted
+```
+
+With `SYNAPSE_ANE_PROFILE_DIR` set, the `admit` profile record also carries
+`cache_hit`, `compiled` and per-layer `layer_loads` rows (`origin` and `ms`).
+
+The cache is aned's: an OS update, 14 days without use, storage pressure or a
+changed signing identifier empties it, and the next admission compiles once.
+Neither the cache nor its disk use is visible to Synapse.
+
+Checks: `graph::compile::tests::identical_graphs_emit_identical_sources` and
+`client::tests::a_cached_program_is_loaded_without_writing_or_compiling` in the
+vendored binding (`cargo test --locked -p ane --lib`, macOS), and
+`backend::temp_space_tests::a_layer_aned_holds_is_not_refused_on_a_full_disk`.
