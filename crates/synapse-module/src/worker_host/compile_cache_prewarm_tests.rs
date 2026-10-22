@@ -566,11 +566,13 @@ async fn resident_shape_inference_holds_off_prewarm() {
     let stream = handle.stream.lock().await;
     drop(lease);
     tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(
-        compiler.compiles_of("lane").len(),
-        1,
+    // A started admission would be waiting for the stream, not compiling, so
+    // look at the reservation as well as the compiler.
+    assert!(
+        !supervisor.inner.lock().compile_running(),
         "prewarm started while the worker stream was in use"
     );
+    assert_eq!(compiler.compiles_of("lane").len(), 1);
     drop(stream);
     tokio::time::sleep(Duration::from_secs(20)).await;
     let shapes: Vec<_> = compiler

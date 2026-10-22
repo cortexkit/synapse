@@ -412,6 +412,7 @@ package = "synapse-module"
 target = "--lib"
 select = "expected"
 expect_red = [
+    "worker_host::ane_residency::tests::prewarm_resumes_after_a_recovery_releases_its_admission",
     "worker_host::ane_residency::tests::resident_shape_inference_holds_off_prewarm",
 ]
 expect_message = "prewarm started while the worker stream was in use"
