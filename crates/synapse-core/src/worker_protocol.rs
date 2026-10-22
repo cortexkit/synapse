@@ -519,6 +519,13 @@ pub enum WorkerResponse {
         cold_load_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         buckets: Option<Vec<usize>>,
+        /// Direct ANE only: the ladder rungs whose compiled programs aned
+        /// already holds (checked on each rung's first and last layer), so the
+        /// module predicts a fast load instead of a compile for them. Workers
+        /// that do not check omit it, and every rung is then treated as
+        /// unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ane_cached_shapes: Option<Vec<usize>>,
     },
     Vectors {
         req_id: String,
@@ -544,6 +551,14 @@ pub enum WorkerResponse {
     Admitted {
         req_id: String,
         inventory: AnePlacementInventory,
+        /// How many of the shape's layers were loaded from aned's compiled
+        /// copy and how many were compiled. The module learns load and
+        /// compile times separately from them; a worker that omits them has
+        /// every admission learned as a compile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_hit_layers: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compiled_layers: Option<u32>,
     },
     /// Acknowledges `ANE_EVICT_SHAPE` once the shape's executables are released.
     Evicted {
@@ -1054,6 +1069,8 @@ mod tests {
                 ],
                 cpu_stages: vec!["token_embedding".to_string(), "pooling".to_string()],
             },
+            cache_hit_layers: None,
+            compiled_layers: None,
         };
         let encoded = serde_json::to_value(&admitted).unwrap();
         assert_eq!(
@@ -1085,6 +1102,184 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<WorkerResponse>(encoded).unwrap(),
             evicted
+        );
+    }
+
+    /// The cache fields on `LOADED` and `ADMITTED` are optional additions to
+    /// protocol v3: a worker that sends them still talks to a module that
+    /// predates them, and a module still accepts a worker that omits them.
+    #[test]
+    fn cache_fields_are_optional_in_both_directions() {
+        // The replies as a module built before the fields existed decodes
+        // them: the same tags and fields, minus the new ones.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+        enum OlderModuleResponse {
+            Loaded {
+                req_id: String,
+                model_ref: String,
+                dims: usize,
+                cold_load_ms: u64,
+                #[serde(default)]
+                buckets: Option<Vec<usize>>,
+            },
+            Admitted {
+                req_id: String,
+                inventory: AnePlacementInventory,
+            },
+        }
+
+        let loaded = WorkerResponse::Loaded {
+            req_id: "load-1".into(),
+            model_ref: "ane-direct:p:sha256:1".into(),
+            dims: 1024,
+            cold_load_ms: 5,
+            buckets: Some(vec![128, 256]),
+            ane_cached_shapes: Some(vec![128]),
+        };
+        let admitted = WorkerResponse::Admitted {
+            req_id: "admit-1".into(),
+            inventory: AnePlacementInventory::default(),
+            cache_hit_layers: Some(27),
+            compiled_layers: Some(1),
+        };
+        let loaded_wire = serde_json::to_value(&loaded).unwrap();
+        let admitted_wire = serde_json::to_value(&admitted).unwrap();
+        assert_eq!(loaded_wire["ane_cached_shapes"], serde_json::json!([128]));
+        assert_eq!(admitted_wire["cache_hit_layers"], 27);
+        assert_eq!(admitted_wire["compiled_layers"], 1);
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(loaded_wire.clone()).unwrap(),
+            loaded
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(admitted_wire.clone()).unwrap(),
+            admitted
+        );
+        match serde_json::from_value::<OlderModuleResponse>(loaded_wire).unwrap() {
+            OlderModuleResponse::Loaded {
+                req_id,
+                model_ref,
+                dims,
+                cold_load_ms,
+                buckets,
+            } => {
+                assert_eq!(
+                    (req_id.as_str(), model_ref.as_str(), dims, cold_load_ms),
+                    ("load-1", "ane-direct:p:sha256:1", 1024, 5)
+                );
+                assert_eq!(buckets, Some(vec![128, 256]));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        match serde_json::from_value::<OlderModuleResponse>(admitted_wire).unwrap() {
+            OlderModuleResponse::Admitted { req_id, inventory } => {
+                assert_eq!(req_id, "admit-1");
+                assert_eq!(inventory, AnePlacementInventory::default());
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+
+        // An older worker's replies, without the fields, decode with them
+        // unset and encode back without them.
+        let older_loaded = serde_json::json!({
+            "type": "LOADED", "req_id": "load-1", "model_ref": "m", "dims": 8,
+            "cold_load_ms": 1, "buckets": [128],
+        });
+        let older_admitted = serde_json::json!({
+            "type": "ADMITTED", "req_id": "admit-1",
+            "inventory": { "executables": [], "cpu_stages": [] },
+        });
+        let decoded = serde_json::from_value::<WorkerResponse>(older_loaded.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            WorkerResponse::Loaded {
+                ane_cached_shapes: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), older_loaded);
+        let decoded = serde_json::from_value::<WorkerResponse>(older_admitted.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            WorkerResponse::Admitted {
+                cache_hit_layers: None,
+                compiled_layers: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), older_admitted);
+    }
+
+    /// The module decodes worker replies with this crate's `WorkerResponse`,
+    /// so a newer worker may add optional fields to `LOADED` and `ADMITTED`
+    /// only while that type ignores fields it does not know.
+    #[test]
+    fn worker_response_ignores_unknown_extension_fields() {
+        let loaded = serde_json::json!({
+            "type": "LOADED", "req_id": "load-1", "model_ref": "m", "dims": 8,
+            "cold_load_ms": 1, "buckets": [128], "ane_cached_shapes": [128],
+            "added_later": {"nested": true},
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(loaded).unwrap(),
+            WorkerResponse::Loaded {
+                req_id: "load-1".into(),
+                model_ref: "m".into(),
+                dims: 8,
+                cold_load_ms: 1,
+                buckets: Some(vec![128]),
+                ane_cached_shapes: Some(vec![128]),
+            }
+        );
+        let admitted = serde_json::json!({
+            "type": "ADMITTED", "req_id": "admit-1",
+            "inventory": { "executables": [], "cpu_stages": [] },
+            "cache_hit_layers": 28, "compiled_layers": 0, "added_later": 1,
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(admitted).unwrap(),
+            WorkerResponse::Admitted {
+                req_id: "admit-1".into(),
+                inventory: AnePlacementInventory::default(),
+                cache_hit_layers: Some(28),
+                compiled_layers: Some(0),
+            }
+        );
+    }
+
+    /// A worker built from this crate must keep accepting requests from a
+    /// newer module that adds optional fields the same way, so neither the
+    /// requests nor HELLO's acknowledgement refuse fields they do not know.
+    #[test]
+    fn worker_side_decoding_ignores_unknown_fields() {
+        let admit = serde_json::json!({
+            "type": "ANE_ADMIT_SHAPE", "req_id": "a", "model_ref": "m", "shape": 128,
+            "added_later": true,
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkerRequest>(admit).unwrap(),
+            WorkerRequest::AneAdmitShape {
+                req_id: "a".into(),
+                model_ref: "m".into(),
+                shape: 128,
+            }
+        );
+        let load = serde_json::json!({
+            "type": "LOAD", "req_id": "l", "artifact_path": "/p", "artifact_digest": "d",
+            "format": "safetensors-package", "runtime_config": {}, "added_later": 1,
+        });
+        assert!(matches!(
+            serde_json::from_value::<WorkerRequest>(load).unwrap(),
+            WorkerRequest::Load { .. }
+        ));
+        let ack = serde_json::json!({
+            "v": WORKER_PROTOCOL_VERSION, "accept": true, "max_frame": 4096, "added_later": 1,
+        });
+        assert!(
+            serde_json::from_value::<WorkerHelloAck>(ack)
+                .unwrap()
+                .accept
         );
     }
 

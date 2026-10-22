@@ -47,6 +47,7 @@ async fn malformed_reply_faults(corruption: Corruption) {
                 dims: 1,
                 cold_load_ms: 0,
                 buckets: None,
+                ane_cached_shapes: None,
             },
             DEFAULT_MAX_FRAME_BYTES,
         )

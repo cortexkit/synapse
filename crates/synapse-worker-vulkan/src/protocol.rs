@@ -174,6 +174,7 @@ pub fn request_loop<S: Read + Write>(
                             dims: model.dims,
                             cold_load_ms: 0,
                             buckets: None,
+                            ane_cached_shapes: None,
                         };
                         loaded = Some(model);
                         response

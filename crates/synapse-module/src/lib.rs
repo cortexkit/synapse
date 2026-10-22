@@ -19352,6 +19352,8 @@ mod tests {
                                 WorkerResponse::Admitted {
                                     req_id: req_id.clone(),
                                     inventory: inventory(),
+                                    cache_hit_layers: None,
+                                    compiled_layers: None,
                                 }
                             }
                             WorkerRequest::AneAdmitPacked { req_id, .. } => {
@@ -19364,6 +19366,8 @@ mod tests {
                                 WorkerResponse::Admitted {
                                     req_id: req_id.clone(),
                                     inventory: inventory(),
+                                    cache_hit_layers: None,
+                                    compiled_layers: None,
                                 }
                             }
                             WorkerRequest::AneEvictShape { req_id, shape, .. } => {
@@ -30714,7 +30718,37 @@ async fn run_lane_check(
         })?;
     let model = check_profile_model(state, model, guard).await?;
     start_packed_preparation(&state.runtime, &model);
+    start_direct_ane_prewarm(&state.runtime, &model);
     Ok(model)
+}
+
+/// Once a direct-ANE catalog lane is ready (its self-check passed), its
+/// common short shapes are loaded in the background at the lowest priority,
+/// so that later requests at those lengths usually find them resident. The
+/// supervisor loads them only while no request waits and only into free
+/// budget, and ignores a repeated call for the same worker.
+fn start_direct_ane_prewarm(runtime: &Arc<RuntimeState>, model: &EmbeddingModel) {
+    #[cfg(unix)]
+    if let EmbedBackend::DirectAne(engine) = &model.backend {
+        if resolved_catalog_lane(runtime, &model.model_id).is_some() {
+            // Packed preparation that gave up while a prewarm admission held
+            // the worker or its budget is retried when that admission ends;
+            // the launcher does nothing for a lane without packing.
+            let weak = Arc::downgrade(runtime);
+            let model_id = model.model_id.clone();
+            let notify: worker_host::ane_residency::PrewarmNotify = Arc::new(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.activity_telemetry.prepare_when_idle(&model_id);
+                }
+            });
+            if let Err(error) = engine.prewarm(&model.model_id, Some(notify)) {
+                tracing::warn!(target: "worker", lane = %model.model_id, %error,
+                    "direct-ANE prewarm could not start");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (runtime, model);
 }
 
 /// The numerical self-check's persisted id and key for a profile model.

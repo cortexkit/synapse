@@ -123,6 +123,15 @@ pub struct Model {
     pub tensors: BTreeMap<String, Vec<f32>>,
     pub resident: BTreeMap<usize, Resident>,
 }
+/// A shape made resident, and how many of its layers were loaded from
+/// aned's compiled copy or compiled. Both counts are zero when the shape was
+/// already resident.
+#[derive(Debug)]
+pub struct ShapeAdmission {
+    pub inventory: AnePlacementInventory,
+    pub cache_hit_layers: u32,
+    pub compiled_layers: u32,
+}
 pub struct Resident {
     pub inventory: AnePlacementInventory,
     executables: Vec<Executable>,
@@ -225,6 +234,7 @@ impl Model {
     #[allow(dead_code)]
     pub fn admit(&mut self, shape: usize, os: &str) -> Result<AnePlacementInventory> {
         self.admit_progress(shape, os, &mut || Ok(()))
+            .map(|admission| admission.inventory)
     }
 
     pub fn admit_progress(
@@ -232,7 +242,7 @@ impl Model {
         shape: usize,
         os: &str,
         progress: &mut impl FnMut() -> Result<()>,
-    ) -> Result<AnePlacementInventory> {
+    ) -> Result<ShapeAdmission> {
         self.admit_progress_checking_space(
             shape,
             os,
@@ -254,7 +264,7 @@ impl Model {
         available: impl Fn(&Path) -> std::io::Result<u64>,
         mut compile_gated: impl FnMut(&Graph, &mut dyn FnMut() -> Result<()>) -> Result<Executable>,
         progress: &mut impl FnMut() -> Result<()>,
-    ) -> Result<AnePlacementInventory> {
+    ) -> Result<ShapeAdmission> {
         let profile = crate::profile::LaneProfile::new();
         let cached = self.resident.contains_key(&shape);
         let started = std::time::Instant::now();
@@ -296,7 +306,46 @@ impl Model {
             "compiled": loads.count(ProgramOrigin::Compiled),
             "layer_loads": loads.profile_rows(),
         }));
-        result
+        let count = |origin| u32::try_from(loads.count(origin)).unwrap_or(u32::MAX);
+        result.map(|inventory| ShapeAdmission {
+            inventory,
+            cache_hit_layers: count(ProgramOrigin::CacheHit),
+            compiled_layers: count(ProgramOrigin::Compiled),
+        })
+    }
+
+    /// The ladder rungs whose programs aned already holds compiled, judged
+    /// by each rung's last and first layer. Layers are compiled in order
+    /// within one admission, so a cached last layer means the whole shape
+    /// was compiled once; checking every layer would cost about as much as
+    /// loading the shape. A layer that cannot be checked counts as not
+    /// cached, which only predicts a compile.
+    pub fn cached_rungs(&self) -> Vec<usize> {
+        ane::autoreleasepool(|_| {
+            self.cached_rungs_with(|_, _, graph| {
+                graph.compiled_program_exists().map_err(Into::into)
+            })
+        })
+    }
+
+    /// [`Model::cached_rungs`] with aned's answer for one layer (given the
+    /// shape, the layer and its graph) as a parameter, so tests can stand
+    /// in for aned.
+    fn cached_rungs_with(
+        &self,
+        mut exists: impl FnMut(usize, usize, &Graph) -> Result<bool>,
+    ) -> Vec<usize> {
+        let layers = self.profile.n("num_hidden_layers");
+        let mut cached = |shape: usize, layer: usize| {
+            self.layer_graph(shape, layer)
+                .and_then(|graph| exists(shape, layer, &graph))
+                .unwrap_or(false)
+        };
+        LADDER
+            .iter()
+            .copied()
+            .filter(|&shape| layers > 0 && cached(shape, layers - 1) && cached(shape, 0))
+            .collect()
     }
     #[cfg(test)]
     fn admit_with_compiler(
@@ -2044,6 +2093,43 @@ mod layer_program_tests {
                 .unwrap(),
             identifier
         );
+    }
+
+    #[test]
+    fn loaded_reports_the_cached_ladder_rungs() {
+        // Layer 0's weights stand in for the last layer too, so both
+        // layers a rung is checked on can be built.
+        let mut model = synthetic_gte_model(1);
+        let last = model.profile.n("num_hidden_layers") - 1;
+        let first_layer = format!("{}layers.0.", model.profile.prefix());
+        let last_layer = format!("{}layers.{last}.", model.profile.prefix());
+        let copies: Vec<(String, Vec<f32>)> = model
+            .tensors
+            .iter()
+            .filter(|(name, _)| name.starts_with(&first_layer))
+            .map(|(name, values)| (name.replacen(&first_layer, &last_layer, 1), values.clone()))
+            .collect();
+        model.tensors.extend(copies);
+        let mut asked = Vec::new();
+        let cached = model.cached_rungs_with(|shape, layer, _| {
+            asked.push((shape, layer));
+            Ok(match shape {
+                128 | 1024 => true,
+                256 => layer == 0,
+                512 => layer == last,
+                _ => false,
+            })
+        });
+        assert_eq!(cached, vec![128, 1024]);
+        assert!(
+            asked.iter().all(|(_, layer)| *layer == 0 || *layer == last),
+            "{asked:?}"
+        );
+        assert!(asked.contains(&(512, 0)), "{asked:?}");
+        // A layer that cannot be checked counts as not cached.
+        assert!(model
+            .cached_rungs_with(|_, _, _| Err(anyhow::anyhow!("no answer")))
+            .is_empty());
     }
 
     #[test]

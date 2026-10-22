@@ -260,6 +260,16 @@ fn request_loop<S: Read + Write>(
                     let dims = model.profile.model["output"]["dimension"]
                         .as_u64()
                         .context("model_unsupported")? as usize;
+                    // Which rungs aned already holds compiled, so the module
+                    // predicts a fast load for them instead of a compile.
+                    let check_started = Instant::now();
+                    let cached = model.cached_rungs();
+                    // The module logs each worker stderr line at INFO.
+                    eprintln!(
+                        "ane-direct compile cache check: model_ref={model_ref} cached={cached:?} checked={} total_ms={:.1}",
+                        crate::backend::LADDER.len(),
+                        check_started.elapsed().as_secs_f64() * 1000.0
+                    );
                     models.insert(model_ref.clone(), model);
                     (
                         WorkerResponse::Loaded {
@@ -268,6 +278,7 @@ fn request_loop<S: Read + Write>(
                             dims,
                             cold_load_ms: start.elapsed().as_millis() as u64,
                             buckets: Some(crate::backend::LADDER.to_vec()),
+                            ane_cached_shapes: Some(cached),
                         },
                         None,
                     )
@@ -284,13 +295,21 @@ fn request_loop<S: Read + Write>(
                         already || models.values().map(|m| m.resident.len()).sum::<usize>() < 8,
                         "ane_residency_limit"
                     );
-                    let inventory = models
+                    let admission = models
                         .get_mut(&model_ref)
                         .context("model_not_loaded")?
                         .admit_progress(shape, &os_build()?, &mut || {
                             progress(WorkerProgressPhase::Setup)
                         })?;
-                    (WorkerResponse::Admitted { req_id, inventory }, None)
+                    (
+                        WorkerResponse::Admitted {
+                            req_id,
+                            inventory: admission.inventory,
+                            cache_hit_layers: Some(admission.cache_hit_layers),
+                            compiled_layers: Some(admission.compiled_layers),
+                        },
+                        None,
+                    )
                 }
                 WorkerRequest::AneAdmitPacked {
                     req_id,
@@ -318,7 +337,15 @@ fn request_loop<S: Read + Write>(
                             .collect(),
                         cpu_stages: vec!["embedding_gather".into(), "final_rms_l2".into()],
                     };
-                    (WorkerResponse::Admitted { req_id, inventory }, None)
+                    (
+                        WorkerResponse::Admitted {
+                            req_id,
+                            inventory,
+                            cache_hit_layers: None,
+                            compiled_layers: None,
+                        },
+                        None,
+                    )
                 }
                 WorkerRequest::AneEvictPacked {
                     req_id,

@@ -144,6 +144,7 @@ fn run_worker<S: Read + Write>(
                         dims: embed_dims,
                         cold_load_ms: load_sleep_ms,
                         buckets: buckets.clone(),
+                        ane_cached_shapes: None,
                     },
                     max_frame,
                 )?;

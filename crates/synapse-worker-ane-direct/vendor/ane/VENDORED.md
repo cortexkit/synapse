@@ -79,6 +79,12 @@ Local compatibility changes:
   without compiling. The `client::tests` unit tests cover the hit, miss,
   failed-hit, resource-refused hit and refused-compile sequences with a
   stand-in program.
+- Local modification, not upstream behaviour: `client::compiled_program_exists`
+  and `Graph::compiled_program_exists` build a graph's program sources and
+  ask `compiledModelExists` the same way `client::compile_network` does
+  before it loads, without compiling, loading or writing anything. The
+  worker uses it while loading a model to report which ladder rungs aned
+  already holds compiled, so the module can predict a fast load for them.
 
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).

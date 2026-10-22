@@ -1,0 +1,619 @@
+[[control]]
+id = "ane-cache-load-prediction"
+guards = "A shape the worker reported in aned's compile cache is predicted at its load cost, so a request is not refused early for a compile that will not happen"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "                Some(load) => load,"
+new = "                Some(_) => self.compile_estimate(key, seed), // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::cached_shape_is_predicted_at_load_cost_and_not_refused_early"]
+expect_message = "a cached shape was refused"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-miss-reprice"
+guards = "An admission predicted as a cached load that runs well past it is repriced as the compile it has become"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "Some(compile) if self.missed_load_at(dispatched) <= now => {"
+new = "Some(compile) if false && self.missed_load_at(dispatched) <= now => { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::cached_load_that_compiles_is_repriced_as_a_compile"]
+expect_message = "re-checked at the miss"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-miss-wake"
+guards = "Requests accepted on a load prediction are re-checked at the moment that load counts as missed, not only at their deadline"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            .chain(misses)"
+new = "            .chain(misses.filter(|_| false)) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::cached_load_that_compiles_is_repriced_as_a_compile"]
+expect_message = "re-checked at the miss"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-load-learning"
+guards = "A shape loaded wholly from aned's cache is learned as a load, never as a compile or into the machine factor"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """                (_, 0) => {
+                    self.measured_loads
+                        .insert((key.model_ref.clone(), key.shape), took);
+                }"""
+new = """                (_, 0) => self.learn(key, seed, took), // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::cached_loads_do_not_change_the_machine_factor",
+    "worker_host::ane_residency::tests::cached_shape_is_predicted_at_load_cost_and_not_refused_early",
+]
+expect_message = "the load was not learned as a load"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-older-worker"
+guards = "A worker that does not report where admitted layers came from keeps compile predictions and compile learning"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "            let Some(origins) = origins else {"
+new = "            let Some(origins) = origins.or(Some(AdmissionOrigins { cache_hit_layers: 1, compiled_layers: 0 })) else { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::learning_ignores_the_stream_wait_before_dispatch",
+    "worker_host::ane_residency::tests::machine_factor_corrects_unseen_shape_predictions",
+    "worker_host::ane_residency::tests::older_worker_without_cache_fields_keeps_full_compile_predictions",
+    "worker_host::ane_residency::tests::queued_entries_are_repriced_after_learning",
+]
+expect_message = "machine_factor.is_some()"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-yields-to-requests"
+guards = "A prewarm admission never starts while a request waits or a compile entry is queued, even inside its gathering window"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """            let queue_idle =
+                self.waiters.is_empty() && state.entries.is_empty() && !state.compile_running();"""
+new = """            let queue_idle = !state.compile_running(); // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_waits_for_a_request_in_its_gathering_window"]
+expect_message = "the request started before the prewarm"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-free-budget"
+guards = "Prewarm uses only free executable budget and skips what does not fit instead of evicting"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """                                && state.reserved_executables().saturating_add(*executables)
+                                    <= inner.executable_budget"""
+new = """                                && true // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_skips_what_the_free_budget_cannot_hold_and_evicts_nothing"]
+expect_message = "left: [128, 256, 512]"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-resource-refusal"
+guards = "A prewarm admission refused for lack of Neural Engine resources gives up instead of evicting a resident shape and retrying"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                if prewarm && error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) && !retry =>"
+new = "                if false && prewarm && error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) && !retry => // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_refused_for_resources_evicts_nothing"]
+expect_message = "a refused prewarm evicted a shape to retry"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-retire-cancels"
+guards = "Retiring a worker (lane unload or Neural Engine pause) drops the rest of its prewarm"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                    if let Some(prewarm) = self.prewarms.remove(&id) {"
+new = "                    if let Some(prewarm) = None::<Prewarm> { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_stops_when_the_lane_retires"]
+expect_message = "left: [128,"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-once-per-worker"
+guards = "A worker's lane is prewarmed once; a repeated readiness signal loads nothing again"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "self.prewarmed.insert(id.clone())"
+new = "{ self.prewarmed.insert(id.clone()); true } /* NON-VACUITY BREAK */"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_loads_cached_shapes_without_compiling"]
+expect_message = "right: 3"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-not-withdrawn-with-a-joiner"
+guards = "A prewarm admission is not withdrawn when a request that joined it is cancelled"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = ".filter(|slot| slot.state == SlotState::Admitting && !slot.prewarm)"
+new = ".filter(|slot| slot.state == SlotState::Admitting) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_admission_stays_when_a_joined_request_is_cancelled"]
+expect_message = "withdrawn with the request that joined it"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-not-withdrawn-after-a-lapsed-promise"
+guards = "A prewarm admission is not withdrawn when a promise a joined request was given lapses"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """                            && slot.state == SlotState::Admitting
+                            && !slot.prewarm"""
+new = """                            && slot.state == SlotState::Admitting // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::prewarm_admission_stays_after_a_joined_request_promise_lapses"]
+expect_message = "withdrawn when the promise lapsed"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-scheduler-admits-packed-preparation"
+guards = "Packed preparation is not turned away by the scheduler because a background prewarm admission runs on its worker"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                            || (slot.state == SlotState::Admitting && !slot.prewarm))"
+new = "                            || slot.state == SlotState::Admitting) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up",
+]
+expect_message = "packed preparation gave up behind a prewarm admission"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-preparation-possible"
+guards = "Packed preparation is not skipped up front because a background prewarm admission runs on its worker"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "                    && (slot.leases != 0 || (slot.state == SlotState::Admitting && !slot.prewarm))"
+new = "                    && (slot.leases != 0 || slot.state == SlotState::Admitting) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "tests::tight_packing_admission_contention_keeps_resident_single_deadline_shape_compiling",
+    "tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch",
+    "tests::tight_packing_qualification_mismatch_disables_only_packing",
+    "tests::tight_packing_unpinned_lane_stays_standalone_and_over_width_rows_fall_back",
+    "tests::tight_packing_waits_for_cancelled_request_drain_before_preparation",
+]
+expect_message = "finished"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-preparation-waits-for-prewarm"
+guards = "Packed preparation waits for a running prewarm admission instead of giving up behind it"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                if only_prepare && !state.only_prewarm_running() {"
+new = "                if only_prepare { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up",
+]
+expect_message = "packed preparation gave up behind a prewarm admission"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-fields-omitted-when-absent"
+guards = "ADMITTED without cache counts encodes exactly as before the fields existed"
+file = "crates/synapse-core/src/worker_protocol.rs"
+old = """        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compiled_layers: Option<u32>,"""
+new = """        compiled_layers: Option<u32>, // NON-VACUITY BREAK"""
+test_file = "crates/synapse-core/src/worker_protocol.rs"
+runner = "nextest"
+package = "synapse-core"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_protocol::tests::ane_shape_messages_round_trip_without_raw_frames",
+    "worker_protocol::tests::cache_fields_are_optional_in_both_directions",
+]
+expect_message = "compiled_layers"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-worker-decoding-ignores-unknown-fields"
+guards = "A worker accepts HELLO acknowledgements carrying fields it does not know, so a newer module can add optional ones"
+file = "crates/synapse-core/src/worker_protocol.rs"
+old = """#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerHelloAck {"""
+new = """#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)] // NON-VACUITY BREAK
+pub struct WorkerHelloAck {"""
+test_file = "crates/synapse-core/src/worker_protocol.rs"
+runner = "nextest"
+package = "synapse-core"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_protocol::tests::worker_side_decoding_ignores_unknown_fields",
+    "worker_transport::unix::tests::non_owned_workers_pass_a_bound_host_with_both_fields_absent",
+]
+expect_message = "unknown field"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-worker-cache-check-last-layer"
+guards = "LOAD reports a rung cached only when aned holds both its last and its first layer"
+file = "crates/synapse-worker-ane-direct/src/backend.rs"
+old = ".filter(|&shape| layers > 0 && cached(shape, layers - 1) && cached(shape, 0))"
+new = ".filter(|&shape| layers > 0 && cached(shape, 0)) // NON-VACUITY BREAK"
+test_file = "crates/synapse-worker-ane-direct/src/backend.rs"
+runner = "cargo"
+package = "synapse-worker-ane-direct"
+target = "--bin ck-synapse-worker-ane-direct"
+select = "expected"
+expect_red = ["backend::layer_program_tests::loaded_reports_the_cached_ladder_rungs"]
+expect_message = "right: [128, 1024]"
+only = false
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+desk_only = "The direct-ANE backend compiles only on macOS; CI has no Apple runner for it. Replay the first-layer-only cache check on a Mac."
+
+[[control]]
+id = "ane-worker-cache-check-error-not-cached"
+guards = "A rung whose cache check fails counts as not cached, which only predicts a compile"
+file = "crates/synapse-worker-ane-direct/src/backend.rs"
+old = "                .unwrap_or(false)"
+new = "                .unwrap_or(true) // NON-VACUITY BREAK"
+test_file = "crates/synapse-worker-ane-direct/src/backend.rs"
+runner = "cargo"
+package = "synapse-worker-ane-direct"
+target = "--bin ck-synapse-worker-ane-direct"
+select = "expected"
+expect_red = ["backend::layer_program_tests::loaded_reports_the_cached_ladder_rungs"]
+expect_message = "cached_rungs_with"
+only = false
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+desk_only = "The direct-ANE backend compiles only on macOS; CI has no Apple runner for it. Replay the cache check that treats errors as cached on a Mac."
+
+[[control]]
+id = "ane-prewarm-waits-for-serving-lane"
+guards = "A prewarm admission does not start while its lane holds a lease or a request is between its handoff answer and its lease"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                let serving = state.worker_serving(&id);"
+new = "                let serving = false; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::joined_request_runs_its_inference_before_the_next_prewarm",
+    "worker_host::ane_residency::tests::resident_shape_inference_holds_off_prewarm",
+]
+expect_message = "a second prewarm admission started"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-membership-counts-as-serving"
+guards = "A request between its handoff answer and its lease keeps background prewarm off its worker"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """            self.live_members.contains_key(worker_id)
+                ||"""
+new = """            false // NON-VACUITY BREAK
+                ||"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::joined_request_runs_its_inference_before_the_next_prewarm",
+]
+expect_message = "a second prewarm admission started"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-waits-for-stream"
+guards = "A prewarm admission does not start while the worker stream is in use"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                let stream_busy = !prewarm.worker.stream_idle();"
+new = "                let stream_busy = false; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::prewarm_resumes_after_a_recovery_releases_its_admission",
+    "worker_host::ane_residency::tests::resident_shape_inference_holds_off_prewarm",
+]
+expect_message = "prewarm started while the worker stream was in use"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-stream-recheck"
+guards = "A prewarm held back only by a busy stream looks again by itself"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            .chain(self.prewarm_recheck)"
+new = "            .chain(self.prewarm_recheck.filter(|_| false)) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::resident_shape_inference_holds_off_prewarm",
+]
+expect_message = "prewarm did not start once the stream was free"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-requeue-after-recovery"
+guards = "A prewarm admission whose slot a recovery released is loaded again on the restarted worker"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            prewarm.pending.push_front(shape);"
+new = "            let _ = shape; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::prewarm_resumes_after_a_recovery_releases_its_admission",
+]
+expect_message = "did not load its interrupted shape again"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-definite-error-no-restart"
+guards = "A worker refusal of a prewarm admission ends the prewarm without restarting the worker"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            Err(error @ AneResidencyError::WorkerErr { .. }) if prewarm => {"
+new = "            Err(error @ AneResidencyError::WorkerErr { .. }) if false && prewarm => { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::definite_prewarm_failure_ends_the_prewarm_without_a_restart",
+]
+expect_message = "restarted the lane's worker"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-retire-withdraws"
+guards = "Retiring a worker withdraws a prewarm admission that has not reached it, so unload and pause do not wait for it"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """                    for task in undispatched {
+                        self.op_guards.remove(&task);
+                    }"""
+new = "                    let _ = undispatched; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::retirement_withdraws_an_undispatched_prewarm_admission",
+]
+expect_message = "retirement waited for a prewarm admission"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-budget-reclaimable"
+guards = "Budget held by a running prewarm admission counts as reclaimable for packed preparation"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "                        || (slot.state == SlotState::Admitting && slot.prewarm))"
+new = "                        || false) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_budget_a_prewarm_admission_holds",
+]
+expect_message = "the prewarm's budget is about to be reclaimable"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-preparation-waits-for-budget"
+guards = "Packed preparation waits for budget a running prewarm admission holds instead of giving up"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """            if only_prepare && state.only_prewarm_running() {
+                return;
+            }"""
+new = "            // NON-VACUITY BREAK: preparation gives up behind prewarm-held budget"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_budget_a_prewarm_admission_holds",
+]
+expect_message = "gave up behind budget a prewarm admission holds"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-prewarm-notifies-admission-end"
+guards = "The end of each prewarm admission is reported, so packed preparation can try again"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            effects.notifications.push(notify.clone());"
+new = "            let _ = notify; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_budget_a_prewarm_admission_holds",
+]
+expect_message = "right: 2"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-check-fence"
+guards = "A cache check that began before an admission completed does not overwrite what that admission saw"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                            .is_some_and(|learned| *learned > checked_at)"
+new = "                            .is_some_and(|_| false) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::late_cache_check_does_not_overwrite_a_newer_admission",
+]
+expect_message = "an older cache check overwrote"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-cache-mixed-not-learned"
+guards = "An admission with both cached and compiled layers is learned as neither a load nor a compile"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """                (0, _) => self.learn(key, seed, took),
+                _ => {}"""
+new = """                (0, _) => self.learn(key, seed, took),
+                _ => self.learn(key, seed, took), // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_host::ane_residency::tests::mixed_origin_admission_is_learned_as_neither",
+]
+expect_message = "learned as a compile"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-worker-response-ignores-unknown-fields"
+guards = "The module accepts LOADED and ADMITTED replies carrying fields it does not know, so workers can add optional ones"
+file = "crates/synapse-core/src/worker_protocol.rs"
+old = """#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerResponse {"""
+new = """#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)] // NON-VACUITY BREAK
+pub enum WorkerResponse {"""
+test_file = "crates/synapse-core/src/worker_protocol.rs"
+runner = "nextest"
+package = "synapse-core"
+target = "--lib"
+select = "expected"
+expect_red = [
+    "worker_protocol::tests::worker_response_ignores_unknown_extension_fields",
+]
+expect_message = "unknown field"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

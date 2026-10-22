@@ -993,6 +993,7 @@ impl WorkerHost {
                     dims,
                     cold_load_ms,
                     buckets,
+                    ..
                 },
                 _,
             )) => {
@@ -3329,6 +3330,7 @@ mod tests {
                         dims: 0,
                         cold_load_ms: 0,
                         buckets: None,
+                        ane_cached_shapes: None,
                     },
                     None,
                 ),
@@ -4111,6 +4113,20 @@ pub mod ane_residency {
         ) -> std::time::Duration {
             pinned_compile_cost_seed(model_ref, shape, layers)
         }
+        /// Expected time to load `shape` from aned's compiled copy when aned
+        /// already holds its programs: building and hashing each layer's
+        /// program on the CPU, then aned's load. Used only for shapes the
+        /// worker reported cached; zero means unknown, and such shapes are
+        /// predicted as a compile.
+        fn load_cost_seed(
+            &self,
+            model_ref: &str,
+            shape: usize,
+            layers: usize,
+        ) -> std::time::Duration {
+            let _ = model_ref;
+            seed_load_cost(layers, shape)
+        }
         fn admit_shape_at_generation<'a>(
             &'a self,
             generation: u64,
@@ -4229,6 +4245,56 @@ pub mod ane_residency {
         std::time::Duration::from_secs_f64(per_layer * layers as f64)
     }
 
+    /// Seconds per layer to load a program aned already holds compiled, by
+    /// ladder width, rounded up. Most of it is CPU work in the worker: on an
+    /// M5 Max, building one Qwen3 layer's graph and computing aned's
+    /// identifier for it took 56–67 ms up to width 2048, 97 ms at 4096 and
+    /// 191 ms at 8192. aned's own load added 3.5–45 ms per layer on an M6
+    /// mini. Measured loads replace these values.
+    const SEED_LOAD_SECONDS_PER_LAYER: [(usize, f64); 3] =
+        [(2048, 0.10), (4096, 0.15), (8192, 0.30)];
+
+    /// `layers` times the per-layer load time for `width`, interpolated
+    /// linearly between the table's widths and clamped at both ends.
+    fn seed_load_cost(layers: usize, width: usize) -> std::time::Duration {
+        let row = &SEED_LOAD_SECONDS_PER_LAYER;
+        let per_layer = match row.iter().position(|(rung, _)| *rung >= width) {
+            Some(0) => row[0].1,
+            None => row[row.len() - 1].1,
+            Some(upper) => {
+                let (low_width, low) = row[upper - 1];
+                let (high_width, high) = row[upper];
+                let fraction = (width - low_width) as f64 / (high_width - low_width) as f64;
+                low + (high - low) * fraction
+            }
+        };
+        std::time::Duration::from_secs_f64(per_layer * layers as f64)
+    }
+
+    /// An admission predicted as a cached load that runs longer than twice
+    /// that prediction plus this grace is treated as the compile it has
+    /// evidently become: aned no longer held the program, or its copy
+    /// failed to load and the worker compiles it.
+    const CACHED_LOAD_MISS_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// How many of an admitted shape's layers the worker loaded from aned's
+    /// compiled copy and how many it compiled, as reported in `ADMITTED`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct AdmissionOrigins {
+        pub cache_hit_layers: u32,
+        pub compiled_layers: u32,
+    }
+
+    /// The ladder rungs a newly ready direct-ANE catalog lane loads in the
+    /// background, at the lowest priority, so the common short lengths are
+    /// usually resident before requests need them. They are loaded only while
+    /// no request waits and only into free budget.
+    pub const ANE_PREWARM_SHAPES: [usize; 3] = [128, 256, 512];
+
+    /// Called by the compile scheduler after a prewarm admission ends and
+    /// when a lane's prewarm ends, outside its state lock.
+    pub type PrewarmNotify = Arc<dyn Fn() + Send + Sync>;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct AneResidencyLimits {
         pub per_model: usize,
@@ -4317,6 +4383,9 @@ pub mod ane_residency {
         /// and the worker's seed estimate for it.
         compile_cost: std::time::Duration,
         compile_seed: std::time::Duration,
+        /// The worker's load estimate, kept so a withdrawn compile is queued
+        /// again with it.
+        load_seed: std::time::Duration,
         /// The queue entry this compile came from, so an admission withdrawn
         /// before it reached the worker can be queued again in its old place.
         queued_as: Option<QueuedPlace>,
@@ -4328,6 +4397,13 @@ pub mod ane_residency {
         promise: Option<(tokio::time::Instant, std::time::Duration)>,
         /// When the compile's admission reached the worker.
         dispatched_at: Option<tokio::time::Instant>,
+        /// Set when `compile_cost` is a cached load's: the compile estimate
+        /// the admission is repriced to if it runs well past that load.
+        miss_cost: Option<std::time::Duration>,
+        /// A background prewarm admission, which nobody asked for: it is
+        /// never withdrawn for a request that left, and a refusal for lack
+        /// of Neural Engine resources ends it without evicting anything.
+        prewarm: bool,
     }
 
     /// Where a compile stood in the queue: its creation order and start key.
@@ -4359,13 +4435,26 @@ pub mod ane_residency {
             let layer = self.compile_cost / layers;
             match (self.state, self.dispatched_at) {
                 (SlotState::Admitting, None) => self.compile_cost,
-                (SlotState::Admitting, Some(dispatched)) => self
-                    .compile_cost
-                    .saturating_sub(now.saturating_duration_since(dispatched))
-                    .max(layer),
+                (SlotState::Admitting, Some(dispatched)) => {
+                    let elapsed = now.saturating_duration_since(dispatched);
+                    match self.miss_cost {
+                        // Predicted as a cached load but still running long
+                        // after it: aned is compiling, so count the compile.
+                        Some(compile) if self.missed_load_at(dispatched) <= now => {
+                            compile.saturating_sub(elapsed).max(compile / layers)
+                        }
+                        _ => self.compile_cost.saturating_sub(elapsed).max(layer),
+                    }
+                }
                 (SlotState::Failed, _) => layer,
                 _ => std::time::Duration::ZERO,
             }
+        }
+
+        /// When an admission predicted as a cached load and dispatched at
+        /// `dispatched` is taken to have turned into a compile.
+        fn missed_load_at(&self, dispatched: tokio::time::Instant) -> tokio::time::Instant {
+            dispatched + self.compile_cost * 2 + CACHED_LOAD_MISS_GRACE
         }
     }
 
@@ -4388,6 +4477,9 @@ pub mod ane_residency {
         /// entry queued before the first measured compile is repriced once
         /// the machine factor is known; only `start_key` stays fixed.
         seed: std::time::Duration,
+        /// The worker's load estimate, used instead of `seed` while the shape
+        /// is known to be in aned's compile cache.
+        load_seed: std::time::Duration,
         worker: Arc<dyn AneShapeWorker>,
         executables: usize,
         /// When the last request waiting for this entry left, and the retry
@@ -4463,6 +4555,21 @@ pub mod ane_residency {
         /// Moving average of measured compile time over the worker's seed
         /// estimate, so a slower machine corrects shapes not measured yet.
         machine_factor: Option<f64>,
+        /// Whether aned holds a shape's compiled programs, per (model, shape):
+        /// filled from the worker's `LOADED` report and set after every
+        /// admission the worker reported. Absent means unknown, predicted as
+        /// a compile.
+        cached: BTreeMap<(String, usize), bool>,
+        /// When an admission last showed each (model, shape) cached in aned,
+        /// so a cache check that began earlier does not overwrite it.
+        cached_learned_at: BTreeMap<(String, usize), tokio::time::Instant>,
+        /// Requests answered with a handoff membership that have not leased
+        /// or left yet, per worker.
+        live_members: BTreeMap<String, u32>,
+        /// Measured time to load a shape from aned's compiled copy, per
+        /// (model, shape). Kept apart from compile times, and never used for
+        /// the machine factor.
+        measured_loads: BTreeMap<(String, usize), std::time::Duration>,
         // Kept outside residency slots so eviction and confirmed-exit recovery
         // cannot erase certification evidence. Disabled supervisors retain nothing.
         inventory_sink: Option<Vec<Arc<AnePlacementInventory>>>,
@@ -4518,9 +4625,49 @@ pub mod ane_residency {
             self.recovering.contains(worker_id)
         }
 
+        /// Predicted admission time of `key`: a load from aned's compiled copy
+        /// when the shape is known to be cached there, a compile otherwise.
+        fn estimate(
+            &self,
+            key: &ShapeKey,
+            seed: std::time::Duration,
+            load_seed: std::time::Duration,
+        ) -> std::time::Duration {
+            match self.load_estimate(key, seed, load_seed) {
+                Some(load) => load,
+                None => self.compile_estimate(key, seed),
+            }
+        }
+
+        /// The predicted cached load of `key`, when aned is known to hold its
+        /// programs and both costs are known: what it took last time, else
+        /// the worker's load seed.
+        fn load_estimate(
+            &self,
+            key: &ShapeKey,
+            seed: std::time::Duration,
+            load_seed: std::time::Duration,
+        ) -> Option<std::time::Duration> {
+            let cached = key.program == AneProgram::Single
+                && self.cached.get(&(key.model_ref.clone(), key.shape)) == Some(&true);
+            if !cached || seed.is_zero() || load_seed.is_zero() {
+                return None;
+            }
+            Some(
+                self.measured_loads
+                    .get(&(key.model_ref.clone(), key.shape))
+                    .copied()
+                    .unwrap_or(load_seed),
+            )
+        }
+
         /// Predicted compile time of `key`: what it took last time on this
         /// machine, else the worker's seed scaled by the machine factor.
-        fn estimate(&self, key: &ShapeKey, seed: std::time::Duration) -> std::time::Duration {
+        fn compile_estimate(
+            &self,
+            key: &ShapeKey,
+            seed: std::time::Duration,
+        ) -> std::time::Duration {
             if seed.is_zero() {
                 return seed;
             }
@@ -4531,6 +4678,47 @@ pub mod ane_residency {
                 return *measured;
             }
             seed.mul_f64(self.machine_factor.unwrap_or(1.0))
+        }
+
+        /// Records a finished admission so later predictions use it, measured
+        /// from the moment it reached the worker. With the worker's report of
+        /// where each layer came from, an admission that loaded every layer
+        /// from aned's cache is learned as that shape's load time, one that
+        /// compiled every layer as a compile, and a mix as neither; the shape
+        /// is cached afterwards either way. Without the report (an older
+        /// worker), every admission is learned as a compile, as before.
+        fn learn_admission(
+            &mut self,
+            key: &ShapeKey,
+            seed: std::time::Duration,
+            took: Option<std::time::Duration>,
+            origins: Option<AdmissionOrigins>,
+            finished: tokio::time::Instant,
+        ) {
+            let Some(origins) = origins else {
+                if let Some(took) = took {
+                    self.learn(key, seed, took);
+                }
+                return;
+            };
+            if key.program != AneProgram::Single {
+                return;
+            }
+            self.cached.insert((key.model_ref.clone(), key.shape), true);
+            self.cached_learned_at
+                .insert((key.model_ref.clone(), key.shape), finished);
+            let Some(took) = took.filter(|took| !took.is_zero()) else {
+                return;
+            };
+            match (origins.cache_hit_layers, origins.compiled_layers) {
+                (0, 0) => {}
+                (_, 0) => {
+                    self.measured_loads
+                        .insert((key.model_ref.clone(), key.shape), took);
+                }
+                (0, _) => self.learn(key, seed, took),
+                _ => {}
+            }
         }
 
         /// Records a standalone compile so later predictions use it. Only
@@ -4557,6 +4745,30 @@ pub mod ane_residency {
             self.slots
                 .values()
                 .any(|slot| matches!(slot.state, SlotState::Admitting | SlotState::Failed))
+        }
+
+        /// Whether the compile gate is held only by a background prewarm
+        /// admission.
+        fn only_prewarm_running(&self) -> bool {
+            let mut running = self
+                .slots
+                .values()
+                .filter(|slot| matches!(slot.state, SlotState::Admitting | SlotState::Failed))
+                .peekable();
+            running.peek().is_some() && running.all(|slot| slot.prewarm)
+        }
+
+        /// Whether `worker_id`'s lane is serving: a shape of it is leased,
+        /// or a request answered with a handoff membership has not leased or
+        /// left yet. A member keeps its membership from that answer until it
+        /// leases or leaves, so an open handoff cohort with a member still to
+        /// lease always counts here.
+        fn worker_serving(&self, worker_id: &str) -> bool {
+            self.live_members.contains_key(worker_id)
+                || self
+                    .slots
+                    .values()
+                    .any(|slot| slot.worker.worker_id() == worker_id && slot.leases != 0)
         }
 
         fn running_remaining(&self, now: tokio::time::Instant) -> std::time::Duration {
@@ -4601,9 +4813,13 @@ pub mod ane_residency {
                 .filter(|(other, queued)| {
                     queued.order() < entry.order() && !self.worker_unavailable(&other.worker_id)
                 })
-                .map(|(other, queued)| self.estimate(other, queued.seed))
+                .map(|(other, queued)| self.estimate(other, queued.seed, queued.load_seed))
                 .sum();
-            Some(now + self.running_remaining(now) + ahead + self.estimate(key, entry.seed))
+            Some(
+                now + self.running_remaining(now)
+                    + ahead
+                    + self.estimate(key, entry.seed, entry.load_seed),
+            )
         }
 
         /// The shape freed to retry an admission the worker refused for lack
@@ -4652,7 +4868,7 @@ pub mod ane_residency {
             let mut placed: Vec<((tokio::time::Instant, u64), std::time::Duration)> = Vec::new();
             for key in keys {
                 let entry = &self.entries[&key];
-                let cost = self.estimate(&key, entry.seed);
+                let cost = self.estimate(&key, entry.seed, entry.load_seed);
                 let mut order = entry.order();
                 let mut others: Vec<(ShapeKey, (tokio::time::Instant, u64))> = self
                     .entries
@@ -4701,7 +4917,8 @@ pub mod ane_residency {
             now: tokio::time::Instant,
         ) {
             let seed = worker.compile_cost_seed(&key.model_ref, key.shape, executables);
-            let cost = self.estimate(key, seed);
+            let load_seed = worker.load_cost_seed(&key.model_ref, key.shape, executables);
+            let cost = self.estimate(key, seed, load_seed);
             let mut start_key = now + cost;
             let mut queued: Vec<_> = self.entries.iter().collect();
             queued.sort_by_key(|(_, entry)| entry.order());
@@ -4725,6 +4942,7 @@ pub mod ane_residency {
                     enqueued_at: now,
                     start_key,
                     seed,
+                    load_seed,
                     worker: worker.clone(),
                     executables,
                     promise: None,
@@ -4922,16 +5140,42 @@ pub mod ane_residency {
         id: u64,
     }
 
+    impl CohortMembership {
+        /// A membership for request `id`, counted against its worker until it
+        /// is dropped (the request leased, or left), so background prewarm
+        /// does not take the worker stream while a member is on its way from
+        /// its answer to its lease. Call with the state lock held.
+        fn new(inner: &Arc<Inner>, state: &mut State, key: &ShapeKey, id: u64) -> Self {
+            *state.live_members.entry(key.worker_id.clone()).or_default() += 1;
+            Self {
+                inner: inner.clone(),
+                key: key.clone(),
+                id,
+            }
+        }
+    }
+
     impl Drop for CohortMembership {
         fn drop(&mut self) {
-            let emptied = {
+            let wake = {
                 let mut state = self.inner.lock();
-                state
+                let emptied = state
                     .slots
                     .get_mut(&self.key)
-                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty())
+                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty());
+                let last_member = match state.live_members.get_mut(&self.key.worker_id) {
+                    Some(count) => {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    }
+                    None => false,
+                };
+                if last_member {
+                    state.live_members.remove(&self.key.worker_id);
+                }
+                emptied || last_member
             };
-            if emptied {
+            if wake {
                 self.inner.nudge();
             }
         }
@@ -5163,6 +5407,51 @@ pub mod ane_residency {
                 let _ = done.await;
             }
             result
+        }
+
+        /// Records what a worker's `LOAD` found in aned's compile cache: of the
+        /// `checked` rungs of `model_ref`, those in `cached` load from aned's
+        /// compiled copy and are predicted as loads, the others as compiles.
+        /// `checked_at` is when the check began (before `LOAD` was sent). For a
+        /// rung an admission found cached after that instant, the admission's
+        /// result is kept instead of this check's.
+        pub fn record_compile_cache(
+            &self,
+            model_ref: &str,
+            checked: &[usize],
+            cached: &[usize],
+            checked_at: tokio::time::Instant,
+        ) -> Result<(), AneResidencyError> {
+            self.inner.send(scheduler::Msg::CacheKnown {
+                model_ref: model_ref.to_owned(),
+                checked: checked.to_vec(),
+                cached: cached.to_vec(),
+                checked_at,
+            })
+        }
+
+        /// Loads `shapes` of `model_ref` on `worker` in the background, at the
+        /// lowest priority: one at a time, only while no request waits, never
+        /// evicting and only within the free budget. Retiring the worker
+        /// cancels what has not started. `lane` names the lane in the log line
+        /// written when the prewarm ends. `notify` is called after each
+        /// prewarm admission ends and when the prewarm finishes, but not when
+        /// retirement cancels it. A worker is prewarmed at most once.
+        pub fn prewarm(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+            lane: &str,
+            shapes: &[usize],
+            notify: Option<PrewarmNotify>,
+        ) -> Result<(), AneResidencyError> {
+            self.inner.send(scheduler::Msg::Prewarm {
+                worker: worker.clone(),
+                model_ref: model_ref.to_owned(),
+                lane: lane.to_owned(),
+                shapes: shapes.to_vec(),
+                notify,
+            })
         }
 
         pub fn limits(&self) -> AneResidencyLimits {
@@ -5438,9 +5727,11 @@ pub mod ane_residency {
             {
                 return false;
             }
+            // A background prewarm admission does not hold preparation off:
+            // preparation outranks it (see the scheduler's `admit_want`).
             if state.slots.values().any(|slot| {
                 slot.worker.worker_id() == worker.worker_id()
-                    && (slot.leases != 0 || slot.state == SlotState::Admitting)
+                    && (slot.leases != 0 || (slot.state == SlotState::Admitting && !slot.prewarm))
             }) {
                 return false;
             }
@@ -5448,7 +5739,11 @@ pub mod ane_residency {
                 .slots
                 .values()
                 .filter(|slot| {
-                    slot.state == SlotState::Resident
+                    // A running prewarm admission counts too: its shape is
+                    // unleased and evictable as soon as it is resident, and
+                    // the scheduler makes preparation wait for that.
+                    (slot.state == SlotState::Resident
+                        || (slot.state == SlotState::Admitting && slot.prewarm))
                         && slot.leases == 0
                         && !state.recovering.contains(slot.worker.worker_id())
                 })
@@ -6608,9 +6903,21 @@ pub mod ane_residency {
                         WorkerResponse::Admitted {
                             req_id: got,
                             inventory,
+                            cache_hit_layers,
+                            compiled_layers,
                         },
                         _,
-                    ) if got == req_id => Ok(inventory),
+                    ) if got == req_id => {
+                        if let (Some(cache_hit_layers), Some(compiled_layers)) =
+                            (cache_hit_layers, compiled_layers)
+                        {
+                            scheduler::report_admission_origins(AdmissionOrigins {
+                                cache_hit_layers,
+                                compiled_layers,
+                            });
+                        }
+                        Ok(inventory)
+                    }
                     (WorkerResponse::Err { code, msg, .. }, _) => {
                         Err(AneResidencyError::WorkerErr { code, msg })
                     }
@@ -6658,6 +6965,7 @@ pub mod ane_residency {
                         WorkerResponse::Admitted {
                             req_id: got,
                             inventory,
+                            ..
                         },
                         _,
                     ) if got == req_id => Ok(inventory),
@@ -7054,6 +7362,9 @@ pub mod ane_residency {
                 runtime_config: runtime_config.values.clone(),
             };
             let loaded = runtime.block_on(async {
+                // The worker checks aned's cache while it loads; any admission
+                // that completes after this instant saw the cache later.
+                let check_started = tokio::time::Instant::now();
                 let (response, _) =
                     tokio::time::timeout(load_timeout, channel.exchange(&request, None))
                         .await
@@ -7066,19 +7377,33 @@ pub mod ane_residency {
                         model_ref,
                         dims,
                         buckets: Some(buckets),
+                        ane_cached_shapes,
                         ..
-                    } if request.req_id() == Some(req_id.as_str()) => AneServing::new(
-                        channel.clone(),
-                        supervisor.clone(),
-                        AneServingMetadata {
-                            model_ref,
-                            buckets,
-                            dims,
-                            pooling,
-                            normalize,
-                            timeout,
-                        },
-                    ),
+                    } if request.req_id() == Some(req_id.as_str()) => {
+                        // A worker that checked aned's compile cache reports
+                        // the cached rungs; one that did not leaves them all
+                        // unknown, which predicts compiles as before.
+                        if let Some(cached) = &ane_cached_shapes {
+                            supervisor.record_compile_cache(
+                                &model_ref,
+                                &buckets,
+                                cached,
+                                check_started,
+                            )?;
+                        }
+                        AneServing::new(
+                            channel.clone(),
+                            supervisor.clone(),
+                            AneServingMetadata {
+                                model_ref,
+                                buckets,
+                                dims,
+                                pooling,
+                                normalize,
+                                timeout,
+                            },
+                        )
+                    }
                     WorkerResponse::Err { code, msg, .. } => {
                         Err(AneResidencyError::WorkerErr { code, msg })
                     }
@@ -7147,6 +7472,16 @@ pub mod ane_residency {
                 .as_ref()
                 .expect("live ANE runtime")
                 .block_on(self.serving.retire())
+        }
+
+        /// Starts the background prewarm of this lane's common short shapes;
+        /// see [`AneServing::prewarm`].
+        pub fn prewarm(
+            &self,
+            lane: &str,
+            notify: Option<PrewarmNotify>,
+        ) -> Result<(), AneResidencyError> {
+            self.serving.prewarm(lane, notify)
         }
     }
 
@@ -7263,6 +7598,24 @@ pub mod ane_residency {
             self.supervisor
                 .retire(&worker, self.channel.shutdown())
                 .await
+        }
+
+        /// Asks the supervisor to load [`ANE_PREWARM_SHAPES`] of this lane's
+        /// ladder in the background, at the lowest priority. Call it once the
+        /// lane is ready (its self-check passed), so the check never waits
+        /// behind a prewarm admission.
+        pub fn prewarm(
+            &self,
+            lane: &str,
+            notify: Option<PrewarmNotify>,
+        ) -> Result<(), AneResidencyError> {
+            let shapes: Vec<usize> = ANE_PREWARM_SHAPES
+                .into_iter()
+                .filter(|shape| self.metadata.buckets.contains(shape))
+                .collect();
+            let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
+            self.supervisor
+                .prewarm(&worker, &self.metadata.model_ref, lane, &shapes, notify)
         }
 
         pub async fn infer(
@@ -9324,6 +9677,7 @@ pub mod ane_residency {
                                 dims: if direct_profile.is_some() { 1 } else { 4 },
                                 cold_load_ms: 0,
                                 buckets: direct_profile.map(|_| ANE_SHAPE_LADDER.to_vec()),
+                                ane_cached_shapes: None,
                             },
                             None,
                         )
@@ -9394,6 +9748,8 @@ pub mod ane_residency {
                                 WorkerResponse::Admitted {
                                     req_id: req_id.clone(),
                                     inventory,
+                                    cache_hit_layers: None,
+                                    compiled_layers: None,
                                 },
                                 None,
                             )
@@ -9654,6 +10010,8 @@ pub mod ane_residency {
                                     WorkerResponse::Admitted {
                                         req_id: req_id.clone(),
                                         inventory: packed_inventory("single"),
+                                        cache_hit_layers: None,
+                                        compiled_layers: None,
                                     }
                                 }
                                 WorkerRequest::AneAdmitPacked { req_id, .. } => {
@@ -9669,6 +10027,8 @@ pub mod ane_residency {
                                         WorkerResponse::Admitted {
                                             req_id: req_id.clone(),
                                             inventory: packed_inventory("packed"),
+                                            cache_hit_layers: None,
+                                            compiled_layers: None,
                                         }
                                     }
                                 }
@@ -10635,6 +10995,7 @@ pub mod ane_residency {
         include!("admission_tests.rs");
         include!("compile_queue_tests.rs");
         include!("compile_queue_fault_tests.rs");
+        include!("compile_cache_prewarm_tests.rs");
 
         #[tokio::test]
         async fn executable_budget_refuses_before_hardware_limit() {

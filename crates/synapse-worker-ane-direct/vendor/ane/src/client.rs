@@ -127,6 +127,18 @@ pub fn program_identifier(graph: &Graph) -> Result<Option<String>, Error> {
     Ok(model.hex_string_identifier().map(|id| id.to_string()))
 }
 
+/// Whether aned already holds this graph's compiled program, asked the same
+/// way [`compile_network`] asks before it decides to load instead of
+/// compiling. Nothing is compiled, loaded or written. Building the program's
+/// sources and identifier is CPU work proportional to the layer's weights.
+pub fn compiled_program_exists(graph: &Graph) -> Result<bool, Error> {
+    ensure_framework()?;
+    let sources = ProgramSources::new(graph)?;
+    let model =
+        ANEInMemoryModel::with_descriptor(&sources.descriptor).ok_or(Error::ModelCreation)?;
+    Ok(model.compiled_model_exists())
+}
+
 /// One layer program's MIL text and packed weights, and the in-memory model
 /// descriptor built from them.
 struct ProgramSources {

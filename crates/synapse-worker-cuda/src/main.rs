@@ -502,6 +502,7 @@ fn handle_load_with_probe(
             dims,
             cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             buckets: None,
+            ane_cached_shapes: None,
         }
     }
 }
