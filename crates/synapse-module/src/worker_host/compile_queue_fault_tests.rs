@@ -1738,3 +1738,49 @@ fn dedicated_scheduler_ends_when_the_supervisor_drops() {
         "the scheduler's thread outlived its supervisor"
     );
 }
+
+/// A confirmation of the old process's exit handled after the restart's
+/// completion has already reopened the worker (the completion can be taken
+/// before queued messages) releases only the old process's slots: a compile
+/// the replacement started meanwhile keeps its slot and the gate.
+#[tokio::test(start_paused = true)]
+async fn late_exit_confirmation_does_not_release_the_replacement_slots() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let old_generation = worker.generation();
+    assert!(supervisor.recover(&worker_dyn).await.is_ok());
+    assert!(worker.generation() > old_generation);
+    // The replacement starts a compile, held once it reached the worker.
+    let (reached, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *worker.admit_gate.lock().unwrap() = Some((reached.clone(), release.clone()));
+    let compile = ask_at(&supervisor, &compiler, &worker_dyn, QUEUE_GTE, 128, compiler.now(), None);
+    reached.notified().await;
+    // The old process's confirmation arrives only now.
+    supervisor
+        .inner
+        .send(scheduler::Msg::ExitConfirmed {
+            worker_id: "worker".into(),
+            generation: old_generation,
+        })
+        .unwrap();
+    supervisor.inner.nudge();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let state = supervisor.inner.lock();
+        assert!(
+            state
+                .slots
+                .get(&queue_key("worker", QUEUE_GTE, 128))
+                .is_some_and(|slot| slot.state == SlotState::Admitting),
+            "a late exit confirmation removed the replacement's compiling slot"
+        );
+        assert!(state.compile_running(), "the gate opened mid-compile");
+        assert_eq!(state.reserved_executables(), 22);
+    }
+    release.notify_one();
+    assert!(compile.await.unwrap().ok());
+}

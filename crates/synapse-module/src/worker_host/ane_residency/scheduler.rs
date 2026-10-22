@@ -304,8 +304,11 @@ enum OpDone {
     },
     Evict(Result<(), AneResidencyError>),
     /// `exited`: the old process's exit was confirmed during the restart. It
-    /// is also reported early by `Msg::ExitConfirmed`, but the completion
-    /// carries it too, so it does not depend on which one is handled first.
+    /// is also reported early by `Msg::ExitConfirmed`, and the completion
+    /// carries it too, so the release does not wait for that message. Either
+    /// one releases only slots of the old process's generation, so whichever
+    /// comes second (even after the worker reopened and reserved new slots)
+    /// changes nothing.
     Recover {
         result: Result<(), AneResidencyError>,
         exited: bool,
@@ -1709,7 +1712,10 @@ impl Scheduler {
                 recovery.exit_confirmed = true;
             }
         }
-        release_exited_worker(state, worker_id);
+        // Fenced by generation: a late or repeated confirmation (handled after
+        // the restart's completion reopened the worker) must not remove the
+        // replacement's slots.
+        release_exited_worker(state, worker_id, generation);
         tracing::debug!(target: "worker", worker_id, "direct-ANE worker exit confirmed; its slots are released");
     }
 
@@ -1911,7 +1917,8 @@ impl Scheduler {
                         if let Some(recovery) = self.recoveries.get_mut(&worker_id) {
                             if !recovery.exit_confirmed {
                                 recovery.exit_confirmed = true;
-                                release_exited_worker(&mut state, &worker_id);
+                                let generation = recovery.generation;
+                                release_exited_worker(&mut state, &worker_id, generation);
                             }
                         }
                     }
@@ -2301,7 +2308,7 @@ impl Scheduler {
                 tracing::warn!(target: "worker", worker_id, error = %error, "direct-ANE worker restart failed after the old process exited");
                 // Only the replacement failed. The old process's slots are
                 // gone with it, and a later request can recover the worker.
-                release_exited_worker(state, worker_id);
+                release_exited_worker(state, worker_id, recovery.generation);
                 state.rejoin(worker_id, now);
                 state.recovering.remove(worker_id);
                 self.closed.remove(worker_id);
@@ -2387,13 +2394,15 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Every slot of a worker whose old process has exited is removed and its
+/// Every slot of a worker's process that has exited is removed and its
 /// reservation refunded, whatever its state: nothing of that process can be
-/// compiling, resident or leased any more.
-fn release_exited_worker(state: &mut State, exited: &str) {
+/// compiling, resident or leased any more. Only slots of that process's
+/// generation (or older) go; a replacement's slots are newer, so repeating
+/// the release, or handling it late, removes nothing more.
+fn release_exited_worker(state: &mut State, exited: &str, generation: u64) {
     state
         .slots
-        .retain(|_, slot| slot.worker.worker_id() != exited);
+        .retain(|_, slot| slot.worker.worker_id() != exited || slot.generation > generation);
 }
 
 /// Stops a worker whose process's exit cannot be confirmed from holding the

@@ -161,8 +161,8 @@ build_timeout_s = 1800
 id = "ane-compile-queue-no-ghost-slots"
 guards = "After a confirmed exit every slot of the old process is removed, whatever its state, even when the replacement fails"
 file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
-old = "        .retain(|_, slot| slot.worker.worker_id() != exited);"
-new = "        .retain(|_, slot| slot.worker.worker_id() != exited || matches!(slot.state, SlotState::Resident | SlotState::Evicting)); // NON-VACUITY BREAK"
+old = "        .retain(|_, slot| slot.worker.worker_id() != exited || slot.generation > generation);"
+new = "        .retain(|_, slot| slot.worker.worker_id() != exited || slot.generation > generation || matches!(slot.state, SlotState::Resident | SlotState::Evicting)); // NON-VACUITY BREAK"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
 runner = "nextest"
 package = "synapse-module"
@@ -271,6 +271,23 @@ target = "--lib"
 select = "expected"
 expect_red = ["worker_host::ane_residency::tests::recovery_panic_before_exit_keeps_the_gate_for_the_grace"]
 expect_message = "a panicked recovery released the gate before the grace ended"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-exit-release-fenced-by-generation"
+guards = "A late or repeated exit confirmation releases only the old process's slots, not a replacement's compiling slot"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "        .retain(|_, slot| slot.worker.worker_id() != exited || slot.generation > generation);"
+new = "        .retain(|_, slot| slot.worker.worker_id() != exited || generation == u64::MAX); // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::late_exit_confirmation_does_not_release_the_replacement_slots"]
+expect_message = "a late exit confirmation removed the replacement's compiling slot"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
