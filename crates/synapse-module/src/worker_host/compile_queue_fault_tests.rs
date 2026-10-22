@@ -1115,6 +1115,50 @@ async fn recovered_entries_rejoin_behind_accepted_bounds() {
     assert!(running_answer.await.unwrap().ok());
 }
 
+/// Two compiles of a recovering worker that each alone would fit ahead of an
+/// accepted bound, but not together, rejoin so that the bound still holds:
+/// the second goes behind the accepted request.
+#[tokio::test(start_paused = true)]
+async fn recovered_entries_rejoin_cumulatively_behind_accepted_bounds() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let running = fake_worker(&compiler, "running");
+    let recovering = fake_handle(&compiler, "recovering");
+    let (restarting, finish) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *recovering.restart_gate.lock().unwrap() = Some((restarting.clone(), finish.clone()));
+    let recovering_dyn: Arc<dyn AneShapeWorker> = recovering.clone();
+    let accepted = fake_worker(&compiler, "accepted");
+    // Qwen3@2048 runs until 41.72 s.
+    let running_answer = ask_at(&supervisor, &compiler, &running, QUEUE_QWEN, 2048, 0.0, None);
+    // GTE@128 (4.62 s, start key 5.62 s) and GTE@512 (8.14 s, start key
+    // 9.64 s) queue, then their worker recovers.
+    let small = ask_at(&supervisor, &compiler, &recovering_dyn, QUEUE_GTE, 128, 1.0, None);
+    let medium = ask_at(&supervisor, &compiler, &recovering_dyn, QUEUE_GTE, 512, 1.5, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(2)).await;
+    let recovery = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = recovering_dyn.clone();
+        async move { supervisor.recover(&worker).await.is_ok() }
+    });
+    restarting.notified().await;
+    // GTE@2048 (18.92 s, start key 21.92 s) is ready at 60.64 s with neither
+    // rejoining compile ahead, 65.26 s or 68.78 s with one, and 73.4 s with
+    // both. Its bound is 70 s.
+    let bound_respected =
+        ask_at(&supervisor, &compiler, &accepted, QUEUE_GTE, 2048, 3.0, Some(67.0));
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(10)).await;
+    finish.notify_one();
+    assert!(recovery.await.unwrap());
+    let bound_respected = bound_respected.await.unwrap();
+    assert!(
+        bound_respected.ok(),
+        "two rejoining compiles together broke an accepted bound: {bound_respected:?}"
+    );
+    assert!(small.await.unwrap().ok());
+    assert!(medium.await.unwrap().ok());
+    assert!(running_answer.await.unwrap().ok());
+}
+
 /// The running compile is predicted from the moment its admission reached
 /// the worker, not from its reservation, so a long wait for the worker's
 /// stream does not make it look almost finished.

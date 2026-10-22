@@ -4635,15 +4635,21 @@ pub mod ane_residency {
         /// A worker's queued compiles rejoin the queue when its recovery
         /// ends. They keep their start keys, but, like a newcomer, one is moved
         /// behind any queued compile whose accepted bound it would otherwise
-        /// break. Call while the worker is still marked recovering, so the
-        /// predictions it checks do not count these entries yet.
+        /// break. The returning compiles are placed together, in their order:
+        /// each one is checked with the cost of those already placed ahead of
+        /// the same compile, so several cannot together break a bound that
+        /// each alone would keep. Call while the worker is still marked
+        /// recovering, so the predictions it checks do not count these
+        /// entries yet.
         fn rejoin(&mut self, worker_id: &str, now: tokio::time::Instant) {
-            let keys: Vec<ShapeKey> = self
+            let mut keys: Vec<ShapeKey> = self
                 .entries
                 .keys()
                 .filter(|key| key.worker_id == worker_id)
                 .cloned()
                 .collect();
+            keys.sort_by_key(|key| self.entries[key].order());
+            let mut placed: Vec<((tokio::time::Instant, u64), std::time::Duration)> = Vec::new();
             for key in keys {
                 let entry = &self.entries[&key];
                 let cost = self.estimate(&key, entry.seed);
@@ -4663,7 +4669,12 @@ pub mod ane_residency {
                     let promised = self.entry_bound(&other);
                     let ready = self.predicted_ready(&other, now);
                     if let (Some(bound), Some(ready)) = (promised, ready) {
-                        if ready + cost > bound {
+                        let returned_ahead: std::time::Duration = placed
+                            .iter()
+                            .filter(|(placed_order, _)| *placed_order < other_order)
+                            .map(|(_, placed_cost)| *placed_cost)
+                            .sum();
+                        if ready + returned_ahead + cost > bound {
                             self.next_entry += 1;
                             order = (other_order.0, self.next_entry);
                             moved = true;
@@ -4675,6 +4686,7 @@ pub mod ane_residency {
                     entry.start_key = order.0;
                     entry.seq = order.1;
                 }
+                placed.push((order, cost));
             }
         }
 
