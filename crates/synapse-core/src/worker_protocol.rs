@@ -1211,6 +1211,43 @@ mod tests {
         assert_eq!(serde_json::to_value(&decoded).unwrap(), older_admitted);
     }
 
+    /// The module decodes worker replies with this crate's `WorkerResponse`,
+    /// so a newer worker may add optional fields to `LOADED` and `ADMITTED`
+    /// only while that type ignores fields it does not know.
+    #[test]
+    fn worker_response_ignores_unknown_extension_fields() {
+        let loaded = serde_json::json!({
+            "type": "LOADED", "req_id": "load-1", "model_ref": "m", "dims": 8,
+            "cold_load_ms": 1, "buckets": [128], "ane_cached_shapes": [128],
+            "added_later": {"nested": true},
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(loaded).unwrap(),
+            WorkerResponse::Loaded {
+                req_id: "load-1".into(),
+                model_ref: "m".into(),
+                dims: 8,
+                cold_load_ms: 1,
+                buckets: Some(vec![128]),
+                ane_cached_shapes: Some(vec![128]),
+            }
+        );
+        let admitted = serde_json::json!({
+            "type": "ADMITTED", "req_id": "admit-1",
+            "inventory": { "executables": [], "cpu_stages": [] },
+            "cache_hit_layers": 28, "compiled_layers": 0, "added_later": 1,
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(admitted).unwrap(),
+            WorkerResponse::Admitted {
+                req_id: "admit-1".into(),
+                inventory: AnePlacementInventory::default(),
+                cache_hit_layers: Some(28),
+                compiled_layers: Some(0),
+            }
+        );
+    }
+
     /// A worker built from this crate must keep accepting requests from a
     /// newer module that adds optional fields the same way, so neither the
     /// requests nor HELLO's acknowledgement refuse fields they do not know.

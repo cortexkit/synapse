@@ -4291,6 +4291,10 @@ pub mod ane_residency {
     /// no request waits and only into free budget.
     pub const ANE_PREWARM_SHAPES: [usize; 3] = [128, 256, 512];
 
+    /// Called by the compile scheduler after a prewarm admission ends and
+    /// when a lane's prewarm ends, outside its state lock.
+    pub type PrewarmNotify = Arc<dyn Fn() + Send + Sync>;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct AneResidencyLimits {
         pub per_model: usize,
@@ -4556,6 +4560,12 @@ pub mod ane_residency {
         /// admission the worker reported. Absent means unknown, predicted as
         /// a compile.
         cached: BTreeMap<(String, usize), bool>,
+        /// When an admission last showed each (model, shape) cached in aned,
+        /// so a cache check that began earlier does not overwrite it.
+        cached_learned_at: BTreeMap<(String, usize), tokio::time::Instant>,
+        /// Requests answered with a handoff membership that have not leased
+        /// or left yet, per worker.
+        live_members: BTreeMap<String, u32>,
         /// Measured time to load a shape from aned's compiled copy, per
         /// (model, shape). Kept apart from compile times, and never used for
         /// the machine factor.
@@ -4683,6 +4693,7 @@ pub mod ane_residency {
             seed: std::time::Duration,
             took: Option<std::time::Duration>,
             origins: Option<AdmissionOrigins>,
+            finished: tokio::time::Instant,
         ) {
             let Some(origins) = origins else {
                 if let Some(took) = took {
@@ -4694,6 +4705,8 @@ pub mod ane_residency {
                 return;
             }
             self.cached.insert((key.model_ref.clone(), key.shape), true);
+            self.cached_learned_at
+                .insert((key.model_ref.clone(), key.shape), finished);
             let Some(took) = took.filter(|took| !took.is_zero()) else {
                 return;
             };
@@ -4743,6 +4756,19 @@ pub mod ane_residency {
                 .filter(|slot| matches!(slot.state, SlotState::Admitting | SlotState::Failed))
                 .peekable();
             running.peek().is_some() && running.all(|slot| slot.prewarm)
+        }
+
+        /// Whether `worker_id`'s lane is serving: a shape of it is leased,
+        /// or a request answered with a handoff membership has not leased or
+        /// left yet. A member keeps its membership from that answer until it
+        /// leases or leaves, so an open handoff cohort with a member still to
+        /// lease always counts here.
+        fn worker_serving(&self, worker_id: &str) -> bool {
+            self.live_members.contains_key(worker_id)
+                || self
+                    .slots
+                    .values()
+                    .any(|slot| slot.worker.worker_id() == worker_id && slot.leases != 0)
         }
 
         fn running_remaining(&self, now: tokio::time::Instant) -> std::time::Duration {
@@ -5114,16 +5140,42 @@ pub mod ane_residency {
         id: u64,
     }
 
+    impl CohortMembership {
+        /// A membership for request `id`, counted against its worker until it
+        /// is dropped (the request leased, or left), so background prewarm
+        /// does not take the worker stream while a member is on its way from
+        /// its answer to its lease. Call with the state lock held.
+        fn new(inner: &Arc<Inner>, state: &mut State, key: &ShapeKey, id: u64) -> Self {
+            *state.live_members.entry(key.worker_id.clone()).or_default() += 1;
+            Self {
+                inner: inner.clone(),
+                key: key.clone(),
+                id,
+            }
+        }
+    }
+
     impl Drop for CohortMembership {
         fn drop(&mut self) {
-            let emptied = {
+            let wake = {
                 let mut state = self.inner.lock();
-                state
+                let emptied = state
                     .slots
                     .get_mut(&self.key)
-                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty())
+                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty());
+                let last_member = match state.live_members.get_mut(&self.key.worker_id) {
+                    Some(count) => {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    }
+                    None => false,
+                };
+                if last_member {
+                    state.live_members.remove(&self.key.worker_id);
+                }
+                emptied || last_member
             };
-            if emptied {
+            if wake {
                 self.inner.nudge();
             }
         }
@@ -5360,16 +5412,20 @@ pub mod ane_residency {
         /// Records what a worker's `LOAD` found in aned's compile cache: of the
         /// `checked` rungs of `model_ref`, those in `cached` load from aned's
         /// compiled copy and are predicted as loads, the others as compiles.
+        /// `checked_at` is when the check began (before `LOAD` was sent); a
+        /// rung an admission found cached after that instant keeps that.
         pub fn record_compile_cache(
             &self,
             model_ref: &str,
             checked: &[usize],
             cached: &[usize],
+            checked_at: tokio::time::Instant,
         ) -> Result<(), AneResidencyError> {
             self.inner.send(scheduler::Msg::CacheKnown {
                 model_ref: model_ref.to_owned(),
                 checked: checked.to_vec(),
                 cached: cached.to_vec(),
+                checked_at,
             })
         }
 
@@ -5377,19 +5433,23 @@ pub mod ane_residency {
         /// lowest priority: one at a time, only while no request waits, never
         /// evicting and only within the free budget. Retiring the worker
         /// cancels what has not started. `lane` names the lane in the log line
-        /// written when the prewarm ends. A worker is prewarmed at most once.
+        /// written when the prewarm ends. `notify` is called after each
+        /// prewarm admission ends and when the prewarm ends. A worker is
+        /// prewarmed at most once.
         pub fn prewarm(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
             lane: &str,
             shapes: &[usize],
+            notify: Option<PrewarmNotify>,
         ) -> Result<(), AneResidencyError> {
             self.inner.send(scheduler::Msg::Prewarm {
                 worker: worker.clone(),
                 model_ref: model_ref.to_owned(),
                 lane: lane.to_owned(),
                 shapes: shapes.to_vec(),
+                notify,
             })
         }
 
@@ -5678,7 +5738,11 @@ pub mod ane_residency {
                 .slots
                 .values()
                 .filter(|slot| {
-                    slot.state == SlotState::Resident
+                    // A running prewarm admission counts too: its shape is
+                    // unleased and evictable as soon as it is resident, and
+                    // the scheduler makes preparation wait for that.
+                    (slot.state == SlotState::Resident
+                        || (slot.state == SlotState::Admitting && slot.prewarm))
                         && slot.leases == 0
                         && !state.recovering.contains(slot.worker.worker_id())
                 })
@@ -7297,6 +7361,9 @@ pub mod ane_residency {
                 runtime_config: runtime_config.values.clone(),
             };
             let loaded = runtime.block_on(async {
+                // The worker checks aned's cache while it loads; any admission
+                // that completes after this instant saw the cache later.
+                let check_started = tokio::time::Instant::now();
                 let (response, _) =
                     tokio::time::timeout(load_timeout, channel.exchange(&request, None))
                         .await
@@ -7316,7 +7383,12 @@ pub mod ane_residency {
                         // the cached rungs; one that did not leaves them all
                         // unknown, which predicts compiles as before.
                         if let Some(cached) = &ane_cached_shapes {
-                            supervisor.record_compile_cache(&model_ref, &buckets, cached)?;
+                            supervisor.record_compile_cache(
+                                &model_ref,
+                                &buckets,
+                                cached,
+                                check_started,
+                            )?;
                         }
                         AneServing::new(
                             channel.clone(),
@@ -7403,8 +7475,12 @@ pub mod ane_residency {
 
         /// Starts the background prewarm of this lane's common short shapes;
         /// see [`AneServing::prewarm`].
-        pub fn prewarm(&self, lane: &str) -> Result<(), AneResidencyError> {
-            self.serving.prewarm(lane)
+        pub fn prewarm(
+            &self,
+            lane: &str,
+            notify: Option<PrewarmNotify>,
+        ) -> Result<(), AneResidencyError> {
+            self.serving.prewarm(lane, notify)
         }
     }
 
@@ -7514,14 +7590,18 @@ pub mod ane_residency {
         /// ladder in the background, at the lowest priority. Call it once the
         /// lane is ready (its self-check passed), so the check never waits
         /// behind a prewarm admission.
-        pub fn prewarm(&self, lane: &str) -> Result<(), AneResidencyError> {
+        pub fn prewarm(
+            &self,
+            lane: &str,
+            notify: Option<PrewarmNotify>,
+        ) -> Result<(), AneResidencyError> {
             let shapes: Vec<usize> = ANE_PREWARM_SHAPES
                 .into_iter()
                 .filter(|shape| self.metadata.buckets.contains(shape))
                 .collect();
             let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
             self.supervisor
-                .prewarm(&worker, &self.metadata.model_ref, lane, &shapes)
+                .prewarm(&worker, &self.metadata.model_ref, lane, &shapes, notify)
         }
 
         pub async fn infer(

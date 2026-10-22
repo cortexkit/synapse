@@ -40,7 +40,7 @@ async fn cached_shape_is_predicted_at_load_cost_and_not_refused_early() {
     let handle = caching_worker(&compiler, "qwen", QUEUE_QWEN, &[4096]);
     let worker: Arc<dyn AneShapeWorker> = handle.clone();
     supervisor
-        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[4096])
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[4096], tokio::time::Instant::now())
         .unwrap();
     // Predicted as a compile, Qwen3@4096 takes about 84.6 s and a 30 s
     // deadline is refused at once. aned holds it, so it loads in about 1.7 s.
@@ -70,7 +70,7 @@ async fn cached_load_that_compiles_is_repriced_as_a_compile() {
     let wide: Arc<dyn AneShapeWorker> = wide;
     let small = fake_worker(&compiler, "small");
     supervisor
-        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[4096])
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[4096], tokio::time::Instant::now())
         .unwrap();
     let wide_answer = ask_at(&supervisor, &compiler, &wide, QUEUE_QWEN, 4096, 0.0, None);
     // Asked while the load prediction (4.2 s) still holds: accepted, then
@@ -117,7 +117,7 @@ async fn cached_loads_do_not_change_the_machine_factor() {
     let worker: Arc<dyn AneShapeWorker> =
         caching_worker(&compiler, "qwen", QUEUE_QWEN, &[128, 256, 512]);
     supervisor
-        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[128, 256, 512])
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[128, 256, 512], tokio::time::Instant::now())
         .unwrap();
     for (index, shape) in [128, 256, 512].into_iter().enumerate() {
         let answer = ask_at(
@@ -189,11 +189,11 @@ async fn prewarm_never_delays_a_queued_request() {
     let first = ask_at(&supervisor, &compiler, &lane, QUEUE_QWEN, 2048, 0.0, None);
     tokio::time::sleep_until(compiler.epoch + Duration::from_secs(1)).await;
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     // A second readiness signal for the same worker starts nothing more.
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     let request = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 2.0, None);
     assert!(first.await.unwrap().ok());
@@ -239,7 +239,7 @@ async fn prewarm_waits_for_a_request_in_its_gathering_window() {
     let request = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 0.0, None);
     tokio::time::sleep_until(compiler.epoch + Duration::from_millis(10)).await;
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None)
         .unwrap();
     let request = request.await.unwrap();
     assert!(request.ok());
@@ -264,7 +264,7 @@ async fn prewarm_skips_what_the_free_budget_cannot_hold_and_evicts_nothing() {
     let leased = supervisor.lease_until(&gte, QUEUE_GTE, 128, None).await.unwrap();
     drop(supervisor.lease_until(&gte, QUEUE_GTE, 512, None).await.unwrap());
     supervisor
-        .prewarm(&qwen, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&qwen, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(120)).await;
     let prewarmed: Vec<_> = compiler
@@ -293,7 +293,7 @@ async fn prewarm_refused_for_resources_evicts_nothing() {
     drop(supervisor.lease_until(&gte, QUEUE_GTE, 512, None).await.unwrap());
     qwen_handle.exhaust_next_admit.store(true, Ordering::SeqCst);
     supervisor
-        .prewarm(&qwen, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&qwen, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(120)).await;
     assert!(
@@ -312,7 +312,7 @@ async fn prewarm_stops_when_the_lane_retires() {
     let supervisor = queue_supervisor();
     let lane = fake_worker(&compiler, "lane");
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(compiler.compiles_of("lane").len(), 1, "prewarm did not start");
@@ -334,7 +334,7 @@ async fn prewarm_stops_when_the_lane_retires() {
     assert!(supervisor.inner.lock().slots.is_empty());
     // A retired worker is not prewarmed again.
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(120)).await;
     assert_eq!(compiler.compiles_of("lane").len(), 1);
@@ -347,10 +347,10 @@ async fn prewarm_loads_cached_shapes_without_compiling() {
     let handle = caching_worker(&compiler, "lane", QUEUE_QWEN, &[128, 256, 512]);
     let lane: Arc<dyn AneShapeWorker> = handle.clone();
     supervisor
-        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[128, 256, 512])
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[128, 256, 512], tokio::time::Instant::now())
         .unwrap();
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(compiler.records().is_empty());
@@ -384,7 +384,7 @@ async fn prewarm_loads_cached_shapes_without_compiling() {
     // The lane was prewarmed once; another readiness signal for the same
     // worker loads nothing again.
     supervisor
-        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512], None)
         .unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(handle.cached_loads.lock().unwrap().len(), 3);
@@ -396,11 +396,13 @@ async fn prewarm_admission_stays_when_a_joined_request_is_cancelled() {
     let supervisor = queue_supervisor();
     let handle = fake_handle(&compiler, "lane");
     let lane: Arc<dyn AneShapeWorker> = handle.clone();
-    // A long inference holds the stream, so the prewarm admission has not
-    // reached the worker yet when a request joins it and is cancelled.
-    let stream = handle.stream.lock().await;
-    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
-    settle().await;
+    // The prewarm admission is held before it reaches the worker, so it
+    // could still be withdrawn when a request joins it and is cancelled.
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *handle.pre_wire_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None).unwrap();
+    started.notified().await;
     let joined = {
         let supervisor = supervisor.clone();
         let lane = lane.clone();
@@ -412,7 +414,7 @@ async fn prewarm_admission_stays_when_a_joined_request_is_cancelled() {
     // Make sure the scheduler runs a pass while the admission still waits.
     let _ = supervisor.inner.send(scheduler::Msg::Nudge);
     tokio::time::sleep(Duration::from_secs(1)).await;
-    drop(stream);
+    release.notify_one();
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(
         compiler.compiles_of("lane").len(),
@@ -427,18 +429,20 @@ async fn prewarm_admission_stays_after_a_joined_request_promise_lapses() {
     let supervisor = queue_supervisor();
     let handle = fake_handle(&compiler, "lane");
     let lane: Arc<dyn AneShapeWorker> = handle.clone();
-    let stream = handle.stream.lock().await;
-    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
-    settle().await;
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *handle.pre_wire_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None).unwrap();
+    started.notified().await;
     // Joins the waiting prewarm admission and is answered shape_compiling
     // at its 1 s deadline, which records a promise on the admission.
     let answer = ask_at(&supervisor, &compiler, &lane, QUEUE_QWEN, 128, 0.5, Some(1.0))
         .await
         .unwrap();
     assert_eq!(answer.code.as_deref(), Some(ERR_ANE_SHAPE_COMPILING), "{answer:?}");
-    // Long after twice that promise, the stream frees.
+    // Long after twice that promise, the admission goes on to the worker.
     tokio::time::sleep(Duration::from_secs(60)).await;
-    drop(stream);
+    release.notify_one();
     tokio::time::sleep(Duration::from_secs(30)).await;
     assert_eq!(
         compiler.compiles_of("lane").len(),
@@ -456,7 +460,7 @@ async fn packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up()
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     *handle.admit_gate.lock().unwrap() = Some((started.clone(), release.clone()));
-    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None).unwrap();
     started.notified().await;
     let preparation = {
         let supervisor = supervisor.clone();
@@ -477,4 +481,305 @@ async fn packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up()
         Some("unsupported_request")
     );
     assert_eq!(compiler.compiles_of("lane").len(), 1);
+}
+
+/// Holds `handle`'s next admission once it reaches the worker; returns the
+/// notifications that it started and that releases it.
+fn hold_admission(handle: &FakeCompileWorker) -> (Arc<Notify>, Arc<Notify>) {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *handle.admit_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+    (started, release)
+}
+
+#[tokio::test(start_paused = true)]
+async fn joined_request_runs_its_inference_before_the_next_prewarm() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256], None)
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(compiler.compiles_of("lane").len(), 1, "prewarm 128 did not start");
+    // R asks for 128 while it is being prewarmed, and joins that admission.
+    let request = {
+        let supervisor = supervisor.clone();
+        let lane = lane.clone();
+        tokio::spawn(async move { supervisor.lease_until(&lane, QUEUE_QWEN, 128, None).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Hold R right after its handoff answer, before it leases, while the
+    // scheduler runs well past the handoff.
+    let checked = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    *supervisor.inner.lease_decision_gate.lock().unwrap() = Some((checked.clone(), resume.clone()));
+    checked.notified().await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        compiler.compiles_of("lane").len(),
+        1,
+        "a second prewarm admission started while a request was on its way to its lease"
+    );
+    resume.notify_one();
+    let lease = request.await.unwrap().unwrap();
+    // R's inference takes the worker stream at once: no prewarm holds it.
+    let inference = handle
+        .stream
+        .try_lock()
+        .expect("a prewarm admission holds the stream R's inference needs");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(compiler.compiles_of("lane").len(), 1);
+    drop(inference);
+    drop(lease);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let shapes: Vec<_> = compiler
+        .compiles_of("lane")
+        .iter()
+        .map(|record| record.shape)
+        .collect();
+    assert_eq!(shapes, [128, 256], "prewarm did not resume once R finished");
+}
+
+#[tokio::test(start_paused = true)]
+async fn resident_shape_inference_holds_off_prewarm() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    let lease = supervisor
+        .lease_until(&lane, QUEUE_QWEN, 2048, None)
+        .await
+        .unwrap();
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None)
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        compiler.compiles_of("lane").len(),
+        1,
+        "prewarm started while a resident shape of the lane was leased"
+    );
+    // Stream use without a lease (an exchange still draining) also holds it
+    // off; nothing reports its end, so prewarm looks again by itself.
+    let stream = handle.stream.lock().await;
+    drop(lease);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        compiler.compiles_of("lane").len(),
+        1,
+        "prewarm started while the worker stream was in use"
+    );
+    drop(stream);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let shapes: Vec<_> = compiler
+        .compiles_of("lane")
+        .iter()
+        .map(|record| record.shape)
+        .collect();
+    assert_eq!(shapes, [2048, 128], "prewarm did not start once the stream was free");
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_resumes_after_a_recovery_releases_its_admission() {
+    let compiler = SharedCompiler::new(1.0);
+    // A short drain bound, so the recovery restarts the worker while the
+    // prewarm admission is still held.
+    let supervisor = budget_supervisor(ANE_RESIDENT_EXECUTABLES_TOTAL, Duration::from_secs(5));
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    let (started, release) = hold_admission(&handle);
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256], None)
+        .unwrap();
+    started.notified().await;
+    let recovery = {
+        let supervisor = supervisor.clone();
+        let lane = lane.clone();
+        tokio::spawn(async move { supervisor.recover(&lane).await })
+    };
+    recovery.await.unwrap().unwrap();
+    assert_eq!(handle.restarts.load(Ordering::SeqCst), 1);
+    assert!(
+        supervisor.inner.lock().slots.is_empty(),
+        "the confirmed exit did not release the prewarm admission's slot"
+    );
+    // The old process's admission ends only now, after its slot is gone.
+    release.notify_one();
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let shapes: Vec<_> = compiler
+        .compiles_of("lane")
+        .iter()
+        .map(|record| record.shape)
+        .collect();
+    assert_eq!(
+        shapes,
+        [128, 128, 256],
+        "the prewarm did not load its interrupted shape again and go on"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn definite_prewarm_failure_ends_the_prewarm_without_a_restart() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    handle.fail_next_admit.store(true, Ordering::SeqCst);
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256], None)
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        handle.restarts.load(Ordering::SeqCst),
+        0,
+        "a refused prewarm admission restarted the lane's worker"
+    );
+    assert!(compiler.compiles_of("lane").is_empty(), "the prewarm went on");
+    let state = supervisor.inner.lock();
+    assert!(state.slots.is_empty(), "the refused admission stayed charged");
+    assert!(!state.recovering.contains("lane"));
+    drop(state);
+    // An unknown outcome still restarts the worker: the stream's state is
+    // unknown, as for any admission.
+    let other = fake_handle(&compiler, "other");
+    let other_dyn: Arc<dyn AneShapeWorker> = other.clone();
+    other.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    supervisor
+        .prewarm(&other_dyn, QUEUE_QWEN, "other-lane", &[128], None)
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(other.restarts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retirement_withdraws_an_undispatched_prewarm_admission() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *handle.pre_wire_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], None)
+        .unwrap();
+    started.notified().await;
+    let retired = tokio::time::timeout(
+        Duration::from_secs(5),
+        supervisor.retire(&lane, async { Ok::<(), AneResidencyError>(()) }),
+    )
+    .await;
+    assert!(
+        retired.is_ok(),
+        "retirement waited for a prewarm admission that had not reached the worker"
+    );
+    retired.unwrap().unwrap();
+    release.notify_one();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(compiler.compiles_of("lane").is_empty());
+    assert!(supervisor.inner.lock().slots.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn packed_preparation_waits_for_budget_a_prewarm_admission_holds() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let gte = fake_worker(&compiler, "gte");
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    // Three leased 22-executable shapes elsewhere: 66 of 100.
+    let mut leases = Vec::new();
+    for shape in [128, 512, 2048] {
+        leases.push(supervisor.lease_until(&gte, QUEUE_GTE, shape, None).await.unwrap());
+    }
+    let notified = Arc::new(AtomicU64::new(0));
+    let notify: PrewarmNotify = {
+        let notified = notified.clone();
+        Arc::new(move || {
+            notified.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let (started, release) = hold_admission(&handle);
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128], Some(notify))
+        .unwrap();
+    started.notified().await;
+    // 94 of 100 reserved: a packed program (28) fits once the prewarmed
+    // shape is resident and can be evicted.
+    assert_eq!(supervisor.inner.lock().reserved_executables(), 94);
+    assert!(
+        supervisor.preparation_possible(&lane),
+        "preparation gave up although the prewarm's budget is about to be reclaimable"
+    );
+    let preparation = {
+        let supervisor = supervisor.clone();
+        let lane = lane.clone();
+        tokio::spawn(async move { supervisor.prepare_packed_lease(&lane, QUEUE_QWEN).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !preparation.is_finished(),
+        "packed preparation gave up behind budget a prewarm admission holds"
+    );
+    assert_eq!(notified.load(Ordering::SeqCst), 0);
+    release.notify_one();
+    let prepared = preparation.await.unwrap();
+    // The prewarmed shape was evicted for the packed program, which the
+    // fake worker does not have.
+    assert_eq!(
+        prepared
+            .err()
+            .and_then(|error| error.code().map(str::to_owned))
+            .as_deref(),
+        Some("unsupported_request")
+    );
+    assert_eq!(handle.evicted(), [(QUEUE_QWEN.to_owned(), 128)]);
+    // Notified when the prewarm admission ended and when the prewarm ended.
+    assert_eq!(notified.load(Ordering::SeqCst), 2);
+    drop(leases);
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_cache_check_does_not_overwrite_a_newer_admission() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker: Arc<dyn AneShapeWorker> = caching_worker(&compiler, "qwen", QUEUE_QWEN, &[]);
+    let key = (QUEUE_QWEN.to_owned(), 128);
+    // A LOAD-time check begins, then an admission of 128 finishes, then the
+    // check's report (128 not cached) arrives.
+    let check_began = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(supervisor.lease_until(&worker, QUEUE_QWEN, 128, None).await.unwrap());
+    supervisor
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[], check_began)
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        supervisor.inner.lock().cached.get(&key),
+        Some(&true),
+        "an older cache check overwrote what a later admission saw"
+    );
+    // A check that began after that admission still says what aned holds.
+    supervisor
+        .record_compile_cache(QUEUE_QWEN, &CACHE_LADDER, &[], tokio::time::Instant::now())
+        .unwrap();
+    settle().await;
+    assert_eq!(supervisor.inner.lock().cached.get(&key), Some(&false));
+}
+
+#[tokio::test(start_paused = true)]
+async fn mixed_origin_admission_is_learned_as_neither() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = caching_worker(&compiler, "qwen", QUEUE_QWEN, &[]);
+    handle.mixed_origins.store(true, Ordering::SeqCst);
+    let worker: Arc<dyn AneShapeWorker> = handle.clone();
+    drop(supervisor.lease_until(&worker, QUEUE_QWEN, 128, None).await.unwrap());
+    let state = supervisor.inner.lock();
+    assert!(state.measured_costs.is_empty(), "a mixed admission was learned as a compile");
+    assert!(state.measured_loads.is_empty(), "a mixed admission was learned as a load");
+    assert_eq!(state.machine_factor, None);
+    assert_eq!(state.cached.get(&(QUEUE_QWEN.to_owned(), 128)), Some(&true));
 }

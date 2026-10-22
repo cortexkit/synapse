@@ -136,6 +136,11 @@ struct FakeCompileWorker {
     fail_next_evict: std::sync::atomic::AtomicBool,
     /// Holds the next admission once it has reached the worker.
     admit_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Holds the next admission after it took the stream but before it
+    /// reaches the worker, where withdrawing it still cancels it.
+    pre_wire_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Report every admission as half loaded from the cache, half compiled.
+    mixed_origins: std::sync::atomic::AtomicBool,
     fail_next_restart: std::sync::atomic::AtomicBool,
     exit_unconfirmed: std::sync::atomic::AtomicBool,
     restart_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
@@ -209,6 +214,11 @@ impl AneShapeWorker for FakeCompileWorker {
                     "worker connection requires confirmed-exit restart".into(),
                 ));
             }
+            let pre_wire = self.pre_wire_gate.lock().unwrap().take();
+            if let Some((started, release)) = pre_wire {
+                started.notify_one();
+                cancellable_wait(release.notified()).await?;
+            }
             scheduler::mark_compile_dispatched();
             let held = self.held_supervisor.lock().unwrap().clone();
             if let Some(supervisor) = held {
@@ -270,6 +280,14 @@ impl AneShapeWorker for FakeCompileWorker {
                     cache_hit_layers: 0,
                     compiled_layers: layers as u32,
                 }
+            };
+            let origins = if self.mixed_origins.load(Ordering::SeqCst) {
+                AdmissionOrigins {
+                    cache_hit_layers: layers as u32 / 2,
+                    compiled_layers: layers as u32 - layers as u32 / 2,
+                }
+            } else {
+                origins
             };
             if self.reports_origins.load(Ordering::SeqCst) {
                 scheduler::report_admission_origins(origins);
@@ -358,6 +376,8 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         exhaust_next_admit: Default::default(),
         fail_next_evict: Default::default(),
         admit_gate: Mutex::new(None),
+        pre_wire_gate: Mutex::new(None),
+        mixed_origins: Default::default(),
         fail_next_restart: Default::default(),
         exit_unconfirmed: Default::default(),
         restart_gate: Mutex::new(None),

@@ -38,6 +38,10 @@ pub(super) const EXIT_CONFIRMATION_GIVE_UP: std::time::Duration =
 /// of the one that woke it.
 const MESSAGES_PER_PASS: usize = 64;
 
+/// How soon a pending prewarm looks again at a worker whose stream is in use
+/// with no lease held (nothing reports when such use ends).
+const PREWARM_STREAM_RECHECK: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// A request's admission trace context in tests; empty otherwise.
 #[derive(Clone, Default)]
 pub(super) struct Trace {
@@ -102,6 +106,9 @@ pub(super) enum Msg {
         model_ref: String,
         checked: Vec<usize>,
         cached: Vec<usize>,
+        /// When the check began (before `LOAD` was sent). An admission that
+        /// completed after this instant knows better and is not overwritten.
+        checked_at: tokio::time::Instant,
     },
     /// A direct-ANE catalog lane became ready: load `shapes` of its model in
     /// the background, at the lowest priority. Ignored for a worker whose
@@ -111,6 +118,7 @@ pub(super) enum Msg {
         model_ref: String,
         lane: String,
         shapes: Vec<usize>,
+        notify: Option<PrewarmNotify>,
     },
     #[cfg(test)]
     Evict {
@@ -384,7 +392,13 @@ struct Prewarm {
     lane: String,
     started: tokio::time::Instant,
     pending: VecDeque<usize>,
-    running: Option<usize>,
+    /// The shape being admitted and the id of its slot. A completion is
+    /// matched by slot id, so a stale one never touches a later admission.
+    running: Option<(usize, u64)>,
+    /// Called after each prewarm admission ends and when the prewarm ends,
+    /// so work that waits for the worker to be free (packed preparation)
+    /// can try again.
+    notify: Option<PrewarmNotify>,
     /// Admitted shapes, with where their layers came from when reported.
     loaded: Vec<(usize, Option<AdmissionOrigins>)>,
     /// Shapes already resident (or being admitted for a request).
@@ -394,6 +408,8 @@ struct Prewarm {
     skipped: Vec<usize>,
     /// The admission that failed and ended the prewarm.
     failed: Option<(usize, String)>,
+    /// How often a recovery released the running admission's slot.
+    interrupted: u32,
 }
 
 impl Prewarm {
@@ -471,6 +487,8 @@ struct Effects {
     /// Cohort memberships to drop once the state lock is released (dropping
     /// one locks the state).
     memberships: Vec<CohortMembership>,
+    /// Prewarm notifications, called once the state lock is released.
+    notifications: Vec<PrewarmNotify>,
     progress: bool,
 }
 
@@ -500,6 +518,9 @@ pub(super) struct Scheduler {
     /// Background prewarms by worker id; at most one admission of all of
     /// them runs at a time, and only while no request waits.
     prewarms: BTreeMap<String, Prewarm>,
+    /// When to look again at a prewarm held back only by its worker's busy
+    /// stream.
+    prewarm_recheck: Option<tokio::time::Instant>,
     /// Workers whose lane was already given a prewarm, so a repeated
     /// readiness signal for the same worker starts nothing.
     prewarmed: BTreeSet<String>,
@@ -557,6 +578,7 @@ impl Scheduler {
                 _exit_signal: inner.scheduler_exit_signal.lock().unwrap().clone(),
                 answered: VecDeque::new(),
                 prewarms: BTreeMap::new(),
+                prewarm_recheck: None,
                 prewarmed: BTreeSet::new(),
             },
             tx,
@@ -688,10 +710,35 @@ impl Scheduler {
                     // A retired worker compiles nothing more, so its queued
                     // compiles are dropped at once, promised or not.
                     state.entries.retain(|key, _| key.worker_id != id);
-                    // Its prewarm stops too; an admission already running
-                    // finishes and goes with the worker.
+                    // Its prewarm stops too. A prewarm admission still waiting
+                    // for the worker stream is withdrawn, so unloading or
+                    // pausing the lane never waits for a compile nobody asked
+                    // for; one already on the wire finishes and goes with the
+                    // worker.
                     if let Some(prewarm) = self.prewarms.remove(&id) {
                         prewarm.log("cancelled", now);
+                        if let Some(notify) = prewarm.notify {
+                            effects.notifications.push(notify);
+                        }
+                    }
+                    let undispatched: Vec<tokio::task::Id> = self
+                        .op_kinds
+                        .iter()
+                        .filter(|(_, kind)| match kind {
+                            OpKind::Compile { key, slot_id, .. } => {
+                                key.worker_id == id
+                                    && state.slots.get(key).is_some_and(|slot| {
+                                        slot.id == *slot_id
+                                            && slot.prewarm
+                                            && slot.dispatched_at.is_none()
+                                    })
+                            }
+                            _ => false,
+                        })
+                        .map(|(task, _)| *task)
+                        .collect();
+                    for task in undispatched {
+                        self.op_guards.remove(&task);
                     }
                     self.retirements.insert(
                         id,
@@ -749,11 +796,20 @@ impl Scheduler {
                     model_ref,
                     checked,
                     cached,
+                    checked_at,
                 } => {
                     for shape in checked {
-                        state
-                            .cached
-                            .insert((model_ref.clone(), shape), cached.contains(&shape));
+                        let key = (model_ref.clone(), shape);
+                        // An admission that completed after this check began
+                        // saw aned's cache later than the check did.
+                        if state
+                            .cached_learned_at
+                            .get(&key)
+                            .is_some_and(|learned| *learned > checked_at)
+                        {
+                            continue;
+                        }
+                        state.cached.insert(key, cached.contains(&shape));
                     }
                     effects.progress = true;
                 }
@@ -762,6 +818,7 @@ impl Scheduler {
                     model_ref,
                     lane,
                     shapes,
+                    notify,
                 } => {
                     let id = worker.worker_id().to_owned();
                     if !state.retired.contains(&id) && self.prewarmed.insert(id.clone()) {
@@ -774,10 +831,12 @@ impl Scheduler {
                                 started: now,
                                 pending: shapes.into(),
                                 running: None,
+                                notify,
                                 loaded: Vec::new(),
                                 present: Vec::new(),
                                 skipped: Vec::new(),
                                 failed: None,
+                                interrupted: 0,
                             },
                         );
                         effects.progress = true;
@@ -899,7 +958,12 @@ impl Scheduler {
                     .retirements
                     .values()
                     .any(|retirement| retirement.reply.is_some())
-                || state.slots.values().any(|slot| slot.handing_off(now));
+                || state.slots.values().any(|slot| slot.handing_off(now))
+                // A pending prewarm waits for its worker's leases to end.
+                || self
+                    .prewarms
+                    .values()
+                    .any(|prewarm| prewarm.running.is_none() && !prewarm.pending.is_empty());
             inner.watch_leases.store(watch, Ordering::Release);
         }
         let progress = effects.progress;
@@ -923,6 +987,9 @@ impl Scheduler {
         drop(effects.memberships);
         for sender in effects.units {
             let _ = sender.send(());
+        }
+        for notify in effects.notifications {
+            notify();
         }
     }
 
@@ -1465,6 +1532,12 @@ impl Scheduler {
                 )
             });
         let Some((victim, slot_id, owner, generation)) = victim else {
+            // A running prewarm admission's shape becomes evictable as soon
+            // as it is resident, so preparation waits for it rather than
+            // giving up for lack of budget.
+            if only_prepare && state.only_prewarm_running() {
+                return;
+            }
             if only_prepare {
                 for id in head_waiters {
                     self.answer(state, id, Answer::Ready, effects);
@@ -1990,11 +2063,15 @@ impl Scheduler {
     }
 
     /// Starts the next background prewarm admission, if any lane has one
-    /// pending and nothing else wants the Neural Engine: no request waits or
-    /// is queued, no compile entry exists and the compile gate is free. A
-    /// prewarm admission only uses free budget and free shape slots; the
-    /// first shape that does not fit without evicting ends its lane's
-    /// prewarm. A lane with nothing left to load logs its result.
+    /// pending and nothing else wants the Neural Engine or the lane's worker:
+    /// no request waits or is queued, no compile entry exists, the compile
+    /// gate is free, and the worker has no lease, no open handoff cohort, no
+    /// request between its cohort answer and its lease, and nothing on its
+    /// stream. A prewarm admission holds the worker stream for its whole
+    /// length, so starting one while the lane serves would make that traffic
+    /// wait for it. A prewarm admission only uses free budget and free shape
+    /// slots; the first shape that does not fit without evicting ends its
+    /// lane's prewarm. A lane with nothing left to load logs its result.
     fn drive_prewarms(
         &mut self,
         inner: &Arc<Inner>,
@@ -2002,17 +2079,30 @@ impl Scheduler {
         now: tokio::time::Instant,
         effects: &mut Effects,
     ) {
+        self.prewarm_recheck = None;
         let ids: Vec<String> = self.prewarms.keys().cloned().collect();
         for id in ids {
-            let idle = self.waiters.is_empty()
-                && state.entries.is_empty()
-                && !state.compile_running()
-                && !state.recovering.contains(&id)
-                && !self.closed.contains(&id);
+            self.reconcile_prewarm(state, &id);
+            let queue_idle =
+                self.waiters.is_empty() && state.entries.is_empty() && !state.compile_running();
+            let available = !state.recovering.contains(&id) && !self.closed.contains(&id);
+            let prewarm = &self.prewarms[&id];
+            let wants_start = prewarm.running.is_none() && !prewarm.pending.is_empty();
+            let mut lane_quiet = false;
+            if wants_start && queue_idle && available {
+                let serving = state.worker_serving(&id);
+                let stream_busy = !prewarm.worker.stream_idle();
+                lane_quiet = !serving && !stream_busy;
+                if !serving && stream_busy {
+                    // Nothing reports the end of stream use that holds no
+                    // lease, so look again shortly.
+                    self.prewarm_recheck = Some(now + PREWARM_STREAM_RECHECK);
+                }
+            }
             let start = {
                 let prewarm = self.prewarms.get_mut(&id).expect("listed above");
                 let mut start = None;
-                while idle && prewarm.running.is_none() {
+                while lane_quiet && start.is_none() {
                     let Some(&shape) = prewarm.pending.front() else {
                         break;
                     };
@@ -2042,7 +2132,6 @@ impl Scheduler {
                         break;
                     };
                     prewarm.pending.pop_front();
-                    prewarm.running = Some(shape);
                     start = Some((key, worker, executables));
                 }
                 start
@@ -2052,6 +2141,9 @@ impl Scheduler {
                 self.reserve(inner, state, None, &key, &worker, executables);
                 if let Some(slot) = state.slots.get_mut(&key) {
                     slot.prewarm = true;
+                    let slot_id = slot.id;
+                    self.prewarms.get_mut(&id).expect("listed above").running =
+                        Some((key.shape, slot_id));
                 }
                 effects.progress = true;
                 return;
@@ -2060,23 +2152,55 @@ impl Scheduler {
             if prewarm.running.is_none() && prewarm.pending.is_empty() {
                 let prewarm = self.prewarms.remove(&id).expect("checked above");
                 prewarm.log("finished", now);
+                if let Some(notify) = prewarm.notify {
+                    effects.notifications.push(notify);
+                }
             }
         }
     }
 
-    /// Records the end of a prewarm admission. Any failed admission ends its
-    /// lane's prewarm, so nothing more is admitted in the background for a
-    /// worker that just failed one.
+    /// A prewarm admission whose slot went away without a completion the
+    /// prewarm saw (a recovery confirmed the worker's exit and released every
+    /// slot of the old process) did not load its shape: the shape goes back
+    /// to the front of the plan, to be loaded on the restarted worker. A
+    /// second such interruption ends the prewarm.
+    fn reconcile_prewarm(&mut self, state: &State, id: &str) {
+        let Some(prewarm) = self.prewarms.get_mut(id) else {
+            return;
+        };
+        let Some((shape, slot_id)) = prewarm.running else {
+            return;
+        };
+        if state.slots.values().any(|slot| slot.id == slot_id) {
+            return;
+        }
+        prewarm.running = None;
+        prewarm.interrupted += 1;
+        if prewarm.interrupted > 1 {
+            prewarm.failed = Some((shape, "interrupted twice by worker recovery".into()));
+            prewarm.pending.clear();
+        } else {
+            prewarm.pending.push_front(shape);
+        }
+    }
+
+    /// Records the end of the prewarm admission of slot `slot_id`. A
+    /// completion for any other slot (an admission the prewarm already wrote
+    /// off) changes nothing. Any failed admission ends its lane's prewarm, so
+    /// nothing more is admitted in the background for a worker that just
+    /// failed one.
     fn prewarm_finished(
         &mut self,
         key: &ShapeKey,
+        slot_id: u64,
         error: Option<&AneResidencyError>,
         origins: Option<AdmissionOrigins>,
+        effects: &mut Effects,
     ) {
         let Some(prewarm) = self.prewarms.get_mut(&key.worker_id) else {
             return;
         };
-        if prewarm.running != Some(key.shape) {
+        if prewarm.running != Some((key.shape, slot_id)) {
             return;
         }
         prewarm.running = None;
@@ -2086,6 +2210,9 @@ impl Scheduler {
                 prewarm.failed = Some((key.shape, error.to_string()));
                 prewarm.pending.clear();
             }
+        }
+        if let Some(notify) = &prewarm.notify {
+            effects.notifications.push(notify.clone());
         }
     }
 
@@ -2167,6 +2294,7 @@ impl Scheduler {
             .chain(retirements)
             .chain(lapses)
             .chain(misses)
+            .chain(self.prewarm_recheck)
             .filter(|at| *at > now)
             .min()
     }
@@ -2338,7 +2466,7 @@ impl Scheduler {
         let worker = slot.worker.clone();
         let prewarm = slot.prewarm;
         if prewarm {
-            self.prewarm_finished(&key, result.as_ref().err(), origins);
+            self.prewarm_finished(&key, slot_id, result.as_ref().err(), origins, effects);
         }
         match result {
             Ok(inventory) => {
@@ -2359,7 +2487,7 @@ impl Scheduler {
                 let took = dispatched
                     .filter(|_| !retry)
                     .map(|dispatched| finished.saturating_duration_since(dispatched));
-                state.learn_admission(&key, seed, took, origins);
+                state.learn_admission(&key, seed, took, origins, finished);
                 state.sample();
                 tracing::debug!(
                     target: "worker",
@@ -2424,11 +2552,7 @@ impl Scheduler {
                     // Answering removes the request from every cohort, so it
                     // joins this one afterwards. Its membership is released
                     // when it leases, or when the answer is dropped unread.
-                    let membership = CohortMembership {
-                        inner: inner.clone(),
-                        key: key.clone(),
-                        id,
-                    };
+                    let membership = CohortMembership::new(inner, state, &key, id);
                     self.answer(state, id, Answer::Joined(membership), effects);
                     state
                         .slots
@@ -2529,6 +2653,22 @@ impl Scheduler {
             {
                 state.slots.remove(&key);
                 self.answer_owner(state, &key, owner, error, effects);
+            }
+            Err(error @ AneResidencyError::WorkerErr { .. }) if prewarm => {
+                // The worker answered a background prewarm with an error: it
+                // has rolled back what it loaded and nothing is compiling, so
+                // the reservation is refunded and the worker, which may be
+                // serving its lane, is not restarted for work nobody asked
+                // for. The lane's prewarm has ended (`prewarm_finished`).
+                state.slots.remove(&key);
+                tracing::warn!(
+                    target: "worker",
+                    model_ref = %key.model_ref,
+                    shape = key.shape,
+                    worker_id = %key.worker_id,
+                    error = %error,
+                    "direct-ANE prewarm admission refused by the worker; the lane's prewarm ends"
+                );
             }
             Err(error) => {
                 // A definite refusal from the worker means nothing can still

@@ -30727,11 +30727,21 @@ async fn run_lane_check(
 /// so that later requests at those lengths usually find them resident. The
 /// supervisor loads them only while no request waits and only into free
 /// budget, and ignores a repeated call for the same worker.
-fn start_direct_ane_prewarm(runtime: &RuntimeState, model: &EmbeddingModel) {
+fn start_direct_ane_prewarm(runtime: &Arc<RuntimeState>, model: &EmbeddingModel) {
     #[cfg(unix)]
     if let EmbedBackend::DirectAne(engine) = &model.backend {
         if resolved_catalog_lane(runtime, &model.model_id).is_some() {
-            if let Err(error) = engine.prewarm(&model.model_id) {
+            // Packed preparation that gave up while a prewarm admission held
+            // the worker or its budget is retried when that admission ends;
+            // the launcher does nothing for a lane without packing.
+            let weak = Arc::downgrade(runtime);
+            let model_id = model.model_id.clone();
+            let notify: worker_host::ane_residency::PrewarmNotify = Arc::new(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.activity_telemetry.prepare_when_idle(&model_id);
+                }
+            });
+            if let Err(error) = engine.prewarm(&model.model_id, Some(notify)) {
                 tracing::warn!(target: "worker", lane = %model.model_id, %error,
                     "direct-ANE prewarm could not start");
             }
