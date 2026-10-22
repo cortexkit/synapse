@@ -637,10 +637,11 @@ async fn definite_prewarm_failure_ends_the_prewarm_without_a_restart() {
         "a refused prewarm admission restarted the lane's worker"
     );
     assert!(compiler.compiles_of("lane").is_empty(), "the prewarm went on");
-    let state = supervisor.inner.lock();
-    assert!(state.slots.is_empty(), "the refused admission stayed charged");
-    assert!(!state.recovering.contains("lane"));
-    drop(state);
+    {
+        let state = supervisor.inner.lock();
+        assert!(state.slots.is_empty(), "the refused admission stayed charged");
+        assert!(!state.recovering.contains("lane"));
+    }
     // An unknown outcome still restarts the worker: the stream's state is
     // unknown, as for any admission.
     let other = fake_handle(&compiler, "other");
