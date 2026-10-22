@@ -269,6 +269,14 @@ async fn at_most_one_cold_compile_runs_across_workers() {
         assert!(answer.ok(), "request failed: {answer:?}");
     }
     assert_eq!(compiler.records().len(), 12);
+    let mut keys: Vec<_> = compiler
+        .records()
+        .into_iter()
+        .map(|record| (record.worker, record.model_ref, record.shape))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 12, "a shape was compiled twice");
     assert_eq!(
         compiler.peak.load(Ordering::SeqCst),
         1,
@@ -565,5 +573,42 @@ async fn orphaned_entry_expires_after_twice_its_promise() {
         compiler.compiles_of("small").is_empty(),
         "an entry nobody came back for kept compiling: {:?}",
         compiler.compiles_of("small")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cheaper_newcomer_does_not_break_an_accepted_deadline() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let first = fake_worker(&compiler, "first");
+    let accepted = fake_worker(&compiler, "accepted");
+    let newcomer = fake_worker(&compiler, "newcomer");
+    let first_answer = ask_at(&supervisor, &compiler, &first, QUEUE_QWEN, 2048, 0.0, None);
+    // Qwen3@128 is predicted ready at about 52.4 s, inside its 56 s bound,
+    // so it is accepted and waits.
+    let accepted_answer = ask_at(
+        &supervisor,
+        &compiler,
+        &accepted,
+        QUEUE_QWEN,
+        128,
+        1.0,
+        Some(55.0),
+    );
+    // GTE@512 is cheaper and its start key (2 + 8.14 s) is earlier, but going
+    // first would push the accepted request to about 60.6 s, past its bound.
+    let newcomer_answer = ask_at(&supervisor, &compiler, &newcomer, QUEUE_GTE, 512, 2.0, None);
+    let accepted_answer = accepted_answer.await.unwrap();
+    assert!(
+        accepted_answer.ok(),
+        "a request told its compile would be ready in time missed its deadline: {accepted_answer:?}"
+    );
+    assert!(newcomer_answer.await.unwrap().ok());
+    assert!(first_answer.await.unwrap().ok());
+    let accepted_start = compiler.compiles_of("accepted")[0].start;
+    let newcomer_start = compiler.compiles_of("newcomer")[0].start;
+    assert!(
+        accepted_start < newcomer_start,
+        "the cheaper newcomer ({newcomer_start:.2} s) went ahead of the accepted request ({accepted_start:.2} s)"
     );
 }

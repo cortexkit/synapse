@@ -251,29 +251,33 @@ eviction tests pass unchanged.
 
 ### Hardware check on the M4 mini
 
-A runner kit the operator starts from their own shell; it never runs from an
-agent session. It follows the October latency kit's conventions: holder check
-for other Neural Engine clients (refuse unless allowed by name), `env -u TMPDIR`,
-full Xcode `DEVELOPER_DIR`, release builds of the base commit and of the change,
-commit order alternating per repeat, three repeats, per-run JSON with host load
-and OS build.
+The operator runs the kit from their own shell; it never runs from an agent
+session. It follows the October latency kit's conventions. It refuses to run
+while another Neural Engine user is present, unless that user is allowed by
+name. It holds the direct-ANE lane lock, unsets `TMPDIR`, and builds in release
+with full Xcode's `DEVELOPER_DIR` in a throwaway clone. It runs three repeats
+and keeps per-run JSON with host load and OS build. Only the change is built:
+the October kit already measured the base behaviour on this mini, in 108 runs.
 
-It drives the module supervisor itself, not a bare compile probe: a new ignored
-case `compile_scheduling` beside `residency_safety` in the stress harness, run
-with `crates/synapse-worker-ane-direct/tests/run_stress.py --case
-compile-scheduling`. Packages: `gte-modernbert-base` and `qwen3-embedding-0.6b`
-(the ones on the mini). Arms:
+It drives the module supervisor itself, not a bare compile probe: the ignored
+case `real_direct_ane_compile_scheduling` beside `real_direct_ane_residency_safety`,
+run through `crates/synapse-worker-ane-direct/tests/run_stress.py --case
+compile-scheduling`. Each arm uses fresh worker processes and a fresh
+supervisor, so every shape compiles cold. Packages: `gte-modernbert-base` and
+`qwen3-embedding-0.6b` (the ones on the mini). Arms:
 
-| Arm | Pass on the change | Today (for contrast) |
+| Arm | Pass on the change | Before (October kit) |
 |---|---|---|
-| Qwen3@4096 requested, GTE@128 1 ms later | GTE@128 ≤ 1.5× its standalone median (about 8 s) | 66.7 s |
-| GTE@128 requested 10 s after Qwen3@4096 has started | GTE@128 ≤ the rest of the Qwen3 compile plus its standalone time + 10% | waits one wide layer per layer |
-| GTE and Qwen3 at 128, 512 and 2048, all requested together | makespan ≤ 1.05× the sum of standalone times; no two compile RPCs overlap in the admission timeline | 1.03–1.91× |
-| Qwen3@4096 queued, then a Qwen3@128 request with a 30 s deadline queued behind it | if the prediction exceeds 30 s, the answer is `shape_compiling` within 1 s, and its `retry_after_ms` is within 25% of when the shape actually became resident | answered at 30 s with 1000 ms |
+| standalone: GTE@128/512/2048, Qwen3@128/512/2048/4096, one at a time | all succeed; these times are the reference | |
+| Qwen3@4096 asked, GTE@128 1 ms later | GTE@128 ≤ 1.5× its standalone time; Qwen3@4096 ≤ 1.1× (its standalone + GTE@128's) | 66.7 s (12.8×) |
+| GTE@128 asked 10 s after Qwen3@4096 | GTE@128 ≤ the rest of the Qwen3 compile + 1.1× its standalone + 1 s | one wide layer per layer of its own |
+| GTE and Qwen3 at 128, 512 and 2048, all asked at once | makespan ≤ 1.05× the sum of standalone times | 1.03–1.91× |
+| Qwen3@4096 asked, GTE@512 with a 30 s deadline 1 s later | answered `shape_compiling` within 1 s; `retry_after_ms` within 25% of when GTE@512 actually finished compiling | answered at 30 s with 1000 ms |
 
-Every arm also requires zero `ane_resources_exhausted` errors. The kit reports
-pass or fail per arm and keeps the raw timelines. A hardware run needs your
-approval and exclusive use of the mini's Neural Engine.
+Every arm also requires that no two shape compiles overlap, no
+`ane_resources_exhausted`, and a drained queue. The kit reports pass or fail per
+arm and keeps the raw timelines. A hardware run needs approval and exclusive use
+of the mini's Neural Engine.
 
 ## Changes during implementation
 

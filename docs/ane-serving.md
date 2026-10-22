@@ -151,6 +151,11 @@ runs the ignored 37-request concurrent residency-safety workload, including its
 numerical, leased-eviction, budget and hardware-resource-refusal checks.
 `--case cold-throughput` runs the same cold workload as characterization: its
 report records completions, errors and wall time without a throughput assertion.
+`--case compile-scheduling` times cold compiles of `gte-modernbert-base` and
+`qwen3-embedding-0.6b` alone, a small shape asked beside a wide one, six shapes
+asked at once, and a request the queue refuses early. It asserts that no two
+compiles overlap and no resource refusal occurs; latency is judged by the
+operator's runner against the standalone times in the same report.
 Run either only in an exclusive hardware window; neither is release certification.
 
 Both use a **test-only 2100 s admission-wait backstop**, not a production deadline

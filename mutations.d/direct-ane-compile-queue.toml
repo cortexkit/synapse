@@ -1,0 +1,84 @@
+[[control]]
+id = "ane-compile-queue-orphan-expiry"
+guards = "A queued compile nobody came back for is dropped after twice the retry delay it promised"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "const ORPHAN_EXPIRY_FACTOR: u32 = 2;"
+new = "const ORPHAN_EXPIRY_FACTOR: u32 = 100; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::orphaned_entry_expires_after_twice_its_promise"]
+expect_message = "an entry nobody came back for kept compiling"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-aging"
+guards = "A wide compile is passed only by compiles whose start key (arrival plus cost) is earlier"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "(entry.is_none(), entry.map(QueuedCompile::order), *position)"
+new = "(entry.is_none(), entry.map(|entry| (entry.cost, entry.seq)), *position) /* NON-VACUITY BREAK: no aging */"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::wide_compile_starts_after_its_aging_window"]
+expect_message = "that had aged past it"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-machine-factor"
+guards = "Predictions for unmeasured shapes are scaled by how much slower this machine compiled so far"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "seed.mul_f64(self.machine_factor.unwrap_or(1.0))"
+new = "seed /* NON-VACUITY BREAK: machine factor ignored */"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::machine_factor_corrects_unseen_shape_predictions"]
+expect_message = "refused after"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-accepted-bound"
+guards = "A cheaper newcomer is not started ahead of a request that was told its compile would be ready in time"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "start_key = entry.start_key;"
+new = "let _ = entry.start_key; // NON-VACUITY BREAK: accepted bounds ignored"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::cheaper_newcomer_does_not_break_an_accepted_deadline"]
+expect_message = "a request told its compile would be ready in time missed its deadline"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-gather"
+guards = "Compiles requested together start cheapest first, not in the order their requests arrived"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "const COMPILE_GATHER: std::time::Duration = std::time::Duration::from_millis(50);"
+new = "const COMPILE_GATHER: std::time::Duration = std::time::Duration::ZERO; // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::small_compile_beside_wide_finishes_in_its_standalone_time"]
+expect_message = "alone it takes"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

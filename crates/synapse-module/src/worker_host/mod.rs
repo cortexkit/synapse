@@ -4674,8 +4674,9 @@ pub mod ane_residency {
             let key = state.waiter_keys.get(&self.id).cloned();
             let removed = state.leave_queue(self.id);
             // The last request for a queued compile has left. Keep the entry,
-            // driven by a task of its own, while the retry delay it promised
-            // has not expired; otherwise nobody will come back for it.
+            // driven by a task of its own, until its orphan expiry
+            // (ORPHAN_EXPIRY_FACTOR times the retry delay it promised);
+            // without a live promise nobody will come back for it.
             let mut orphan = None;
             if let Some(key) = key {
                 let still_wanted = state.waiter_keys.values().any(|waiting| *waiting == key);
@@ -5042,7 +5043,8 @@ pub mod ane_residency {
 
         /// The request is leaving while its shape's compile is still queued:
         /// record the retry delay it was (or would have been) given, so the
-        /// entry stays queued for a retry until that promise expires.
+        /// entry stays queued for a retry until its orphan expiry
+        /// ([`ORPHAN_EXPIRY_FACTOR`] times that delay).
         fn promise_on_exit(&self, key: &ShapeKey) {
             let mut state = self.inner.lock();
             let now = tokio::time::Instant::now();
@@ -8676,6 +8678,317 @@ pub mod ane_residency {
         #[ignore = "cold-throughput characterization; exclusive ANE access required"]
         async fn real_direct_ane_cold_throughput() {
             run_direct_ane_stress("cold_throughput").await;
+        }
+
+        /// A real worker whose shape compiles are timed against one epoch, so
+        /// the compile-scheduling case can show which compiles overlapped.
+        struct TimedWorker {
+            channel: RealChannel,
+            slug: String,
+            epoch: std::time::Instant,
+            compiles: Arc<Mutex<Vec<Value>>>,
+        }
+        impl AneShapeWorker for TimedWorker {
+            fn stream_idle(&self) -> bool {
+                self.channel.stream_idle()
+            }
+            fn worker_id(&self) -> &str {
+                self.channel.worker_id()
+            }
+            fn generation(&self) -> u64 {
+                self.channel.generation()
+            }
+            fn admit_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.admit_shape_at_generation(self.generation(), model_ref, shape)
+            }
+            fn admit_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                Box::pin(async move {
+                    let start = self.epoch.elapsed().as_secs_f64();
+                    let result = self
+                        .channel
+                        .admit_shape_at_generation(generation, model_ref, shape)
+                        .await;
+                    let end = self.epoch.elapsed().as_secs_f64();
+                    self.compiles.lock().unwrap().push(json!({
+                        "slug": self.slug,
+                        "shape": shape,
+                        "start_s": start,
+                        "end_s": end,
+                        "admitted": result.is_ok(),
+                        "code": result.as_ref().err().and_then(AneResidencyError::code),
+                    }));
+                    result
+                })
+            }
+            fn evict_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.channel.evict_shape(model_ref, shape)
+            }
+            fn evict_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.channel
+                    .evict_shape_at_generation(generation, model_ref, shape)
+            }
+            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                Box::pin(async move { self.channel.restart().await })
+            }
+        }
+
+        /// One request of a compile-scheduling arm: model slug, shape, when to
+        /// ask (seconds after the arm's epoch) and an optional deadline in
+        /// seconds after asking.
+        type ScheduledRequest = (&'static str, usize, f64, Option<f64>);
+
+        /// Runs one arm on fresh workers and a fresh supervisor (production
+        /// limits and 600 s bound), so every shape compiles cold, as after a
+        /// restart. `sequential` asks each request only after the previous one
+        /// was answered (standalone timings); otherwise requests are asked at
+        /// their own times. Returns every answer and every compile, timed.
+        async fn compile_scheduling_arm(
+            lock: &AneDirectLaneLock,
+            root: &Path,
+            name: &str,
+            sequential: bool,
+            requests: &[ScheduledRequest],
+        ) -> Value {
+            let factory = Factory::new(root.join(name), lock);
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let compiles = Arc::new(Mutex::new(Vec::new()));
+            let mut slugs: Vec<&str> = requests.iter().map(|request| request.0).collect();
+            slugs.sort();
+            slugs.dedup();
+            let mut loaded = Vec::new();
+            for slug in &slugs {
+                let channel = factory.connect(&format!("{name}-{slug}")).await;
+                let model_ref = load(&channel, slug).await;
+                loaded.push((*slug, channel, model_ref));
+            }
+            let epoch = std::time::Instant::now();
+            let workers: BTreeMap<&str, (Arc<dyn AneShapeWorker>, String)> = loaded
+                .into_iter()
+                .map(|(slug, channel, model_ref)| {
+                    let worker: Arc<dyn AneShapeWorker> = Arc::new(TimedWorker {
+                        channel,
+                        slug: slug.into(),
+                        epoch,
+                        compiles: compiles.clone(),
+                    });
+                    (slug, (worker, model_ref))
+                })
+                .collect();
+            let ask = |request: ScheduledRequest| {
+                let (slug, shape, at, deadline) = request;
+                let (worker, model_ref) = workers[slug].clone();
+                let supervisor = supervisor.clone();
+                async move {
+                    if !sequential {
+                        tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(epoch) + Duration::from_secs_f64(at),
+                        )
+                        .await;
+                    }
+                    let asked = epoch.elapsed().as_secs_f64();
+                    let request_deadline = deadline.map(|seconds| {
+                        tokio::time::Instant::now() + Duration::from_secs_f64(seconds)
+                    });
+                    let result = supervisor
+                        .lease_until(&worker, &model_ref, shape, request_deadline)
+                        .await;
+                    let answered = epoch.elapsed().as_secs_f64();
+                    let (code, retry_after_ms) = match &result {
+                        Ok(_) => (None, None),
+                        Err(error) => (
+                            Some(error.code().unwrap_or("other").to_owned()),
+                            error
+                                .to_engine_error(synapse_core::EngineErrorStage::Inference)
+                                .retry_after_ms,
+                        ),
+                    };
+                    drop(result);
+                    json!({
+                        "slug": slug,
+                        "shape": shape,
+                        "deadline_s": deadline,
+                        "asked_s": asked,
+                        "answered_s": answered,
+                        "code": code,
+                        "retry_after_ms": retry_after_ms,
+                    })
+                }
+            };
+            let mut answers = Vec::new();
+            if sequential {
+                for request in requests {
+                    answers.push(ask(*request).await);
+                }
+            } else {
+                let mut tasks = Vec::new();
+                for request in requests {
+                    tasks.push(tokio::spawn(ask(*request)));
+                }
+                for task in tasks {
+                    answers.push(task.await.unwrap());
+                }
+            }
+            // A refused request leaves its compile queued for the retry; wait
+            // until the queue is empty so that compile is timed too.
+            let drained = tokio::time::timeout(Duration::from_secs(900), async {
+                loop {
+                    let idle = {
+                        let state = supervisor.inner.lock();
+                        state.entries.is_empty() && !state.compile_running()
+                    };
+                    if idle {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+            .is_ok();
+            factory.stop().await;
+            let compiles = compiles.lock().unwrap().clone();
+            json!({
+                "arm": name,
+                "sequential": sequential,
+                "queue_drained": drained,
+                "answers": answers,
+                "compiles": compiles,
+            })
+        }
+
+        /// Hardware check of the compile queue, started by the operator on a
+        /// Mac with exclusive Neural Engine access (run_stress.py --case
+        /// compile-scheduling):
+        /// standalone compile times, then a small shape asked together with
+        /// and after a wide one, six shapes asked at once, and a request
+        /// whose deadline the queue predicts it cannot meet. It writes a JSON
+        /// report (ANE_STRESS_OUT) and asserts only what must hold on any
+        /// machine: no two compiles overlap and the Neural Engine never ran
+        /// out of resources. Latency is judged by the operator's runner, which
+        /// compares each arm with the standalone times in the same report.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "compile-scheduling hardware check; exclusive ANE access required"]
+        async fn real_direct_ane_compile_scheduling() {
+            const GTE: &str = "gte-modernbert-base";
+            const QWEN: &str = "qwen3-embedding-0.6b";
+            let load_start = load_averages();
+            let root = PathBuf::from(format!(
+                "../../target/ane-compile-scheduling-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
+            let standalone: Vec<ScheduledRequest> = [
+                (GTE, 128),
+                (GTE, 512),
+                (GTE, 2048),
+                (QWEN, 128),
+                (QWEN, 512),
+                (QWEN, 2048),
+                (QWEN, 4096),
+            ]
+            .into_iter()
+            .map(|(slug, shape)| (slug, shape, 0.0, None))
+            .collect();
+            let batch: Vec<ScheduledRequest> = standalone[..6]
+                .iter()
+                .map(|(slug, shape, _, _)| (*slug, *shape, 0.0, None))
+                .collect();
+            let arms: [(&str, bool, Vec<ScheduledRequest>); 5] = [
+                ("standalone", true, standalone),
+                (
+                    "together",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 128, 0.001, None)],
+                ),
+                (
+                    "late",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 128, 10.0, None)],
+                ),
+                ("batch", false, batch),
+                (
+                    "refusal",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 512, 1.0, Some(30.0))],
+                ),
+            ];
+            let mut results = Vec::new();
+            for (name, sequential, requests) in arms {
+                println!("COMPILE_SCHEDULING_ARM={name}");
+                results
+                    .push(compile_scheduling_arm(&lock, &root, name, sequential, &requests).await);
+            }
+            let report = json!({
+                "schema": 1,
+                "case": "compile_scheduling",
+                "os": {
+                    "version": output("sw_vers", &["-productVersion"]),
+                    "build": output("sw_vers", &["-buildVersion"]),
+                    "model": output("sysctl", &["-n", "hw.model"]),
+                },
+                "load_start": load_start,
+                "load_end": load_averages(),
+                "arms": results,
+            });
+            let out = std::env::var_os("ANE_STRESS_OUT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join("compile-scheduling.json"));
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            println!("ANE_STRESS_OUTPUT={}", out.display());
+            for arm in report["arms"].as_array().unwrap() {
+                let mut spans: Vec<(f64, f64)> = arm["compiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|compile| {
+                        (
+                            compile["start_s"].as_f64().unwrap(),
+                            compile["end_s"].as_f64().unwrap(),
+                        )
+                    })
+                    .collect();
+                spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+                assert!(
+                    spans.windows(2).all(|pair| pair[1].0 >= pair[0].1),
+                    "{}: two shape compiles overlapped: {spans:?}",
+                    arm["arm"]
+                );
+                let codes: Vec<&Value> = arm["answers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(arm["compiles"].as_array().unwrap())
+                    .map(|entry| &entry["code"])
+                    .collect();
+                assert!(
+                    !codes
+                        .iter()
+                        .any(|code| code.as_str() == Some(ERR_ANE_RESOURCES_EXHAUSTED)),
+                    "{}: the Neural Engine ran out of resources",
+                    arm["arm"]
+                );
+            }
         }
 
         async fn run_direct_ane_stress(case: &str) {
