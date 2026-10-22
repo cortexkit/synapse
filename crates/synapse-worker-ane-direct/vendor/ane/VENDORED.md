@@ -51,6 +51,29 @@ Local compatibility changes:
   left every inference output byte-identical, across eviction, recompilation
   and unload. The `client::tests` unit tests cover the removal with a
   stand-in for the private compile and load.
+- Local modification, not upstream behaviour: `Graph::to_ops_and_shapes`
+  emits constants in tensor-id order instead of `HashMap` iteration order, so
+  identical graphs emit byte-identical MIL text and weights, within a process
+  and across processes. The private compiler identifies a program by hashes
+  of those bytes, so before this change every build of the same layer got a
+  new identifier. On an M6 with macOS 27.0 (26A425), three random-order
+  compiles and the sorted compile of one gte-modernbert layer gave
+  byte-identical outputs. The `graph::compile::tests` unit tests cover it.
+- Local modification, not upstream behaviour: `client::compile_network`
+  reuses aned's compiled-program cache. When `_ANEInMemoryModel
+  compiledModelExists` reports a cached program for the identifier (the
+  selector is feature-detected; a missing selector counts as not cached), it
+  calls `loadWithQoS:` alone, writing no sources and calling no compile. On a
+  miss, or if that load fails, it compiles as before (write sources,
+  `compileWithQoS:`, `loadWithQoS:`, remove the sources) from a fresh model
+  object. A load without a cached program fails aned's bundle verification,
+  and `compileWithQoS:` always recompiles, so neither shortcut is used.
+  `Graph::compile_gated` and `client::compile_network_gated` run a caller
+  check just before a compile (never before a cached load), and
+  `Executable::origin` reports `ProgramOrigin::CacheHit` or `Compiled`. The
+  development accessor `Graph::program_identifier` returns the identifier
+  without compiling. The `client::tests` unit tests cover the hit, miss,
+  failed-hit and refused-compile sequences with a stand-in program.
 
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).

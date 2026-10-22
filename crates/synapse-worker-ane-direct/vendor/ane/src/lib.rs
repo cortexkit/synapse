@@ -47,6 +47,7 @@ pub mod ops;
 pub(crate) mod request;
 mod tensor_data;
 
+pub use client::ProgramOrigin;
 pub use error::Error;
 pub use executable::Executable;
 pub use graph::{

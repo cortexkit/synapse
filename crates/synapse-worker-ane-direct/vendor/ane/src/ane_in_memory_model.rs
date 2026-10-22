@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject};
-use objc2::{ClassType, extern_class, extern_conformance, msg_send};
+use objc2::{ClassType, extern_class, extern_conformance, msg_send, sel};
 use objc2_foundation::{NSDictionary, NSError, NSObjectProtocol, NSQualityOfService, NSString};
 
 use crate::ane_in_memory_model_descriptor::ANEInMemoryModelDescriptor;
@@ -30,6 +30,18 @@ impl ANEInMemoryModel {
 
     pub fn hex_string_identifier(&self) -> Option<Retained<NSString>> {
         unsafe { msg_send![self, hexStringIdentifier] }
+    }
+
+    /// Whether aned already holds a compiled program for this model's
+    /// identifier, so `load` can run without `compile`. The selector is
+    /// private and undocumented: an OS build without it answers `false`, which
+    /// makes the caller compile as before.
+    pub fn compiled_model_exists(&self) -> bool {
+        if !self.respondsToSelector(sel!(compiledModelExists)) {
+            return false;
+        }
+        let exists: Bool = unsafe { msg_send![self, compiledModelExists] };
+        exists.as_bool()
     }
 
     pub fn compile(&self, qos: NSQualityOfService) -> Result<(), Retained<NSError>> {

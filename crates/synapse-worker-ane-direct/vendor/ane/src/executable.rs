@@ -7,6 +7,7 @@ use crate::Error;
 use crate::ane_client::ANEClient;
 use crate::ane_in_memory_model::ANEInMemoryModel;
 use crate::ane_performance_stats::ANEPerformanceStats;
+use crate::client::ProgramOrigin;
 use crate::request::Request;
 use crate::tensor_data::TensorData;
 
@@ -17,6 +18,8 @@ use crate::tensor_data::TensorData;
 pub struct Executable {
     pub(crate) inner: Retained<ANEInMemoryModel>,
     pub(crate) qos: NSQualityOfService,
+    /// Whether the program was loaded from aned's cache or compiled.
+    pub(crate) origin: ProgramOrigin,
     /// Cached request for `run_cached`. Lazily initialized on first call.
     pub(crate) cached_request: UnsafeCell<Option<Request>>,
     /// Cached stats-enabled request for `run_cached_with_stats`.
@@ -29,6 +32,12 @@ unsafe impl Send for Executable {}
 unsafe impl Sync for Executable {}
 
 impl Executable {
+    /// Whether this program was loaded from aned's compiled-program cache or
+    /// compiled when it was created.
+    pub fn origin(&self) -> ProgramOrigin {
+        self.origin
+    }
+
     /// Run the compiled program on the ANE.
     ///
     /// `inputs` and `outputs` are positional [`TensorData`] arrays matching the

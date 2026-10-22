@@ -1,5 +1,5 @@
 use crate::{modernbert, qwen};
-use ane::{Executable, Graph, NSQualityOfService, TensorData};
+use ane::{Executable, Graph, NSQualityOfService, ProgramOrigin, TensorData};
 use anyhow::{ensure, Context, Result};
 use half::f16;
 use safetensors::{Dtype, SafeTensors};
@@ -233,37 +233,69 @@ impl Model {
         os: &str,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<AnePlacementInventory> {
-        self.admit_progress_checking_space(shape, os, temp_volume_available, progress)
+        self.admit_progress_checking_space(
+            shape,
+            os,
+            temp_volume_available,
+            |graph, before_compile| {
+                graph.compile_gated(NSQualityOfService::UserInteractive, before_compile)
+            },
+            progress,
+        )
     }
 
-    /// `admit_progress` with the free-space reading as a parameter, so tests
-    /// can simulate a full disk.
+    /// `admit_progress` with the free-space reading and the binding's gated
+    /// compile as parameters, so tests can simulate a full disk and a cached
+    /// or uncached program without the Neural Engine.
     fn admit_progress_checking_space(
         &mut self,
         shape: usize,
         os: &str,
-        available: impl FnOnce(&Path) -> std::io::Result<u64>,
+        available: impl Fn(&Path) -> std::io::Result<u64>,
+        mut compile_gated: impl FnMut(&Graph, &mut dyn FnMut() -> Result<()>) -> Result<Executable>,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<AnePlacementInventory> {
         let profile = crate::profile::LaneProfile::new();
         let cached = self.resident.contains_key(&shape);
+        let started = std::time::Instant::now();
+        let mut loads = LayerLoads::default();
         // Compile temporaries retain ANE programs until the autorelease pool drains.
         let result = ane::autoreleasepool(|_| {
-            // A resident shape compiles nothing, so only a compile needs room.
-            // The compiler works in the default per-user temp folder.
-            if !cached {
-                let dir = std::env::temp_dir();
-                ensure_compile_temp_space(&dir, available(&dir))?;
-            }
+            // Only a compile needs room in the temp folder, so the binding
+            // checks just before it compiles a layer. A program that aned
+            // already holds compiled is loaded without writing anything, and
+            // a full disk does not refuse it. The compiler works in the
+            // default per-user temp folder.
+            let dir = std::env::temp_dir();
             self.admit_with_limit_progress(
                 shape,
                 os,
                 PRODUCTION_SHAPE_LIMIT,
-                |graph, _| graph.compile(NSQualityOfService::UserInteractive),
+                |graph, _| {
+                    compile_gated(graph, &mut || {
+                        ensure_compile_temp_space(&dir, available(&dir))
+                    })
+                },
+                &mut loads,
                 progress,
             )
         });
-        profile.finish(serde_json::json!({"kind":"admit", "shape":shape, "cached":cached, "ok":result.is_ok()}));
+        if !cached {
+            // The module logs each worker stderr line at INFO.
+            eprintln!(
+                "{}",
+                loads.summary(shape, started.elapsed(), result.as_ref().err())
+            );
+        }
+        profile.finish(serde_json::json!({
+            "kind": "admit",
+            "shape": shape,
+            "cached": cached,
+            "ok": result.is_ok(),
+            "cache_hit": loads.count(ProgramOrigin::CacheHit),
+            "compiled": loads.count(ProgramOrigin::Compiled),
+            "layer_loads": loads.profile_rows(),
+        }));
         result
     }
     #[cfg(test)]
@@ -283,15 +315,59 @@ impl Model {
         limit: usize,
         compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
     ) -> Result<AnePlacementInventory> {
-        self.admit_with_limit_progress(shape, os, limit, compile, &mut || Ok(()))
+        self.admit_with_limit_progress(
+            shape,
+            os,
+            limit,
+            compile,
+            &mut LayerLoads::default(),
+            &mut || Ok(()),
+        )
     }
 
-    fn admit_with_limit_progress(
+    /// Builds one hidden layer's Neural Engine graph at width `shape`.
+    fn layer_graph(&self, shape: usize, layer: usize) -> Result<Graph> {
+        let hidden = self.profile.n("hidden_size");
+        let mut graph = Graph::new();
+        let input = graph.placeholder(modernbert::shape(shape, hidden));
+        let mask = graph.placeholder(modernbert::shape(shape, 1));
+        if self.profile.modern() {
+            let residual = if layer == 0 {
+                graph.placeholder(modernbert::shape(shape, hidden))
+            } else {
+                input
+            };
+            let config: modernbert::Config = serde_json::from_value(self.profile.params().clone())?;
+            let base = format!("{}layers.{layer}", self.profile.prefix());
+            let linear = |name: &str| -> Result<modernbert::Linear> {
+                Ok(modernbert::Linear {
+                    weight: self.tensor(&format!("{base}.{name}.weight"))?.to_vec(),
+                })
+            };
+            let weights = modernbert::LayerWeights {
+                qkv: linear("attn.Wqkv")?,
+                attention_output: linear("attn.Wo")?,
+                attention_norm: (layer > 0).then(|| vec![1.0; hidden]),
+                mlp_input: linear("mlp.Wi")?,
+                mlp_output: linear("mlp.Wo")?,
+                mlp_norm: vec![1.0; hidden],
+            };
+            let _ = modernbert::layer_graph(
+                &mut graph, input, residual, mask, &weights, &config, layer, shape,
+            );
+        } else {
+            qwen::layer_graph(&mut graph, input, mask, self, layer, shape)?;
+        }
+        Ok(graph)
+    }
+
+    fn admit_with_limit_progress<E: Into<anyhow::Error>>(
         &mut self,
         shape: usize,
         os: &str,
         limit: usize,
-        mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, ane::Error>,
+        mut compile: impl FnMut(&Graph, usize) -> std::result::Result<ane::Executable, E>,
+        loads: &mut LayerLoads,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<AnePlacementInventory> {
         ensure!(LADDER.contains(&shape), "invalid_shape");
@@ -303,46 +379,15 @@ impl Model {
         let hidden = self.profile.n("hidden_size");
         let mut executables = Vec::new();
         for layer in 0..self.profile.n("num_hidden_layers") {
-            let mut graph = Graph::new();
-            let input = graph.placeholder(modernbert::shape(shape, hidden));
-            let mask = graph.placeholder(modernbert::shape(shape, 1));
-            if self.profile.modern() {
-                let residual = if layer == 0 {
-                    graph.placeholder(modernbert::shape(shape, hidden))
-                } else {
-                    input
-                };
-                let config: modernbert::Config =
-                    serde_json::from_value(self.profile.params().clone())?;
-                let base = format!("{}layers.{layer}", self.profile.prefix());
-                let linear = |name: &str| -> Result<modernbert::Linear> {
-                    Ok(modernbert::Linear {
-                        weight: self.tensor(&format!("{base}.{name}.weight"))?.to_vec(),
-                    })
-                };
-                let weights = modernbert::LayerWeights {
-                    qkv: linear("attn.Wqkv")?,
-                    attention_output: linear("attn.Wo")?,
-                    attention_norm: (layer > 0).then(|| vec![1.0; hidden]),
-                    mlp_input: linear("mlp.Wi")?,
-                    mlp_output: linear("mlp.Wo")?,
-                    mlp_norm: vec![1.0; hidden],
-                };
-                let _ = modernbert::layer_graph(
-                    &mut graph, input, residual, mask, &weights, &config, layer, shape,
-                );
-            } else {
-                qwen::layer_graph(&mut graph, input, mask, self, layer, shape)?;
-            }
+            let graph = self.layer_graph(shape, layer)?;
             #[cfg(test)]
             let diagnostic = if std::env::var_os("ANE_DIAGNOSTICS").is_some() {
                 Some(diagnostic_payload(&graph, shape, layer))
             } else {
                 None
             };
-            #[cfg(test)]
             let layer_started = std::time::Instant::now();
-            let result = compile(&graph, layer);
+            let result = compile(&graph, layer).map_err(|error| layer_error(error.into(), layer));
             #[cfg(test)]
             if let Some(payload) = diagnostic {
                 diagnostic_artifact(payload, result.is_ok());
@@ -350,7 +395,9 @@ impl Model {
             }
             // The vector stays local until every layer loads. Returning an
             // error drops all previous executables before the worker replies.
-            executables.push(result.map_err(|error| admission_error(error, layer))?);
+            let executable = result?;
+            loads.record(layer, executable.origin(), layer_started.elapsed());
+            executables.push(executable);
             progress()?;
         }
         self.resident.insert(
@@ -1779,7 +1826,71 @@ fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
     }
 }
 
-/// Free space the temp volume must have before a shape compile starts: 2 GiB.
+/// Adds the layer to a binding error. Any other error, such as a
+/// `TempSpaceRefusal` raised before compiling, is returned as it is: the
+/// worker takes the wire code from the start of the outermost message.
+fn layer_error(error: anyhow::Error, layer: usize) -> anyhow::Error {
+    match error.downcast::<ane::Error>() {
+        Ok(error) => admission_error(error, layer),
+        Err(other) => other,
+    }
+}
+
+/// How each layer of one shape admission reached the Neural Engine: loaded
+/// from aned's compiled-program cache or compiled, and how long the binding
+/// call took.
+#[derive(Default)]
+struct LayerLoads {
+    layers: Vec<(usize, ProgramOrigin, std::time::Duration)>,
+}
+
+impl LayerLoads {
+    fn record(&mut self, layer: usize, origin: ProgramOrigin, elapsed: std::time::Duration) {
+        self.layers.push((layer, origin, elapsed));
+    }
+
+    fn count(&self, origin: ProgramOrigin) -> usize {
+        self.layers
+            .iter()
+            .filter(|(_, layer_origin, _)| *layer_origin == origin)
+            .count()
+    }
+
+    fn profile_rows(&self) -> Value {
+        self.layers
+            .iter()
+            .map(|(layer, origin, elapsed)| {
+                serde_json::json!({
+                    "layer": layer,
+                    "origin": origin.as_str(),
+                    "ms": elapsed.as_secs_f64() * 1000.0,
+                })
+            })
+            .collect()
+    }
+
+    /// The one log line for a shape admission.
+    fn summary(
+        &self,
+        shape: usize,
+        total: std::time::Duration,
+        failure: Option<&anyhow::Error>,
+    ) -> String {
+        let outcome = match failure {
+            None => "admitted".to_owned(),
+            Some(error) => format!("failed: {error}"),
+        };
+        format!(
+            "ane-direct shape admission: shape={shape} layers_loaded={} cache_hit={} compiled={} total_ms={:.1} outcome={outcome}",
+            self.layers.len(),
+            self.count(ProgramOrigin::CacheHit),
+            self.count(ProgramOrigin::Compiled),
+            total.as_secs_f64() * 1000.0,
+        )
+    }
+}
+
+/// Free space the temp volume must have before a layer compile starts: 2 GiB.
 ///
 /// Each layer's compile writes its MIL, its weights and the compiler's own
 /// output of the same size into the per-user temp folder. Measured on an M4 at
@@ -1790,13 +1901,14 @@ fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
 /// admissions at once: about 0.25 GB. 2 GiB covers that several times over and still holds a
 /// whole Qwen3 shape if a removal fails. Refusing up front is better than a
 /// compile that fails part-way on a full disk, which would also starve every
-/// other process writing to the same volume.
+/// other process writing to the same volume. A layer that aned already holds
+/// compiled is loaded without writing to the temp folder and is not checked.
 pub const MIN_COMPILE_TEMP_FREE_BYTES: u64 = 2 << 30;
 
-/// Why a shape admission was refused before compiling: the temp volume has
-/// too little free space, or its free space could not be read. A check that
-/// could not look is a refusal, not a pass. The message starts with the wire
-/// code `ane_temp_space_low`.
+/// Why a shape admission was refused before compiling a layer: the temp
+/// volume has too little free space, or its free space could not be read. A
+/// check that could not look is a refusal, not a pass. The message starts
+/// with the wire code `ane_temp_space_low`.
 #[derive(Debug)]
 pub enum TempSpaceRefusal {
     Low {
@@ -1819,7 +1931,7 @@ impl std::fmt::Display for TempSpaceRefusal {
                 required_bytes,
             } => write!(
                 f,
-                "ane_temp_space_low: {} has {available_bytes} bytes free; compiling a shape needs at least {required_bytes}",
+                "ane_temp_space_low: {} has {available_bytes} bytes free; compiling a layer needs at least {required_bytes}",
                 dir.display()
             ),
             Self::Unreadable { dir, error } => write!(
@@ -1864,25 +1976,139 @@ fn temp_volume_available(dir: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(test)]
-mod temp_space_tests {
+mod layer_program_tests {
     use super::*;
 
-    fn empty_gte_model() -> Model {
+    /// A gte-modernbert model whose first `layers` layers have made-up but
+    /// deterministic weights of the real sizes: enough to build those
+    /// layers' graphs without the converted package.
+    pub(super) fn synthetic_gte_model(layers: usize) -> Model {
+        let profile = Profile::select("gte-modernbert-base.ane-direct-worker", "embed").unwrap();
+        let hidden = profile.n("hidden_size");
+        let intermediate = profile.n("intermediate_size");
+        let mut tensors = BTreeMap::new();
+        for layer in 0..layers {
+            for (name, count) in [
+                ("attn.Wqkv", 3 * hidden * hidden),
+                ("attn.Wo", hidden * hidden),
+                ("mlp.Wi", 2 * intermediate * hidden),
+                ("mlp.Wo", hidden * intermediate),
+            ] {
+                let values = (0..count)
+                    .map(|index| ((index * 7919 + layer * 104_729) % 2001) as f32 / 1000.0 - 1.0)
+                    .map(|value| value * 0.05)
+                    .collect();
+                tensors.insert(
+                    format!("{}layers.{layer}.{name}.weight", profile.prefix()),
+                    values,
+                );
+            }
+        }
         Model {
-            profile: Profile::select("gte-modernbert-base.ane-direct-worker", "embed").unwrap(),
-            tensors: BTreeMap::new(),
+            profile,
+            tensors,
             resident: BTreeMap::new(),
         }
     }
 
     #[test]
+    fn the_same_layer_graph_emits_the_same_sources_every_build() {
+        // aned reuses a compiled program only for byte-identical MIL text and
+        // weights, so every build of one layer must emit exactly the same.
+        let model = synthetic_gte_model(1);
+        let (mil_text, weight_bytes) = model.layer_graph(128, 0).unwrap().source_payload();
+        for build in 1..4 {
+            let (other_mil, other_weights) = model.layer_graph(128, 0).unwrap().source_payload();
+            assert!(other_mil == mil_text, "build {build}: MIL text changed");
+            assert!(
+                other_weights == weight_bytes,
+                "build {build}: weight bytes changed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_layer_graph_gets_the_same_compiler_identifier() {
+        let model = synthetic_gte_model(1);
+        let identifier = model
+            .layer_graph(128, 0)
+            .unwrap()
+            .program_identifier()
+            .unwrap();
+        assert!(identifier.is_some());
+        assert_eq!(
+            model
+                .layer_graph(128, 0)
+                .unwrap()
+                .program_identifier()
+                .unwrap(),
+            identifier
+        );
+    }
+
+    #[test]
+    fn admission_summary_counts_cache_hits_and_compiles() {
+        let mut loads = LayerLoads::default();
+        loads.record(
+            0,
+            ProgramOrigin::CacheHit,
+            std::time::Duration::from_millis(4),
+        );
+        loads.record(
+            1,
+            ProgramOrigin::Compiled,
+            std::time::Duration::from_millis(400),
+        );
+        loads.record(
+            2,
+            ProgramOrigin::CacheHit,
+            std::time::Duration::from_millis(3),
+        );
+        assert_eq!(loads.count(ProgramOrigin::CacheHit), 2);
+        assert_eq!(loads.count(ProgramOrigin::Compiled), 1);
+        assert_eq!(
+            loads.summary(128, std::time::Duration::from_millis(450), None),
+            "ane-direct shape admission: shape=128 layers_loaded=3 cache_hit=2 compiled=1 total_ms=450.0 outcome=admitted"
+        );
+        let failure = anyhow::anyhow!("ane_temp_space_low: full");
+        assert!(loads
+            .summary(128, std::time::Duration::ZERO, Some(&failure))
+            .ends_with("outcome=failed: ane_temp_space_low: full"));
+        assert_eq!(
+            loads.profile_rows()[1],
+            serde_json::json!({"layer": 1, "origin": "compiled", "ms": 400.0})
+        );
+    }
+}
+
+#[cfg(test)]
+mod temp_space_tests {
+    use super::layer_program_tests::synthetic_gte_model;
+    use super::*;
+    use std::cell::Cell;
+
+    /// Stands in for the binding when aned does not hold the layer: it runs
+    /// the temp-space check, then fails where the real compile would start.
+    fn uncached_binding(
+        compiles: &Cell<usize>,
+    ) -> impl FnMut(&Graph, &mut dyn FnMut() -> Result<()>) -> Result<Executable> + '_ {
+        move |_, before_compile| {
+            before_compile()?;
+            compiles.set(compiles.get() + 1);
+            Err(ane::Error::Compile("stand-in compiler stops here".into()).into())
+        }
+    }
+
+    #[test]
     fn admission_refuses_before_compiling_when_temp_space_is_low() {
-        let mut model = empty_gte_model();
+        let mut model = synthetic_gte_model(1);
+        let compiles = Cell::new(0);
         let error = model
             .admit_progress_checking_space(
                 128,
                 "test-os",
                 |_| Ok(MIN_COMPILE_TEMP_FREE_BYTES - 1),
+                uncached_binding(&compiles),
                 &mut || Ok(()),
             )
             .unwrap_err();
@@ -1895,6 +2121,7 @@ mod temp_space_tests {
             ),
             "{error:#}"
         );
+        assert_eq!(compiles.get(), 0, "nothing may compile on a full disk");
         assert!(model.resident.is_empty());
         let synapse_core::WorkerResponse::Err { code, .. } =
             crate::worker::request_error(None, &error)
@@ -1906,12 +2133,14 @@ mod temp_space_tests {
 
     #[test]
     fn unreadable_temp_space_is_a_refusal() {
-        let mut model = empty_gte_model();
+        let mut model = synthetic_gte_model(1);
+        let compiles = Cell::new(0);
         let error = model
             .admit_progress_checking_space(
                 128,
                 "test-os",
                 |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                uncached_binding(&compiles),
                 &mut || Ok(()),
             )
             .unwrap_err();
@@ -1923,25 +2152,56 @@ mod temp_space_tests {
             "{error:#}"
         );
         assert!(error.to_string().starts_with("ane_temp_space_low:"));
+        assert_eq!(compiles.get(), 0);
     }
 
     #[test]
     fn enough_temp_space_lets_admission_proceed() {
-        // With room to compile, admission goes on to build the first layer's
-        // graph, which needs weights this test model does not have.
-        let mut model = empty_gte_model();
+        let mut model = synthetic_gte_model(1);
+        let compiles = Cell::new(0);
         let error = model
             .admit_progress_checking_space(
                 128,
                 "test-os",
                 |_| Ok(MIN_COMPILE_TEMP_FREE_BYTES),
+                uncached_binding(&compiles),
                 &mut || Ok(()),
             )
             .unwrap_err();
         assert!(error.downcast_ref::<TempSpaceRefusal>().is_none());
+        assert_eq!(compiles.get(), 1, "{error:#}");
         assert!(
-            error.to_string().starts_with("tensor_missing:"),
+            format!("{error:#}").starts_with("compile layer 0: ANE compile failed"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_layer_aned_holds_is_not_refused_on_a_full_disk() {
+        // Stands in for the binding when aned holds the layer: it loads
+        // without the temp-space check, then this stand-in stops, because a
+        // real executable needs the Neural Engine.
+        let mut model = synthetic_gte_model(1);
+        let checked = Cell::new(false);
+        let error = model
+            .admit_progress_checking_space(
+                128,
+                "test-os",
+                |_| {
+                    checked.set(true);
+                    Ok(0)
+                },
+                |_, _| Err(ane::Error::Load("stand-in stops after the cached load".into()).into()),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<TempSpaceRefusal>().is_none(),
+            "{error:#}"
+        );
+        assert!(
+            !checked.get(),
+            "a cached layer must not read the temp volume"
         );
     }
 

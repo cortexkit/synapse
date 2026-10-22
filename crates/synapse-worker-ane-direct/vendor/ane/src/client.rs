@@ -50,64 +50,228 @@ pub fn nsdata_on_surface(data: &[u8]) -> (Retained<NSData>, Retained<IOSurface>)
     (nsdata, surface)
 }
 
+/// How a layer program got onto the Neural Engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramOrigin {
+    /// aned already held the compiled program for this identifier, and it
+    /// was loaded without writing sources or compiling.
+    CacheHit,
+    /// The program was compiled from its sources, then loaded.
+    Compiled,
+}
+
+impl ProgramOrigin {
+    /// The name used in logs and profile records: `cache_hit` or `compiled`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheHit => "cache_hit",
+            Self::Compiled => "compiled",
+        }
+    }
+}
+
 pub fn compile_network(
     graph: &Graph,
     quality_of_service: NSQualityOfService,
 ) -> Result<Executable, Error> {
+    compile_network_gated(graph, quality_of_service, || Ok::<(), Error>(()))
+}
+
+/// [`compile_network`], calling `before_compile` just before it would write
+/// the sources and compile. If `before_compile` fails, its error is returned
+/// unchanged and nothing is written or compiled. A program that aned already
+/// holds is loaded without calling it, because that load writes nothing.
+pub fn compile_network_gated<E: From<Error>>(
+    graph: &Graph,
+    quality_of_service: NSQualityOfService,
+    before_compile: impl FnOnce() -> Result<(), E>,
+) -> Result<Executable, E> {
     ensure_framework()?;
-
-    let (ops, shapes) = graph.to_ops_and_shapes();
-    let (mil_text, weight_bytes) = crate::ops::mil::emit_mil(&ops, &shapes);
-
-    let (mil_data, _mil_surface) = nsdata_on_surface(mil_text.as_bytes());
-
-    let _weight_surface: Option<Retained<IOSurface>>;
-    let weights_dict: Retained<NSDictionary<NSString, AnyObject>> = if weight_bytes.is_empty() {
-        _weight_surface = None;
-        NSDictionary::new()
-    } else {
-        let (weight_data, weight_surface) = nsdata_on_surface(&weight_bytes);
-        _weight_surface = Some(weight_surface);
-        let offset = NSNumber::new_u64(0);
-        let entry: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(
-            &[&*NSString::from_str("offset"), &*NSString::from_str("data")],
-            &[
-                offset.as_ref() as &AnyObject,
-                weight_data.as_ref() as &AnyObject,
-            ],
-        );
-        let key = NSString::from_str("@model_path/weights/weight.bin");
-        NSDictionary::from_slices(&[&*key], &[entry.as_ref() as &AnyObject])
+    let sources = ProgramSources::new(graph)?;
+    let new_program = || {
+        ANEInMemoryModel::with_descriptor(&sources.descriptor)
+            .map(|model| InMemoryProgram {
+                model,
+                qos: quality_of_service,
+            })
+            .ok_or(Error::ModelCreation)
     };
-
-    let descriptor = ANEInMemoryModelDescriptor::new(&mil_data, Some(&weights_dict))
-        .ok_or(Error::ModelCreation)?;
-
-    let model = ANEInMemoryModel::with_descriptor(&descriptor).ok_or(Error::ModelCreation)?;
-
-    let identifier = model.hex_string_identifier().map(|id| id.to_string());
-    with_compile_dir(
+    let (program, origin) = load_program(
+        new_program,
         &std::env::temp_dir(),
-        identifier.as_deref(),
-        mil_text.as_bytes(),
-        &weight_bytes,
-        || {
-            model
-                .compile(quality_of_service)
-                .map_err(|error| Error::Compile(error.localizedDescription().to_string()))?;
-            model
-                .load(quality_of_service)
-                .map_err(|error| Error::Load(error.localizedDescription().to_string()))
-        },
+        sources.mil_text.as_bytes(),
+        &sources.weight_bytes,
+        before_compile,
     )?;
 
     Ok(Executable {
-        inner: model,
+        inner: program.model,
         qos: quality_of_service,
+        origin,
         cached_request: std::cell::UnsafeCell::new(None),
         stats_request: std::cell::UnsafeCell::new(None),
         perf_stats: std::cell::UnsafeCell::new(None),
     })
+}
+
+/// The identifier aned files this graph's compiled program under
+/// (`<MIL hash>_<weights hash>_<options hash>`), computed from the same
+/// descriptor [`compile_network`] builds. Nothing is compiled or loaded and
+/// aned is not asked about its cache.
+#[doc(hidden)]
+pub fn program_identifier(graph: &Graph) -> Result<Option<String>, Error> {
+    ensure_framework()?;
+    let sources = ProgramSources::new(graph)?;
+    let model =
+        ANEInMemoryModel::with_descriptor(&sources.descriptor).ok_or(Error::ModelCreation)?;
+    Ok(model.hex_string_identifier().map(|id| id.to_string()))
+}
+
+/// One layer program's MIL text and packed weights, and the in-memory model
+/// descriptor built from them.
+struct ProgramSources {
+    mil_text: String,
+    weight_bytes: Box<[u8]>,
+    descriptor: Retained<ANEInMemoryModelDescriptor>,
+    // The descriptor's NSData objects point into these surfaces without
+    // copying, so the surfaces are kept as long as the sources are.
+    _mil_surface: Retained<IOSurface>,
+    _weight_surface: Option<Retained<IOSurface>>,
+}
+
+impl ProgramSources {
+    fn new(graph: &Graph) -> Result<Self, Error> {
+        let (ops, shapes) = graph.to_ops_and_shapes();
+        let (mil_text, weight_bytes) = crate::ops::mil::emit_mil(&ops, &shapes);
+
+        let (mil_data, mil_surface) = nsdata_on_surface(mil_text.as_bytes());
+
+        let weight_surface: Option<Retained<IOSurface>>;
+        let weights_dict: Retained<NSDictionary<NSString, AnyObject>> = if weight_bytes.is_empty() {
+            weight_surface = None;
+            NSDictionary::new()
+        } else {
+            let (weight_data, surface) = nsdata_on_surface(&weight_bytes);
+            weight_surface = Some(surface);
+            let offset = NSNumber::new_u64(0);
+            let entry: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(
+                &[&*NSString::from_str("offset"), &*NSString::from_str("data")],
+                &[
+                    offset.as_ref() as &AnyObject,
+                    weight_data.as_ref() as &AnyObject,
+                ],
+            );
+            let key = NSString::from_str("@model_path/weights/weight.bin");
+            NSDictionary::from_slices(&[&*key], &[entry.as_ref() as &AnyObject])
+        };
+
+        let descriptor = ANEInMemoryModelDescriptor::new(&mil_data, Some(&weights_dict))
+            .ok_or(Error::ModelCreation)?;
+        Ok(Self {
+            mil_text,
+            weight_bytes,
+            descriptor,
+            _mil_surface: mil_surface,
+            _weight_surface: weight_surface,
+        })
+    }
+}
+
+/// The private calls that getting one in-memory program onto the Neural
+/// Engine needs. [`load_program`] decides between them; the unit tests drive
+/// it with a stand-in, because the real calls need aned and the hardware.
+pub(crate) trait LayerProgram {
+    /// aned's identifier for the program, which also names its compiler
+    /// temp directory.
+    fn identifier(&self) -> Option<String>;
+    /// Whether aned already holds the compiled program.
+    fn compiled_model_exists(&self) -> bool;
+    fn compile(&self) -> Result<(), Error>;
+    fn load(&self) -> Result<(), Error>;
+}
+
+struct InMemoryProgram {
+    model: Retained<ANEInMemoryModel>,
+    qos: NSQualityOfService,
+}
+
+impl LayerProgram for InMemoryProgram {
+    fn identifier(&self) -> Option<String> {
+        self.model.hex_string_identifier().map(|id| id.to_string())
+    }
+
+    fn compiled_model_exists(&self) -> bool {
+        self.model.compiled_model_exists()
+    }
+
+    fn compile(&self) -> Result<(), Error> {
+        self.model
+            .compile(self.qos)
+            .map_err(|error| Error::Compile(error.localizedDescription().to_string()))
+    }
+
+    fn load(&self) -> Result<(), Error> {
+        self.model
+            .load(self.qos)
+            .map_err(|error| Error::Load(error.localizedDescription().to_string()))
+    }
+}
+
+/// Gets one program onto the Neural Engine, reusing aned's compiled copy when
+/// there is one.
+///
+/// aned keeps compiled in-memory programs on disk, keyed by the program's
+/// identifier (a hash of its MIL text, weights and options) and the calling
+/// binary's code-signing identifier. When it holds this program, `load`
+/// alone uses that copy: nothing is written and nothing is compiled. On
+/// macOS 27.0 (26A425), such a load took 3.5–45 ms against 0.37–15.8 s for a
+/// compile, with byte-identical outputs.
+///
+/// Otherwise this compiles as before: write the sources, compile, load,
+/// remove the sources ([`with_compile_dir`]). Two shortcuts are wrong and are
+/// not taken. A `load` without a cached copy makes the framework write its
+/// own sources, which aned then rejects (`verifyBundleAtPath` hash
+/// mismatch). And `compile` never consults the cache, so compiling a cached
+/// program repeats the whole compile.
+///
+/// If the cached load fails anyway (for example because aned evicted the
+/// copy after the check), the program is compiled from a fresh model object,
+/// since the failed load may have left the first one in an unknown state.
+/// `before_compile` runs only on the compile path, right before the sources
+/// are written.
+pub(crate) fn load_program<P: LayerProgram, E: From<Error>>(
+    mut new_program: impl FnMut() -> Result<P, Error>,
+    temp_root: &Path,
+    mil_text: &[u8],
+    weight_bytes: &[u8],
+    before_compile: impl FnOnce() -> Result<(), E>,
+) -> Result<(P, ProgramOrigin), E> {
+    let mut program = new_program()?;
+    if program.compiled_model_exists() {
+        match program.load() {
+            Ok(()) => return Ok((program, ProgramOrigin::CacheHit)),
+            Err(error) => {
+                eprintln!(
+                    "ane: loading cached program {} failed, compiling it instead: {error}",
+                    program.identifier().as_deref().unwrap_or("<no identifier>")
+                );
+                program = new_program()?;
+            }
+        }
+    }
+    before_compile()?;
+    let identifier = program.identifier();
+    with_compile_dir(
+        temp_root,
+        identifier.as_deref(),
+        mil_text,
+        weight_bytes,
+        || {
+            program.compile()?;
+            program.load()
+        },
+    )?;
+    Ok((program, ProgramOrigin::Compiled))
 }
 
 /// Gives the private compiler the source files of one layer program, runs
@@ -129,10 +293,11 @@ pub fn compile_network(
 /// other applications use the same private compiler and the same per-user
 /// temp folder.
 ///
-/// On that OS build every compile got a fresh identifier, even for an
-/// identical program, so two compiles normally never share a directory.
-/// Nothing guarantees that, so each compile holds a shared `flock` on the
-/// directory while it uses it. If two compiles ever share one, whoever
+/// The identifier is a hash of the program's bytes, and the graph emits
+/// identical bytes for an identical program, so two processes compiling the
+/// same layer at the same time share one directory. Each compile therefore
+/// holds a shared `flock` on the directory while it uses it. If two compiles
+/// share one, whoever
 /// finishes last can take the lock exclusively and removes it; a compile that
 /// finds it still shared leaves it to the other.
 pub(crate) fn with_compile_dir<T>(
@@ -410,5 +575,143 @@ mod tests {
             );
         }
         assert!(inner.exists() && root.0.exists());
+    }
+
+    /// Stand-in for one `_ANEInMemoryModel`: answers the cache query as told
+    /// and records every call in a log shared with the test.
+    struct FakeProgram {
+        cached: bool,
+        cached_load_fails: bool,
+        dir: PathBuf,
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl LayerProgram for FakeProgram {
+        fn identifier(&self) -> Option<String> {
+            Some(ID.into())
+        }
+
+        fn compiled_model_exists(&self) -> bool {
+            self.log.borrow_mut().push("exists");
+            self.cached
+        }
+
+        fn compile(&self) -> Result<(), Error> {
+            self.log.borrow_mut().push("compile");
+            fake_compiler_outputs(&self.dir);
+            Ok(())
+        }
+
+        fn load(&self) -> Result<(), Error> {
+            if self.cached && self.cached_load_fails {
+                self.log.borrow_mut().push("load-failed");
+                return Err(Error::Load("verifyBundleAtPath: hash mismatch".into()));
+            }
+            self.log.borrow_mut().push("load");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    enum GateError {
+        Refused(&'static str),
+        Ane(Error),
+    }
+
+    impl From<Error> for GateError {
+        fn from(error: Error) -> Self {
+            Self::Ane(error)
+        }
+    }
+
+    /// Runs `load_program` with fake programs: the first one answers the
+    /// cache query with `cached`; any later one (the compile after a failed
+    /// cached load) is a miss. Returns the outcome and the call log.
+    fn run_load_program(
+        root: &TempRoot,
+        cached: bool,
+        cached_load_fails: bool,
+        gate: Result<(), GateError>,
+    ) -> (Result<ProgramOrigin, GateError>, Vec<&'static str>) {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut created = 0;
+        let new_program = || {
+            log.borrow_mut().push("new");
+            created += 1;
+            Ok(FakeProgram {
+                cached: cached && created == 1,
+                cached_load_fails,
+                dir: root.0.join(ID),
+                log: log.clone(),
+            })
+        };
+        let result = load_program(new_program, &root.0, b"program", b"weights", || {
+            log.borrow_mut().push("gate");
+            gate
+        })
+        .map(|(_, origin)| origin);
+        let calls = log.borrow().clone();
+        (result, calls)
+    }
+
+    #[test]
+    fn a_cached_program_is_loaded_without_writing_or_compiling() {
+        let root = TempRoot::new("cache-hit");
+        let (result, calls) = run_load_program(&root, true, false, Ok(()));
+        assert_eq!(result.unwrap(), ProgramOrigin::CacheHit);
+        // No temp-space gate, no sources, no compile.
+        assert_eq!(calls, ["new", "exists", "load"]);
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_uncached_program_is_compiled_then_loaded() {
+        let root = TempRoot::new("cache-miss");
+        let (result, calls) = run_load_program(&root, false, false, Ok(()));
+        assert_eq!(result.unwrap(), ProgramOrigin::Compiled);
+        // No load is tried before the compile: on a miss it would make the
+        // framework write sources that aned rejects.
+        assert_eq!(calls, ["new", "exists", "gate", "compile", "load"]);
+        assert!(!root.0.join(ID).exists(), "the sources must be removed");
+    }
+
+    #[test]
+    fn a_failed_cached_load_falls_back_to_compiling_a_fresh_model() {
+        let root = TempRoot::new("cache-hit-fails");
+        let (result, calls) = run_load_program(&root, true, true, Ok(()));
+        assert_eq!(result.unwrap(), ProgramOrigin::Compiled);
+        assert_eq!(
+            calls,
+            [
+                "new",
+                "exists",
+                "load-failed",
+                "new",
+                "gate",
+                "compile",
+                "load"
+            ]
+        );
+        assert!(!root.0.join(ID).exists(), "the sources must be removed");
+    }
+
+    #[test]
+    fn a_refused_compile_writes_and_compiles_nothing() {
+        let root = TempRoot::new("gate-refuses");
+        for (cached, cached_load_fails) in [(false, false), (true, true)] {
+            let (result, calls) = run_load_program(
+                &root,
+                cached,
+                cached_load_fails,
+                Err(GateError::Refused("no room")),
+            );
+            assert!(
+                matches!(result, Err(GateError::Refused("no room"))),
+                "{result:?}"
+            );
+            assert_eq!(calls.last(), Some(&"gate"), "{calls:?}");
+            assert!(!calls.contains(&"compile"), "{calls:?}");
+            assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+        }
     }
 }
