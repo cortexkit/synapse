@@ -269,16 +269,23 @@ a compile, as before.
 Once a direct-ANE catalog lane is ready (its self-check passed), the module
 loads rungs 128, 256 and 512 of it in the background:
 
-- at the lowest priority, one admission at a time, only while no request waits;
+- at the lowest priority, one admission at a time, only while no request
+  waits and the lane is quiet: no shape of it leased, no request on its way
+  from a handoff answer to its lease, and its worker stream idle;
 - only into free executable budget and free shape slots, never evicting;
 - the first rung that does not fit ends the prewarm.
 
-Packed preparation outranks prewarm: it waits for a running prewarm admission
-instead of giving up. A request that arrives while a prewarm admission runs
+Packed preparation outranks prewarm. It waits for a running prewarm admission,
+including for the budget that admission holds, and it is retried when a
+prewarm admission ends. A request that arrives while a prewarm admission runs
 waits for that one admission, which is about 2 s on a cached machine and one
 small compile on a cold one. Unloading the lane, pausing the Neural Engine
-(`lanes.pause` unloads every lane) and retiring the worker cancel the rest.
-A running admission finishes first. Each worker is prewarmed once. The end is
+(`lanes.pause` unloads every lane) and retiring the worker cancel the rest: a
+prewarm admission that has not reached the worker is withdrawn, and one on
+the wire finishes first. If the worker refuses a prewarm admission, the
+prewarm ends with a WARN line and the worker is not restarted; an admission
+with an unknown outcome restarts it, as any admission does. Each worker is
+prewarmed once. The end is
 logged once at INFO, `direct-ANE prewarm finished` (or `cancelled`), with the
 fields `lane`, `loaded` (the rungs admitted), `loaded_from_cache` and
 `compiled` (how many of those rungs), `already_resident`,

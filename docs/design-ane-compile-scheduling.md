@@ -726,10 +726,19 @@ passed, the module sends the scheduler `Prewarm { worker, model_ref, shapes:
 [128, 256, 512] ∩ published ladder }`. The scheduler keeps a per-worker list
 and owns it like everything else:
 
-- **Lowest priority.** In a pass, a prewarm shape starts only if no request is
-  waiting or queued, no compile entry exists, and the compile gate is free.
-  Then it is reserved and dispatched like a compile with no owner and no
-  waiter. A request that arrives later for the same shape joins it.
+- **Lowest priority.** In a pass, a prewarm shape starts only if:
+  - no request is waiting or queued, no compile entry exists, and the
+    compile gate is free;
+  - its worker's lane is quiet: no shape of it is leased, no request is
+    between its handoff answer and its lease (a cohort member keeps its
+    membership until it leases or leaves), and its stream is idle.
+
+  A prewarm admission holds the worker stream for its whole length, so
+  starting one while the lane serves would make that traffic wait for it.
+  Stream use without a lease is not reported when it ends, so a prewarm held
+  back only by it looks again every 50 ms. Once started, a prewarm shape is
+  reserved and dispatched like a compile with no owner and no waiter. A
+  request that arrives later for the same shape joins it.
 - **No eviction, within the budget.** A prewarm shape starts only if the free
   budget already holds it (`reserved + executables ≤ 100`) and the per-model
   (4) and total (8) shape limits allow it. It never evicts, so it never
@@ -746,9 +755,28 @@ and owns it like everything else:
   at 128, 14 s at 256 and 21 s at 512, and measured runs varied up to twice
   that. Going smallest first keeps each step short.
 - **Cancellation.** Lane unload, pause and retirement all retire the worker
-  (`AneServing::retire`). Retirement drops that worker's prewarm list. A
-  prewarm admission already running finishes and is then released by the
-  retirement, as any running admission is today.
+  (`AneServing::retire`).
+  - Retirement drops that worker's prewarm list.
+  - A prewarm admission that has not reached the worker yet is withdrawn, so
+    unload and pause do not wait for it.
+  - A prewarm admission already on the wire finishes and is then released by
+    the retirement, as any running admission is.
+- **Failures.** An admission that fails ends that lane's prewarm.
+  - **A definite worker error** (the worker answered, for example
+    `compile_failed`): the worker has rolled back what it loaded and nothing
+    is compiling. The reservation is refunded, one WARN line is written, and
+    the worker is not restarted.
+  - **A refusal for lack of Neural Engine resources** removes the slot and
+    evicts nothing.
+  - **An unknown outcome** (transport fault, timeout, panic): the worker is
+    still restarted after confirmed exit, as for any admission. The stream may
+    be mid-reply, so the worker cannot be trusted without a restart.
+- **Recovery.** A recovery started for another reason may confirm the old
+  process's exit and release the running prewarm admission's slot before
+  that admission's completion arrives. The shape then goes back to the front
+  of the plan and is loaded on the restarted worker. Completions are matched
+  by slot id, so a stale completion never touches a later admission. A
+  second such interruption ends the prewarm.
 - **Pause and self-check.** `lanes.pause` unloads every Neural Engine lane, so
   prewarm stops with it. After resume, a lane prewarms again when it next
   becomes ready. Prewarm is queued only after the self-check, so the self-check
@@ -827,3 +855,37 @@ takes. It also times `compiledModelExists`.
     after the cold run had skipped it. In the second cold run, the kit's
     purge reported every layer gone, yet a fresh worker found and loaded all
     of them from the cache. Why the purge did not take there is unresolved.
+
+### 7.8 Changes after the audit of `42872ce7`
+
+- **Prewarm waits for a quiet lane.** A request that joined a prewarm
+  admission had to return to its lease after the handoff answer. Meanwhile the
+  next prewarm admission could take the worker stream, so that request waited
+  for two prewarm admissions. Prewarm now also requires its worker to hold no
+  lease, no request between handoff answer and lease, and an idle stream
+  (7.4).
+- **Recovery and prewarm.** A recovery that released the running prewarm
+  admission's slot used to leave the prewarm stuck. The shape is now loaded
+  again on the restarted worker, and completions are matched by slot id
+  (7.4).
+- **Failures.** A worker refusal of a prewarm admission no longer restarts
+  the worker; an unknown outcome still does (7.4).
+- **Retirement** withdraws a prewarm admission that has not reached the
+  worker (7.4).
+- **Packed preparation and prewarm budget.** Budget held by a running prewarm
+  admission counts as reclaimable for packed preparation, which waits for it.
+  Preparation is retried each time a prewarm admission ends.
+- **Cache reports carry when the check began.** A `LOADED` report whose check
+  began before an admission of the same rung completed no longer overwrites
+  what that admission saw. A later check still can, so aned's own evictions
+  are seen.
+- **Retirement cancellation.** The retirement future (`AneResidencySupervisor::retire`:
+  `Retire`, then the shutdown, then `RetireDone`) is not cancellation-safe,
+  but production never cancels it, so nothing changed:
+  - `DirectAneEngine::unload` runs it under `block_on` to completion.
+  - The model-unload handler and the pause drain call that from
+    `spawn_blocking`, which is not cancelled when its handle is dropped.
+  - `Drop for DirectAneEngine` runs it on a thread of its own, and only its
+    wait for that thread is bounded.
+
+  Only tests await it directly.
