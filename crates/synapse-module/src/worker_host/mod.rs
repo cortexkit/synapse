@@ -4800,6 +4800,10 @@ pub mod ane_residency {
         /// test can keep its mailbox busier than it can drain.
         #[cfg(test)]
         slow_nudges: Mutex<Option<std::time::Duration>>,
+        /// Given to the scheduler when it starts; it is dropped with the
+        /// scheduler, so a test can see the scheduler end.
+        #[cfg(test)]
+        scheduler_exit_signal: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         #[cfg(unix)]
         lane_lock: Mutex<Option<AneDirectLaneLock>>,
         #[cfg(unix)]
@@ -4835,6 +4839,8 @@ pub mod ane_residency {
                 wait_decision_gate: Mutex::new(None),
                 #[cfg(test)]
                 slow_nudges: Mutex::new(None),
+                #[cfg(test)]
+                scheduler_exit_signal: Mutex::new(None),
                 #[cfg(unix)]
                 lane_lock: Mutex::new(None),
                 #[cfg(unix)]

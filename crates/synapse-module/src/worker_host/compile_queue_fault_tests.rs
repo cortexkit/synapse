@@ -1654,3 +1654,72 @@ async fn closed_joiner_does_not_stay_in_the_handoff_cohort() {
     );
     assert!(owner.await.unwrap().ok());
 }
+
+/// After the scheduler stops, a supervisor whose worker holds it (as the
+/// worker channel's connector does) is still freed once its users drop it:
+/// the stopped scheduler's slots no longer keep the worker, and so the
+/// supervisor, alive.
+#[tokio::test(start_paused = true)]
+async fn supervisor_drops_cleanly_after_the_scheduler_stops() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+    *worker.held_supervisor.lock().unwrap() = Some(supervisor.clone());
+    let inner = Arc::downgrade(&supervisor.inner);
+    supervisor
+        .inner
+        .scheduler_task
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the scheduler was started")
+        .abort();
+    until(|| supervisor.inner.closed.load(Ordering::Acquire)).await;
+    drop((supervisor, worker, worker_dyn));
+    assert!(
+        inner.upgrade().is_none(),
+        "the supervisor leaked through its stopped scheduler's slots"
+    );
+}
+
+/// A scheduler on its own thread ends when the supervisor is dropped, even
+/// while one of its operations never finishes: operations do not keep its
+/// mailbox open.
+#[test]
+fn dedicated_scheduler_ends_when_the_supervisor_drops() {
+    let supervisor = queue_supervisor();
+    let (signal, exited) = std::sync::mpsc::channel();
+    *supervisor.inner.scheduler_exit_signal.lock().unwrap() = Some(signal);
+    let compiler = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async { SharedCompiler::new(1.0) });
+    let broken = fake_handle(&compiler, "broken");
+    broken.exit_never_confirmed.store(true, Ordering::SeqCst);
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    // No Tokio runtime on this thread, so the scheduler starts on its own.
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    supervisor
+        .inner
+        .send(scheduler::Msg::Recover {
+            worker: broken_dyn.clone(),
+            generation: 0,
+            reply,
+        })
+        .unwrap();
+    // The restart has begun (it bumps the generation) and never returns.
+    let started = std::time::Instant::now();
+    while broken.generation() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(5), "the restart never began");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop((supervisor, broken_dyn));
+    assert_eq!(
+        exited.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the scheduler's thread outlived its supervisor"
+    );
+}

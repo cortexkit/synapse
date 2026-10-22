@@ -194,7 +194,10 @@ impl AnswerKind {
 pub(super) struct DispatchCell {
     at: Mutex<Option<tokio::time::Instant>>,
     slot_id: u64,
-    report: mpsc::UnboundedSender<Msg>,
+    /// Weak, like every sender an operation holds, so that an operation
+    /// still running does not keep the scheduler alive after the supervisor
+    /// is gone.
+    report: mpsc::WeakUnboundedSender<Msg>,
 }
 
 impl DispatchCell {
@@ -204,10 +207,12 @@ impl DispatchCell {
             .at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(now);
-        let _ = self.report.send(Msg::Dispatched {
-            slot_id: self.slot_id,
-            at: now,
-        });
+        if let Some(report) = self.report.upgrade() {
+            let _ = report.send(Msg::Dispatched {
+                slot_id: self.slot_id,
+                at: now,
+            });
+        }
     }
 
     fn at(&self) -> Option<tokio::time::Instant> {
@@ -358,6 +363,8 @@ pub(super) struct Scheduler {
     /// Caller expiries that arrived before their request was first decided.
     deferred_expiries: Vec<(u64, oneshot::Sender<AnswerKind>)>,
     answered: VecDeque<(u64, AnswerKind)>,
+    #[cfg(test)]
+    _exit_signal: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// Marks the supervisor closed when the scheduler's loop ends for any
@@ -369,6 +376,18 @@ impl Drop for DeathGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.0.upgrade() {
             inner.closed.store(true, Ordering::Release);
+            // Nothing will manage these any more. Their workers hold the
+            // connector, which holds the supervisor: dropping them breaks that
+            // reference cycle, so the supervisor (and its lane lock) can go
+            // when its last user drops it. Dropped outside the state lock.
+            let (slots, entries) = {
+                let mut state = inner.lock();
+                (
+                    std::mem::take(&mut state.slots),
+                    std::mem::take(&mut state.entries),
+                )
+            };
+            drop((slots, entries));
             tracing::error!(
                 target: "worker",
                 "direct-ANE compile scheduler stopped; direct-ANE lanes are closed until the module restarts"
@@ -393,6 +412,8 @@ impl Scheduler {
                 retirements: BTreeMap::new(),
                 closed: BTreeSet::new(),
                 deferred_expiries: Vec::new(),
+                #[cfg(test)]
+                _exit_signal: inner.scheduler_exit_signal.lock().unwrap().clone(),
                 answered: VecDeque::new(),
             },
             tx,
@@ -1376,8 +1397,11 @@ impl Scheduler {
         );
     }
 
-    fn report_sender(&self) -> Option<mpsc::UnboundedSender<Msg>> {
-        self.tx.upgrade()
+    /// Where an operation reports back. Weak: the supervisor's mailbox is the
+    /// only strong sender, so the scheduler's loop ends (aborting what it still
+    /// runs) once the supervisor is dropped.
+    fn report_sender(&self) -> Option<mpsc::WeakUnboundedSender<Msg>> {
+        self.tx.upgrade().map(|_| self.tx.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1643,7 +1667,7 @@ impl Scheduler {
             let (exited, exit) = oneshot::channel();
             let forward = async move {
                 let exited = exit.await.is_ok();
-                if exited {
+                if let (true, Some(report)) = (exited, report.upgrade()) {
                     let _ = report.send(Msg::ExitConfirmed {
                         worker_id: reported,
                         generation,

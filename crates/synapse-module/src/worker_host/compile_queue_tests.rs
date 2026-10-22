@@ -149,6 +149,8 @@ struct FakeCompileWorker {
     panic_restart_after_exit: std::sync::atomic::AtomicBool,
     restarts: AtomicU64,
     evictions: Mutex<Vec<(String, usize)>>,
+    /// A supervisor the worker keeps, as the worker channel's connector does.
+    held_supervisor: Mutex<Option<AneResidencySupervisor>>,
 }
 
 impl FakeCompileWorker {
@@ -303,6 +305,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         panic_restart_after_exit: Default::default(),
         restarts: AtomicU64::new(0),
         evictions: Mutex::new(Vec::new()),
+        held_supervisor: Mutex::new(None),
     })
 }
 
