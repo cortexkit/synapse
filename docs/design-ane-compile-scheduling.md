@@ -362,7 +362,9 @@ Each change below was made after a deterministic test failed against
 
 ## 6. Rebuild: one scheduler task (proposed after the second audit of `c85405b3`)
 
-Status: **proposed, not implemented.** Most findings of the second audit come
+Status: **implemented**, with the two changes approved with it (6.4, exit
+never confirmed; 6.9, a stopped scheduler) and the choices recorded in 6.10.
+Most findings of the second audit come
 from request tasks and orphan drivers driving the queue at the same time, each
 under its own lock acquisitions, instants and cancellation. The rebuild moves
 every queue decision into one task.
@@ -552,3 +554,54 @@ regression checks on behaviour that can still be observed, such as an expired
 promise leaving no entry and a head waking at the end of its gathering window.
 
 The hardware kit is unchanged; whether to re-run it is decided after review.
+
+### 6.9 A stopped scheduler closes the lane
+
+If the scheduler's loop ends for any reason (a panic, or its task being
+aborted), its pending requests' reply channels close and every later request is
+refused at once: requests get `SchedulerStopped`, which the wire maps to
+`engine_crashed` with the lane id. The supervisor does not restart the
+scheduler. A restarted scheduler would have to rebuild in-flight compiles and
+evictions it no longer owns, and a scheduler stopped by a bug would likely stop
+again. The lane stays closed until the module restarts, and the module logs one
+error.
+
+### 6.10 Choices made while implementing
+
+- **Where the state lives.** Queue entries, slots and learning state stay in the
+  supervisor's shared `State` behind its mutex, so the lease fast path,
+  statistics and tests can read them. Only the scheduler task changes queue
+  entries, waiters, promises and slot lifecycles. Requests change nothing but
+  their own leases. Waiters' reply channels live in the scheduler task, so they
+  close if it stops.
+- **Where the scheduler runs.** The module's supervisor (`with_lane_lock`) runs
+  its scheduler on a thread with its own runtime, because direct-ANE engines each
+  have their own runtime and any of them may be unloaded. A supervisor built with
+  `new` (tests) runs it on the first caller's runtime, whose paused clock it then
+  shares.
+- **Exit confirmation.** The worker trait gains `restart_with_exit_signal`,
+  which reports the old process's confirmed exit before the replacement starts.
+  That is an internal change only. The scheduler gives up on confirmation for
+  the gate after `EXIT_CONFIRMATION_GIVE_UP` (35 s). The worker channel waits
+  2 s, sends SIGKILL, and allows 30 s in total, and the extra 5 s lets the
+  channel's own timeout report first. After giving up, the slot stays charged
+  as `Abandoned`, the worker stays closed, and one WARN names the worker and its
+  pid.
+- **A definite worker error** leaves the slot `Rejected`: charged, but not
+  holding the gate, until the worker's recovery confirms its exit.
+- **Whose wait the compile bounds.** The request whose turn started a compile
+  waits for that compile to finish, as it always has. Its serving task keeps the
+  lane's serving gate until the compile's reply has drained, and its caller is
+  answered at the deadline through `Expired`. Requests that only joined the
+  compile are answered at their own deadline. The 600 s backstop bounds queue
+  waits, not a running compile.
+- **Compiles kept only for a promise** (nobody waits for them now) are elected
+  like any other. While another compile runs they do not evict ahead of their
+  turn, so a compile that may expire before it can start never evicts.
+- **Requests register when the scheduler receives them.** The window the audit
+  found, a retry enqueued but not yet decided, no longer exists. The test for it
+  now holds a registered request unpolled across the expiry.
+- **The handoff** uses `Ready` answers plus a cohort barrier on the slot, as
+  designed. A cohort member leases through the fast path. The barrier ends when
+  the last member leases, or at the scheduler's 250 ms timer.
+

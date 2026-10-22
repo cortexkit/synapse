@@ -109,20 +109,33 @@ impl SharedCompiler {
 
 /// A fake direct-ANE worker on the shared compiler. Like a real worker it has
 /// one stream: a compile or an eviction holds it, and a test can hold it to
-/// stand for a long inference. A test can also make the next admission
-/// panic or fail, hold or fail the next restart (a successful restart
-/// increments the generation), report that the old process's exit could not
-/// be confirmed, and read which shapes were evicted.
+/// stand for a long inference. A test can also make the next admission panic
+/// or fail, and shape the next restart: hold it before the old process's exit
+/// is confirmed (`restart_gate`) or after it (`replacement_gate`), never
+/// confirm the exit, fail it, or report the exit unconfirmed. Every restart
+/// attempt starts a new generation, as the worker channel's does.
 struct FakeCompileWorker {
     id: String,
     compiler: Arc<SharedCompiler>,
     stream: tokio::sync::Mutex<()>,
     generation: AtomicU64,
     panic_next_admit: std::sync::atomic::AtomicBool,
+    /// The worker answers the next admission with an error (a definite
+    /// refusal: nothing is compiling).
     fail_next_admit: std::sync::atomic::AtomicBool,
+    /// The next admission's connection fails (an unknown outcome).
+    transport_fail_next_admit: std::sync::atomic::AtomicBool,
+    /// The worker refuses the next admission for lack of Neural Engine
+    /// resources.
+    exhaust_next_admit: std::sync::atomic::AtomicBool,
+    fail_next_evict: std::sync::atomic::AtomicBool,
+    /// Holds the next admission once it has reached the worker.
+    admit_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     fail_next_restart: std::sync::atomic::AtomicBool,
     exit_unconfirmed: std::sync::atomic::AtomicBool,
     restart_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    replacement_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    exit_never_confirmed: std::sync::atomic::AtomicBool,
     restarts: AtomicU64,
     evictions: Mutex<Vec<(String, usize)>>,
 }
@@ -155,13 +168,28 @@ impl AneShapeWorker for FakeCompileWorker {
             // Nothing reaches the worker until its stream is free, so a
             // caller that goes away before then cancels the admission.
             let _stream = cancellable_wait(self.stream.lock()).await?;
+            scheduler::mark_compile_dispatched();
+            let gate = self.admit_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
             if self.panic_next_admit.swap(false, Ordering::SeqCst) {
                 panic!("injected panic in a fake admission");
             }
             if self.fail_next_admit.swap(false, Ordering::SeqCst) {
                 return Err(AneResidencyError::WorkerErr {
-                    code: "internal".into(),
+                    code: "compile_failed".into(),
                     msg: "injected admission failure".into(),
+                });
+            }
+            if self.transport_fail_next_admit.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::Channel("injected connection reset".into()));
+            }
+            if self.exhaust_next_admit.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::WorkerErr {
+                    code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
+                    msg: "injected resource refusal".into(),
                 });
             }
             self.compiler.compile(&self.id, model_ref, shape).await;
@@ -175,6 +203,12 @@ impl AneShapeWorker for FakeCompileWorker {
     ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
         Box::pin(async move {
             let _stream = cancellable_wait(self.stream.lock()).await?;
+            if self.fail_next_evict.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::WorkerErr {
+                    code: "evict_failed".into(),
+                    msg: "injected eviction failure".into(),
+                });
+            }
             self.evictions
                 .lock()
                 .unwrap()
@@ -182,9 +216,32 @@ impl AneShapeWorker for FakeCompileWorker {
             Ok(())
         })
     }
+    fn process_id(&self) -> Option<u32> {
+        Some(4242)
+    }
     fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
+        let (exited, _) = tokio::sync::oneshot::channel();
+        self.restart_with_exit_signal(exited)
+    }
+    fn restart_with_exit_signal<'a>(
+        &'a self,
+        exited: tokio::sync::oneshot::Sender<()>,
+    ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
         Box::pin(async move {
             let gate = self.restart_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            if self.exit_never_confirmed.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.exit_unconfirmed.load(Ordering::SeqCst) {
+                return Err(AneResidencyError::Channel("old owner exit unconfirmed".into()));
+            }
+            let _ = exited.send(());
+            let gate = self.replacement_gate.lock().unwrap().take();
             if let Some((started, release)) = gate {
                 started.notify_one();
                 release.notified().await;
@@ -192,7 +249,6 @@ impl AneShapeWorker for FakeCompileWorker {
             if self.fail_next_restart.swap(false, Ordering::SeqCst) {
                 return Err(AneResidencyError::Channel("injected restart failure".into()));
             }
-            self.generation.fetch_add(1, Ordering::SeqCst);
             self.restarts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
@@ -207,9 +263,15 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         generation: AtomicU64::new(0),
         panic_next_admit: Default::default(),
         fail_next_admit: Default::default(),
+        transport_fail_next_admit: Default::default(),
+        exhaust_next_admit: Default::default(),
+        fail_next_evict: Default::default(),
+        admit_gate: Mutex::new(None),
         fail_next_restart: Default::default(),
         exit_unconfirmed: Default::default(),
         restart_gate: Mutex::new(None),
+        replacement_gate: Mutex::new(None),
+        exit_never_confirmed: Default::default(),
         restarts: AtomicU64::new(0),
         evictions: Mutex::new(Vec::new()),
     })

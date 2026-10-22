@@ -127,6 +127,18 @@ elected, so they cannot hold up other workers. Compile times are learned from th
 moment the admission reaches the worker, and never from retried compiles or
 packed programs.
 
+One scheduler task makes every compile-queue decision for all direct-ANE
+workers: it elects the next compile, reserves budget, evicts, answers waiting
+requests at their bounds, keeps promised compiles, observes every compile,
+eviction and recovery it starts (a panic included) and drives worker recovery.
+Requests only lease resident shapes on a lock-only fast path or wait for its
+answer. A compile that failed with an unknown outcome holds the compile gate
+until the old process's exit is confirmed, or for at most 35 s after its restart
+began; a worker answering an admission with an error frees the gate at once.
+After a confirmed exit every slot of the old process is released. If the
+scheduler itself stops, every request is answered `engine_crashed` with the lane
+id until the module restarts.
+
 The supervisor reserves at most **100 layer executables**, including pending
 admissions and evictions. A leased shape is never an eviction candidate. Eviction
 refunds its charge only after the worker acknowledges release; a busy stream is

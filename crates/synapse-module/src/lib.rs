@@ -7165,6 +7165,17 @@ fn ane_lane_error_to_wire(
         wire.details = Some(json!({"lane_id": lane, "quarantined": true}));
         return wire;
     }
+    if matches!(
+        error,
+        worker_host::ane_residency::AneResidencyError::SchedulerStopped
+    ) {
+        // The compile scheduler stopped: the lane stays closed until the
+        // module restarts, so a retry only helps after that restart.
+        let mut wire =
+            WireOperationError::from_stable(StableError::engine_crashed(None), error.to_string());
+        wire.details = Some(json!({"lane_id": lane, "scheduler_stopped": true}));
+        return wire;
+    }
     let mut wire = ane_residency_error_to_wire(error);
     if wire.code == worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING {
         if let Some(Value::Object(details)) = wire.details.as_mut() {
@@ -19424,6 +19435,7 @@ mod tests {
                     }
                 });
                 Ok(AneWorkerSession {
+                    pid: None,
                     stream: host,
                     packed: Some(synapse_core::PackedCapability::tight256()),
                     confirm_exit: Box::pin(async move {
@@ -21109,6 +21121,19 @@ mod tests {
             )))
             .is_err(),
             "an unconfigured unit test must fail before resolving a production lock path"
+        );
+    }
+
+    #[test]
+    fn stopped_ane_scheduler_maps_to_engine_crashed_with_the_lane_id() {
+        let wire = ane_lane_error_to_wire(
+            worker_host::ane_residency::AneResidencyError::SchedulerStopped,
+            "lane-a",
+        );
+        assert_eq!(wire.code, "engine_crashed");
+        assert_eq!(
+            wire.details,
+            Some(json!({"lane_id": "lane-a", "scheduler_stopped": true}))
         );
     }
 

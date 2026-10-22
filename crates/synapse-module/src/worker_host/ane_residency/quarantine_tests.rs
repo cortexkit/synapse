@@ -71,6 +71,7 @@ async fn channel() -> (
                 }
             });
             Ok(AneWorkerSession {
+                pid: None,
                 stream: module,
                 packed: None,
                 confirm_exit: Box::pin(async move {

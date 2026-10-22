@@ -1,13 +1,13 @@
 [[control]]
 id = "residency-retirement-inside-grant"
 guards = "Retirement racing the outer precheck cannot acquire a phantom admission reservation"
-file = "crates/synapse-module/src/worker_host/mod.rs"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
 old = """
-if state.retired.contains(worker.worker_id()) {
-                return Step::Retired;"""
+            if state.retired.contains(worker.worker_id()) {
+                self.answer("""
 new = """
-if false && state.retired.contains(worker.worker_id()) { // NON-VACUITY BREAK
-                return Step::Retired;"""
+            if false && state.retired.contains(worker.worker_id()) { // NON-VACUITY BREAK
+                self.answer("""
 edits = []
 test_file = "crates/synapse-module/src/worker_host/mod.rs"
 runner = "nextest"

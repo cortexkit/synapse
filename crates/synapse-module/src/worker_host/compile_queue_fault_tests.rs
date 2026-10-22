@@ -18,6 +18,17 @@ fn queued_keys(supervisor: &AneResidencySupervisor) -> Vec<ShapeKey> {
     supervisor.inner.lock().entries.keys().cloned().collect()
 }
 
+/// Waits on the paused clock until `condition` holds, for up to `seconds`.
+async fn until_within(seconds: u64, mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(seconds), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition never held");
+}
+
 fn gate_held(supervisor: &AneResidencySupervisor) -> bool {
     supervisor.inner.lock().compile_running()
 }
@@ -56,7 +67,9 @@ async fn panicking_orphan_admission_releases_the_gate_after_confirmed_restart() 
     assert!(gate_held(&supervisor), "gate released before the restart confirmed exit");
     let other = fake_worker(&compiler, "other");
     let other_answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 100.0, None);
-    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(120)).await;
+    // Still inside the exit-confirmation grace (the restart began at about
+    // 84.6 s).
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(110)).await;
     assert!(compiler.compiles_of("other").is_empty(), "a compile overlapped an unconfirmed one");
     release_restart.notify_one();
     let other_answer = tokio::time::timeout(Duration::from_secs(60), other_answer)
@@ -244,6 +257,15 @@ async fn accepted_wait_past_the_600s_bound_is_shape_compiling_and_keeps_its_comp
         "{answered:?}"
     );
     assert!((answered.waited() - 600.0).abs() < 0.1, "{answered:?}");
+    // The wide compile has overrun its prediction (84.56 s): it is given one
+    // more layer (3.02 s), then GTE@128 takes 4.62 s.
+    let expected = 28.0f64.recip() * standalone(QUEUE_QWEN, 4096) + standalone(QUEUE_GTE, 128);
+    assert_close(
+        answered.retry_after_ms.unwrap() as f64 / 1000.0,
+        expected,
+        0.02,
+        "retry_after_ms at the backstop",
+    );
     assert!(queued_keys(&supervisor).contains(&queue_key("small", QUEUE_GTE, 128)));
     assert!(supervisor.inner.lock().entries[&queue_key("small", QUEUE_GTE, 128)]
         .promise
@@ -445,8 +467,9 @@ async fn orphan_driver_first_polled_after_expiry_removes_its_entry() {
     assert!(wide_answer.await.unwrap().ok());
 }
 
-/// A retry that has enqueued but not yet decided
-/// counts as attached, so the orphan entry and its start key survive.
+/// A retry the scheduler has registered before the expiry counts as
+/// attached, so the kept entry and its start key survive the expiry even
+/// while the retry's own task has not run again.
 #[tokio::test(start_paused = true)]
 async fn retry_that_has_not_decided_yet_keeps_the_orphan_entry() {
     let compiler = SharedCompiler::new(3.0);
@@ -469,29 +492,19 @@ async fn retry_that_has_not_decided_yet_keeps_the_orphan_entry() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let key = queue_key("small", QUEUE_GTE, 128);
     let seq = supervisor.inner.lock().entries[&key].seq;
-    // The retry enqueues just before the expiry and is held before its first
-    // decision while the expiry passes.
+    // The retry registers just before the expiry; its task then does not
+    // run again while the expiry passes.
     let expiry = 1.0 + 2.0 * promised;
     tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(expiry - 1.0)).await;
-    let (checked, continue_grant) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    *supervisor.inner.lease_decision_gate.lock().unwrap() =
-        Some((checked.clone(), continue_grant.clone()));
-    let retry = tokio::spawn({
-        let supervisor = supervisor.clone();
-        let small = small.clone();
-        async move { supervisor.lease_until(&small, QUEUE_GTE, 128, None).await }
-    });
-    checked.notified().await;
+    let (_id, retry) = raw_want(&supervisor, &small, QUEUE_GTE, 128);
     tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(expiry + 1.0)).await;
-    continue_grant.notify_one();
-    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         supervisor.inner.lock().entries.get(&key).map(|entry| entry.seq),
         Some(seq),
         "the orphan entry expired under a retry that had already enqueued"
     );
     assert!(wide_answer.await.unwrap().ok());
-    drop(retry.await.unwrap().unwrap());
+    assert!(matches!(retry.await.unwrap(), scheduler::Answer::Ready));
 }
 
 /// An orphan driver must not evict a resident shape
@@ -594,41 +607,60 @@ async fn caller_expiry_reports_a_fresh_prediction() {
     compile.await.unwrap().unwrap();
 }
 
-/// A failed admission holds the compile gate until its worker's exit
-/// is confirmed, so another worker's compile cannot overlap one that may
-/// still be running.
-#[tokio::test]
+/// A compile that failed with an unknown outcome (the connection broke)
+/// holds the compile gate until its worker's exit is confirmed, so another
+/// worker's compile cannot overlap one that may still be running.
+#[tokio::test(start_paused = true)]
 async fn failed_admission_holds_the_gate_until_exit_is_confirmed() {
-    let supervisor = AneResidencySupervisor::new(Default::default());
-    let failing_ledger = SharedLedger::default();
-    let (exiting, exit) = notify_pair();
-    failing_ledger.lock().unwrap().exit_gate = Some((exiting.clone(), exit.clone()));
-    let failing = serving_fixture_for(&failing_ledger, "failing", supervisor.clone()).await;
-    failing.infer(vec![vec![1]], false).await.unwrap();
-    failing_ledger
-        .lock()
-        .unwrap()
-        .fail_admit
-        .insert((failing.metadata.model_ref.clone(), 1024));
-    let other_ledger = SharedLedger::default();
-    let other = serving_fixture_for(&other_ledger, "other", supervisor.clone()).await;
-    other.infer(vec![vec![1]], false).await.unwrap();
-    let failed = spawn_infer(&failing, 600, None);
-    acknowledged(&exiting).await;
-    let compiled = spawn_infer(&other, 600, None);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let overlapped = other_ledger
-        .lock()
-        .unwrap()
-        .admit_attempts
-        .contains_key(&(other.metadata.model_ref.clone(), 1024));
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let failing = fake_handle(&compiler, "failing");
+    failing.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    let (exiting, exit) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *failing.restart_gate.lock().unwrap() = Some((exiting.clone(), exit.clone()));
+    let failing_dyn: Arc<dyn AneShapeWorker> = failing.clone();
+    let failed = ask_at(&supervisor, &compiler, &failing_dyn, QUEUE_GTE, 512, 0.0, None);
+    exiting.notified().await;
+    let other = fake_worker(&compiler, "other");
+    let compiled = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 128, compiler.now(), None);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let overlapped = !compiler.compiles_of("other").is_empty();
+    assert!(gate_held(&supervisor));
     exit.notify_one();
-    let _ = failed.await.unwrap();
-    compiled.await.unwrap().unwrap();
+    assert!(!failed.await.unwrap().ok());
+    assert!(compiled.await.unwrap().ok());
     assert!(
         !overlapped,
         "another worker compiled before the failed one's exit was confirmed"
     );
+    assert_queue_idle(&supervisor);
+}
+
+/// A worker that answers an admission with an error is not compiling
+/// anything, so the compile gate is free at once, even while that worker's
+/// recovery waits for one of its leases to drain.
+#[tokio::test(start_paused = true)]
+async fn definite_worker_error_releases_the_gate_at_once() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let failing = fake_handle(&compiler, "failing");
+    let failing_dyn: Arc<dyn AneShapeWorker> = failing.clone();
+    let held = supervisor.lease(&failing_dyn, QUEUE_GTE, 128).await.unwrap();
+    failing.fail_next_admit.store(true, Ordering::SeqCst);
+    let start = compiler.now();
+    let failed = ask_at(&supervisor, &compiler, &failing_dyn, QUEUE_GTE, 512, start, None)
+        .await
+        .unwrap();
+    assert_eq!(failed.code.as_deref(), Some("compile_failed"), "{failed:?}");
+    let other = fake_worker(&compiler, "other");
+    let compiled = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 2048, compiler.now(), None);
+    let compiled = tokio::time::timeout(Duration::from_secs(30), compiled)
+        .await
+        .expect("a definite worker error held the compile gate")
+        .unwrap();
+    assert!(compiled.ok(), "{compiled:?}");
+    assert!(supervisor.inner.lock().recovering.contains("failing"));
+    drop(held);
 }
 
 /// Once the old process's exit is confirmed, a compile that failed in it
@@ -660,28 +692,432 @@ async fn failed_compile_releases_the_gate_once_exit_is_confirmed_even_if_restart
     assert_eq!(state.reserved_executables(), 22);
 }
 
-/// While the old process's exit is unconfirmed, the failed compile may still
-/// be running, so its slot keeps holding the compile gate.
+/// While the old process's exit is unconfirmed, a compile that failed in it
+/// may still be running, so its slot holds the compile gate; but only for the
+/// fixed grace after the restart began. Then the gate is released (another
+/// worker compiles), and the worker stays closed with its slot charged.
 #[tokio::test(start_paused = true)]
-async fn failed_compile_keeps_the_gate_while_exit_is_unconfirmed() {
+async fn exit_never_confirmed_releases_the_gate_after_the_grace_and_keeps_the_worker_closed() {
     let compiler = SharedCompiler::new(1.0);
     let supervisor = queue_supervisor();
     let broken = fake_handle(&compiler, "broken");
-    broken.fail_next_admit.store(true, Ordering::SeqCst);
-    broken.fail_next_restart.store(true, Ordering::SeqCst);
-    broken.exit_unconfirmed.store(true, Ordering::SeqCst);
+    broken.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    broken.exit_never_confirmed.store(true, Ordering::SeqCst);
     let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
     let failed = ask_at(&supervisor, &compiler, &broken_dyn, QUEUE_GTE, 128, 0.0, None)
         .await
         .unwrap();
     assert!(!failed.ok(), "{failed:?}");
+    let failed_at = failed.at;
     let other = fake_worker(&compiler, "other");
-    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 1.0, None);
-    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(60)).await;
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, failed_at + 1.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(failed_at + 30.0)).await;
     assert!(
         compiler.compiles_of("other").is_empty(),
         "a compile started beside one whose process may still be running"
     );
     assert!(gate_held(&supervisor));
-    answer.abort();
+    let answer = tokio::time::timeout(Duration::from_secs(60), answer)
+        .await
+        .expect("an exit that is never confirmed held the compile gate past the grace")
+        .unwrap();
+    assert!(answer.ok(), "{answer:?}");
+    let state = supervisor.inner.lock();
+    assert!(state.recovering.contains("broken"), "the worker must stay closed");
+    assert!(state
+        .slots
+        .iter()
+        .any(|(key, slot)| key.worker_id == "broken" && slot.state == SlotState::Abandoned));
+    assert_eq!(state.reserved_executables(), 44, "its reservation stays charged");
+}
+
+/// After a worker's old process exits, every slot it had is gone, whatever
+/// its state, even when the replacement then fails to start: nothing stays
+/// charged or leasable for a process that no longer exists.
+#[tokio::test(start_paused = true)]
+async fn confirmed_exit_with_failed_replacement_leaves_no_ghost_slots() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 512).await.unwrap());
+    assert_eq!(supervisor.inner.lock().reserved_executables(), 44);
+    worker.fail_next_restart.store(true, Ordering::SeqCst);
+    assert!(!supervisor.recover(&worker_dyn).await);
+    let state = supervisor.inner.lock();
+    assert!(
+        !state.slots.keys().any(|key| key.worker_id == "worker"),
+        "ghost slots after a confirmed exit: {:?}",
+        state.slots.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(state.reserved_executables(), 0);
+    drop(state);
+    assert!(supervisor
+        .try_lease(&queue_key("worker", QUEUE_GTE, 128), &worker_dyn, None)
+        .unwrap()
+        .is_none());
+}
+
+/// A request told shape_compiling while the shape's compile was reserved but
+/// still waiting for its worker keeps that compile alive when the request that
+/// reserved it is cancelled: the compile runs once the worker is free.
+#[tokio::test(start_paused = true)]
+async fn promise_given_during_a_reserved_compile_survives_the_owner_cancelling() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    // An inference holds the worker's stream.
+    let inference = worker.stream.lock().await;
+    let owner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker_dyn.clone();
+        async move { supervisor.lease(&worker, QUEUE_QWEN, 512).await }
+    });
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&queue_key("worker", QUEUE_QWEN, 512))
+            .is_some_and(|slot| slot.state == SlotState::Admitting)
+    })
+    .await;
+    let deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+    let told = supervisor
+        .lease_until(&worker_dyn, QUEUE_QWEN, 512, deadline)
+        .await
+        .err()
+        .expect("the joiner cannot be served in 5 s");
+    assert_eq!(told.code(), Some(ERR_ANE_SHAPE_COMPILING));
+    owner.abort();
+    let _ = owner.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(inference);
+    until_within(120, || {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&queue_key("worker", QUEUE_QWEN, 512))
+            .is_some_and(|slot| slot.state == SlotState::Resident)
+    })
+    .await;
+    assert_eq!(compiler.compiles_of("worker").len(), 1);
+    assert_queue_idle(&supervisor);
+}
+
+/// A caller cancelled while its admission's resource-refusal retry evicts a
+/// victim does not lose the retry: the compile still completes.
+#[tokio::test(start_paused = true)]
+async fn exhaustion_retry_survives_the_caller_cancelling_during_its_eviction() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let victim = fake_handle(&compiler, "victim");
+    let victim_dyn: Arc<dyn AneShapeWorker> = victim.clone();
+    drop(supervisor.lease(&victim_dyn, QUEUE_GTE, 128).await.unwrap());
+    let worker = fake_handle(&compiler, "worker");
+    worker.exhaust_next_admit.store(true, Ordering::SeqCst);
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    // The victim's stream is busy, so the retry's eviction waits for it.
+    let busy = victim.stream.lock().await;
+    let caller = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker_dyn.clone();
+        async move { supervisor.lease(&worker, QUEUE_GTE, 512).await }
+    });
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .values()
+            .any(|slot| slot.state == SlotState::Evicting)
+    })
+    .await;
+    caller.abort();
+    let _ = caller.await;
+    drop(busy);
+    until_within(120, || {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&queue_key("worker", QUEUE_GTE, 512))
+            .is_some_and(|slot| slot.state == SlotState::Resident)
+    })
+    .await;
+    assert_eq!(victim.evicted(), vec![(QUEUE_GTE.to_owned(), 128)]);
+}
+
+/// A compile that failed with an unknown outcome holds the gate only until
+/// the old process's exit is confirmed, not while the replacement starts.
+#[tokio::test(start_paused = true)]
+async fn failed_compile_releases_the_gate_before_the_replacement_starts() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let failing = fake_handle(&compiler, "failing");
+    failing.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    let (starting, start) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *failing.replacement_gate.lock().unwrap() = Some((starting.clone(), start.clone()));
+    let failing_dyn: Arc<dyn AneShapeWorker> = failing.clone();
+    let failed = ask_at(&supervisor, &compiler, &failing_dyn, QUEUE_GTE, 512, 0.0, None);
+    starting.notified().await;
+    let other = fake_worker(&compiler, "other");
+    let compiled = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 128, compiler.now(), None);
+    let compiled = tokio::time::timeout(Duration::from_secs(30), compiled)
+        .await
+        .expect("the gate was held while the replacement started")
+        .unwrap();
+    assert!(compiled.ok(), "{compiled:?}");
+    start.notify_one();
+    assert!(!failed.await.unwrap().ok());
+}
+
+/// A head whose only victim fails to evict (and whose owner then stays
+/// closed) does not keep a smaller request that fits from compiling.
+#[tokio::test(start_paused = true)]
+async fn failed_eviction_does_not_block_a_smaller_request_that_fits() {
+    let compiler = SharedCompiler::new(1.0);
+    let mut supervisor = queue_supervisor();
+    Arc::get_mut(&mut supervisor.inner).unwrap().executable_budget = 66;
+    let victim = fake_handle(&compiler, "victim");
+    let victim_dyn: Arc<dyn AneShapeWorker> = victim.clone();
+    let leased = fake_worker(&compiler, "leased");
+    drop(supervisor.lease(&victim_dyn, QUEUE_GTE, 128).await.unwrap());
+    let held = supervisor.lease(&leased, QUEUE_GTE, 128).await.unwrap();
+    victim.fail_next_evict.store(true, Ordering::SeqCst);
+    victim.exit_unconfirmed.store(true, Ordering::SeqCst);
+    // Reserved 44; Qwen3@128 needs 28 (72 > 66), so it evicts the victim,
+    // which fails; the victim's worker then cannot be confirmed gone.
+    let wide = fake_worker(&compiler, "wide");
+    let start = compiler.now();
+    let blocked = ask_at(&supervisor, &compiler, &wide, QUEUE_QWEN, 128, start, Some(20.0));
+    let small = fake_worker(&compiler, "small");
+    let fits = ask_at(&supervisor, &compiler, &small, QUEUE_GTE, 512, start + 1.0, None);
+    let blocked = blocked.await.unwrap();
+    assert!(!blocked.ok(), "{blocked:?}");
+    let fits = tokio::time::timeout(Duration::from_secs(60), fits)
+        .await
+        .expect("a smaller request that fits stayed blocked")
+        .unwrap();
+    assert!(fits.ok(), "{fits:?}");
+    assert!(queued_keys(&supervisor).is_empty());
+    drop(held);
+}
+
+/// The 250 ms handoff's end wakes the queue head even when time passes
+/// between the scheduler's decision and arming its timer (held by a test
+/// hook while the paused clock moves past the handoff's end).
+#[tokio::test(start_paused = true)]
+async fn handoff_end_wakes_the_head_after_a_late_timer() {
+    let compiler = SharedCompiler::new(1.0);
+    let mut supervisor = queue_supervisor();
+    Arc::get_mut(&mut supervisor.inner).unwrap().executable_budget = 22;
+    let shared = fake_worker(&compiler, "shared");
+    let (_joiner, _held_answer) = raw_want(&supervisor, &shared, QUEUE_GTE, 128);
+    let owner = supervisor.lease(&shared, QUEUE_GTE, 128).await.unwrap();
+    drop(owner);
+    let head_worker = fake_worker(&compiler, "head");
+    let head = ask_at(&supervisor, &compiler, &head_worker, QUEUE_GTE, 512, compiler.now(), None);
+    until(|| supervisor.inner.lock().starved_head.is_some()).await;
+    let (decided, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *supervisor.inner.wait_decision_gate.lock().unwrap() = Some((decided.clone(), resume.clone()));
+    supervisor.inner.nudge();
+    decided.notified().await;
+    tokio::time::advance(Duration::from_millis(400)).await;
+    resume.notify_one();
+    let head = tokio::time::timeout(Duration::from_secs(30), head)
+        .await
+        .expect("the head slept past the end of the handoff")
+        .unwrap();
+    assert!(head.ok(), "{head:?}");
+}
+
+/// A compile whose requester was cancelled after it reached the worker, and
+/// which then panics, is still cleaned up: the scheduler observes the panic
+/// itself, recovers the worker, and another worker compiles afterwards.
+#[tokio::test(start_paused = true)]
+async fn panic_after_the_direct_caller_is_cancelled_is_still_cleaned_up() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let (dispatched, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *worker.admit_gate.lock().unwrap() = Some((dispatched.clone(), release.clone()));
+    worker.panic_next_admit.store(true, Ordering::SeqCst);
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let caller = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker_dyn.clone();
+        async move { supervisor.lease(&worker, QUEUE_GTE, 128).await }
+    });
+    dispatched.notified().await;
+    caller.abort();
+    let _ = caller.await;
+    release.notify_one();
+    let other = fake_worker(&compiler, "other");
+    let compiled = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, compiler.now(), None);
+    let compiled = tokio::time::timeout(Duration::from_secs(60), compiled)
+        .await
+        .expect("a panicked compile with a cancelled caller stranded the gate")
+        .unwrap();
+    assert!(compiled.ok(), "{compiled:?}");
+    assert_eq!(worker.restarts.load(Ordering::SeqCst), 1);
+    assert!(!supervisor
+        .inner
+        .lock()
+        .slots
+        .keys()
+        .any(|key| key.worker_id == "worker"));
+}
+
+/// When a worker's recovery begins, the next queued compile on another
+/// worker is elected at once, with no other event to wake the queue.
+#[tokio::test(start_paused = true)]
+async fn recovery_start_elects_the_next_head_at_once() {
+    let compiler = SharedCompiler::new(1.0);
+    let mut supervisor = AneResidencySupervisor::new(AneResidencyLimits {
+        per_model: 1,
+        total: 8,
+    });
+    Arc::get_mut(&mut supervisor.inner).unwrap().wait_timeout = Duration::from_secs(600);
+    let blocked = fake_worker(&compiler, "blocked");
+    let held = supervisor.lease(&blocked, QUEUE_GTE, 512).await.unwrap();
+    // GTE@128 is the head (its start key is earliest) but its model is at its
+    // limit and the only GTE shape is leased.
+    let start = compiler.now();
+    let head = ask_at(&supervisor, &compiler, &blocked, QUEUE_GTE, 128, start, None);
+    let other = fake_worker(&compiler, "other");
+    let next = ask_at(&supervisor, &compiler, &other, QUEUE_QWEN, 128, start + 0.001, None);
+    until(|| supervisor.inner.lock().starved_head.is_some()).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(compiler.compiles_of("other").is_empty());
+    let recovery = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let blocked = blocked.clone();
+        async move { supervisor.recover(&blocked).await }
+    });
+    let next = tokio::time::timeout(Duration::from_secs(30), next)
+        .await
+        .expect("recovery began but the next head was not elected")
+        .unwrap();
+    assert!(next.ok(), "{next:?}");
+    drop(held);
+    assert!(recovery.await.unwrap());
+    let _ = head.await;
+}
+
+/// A recovering worker's queued compile rejoins the queue without breaking
+/// a bound the queue accepted while it was away.
+#[tokio::test(start_paused = true)]
+async fn recovered_entries_rejoin_behind_accepted_bounds() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let running = fake_worker(&compiler, "running");
+    let recovering = fake_handle(&compiler, "recovering");
+    let (restarting, finish) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *recovering.restart_gate.lock().unwrap() = Some((restarting.clone(), finish.clone()));
+    let recovering_dyn: Arc<dyn AneShapeWorker> = recovering.clone();
+    let accepted = fake_worker(&compiler, "accepted");
+    let running_answer = ask_at(&supervisor, &compiler, &running, QUEUE_QWEN, 2048, 0.0, None);
+    // GTE@128 (start key 5.62 s) queues first, then its worker recovers.
+    let early = ask_at(&supervisor, &compiler, &recovering_dyn, QUEUE_GTE, 128, 1.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(2)).await;
+    let recovery = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = recovering_dyn.clone();
+        async move { supervisor.recover(&worker).await }
+    });
+    restarting.notified().await;
+    // Ready in about 49.9 s without GTE@128 ahead, 54.5 s with it; its bound
+    // is 53 s.
+    let bound_respected = ask_at(&supervisor, &compiler, &accepted, QUEUE_GTE, 512, 3.0, Some(50.0));
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(10)).await;
+    finish.notify_one();
+    assert!(recovery.await.unwrap());
+    let bound_respected = bound_respected.await.unwrap();
+    assert!(bound_respected.ok(), "an accepted bound was broken: {bound_respected:?}");
+    assert!(
+        compiler.compiles_of("accepted")[0].start < compiler.compiles_of("recovering")[0].start,
+        "the rejoining compile went ahead of an accepted request"
+    );
+    assert!(early.await.unwrap().ok());
+    assert!(running_answer.await.unwrap().ok());
+}
+
+/// The running compile is predicted from the moment its admission reached
+/// the worker, not from its reservation, so a long wait for the worker's
+/// stream does not make it look almost finished.
+#[tokio::test(start_paused = true)]
+async fn running_prediction_counts_from_dispatch() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let inference = worker.stream.lock().await;
+    let running = ask_at(&supervisor, &compiler, &worker_dyn, QUEUE_QWEN, 2048, 0.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(20)).await;
+    drop(inference);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(21)).await;
+    let other = fake_worker(&compiler, "other");
+    let refused = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 128, 21.0, Some(30.0))
+        .await
+        .unwrap();
+    assert_eq!(refused.code.as_deref(), Some(ERR_ANE_SHAPE_COMPILING), "{refused:?}");
+    let dispatched = compiler.compiles_of("worker")[0].start;
+    let expected = dispatched + standalone(QUEUE_QWEN, 2048) + standalone(QUEUE_GTE, 128) - 21.0;
+    assert_close(
+        refused.retry_after_ms.unwrap() as f64 / 1000.0,
+        expected,
+        0.05,
+        "retry_after_ms",
+    );
+    assert!(running.await.unwrap().ok());
+}
+
+/// If the scheduler's task ends, a waiting request and a new request both
+/// get a typed error promptly, and the lane stays closed.
+#[tokio::test(start_paused = true)]
+async fn stopped_scheduler_fails_waiting_and_new_requests_promptly() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let inference = worker.stream.lock().await;
+    let waiting = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker_dyn.clone();
+        async move { supervisor.lease(&worker, QUEUE_GTE, 128).await }
+    });
+    until(|| !supervisor.inner.lock().slots.is_empty()).await;
+    supervisor
+        .inner
+        .scheduler_task
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the scheduler was started")
+        .abort();
+    let waited = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("a waiting request hung after the scheduler stopped")
+        .unwrap();
+    assert!(
+        matches!(waited, Err(AneResidencyError::SchedulerStopped)),
+        "{:?}",
+        waited.err()
+    );
+    let fresh = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.lease(&worker_dyn, QUEUE_GTE, 512),
+    )
+    .await
+    .expect("a new request hung after the scheduler stopped");
+    assert!(
+        matches!(fresh, Err(AneResidencyError::SchedulerStopped)),
+        "{:?}",
+        fresh.err()
+    );
+    drop(inference);
 }

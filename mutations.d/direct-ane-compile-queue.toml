@@ -18,9 +18,9 @@ build_timeout_s = 1800
 [[control]]
 id = "ane-compile-queue-aging"
 guards = "A wide compile is passed only by compiles whose start key (arrival plus cost) is earlier"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = "(entry.is_none(), entry.map(QueuedCompile::order), *position)"
-new = "(entry.is_none(), entry.map(|entry| (entry.cost, entry.seq)), *position) /* NON-VACUITY BREAK: no aging */"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = ".min_by_key(|(_, entry)| entry.order())"
+new = ".min_by_key(|(key, entry)| (state.estimate(key, entry.seed), entry.seq)) /* NON-VACUITY BREAK: no aging */"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
 runner = "nextest"
 package = "synapse-module"
@@ -84,53 +84,40 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
-id = "ane-compile-queue-panic-holds-gate-until-restart"
-guards = "A panicked admission is marked failed and its worker restarted at once; the gate is released only by that confirmed restart"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = "mark_failed_admission(&self.inner, &failed_key, slot_id);"
-new = "// NON-VACUITY BREAK: panic leaves the slot Admitting"
+id = "ane-compile-queue-panic-observed"
+guards = "The scheduler observes a panicked compile itself: the slot holds the gate as failed and the worker is restarted, whoever asked for the compile"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """                        Err(error) => (
+                            Err(AneResidencyError::Panicked(format!(
+                                "shape admission task failed: {error}"
+                            ))),
+                            None,
+                            now,
+                        ),"""
+new = """                        Err(_) => return, // NON-VACUITY BREAK: a panicked compile is ignored"""
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
 runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_host::ane_residency::tests::panicking_orphan_admission_releases_the_gate_after_confirmed_restart"]
+expect_red = ["worker_host::ane_residency::tests::panicking_orphan_admission_releases_the_gate_after_confirmed_restart", "worker_host::ane_residency::tests::panic_after_the_direct_caller_is_cancelled_is_still_cleaned_up"]
 expect_message = "the panicked admission's worker was not restarted promptly"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
-id = "ane-compile-queue-single-orphan-driver"
-guards = "Only one orphan driver exists per queued compile, so orphan expiry holds after two refusals before a yield"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = """        if entry.driver_ticket.is_some() {
-            return None;
-        }"""
-new = "        // NON-VACUITY BREAK: a second driver may be started"
+id = "ane-compile-queue-promise-retention"
+guards = "A promise given while a compile is reserved stays with that compile, so cancelling the request that reserved it does not withdraw it"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            slot.promise = Some(told);"
+new = "            let _ = (slot, told); // NON-VACUITY BREAK: the running compile forgets its promise"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
 runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_host::ane_residency::tests::two_refusals_before_a_yield_still_expire_the_orphan"]
-expect_message = "the orphan entry outlived twice its promise"
-platforms = ["linux", "macos"]
-timeout_s = 600
-build_timeout_s = 1800
-
-[[control]]
-id = "ane-compile-queue-requeue-cancelled-admission"
-guards = "An admission cancelled before reaching the worker is queued again when its caller was told shape_compiling"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = ".filter(|_| told || joined_waiting)"
-new = ".filter(|_| false && (told || joined_waiting)) /* NON-VACUITY BREAK */"
-test_file = "crates/synapse-module/src/worker_host/mod.rs"
-runner = "nextest"
-package = "synapse-module"
-target = "--lib"
-select = "expected"
-expect_red = ["worker_host::ane_residency::tests::deadline_on_an_own_admit_queued_behind_inference_is_shape_compiling"]
+expect_red = ["worker_host::ane_residency::tests::promise_given_during_a_reserved_compile_survives_the_owner_cancelling"]
 expect_message = "condition never held"
 platforms = ["linux", "macos"]
 timeout_s = 600
@@ -139,9 +126,9 @@ build_timeout_s = 1800
 [[control]]
 id = "ane-compile-queue-backstop-is-shape-compiling"
 guards = "A wait on the compile queue that reaches the 600 s backstop is answered shape_compiling and keeps its compile"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = "if request_expired || compiling.is_some() {"
-new = "if request_expired /* NON-VACUITY BREAK */ {"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "if waiter.waiting_on_compile && Self::compiling(state, &key) {"
+new = "if waiter.waiting_on_compile && Self::compiling(state, &key) && waiter.deadline.is_some() { // NON-VACUITY BREAK"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
 runner = "nextest"
 package = "synapse-module"
@@ -154,18 +141,35 @@ timeout_s = 600
 build_timeout_s = 1800
 
 [[control]]
-id = "ane-compile-queue-release-gate-after-confirmed-exit"
-guards = "A failed compile releases the compile gate and its budget once its old process's exit is confirmed, even if the restart fails"
-file = "crates/synapse-module/src/worker_host/mod.rs"
-old = "slot.worker.worker_id() != id || slot.state != SlotState::Failed"
-new = "true /* NON-VACUITY BREAK: hold the gate after confirmed exit */"
+id = "ane-compile-queue-release-gate-on-exit-confirmation"
+guards = "A failed compile's hold on the gate ends when the old process's exit is confirmed, before the replacement starts"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                } => self.exit_confirmed(&mut state, &worker_id, generation),"
+new = "                } => { let _ = (&worker_id, generation); } // NON-VACUITY BREAK: exit confirmation ignored"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
 runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_host::ane_residency::tests::failed_compile_releases_the_gate_once_exit_is_confirmed_even_if_restart_fails"]
-expect_message = "a failed compile with a confirmed exit still held the compile gate"
+expect_red = ["worker_host::ane_residency::tests::failed_compile_releases_the_gate_before_the_replacement_starts"]
+expect_message = "the gate was held while the replacement started"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-no-ghost-slots"
+guards = "After a confirmed exit every slot of the old process is removed, whatever its state, even when the replacement fails"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "        .retain(|_, slot| slot.worker.worker_id() != exited);"
+new = "        .retain(|_, slot| slot.worker.worker_id() != exited || matches!(slot.state, SlotState::Resident | SlotState::Evicting)); // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::confirmed_exit_with_failed_replacement_leaves_no_ghost_slots"]
+expect_message = "ghost slots after a confirmed exit"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800

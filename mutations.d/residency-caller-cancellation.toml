@@ -9,7 +9,7 @@ old = """
                     Err(_) => {
                         #[cfg(test)]
                         self.channel.pass_classify_gate(GateSite::Caller).await;
-                        return Err(self.channel.expired_wait(&waits, deadline));
+                        return Err(self.channel.expired_wait(&waits, deadline).await);
                     }
                 },
                 None => task.await,
@@ -27,7 +27,7 @@ new = """
                     Err(_) => {
                         #[cfg(test)]
                         self.channel.pass_classify_gate(GateSite::Caller).await;
-                        return Err(self.channel.expired_wait(&waits, deadline));
+                        return Err(self.channel.expired_wait(&waits, deadline).await);
                     }
                 },
                 None => (&mut task.0).await,

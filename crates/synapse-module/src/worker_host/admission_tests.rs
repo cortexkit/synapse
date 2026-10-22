@@ -1,5 +1,38 @@
-// These tests control the worker reply and the supervisor's decision order
-// separately, so scheduler wakeup order cannot hide a lost single-flight handoff.
+// These tests control the worker reply and hold requests unpolled at chosen
+// points, so scheduler wakeup order cannot hide a lost single-flight handoff.
+
+/// Sends a request for `shape` straight to the scheduler and returns its id
+/// and answer receiver without polling it, as a request whose task is not
+/// running would leave it.
+fn raw_want(
+    supervisor: &AneResidencySupervisor,
+    worker: &Arc<dyn AneShapeWorker>,
+    model_ref: &str,
+    shape: usize,
+) -> (u64, tokio::sync::oneshot::Receiver<scheduler::Answer>) {
+    let id = supervisor.inner.next_waiter.fetch_add(1, Ordering::Relaxed) + 1;
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    supervisor
+        .inner
+        .send(scheduler::Msg::Want(scheduler::Want {
+            id,
+            key: ShapeKey {
+                worker_id: worker.worker_id().into(),
+                model_ref: model_ref.into(),
+                shape,
+                program: AneProgram::Single,
+            },
+            worker: worker.clone(),
+            executables: worker.executable_count(model_ref).unwrap(),
+            bound: Some(tokio::time::Instant::now() + supervisor.inner.wait_timeout),
+            deadline: None,
+            reply: scheduler::Reply::Lease(reply),
+            trace: scheduler::Trace::default(),
+        }))
+        .unwrap();
+    (id, answer)
+}
+
 #[tokio::test]
 async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers() {
     let ledger = SharedLedger::default();
@@ -11,67 +44,62 @@ async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers
         shape,
         program: AneProgram::Single,
     };
-    let original = QueueTicket::enqueue(&supervisor.inner);
-    let Step::Admit(id) = supervisor.next_step(original.id, &key(128), &worker, 4) else {
-        panic!("initial shape must reserve budget");
-    };
-    let head = QueueTicket::enqueue(&supervisor.inner);
-    assert!(matches!(
-        supervisor.next_step(head.id, &key(256), &worker, 4),
-        Step::Wait(_)
-    ));
-    let joiners: Vec<_> = (0..8)
-        .map(|_| QueueTicket::enqueue(&supervisor.inner))
-        .collect();
-    for joiner in &joiners {
-        assert!(matches!(
-            supervisor.next_step(joiner.id, &key(128), &worker, 4),
-            Step::Wait(Some(128))
-        ));
-    }
     let (started, release) = notify_pair();
     ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
-    let admitting = tokio::spawn({
+    let (original, original_answer) = raw_want(&supervisor, &worker, "model", 128);
+    notified(&started).await;
+    let head = tokio::spawn({
         let supervisor = supervisor.clone();
         let worker = worker.clone();
-        let key = key(128);
-        async move { supervisor.admit(worker, key, id).await }
+        async move { supervisor.lease(&worker, "model", 256).await }
     });
-    notified(&started).await;
+    until(|| supervisor.inner.lock().starved_head.is_some()).await;
+    let joiners: Vec<_> = (0..8)
+        .map(|_| raw_want(&supervisor, &worker, "model", 128))
+        .collect();
+    until(|| supervisor.inner.lock().slots[&key(128)].joined.len() == 9).await;
     release.notify_one();
-    drop(admitting.await.unwrap().unwrap());
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&key(128))
+            .is_none_or(|slot| slot.state != SlotState::Admitting)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
-        resource_victim(&supervisor.inner).is_none(),
+        supervisor
+            .inner
+            .lock()
+            .resource_victim(tokio::time::Instant::now())
+            .is_none(),
         "resource-refusal recovery must also protect the pending handoff"
     );
     assert!(
-        matches!(
-            supervisor.next_step(head.id, &key(256), &worker, 4),
-            Step::Wait(_)
-        ),
+        !head.is_finished() && !ledger.lock().unwrap().events.contains(&"evict model 128".into()),
         "newly ready shape was selected before its eight joiners leased it"
     );
-    let newcomer = QueueTicket::enqueue(&supervisor.inner);
     assert!(
-        matches!(
-            supervisor.next_step(newcomer.id, &key(128), &worker, 4),
-            Step::Wait(_)
-        ),
+        supervisor.try_lease(&key(128), &worker, None).unwrap().is_none(),
         "post-completion traffic must not extend the handoff"
     );
-    for joiner in &joiners {
-        let Step::Leased(lease) = supervisor.next_step(joiner.id, &key(128), &worker, 4) else {
+    for (id, answer) in std::iter::once((original, original_answer)).chain(joiners) {
+        assert!(matches!(answer.await.unwrap(), scheduler::Answer::Ready));
+        let Some(lease) = supervisor.try_lease(&key(128), &worker, Some(id)).unwrap() else {
             panic!("a pre-completion joiner lost its handoff to the budget head");
         };
         drop(lease);
     }
-    assert!(
-        matches!(
-            supervisor.next_step(head.id, &key(256), &worker, 4),
-            Step::Evict { .. }
-        ),
-        "the finite handoff must stop protecting the shape after its cohort drains"
+    drop(
+        tokio::time::timeout(Duration::from_secs(2), head)
+            .await
+            .expect("the finite handoff must stop protecting the shape after its cohort drains")
+            .unwrap()
+            .unwrap(),
     );
+    assert!(ledger.lock().unwrap().events.contains(&"evict model 128".into()));
 }
 
 /// Eviction still picks the idle stream while another worker's compile runs,
@@ -199,28 +227,25 @@ async fn suspended_joiner_handoff_expires_without_an_external_wakeup() {
     let ledger = SharedLedger::default();
     let worker: Arc<dyn AneShapeWorker> = mock_channel("worker", &ledger).await;
     let supervisor = budget_supervisor(4, Duration::from_secs(2));
-    let key = ShapeKey {
-        worker_id: "worker".into(),
-        model_ref: "model".into(),
-        shape: 128,
-        program: AneProgram::Single,
-    };
-    let owner = QueueTicket::enqueue(&supervisor.inner);
-    let Step::Admit(id) = supervisor.next_step(owner.id, &key, &worker, 4) else {
-        panic!("reservation");
-    };
+    let (started, release) = notify_pair();
+    ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
+    let owner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker.clone();
+        async move { supervisor.lease(&worker, "model", 128).await }
+    });
+    notified(&started).await;
     let head = tokio::spawn({
         let supervisor = supervisor.clone();
         let worker = worker.clone();
         async move { supervisor.lease(&worker, "model", 256).await }
     });
     until(|| supervisor.inner.lock().starved_head.is_some()).await;
-    let suspended = QueueTicket::enqueue(&supervisor.inner);
-    assert!(matches!(
-        supervisor.next_step(suspended.id, &key, &worker, 4),
-        Step::Wait(Some(128))
-    ));
-    drop(supervisor.admit(worker.clone(), key, id).await.unwrap());
+    // A joiner whose task never runs again: it holds its "ready" answer
+    // without leasing.
+    let (_suspended, _answer) = raw_want(&supervisor, &worker, "model", 128);
+    release.notify_one();
+    drop(owner.await.unwrap().unwrap());
     // No joined request is polled or cancelled, so only the handoff timer can
     // wake the head. Its normal admission backstop is deliberately much later.
     drop(
@@ -245,31 +270,41 @@ async fn eviction_prefers_no_queued_demand_before_smallest_rung_and_lru() {
         .lock()
         .smallest_rungs
         .insert("model".into(), 128);
-    let key = |shape| ShapeKey {
-        worker_id: "worker".into(),
-        model_ref: "model".into(),
-        shape,
-        program: AneProgram::Single,
-    };
-    let head = QueueTicket::enqueue(&supervisor.inner);
-    assert!(matches!(
-        supervisor.next_step(head.id, &key(512), &worker, 4),
-        Step::Wait(_)
-    ));
-    let waiter = QueueTicket::enqueue(&supervisor.inner);
-    assert!(matches!(
-        supervisor.next_step(waiter.id, &key(256), &worker, 4),
-        Step::Wait(_)
-    ));
+    let head = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker.clone();
+        async move { supervisor.lease(&worker, "model", 512).await }
+    });
+    until(|| supervisor.inner.lock().starved_head.is_some()).await;
+    // Queued behind the starved head, a request for the resident 256 waits.
+    let waiter = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker.clone();
+        async move { supervisor.lease(&worker, "model", 256).await }
+    });
+    until(|| supervisor.inner.lock().waiters.len() == 2).await;
     drop((demanded, other));
-    let Step::Evict { key: victim, .. } = supervisor.next_step(head.id, &key(512), &worker, 4)
-    else {
-        panic!("victim");
-    };
+    drop(
+        tokio::time::timeout(Duration::from_secs(2), head)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    );
+    let evictions: Vec<String> = ledger
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter(|event| event.starts_with("evict "))
+        .cloned()
+        .collect();
     assert_eq!(
-        victim.shape, 128,
+        evictions.first().map(String::as_str),
+        Some("evict model 128"),
         "queued demand should outweigh the smallest-rung preference"
     );
+    drop(waiter.await.unwrap().unwrap());
 }
 
 #[tokio::test]
