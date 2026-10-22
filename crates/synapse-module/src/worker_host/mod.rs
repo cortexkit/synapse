@@ -5319,45 +5319,55 @@ pub mod ane_residency {
 
         /// Borrow only an already compiled program whose output matched standalone
         /// output bit-for-bit on the qualification fixtures. A missing program
-        /// returns None instead of triggering compilation.
+        /// returns None instead of triggering compilation. A stopped scheduler
+        /// closes the lane for packed requests too, as for `try_lease`.
         fn try_packed_lease(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
-        ) -> Option<AneShapeLease> {
+        ) -> Result<Option<AneShapeLease>, AneResidencyError> {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
             let key = Self::packed_key(worker, model_ref);
             let mut state = self.inner.lock();
             // Packed arrivals have no budget-queue ticket. Do not let their fast
             // path repeatedly lease the only program a starved admission can evict.
             if state.starved_head.is_some() {
-                return None;
+                return Ok(None);
             }
             if state.recovering.contains(worker.worker_id())
                 || state.retired.contains(worker.worker_id())
             {
-                return None;
+                return Ok(None);
             }
             let now = state.tick();
-            let slot = state.slots.get_mut(&key)?;
+            let Some(slot) = state.slots.get_mut(&key) else {
+                return Ok(None);
+            };
             if slot.state != SlotState::Resident
                 || !slot.packed_qualified
                 || slot.generation != worker.generation()
             {
-                return None;
+                return Ok(None);
             }
             slot.leases += 1;
             slot.last_used = now;
-            Some(AneShapeLease {
+            Ok(Some(AneShapeLease {
                 inner: self.inner.clone(),
                 key,
                 slot_id: slot.id,
                 inventory: slot.inventory.clone(),
-            })
+            }))
         }
 
-        fn packed_resident(&self, worker: &Arc<dyn AneShapeWorker>, model_ref: &str) -> bool {
-            let lease = self.try_packed_lease(worker, model_ref);
-            lease.is_some()
+        fn packed_resident(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+        ) -> Result<bool, AneResidencyError> {
+            let lease = self.try_packed_lease(worker, model_ref)?;
+            Ok(lease.is_some())
         }
 
         fn preparation_possible(&self, worker: &Arc<dyn AneShapeWorker>) -> bool {
@@ -7253,7 +7263,7 @@ pub mod ane_residency {
             let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
             if self
                 .supervisor
-                .packed_resident(&worker, &self.metadata.model_ref)
+                .packed_resident(&worker, &self.metadata.model_ref)?
             {
                 return Ok(true);
             }
@@ -7468,7 +7478,7 @@ pub mod ane_residency {
             if self.channel.packing_available()
                 && self
                     .supervisor
-                    .packed_resident(worker, &self.metadata.model_ref)
+                    .packed_resident(worker, &self.metadata.model_ref)?
             {
                 let plan = synapse_core::plan_packed(&lengths)
                     .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
@@ -7493,7 +7503,7 @@ pub mod ane_residency {
                     ensure_request_live()?;
                     if let Some(lease) = self
                         .supervisor
-                        .try_packed_lease(worker, &self.metadata.model_ref)
+                        .try_packed_lease(worker, &self.metadata.model_ref)?
                     {
                         fault_generation.store(worker.generation(), Ordering::Release);
                         let (indices, passes) = packed_subset(&plan.passes);
@@ -9893,6 +9903,7 @@ pub mod ane_residency {
                 serving
                     .supervisor
                     .try_packed_lease(&worker, PACKED_MODEL)
+                    .unwrap()
                     .is_none(),
                 "new packed leases must not keep the starved head's only eviction victim busy"
             );
@@ -10007,6 +10018,46 @@ pub mod ane_residency {
                     .iter()
                     .all(|r| !is_packed_request(r)),
                 "request must not re-admit an evicted packed key"
+            );
+        }
+
+        /// After the compile scheduler stops, a request whose rows are all
+        /// served by the resident packed program is refused like any other
+        /// (`SchedulerStopped`, which the wire reports as `engine_crashed`),
+        /// and nothing reaches the worker.
+        #[tokio::test]
+        async fn packed_requests_are_refused_after_the_scheduler_stops() {
+            let peer = Arc::new(Mutex::new(PackedPeer::default()));
+            let serving = packed_peer(false, peer.clone()).await;
+            assert!(serving.prepare_packed().await.unwrap());
+            serving
+                .supervisor
+                .inner
+                .scheduler_task
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the scheduler was started")
+                .abort();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !serving.supervisor.inner.closed.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the stopped scheduler did not close the lane");
+            let before = peer.lock().unwrap().requests.len();
+            let result = serving
+                .infer_packed(vec![vec![41; 127], vec![42; 129]])
+                .await;
+            assert!(
+                matches!(result, Err(AneResidencyError::SchedulerStopped)),
+                "{result:?}"
+            );
+            assert_eq!(
+                peer.lock().unwrap().requests.len(),
+                before,
+                "a packed request reached the worker after the scheduler stopped"
             );
         }
 
