@@ -236,6 +236,8 @@ struct Waiter {
     /// The request waits on a compile right now (queued for it, or joined to
     /// it), as opposed to waiting for budget or for a worker's recovery.
     waiting_on_compile: bool,
+    /// A pass has decided this request at least once.
+    classified: bool,
     trace: Trace,
 }
 
@@ -353,6 +355,8 @@ pub(super) struct Scheduler {
     /// so nobody knows whether it still owns the Neural Engine. Requests for
     /// them are refused at once.
     closed: BTreeSet<String>,
+    /// Caller expiries that arrived before their request was first decided.
+    deferred_expiries: Vec<(u64, oneshot::Sender<AnswerKind>)>,
     answered: VecDeque<(u64, AnswerKind)>,
 }
 
@@ -388,6 +392,7 @@ impl Scheduler {
                 recoveries: BTreeMap::new(),
                 retirements: BTreeMap::new(),
                 closed: BTreeSet::new(),
+                deferred_expiries: Vec::new(),
                 answered: VecDeque::new(),
             },
             tx,
@@ -487,28 +492,18 @@ impl Scheduler {
                     generation,
                 } => self.exit_confirmed(&mut state, &worker_id, generation),
                 Msg::Expired { id, reply } => {
-                    let owns_compile = self.waiters.get(&id).is_some_and(|waiter| {
-                        state.slots.get(&waiter.key).is_some_and(|slot| {
-                            slot.state == SlotState::Admitting && slot.owner == Some(id)
-                        })
-                    });
-                    let kind = match self.waiters.contains_key(&id) {
-                        // The caller is answered, but the request that started
-                        // the compile keeps waiting for it (see `Waiter::bound`).
-                        true if owns_compile => {
-                            let error = self.expiry_answer(&mut state, id, now, true);
-                            let kind = AnswerKind::of(&error);
-                            self.answered.push_back((id, kind.clone()));
-                            Some(kind)
-                        }
-                        true => {
-                            let error = self.expiry_answer(&mut state, id, now, true);
-                            self.answer(&mut state, id, Answer::Failed(error), &mut effects);
-                            self.recent(id)
-                        }
-                        false => self.recent(id),
-                    };
-                    let _ = reply.send(kind.unwrap_or(AnswerKind::DeadlineExceeded));
+                    if self
+                        .waiters
+                        .get(&id)
+                        .is_some_and(|waiter| !waiter.classified)
+                    {
+                        // Not decided yet: answer once the pass that follows
+                        // has classified it, so the answer reflects its wait.
+                        self.deferred_expiries.push((id, reply));
+                        effects.progress = true;
+                    } else {
+                        self.expire_now(&mut state, id, reply, now, &mut effects);
+                    }
                 }
                 Msg::Recover {
                     worker,
@@ -646,6 +641,7 @@ impl Scheduler {
                 reply: want.reply,
                 on_compile: false,
                 waiting_on_compile: false,
+                classified: false,
                 trace: want.trace,
             },
         );
@@ -668,6 +664,9 @@ impl Scheduler {
             self.drive_recoveries(&mut state, now, &mut effects);
             self.drive_retirements(&mut state, now, &mut effects);
             self.decide(&inner, &mut state, now, &mut effects);
+            for (id, reply) in std::mem::take(&mut self.deferred_expiries) {
+                self.expire_now(&mut state, id, reply, now, &mut effects);
+            }
             self.expire_entries(&mut state, now);
             wake = self.next_wake(&state, now);
             let watch = state.starved_head.is_some()
@@ -834,6 +833,41 @@ impl Scheduler {
         }
     }
 
+    /// Answers a serving caller whose own deadline fired, with the same
+    /// answer the scheduler gives (or gave) its request.
+    fn expire_now(
+        &mut self,
+        state: &mut State,
+        id: u64,
+        reply: oneshot::Sender<AnswerKind>,
+        now: tokio::time::Instant,
+        effects: &mut Effects,
+    ) {
+        let owns_compile = self.waiters.get(&id).is_some_and(|waiter| {
+            state
+                .slots
+                .get(&waiter.key)
+                .is_some_and(|slot| slot.state == SlotState::Admitting && slot.owner == Some(id))
+        });
+        let kind = match self.waiters.contains_key(&id) {
+            // The caller is answered, but the request that started the
+            // compile keeps waiting for it (see `Waiter::bound`).
+            true if owns_compile => {
+                let error = self.expiry_answer(state, id, now, true);
+                let kind = AnswerKind::of(&error);
+                self.answered.push_back((id, kind.clone()));
+                Some(kind)
+            }
+            true => {
+                let error = self.expiry_answer(state, id, now, true);
+                self.answer(state, id, Answer::Failed(error), effects);
+                self.recent(id)
+            }
+            false => self.recent(id),
+        };
+        let _ = reply.send(kind.unwrap_or(AnswerKind::DeadlineExceeded));
+    }
+
     /// Whether `key` is waiting on a compile: queued, or being compiled.
     fn compiling(state: &State, key: &ShapeKey) -> bool {
         state.entries.contains_key(key)
@@ -947,6 +981,7 @@ impl Scheduler {
                 continue;
             };
             waiter.waiting_on_compile = false;
+            waiter.classified = true;
             let key = waiter.key.clone();
             let worker = waiter.worker.clone();
             let executables = waiter.executables;
@@ -1940,6 +1975,25 @@ impl Scheduler {
                 slot.joined.clear();
                 slot.handoff_until = Some(now + ADMISSION_HANDOFF);
                 for id in cohort {
+                    // A request that went away before this answer is dropped
+                    // at once rather than joining the cohort as a member
+                    // nobody will lease for.
+                    if self.waiters[&id].reply.is_closed() {
+                        self.waiters.remove(&id);
+                        state.leave_queue(id);
+                        continue;
+                    }
+                    // A joiner whose bound has already passed is answered by
+                    // its bound, not handed the shape late.
+                    if owner != Some(id)
+                        && self.waiters[&id]
+                            .bound(id, state)
+                            .is_some_and(|bound| now >= bound)
+                    {
+                        let error = self.expiry_answer(state, id, now, false);
+                        self.answer(state, id, Answer::Failed(error), effects);
+                        continue;
+                    }
                     if self.waiters[&id].prepare() {
                         let tick = state.tick();
                         let slot = state.slots.get_mut(&key).expect("checked above");

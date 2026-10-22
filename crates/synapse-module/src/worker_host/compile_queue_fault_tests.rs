@@ -1503,3 +1503,154 @@ async fn resident_request_behind_a_lapsed_starvation_barrier_is_granted() {
     .expect("a resident request stayed behind a starvation barrier that had lapsed");
     assert!(leased.is_ok(), "{:?}", leased.err());
 }
+
+/// A caller expiry that reaches the scheduler before its request was ever
+/// decided is answered after that request is classified: a request queued
+/// behind a running compile is told `shape_compiling`, not a bare deadline.
+#[tokio::test(start_paused = true)]
+async fn expiry_before_the_first_decision_is_answered_after_it() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let running = fake_worker(&compiler, "running");
+    let running_answer = ask_at(&supervisor, &compiler, &running, QUEUE_QWEN, 2048, 0.0, None);
+    until(|| supervisor.inner.lock().compile_running()).await;
+    let other = fake_worker(&compiler, "other");
+    let now = tokio::time::Instant::now();
+    let (reply, _answer) = tokio::sync::oneshot::channel();
+    let (expired, expiry) = tokio::sync::oneshot::channel();
+    // Both messages are in the mailbox before the scheduler runs again.
+    supervisor
+        .inner
+        .send(scheduler::Msg::Want(scheduler::Want {
+            id: 9_000,
+            key: queue_key("other", QUEUE_GTE, 128),
+            worker: other,
+            executables: 22,
+            bound: Some(now + Duration::from_secs(600)),
+            deadline: Some(now),
+            reply: scheduler::Reply::Lease(reply),
+            trace: scheduler::Trace::current(),
+        }))
+        .unwrap();
+    supervisor
+        .inner
+        .send(scheduler::Msg::Expired {
+            id: 9_000,
+            reply: expired,
+        })
+        .unwrap();
+    let kind = expiry.await.unwrap();
+    assert!(
+        matches!(kind, scheduler::AnswerKind::ShapeCompiling { .. }),
+        "an expiry decided before its request was classified: {kind:?}"
+    );
+    assert!(running_answer.await.unwrap().ok());
+}
+
+/// Sends a request straight to the scheduler, as `lease_until` does, and
+/// returns its answer channel.
+fn want_with_id(
+    supervisor: &AneResidencySupervisor,
+    worker: &Arc<dyn AneShapeWorker>,
+    id: u64,
+    shape: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> tokio::sync::oneshot::Receiver<scheduler::Answer> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let bound = tokio::time::Instant::now() + Duration::from_secs(600);
+    supervisor
+        .inner
+        .send(scheduler::Msg::Want(scheduler::Want {
+            id,
+            key: queue_key(worker.worker_id(), QUEUE_GTE, shape),
+            worker: worker.clone(),
+            executables: 22,
+            bound: Some(deadline.map_or(bound, |deadline| deadline.min(bound))),
+            deadline,
+            reply: scheduler::Reply::Lease(reply),
+            trace: scheduler::Trace::current(),
+        }))
+        .unwrap();
+    answer
+}
+
+/// Holds the scheduler after its next pass, runs `meanwhile`, then lets it
+/// go on and gives it a few polls without moving the clock.
+async fn while_scheduler_held(supervisor: &AneResidencySupervisor, meanwhile: impl Future) {
+    let (decided, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *supervisor.inner.wait_decision_gate.lock().unwrap() =
+        Some((decided.clone(), resume.clone()));
+    supervisor.inner.nudge();
+    decided.notified().await;
+    meanwhile.await;
+    resume.notify_one();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A joiner whose bound passed while a compile's completion was waiting to
+/// be handled is answered by its bound, not handed the shape late.
+#[tokio::test(start_paused = true)]
+async fn completion_does_not_outrun_an_overdue_joiner_bound() {
+    // The machine compiles 1.5 times slower than predicted: GTE@128 is
+    // predicted ready at 4.67 s but finishes at about 7 s.
+    let compiler = SharedCompiler::new(1.5);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    let owner = ask_at(&supervisor, &compiler, &worker, QUEUE_GTE, 128, 0.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(1)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut joined = want_with_id(&supervisor, &worker, 9_002, 128, Some(deadline));
+    // Its 6 s bound (accepted: the prediction is earlier) and the compile's
+    // end both pass while the scheduler is
+    // held, so it sees the completion before the bound's timer.
+    while_scheduler_held(
+        &supervisor,
+        tokio::time::sleep_until(compiler.epoch + Duration::from_secs(8)),
+    )
+    .await;
+    assert!(
+        matches!(joined.try_recv(), Ok(scheduler::Answer::Failed(_))),
+        "a joiner was handed the shape after its bound had passed"
+    );
+    assert!(owner.await.unwrap().ok());
+}
+
+/// A joiner that went away before its compile's completion was handled is
+/// dropped then, instead of staying in the handoff cohort as a member nobody
+/// will lease for.
+#[tokio::test(start_paused = true)]
+async fn closed_joiner_does_not_stay_in_the_handoff_cohort() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    let key = queue_key("worker", QUEUE_GTE, 128);
+    let owner = ask_at(&supervisor, &compiler, &worker, QUEUE_GTE, 128, 0.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(1)).await;
+    // A deadline gives the scheduler a timer to hold on; it is accepted.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+    let joiner = want_with_id(&supervisor, &worker, 9_001, 128, Some(deadline));
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&key)
+            .is_some_and(|slot| slot.joined.contains(&9_001))
+    })
+    .await;
+    // The joiner goes away and the compile finishes while the scheduler is
+    // held, so the completion is handled before the departure is noticed.
+    while_scheduler_held(&supervisor, async {
+        drop(joiner);
+        tokio::time::sleep_until(compiler.epoch + Duration::from_secs(5)).await;
+    })
+    .await;
+    let joined = supervisor.inner.lock().slots[&key].joined.clone();
+    assert!(
+        !joined.contains(&9_001),
+        "a joiner that had gone away stayed in the handoff cohort: {joined:?}"
+    );
+    assert!(owner.await.unwrap().ok());
+}

@@ -4906,6 +4906,31 @@ pub mod ane_residency {
         }
     }
 
+    /// A request's place in the handoff cohort of a shape it waited for.
+    /// Dropping it removes the request from the cohort if it has not leased
+    /// through it (leasing removes it already), and wakes the scheduler when
+    /// that leaves the cohort empty, so the handoff barrier ends at once.
+    struct CohortMembership {
+        inner: Arc<Inner>,
+        key: ShapeKey,
+        id: u64,
+    }
+
+    impl Drop for CohortMembership {
+        fn drop(&mut self) {
+            let emptied = {
+                let mut state = self.inner.lock();
+                state
+                    .slots
+                    .get_mut(&self.key)
+                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty())
+            };
+            if emptied {
+                self.inner.nudge();
+            }
+        }
+    }
+
     /// Wakes the scheduler when a request stops waiting for its answer, so a
     /// compile or eviction nobody needs any more can be withdrawn promptly.
     struct DepartureNudge {
@@ -5237,6 +5262,9 @@ pub mod ane_residency {
             let bound = request_deadline.map_or(deadline, |request| request.min(deadline));
             link_request(&self.inner, worker.worker_id());
             let mut cohort = None;
+            // Leaves the handoff cohort if this request stops before leasing
+            // through it, so the barrier does not wait for a member that left.
+            let mut membership: Option<CohortMembership> = None;
             loop {
                 if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
@@ -5254,7 +5282,10 @@ pub mod ane_residency {
                     }
                 }
                 ensure_request_live()?;
-                if let Some(lease) = self.try_lease(&key, worker, cohort.take())? {
+                let member = membership.take();
+                let leased = self.try_lease(&key, worker, cohort.take());
+                drop(member);
+                if let Some(lease) = leased? {
                     #[cfg(test)]
                     admission_trace::event("lease_grant", model_ref, shape);
                     return Ok(lease);
@@ -5308,6 +5339,11 @@ pub mod ane_residency {
                     Ok(Ok(scheduler::Answer::Ready)) => {
                         enter_wait(WaitPhase::Compile(shape));
                         cohort = Some(id);
+                        membership = Some(CohortMembership {
+                            inner: self.inner.clone(),
+                            key: key.clone(),
+                            id,
+                        });
                     }
                     Ok(Ok(scheduler::Answer::Failed(error))) => {
                         #[cfg(test)]
