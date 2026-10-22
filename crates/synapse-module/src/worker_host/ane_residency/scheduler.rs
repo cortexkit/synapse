@@ -96,6 +96,22 @@ pub(super) enum Msg {
         exit_confirmed: bool,
         reply: oneshot::Sender<()>,
     },
+    /// The worker's `LOAD` checked aned's compile cache for `checked` rungs
+    /// of `model_ref` and found `cached` among them.
+    CacheKnown {
+        model_ref: String,
+        checked: Vec<usize>,
+        cached: Vec<usize>,
+    },
+    /// A direct-ANE catalog lane became ready: load `shapes` of its model in
+    /// the background, at the lowest priority. Ignored for a worker whose
+    /// lane was already prewarmed.
+    Prewarm {
+        worker: Arc<dyn AneShapeWorker>,
+        model_ref: String,
+        lane: String,
+        shapes: Vec<usize>,
+    },
     #[cfg(test)]
     Evict {
         key: ShapeKey,
@@ -209,6 +225,9 @@ pub(super) struct DispatchCell {
     /// still running does not keep the scheduler alive after the supervisor
     /// is gone.
     report: mpsc::WeakUnboundedSender<Msg>,
+    /// Where the worker reported each layer of the admitted shape came from,
+    /// when it reports that.
+    origins: Mutex<Option<AdmissionOrigins>>,
 }
 
 impl DispatchCell {
@@ -248,6 +267,18 @@ impl DispatchCell {
 /// worker. Workers other than the channel (tests) call this themselves.
 pub(super) fn mark_compile_dispatched() {
     let _ = COMPILE_DISPATCHED.try_with(|cell| cell.mark());
+}
+
+/// Records where the layers of the shape being admitted came from, as the
+/// worker reported in `ADMITTED`. Workers other than the channel (tests)
+/// call this themselves.
+pub(super) fn report_admission_origins(origins: AdmissionOrigins) {
+    let _ = COMPILE_DISPATCHED.try_with(|cell| {
+        *cell
+            .origins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(origins);
+    });
 }
 
 struct Waiter {
@@ -319,6 +350,7 @@ enum OpDone {
         result: Result<AnePlacementInventory, AneResidencyError>,
         dispatched: Option<tokio::time::Instant>,
         finished: tokio::time::Instant,
+        origins: Option<AdmissionOrigins>,
     },
     Evict(Result<(), AneResidencyError>),
     /// `exited`: the old process's exit was confirmed during the restart. It
@@ -334,6 +366,81 @@ enum OpDone {
 }
 
 pub(super) type RecoverReply = oneshot::Sender<Result<(), AneResidencyError>>;
+
+/// How a finished admission went on the wire.
+struct Admission {
+    /// When it reached the worker, if it did.
+    dispatched: Option<tokio::time::Instant>,
+    finished: tokio::time::Instant,
+    /// Where the worker said each layer came from, if it says.
+    origins: Option<AdmissionOrigins>,
+}
+
+/// One lane's background prewarm: the shapes still to load, one at a time,
+/// and what became of the others, for the line logged when it ends.
+struct Prewarm {
+    worker: Arc<dyn AneShapeWorker>,
+    model_ref: String,
+    lane: String,
+    started: tokio::time::Instant,
+    pending: VecDeque<usize>,
+    running: Option<usize>,
+    /// Admitted shapes, with where their layers came from when reported.
+    loaded: Vec<(usize, Option<AdmissionOrigins>)>,
+    /// Shapes already resident (or being admitted for a request).
+    present: Vec<usize>,
+    /// Shapes left out because the free budget or the shape limits could
+    /// not hold them without evicting.
+    skipped: Vec<usize>,
+    /// The admission that failed and ended the prewarm.
+    failed: Option<(usize, String)>,
+}
+
+impl Prewarm {
+    /// One INFO line saying what the prewarm did, so its effect is visible
+    /// in production logs.
+    fn log(&self, outcome: &str, now: tokio::time::Instant) {
+        let shapes = |list: &[usize]| {
+            list.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let loaded: Vec<usize> = self.loaded.iter().map(|(shape, _)| *shape).collect();
+        let count = |pick: fn(&AdmissionOrigins) -> u32| {
+            self.loaded
+                .iter()
+                .filter(|(_, origins)| origins.as_ref().is_some_and(|o| pick(o) > 0))
+                .count()
+        };
+        let cached = self
+            .loaded
+            .iter()
+            .filter(|(_, origins)| {
+                origins
+                    .as_ref()
+                    .is_some_and(|o| o.compiled_layers == 0 && o.cache_hit_layers > 0)
+            })
+            .count();
+        let compiled = count(|o| o.compiled_layers);
+        tracing::info!(
+            target: "worker",
+            lane = %self.lane,
+            model_ref = %self.model_ref,
+            worker_id = %self.worker.worker_id(),
+            outcome,
+            loaded = %shapes(&loaded),
+            loaded_from_cache = cached,
+            compiled,
+            already_resident = %shapes(&self.present),
+            skipped_for_budget = %shapes(&self.skipped),
+            failed = ?self.failed,
+            total_ms = u64::try_from(now.saturating_duration_since(self.started).as_millis())
+                .unwrap_or(u64::MAX),
+            "direct-ANE prewarm {outcome}"
+        );
+    }
+}
 
 struct Recovery {
     worker: Arc<dyn AneShapeWorker>,
@@ -395,6 +502,12 @@ pub(super) struct Scheduler {
     /// Caller expiries that arrived before their request was first decided.
     deferred_expiries: Vec<(u64, oneshot::Sender<AnswerKind>)>,
     answered: VecDeque<(u64, AnswerKind)>,
+    /// Background prewarms by worker id; at most one admission of all of
+    /// them runs at a time, and only while no request waits.
+    prewarms: BTreeMap<String, Prewarm>,
+    /// Workers whose lane was already given a prewarm, so a repeated
+    /// readiness signal for the same worker starts nothing.
+    prewarmed: BTreeSet<String>,
     #[cfg(test)]
     _exit_signal: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -448,6 +561,8 @@ impl Scheduler {
                 #[cfg(test)]
                 _exit_signal: inner.scheduler_exit_signal.lock().unwrap().clone(),
                 answered: VecDeque::new(),
+                prewarms: BTreeMap::new(),
+                prewarmed: BTreeSet::new(),
             },
             tx,
         )
@@ -578,6 +693,11 @@ impl Scheduler {
                     // A retired worker compiles nothing more, so its queued
                     // compiles are dropped at once, promised or not.
                     state.entries.retain(|key, _| key.worker_id != id);
+                    // Its prewarm stops too; an admission already running
+                    // finishes and goes with the worker.
+                    if let Some(prewarm) = self.prewarms.remove(&id) {
+                        prewarm.log("cancelled", now);
+                    }
                     self.retirements.insert(
                         id,
                         Retirement {
@@ -630,6 +750,44 @@ impl Scheduler {
                     }
                     effects.units.push(reply);
                 }
+                Msg::CacheKnown {
+                    model_ref,
+                    checked,
+                    cached,
+                } => {
+                    for shape in checked {
+                        state
+                            .cached
+                            .insert((model_ref.clone(), shape), cached.contains(&shape));
+                    }
+                    effects.progress = true;
+                }
+                Msg::Prewarm {
+                    worker,
+                    model_ref,
+                    lane,
+                    shapes,
+                } => {
+                    let id = worker.worker_id().to_owned();
+                    if !state.retired.contains(&id) && self.prewarmed.insert(id.clone()) {
+                        self.prewarms.insert(
+                            id,
+                            Prewarm {
+                                worker,
+                                model_ref,
+                                lane,
+                                started: now,
+                                pending: shapes.into(),
+                                running: None,
+                                loaded: Vec::new(),
+                                present: Vec::new(),
+                                skipped: Vec::new(),
+                                failed: None,
+                            },
+                        );
+                        effects.progress = true;
+                    }
+                }
                 #[cfg(test)]
                 Msg::Evict {
                     key,
@@ -671,12 +829,15 @@ impl Scheduler {
     ) {
         if let Reply::Prepare(sender) = &want.reply {
             // Preparation does not wait for budget behind live requests or
-            // for the worker's own in-flight work.
+            // for the worker's own in-flight work. A background prewarm
+            // admission is not such work: preparation outranks prewarm and
+            // waits for that one admission instead of giving up.
             let busy = !state.waiters.is_empty()
                 || !state.entries.is_empty()
                 || state.slots.values().any(|slot| {
                     slot.worker.worker_id() == want.worker.worker_id()
-                        && (slot.leases != 0 || slot.state == SlotState::Admitting)
+                        && (slot.leases != 0
+                            || (slot.state == SlotState::Admitting && !slot.prewarm))
                 });
             if busy {
                 if let Reply::Prepare(sender) = want.reply {
@@ -731,6 +892,7 @@ impl Scheduler {
             self.drive_recoveries(&mut state, now, &mut effects);
             self.drive_retirements(&mut state, now, &mut effects);
             self.decide(&inner, &mut state, now, &mut effects);
+            self.drive_prewarms(&inner, &mut state, now, &mut effects);
             for (id, reply) in std::mem::take(&mut self.deferred_expiries) {
                 self.expire_now(&mut state, id, reply, now, &mut effects);
             }
@@ -843,7 +1005,7 @@ impl Scheduler {
             let slot = state
                 .slots
                 .get(&key)
-                .filter(|slot| slot.state == SlotState::Admitting)
+                .filter(|slot| slot.state == SlotState::Admitting && !slot.prewarm)
                 .map(|slot| {
                     (
                         slot.id,
@@ -897,6 +1059,7 @@ impl Scheduler {
                     && state.slots.get(key).is_some_and(|slot| {
                         slot.id == *slot_id
                             && slot.state == SlotState::Admitting
+                            && !slot.prewarm
                             && slot.dispatched_at.is_none()
                             && slot
                                 .promise
@@ -1263,7 +1426,9 @@ impl Scheduler {
             let gathered =
                 head.program != AneProgram::Single || state.entries[&head].gathered_at() <= now;
             if state.compile_running() || !gathered {
-                if only_prepare {
+                // Preparation gives up behind any other compile, but waits
+                // for a background prewarm admission, which it outranks.
+                if only_prepare && !state.only_prewarm_running() {
                     for id in head_waiters {
                         self.answer(state, id, Answer::Ready, effects);
                     }
@@ -1392,9 +1557,15 @@ impl Scheduler {
         executables: usize,
     ) {
         let queued = state.entries.remove(key);
-        let compile_cost = queued
-            .as_ref()
-            .map_or(Default::default(), |entry| state.estimate(key, entry.seed));
+        // A shape aned holds compiled is predicted as a load; the compile
+        // estimate is kept in case the load turns into a compile.
+        let (compile_cost, miss_cost) = match queued.as_ref() {
+            None => (Default::default(), None),
+            Some(entry) => match state.load_estimate(key, entry.seed, entry.load_seed) {
+                Some(load) => (load, Some(state.compile_estimate(key, entry.seed))),
+                None => (state.compile_estimate(key, entry.seed), None),
+            },
+        };
         let tick = state.tick();
         state.next_slot += 1;
         let slot_id = state.next_slot;
@@ -1424,10 +1595,15 @@ impl Scheduler {
                 compile_seed: queued
                     .as_ref()
                     .map_or(Default::default(), |entry| entry.seed),
+                load_seed: queued
+                    .as_ref()
+                    .map_or(Default::default(), |entry| entry.load_seed),
                 queued_as: queued.as_ref().map(QueuedCompile::place),
                 owner,
                 promise: queued.as_ref().and_then(|entry| entry.promise),
                 dispatched_at: None,
+                miss_cost,
+                prewarm: false,
             },
         );
         tracing::debug!(
@@ -1492,6 +1668,7 @@ impl Scheduler {
             slot_id,
             inner: Arc::downgrade(inner),
             report,
+            origins: Mutex::new(None),
         });
         #[cfg(test)]
         let gate = inner.admission_gate.clone();
@@ -1518,6 +1695,10 @@ impl Scheduler {
                 result,
                 dispatched: cell.at(),
                 finished: tokio::time::Instant::now(),
+                origins: *cell
+                    .origins
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
             }
         };
         #[cfg(test)]
@@ -1813,6 +1994,106 @@ impl Scheduler {
         }
     }
 
+    /// Starts the next background prewarm admission, if any lane has one
+    /// pending and nothing else wants the Neural Engine: no request waits or
+    /// is queued, no compile entry exists and the compile gate is free. A
+    /// prewarm admission only uses free budget and free shape slots; the
+    /// first shape that does not fit without evicting ends its lane's
+    /// prewarm. A lane with nothing left to load logs its result.
+    fn drive_prewarms(
+        &mut self,
+        inner: &Arc<Inner>,
+        state: &mut State,
+        now: tokio::time::Instant,
+        effects: &mut Effects,
+    ) {
+        let ids: Vec<String> = self.prewarms.keys().cloned().collect();
+        for id in ids {
+            let idle = self.waiters.is_empty()
+                && state.entries.is_empty()
+                && !state.compile_running()
+                && !state.recovering.contains(&id)
+                && !self.closed.contains(&id);
+            let start = {
+                let prewarm = self.prewarms.get_mut(&id).expect("listed above");
+                let mut start = None;
+                while idle && prewarm.running.is_none() {
+                    let Some(&shape) = prewarm.pending.front() else {
+                        break;
+                    };
+                    let key = ShapeKey {
+                        worker_id: id.clone(),
+                        model_ref: prewarm.model_ref.clone(),
+                        shape,
+                        program: AneProgram::Single,
+                    };
+                    if state.slots.contains_key(&key) {
+                        prewarm.present.push(shape);
+                        prewarm.pending.pop_front();
+                        continue;
+                    }
+                    let worker = prewarm.worker.clone();
+                    let fits = worker
+                        .executable_count(&key.model_ref)
+                        .ok()
+                        .filter(|executables| {
+                            state.model_count(&key.model_ref) < inner.limits.per_model
+                                && state.slots.len() < inner.limits.total
+                                && state.reserved_executables().saturating_add(*executables)
+                                    <= inner.executable_budget
+                        });
+                    let Some(executables) = fits else {
+                        prewarm.skipped.extend(prewarm.pending.drain(..));
+                        break;
+                    };
+                    prewarm.pending.pop_front();
+                    prewarm.running = Some(shape);
+                    start = Some((key, worker, executables));
+                }
+                start
+            };
+            if let Some((key, worker, executables)) = start {
+                state.create_entry(&key, &worker, executables, now);
+                self.reserve(inner, state, None, &key, &worker, executables);
+                if let Some(slot) = state.slots.get_mut(&key) {
+                    slot.prewarm = true;
+                }
+                effects.progress = true;
+                return;
+            }
+            let prewarm = &self.prewarms[&id];
+            if prewarm.running.is_none() && prewarm.pending.is_empty() {
+                let prewarm = self.prewarms.remove(&id).expect("checked above");
+                prewarm.log("finished", now);
+            }
+        }
+    }
+
+    /// Records the end of a prewarm admission. A failed one ends its lane's
+    /// prewarm: the worker is recovering or refused for lack of resources,
+    /// and loading more in the background would only add to that.
+    fn prewarm_finished(
+        &mut self,
+        key: &ShapeKey,
+        error: Option<&AneResidencyError>,
+        origins: Option<AdmissionOrigins>,
+    ) {
+        let Some(prewarm) = self.prewarms.get_mut(&key.worker_id) else {
+            return;
+        };
+        if prewarm.running != Some(key.shape) {
+            return;
+        }
+        prewarm.running = None;
+        match error {
+            None => prewarm.loaded.push((key.shape, origins)),
+            Some(error) => {
+                prewarm.failed = Some((key.shape, error.to_string()));
+                prewarm.pending.clear();
+            }
+        }
+    }
+
     /// Entries nobody waits for are kept until their promise expires.
     fn expire_entries(&mut self, state: &mut State, now: tokio::time::Instant) {
         let expired: Vec<ShapeKey> = state
@@ -1876,12 +2157,21 @@ impl Scheduler {
             .filter(|slot| slot.state == SlotState::Admitting && slot.dispatched_at.is_none())
             .filter_map(|slot| slot.promise)
             .map(|(at, delay)| at + delay * ORPHAN_EXPIRY_FACTOR);
+        // An admission predicted as a cached load is repriced as a compile
+        // once it runs well past that load, so waiting requests are
+        // re-checked against their bounds at that moment.
+        let misses = state
+            .slots
+            .values()
+            .filter(|slot| slot.state == SlotState::Admitting && slot.miss_cost.is_some())
+            .filter_map(|slot| slot.dispatched_at.map(|at| slot.missed_load_at(at)));
         bounds
             .chain(entries.flatten())
             .chain(handoffs)
             .chain(recoveries)
             .chain(retirements)
             .chain(lapses)
+            .chain(misses)
             .filter(|at| *at > now)
             .min()
     }
@@ -1912,12 +2202,13 @@ impl Scheduler {
                     generation,
                     retry,
                 } => {
-                    let (result, dispatched, finished) = match done {
+                    let (result, dispatched, finished, origins) = match done {
                         Ok(OpDone::Compile {
                             result,
                             dispatched,
                             finished,
-                        }) => (result, dispatched, finished),
+                            origins,
+                        }) => (result, dispatched, finished, origins),
                         Ok(_) => return,
                         Err(error) => (
                             Err(AneResidencyError::Panicked(format!(
@@ -1925,6 +2216,7 @@ impl Scheduler {
                             ))),
                             None,
                             now,
+                            None,
                         ),
                     };
                     self.compiled(
@@ -1935,8 +2227,11 @@ impl Scheduler {
                         generation,
                         retry,
                         result,
-                        dispatched,
-                        finished,
+                        Admission {
+                            dispatched,
+                            finished,
+                            origins,
+                        },
                         now,
                         &mut effects,
                     );
@@ -2027,11 +2322,15 @@ impl Scheduler {
         generation: u64,
         retry: bool,
         result: Result<AnePlacementInventory, AneResidencyError>,
-        dispatched: Option<tokio::time::Instant>,
-        finished: tokio::time::Instant,
+        admission: Admission,
         now: tokio::time::Instant,
         effects: &mut Effects,
     ) {
+        let Admission {
+            dispatched,
+            finished,
+            origins,
+        } = admission;
         let Some(slot) = state
             .slots
             .get(&key)
@@ -2042,6 +2341,10 @@ impl Scheduler {
         };
         let owner = slot.owner;
         let worker = slot.worker.clone();
+        let prewarm = slot.prewarm;
+        if prewarm {
+            self.prewarm_finished(&key, result.as_ref().err(), origins);
+        }
         match result {
             Ok(inventory) => {
                 let tick = state.tick();
@@ -2056,11 +2359,12 @@ impl Scheduler {
                     sink.push(Arc::clone(&inventory));
                 }
                 state.stats.admitted += 1;
-                // Learn only from a standalone compile, measured from the
+                // Learn only from a standalone admission, measured from the
                 // moment it reached the worker.
-                if let (false, Some(dispatched)) = (retry, dispatched) {
-                    state.learn(&key, seed, finished.saturating_duration_since(dispatched));
-                }
+                let took = dispatched
+                    .filter(|_| !retry)
+                    .map(|dispatched| finished.saturating_duration_since(dispatched));
+                state.learn_admission(&key, seed, took, origins);
                 state.sample();
                 tracing::debug!(
                     target: "worker",
@@ -2156,6 +2460,7 @@ impl Scheduler {
                             enqueued_at: place.enqueued_at,
                             start_key: place.start_key,
                             seed: slot.compile_seed,
+                            load_seed: slot.load_seed,
                             worker: slot.worker.clone(),
                             executables: slot.executables,
                             promise: slot.promise,
@@ -2181,6 +2486,12 @@ impl Scheduler {
                 // confirmation removes the slot.
                 state.slots.get_mut(&key).expect("checked above").state = SlotState::Failed;
                 self.answer_owner(state, &key, owner, resource_refusal(error), effects);
+            }
+            Err(error)
+                if prewarm && error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) && !retry =>
+            {
+                // Prewarm never evicts to make room: it gives this shape up.
+                state.slots.remove(&key);
             }
             Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) && !retry => {
                 // Keep this shape's reservation (and the gate) while freeing

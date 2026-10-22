@@ -19352,6 +19352,8 @@ mod tests {
                                 WorkerResponse::Admitted {
                                     req_id: req_id.clone(),
                                     inventory: inventory(),
+                                    cache_hit_layers: None,
+                                    compiled_layers: None,
                                 }
                             }
                             WorkerRequest::AneAdmitPacked { req_id, .. } => {
@@ -19364,6 +19366,8 @@ mod tests {
                                 WorkerResponse::Admitted {
                                     req_id: req_id.clone(),
                                     inventory: inventory(),
+                                    cache_hit_layers: None,
+                                    compiled_layers: None,
                                 }
                             }
                             WorkerRequest::AneEvictShape { req_id, shape, .. } => {
@@ -30714,7 +30718,26 @@ async fn run_lane_check(
         })?;
     let model = check_profile_model(state, model, guard).await?;
     start_packed_preparation(&state.runtime, &model);
+    start_direct_ane_prewarm(&state.runtime, &model);
     Ok(model)
+}
+
+/// Once a direct-ANE catalog lane is ready (its self-check passed), its
+/// common short shapes are loaded in the background at the lowest priority,
+/// so the first requests at those lengths do not wait for them. The
+/// supervisor ignores a repeated call for the same worker.
+fn start_direct_ane_prewarm(runtime: &RuntimeState, model: &EmbeddingModel) {
+    #[cfg(unix)]
+    if let EmbedBackend::DirectAne(engine) = &model.backend {
+        if resolved_catalog_lane(runtime, &model.model_id).is_some() {
+            if let Err(error) = engine.prewarm(&model.model_id) {
+                tracing::warn!(target: "worker", lane = %model.model_id, %error,
+                    "direct-ANE prewarm could not start");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (runtime, model);
 }
 
 /// The numerical self-check's persisted id and key for a profile model.

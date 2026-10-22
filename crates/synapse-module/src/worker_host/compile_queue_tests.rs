@@ -18,9 +18,11 @@ fn fake_compile_profile(model_ref: &str, shape: usize) -> (usize, f64) {
     let gte = model_ref == QUEUE_GTE;
     let per_layer = match (gte, shape) {
         (true, 128) => 0.21,
+        (true, 256) => 0.263,
         (true, 512) => 0.37,
         (true, 2048) => 0.86,
         (false, 128) => 0.38,
+        (false, 256) => 0.507,
         (false, 512) => 0.76,
         (false, 2048) => 1.49,
         (false, 4096) => 3.02,
@@ -158,7 +160,21 @@ struct FakeCompileWorker {
     /// does. Unix only: the connector's stream type is a Unix socket there.
     #[cfg(unix)]
     held_connector: Mutex<Option<AneWorkerConnector<tokio::net::UnixStream>>>,
+    /// Stands in for aned's compiled-program cache when set: a shape in it
+    /// loads in [`FAKE_CACHED_LOAD_PER_LAYER`] per layer without the shared
+    /// compiler, and every compiled shape is added to it. `None` (the
+    /// default) compiles every admission, as the fake always did.
+    aned_cache: Mutex<Option<BTreeSet<(String, usize)>>>,
+    /// Report where each admitted layer came from, as a worker that sends
+    /// the `ADMITTED` cache fields does. Off for a worker that predates them.
+    reports_origins: std::sync::atomic::AtomicBool,
+    /// Shapes loaded from the fake cache, with the time each load started.
+    cached_loads: Mutex<Vec<(String, usize, f64)>>,
 }
+
+/// Seconds per layer the fake takes to load a shape aned holds compiled,
+/// about what a cached Qwen3 shape took on an M6 mini (1.3–1.8 s for 28).
+const FAKE_CACHED_LOAD_PER_LAYER: f64 = 0.06;
 
 impl FakeCompileWorker {
     fn evicted(&self) -> Vec<(String, usize)> {
@@ -224,7 +240,40 @@ impl AneShapeWorker for FakeCompileWorker {
                     msg: "injected resource refusal".into(),
                 });
             }
-            self.compiler.compile(&self.id, model_ref, shape).await;
+            let (layers, _) = fake_compile_profile(model_ref, shape);
+            let key = (model_ref.to_owned(), shape);
+            let cached = self
+                .aned_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|cache| cache.contains(&key));
+            let origins = if cached {
+                self.cached_loads
+                    .lock()
+                    .unwrap()
+                    .push((model_ref.to_owned(), shape, self.compiler.now()));
+                tokio::time::sleep(Duration::from_secs_f64(
+                    layers as f64 * FAKE_CACHED_LOAD_PER_LAYER,
+                ))
+                .await;
+                AdmissionOrigins {
+                    cache_hit_layers: layers as u32,
+                    compiled_layers: 0,
+                }
+            } else {
+                self.compiler.compile(&self.id, model_ref, shape).await;
+                if let Some(cache) = self.aned_cache.lock().unwrap().as_mut() {
+                    cache.insert(key);
+                }
+                AdmissionOrigins {
+                    cache_hit_layers: 0,
+                    compiled_layers: layers as u32,
+                }
+            };
+            if self.reports_origins.load(Ordering::SeqCst) {
+                scheduler::report_admission_origins(origins);
+            }
             Ok(AnePlacementInventory::default())
         })
     }
@@ -323,6 +372,9 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         dispatch_seen_at_wire: Mutex::new(None),
         #[cfg(unix)]
         held_connector: Mutex::new(None),
+        aned_cache: Mutex::new(None),
+        reports_origins: Default::default(),
+        cached_loads: Mutex::new(Vec::new()),
     })
 }
 

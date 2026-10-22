@@ -163,6 +163,7 @@ fn fixture(label: &str) -> CoreMlFixture {
                             dims: 1,
                             cold_load_ms: 0,
                             buckets: Some(vec![8]),
+                            ane_cached_shapes: None,
                         },
                         None,
                     )

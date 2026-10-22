@@ -61,6 +61,7 @@ async fn live_host_with_script(
                             dims: 1,
                             cold_load_ms: 0,
                             buckets: None,
+                            ane_cached_shapes: None,
                         },
                         DEFAULT_MAX_FRAME_BYTES,
                     )

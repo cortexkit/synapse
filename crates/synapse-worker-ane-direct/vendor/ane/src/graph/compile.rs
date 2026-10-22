@@ -112,6 +112,13 @@ impl Graph {
     pub fn program_identifier(&self) -> Result<Option<String>, crate::Error> {
         crate::client::program_identifier(self)
     }
+
+    /// Whether aned already holds this graph's compiled program, so that
+    /// [`Graph::compile`] would load it without compiling. See
+    /// [`crate::client::compiled_program_exists`].
+    pub fn compiled_program_exists(&self) -> Result<bool, crate::Error> {
+        crate::client::compiled_program_exists(self)
+    }
 }
 
 #[cfg(test)]

@@ -47,6 +47,7 @@ fn peer(host: &mut WorkerHost, generation: u64, crash: bool) -> tokio::task::Joi
                             dims: 1,
                             cold_load_ms: 0,
                             buckets: None,
+                            ane_cached_shapes: None,
                         },
                         DEFAULT_MAX_FRAME_BYTES,
                     )
