@@ -346,3 +346,20 @@ expect_message = "the slot read as undispatched after its admission reached the 
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-failed-retirement-keeps-the-gate"
+guards = "A retirement shutdown that fails without a confirmed exit keeps the worker's failed compile on the gate until the 35 s give-up"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                        if now >= give_up_at {"
+new = "                        if now >= give_up_at || true { // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::failed_retirement_shutdown_keeps_the_gate_for_the_grace"]
+expect_message = "a failed retirement shutdown released the gate before the grace ended"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

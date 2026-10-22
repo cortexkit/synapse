@@ -1853,3 +1853,43 @@ async fn dispatch_is_visible_the_moment_the_admission_reaches_the_worker() {
         "the slot read as undispatched after its admission reached the worker"
     );
 }
+
+/// A retirement whose shutdown fails without confirming the old process's
+/// exit keeps that worker's failed compile holding the gate for the same
+/// grace as a restart would, counted from the shutdown, instead of giving it
+/// up at once.
+#[tokio::test(start_paused = true)]
+async fn failed_retirement_shutdown_keeps_the_gate_for_the_grace() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let failing = fake_handle(&compiler, "failing");
+    failing.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    // Its recovery stops before the old process's exit is confirmed.
+    let (restarting, _never) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *failing.restart_gate.lock().unwrap() = Some((restarting.clone(), _never.clone()));
+    let failing_dyn: Arc<dyn AneShapeWorker> = failing.clone();
+    let failed = ask_at(&supervisor, &compiler, &failing_dyn, QUEUE_GTE, 512, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!failed.ok(), "{failed:?}");
+    restarting.notified().await;
+    let retired_at = compiler.now();
+    let shutdown = supervisor
+        .retire(&failing_dyn, async {
+            Err(AneResidencyError::Channel("injected shutdown failure".into()))
+        })
+        .await;
+    assert!(shutdown.is_err());
+    let other = fake_worker(&compiler, "other");
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 128, compiler.now(), None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(retired_at + 30.0)).await;
+    assert!(
+        compiler.compiles_of("other").is_empty(),
+        "a failed retirement shutdown released the gate before the grace ended"
+    );
+    let answer = tokio::time::timeout(Duration::from_secs(60), answer)
+        .await
+        .expect("the gate was held past the grace")
+        .unwrap();
+    assert!(answer.ok(), "{answer:?}");
+}

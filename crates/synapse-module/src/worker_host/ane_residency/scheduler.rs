@@ -353,6 +353,8 @@ struct Recovery {
 struct Retirement {
     reply: Option<oneshot::Sender<()>>,
     deadline: tokio::time::Instant,
+    /// When the retirement was allowed to shut the worker down.
+    shutdown_started: Option<tokio::time::Instant>,
 }
 
 /// Replies are sent after the state lock is released: a lease dropped by a
@@ -387,6 +389,9 @@ pub(super) struct Scheduler {
     /// so nobody knows whether it still owns the Neural Engine. Requests for
     /// them are refused at once.
     closed: BTreeSet<String>,
+    /// Retired workers whose shutdown failed without confirming the exit, and
+    /// when their slots stop holding the compile gate.
+    retirement_give_ups: BTreeMap<String, tokio::time::Instant>,
     /// Caller expiries that arrived before their request was first decided.
     deferred_expiries: Vec<(u64, oneshot::Sender<AnswerKind>)>,
     answered: VecDeque<(u64, AnswerKind)>,
@@ -438,6 +443,7 @@ impl Scheduler {
                 recoveries: BTreeMap::new(),
                 retirements: BTreeMap::new(),
                 closed: BTreeSet::new(),
+                retirement_give_ups: BTreeMap::new(),
                 deferred_expiries: Vec::new(),
                 #[cfg(test)]
                 _exit_signal: inner.scheduler_exit_signal.lock().unwrap().clone(),
@@ -577,6 +583,7 @@ impl Scheduler {
                         Retirement {
                             reply: Some(reply),
                             deadline: now + inner.wait_timeout,
+                            shutdown_started: None,
                         },
                     );
                 }
@@ -585,7 +592,7 @@ impl Scheduler {
                     exit_confirmed,
                     reply,
                 } => {
-                    self.retirements.remove(&worker_id);
+                    let retirement = self.retirements.remove(&worker_id);
                     if exit_confirmed {
                         // Reservations are summed from these slots. Refund only
                         // this owner, and only after its exit is confirmed; the
@@ -607,7 +614,19 @@ impl Scheduler {
                             recovery.exit_confirmed = true;
                         }
                     } else {
-                        give_up_gate(&mut state, &worker_id, None);
+                        // The shutdown failed without confirming the exit: the
+                        // worker's compiling or failed slots keep the gate for
+                        // the same grace as a restart, counted from the moment
+                        // the shutdown began, and only then give it up.
+                        let started = retirement
+                            .and_then(|retirement| retirement.shutdown_started)
+                            .unwrap_or(now);
+                        let give_up_at = started + EXIT_CONFIRMATION_GIVE_UP;
+                        if now >= give_up_at {
+                            give_up_gate(&mut state, &worker_id, None);
+                        } else {
+                            self.retirement_give_ups.insert(worker_id, give_up_at);
+                        }
                     }
                     effects.units.push(reply);
                 }
@@ -1775,10 +1794,22 @@ impl Scheduler {
                 .filter(|slot| slot.worker.worker_id() == id)
                 .all(|slot| slot.leases == 0 && slot.state != SlotState::Admitting);
             if drained || now >= retirement.deadline {
+                retirement.shutdown_started = Some(now);
                 effects
                     .units
                     .push(retirement.reply.take().expect("checked above"));
             }
+        }
+        let due: Vec<String> = self
+            .retirement_give_ups
+            .iter()
+            .filter(|(_, at)| now >= **at)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.retirement_give_ups.remove(&id);
+            give_up_gate(state, &id, None);
+            effects.progress = true;
         }
     }
 
@@ -1836,7 +1867,8 @@ impl Scheduler {
             .retirements
             .values()
             .filter(|retirement| retirement.reply.is_some())
-            .map(|retirement| retirement.deadline);
+            .map(|retirement| retirement.deadline)
+            .chain(self.retirement_give_ups.values().copied());
         // An undispatched compile is withdrawn when its promise lapses.
         let lapses = state
             .slots
