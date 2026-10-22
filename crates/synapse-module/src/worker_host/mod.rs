@@ -3613,9 +3613,12 @@ mod tests {
 ///
 /// A request runs its rungs one at a time in ascending order and releases each
 /// rung's lease before asking for the next one ([`AneResidencySupervisor::run_by_rung`]),
-/// so no request holds a lease while it waits. Waiting requests are served
-/// strictly first in, first out; when the budget is full, the request at the
-/// head of the queue evicts the least recently used shape that has no lease.
+/// so no request holds a lease while it waits. A request whose shape needs a
+/// cold compile waits in the compile queue: at most one shape compiles at a
+/// time across all workers, and the queued compile with the smallest start
+/// key (arrival plus predicted cost) goes next. When the budget is full, the
+/// request at the head of that queue evicts the least recently used shape
+/// that has no lease.
 ///
 /// Worker connections must not be held while waiting for admission: the
 /// request at the head may need to evict a shape on another worker. That is why
@@ -3664,13 +3667,28 @@ pub mod ane_residency {
     const ADMISSION_HANDOFF: std::time::Duration = std::time::Duration::from_millis(250);
     #[cfg(test)]
     mod admission_trace;
+    mod scheduler;
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
-    /// A request's deadline expired while the lane's worker was compiling a
-    /// shape it was waiting for. The model is loaded; a retry joins the same
+    /// A request is blocked on a shape compile: its deadline expired while it
+    /// waited for one, or the compile queue predicts its shape will be ready
+    /// only after that deadline. The model is loaded; a retry joins the same
     /// compile or finds the shape resident.
     pub const ERR_ANE_SHAPE_COMPILING: &str = "shape_compiling";
+    /// The smallest `retry_after_ms` a `shape_compiling` answer carries; the
+    /// answer otherwise carries the predicted time until the shape is ready.
     pub const ANE_SHAPE_COMPILING_RETRY_AFTER_MS: u64 = 1000;
+    /// The wire code for a direct-ANE lane whose compile scheduler stopped.
+    pub const ERR_ANE_SCHEDULER_STOPPED: &str = "engine_crashed";
+    /// A queued cold compile with a known cost waits this long before it may
+    /// start, so compiles requested together are started cheapest first
+    /// instead of in the order their requests happened to arrive.
+    const COMPILE_GATHER: std::time::Duration = std::time::Duration::from_millis(50);
+    /// A queued compile that no request is waiting for any more is dropped
+    /// once this multiple of the retry delay it last promised has passed.
+    /// Otherwise demand from a caller that never retries keeps compiling and
+    /// evicting shapes that other requests use.
+    const ORPHAN_EXPIRY_FACTOR: u32 = 2;
     /// Lock file, relative to the home directory, held by the one module
     /// process allowed to run direct-ANE workers.
     pub const ANE_DIRECT_LOCK_HOME_PATH: &str = "Library/Caches/ck-synapse/ane-direct.lock";
@@ -3698,10 +3716,12 @@ pub mod ane_residency {
     enum WaitPhase {
         /// Budget queue, eviction, execution permit or inference I/O.
         Other,
-        /// The request's own shape is being admitted (compiled), by this
-        /// request or by another one it joined; counted from the moment the
-        /// shape's slot enters `Admitting`.
+        /// The request waited for its own shape's compile, by this request or
+        /// by another one it joined.
         Compile(usize),
+        /// Waiting for the compile scheduler's answer to request `id`; when
+        /// the caller's own deadline expires, the scheduler decides the answer.
+        Scheduled { id: u64, shape: usize },
         /// Waiting for the worker stream since the given instant. The wait was
         /// on a compile if an admit exchange held the stream at any moment
         /// between that instant and the deadline.
@@ -3713,6 +3733,10 @@ pub mod ane_residency {
     #[derive(Debug)]
     struct RequestWaits {
         phase: Mutex<WaitPhase>,
+        /// The supervisor and worker this request leases from, so an expiry
+        /// on the worker stream can ask for the running compile's remaining
+        /// time.
+        link: Mutex<Option<(std::sync::Weak<Inner>, String)>>,
         abandoned: std::sync::atomic::AtomicBool,
         abandonment: Notify,
     }
@@ -3721,6 +3745,7 @@ pub mod ane_residency {
         fn new() -> Self {
             Self {
                 phase: Mutex::new(WaitPhase::Other),
+                link: Mutex::new(None),
                 abandoned: std::sync::atomic::AtomicBool::new(false),
                 abandonment: Notify::new(),
             }
@@ -3731,11 +3756,44 @@ pub mod ane_residency {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
+
+        fn link(&self) -> Option<(Arc<Inner>, String)> {
+            let link = self
+                .link
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()?;
+            Some((link.0.upgrade()?, link.1))
+        }
+
+        /// When the compile now running on this request's worker is predicted
+        /// to finish, if one is running.
+        fn running_compile_ready(&self) -> Option<tokio::time::Instant> {
+            let (inner, worker_id) = self.link()?;
+            let now = tokio::time::Instant::now();
+            let state = inner.lock();
+            state
+                .slots
+                .values()
+                .filter(|slot| {
+                    slot.worker.worker_id() == worker_id && slot.state == SlotState::Admitting
+                })
+                .map(|slot| now + slot.compile_remaining(now))
+                .max()
+        }
     }
 
     tokio::task_local! {
         /// The wait phase of the serving request whose task this is.
         static REQUEST_WAITS: Arc<RequestWaits>;
+    }
+
+    tokio::task_local! {
+        /// Where the worker channel reports the moment a compile operation's
+        /// admission was written to the worker, after any wait for the
+        /// worker stream. The scheduler counts the running compile and learns
+        /// compile times from that moment.
+        static COMPILE_DISPATCHED: Arc<scheduler::DispatchCell>;
     }
 
     // The caller may disappear while dispatched I/O drains in its detached task.
@@ -3774,17 +3832,16 @@ pub mod ane_residency {
         tokio::select! { result = future => Ok(result), _ = cancellation => Err(AneResidencyError::Abandoned) }
     }
 
-    async fn request_scope<F: Future>(waits: Option<Arc<RequestWaits>>, future: F) -> F::Output {
-        match waits {
-            Some(waits) => REQUEST_WAITS.scope(waits, future).await,
-            None => future.await,
-        }
-    }
-
-    fn deadline_cause_error(cause: Option<usize>) -> AneResidencyError {
-        match cause {
-            Some(shape) => AneResidencyError::ShapeCompiling { shape },
-            None => AneResidencyError::DeadlineExceeded,
+    /// `shape_compiling` for `shape`, whose retry delay is the time left until
+    /// the predicted `ready` instant, but never below the documented minimum.
+    fn shape_compiling(shape: usize, ready: Option<tokio::time::Instant>) -> AneResidencyError {
+        let predicted_ms = ready.map_or(0, |ready| {
+            let left = ready.saturating_duration_since(tokio::time::Instant::now());
+            u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
+        });
+        AneResidencyError::ShapeCompiling {
+            shape,
+            retry_after_ms: predicted_ms.max(ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
         }
     }
 
@@ -3800,7 +3857,9 @@ pub mod ane_residency {
     }
 
     /// The deadline expired during a wait whose cause is `cause`. The first
-    /// classification recorded for the request wins.
+    /// classification recorded for the request wins. A compile cause carries
+    /// the predicted time until the compile now running on the request's
+    /// worker finishes.
     fn deadline_expired(cause: Option<usize>) -> AneResidencyError {
         let recorded = REQUEST_WAITS
             .try_with(|waits| {
@@ -3814,14 +3873,22 @@ pub mod ane_residency {
                 }
             })
             .unwrap_or(cause);
-        deadline_cause_error(recorded)
+        match recorded {
+            Some(shape) => shape_compiling(
+                shape,
+                REQUEST_WAITS
+                    .try_with(|waits| waits.running_compile_ready())
+                    .unwrap_or(None),
+            ),
+            None => AneResidencyError::DeadlineExceeded,
+        }
     }
 
     /// The deadline expired during the last recorded lease wait.
     fn lease_deadline_expired() -> AneResidencyError {
         let cause = REQUEST_WAITS
             .try_with(|waits| match *waits.lock() {
-                WaitPhase::Compile(shape) => Some(shape),
+                WaitPhase::Compile(shape) | WaitPhase::Scheduled { shape, .. } => Some(shape),
                 WaitPhase::Expired(first) => first,
                 _ => None,
             })
@@ -3859,11 +3926,23 @@ pub mod ane_residency {
         #[error("direct-ANE lane lock: {0}")]
         Io(#[from] io::Error),
         #[error("shape_compiling: the direct-ANE worker is compiling shape {shape}")]
-        ShapeCompiling { shape: usize },
+        ShapeCompiling { shape: usize, retry_after_ms: u64 },
         /// The module's execution permit could not be granted for a reason
         /// other than the request deadline (the executor is shutting down).
         #[error("execution permit unavailable: {0}")]
         PermitUnavailable(String),
+        /// The compile scheduler's loop ended (a bug: it panicked or was
+        /// stopped). Direct-ANE lanes stay closed until the module restarts.
+        #[error("engine_crashed: the direct-ANE compile scheduler stopped; the lane is closed until the module restarts")]
+        SchedulerStopped,
+        /// The worker's old process could not be confirmed to have exited, so
+        /// it may still own the Neural Engine: the worker stays closed until
+        /// the module restarts, and its requests are refused at once.
+        #[error("engine_crashed: direct-ANE worker {worker_id} could not confirm that its old process exited; it is closed until the module restarts")]
+        WorkerClosed { worker_id: String },
+        /// A compile, eviction or recovery task panicked or was cancelled.
+        #[error("direct-ANE worker operation failed: {0}")]
+        Panicked(String),
     }
 
     impl AneResidencyError {
@@ -3877,8 +3956,8 @@ pub mod ane_residency {
                 message: self.to_string(),
                 retry_after_ms: match self {
                     Self::Quarantined { retry_after_ms }
-                    | Self::ResourcesExhausted { retry_after_ms, .. } => Some(*retry_after_ms),
-                    Self::ShapeCompiling { .. } => Some(ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
+                    | Self::ResourcesExhausted { retry_after_ms, .. }
+                    | Self::ShapeCompiling { retry_after_ms, .. } => Some(*retry_after_ms),
                     _ => None,
                 },
                 safe_to_retry_same_request: matches!(
@@ -3895,6 +3974,7 @@ pub mod ane_residency {
                 Self::LaneBusy { .. } => Some(ERR_ANE_LANE_BUSY),
                 Self::ResourcesExhausted { .. } => Some(ERR_ANE_RESOURCES_EXHAUSTED),
                 Self::ShapeCompiling { .. } => Some(ERR_ANE_SHAPE_COMPILING),
+                Self::SchedulerStopped => Some(ERR_ANE_SCHEDULER_STOPPED),
                 _ => None,
             }
         }
@@ -3967,6 +4047,33 @@ pub mod ane_residency {
         fn generation(&self) -> u64 {
             0
         }
+        /// Whether a restart could not confirm that the old worker process
+        /// exited. Its hardware ownership is then unknown, so the worker
+        /// stays closed rather than being retried.
+        fn exit_unconfirmed(&self) -> bool {
+            false
+        }
+        /// The worker process's id, for logs, when known.
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        /// Restarts the worker and sends on `exited` as soon as the old
+        /// process's exit is confirmed, before the replacement starts, so the
+        /// scheduler can release what the old process held. This default
+        /// signals only once the whole restart has finished with the exit
+        /// confirmed.
+        fn restart_with_exit_signal<'a>(
+            &'a self,
+            exited: tokio::sync::oneshot::Sender<()>,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+            Box::pin(async move {
+                let result = self.restart().await;
+                if result.is_ok() || !self.exit_unconfirmed() {
+                    let _ = exited.send(());
+                }
+                result
+            })
+        }
         fn evict_shape_at_generation<'a>(
             &'a self,
             generation: u64,
@@ -3984,29 +4091,25 @@ pub mod ane_residency {
         /// Full layer count reserved before compilation, from the model profile in
         /// the repository's versioned bench/parity/models.json manifest.
         fn executable_count(&self, model_ref: &str) -> Result<usize, AneResidencyError> {
-            static MANIFEST: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-            let manifest = MANIFEST.get_or_init(|| {
-                serde_json::from_str(include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../bench/parity/models.json"
-                )))
-                .expect("pinned parity manifest")
-            });
-            let profile = model_ref
-                .strip_prefix("ane-direct:")
-                .and_then(|value| value.split(':').next());
-            let layers = profile
-                .and_then(|profile| {
-                    let model = manifest["profiles"][profile]["model"].as_str()?;
-                    manifest["models"][model]["architecture"]["params"]["num_hidden_layers"]
-                        .as_u64()
-                })
+            let layers = pinned_model_param(model_ref, "num_hidden_layers")
                 .and_then(|layers| usize::try_from(layers).ok())
                 .filter(|layers| *layers > 0);
             layers.ok_or_else(|| AneResidencyError::WorkerErr {
                 code: "model_unsupported".into(),
                 msg: "no pinned layer count for direct-ANE model reference".into(),
             })
+        }
+        /// Expected standalone compile time of `shape` with `layers` layers,
+        /// before the module has measured any compile. It only orders the
+        /// compile queue and seeds its predictions; zero means unknown, and
+        /// such compiles are queued in arrival order and never refused early.
+        fn compile_cost_seed(
+            &self,
+            model_ref: &str,
+            shape: usize,
+            layers: usize,
+        ) -> std::time::Duration {
+            pinned_compile_cost_seed(model_ref, shape, layers)
         }
         fn admit_shape_at_generation<'a>(
             &'a self,
@@ -4036,6 +4139,94 @@ pub mod ane_residency {
         ) -> BoxFuture<'a, Result<(), AneResidencyError>>;
         /// Replaces the worker process with a fresh one that has no shapes.
         fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>>;
+    }
+
+    /// The seed estimate for a model in the pinned manifest: its layer count
+    /// times the measured per-layer time for its hidden size and `shape`.
+    fn pinned_compile_cost_seed(
+        model_ref: &str,
+        shape: usize,
+        layers: usize,
+    ) -> std::time::Duration {
+        let hidden = pinned_model_param(model_ref, "hidden_size")
+            .and_then(|hidden| usize::try_from(hidden).ok());
+        seed_compile_cost(hidden, layers, shape)
+    }
+
+    /// One architecture parameter of the model behind a direct-ANE model
+    /// reference, from the repository's pinned bench/parity/models.json.
+    fn pinned_model_param(model_ref: &str, name: &str) -> Option<u64> {
+        static MANIFEST: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        let manifest = MANIFEST.get_or_init(|| {
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../bench/parity/models.json"
+            )))
+            .expect("pinned parity manifest")
+        });
+        let profile = model_ref
+            .strip_prefix("ane-direct:")
+            .and_then(|value| value.split(':').next())?;
+        let model = manifest["profiles"][profile]["model"].as_str()?;
+        manifest["models"][model]["architecture"]["params"][name].as_u64()
+    }
+
+    /// Median compile-and-load seconds per layer, by hidden size and ladder
+    /// width, measured with nothing else compiling on an M4 Mac mini (macOS
+    /// 27.0, October 2026). The 768-wide row at 4096 and 8192 and the
+    /// 1024-wide row at 8192 were not measured on the M4: they are M5 Max
+    /// standalone times divided by 1.27, the M5/M4 ratio measured for the
+    /// 1024-wide model at 4096. The 1024-wide 8192 value on the M5 was itself
+    /// an estimate. The compile queue corrects all of these with measured
+    /// compiles; they only need to rank shapes and give a first prediction.
+    const SEED_SECONDS_PER_LAYER: [(usize, [(usize, f64); 5]); 2] = [
+        (
+            768,
+            [
+                (128, 0.21),
+                (512, 0.37),
+                (2048, 0.86),
+                (4096, 2.03),
+                (8192, 4.13),
+            ],
+        ),
+        (
+            1024,
+            [
+                (128, 0.38),
+                (512, 0.76),
+                (2048, 1.49),
+                (4096, 3.02),
+                (8192, 6.47),
+            ],
+        ),
+    ];
+
+    /// `layers` times the table's per-layer seconds for the nearest measured
+    /// hidden size (the wider row when the size is unknown), interpolated
+    /// linearly between measured widths and clamped at both ends.
+    fn seed_compile_cost(
+        hidden: Option<usize>,
+        layers: usize,
+        width: usize,
+    ) -> std::time::Duration {
+        let (_, row) = SEED_SECONDS_PER_LAYER
+            .iter()
+            .min_by_key(|(size, _)| {
+                hidden.map_or(usize::MAX - size, |hidden| size.abs_diff(hidden))
+            })
+            .expect("the seed table has rows");
+        let per_layer = match row.iter().position(|(rung, _)| *rung >= width) {
+            Some(0) => row[0].1,
+            None => row[row.len() - 1].1,
+            Some(upper) => {
+                let (low_width, low) = row[upper - 1];
+                let (high_width, high) = row[upper];
+                let fraction = (width - low_width) as f64 / (high_width - low_width) as f64;
+                low + (high - low) * fraction
+            }
+        };
+        std::time::Duration::from_secs_f64(per_layer * layers as f64)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4094,14 +4285,18 @@ pub mod ane_residency {
         Admitting,
         Resident,
         Evicting,
+        /// The compile failed with an unknown outcome (transport fault,
+        /// timeout or panic): it may still be running in the old process, so
+        /// the slot holds the compile gate until that process's exit is
+        /// confirmed.
         Failed,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum EvictionOutcome {
-        Evicted,
+        /// The worker answered the admission with an error: nothing is
+        /// compiling, so the gate is free, but the reservation stays charged
+        /// until the worker's recovery confirms its exit.
+        Rejected,
+        /// The worker's exit could not be confirmed: the reservation stays
+        /// charged, but no longer holds the compile gate.
         Abandoned,
-        Failed,
     }
 
     struct Slot {
@@ -4118,14 +4313,117 @@ pub mod ane_residency {
         packed_qualified: bool,
         joined: BTreeSet<u64>,
         handoff_until: Option<tokio::time::Instant>,
+        /// The predicted duration of the compile behind an `Admitting` slot,
+        /// and the worker's seed estimate for it.
+        compile_cost: std::time::Duration,
+        compile_seed: std::time::Duration,
+        /// The queue entry this compile came from, so an admission withdrawn
+        /// before it reached the worker can be queued again in its old place.
+        queued_as: Option<QueuedPlace>,
+        /// The request whose turn reserved this slot; it gets the compile's
+        /// error if the compile fails.
+        owner: Option<u64>,
+        /// The retry delay promised while this compile ran, so a withdrawn
+        /// compile goes back into the queue with it.
+        promise: Option<(tokio::time::Instant, std::time::Duration)>,
+        /// When the compile's admission reached the worker.
+        dispatched_at: Option<tokio::time::Instant>,
+    }
+
+    /// Where a compile stood in the queue: its creation order and start key.
+    #[derive(Clone, Copy, Debug)]
+    struct QueuedPlace {
+        seq: u64,
+        enqueued_at: tokio::time::Instant,
+        start_key: tokio::time::Instant,
     }
 
     impl Slot {
-        fn handing_off(&self) -> bool {
-            !self.joined.is_empty()
-                && self
-                    .handoff_until
-                    .is_some_and(|until| tokio::time::Instant::now() < until)
+        /// Whether the 250 ms handoff to the requests that waited for this
+        /// shape's compile is open at `now`.
+        fn handing_off(&self, now: tokio::time::Instant) -> bool {
+            self.state == SlotState::Resident
+                && !self.joined.is_empty()
+                && self.handoff_until.is_some_and(|until| now < until)
+        }
+
+        /// Predicted time left in this slot's compile, counted from the moment
+        /// it reached the worker (all of it until then). A compile running past
+        /// its prediction, or failed with an unknown outcome, is still given
+        /// one more layer's worth of time.
+        fn compile_remaining(&self, now: tokio::time::Instant) -> std::time::Duration {
+            if self.compile_cost.is_zero() {
+                return std::time::Duration::ZERO;
+            }
+            let layers = u32::try_from(self.executables.max(1)).unwrap_or(u32::MAX);
+            let layer = self.compile_cost / layers;
+            match (self.state, self.dispatched_at) {
+                (SlotState::Admitting, None) => self.compile_cost,
+                (SlotState::Admitting, Some(dispatched)) => self
+                    .compile_cost
+                    .saturating_sub(now.saturating_duration_since(dispatched))
+                    .max(layer),
+                (SlotState::Failed, _) => layer,
+                _ => std::time::Duration::ZERO,
+            }
+        }
+    }
+
+    /// A cold compile waiting for its turn. At most one compile runs at a
+    /// time across all direct-ANE workers: Apple's compiler serves one layer
+    /// at a time machine-wide, so compiles run side by side gain no
+    /// throughput, and a small shape beside a wide one waits one wide layer
+    /// per layer of its own. The entry with the smallest `start_key` starts
+    /// next.
+    struct QueuedCompile {
+        /// Creation order; breaks ties between equal start keys.
+        seq: u64,
+        enqueued_at: tokio::time::Instant,
+        /// `enqueued_at + cost`, fixed at creation: cheapest first, with
+        /// aging. An entry of cost C can only be passed by entries that
+        /// arrive less than C after it, so a wide compile still gets a turn.
+        start_key: tokio::time::Instant,
+        /// The worker's seed estimate. The duration used in predictions is
+        /// recomputed from it on every read ([`State::estimate`]), so an
+        /// entry queued before the first measured compile is repriced once
+        /// the machine factor is known; only `start_key` stays fixed.
+        seed: std::time::Duration,
+        worker: Arc<dyn AneShapeWorker>,
+        executables: usize,
+        /// When the last request waiting for this entry left, and the retry
+        /// delay it was given. The entry outlives its requests so a retry
+        /// finds the shape compiled, but only for [`ORPHAN_EXPIRY_FACTOR`]
+        /// times that delay unless another request attaches.
+        promise: Option<(tokio::time::Instant, std::time::Duration)>,
+    }
+
+    impl QueuedCompile {
+        fn order(&self) -> (tokio::time::Instant, u64) {
+            (self.start_key, self.seq)
+        }
+
+        /// When this entry may start: compiles with a known cost wait a short
+        /// gathering window so compiles requested together start cheapest first.
+        fn gathered_at(&self) -> tokio::time::Instant {
+            if self.seed.is_zero() {
+                self.enqueued_at
+            } else {
+                self.enqueued_at + COMPILE_GATHER
+            }
+        }
+
+        /// The instant after which an entry no request waits for is dropped.
+        fn orphan_expiry(&self) -> Option<tokio::time::Instant> {
+            self.promise
+                .map(|(promised_at, retry)| promised_at + retry * ORPHAN_EXPIRY_FACTOR)
+        }
+
+        fn place(&self) -> QueuedPlace {
+            QueuedPlace {
+                seq: self.seq,
+                enqueued_at: self.enqueued_at,
+                start_key: self.start_key,
+            }
         }
     }
 
@@ -4140,19 +4438,31 @@ pub mod ane_residency {
         /// being admitted or being evicted) needs no budget, so it neither
         /// holds nor waits for the head of the FIFO.
         waiter_keys: BTreeMap<u64, ShapeKey>,
-        /// Set while the request at the head of the budget queue waits for an
-        /// eviction victim and none is free. Requests queued behind it then
-        /// lease resident shapes in FIFO order again, so a stream of short
-        /// leases cannot starve it.
+        /// Set while the queue head waits for an eviction victim and none is
+        /// free: the id of its earliest request (or of the last request seen,
+        /// for a compile kept only for a promise). Later requests then lease
+        /// resident shapes in queue order through the scheduler, so a stream
+        /// of short leases cannot starve the head.
         starved_head: Option<u64>,
         /// Each model's smallest published ladder rung. Eviction picks it only
         /// when no other unleased resident shape can be evicted, which keeps
         /// short requests (queries) from recompiling after a long one.
         smallest_rungs: BTreeMap<String, usize>,
-        next_ticket: u64,
         next_slot: u64,
         clock: u64,
         stats: AneResidencyStats,
+        /// Cold compiles waiting for their turn, one per shape key.
+        entries: BTreeMap<ShapeKey, QueuedCompile>,
+        next_entry: u64,
+        /// The latest bound (request deadline or wait timeout) of each queued
+        /// request that was told its compile would be ready in time. A newer
+        /// compile is not started ahead of it if that would break the bound.
+        waiter_bounds: BTreeMap<u64, tokio::time::Instant>,
+        /// Measured compile time per (model, shape, program).
+        measured_costs: BTreeMap<(String, usize, AneProgram), std::time::Duration>,
+        /// Moving average of measured compile time over the worker's seed
+        /// estimate, so a slower machine corrects shapes not measured yet.
+        machine_factor: Option<f64>,
         // Kept outside residency slots so eviction and confirmed-exit recovery
         // cannot erase certification evidence. Disabled supervisors retain nothing.
         inventory_sink: Option<Vec<Arc<AnePlacementInventory>>>,
@@ -4188,6 +4498,7 @@ pub mod ane_residency {
             let queued = self.waiters.len();
             self.waiters.retain(|waiter| *waiter != ticket);
             self.waiter_keys.remove(&ticket);
+            self.waiter_bounds.remove(&ticket);
             for slot in self.slots.values_mut() {
                 slot.joined.remove(&ticket);
             }
@@ -4197,30 +4508,228 @@ pub mod ane_residency {
             self.waiters.len() != queued
         }
 
-        /// The first queued request that needs budget: its shape has no slot
-        /// yet (or it has not been decided yet, which is treated the same).
-        fn budget_head(&self) -> Option<u64> {
-            self.waiters.iter().copied().find(|ticket| {
-                !self
-                    .waiter_keys
-                    .get(ticket)
-                    .is_some_and(|key| self.slots.contains_key(key))
-            })
+        /// Whether `worker_id` cannot compile now: it is being recovered (a
+        /// retiring worker is too, until its exit is confirmed). Its queued
+        /// compiles keep their place but are not elected, so they cannot hold
+        /// up other workers' compiles. A retired worker's queued compiles are
+        /// dropped when it retires, and the scheduler answers its later
+        /// requests with the retirement before queuing anything.
+        fn worker_unavailable(&self, worker_id: &str) -> bool {
+            self.recovering.contains(worker_id)
         }
 
-        /// Whether `ticket` is queued behind the starved budget head.
-        fn behind_starved_head(&self, ticket: u64) -> bool {
-            let Some(starved) = self
-                .starved_head
-                .filter(|starved| self.budget_head() == Some(*starved))
-            else {
-                return false;
-            };
-            let position = |id: u64| self.waiters.iter().position(|waiter| *waiter == id);
-            match (position(starved), position(ticket)) {
-                (Some(head), Some(own)) => head < own,
-                _ => false,
+        /// Predicted compile time of `key`: what it took last time on this
+        /// machine, else the worker's seed scaled by the machine factor.
+        fn estimate(&self, key: &ShapeKey, seed: std::time::Duration) -> std::time::Duration {
+            if seed.is_zero() {
+                return seed;
             }
+            if let Some(measured) =
+                self.measured_costs
+                    .get(&(key.model_ref.clone(), key.shape, key.program))
+            {
+                return *measured;
+            }
+            seed.mul_f64(self.machine_factor.unwrap_or(1.0))
+        }
+
+        /// Records a standalone compile so later predictions use it. Only
+        /// single-shape programs are learned: the seed describes one shape,
+        /// so a packed program measured against it would skew the factor.
+        fn learn(&mut self, key: &ShapeKey, seed: std::time::Duration, took: std::time::Duration) {
+            if seed.is_zero() || took.is_zero() || key.program != AneProgram::Single {
+                return;
+            }
+            self.measured_costs
+                .insert((key.model_ref.clone(), key.shape, key.program), took);
+            let ratio = took.as_secs_f64() / seed.as_secs_f64();
+            self.machine_factor = Some(match self.machine_factor {
+                Some(factor) => (factor + ratio) / 2.0,
+                None => ratio,
+            });
+        }
+
+        /// Whether the module-wide compile gate is held: a compile is
+        /// running, or one failed and its worker's exit is not confirmed yet
+        /// (that compile may still be running in the old process). A failed
+        /// slot is removed only by recovery or retirement after confirmed exit.
+        fn compile_running(&self) -> bool {
+            self.slots
+                .values()
+                .any(|slot| matches!(slot.state, SlotState::Admitting | SlotState::Failed))
+        }
+
+        fn running_remaining(&self, now: tokio::time::Instant) -> std::time::Duration {
+            self.slots
+                .values()
+                .map(|slot| slot.compile_remaining(now))
+                .sum()
+        }
+
+        /// The tightest bound of the requests waiting for `key`'s entry.
+        fn entry_bound(&self, key: &ShapeKey) -> Option<tokio::time::Instant> {
+            self.waiter_keys
+                .iter()
+                .filter(|(_, waiting)| *waiting == key)
+                .filter_map(|(ticket, _)| self.waiter_bounds.get(ticket).copied())
+                .min()
+        }
+
+        /// Whether a request is queued for `key`.
+        fn requested(&self, key: &ShapeKey) -> bool {
+            self.waiter_keys.values().any(|waiting| waiting == key)
+        }
+
+        /// When `key` is predicted to be resident: the rest of the running
+        /// compile, then every queued compile ordered before it, then its own,
+        /// each at its current estimate. Entries of workers that cannot compile
+        /// now are not elected, so they are not counted ahead. `None` when
+        /// `key` is neither compiling nor queued.
+        fn predicted_ready(
+            &self,
+            key: &ShapeKey,
+            now: tokio::time::Instant,
+        ) -> Option<tokio::time::Instant> {
+            if let Some(slot) = self.slots.get(key) {
+                return (slot.state == SlotState::Admitting)
+                    .then(|| now + slot.compile_remaining(now));
+            }
+            let entry = self.entries.get(key)?;
+            let ahead: std::time::Duration = self
+                .entries
+                .iter()
+                .filter(|(other, queued)| {
+                    queued.order() < entry.order() && !self.worker_unavailable(&other.worker_id)
+                })
+                .map(|(other, queued)| self.estimate(other, queued.seed))
+                .sum();
+            Some(now + self.running_remaining(now) + ahead + self.estimate(key, entry.seed))
+        }
+
+        /// The shape freed to retry an admission the worker refused for lack
+        /// of Neural Engine resources: any unleased resident shape outside a
+        /// handoff and outside a recovering worker, by eviction preference.
+        fn resource_victim(
+            &self,
+            now: tokio::time::Instant,
+        ) -> Option<(ShapeKey, u64, Arc<dyn AneShapeWorker>, u64)> {
+            self.slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.state == SlotState::Resident
+                        && slot.leases == 0
+                        && !slot.handing_off(now)
+                        && !self.recovering.contains(slot.worker.worker_id())
+                })
+                .min_by_key(|(candidate, slot)| self.eviction_rank(candidate, slot))
+                .map(|(candidate, slot)| {
+                    (
+                        candidate.clone(),
+                        slot.id,
+                        slot.worker.clone(),
+                        slot.generation,
+                    )
+                })
+        }
+
+        /// A worker's queued compiles rejoin the queue when its recovery
+        /// ends. They keep their start keys, but, like a newcomer, one is moved
+        /// behind any queued compile whose accepted bound it would otherwise
+        /// break. The returning compiles are placed together, in their order:
+        /// each one is checked with the cost of those already placed ahead of
+        /// the same compile, so several cannot together break a bound that
+        /// each alone would keep. Call while the worker is still marked
+        /// recovering, so the predictions it checks do not count these
+        /// entries yet.
+        fn rejoin(&mut self, worker_id: &str, now: tokio::time::Instant) {
+            let mut keys: Vec<ShapeKey> = self
+                .entries
+                .keys()
+                .filter(|key| key.worker_id == worker_id)
+                .cloned()
+                .collect();
+            keys.sort_by_key(|key| self.entries[key].order());
+            let mut placed: Vec<((tokio::time::Instant, u64), std::time::Duration)> = Vec::new();
+            for key in keys {
+                let entry = &self.entries[&key];
+                let cost = self.estimate(&key, entry.seed);
+                let mut order = entry.order();
+                let mut others: Vec<(ShapeKey, (tokio::time::Instant, u64))> = self
+                    .entries
+                    .iter()
+                    .filter(|(other, _)| other.worker_id != worker_id)
+                    .map(|(other, queued)| (other.clone(), queued.order()))
+                    .collect();
+                others.sort_by_key(|(_, other_order)| *other_order);
+                let mut moved = false;
+                for (other, other_order) in others {
+                    if order >= other_order {
+                        continue;
+                    }
+                    let promised = self.entry_bound(&other);
+                    let ready = self.predicted_ready(&other, now);
+                    if let (Some(bound), Some(ready)) = (promised, ready) {
+                        let returned_ahead: std::time::Duration = placed
+                            .iter()
+                            .filter(|(placed_order, _)| *placed_order < other_order)
+                            .map(|(_, placed_cost)| *placed_cost)
+                            .sum();
+                        if ready + returned_ahead + cost > bound {
+                            self.next_entry += 1;
+                            order = (other_order.0, self.next_entry);
+                            moved = true;
+                        }
+                    }
+                }
+                if moved {
+                    let entry = self.entries.get_mut(&key).expect("listed above");
+                    entry.start_key = order.0;
+                    entry.seq = order.1;
+                }
+                placed.push((order, cost));
+            }
+        }
+
+        /// Queues a cold compile for `key`. Its start key is `now + cost`,
+        /// unless starting it ahead of an entry would push that entry past
+        /// the bound its requests were promised; then it goes behind it.
+        fn create_entry(
+            &mut self,
+            key: &ShapeKey,
+            worker: &Arc<dyn AneShapeWorker>,
+            executables: usize,
+            now: tokio::time::Instant,
+        ) {
+            let seed = worker.compile_cost_seed(&key.model_ref, key.shape, executables);
+            let cost = self.estimate(key, seed);
+            let mut start_key = now + cost;
+            let mut queued: Vec<_> = self.entries.iter().collect();
+            queued.sort_by_key(|(_, entry)| entry.order());
+            for (other, entry) in queued {
+                if start_key >= entry.start_key {
+                    continue;
+                }
+                let promised = self.entry_bound(other);
+                let ready = self.predicted_ready(other, now);
+                if let (Some(bound), Some(ready)) = (promised, ready) {
+                    if ready + cost > bound {
+                        start_key = entry.start_key;
+                    }
+                }
+            }
+            self.next_entry += 1;
+            self.entries.insert(
+                key.clone(),
+                QueuedCompile {
+                    seq: self.next_entry,
+                    enqueued_at: now,
+                    start_key,
+                    seed,
+                    worker: worker.clone(),
+                    executables,
+                    promise: None,
+                },
+            );
         }
 
         fn eviction_rank(&self, key: &ShapeKey, slot: &Slot) -> (bool, bool, bool, u64) {
@@ -4260,10 +4769,41 @@ pub mod ane_residency {
         wait_timeout: std::time::Duration,
         state: Mutex<State>,
         changed: Notify,
+        /// The scheduler's mailbox, created when the supervisor is first used.
+        scheduler: Mutex<Option<tokio::sync::mpsc::UnboundedSender<scheduler::Msg>>>,
+        /// Run the scheduler on a thread of its own (the production
+        /// supervisor, shared by every direct-ANE engine, each of which has its
+        /// own runtime) rather than on the first caller's runtime (tests, whose
+        /// paused clocks the scheduler must share).
+        dedicated_scheduler: bool,
+        /// Set when the scheduler's loop ends: every request then gets
+        /// `SchedulerStopped` (the lane is closed) instead of hanging.
+        closed: std::sync::atomic::AtomicBool,
+        next_waiter: AtomicU64,
+        /// Whether the scheduler wants to hear about dropped leases (a starved
+        /// head, a draining recovery or retirement, or an open handoff).
+        watch_leases: std::sync::atomic::AtomicBool,
+        /// Lets a test abort the scheduler task to check that its requests
+        /// fail fast.
+        #[cfg(test)]
+        scheduler_task: Mutex<Option<tokio::task::AbortHandle>>,
         #[cfg(test)]
         admission_gate: Option<Arc<tokio::sync::Mutex<()>>>,
         #[cfg(test)]
         lease_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        /// Holds the scheduler once, right after a pass's decisions and before
+        /// it arms its wake-up timer, so a test can move the clock between the
+        /// two.
+        #[cfg(test)]
+        wait_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        /// Makes the scheduler take this long over each `Nudge` message, so a
+        /// test can keep its mailbox busier than it can drain.
+        #[cfg(test)]
+        slow_nudges: Mutex<Option<std::time::Duration>>,
+        /// Given to the scheduler when it starts; it is dropped with the
+        /// scheduler, so a test can see the scheduler end.
+        #[cfg(test)]
+        scheduler_exit_signal: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         #[cfg(unix)]
         lane_lock: Mutex<Option<AneDirectLaneLock>>,
         #[cfg(unix)]
@@ -4276,46 +4816,152 @@ pub mod ane_residency {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
-    }
 
-    /// A request's place in the admission queue; leaving the queue (served or
-    /// cancelled) lets the next request re-check its turn.
-    struct QueueTicket<'a> {
-        inner: &'a Inner,
-        id: u64,
-    }
-
-    impl<'a> QueueTicket<'a> {
-        fn enqueue(inner: &'a Inner) -> Self {
-            let mut state = inner.lock();
-            state.next_ticket += 1;
-            let id = state.next_ticket;
-            state.waiters.push_back(id);
-            Self { inner, id }
+        fn new(limits: AneResidencyLimits, dedicated_scheduler: bool) -> Self {
+            Self {
+                limits,
+                executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
+                wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
+                state: Mutex::new(State::default()),
+                changed: Notify::new(),
+                scheduler: Mutex::new(None),
+                dedicated_scheduler,
+                closed: std::sync::atomic::AtomicBool::new(false),
+                next_waiter: AtomicU64::new(0),
+                watch_leases: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                scheduler_task: Mutex::new(None),
+                #[cfg(test)]
+                admission_gate: None,
+                #[cfg(test)]
+                lease_decision_gate: Mutex::new(None),
+                #[cfg(test)]
+                wait_decision_gate: Mutex::new(None),
+                #[cfg(test)]
+                slow_nudges: Mutex::new(None),
+                #[cfg(test)]
+                scheduler_exit_signal: Mutex::new(None),
+                #[cfg(unix)]
+                lane_lock: Mutex::new(None),
+                #[cfg(unix)]
+                lane_path: None,
+            }
         }
-    }
 
-    impl Drop for QueueTicket<'_> {
-        fn drop(&mut self) {
-            let removed = self.inner.lock().leave_queue(self.id);
-            if removed {
-                self.inner.changed.notify_waiters();
+        /// Sends `message` to the scheduler, starting it on first use.
+        fn send(self: &Arc<Self>, message: scheduler::Msg) -> Result<(), AneResidencyError> {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
+            let mut mailbox = self
+                .scheduler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if mailbox.is_none() {
+                let (task, sender) = scheduler::Scheduler::new(self);
+                if self.dedicated_scheduler || tokio::runtime::Handle::try_current().is_err() {
+                    let started = std::thread::Builder::new()
+                        .name("ane-compile-scheduler".into())
+                        .spawn(move || {
+                            match tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                Ok(runtime) => runtime.block_on(task.run()),
+                                Err(error) => tracing::error!(
+                                    target: "worker",
+                                    error = %error,
+                                    "direct-ANE compile scheduler could not start a runtime"
+                                ),
+                            }
+                        });
+                    if let Err(error) = started {
+                        self.closed.store(true, Ordering::Release);
+                        return Err(AneResidencyError::Io(error));
+                    }
+                } else {
+                    let handle = tokio::spawn(task.run());
+                    #[cfg(test)]
+                    {
+                        *self.scheduler_task.lock().unwrap() = Some(handle.abort_handle());
+                    }
+                    #[cfg(not(test))]
+                    drop(handle);
+                }
+                *mailbox = Some(sender);
+            }
+            let sender = mailbox.as_ref().expect("started above");
+            if sender.send(message).is_err() {
+                self.closed.store(true, Ordering::Release);
+                return Err(AneResidencyError::SchedulerStopped);
+            }
+            Ok(())
+        }
+
+        /// Wakes the scheduler for a change requests do not report in
+        /// detail. Does nothing before the scheduler has started.
+        fn nudge(&self) {
+            if let Some(sender) = self
+                .scheduler
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            {
+                let _ = sender.send(scheduler::Msg::Nudge);
             }
         }
     }
 
-    enum Step {
-        Leased(AneShapeLease),
-        Admit(u64),
-        Evict {
-            key: ShapeKey,
-            slot_id: u64,
-            owner: Arc<dyn AneShapeWorker>,
-        },
-        /// `Some(shape)`: the shape this request needs has a slot in
-        /// `Admitting`, i.e. its executables are being compiled.
-        Wait(Option<usize>),
-        Retired,
+    /// A request's place in the handoff cohort of a shape it waited for.
+    /// Dropping it removes the request from the cohort if it has not leased
+    /// through it (leasing removes it already), and wakes the scheduler when
+    /// that leaves the cohort empty, so the handoff barrier ends at once.
+    struct CohortMembership {
+        inner: Arc<Inner>,
+        key: ShapeKey,
+        id: u64,
+    }
+
+    impl Drop for CohortMembership {
+        fn drop(&mut self) {
+            let emptied = {
+                let mut state = self.inner.lock();
+                state
+                    .slots
+                    .get_mut(&self.key)
+                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty())
+            };
+            if emptied {
+                self.inner.nudge();
+            }
+        }
+    }
+
+    /// Wakes the scheduler when a request stops waiting for its answer, so a
+    /// compile or eviction nobody needs any more can be withdrawn promptly.
+    struct DepartureNudge {
+        inner: Arc<Inner>,
+        armed: bool,
+    }
+
+    impl Drop for DepartureNudge {
+        fn drop(&mut self) {
+            if self.armed {
+                self.inner.nudge();
+            }
+        }
+    }
+
+    /// Lets a serving request's expiry find the supervisor and worker it
+    /// waits on, for a fresh prediction.
+    fn link_request(inner: &Arc<Inner>, worker_id: &str) {
+        let _ = REQUEST_WAITS.try_with(|waits| {
+            *waits
+                .link
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((Arc::downgrade(inner), worker_id.to_owned()));
+        });
     }
 
     /// Owns the direct-ANE residency budget. Cheap to clone; clones share it.
@@ -4328,42 +4974,21 @@ pub mod ane_residency {
         /// A supervisor that holds no lane lock (the caller holds it, or tests).
         pub fn new(limits: AneResidencyLimits) -> Self {
             Self {
-                inner: Arc::new(Inner {
-                    limits,
-                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
-                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
-                    state: Mutex::new(State::default()),
-                    changed: Notify::new(),
-                    #[cfg(test)]
-                    admission_gate: None,
-                    #[cfg(test)]
-                    lease_decision_gate: Mutex::new(None),
-                    #[cfg(unix)]
-                    lane_lock: Mutex::new(None),
-                    #[cfg(unix)]
-                    lane_path: None,
-                }),
+                inner: Arc::new(Inner::new(limits, false)),
             }
         }
 
         /// A supervisor that initially owns the lane lock; a drained pause may
-        /// release it and re-acquire it before admitting new work.
+        /// release it and re-acquire it before admitting new work. This is the
+        /// module's supervisor, shared by engines with runtimes of their own,
+        /// so its scheduler runs on a thread of its own.
         #[cfg(unix)]
         pub fn with_lane_lock(limits: AneResidencyLimits, lock: AneDirectLaneLock) -> Self {
+            let mut inner = Inner::new(limits, true);
+            inner.lane_path = Some(lock.path().to_path_buf());
+            inner.lane_lock = Mutex::new(Some(lock));
             Self {
-                inner: Arc::new(Inner {
-                    limits,
-                    executable_budget: ANE_RESIDENT_EXECUTABLES_TOTAL,
-                    wait_timeout: ANE_ADMISSION_WAIT_TIMEOUT,
-                    state: Mutex::new(State::default()),
-                    changed: Notify::new(),
-                    #[cfg(test)]
-                    admission_gate: None,
-                    #[cfg(test)]
-                    lease_decision_gate: Mutex::new(None),
-                    lane_path: Some(lock.path().to_path_buf()),
-                    lane_lock: Mutex::new(Some(lock)),
-                }),
+                inner: Arc::new(inner),
             }
         }
 
@@ -4455,21 +5080,56 @@ pub mod ane_residency {
             })
         }
 
-        /// Recover a transport-faulted owner after the inference task releases its lease.
-        pub async fn recover(&self, worker: &Arc<dyn AneShapeWorker>) -> bool {
-            recover_worker(&self.inner, worker).await
+        /// Recover a transport-faulted owner after the inference task releases its
+        /// lease. The scheduler drains the worker's leases and in-flight compile
+        /// (bounded by the admission wait timeout), restarts it, and answers
+        /// whether the replacement came up, or why not.
+        pub async fn recover(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+        ) -> Result<(), AneResidencyError> {
+            self.recover_at_generation(worker, worker.generation())
+                .await
         }
 
         /// Ignore faults from an owner generation that has already been replaced.
+        ///
+        /// The wait is bounded end to end: the drain (admission wait timeout),
+        /// the scheduler's wait for the old process's exit
+        /// (`EXIT_CONFIRMATION_GIVE_UP`, after which it answers that the worker
+        /// is closed), and the replacement's start and model restore (another
+        /// admission wait timeout).
         pub async fn recover_at_generation(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             generation: u64,
-        ) -> bool {
-            recover_worker_at_generation(&self.inner, worker, generation).await
+        ) -> Result<(), AneResidencyError> {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            if self
+                .inner
+                .send(scheduler::Msg::Recover {
+                    worker: worker.clone(),
+                    generation,
+                    reply,
+                })
+                .is_err()
+            {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
+            let bound = self.inner.wait_timeout * 2 + scheduler::EXIT_CONFIRMATION_GIVE_UP;
+            match tokio::time::timeout(bound, answer).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(_)) => Err(AneResidencyError::SchedulerStopped),
+                Err(_) => Err(AneResidencyError::Channel(format!(
+                    "worker recovery did not finish within {} s",
+                    bound.as_secs()
+                ))),
+            }
         }
 
-        /// Stop new leases and retain reservations until the owner has confirmed exit.
+        /// Stop new leases and retain reservations until the owner has confirmed
+        /// exit. If `shutdown` fails, the reservations stay charged but no
+        /// longer hold the compile gate.
         pub async fn retire<F>(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
@@ -4478,42 +5138,31 @@ pub mod ane_residency {
         where
             F: Future<Output = Result<(), AneResidencyError>>,
         {
-            let id = worker.worker_id().to_owned();
+            let (reply, drained) = tokio::sync::oneshot::channel();
+            if self
+                .inner
+                .send(scheduler::Msg::Retire {
+                    worker: worker.clone(),
+                    reply,
+                })
+                .is_ok()
             {
-                let mut state = self.inner.lock();
-                state.retired.insert(id.clone());
-                state.recovering.insert(id.clone());
+                let _ = drained.await;
             }
-            self.inner.changed.notify_waiters();
-            let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
-            loop {
-                let notified = self.inner.changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let drained = self
-                    .inner
-                    .lock()
-                    .slots
-                    .values()
-                    .filter(|slot| slot.worker.worker_id() == id)
-                    .all(|slot| slot.leases == 0 && slot.state != SlotState::Admitting);
-                if drained {
-                    break;
-                }
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    break;
-                }
+            let result = shutdown.await;
+            let (reply, done) = tokio::sync::oneshot::channel();
+            if self
+                .inner
+                .send(scheduler::Msg::RetireDone {
+                    worker_id: worker.worker_id().to_owned(),
+                    exit_confirmed: result.is_ok(),
+                    reply,
+                })
+                .is_ok()
+            {
+                let _ = done.await;
             }
-            shutdown.await?;
-            let mut state = self.inner.lock();
-            // Reservations are summed from these slots by reserved_executables.
-            // Refund only this owner, and only after its process exit is confirmed;
-            // the next worker instance must not inherit a retired owner's charge.
-            state.slots.retain(|_, slot| slot.worker.worker_id() != id);
-            state.recovering.remove(&id);
-            drop(state);
-            self.inner.changed.notify_waiters();
-            Ok(())
+            result
         }
 
         pub fn limits(&self) -> AneResidencyLimits {
@@ -4615,9 +5264,13 @@ pub mod ane_residency {
                 )));
             }
             let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
-            let ticket = QueueTicket::enqueue(&self.inner);
-            #[cfg(test)]
-            admission_trace::queue(ticket.id, model_ref, shape);
+            // The latest moment this request can still use its shape.
+            let bound = request_deadline.map_or(deadline, |request| request.min(deadline));
+            link_request(&self.inner, worker.worker_id());
+            let mut cohort = None;
+            // Leaves the handoff cohort if this request stops before leasing
+            // through it, so the barrier does not wait for a member that left.
+            let mut membership: Option<CohortMembership> = None;
             loop {
                 if request_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
                 {
@@ -4626,14 +5279,6 @@ pub mod ane_residency {
                     return Err(lease_deadline_expired());
                 }
                 ensure_request_live()?;
-                // Register for wakeups before reading the state, so a change
-                // between the check and the wait is not missed.
-                let notified = self.inner.changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if self.inner.lock().retired.contains(worker.worker_id()) {
-                    return Err(AneResidencyError::Channel("worker is retired".into()));
-                }
                 #[cfg(test)]
                 {
                     let gate = self.inner.lease_decision_gate.lock().unwrap().take();
@@ -4643,85 +5288,79 @@ pub mod ane_residency {
                     }
                 }
                 ensure_request_live()?;
-                match self.next_step(ticket.id, &key, worker, executables) {
-                    Step::Retired => {
-                        return Err(AneResidencyError::Channel("worker is retired".into()))
+                let member = membership.take();
+                let leased = self.try_lease(&key, worker, cohort.take());
+                drop(member);
+                if let Some(lease) = leased? {
+                    #[cfg(test)]
+                    admission_trace::event("lease_grant", model_ref, shape);
+                    return Ok(lease);
+                }
+                // Not resident (or a barrier applies): ask the scheduler and
+                // wait for its one answer. Going away just drops the receiver.
+                let id = self.inner.next_waiter.fetch_add(1, Ordering::Relaxed) + 1;
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                self.inner.send(scheduler::Msg::Want(scheduler::Want {
+                    id,
+                    key: key.clone(),
+                    worker: worker.clone(),
+                    executables,
+                    bound: Some(bound),
+                    deadline: request_deadline,
+                    reply: scheduler::Reply::Lease(reply),
+                    trace: scheduler::Trace::current(),
+                }))?;
+                enter_wait(WaitPhase::Scheduled { id, shape });
+                let left = DepartureNudge {
+                    inner: self.inner.clone(),
+                    armed: true,
+                };
+                let mut answer = answer;
+                let answer = match cancellable_wait(&mut answer).await {
+                    // A request whose turn started the compile keeps its serving
+                    // task (and with it the lane's serving gate) until the
+                    // compile's reply has drained, even after its caller went
+                    // away; it then discards the result.
+                    Err(AneResidencyError::Abandoned) if self.owns_running_compile(&key, id) => {
+                        let _ = answer.await;
+                        Err(AneResidencyError::Abandoned)
                     }
-                    Step::Leased(lease) => {
+                    other => other,
+                };
+                let mut left = left;
+                left.armed = matches!(answer, Err(_) | Ok(Err(_)));
+                match answer {
+                    Err(error) => return Err(error),
+                    Ok(Err(_)) => return Err(AneResidencyError::SchedulerStopped),
+                    Ok(Ok(scheduler::Answer::Lease { lease, compiled })) => {
+                        enter_wait(if compiled {
+                            WaitPhase::Compile(shape)
+                        } else {
+                            WaitPhase::Other
+                        });
                         #[cfg(test)]
                         admission_trace::event("lease_grant", model_ref, shape);
                         return Ok(lease);
                     }
-                    Step::Admit(slot_id) => {
-                        // The slot is Admitting from here on: a deadline that
-                        // expires now expires on this shape's compile.
-                        enter_wait(WaitPhase::Compile(key.shape));
-                        let shape = key.shape;
-                        let lease = self.admit(worker.clone(), key, slot_id).await?;
+                    Ok(Ok(scheduler::Answer::Ready)) => {
+                        enter_wait(WaitPhase::Compile(shape));
+                        cohort = Some(id);
+                    }
+                    Ok(Ok(scheduler::Answer::Joined(member))) => {
+                        enter_wait(WaitPhase::Compile(shape));
+                        cohort = Some(id);
+                        membership = Some(member);
+                    }
+                    Ok(Ok(scheduler::Answer::Failed(error))) => {
                         #[cfg(test)]
-                        admission_trace::event("lease_grant", model_ref, shape);
-                        if request_deadline
-                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                        {
-                            drop(lease);
-                            return Err(deadline_expired(Some(shape)));
+                        if matches!(
+                            error,
+                            AneResidencyError::ShapeCompiling { .. }
+                                | AneResidencyError::DeadlineExceeded
+                        ) {
+                            pass_worker_gate(worker).await;
                         }
-                        return Ok(lease);
-                    }
-                    Step::Evict {
-                        key,
-                        slot_id,
-                        owner,
-                    } => {
-                        enter_wait(WaitPhase::Other);
-                        self.evict(owner, key, slot_id).await;
-                    }
-                    Step::Wait(compiling) => {
-                        enter_wait(compiling.map_or(WaitPhase::Other, WaitPhase::Compile));
-                        // Wake even if a suspended joiner neither claims nor cancels
-                        // its handoff; expiry must not need an unrelated notification.
-                        let handoff = self
-                            .inner
-                            .lock()
-                            .slots
-                            .values()
-                            .filter(|slot| slot.handing_off())
-                            .filter_map(|slot| slot.handoff_until)
-                            .min();
-                        let wake = async {
-                            if let Some(until) = handoff {
-                                tokio::select! {
-                                    _ = notified => {},
-                                    _ = tokio::time::sleep_until(until) => {},
-                                }
-                            } else {
-                                notified.await;
-                            }
-                        };
-                        let wait_deadline =
-                            request_deadline.map_or(deadline, |request| request.min(deadline));
-                        let timed_out =
-                            match tokio::time::timeout_at(wait_deadline, cancellable_wait(wake))
-                                .await
-                            {
-                                Ok(result) => {
-                                    result?;
-                                    false
-                                }
-                                Err(_) => true,
-                            };
-                        if timed_out {
-                            if request_deadline
-                                .is_some_and(|request| tokio::time::Instant::now() >= request)
-                            {
-                                #[cfg(test)]
-                                pass_worker_gate(worker).await;
-                                return Err(deadline_expired(compiling));
-                            }
-                            return Err(resource_refusal(AneResidencyError::Channel(
-                                "admission budget wait deadline exceeded".into(),
-                            )));
-                        }
+                        return Err(error);
                     }
                 }
             }
@@ -4740,45 +5379,55 @@ pub mod ane_residency {
 
         /// Borrow only an already compiled program whose output matched standalone
         /// output bit-for-bit on the qualification fixtures. A missing program
-        /// returns None instead of triggering compilation.
+        /// returns None instead of triggering compilation. A stopped scheduler
+        /// closes the lane for packed requests too, as for `try_lease`.
         fn try_packed_lease(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
-        ) -> Option<AneShapeLease> {
+        ) -> Result<Option<AneShapeLease>, AneResidencyError> {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
             let key = Self::packed_key(worker, model_ref);
             let mut state = self.inner.lock();
             // Packed arrivals have no budget-queue ticket. Do not let their fast
             // path repeatedly lease the only program a starved admission can evict.
             if state.starved_head.is_some() {
-                return None;
+                return Ok(None);
             }
             if state.recovering.contains(worker.worker_id())
                 || state.retired.contains(worker.worker_id())
             {
-                return None;
+                return Ok(None);
             }
             let now = state.tick();
-            let slot = state.slots.get_mut(&key)?;
+            let Some(slot) = state.slots.get_mut(&key) else {
+                return Ok(None);
+            };
             if slot.state != SlotState::Resident
                 || !slot.packed_qualified
                 || slot.generation != worker.generation()
             {
-                return None;
+                return Ok(None);
             }
             slot.leases += 1;
             slot.last_used = now;
-            Some(AneShapeLease {
+            Ok(Some(AneShapeLease {
                 inner: self.inner.clone(),
                 key,
                 slot_id: slot.id,
                 inventory: slot.inventory.clone(),
-            })
+            }))
         }
 
-        fn packed_resident(&self, worker: &Arc<dyn AneShapeWorker>, model_ref: &str) -> bool {
-            let lease = self.try_packed_lease(worker, model_ref);
-            lease.is_some()
+        fn packed_resident(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+            model_ref: &str,
+        ) -> Result<bool, AneResidencyError> {
+            let lease = self.try_packed_lease(worker, model_ref)?;
+            Ok(lease.is_some())
         }
 
         fn preparation_possible(&self, worker: &Arc<dyn AneShapeWorker>) -> bool {
@@ -4810,41 +5459,31 @@ pub mod ane_residency {
         }
 
         /// Preparation does not wait for the shared executable budget behind live
-        /// requests. If every candidate for eviction is in use, retry after the
-        /// lane's last in-flight request completes.
+        /// requests or for this worker's own work: the scheduler answers `None`
+        /// at once unless the packed program can be compiled now (evicting if
+        /// needed), and retry happens after the lane's last in-flight request
+        /// completes.
         async fn prepare_packed_lease(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             model_ref: &str,
         ) -> Result<Option<AneShapeLease>, AneResidencyError> {
             let key = Self::packed_key(worker, model_ref);
-            let ticket = QueueTicket::enqueue(&self.inner);
-            loop {
-                {
-                    let state = self.inner.lock();
-                    if state.slots.values().any(|slot| {
-                        slot.worker.worker_id() == worker.worker_id()
-                            && (slot.leases != 0 || slot.state == SlotState::Admitting)
-                    }) {
-                        return Ok(None);
-                    }
-                }
-                match self.next_step(ticket.id, &key, worker, 28) {
-                    Step::Leased(lease) => return Ok(Some(lease)),
-                    Step::Admit(id) => return self.admit(worker.clone(), key, id).await.map(Some),
-                    Step::Evict {
-                        key,
-                        slot_id,
-                        owner,
-                    } => {
-                        self.evict(owner, key, slot_id).await;
-                    }
-                    Step::Wait(_) => return Ok(None),
-                    Step::Retired => {
-                        return Err(AneResidencyError::Channel("worker is retired".into()))
-                    }
-                }
-            }
+            let id = self.inner.next_waiter.fetch_add(1, Ordering::Relaxed) + 1;
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.inner.send(scheduler::Msg::Want(scheduler::Want {
+                id,
+                key,
+                worker: worker.clone(),
+                executables: 28,
+                bound: None,
+                deadline: None,
+                reply: scheduler::Reply::Prepare(reply),
+                trace: scheduler::Trace::current(),
+            }))?;
+            answer
+                .await
+                .map_err(|_| AneResidencyError::SchedulerStopped)?
         }
 
         fn qualify_packed(&self, lease: &AneShapeLease) {
@@ -4964,319 +5603,98 @@ pub mod ane_residency {
                 .collect())
         }
 
-        fn next_step(
+        /// The lease fast path: one lock of the state, no message. Leases
+        /// `key` if it is resident, of the worker's current generation, and
+        /// no scheduler barrier applies. A barrier applies while a starved
+        /// head waits for a victim (requests then lease in queue order through
+        /// the scheduler), except for `cohort`, a request the scheduler told
+        /// its compile is ready, which may lease during the 250 ms handoff.
+        fn try_lease(
             &self,
-            ticket: u64,
             key: &ShapeKey,
             worker: &Arc<dyn AneShapeWorker>,
-            executables: usize,
-        ) -> Step {
+            cohort: Option<u64>,
+        ) -> Result<Option<AneShapeLease>, AneResidencyError> {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
             let mut state = self.inner.lock();
-            if state.retired.contains(worker.worker_id()) {
-                return Step::Retired;
-            }
-            state
-                .waiter_keys
-                .entry(ticket)
-                .or_insert_with(|| key.clone());
+            // A retired worker is also marked recovering until its exit is
+            // confirmed, and has no slots after; the scheduler then answers
+            // its requests with the retirement.
             if state.recovering.contains(worker.worker_id()) {
-                return Step::Wait(None);
+                return Ok(None);
             }
-            if let Some(slot_state) = state.slots.get(key).map(|slot| slot.state) {
-                // A shape with a slot needs no budget, so this request waits
-                // outside the FIFO order: for the admission or eviction in
-                // flight to settle (one compile per shape), or, if resident,
-                // leases it at once so it cannot be evicted while it waits.
-                if slot_state == SlotState::Admitting {
-                    state.slots.get_mut(key).unwrap().joined.insert(ticket);
-                    return Step::Wait(Some(key.shape));
-                }
-                let handoff = state
-                    .slots
-                    .get(key)
-                    .is_some_and(|slot| slot.handing_off() && slot.joined.contains(&ticket));
-                if slot_state != SlotState::Resident
-                    || (!handoff && state.behind_starved_head(ticket))
-                {
-                    return Step::Wait(None);
-                }
-                let now = state.tick();
-                let slot = state.slots.get_mut(key).expect("slot checked above");
-                slot.leases += 1;
-                slot.last_used = now;
-                let lease = AneShapeLease {
-                    inner: self.inner.clone(),
-                    key: key.clone(),
-                    slot_id: slot.id,
-                    inventory: slot.inventory.clone(),
-                };
-                state.leave_queue(ticket);
-                self.inner.changed.notify_waiters();
-                return Step::Leased(lease);
-            }
-            if state.budget_head() != Some(ticket) {
-                return Step::Wait(None);
-            }
-            let now = state.tick();
-            let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
-            let total_full = state.slots.len() >= self.inner.limits.total;
-            let executable_full = state.reserved_executables().saturating_add(executables)
-                > self.inner.executable_budget;
-            if !model_full && !total_full && !executable_full {
-                state.next_slot += 1;
-                let id = state.next_slot;
-                state.slots.insert(
-                    key.clone(),
-                    Slot {
-                        id,
-                        worker: worker.clone(),
-                        state: SlotState::Admitting,
-                        leases: 0,
-                        last_used: now,
-                        inventory: None,
-                        executables,
-                        generation: worker.generation(),
-                        packed_qualified: false,
-                        joined: BTreeSet::new(),
-                        handoff_until: None,
-                    },
-                );
-                state.leave_queue(ticket);
-                self.inner.changed.notify_waiters();
-                #[cfg(test)]
-                admission_trace::event("reservation", &key.model_ref, key.shape);
-                return Step::Admit(id);
-            }
-            // When the model is at its own limit only one of its shapes frees
-            // the slot it needs; otherwise any model's shape does. A model's
-            // idle stream refunds promptly; queued demand and then the smallest
-            // rung break ties before LRU. Busy streams remain a last resort.
-            let victim = state
-                .slots
-                .iter()
-                .filter(|(candidate, slot)| {
-                    slot.state == SlotState::Resident
-                        && slot.leases == 0
-                        && !slot.handing_off()
-                        && !state.recovering.contains(slot.worker.worker_id())
-                        && (!model_full || candidate.model_ref == key.model_ref)
-                })
-                .min_by_key(|(candidate, slot)| state.eviction_rank(candidate, slot))
-                .map(|(candidate, slot)| (candidate.clone(), slot.id, slot.worker.clone()));
-            let Some((victim, slot_id, owner)) = victim else {
-                state.starved_head = Some(ticket);
-                return Step::Wait(None);
+            let now = tokio::time::Instant::now();
+            let starved = state.starved_head.is_some();
+            let tick = state.tick();
+            let Some(slot) = state.slots.get_mut(key) else {
+                return Ok(None);
             };
-            if state.starved_head == Some(ticket) {
-                state.starved_head = None;
+            if slot.state != SlotState::Resident || slot.generation != worker.generation() {
+                return Ok(None);
             }
-            if let Some(slot) = state.slots.get_mut(&victim) {
-                slot.state = SlotState::Evicting;
+            let member =
+                cohort.is_some_and(|id| slot.joined.contains(&id) && slot.handing_off(now));
+            if !member && starved {
+                return Ok(None);
             }
-            Step::Evict {
-                key: victim,
-                slot_id,
-                owner,
+            slot.leases += 1;
+            slot.last_used = tick;
+            if let Some(id) = cohort.filter(|_| member) {
+                slot.joined.remove(&id);
             }
-        }
-
-        async fn admit(
-            &self,
-            worker: Arc<dyn AneShapeWorker>,
-            key: ShapeKey,
-            slot_id: u64,
-        ) -> Result<AneShapeLease, AneResidencyError> {
-            let inner = self.inner.clone();
-            let generation = inner
-                .lock()
-                .slots
-                .get(&key)
-                .filter(|slot| slot.id == slot_id)
-                .map(|slot| slot.generation)
-                .ok_or_else(|| {
-                    AneResidencyError::Channel("admission reservation retired".into())
-                })?;
-            // The exchange runs on its own task so its outcome is recorded even
-            // if the waiting request is dropped part way through.
-            let supervisor = self.clone();
-            let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
-            #[cfg(test)]
-            let trace = admission_trace::current();
-            let task = tokio::spawn(async move {
-                let operation = request_scope(waits, async move {
-                    #[cfg(test)]
-                    let _serial_admission = match &inner.admission_gate {
-                        Some(gate) => Some(gate.lock().await),
-                        None => None,
-                    };
-                    match worker
-                        .admit_program(generation, &key.model_ref, key.shape, key.program)
-                        .await
-                    {
-                        Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
-                        Err(AneResidencyError::Abandoned) => {
-                            forget_failed_admission(&inner, &key, slot_id);
-                            Err(AneResidencyError::Abandoned)
-                        }
-                        Err(error) if worker.generation() != generation => {
-                            mark_failed_admission(&inner, &key, slot_id);
-                            Err(resource_refusal(error))
-                        }
-                        Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
-                            retry_resource_admission(&supervisor, &worker, key, slot_id, error)
-                                .await
-                        }
-                        Err(error)
-                            if key.program != AneProgram::Single
-                                && error.code() == Some("unsupported_request") =>
-                        {
-                            forget_failed_admission(&inner, &key, slot_id);
-                            Err(error)
-                        }
-                        Err(error) => {
-                            mark_failed_admission(&inner, &key, slot_id);
-                            recover_worker_at_generation(&inner, &worker, generation).await;
-                            Err(error)
-                        }
-                    }
-                });
-                #[cfg(test)]
-                let operation = admission_trace::scope(trace, operation);
-                operation.await
-            });
-            task.await.map_err(|error| {
-                AneResidencyError::Channel(format!("shape admission task failed: {error}"))
-            })?
-        }
-
-        async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
-            self.evict_with_recovery(owner, key, slot_id, true).await == EvictionOutcome::Evicted
-        }
-
-        async fn evict_with_recovery(
-            &self,
-            owner: Arc<dyn AneShapeWorker>,
-            key: ShapeKey,
-            slot_id: u64,
-            recover_on_failure: bool,
-        ) -> EvictionOutcome {
-            let inner = self.inner.clone();
-            let Some(generation) = inner
-                .lock()
-                .slots
-                .get(&key)
-                .filter(|slot| slot.id == slot_id)
-                .map(|slot| slot.generation)
-            else {
-                return EvictionOutcome::Evicted;
+            let lease = AneShapeLease {
+                inner: self.inner.clone(),
+                key: key.clone(),
+                slot_id: slot.id,
+                inventory: slot.inventory.clone(),
             };
-            let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
-            #[cfg(test)]
-            let trace = admission_trace::current();
-            #[cfg(test)]
-            admission_trace::event("eviction_dispatch", &key.model_ref, key.shape);
-            let task = tokio::spawn(async move {
-                let operation = request_scope(waits, async move {
-                    match owner
-                        .evict_program(generation, &key.model_ref, key.shape, key.program)
-                        .await
-                    {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            admission_trace::event("eviction_ack", &key.model_ref, key.shape);
-                            let mut state = inner.lock();
-                            if state.slots.get(&key).is_some_and(|slot| slot.id == slot_id) {
-                                state.slots.remove(&key);
-                                state.stats.evicted += 1;
-                                state.sample();
-                            }
-                            drop(state);
-                            inner.changed.notify_waiters();
-                            EvictionOutcome::Evicted
-                        }
-                        Err(AneResidencyError::Abandoned) => {
-                            // No eviction reached the wire, so the worker still owns
-                            // the resident program and its executable charge is unchanged.
-                            let mut state = inner.lock();
-                            if let Some(slot) = state.slots.get_mut(&key).filter(|slot| {
-                                slot.id == slot_id && slot.state == SlotState::Evicting
-                            }) {
-                                slot.state = SlotState::Resident;
-                            }
-                            drop(state);
-                            inner.changed.notify_waiters();
-                            EvictionOutcome::Abandoned
-                        }
-                        Err(_) if owner.generation() != generation => EvictionOutcome::Evicted,
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "worker",
-                                worker_id = owner.worker_id(),
-                                model_ref = %key.model_ref,
-                                shape = key.shape,
-                                error = %error,
-                                "direct-ANE evict failed; restarting the worker"
-                            );
-                            if recover_on_failure {
-                                recover_worker_at_generation(&inner, &owner, generation).await;
-                            }
-                            EvictionOutcome::Failed
-                        }
-                    }
-                });
-                #[cfg(test)]
-                let operation = admission_trace::scope(trace, operation);
-                operation.await
-            });
-            match task.await {
-                Ok(evicted) => evicted,
-                Err(error) => {
-                    tracing::warn!(target: "worker", error = %error, "direct-ANE eviction task failed");
-                    EvictionOutcome::Failed
-                }
+            let handoff_ended = member && slot.joined.is_empty();
+            drop(state);
+            if handoff_ended {
+                // The last cohort member leased: the head waiting behind the
+                // handoff may take its turn now.
+                self.inner.nudge();
             }
+            Ok(Some(lease))
         }
-    }
 
-    fn resource_victim(inner: &Inner) -> Option<(ShapeKey, u64, Arc<dyn AneShapeWorker>)> {
-        let mut state = inner.lock();
-        let victim = state
-            .slots
-            .iter()
-            .filter(|(_, slot)| {
-                slot.state == SlotState::Resident
-                    && slot.leases == 0
-                    && !slot.handing_off()
-                    && !state.recovering.contains(slot.worker.worker_id())
+        /// Whether request `id` reserved the compile of `key` and that compile
+        /// has already reached the worker. Before then a cancelled owner simply
+        /// leaves, and the scheduler withdraws the compile if nobody else waits
+        /// for it and no promise is live, so nothing reaches the wire.
+        fn owns_running_compile(&self, key: &ShapeKey, id: u64) -> bool {
+            self.inner.lock().slots.get(key).is_some_and(|slot| {
+                slot.state == SlotState::Admitting
+                    && slot.owner == Some(id)
+                    && slot.dispatched_at.is_some()
             })
-            .min_by_key(|(key, slot)| state.eviction_rank(key, slot))
-            .map(|(key, slot)| (key.clone(), slot.id, slot.worker.clone()));
-        if let Some((key, _, _)) = &victim {
-            state.slots.get_mut(key).unwrap().state = SlotState::Evicting;
         }
-        victim
-    }
 
-    fn mark_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
-        let mut state = inner.lock();
-        if let Some(slot) = state.slots.get_mut(key).filter(|slot| slot.id == slot_id) {
-            slot.state = SlotState::Failed;
+        /// Test only: evicts a slot the test has marked `Evicting`, through
+        /// the scheduler; returns whether the worker acknowledged it.
+        #[cfg(test)]
+        async fn evict(
+            &self,
+            _owner: Arc<dyn AneShapeWorker>,
+            key: ShapeKey,
+            slot_id: u64,
+        ) -> bool {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            if self
+                .inner
+                .send(scheduler::Msg::Evict {
+                    key,
+                    slot_id,
+                    reply,
+                })
+                .is_err()
+            {
+                return false;
+            }
+            answer.await.unwrap_or(false)
         }
-        drop(state);
-        inner.changed.notify_waiters();
-    }
-
-    fn forget_failed_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
-        let mut state = inner.lock();
-        if state
-            .slots
-            .get(key)
-            .is_some_and(|slot| slot.id == slot_id && slot.state == SlotState::Admitting)
-        {
-            state.slots.remove(key);
-        }
-        drop(state);
-        inner.changed.notify_waiters();
     }
 
     fn resource_refusal(error: AneResidencyError) -> AneResidencyError {
@@ -5286,199 +5704,16 @@ pub mod ane_residency {
         }
     }
 
-    async fn retry_resource_admission(
-        supervisor: &AneResidencySupervisor,
-        worker: &Arc<dyn AneShapeWorker>,
-        key: ShapeKey,
-        slot_id: u64,
-        error: AneResidencyError,
-    ) -> Result<AneShapeLease, AneResidencyError> {
-        if let Err(error) = ensure_request_live() {
-            forget_failed_admission(&supervisor.inner, &key, slot_id);
-            return Err(error);
-        }
-        // Keep the failed shape's budget reservation while freeing one physical
-        // resident. Selecting and marking the victim under the lock prevents a
-        // new lease from racing the eviction; the worker owns partial rollback.
-        let Some((victim, victim_id, owner)) = resource_victim(&supervisor.inner) else {
-            forget_failed_admission(&supervisor.inner, &key, slot_id);
-            return Err(resource_refusal(error));
-        };
-        let owner_generation = owner.generation();
-        match supervisor
-            .evict_with_recovery(owner.clone(), victim, victim_id, false)
-            .await
-        {
-            EvictionOutcome::Evicted => {}
-            EvictionOutcome::Abandoned => {
-                forget_failed_admission(&supervisor.inner, &key, slot_id);
-                return Err(AneResidencyError::Abandoned);
-            }
-            EvictionOutcome::Failed => {
-                // The admission RPC has finished, but its reservation remains charged.
-                // Recovery must not wait on the operation that is requesting recovery.
-                if owner.worker_id() == worker.worker_id() {
-                    mark_failed_admission(&supervisor.inner, &key, slot_id);
-                }
-                recover_worker_at_generation(&supervisor.inner, &owner, owner_generation).await;
-                forget_failed_admission(&supervisor.inner, &key, slot_id);
-                return Err(resource_refusal(error));
-            }
-        }
-        if let Err(error) = ensure_request_live() {
-            forget_failed_admission(&supervisor.inner, &key, slot_id);
-            return Err(error);
-        }
-        let Some(generation) = supervisor
-            .inner
-            .lock()
-            .slots
-            .get(&key)
-            .filter(|slot| slot.id == slot_id)
-            .map(|slot| slot.generation)
-        else {
-            return Err(resource_refusal(error));
-        };
-        // One retry only. Persistent exhaustion after completed eviction triggers
-        // confirmed-exit recovery, not further eviction or an unbounded compile loop.
-        match worker
-            .admit_program(generation, &key.model_ref, key.shape, key.program)
-            .await
-        {
-            Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
-            Err(AneResidencyError::Abandoned) => {
-                forget_failed_admission(&supervisor.inner, &key, slot_id);
-                Err(AneResidencyError::Abandoned)
-            }
-            Err(error) if worker.generation() != generation => {
-                mark_failed_admission(&supervisor.inner, &key, slot_id);
-                Err(resource_refusal(error))
-            }
-            Err(error) if error.code() == Some(ERR_ANE_RESOURCES_EXHAUSTED) => {
-                mark_failed_admission(&supervisor.inner, &key, slot_id);
-                recover_worker_at_generation(&supervisor.inner, worker, generation).await;
-                Err(resource_refusal(error))
-            }
-            Err(error)
-                if key.program != AneProgram::Single
-                    && error.code() == Some("unsupported_request") =>
-            {
-                forget_failed_admission(&supervisor.inner, &key, slot_id);
-                Err(error)
-            }
-            Err(error) => {
-                mark_failed_admission(&supervisor.inner, &key, slot_id);
-                recover_worker_at_generation(&supervisor.inner, worker, generation).await;
-                Err(error)
-            }
-        }
-    }
-
-    fn finish_admit(
-        inner: &Arc<Inner>,
-        key: &ShapeKey,
-        slot_id: u64,
-        inventory: AnePlacementInventory,
-    ) -> Result<AneShapeLease, AneResidencyError> {
-        let mut state = inner.lock();
-        let now = state.tick();
-        let Some(slot) = state.slots.get_mut(key).filter(|slot| slot.id == slot_id) else {
-            return Err(AneResidencyError::Channel(format!(
-                "worker restarted while admitting {} shape {}",
-                key.model_ref, key.shape
-            )));
-        };
-        let inventory = Arc::new(inventory);
-        slot.state = SlotState::Resident;
-        slot.handoff_until = Some(tokio::time::Instant::now() + ADMISSION_HANDOFF);
-        slot.leases = 1;
-        slot.last_used = now;
-        slot.inventory = Some(inventory.clone());
-        if let Some(sink) = state.inventory_sink.as_mut() {
-            sink.push(Arc::clone(&inventory));
-        }
-        state.stats.admitted += 1;
-        state.sample();
-        drop(state);
-        inner.changed.notify_waiters();
-        Ok(AneShapeLease {
+    /// Recovers `worker` through the supervisor's scheduler (see
+    /// [`AneResidencySupervisor::recover`]).
+    #[cfg(test)]
+    async fn recover_worker(inner: &Arc<Inner>, worker: &Arc<dyn AneShapeWorker>) -> bool {
+        AneResidencySupervisor {
             inner: inner.clone(),
-            key: key.clone(),
-            slot_id,
-            inventory: Some(inventory),
-        })
-    }
-
-    /// Recovery stops new leases and waits for already dispatched work to finish.
-    /// Reservations remain until confirmed process exit and pinned model restoration.
-    /// Drain timeout escalates by interrupting active I/O and closing the owner.
-    /// Only an unconfirmed exit or failed replacement/restoration stays closed:
-    /// its hardware ownership cannot safely be made available to another worker.
-    async fn recover_worker(inner: &Inner, worker: &Arc<dyn AneShapeWorker>) -> bool {
-        recover_worker_at_generation(inner, worker, worker.generation()).await
-    }
-
-    async fn recover_worker_at_generation(
-        inner: &Inner,
-        worker: &Arc<dyn AneShapeWorker>,
-        generation: u64,
-    ) -> bool {
-        let id = worker.worker_id().to_owned();
-        let leader = {
-            let mut state = inner.lock();
-            if state.retired.contains(&id) {
-                return false;
-            }
-            if worker.generation() != generation {
-                return true;
-            }
-            state.recovering.insert(id.clone())
-        };
-        let deadline = tokio::time::Instant::now() + inner.wait_timeout;
-        loop {
-            let notified = inner.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let drained = {
-                let state = inner.lock();
-                if state.retired.contains(&id) {
-                    return false;
-                }
-                if !state.recovering.contains(&id) {
-                    return true;
-                }
-                state
-                    .slots
-                    .values()
-                    .filter(|slot| slot.worker.worker_id() == id)
-                    .all(|slot| slot.leases == 0 && slot.state != SlotState::Admitting)
-            };
-            if leader && drained {
-                break;
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                if leader {
-                    tracing::warn!(target:"worker",worker_id=%id,"worker recovery drain deadline exceeded; forcing confirmed-exit restart");
-                    break;
-                }
-                return false;
-            }
         }
-        if worker.generation() != generation {
-            return true;
-        }
-        if let Err(error) = worker.restart().await {
-            tracing::warn!(target:"worker",worker_id=%id,error=%error,"direct-ANE worker restart failed; reservations retained");
-            inner.changed.notify_waiters();
-            return false;
-        }
-        let mut state = inner.lock();
-        state.slots.retain(|_, slot| slot.worker.worker_id() != id);
-        state.recovering.remove(&id);
-        state.stats.restarts += 1;
-        drop(state);
-        inner.changed.notify_waiters();
-        true
+        .recover(worker)
+        .await
+        .is_ok()
     }
 
     /// A held lease on one resident shape; dropping it releases the lease.
@@ -5518,6 +5753,12 @@ pub mod ane_residency {
             }
             drop(state);
             self.inner.changed.notify_waiters();
+            // Only a scheduler waiting on leases (a starved head, a draining
+            // recovery or retirement, an open handoff) needs to hear about
+            // this; the inference hot path sends nothing otherwise.
+            if self.inner.watch_leases.load(Ordering::Acquire) {
+                self.inner.nudge();
+            }
         }
     }
 
@@ -5534,6 +5775,8 @@ pub mod ane_residency {
     /// send a termination signal. In-memory tests model a process with a server
     /// task and confirm that task ended instead.
     pub struct AneWorkerSession<S> {
+        /// The worker process's id, for logs, when known.
+        pub pid: Option<u32>,
         pub stream: S,
         pub packed: Option<synapse_core::PackedCapability>,
         pub confirm_exit: BoxFuture<'static, Result<(), AneResidencyError>>,
@@ -5809,8 +6052,15 @@ pub mod ane_residency {
         shape_rpc_timeout: std::time::Duration,
         owner_exit_timeout: std::time::Duration,
         holder: Mutex<StreamHolder>,
+        /// The current worker process's id, when the connector reports it.
+        pid: Mutex<Option<u32>>,
         #[cfg(test)]
         classify_gate: Mutex<Option<Arc<ClassifyGate>>>,
+        /// Replaces the pinned compile-cost seed in tests. Mock workers compile
+        /// instantly, so test channels start with a zero seed (no early
+        /// refusals, arrival order); the real-hardware stress clears it.
+        #[cfg(test)]
+        test_compile_seed: Mutex<Option<std::time::Duration>>,
     }
 
     impl<S> AneWorkerChannel<S>
@@ -5823,6 +6073,7 @@ pub mod ane_residency {
             connect: AneWorkerConnector<S>,
         ) -> Result<Self, AneResidencyError> {
             let stream = connect().await?;
+            let stream_pid = stream.pid;
             let packed_enabled =
                 stream.packed.as_ref() == Some(&synapse_core::PackedCapability::tight256());
             Ok(Self {
@@ -5841,14 +6092,15 @@ pub mod ane_residency {
                 stop_exchanges: Notify::new(),
                 generation: AtomicU64::new(0),
                 // Compiling/loading all 22 GTE layers at length 8192 took 115.495s
-                // in debug. The 100-program budget permits at most four concurrent
-                // shape compiles (minimum 22 layers each); 600s covers their measured
-                // serialized cost (~462s) plus headroom, but bounds a silent worker.
+                // in debug; 600s leaves headroom for that but bounds a silent worker.
                 shape_rpc_timeout: std::time::Duration::from_secs(600),
                 owner_exit_timeout: std::time::Duration::from_secs(30),
                 holder: Mutex::new(StreamHolder::default()),
+                pid: Mutex::new(stream_pid),
                 #[cfg(test)]
                 classify_gate: Mutex::new(None),
+                #[cfg(test)]
+                test_compile_seed: Mutex::new(Some(std::time::Duration::ZERO)),
             })
         }
 
@@ -5958,20 +6210,56 @@ pub mod ane_residency {
         /// Answers a caller whose deadline expired while its serving task was
         /// still waiting: the cause is that task's current wait, unless the
         /// task already classified its own expiry.
-        fn expired_wait(
+        async fn expired_wait(
             &self,
             waits: &RequestWaits,
             deadline: tokio::time::Instant,
         ) -> AneResidencyError {
+            let scheduled = match *waits.lock() {
+                WaitPhase::Scheduled { id, .. } => Some(id),
+                _ => None,
+            };
+            if let Some(id) = scheduled {
+                // The request waits on the compile scheduler: it decides the
+                // answer, once, with its current prediction, and keeps the
+                // compile queued for exactly the delay it gives.
+                let answer = match waits.link() {
+                    Some((inner, _)) => {
+                        let (reply, answer) = tokio::sync::oneshot::channel();
+                        match inner.send(scheduler::Msg::Expired { id, reply }) {
+                            Ok(()) => answer
+                                .await
+                                .map(scheduler::AnswerKind::into_error)
+                                .unwrap_or(AneResidencyError::SchedulerStopped),
+                            Err(error) => error,
+                        }
+                    }
+                    None => AneResidencyError::DeadlineExceeded,
+                };
+                let cause = match &answer {
+                    AneResidencyError::ShapeCompiling { shape, .. } => Some(*shape),
+                    _ => None,
+                };
+                let mut phase = waits.lock();
+                if !matches!(*phase, WaitPhase::Expired(_)) {
+                    *phase = WaitPhase::Expired(cause);
+                }
+                return answer;
+            }
             let mut phase = waits.lock();
             let cause = match *phase {
                 WaitPhase::Expired(first) => first,
                 WaitPhase::Compile(shape) => Some(shape),
+                WaitPhase::Scheduled { shape, .. } => Some(shape),
                 WaitPhase::Stream(start) => self.compile_during(start, deadline),
                 WaitPhase::Other => None,
             };
             *phase = WaitPhase::Expired(cause);
-            deadline_cause_error(cause)
+            drop(phase);
+            match cause {
+                Some(shape) => shape_compiling(shape, waits.running_compile_ready()),
+                None => AneResidencyError::DeadlineExceeded,
+            }
         }
 
         /// Lets a test hold an expired wait between its deadline expiring and
@@ -6190,6 +6478,12 @@ pub mod ane_residency {
                 faulted: &self.faulted,
                 completed: false,
             };
+            if matches!(
+                request,
+                WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneAdmitPacked { .. }
+            ) {
+                scheduler::mark_compile_dispatched();
+            }
             #[cfg(test)]
             let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
                 .then(|| CompileRpcClock(std::time::Instant::now()));
@@ -6267,8 +6561,23 @@ pub mod ane_residency {
         fn classify_gate(&self) -> Option<Arc<ClassifyGate>> {
             self.classify_gate.lock().unwrap().clone()
         }
+        fn compile_cost_seed(
+            &self,
+            model_ref: &str,
+            shape: usize,
+            layers: usize,
+        ) -> std::time::Duration {
+            #[cfg(test)]
+            if let Some(seed) = *self.test_compile_seed.lock().unwrap() {
+                return seed;
+            }
+            pinned_compile_cost_seed(model_ref, shape, layers)
+        }
         fn generation(&self) -> u64 {
             self.generation.load(Ordering::Acquire)
+        }
+        fn exit_unconfirmed(&self) -> bool {
+            self.exit_unconfirmed.load(Ordering::Acquire)
         }
 
         fn admit_shape<'a>(
@@ -6437,6 +6746,21 @@ pub mod ane_residency {
         }
 
         fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
+            let (exited, _) = tokio::sync::oneshot::channel();
+            self.restart_with_exit_signal(exited)
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            *self
+                .pid
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn restart_with_exit_signal<'a>(
+            &'a self,
+            exited: tokio::sync::oneshot::Sender<()>,
+        ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
             Box::pin(async move {
                 // Stop active I/O before taking the stream lock. A lease or a
                 // nonresponsive request cannot prevent escalation after drain timeout.
@@ -6463,6 +6787,9 @@ pub mod ane_residency {
                         "worker retired during owner exit confirmation".into(),
                     ));
                 }
+                // The old process is gone: what it held can be released before
+                // the replacement starts.
+                let _ = exited.send(());
                 if self.cooldown_remaining().is_some() {
                     // The old process has exited, so the supervisor may release
                     // its executable reservations. During the fault cool-down,
@@ -6535,6 +6862,10 @@ pub mod ane_residency {
                     Ordering::Release,
                 );
                 self.packed_reason_logged.store(false, Ordering::Release);
+                *self
+                    .pid
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh.pid;
                 *guard = Some(fresh);
                 self.faulted.store(false, Ordering::Relaxed);
                 Ok(())
@@ -6624,6 +6955,60 @@ pub mod ane_residency {
         }
     }
 
+    /// Spawns and connects a direct-ANE worker process for a worker channel.
+    /// The connector lives as long as its channel, and the channel lives in
+    /// the supervisor's slots, so it holds the supervisor only weakly: a
+    /// strong reference made a cycle that kept the supervisor, its lane lock
+    /// and its scheduler thread alive after the last engine was dropped.
+    #[cfg(unix)]
+    fn direct_worker_connector(
+        config: super::WorkerHostConfig,
+        supervisor: &AneResidencySupervisor,
+    ) -> AneWorkerConnector<tokio::net::UnixStream> {
+        let supervisor = Arc::downgrade(&supervisor.inner);
+        Box::new(move || {
+            let mut config = config.clone();
+            let inherited = match supervisor.upgrade() {
+                Some(inner) => AneResidencySupervisor { inner }.inherited_lane_lock(),
+                None => Err(AneResidencyError::SchedulerStopped),
+            };
+            Box::pin(async move {
+                config.inherited_lane_lock = inherited?;
+                let mut host = super::WorkerHost::new(config);
+                host.ping()
+                    .await
+                    .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+                let super::WorkerConnection {
+                    stream,
+                    mut child,
+                    packed,
+                    ..
+                } = host.connection.take().ok_or_else(|| {
+                    AneResidencyError::Channel("spawned worker has no connection".into())
+                })?;
+                Ok(AneWorkerSession {
+                    pid: child.id(),
+                    packed,
+                    stream,
+                    confirm_exit: Box::pin(async move {
+                        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                            .await
+                        {
+                            Ok(status) => {
+                                status.map_err(AneResidencyError::Io)?;
+                            }
+                            Err(_) => {
+                                child.start_kill().map_err(AneResidencyError::Io)?;
+                                child.wait().await.map_err(AneResidencyError::Io)?;
+                            }
+                        }
+                        Ok(())
+                    }),
+                })
+            })
+        })
+    }
+
     /// The production owner of one direct-ANE worker and its I/O runtime.
     #[cfg(unix)]
     pub struct DirectAneEngine {
@@ -6658,47 +7043,7 @@ pub mod ane_residency {
             let normalize = config.normalize;
             let timeout = config.request_timeout;
             let load_timeout = super::liveness::SETUP_IDLE;
-            let connector_supervisor = supervisor.clone();
-            let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
-                let mut config = config.clone();
-                let inherited = connector_supervisor.inherited_lane_lock();
-                Box::pin(async move {
-                    config.inherited_lane_lock = inherited?;
-                    let mut host = super::WorkerHost::new(config);
-                    host.ping()
-                        .await
-                        .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
-                    let super::WorkerConnection {
-                        stream,
-                        mut child,
-                        packed,
-                        ..
-                    } = host.connection.take().ok_or_else(|| {
-                        AneResidencyError::Channel("spawned worker has no connection".into())
-                    })?;
-                    Ok(AneWorkerSession {
-                        packed,
-                        stream,
-                        confirm_exit: Box::pin(async move {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                child.wait(),
-                            )
-                            .await
-                            {
-                                Ok(status) => {
-                                    status.map_err(AneResidencyError::Io)?;
-                                }
-                                Err(_) => {
-                                    child.start_kill().map_err(AneResidencyError::Io)?;
-                                    child.wait().await.map_err(AneResidencyError::Io)?;
-                                }
-                            }
-                            Ok(())
-                        }),
-                    })
-                })
-            });
+            let connector = direct_worker_connector(config, &supervisor);
             let channel =
                 Arc::new(runtime.block_on(AneWorkerChannel::connect(id, max_frame, connector))?);
             let request = WorkerRequest::Load {
@@ -6994,7 +7339,7 @@ pub mod ane_residency {
             let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
             if self
                 .supervisor
-                .packed_resident(&worker, &self.metadata.model_ref)
+                .packed_resident(&worker, &self.metadata.model_ref)?
             {
                 return Ok(true);
             }
@@ -7050,7 +7395,8 @@ pub mod ane_residency {
                         // Recovery waits for leases to drain. Release qualification's
                         // own lease before joining the generation-scoped recovery.
                         drop(lease);
-                        self.supervisor
+                        let _ = self
+                            .supervisor
                             .recover_at_generation(&worker, fault_generation)
                             .await;
                         return Err(error);
@@ -7113,12 +7459,19 @@ pub mod ane_residency {
                 if let Some(retry_after_ms) = serving.channel.cooldown_remaining() {
                     return Err(AneResidencyError::Quarantined { retry_after_ms });
                 }
-                if serving.channel.faulted.load(Ordering::Acquire)
-                    && !serving.supervisor.recover(&worker).await
-                {
-                    return Err(AneResidencyError::Channel(
-                        "worker recovery could not confirm exit".into(),
-                    ));
+                if serving.channel.faulted.load(Ordering::Acquire) {
+                    match serving.supervisor.recover(&worker).await {
+                        Ok(()) => {}
+                        Err(
+                            error @ (AneResidencyError::WorkerClosed { .. }
+                            | AneResidencyError::SchedulerStopped),
+                        ) => return Err(error),
+                        Err(_) => {
+                            return Err(AneResidencyError::Channel(
+                                "worker recovery could not confirm exit".into(),
+                            ))
+                        }
+                    }
                 }
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
                 let result = if packing && !rerank {
@@ -7152,7 +7505,7 @@ pub mod ane_residency {
                         .await
                 };
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
-                    serving
+                    let _ = serving
                         .supervisor
                         .recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))
                         .await;
@@ -7165,7 +7518,7 @@ pub mod ane_residency {
                     Err(_) => {
                         #[cfg(test)]
                         self.channel.pass_classify_gate(GateSite::Caller).await;
-                        return Err(self.channel.expired_wait(&waits, deadline));
+                        return Err(self.channel.expired_wait(&waits, deadline).await);
                     }
                 },
                 None => task.await,
@@ -7201,7 +7554,7 @@ pub mod ane_residency {
             if self.channel.packing_available()
                 && self
                     .supervisor
-                    .packed_resident(worker, &self.metadata.model_ref)
+                    .packed_resident(worker, &self.metadata.model_ref)?
             {
                 let plan = synapse_core::plan_packed(&lengths)
                     .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
@@ -7226,7 +7579,7 @@ pub mod ane_residency {
                     ensure_request_live()?;
                     if let Some(lease) = self
                         .supervisor
-                        .try_packed_lease(worker, &self.metadata.model_ref)
+                        .try_packed_lease(worker, &self.metadata.model_ref)?
                     {
                         fault_generation.store(worker.generation(), Ordering::Release);
                         let (indices, passes) = packed_subset(&plan.passes);
@@ -7470,6 +7823,7 @@ pub mod ane_residency {
                         let pid = child.id().expect("new child pid");
                         children.lock().unwrap().push(child);
                         Ok(AneWorkerSession {
+                            pid: None,
                             packed: None,
                             stream,
                             confirm_exit: Box::pin(async move {
@@ -7516,11 +7870,13 @@ pub mod ane_residency {
                         })
                     })
                 });
-                Arc::new(
-                    AneWorkerChannel::connect(id, DEFAULT_MAX_FRAME_BYTES, connector)
-                        .await
-                        .unwrap(),
-                )
+                let channel = AneWorkerChannel::connect(id, DEFAULT_MAX_FRAME_BYTES, connector)
+                    .await
+                    .unwrap();
+                // Real workers compile for real: use the pinned cost seeds, as
+                // production does, so the compile queue orders and predicts.
+                *channel.test_compile_seed.lock().unwrap() = None;
+                Arc::new(channel)
             }
             fn pids(&self) -> Vec<u32> {
                 self.children
@@ -8074,6 +8430,317 @@ pub mod ane_residency {
             run_direct_ane_stress("cold_throughput").await;
         }
 
+        /// A real worker whose shape compiles are timed against one epoch, so
+        /// the compile-scheduling case can show which compiles overlapped.
+        struct TimedWorker {
+            channel: RealChannel,
+            slug: String,
+            epoch: std::time::Instant,
+            compiles: Arc<Mutex<Vec<Value>>>,
+        }
+        impl AneShapeWorker for TimedWorker {
+            fn stream_idle(&self) -> bool {
+                self.channel.stream_idle()
+            }
+            fn worker_id(&self) -> &str {
+                self.channel.worker_id()
+            }
+            fn generation(&self) -> u64 {
+                self.channel.generation()
+            }
+            fn admit_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                self.admit_shape_at_generation(self.generation(), model_ref, shape)
+            }
+            fn admit_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
+                Box::pin(async move {
+                    let start = self.epoch.elapsed().as_secs_f64();
+                    let result = self
+                        .channel
+                        .admit_shape_at_generation(generation, model_ref, shape)
+                        .await;
+                    let end = self.epoch.elapsed().as_secs_f64();
+                    self.compiles.lock().unwrap().push(json!({
+                        "slug": self.slug,
+                        "shape": shape,
+                        "start_s": start,
+                        "end_s": end,
+                        "admitted": result.is_ok(),
+                        "code": result.as_ref().err().and_then(AneResidencyError::code),
+                    }));
+                    result
+                })
+            }
+            fn evict_shape<'a>(
+                &'a self,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.channel.evict_shape(model_ref, shape)
+            }
+            fn evict_shape_at_generation<'a>(
+                &'a self,
+                generation: u64,
+                model_ref: &'a str,
+                shape: usize,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.channel
+                    .evict_shape_at_generation(generation, model_ref, shape)
+            }
+            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                Box::pin(async move { self.channel.restart().await })
+            }
+        }
+
+        /// One request of a compile-scheduling arm: model slug, shape, when to
+        /// ask (seconds after the arm's epoch) and an optional deadline in
+        /// seconds after asking.
+        type ScheduledRequest = (&'static str, usize, f64, Option<f64>);
+
+        /// Runs one arm on fresh workers and a fresh supervisor (production
+        /// limits and 600 s bound), so every shape compiles cold, as after a
+        /// restart. `sequential` asks each request only after the previous one
+        /// was answered (standalone timings); otherwise requests are asked at
+        /// their own times. Returns every answer and every compile, timed.
+        async fn compile_scheduling_arm(
+            lock: &AneDirectLaneLock,
+            root: &Path,
+            name: &str,
+            sequential: bool,
+            requests: &[ScheduledRequest],
+        ) -> Value {
+            let factory = Factory::new(root.join(name), lock);
+            let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+            let compiles = Arc::new(Mutex::new(Vec::new()));
+            let mut slugs: Vec<&str> = requests.iter().map(|request| request.0).collect();
+            slugs.sort();
+            slugs.dedup();
+            let mut loaded = Vec::new();
+            for slug in &slugs {
+                let channel = factory.connect(&format!("{name}-{slug}")).await;
+                let model_ref = load(&channel, slug).await;
+                loaded.push((*slug, channel, model_ref));
+            }
+            let epoch = std::time::Instant::now();
+            let workers: BTreeMap<&str, (Arc<dyn AneShapeWorker>, String)> = loaded
+                .into_iter()
+                .map(|(slug, channel, model_ref)| {
+                    let worker: Arc<dyn AneShapeWorker> = Arc::new(TimedWorker {
+                        channel,
+                        slug: slug.into(),
+                        epoch,
+                        compiles: compiles.clone(),
+                    });
+                    (slug, (worker, model_ref))
+                })
+                .collect();
+            let ask = |request: ScheduledRequest| {
+                let (slug, shape, at, deadline) = request;
+                let (worker, model_ref) = workers[slug].clone();
+                let supervisor = supervisor.clone();
+                async move {
+                    if !sequential {
+                        tokio::time::sleep_until(
+                            tokio::time::Instant::from_std(epoch) + Duration::from_secs_f64(at),
+                        )
+                        .await;
+                    }
+                    let asked = epoch.elapsed().as_secs_f64();
+                    let request_deadline = deadline.map(|seconds| {
+                        tokio::time::Instant::now() + Duration::from_secs_f64(seconds)
+                    });
+                    let result = supervisor
+                        .lease_until(&worker, &model_ref, shape, request_deadline)
+                        .await;
+                    let answered = epoch.elapsed().as_secs_f64();
+                    let (code, retry_after_ms) = match &result {
+                        Ok(_) => (None, None),
+                        Err(error) => (
+                            Some(error.code().unwrap_or("other").to_owned()),
+                            error
+                                .to_engine_error(synapse_core::EngineErrorStage::Inference)
+                                .retry_after_ms,
+                        ),
+                    };
+                    drop(result);
+                    json!({
+                        "slug": slug,
+                        "shape": shape,
+                        "deadline_s": deadline,
+                        "asked_s": asked,
+                        "answered_s": answered,
+                        "code": code,
+                        "retry_after_ms": retry_after_ms,
+                    })
+                }
+            };
+            let mut answers = Vec::new();
+            if sequential {
+                for request in requests {
+                    answers.push(ask(*request).await);
+                }
+            } else {
+                let mut tasks = Vec::new();
+                for request in requests {
+                    tasks.push(tokio::spawn(ask(*request)));
+                }
+                for task in tasks {
+                    answers.push(task.await.unwrap());
+                }
+            }
+            // A refused request leaves its compile queued for the retry; wait
+            // until the queue is empty so that compile is timed too.
+            let drained = tokio::time::timeout(Duration::from_secs(900), async {
+                loop {
+                    let idle = {
+                        let state = supervisor.inner.lock();
+                        state.entries.is_empty() && !state.compile_running()
+                    };
+                    if idle {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+            .is_ok();
+            factory.stop().await;
+            let compiles = compiles.lock().unwrap().clone();
+            json!({
+                "arm": name,
+                "sequential": sequential,
+                "queue_drained": drained,
+                "answers": answers,
+                "compiles": compiles,
+            })
+        }
+
+        /// Hardware check of the compile queue, started by the operator on a
+        /// Mac with exclusive Neural Engine access (run_stress.py --case
+        /// compile-scheduling):
+        /// standalone compile times, then a small shape asked together with
+        /// and after a wide one, six shapes asked at once, and a request
+        /// whose deadline the queue predicts it cannot meet. It writes a JSON
+        /// report (ANE_STRESS_OUT) and asserts only what must hold on any
+        /// machine: no two compiles overlap and the Neural Engine never ran
+        /// out of resources. Latency is judged by the operator's runner, which
+        /// compares each arm with the standalone times in the same report.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "compile-scheduling hardware check; exclusive ANE access required"]
+        async fn real_direct_ane_compile_scheduling() {
+            const GTE: &str = "gte-modernbert-base";
+            const QWEN: &str = "qwen3-embedding-0.6b";
+            let load_start = load_averages();
+            let root = PathBuf::from(format!(
+                "../../target/ane-compile-scheduling-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let lock = AneDirectLaneLock::acquire(&root.join("lane.lock")).unwrap();
+            let standalone: Vec<ScheduledRequest> = [
+                (GTE, 128),
+                (GTE, 512),
+                (GTE, 2048),
+                (QWEN, 128),
+                (QWEN, 512),
+                (QWEN, 2048),
+                (QWEN, 4096),
+            ]
+            .into_iter()
+            .map(|(slug, shape)| (slug, shape, 0.0, None))
+            .collect();
+            let batch: Vec<ScheduledRequest> = standalone[..6]
+                .iter()
+                .map(|(slug, shape, _, _)| (*slug, *shape, 0.0, None))
+                .collect();
+            let arms: [(&str, bool, Vec<ScheduledRequest>); 5] = [
+                ("standalone", true, standalone),
+                (
+                    "together",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 128, 0.001, None)],
+                ),
+                (
+                    "late",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 128, 10.0, None)],
+                ),
+                ("batch", false, batch),
+                (
+                    "refusal",
+                    false,
+                    vec![(QWEN, 4096, 0.0, None), (GTE, 512, 1.0, Some(30.0))],
+                ),
+            ];
+            let mut results = Vec::new();
+            for (name, sequential, requests) in arms {
+                println!("COMPILE_SCHEDULING_ARM={name}");
+                results
+                    .push(compile_scheduling_arm(&lock, &root, name, sequential, &requests).await);
+            }
+            let report = json!({
+                "schema": 1,
+                "case": "compile_scheduling",
+                "os": {
+                    "version": output("sw_vers", &["-productVersion"]),
+                    "build": output("sw_vers", &["-buildVersion"]),
+                    "model": output("sysctl", &["-n", "hw.model"]),
+                },
+                "load_start": load_start,
+                "load_end": load_averages(),
+                "arms": results,
+            });
+            let out = std::env::var_os("ANE_STRESS_OUT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.join("compile-scheduling.json"));
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            println!("ANE_STRESS_OUTPUT={}", out.display());
+            for arm in report["arms"].as_array().unwrap() {
+                let mut spans: Vec<(f64, f64)> = arm["compiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|compile| {
+                        (
+                            compile["start_s"].as_f64().unwrap(),
+                            compile["end_s"].as_f64().unwrap(),
+                        )
+                    })
+                    .collect();
+                spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+                assert!(
+                    spans.windows(2).all(|pair| pair[1].0 >= pair[0].1),
+                    "{}: two shape compiles overlapped: {spans:?}",
+                    arm["arm"]
+                );
+                let codes: Vec<&Value> = arm["answers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(arm["compiles"].as_array().unwrap())
+                    .map(|entry| &entry["code"])
+                    .collect();
+                assert!(
+                    !codes
+                        .iter()
+                        .any(|code| code.as_str() == Some(ERR_ANE_RESOURCES_EXHAUSTED)),
+                    "{}: the Neural Engine ran out of resources",
+                    arm["arm"]
+                );
+            }
+        }
+
         async fn run_direct_ane_stress(case: &str) {
             let timeline = admission_trace::Timeline::new();
             let load_start = load_averages();
@@ -8441,6 +9108,9 @@ pub mod ane_residency {
             fn generation(&self) -> u64 {
                 self.0.generation()
             }
+            fn exit_unconfirmed(&self) -> bool {
+                self.0.exit_unconfirmed.load(Ordering::Acquire)
+            }
             fn admit_shape_at_generation<'a>(
                 &'a self,
                 generation: u64,
@@ -8462,6 +9132,11 @@ pub mod ane_residency {
             fn executable_count(&self, _: &str) -> Result<usize, AneResidencyError> {
                 Ok(LAYERS as usize)
             }
+            /// Mock compiles have no modelled cost: they queue in arrival
+            /// order and are never refused early, as before the compile queue.
+            fn compile_cost_seed(&self, _: &str, _: usize, _: usize) -> Duration {
+                Duration::ZERO
+            }
             fn admit_shape<'a>(
                 &'a self,
                 model_ref: &'a str,
@@ -8478,6 +9153,12 @@ pub mod ane_residency {
             }
             fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
                 self.0.restart()
+            }
+            fn restart_with_exit_signal<'a>(
+                &'a self,
+                exited: tokio::sync::oneshot::Sender<()>,
+            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
+                self.0.restart_with_exit_signal(exited)
             }
         }
         type Channel = Arc<MockChannel>;
@@ -9094,6 +9775,7 @@ pub mod ane_residency {
                     )
                     .await?;
                     Ok(AneWorkerSession {
+                        pid: None,
                         stream: host,
                         packed: hello.packed,
                         confirm_exit: Box::pin(async move {
@@ -9297,6 +9979,7 @@ pub mod ane_residency {
                 serving
                     .supervisor
                     .try_packed_lease(&worker, PACKED_MODEL)
+                    .unwrap()
                     .is_none(),
                 "new packed leases must not keep the starved head's only eviction victim busy"
             );
@@ -9411,6 +10094,37 @@ pub mod ane_residency {
                     .iter()
                     .all(|r| !is_packed_request(r)),
                 "request must not re-admit an evicted packed key"
+            );
+        }
+
+        /// Once the lane is closed (the compile scheduler stopped), a request
+        /// whose rows are all served by the resident packed program is refused
+        /// like any other (`SchedulerStopped`, which the wire reports as
+        /// `engine_crashed`), and nothing reaches the worker. The slot table
+        /// is left as it was, so only the packed lease's own check of the
+        /// closed flag can refuse it.
+        #[tokio::test]
+        async fn packed_requests_are_refused_after_the_scheduler_stops() {
+            let peer = Arc::new(Mutex::new(PackedPeer::default()));
+            let serving = packed_peer(false, peer.clone()).await;
+            assert!(serving.prepare_packed().await.unwrap());
+            serving
+                .supervisor
+                .inner
+                .closed
+                .store(true, Ordering::Release);
+            let before = peer.lock().unwrap().requests.len();
+            let result = serving
+                .infer_packed(vec![vec![41; 127], vec![42; 129]])
+                .await;
+            assert!(
+                matches!(result, Err(AneResidencyError::SchedulerStopped)),
+                "a packed request was served after the lane closed: {result:?}"
+            );
+            assert_eq!(
+                peer.lock().unwrap().requests.len(),
+                before,
+                "a packed request reached the worker after the lane closed"
             );
         }
 
@@ -9803,6 +10517,7 @@ pub mod ane_residency {
                         let (host, worker) = tokio::io::duplex(1 << 16);
                         let task = tokio::spawn(serve_mock(worker, ledger));
                         Ok(AneWorkerSession {
+                            pid: None,
                             packed: None,
                             stream: host,
                             confirm_exit: Box::pin(async move {
@@ -9901,6 +10616,8 @@ pub mod ane_residency {
         }
 
         include!("admission_tests.rs");
+        include!("compile_queue_tests.rs");
+        include!("compile_queue_fault_tests.rs");
 
         #[tokio::test]
         async fn executable_budget_refuses_before_hardware_limit() {
@@ -9933,31 +10650,38 @@ pub mod ane_residency {
                 shape: 128,
                 program: AneProgram::Single,
             };
-            let second = ShapeKey {
-                worker_id: worker.worker_id().to_owned(),
-                model_ref: "model".into(),
-                shape: 256,
-                program: AneProgram::Single,
-            };
-            let first_ticket = QueueTicket::enqueue(&supervisor.inner);
-            assert!(matches!(
-                supervisor.next_step(first_ticket.id, &first, &worker, 4),
-                Step::Admit(_)
-            ));
+            let (started, release) = notify_pair();
+            ledger.lock().unwrap().admit_gate = Some((started.clone(), release.clone()));
+            let compiling = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 128).await }
+            });
+            notified(&started).await;
             assert_eq!(
                 supervisor.inner.lock().slots[&first].state,
                 SlotState::Admitting
             );
-            let second_ticket = QueueTicket::enqueue(&supervisor.inner);
+            let second = tokio::spawn({
+                let supervisor = supervisor.clone();
+                let worker = worker.clone();
+                async move { supervisor.lease(&worker, "model", 256).await }
+            });
+            until(|| supervisor.inner.lock().waiters.len() == 1).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(
-                matches!(
-                    supervisor.next_step(second_ticket.id, &second, &worker, 4),
-                    Step::Wait(_)
-                ),
+                !second.is_finished(),
                 "pending compile's four layers must prevent another four-layer reservation"
             );
             assert_eq!(supervisor.inner.lock().reserved_executables(), 4);
-            assert!(ledger.lock().unwrap().admit_attempts.is_empty());
+            assert!(!ledger
+                .lock()
+                .unwrap()
+                .admit_attempts
+                .contains_key(&("model".into(), 256)));
+            release.notify_one();
+            drop(compiling.await.unwrap().unwrap());
+            second.abort();
         }
 
         #[tokio::test]
@@ -10268,6 +10992,17 @@ pub mod ane_residency {
             gate.release(GateSite::Inner);
             release.notify_one();
             inference.await.unwrap().unwrap();
+            // The caller was told shape_compiling, so the compile it was told
+            // to wait for still runs once the stream is free.
+            let model_ref = serving.metadata.model_ref.clone();
+            until(|| {
+                ledger
+                    .lock()
+                    .unwrap()
+                    .resident
+                    .contains(&(model_ref.clone(), 1024))
+            })
+            .await;
             assert_eq!(
                 compiling_at_classification, None,
                 "the admit must still be queued"
@@ -10275,7 +11010,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     answered,
-                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024, .. })
                 ),
                 "{answered:?}"
             );
@@ -10303,7 +11038,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     answered,
-                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024, .. })
                 ),
                 "{answered:?}"
             );
@@ -10335,7 +11070,8 @@ pub mod ane_residency {
             let joiner = spawn_infer(&serving, 600, deadline);
             until(|| !serving.supervisor.inner.lock().waiters.is_empty()).await;
             release.notify_one();
-            // Recovery is confirming the old worker's exit: the slot is Failed.
+            // Recovery is confirming the old worker's exit: the failed slot is
+            // kept until then (Rejected: the worker answered with an error).
             acknowledged(&exiting).await;
             let slot_failed = serving
                 .supervisor
@@ -10343,7 +11079,7 @@ pub mod ane_residency {
                 .lock()
                 .slots
                 .values()
-                .any(|slot| slot.state == SlotState::Failed);
+                .any(|slot| matches!(slot.state, SlotState::Failed | SlotState::Rejected));
             let answered = tokio::time::timeout(Duration::from_secs(2), joiner)
                 .await
                 .unwrap()
@@ -10432,7 +11168,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     answered,
-                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024, .. })
                 ),
                 "{answered:?}"
             );
@@ -10534,7 +11270,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     answered,
-                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024, .. })
                 ),
                 "{answered:?}"
             );
@@ -10587,7 +11323,7 @@ pub mod ane_residency {
             assert!(
                 matches!(
                     answered,
-                    Err(AneResidencyError::ShapeCompiling { shape: 1024 })
+                    Err(AneResidencyError::ShapeCompiling { shape: 1024, .. })
                 ),
                 "{answered:?}"
             );
@@ -11049,6 +11785,7 @@ pub mod ane_residency {
                     let (stream, server) = tokio::net::UnixStream::pair().unwrap();
                     let task = tokio::spawn(serve_mock(server, ledger.clone()));
                     Ok(AneWorkerSession {
+                        pid: None,
                         packed: None,
                         stream,
                         confirm_exit: Box::pin(async move {
@@ -11210,13 +11947,12 @@ pub mod ane_residency {
             let serving = serving_fixture(&ledger).await;
             let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
             let fault_generation = worker.generation();
-            assert!(serving.supervisor.recover(&worker).await);
-            assert!(
-                serving
-                    .supervisor
-                    .recover_at_generation(&worker, fault_generation)
-                    .await
-            );
+            assert!(serving.supervisor.recover(&worker).await.is_ok());
+            assert!(serving
+                .supervisor
+                .recover_at_generation(&worker, fault_generation)
+                .await
+                .is_ok());
             assert_eq!(serving.supervisor.stats().restarts, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
             serving.retire().await.unwrap();
@@ -11272,6 +12008,43 @@ pub mod ane_residency {
             );
             assert_eq!(serving.supervisor.stats().admitted, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
+        }
+
+        /// A serving caller that goes away while its compile is reserved but
+        /// still waits for the worker stream leaves nothing on the wire: its
+        /// serving task stops waiting, and the scheduler withdraws the compile
+        /// because nobody else waits for it and nothing was promised.
+        #[tokio::test]
+        async fn cancelled_serving_owner_withdraws_its_undispatched_compile() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let busy = serving.channel.stream.lock().await;
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(200),
+                serving.infer(vec![vec![1]], false),
+            )
+            .await;
+            assert!(cancelled.is_err(), "the caller was meant to give up first");
+            let key = ShapeKey {
+                worker_id: "serving".into(),
+                model_ref: serving.metadata.model_ref.clone(),
+                shape: 128,
+                program: AneProgram::Single,
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while serving.supervisor.inner.lock().slots.contains_key(&key) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cancelled owner's undispatched compile was not withdrawn");
+            drop(busy);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                ledger.lock().unwrap().admit_attempts.is_empty(),
+                "a compile nobody waited for reached the worker"
+            );
+            assert_eq!(serving.supervisor.inner.lock().reserved_executables(), 0);
         }
 
         #[tokio::test]
@@ -11773,7 +12546,9 @@ pub mod ane_residency {
             } else {
                 assert!(result.is_err());
             }
-            assert_eq!(supervisor.stats().restarts, 1);
+            // The failed request is answered at once; the worker's recovery
+            // finishes on the scheduler.
+            until(|| supervisor.stats().restarts == 1).await;
             drop(supervisor.lease(&worker, "model", shape).await.unwrap());
         }
 
@@ -12002,7 +12777,6 @@ pub mod ane_residency {
             })
             .await
             .unwrap();
-            assert!(!task.is_finished());
             assert_eq!(
                 ledger.lock().unwrap().connects["worker"],
                 1,
@@ -12026,7 +12800,9 @@ pub mod ane_residency {
                     program: AneProgram::Single,
                 }]
                     .state,
-                SlotState::Failed
+                // The worker refused the retry outright: nothing is compiling,
+                // but the reservation stays charged until recovery.
+                SlotState::Rejected
             );
             drop(held);
             assert!(tokio::time::timeout(Duration::from_secs(1), task)
@@ -12034,8 +12810,10 @@ pub mod ane_residency {
                 .unwrap()
                 .unwrap()
                 .is_err());
-            assert_eq!(ledger.lock().unwrap().connects["worker"], 2);
-            assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
+            // The refused request was answered at once; the restart follows
+            // once the held lease drains.
+            until(|| ledger.lock().unwrap().connects["worker"] == 2).await;
+            until(|| supervisor.inner.lock().reserved_executables() == 0).await;
         }
 
         #[tokio::test]
@@ -12108,6 +12886,7 @@ pub mod ane_residency {
                     let exit_gate = ledger.lock().unwrap().exit_gate.clone();
                     let task = tokio::spawn(serve_mock(worker, ledger));
                     Ok(AneWorkerSession {
+                        pid: None,
                         packed: None,
                         stream: host,
                         confirm_exit: Box::pin(async move {

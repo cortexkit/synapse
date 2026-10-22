@@ -7114,11 +7114,15 @@ fn ane_residency_error_to_wire(
     if let AneResidencyError::PermitUnavailable(message) = &error {
         return WireOperationError::from_stable(StableError::queue_full(Some(100)), message);
     }
-    if let AneResidencyError::ShapeCompiling { shape } = &error {
+    if let AneResidencyError::ShapeCompiling {
+        shape,
+        retry_after_ms,
+    } = &error
+    {
         return WireOperationError {
             code: worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING.to_owned(),
             class: ErrorClass::Transient,
-            retry_after_ms: Some(worker_host::ane_residency::ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
+            retry_after_ms: Some(*retry_after_ms),
             safe_to_retry_same_request: true,
             message: error.to_string(),
             details: Some(json!({ "shape": shape })),
@@ -7159,6 +7163,26 @@ fn ane_lane_error_to_wire(
             error.to_string(),
         );
         wire.details = Some(json!({"lane_id": lane, "quarantined": true}));
+        return wire;
+    }
+    if matches!(
+        error,
+        worker_host::ane_residency::AneResidencyError::SchedulerStopped
+    ) {
+        // The compile scheduler stopped: the lane stays closed until the
+        // module restarts, so a retry only helps after that restart.
+        let mut wire =
+            WireOperationError::from_stable(StableError::engine_crashed(None), error.to_string());
+        wire.details = Some(json!({"lane_id": lane, "scheduler_stopped": true}));
+        return wire;
+    }
+    if let worker_host::ane_residency::AneResidencyError::WorkerClosed { worker_id } = &error {
+        // The worker's old process may still own the Neural Engine, so it
+        // stays closed until the module restarts; waiting cannot help.
+        let mut wire =
+            WireOperationError::from_stable(StableError::engine_crashed(None), error.to_string());
+        wire.details =
+            Some(json!({"lane_id": lane, "worker_id": worker_id, "worker_closed": true}));
         return wire;
     }
     let mut wire = ane_residency_error_to_wire(error);
@@ -19420,6 +19444,7 @@ mod tests {
                     }
                 });
                 Ok(AneWorkerSession {
+                    pid: None,
                     stream: host,
                     packed: Some(synapse_core::PackedCapability::tight256()),
                     confirm_exit: Box::pin(async move {
@@ -21105,6 +21130,19 @@ mod tests {
             )))
             .is_err(),
             "an unconfigured unit test must fail before resolving a production lock path"
+        );
+    }
+
+    #[test]
+    fn stopped_ane_scheduler_maps_to_engine_crashed_with_the_lane_id() {
+        let wire = ane_lane_error_to_wire(
+            worker_host::ane_residency::AneResidencyError::SchedulerStopped,
+            "lane-a",
+        );
+        assert_eq!(wire.code, "engine_crashed");
+        assert_eq!(
+            wire.details,
+            Some(json!({"lane_id": "lane-a", "scheduler_stopped": true}))
         );
     }
 

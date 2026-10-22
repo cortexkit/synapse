@@ -55,9 +55,21 @@ pub(super) async fn scope<F: Future>(context: Option<Context>, future: F) -> F::
     }
 }
 
-pub(super) fn queue(ticket: u64, model: &str, shape: usize) {
-    let _ = TRACE.try_with(|context| context.ticket.store(ticket, Ordering::Relaxed));
-    event("queue_entry", model, shape);
+/// Records `name` for `context`, the trace of the request it belongs to; the
+/// compile scheduler emits events on behalf of requests this way.
+pub(super) fn event_in(
+    context: &Option<Context>,
+    name: &str,
+    model: &str,
+    shape: usize,
+    ticket: Option<u64>,
+) {
+    if let Some(context) = context {
+        if let Some(ticket) = ticket {
+            context.ticket.store(ticket, Ordering::Relaxed);
+        }
+        TRACE.sync_scope(context.clone(), || event(name, model, shape));
+    }
 }
 
 pub(super) fn event(name: &str, model: &str, shape: usize) {
