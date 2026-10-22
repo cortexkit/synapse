@@ -1,0 +1,165 @@
+name: Portable Rust gates
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+        required: true
+      runner:
+        type: string
+        required: true
+      partitions:
+        type: string
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  LLAMA_BUILD_GATE_BUDGET_SECONDS: '900'
+  LLAMA_BUILD_EVIDENCE_CONTRACT: nonmac-build-gates-v1
+  # Explicit portable production crates: Metal/CUDA-only engines and heavy
+  # benchmark workspaces cannot build on hosted CPU runners.
+  SYNAPSE_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
+
+jobs:
+  clippy:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: synapse
+      - uses: ./synapse/.github/actions/ci-rust
+        with:
+          lane: clippy
+      - name: fmt
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Enumerate only our members: cargo fmt --all can follow path
+          # dependencies outside this checkout. jq is not installed on Windows.
+          members=$(cargo tree --workspace --depth 0 --prefix none | awk 'NF { print $1 }' | sort -u)
+          packages=()
+          while IFS= read -r member; do
+            if [[ -n "$member" ]]; then
+              packages+=(-p "$member")
+            fi
+          done <<< "$members"
+          if (( ${#packages[@]} == 0 )); then
+            echo "error: cargo tree returned an empty workspace member list; refusing vacuous fmt check" >&2
+            exit 1
+          fi
+          echo "Formatting $((${#packages[@]} / 2)) workspace members"
+          cargo fmt --check "${packages[@]}"
+      - name: clippy
+        working-directory: synapse
+        shell: bash
+        run: |
+          crates="$SYNAPSE_CRATES"
+          cargo clippy --locked $crates --all-targets -- -D warnings
+
+  nextest:
+    name: nextest (${{ matrix.partition }})
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ${{ fromJSON(inputs.partitions) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: synapse
+      - uses: ./synapse/.github/actions/ci-rust
+        with:
+          lane: nextest
+          nextest: 'true'
+          # All shards restore the same compiled outputs; only the first saves.
+          save-cache: ${{ startsWith(matrix.partition, '1/') }}
+      - name: nextest
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates="$SYNAPSE_CRATES"
+          profile=""
+          # Windows C++ dependencies must agree with Rust's release CRT.
+          if [ "${{ inputs.platform }}" = "windows" ]; then profile="--release"; fi
+          cargo nextest run --locked $crates $profile --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
+
+  llama:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: synapse
+      - uses: ./synapse/.github/actions/ci-rust
+        with:
+          lane: llama-cpu
+      - name: Linux llama CPU build gate
+        if: inputs.platform == 'linux'
+        working-directory: synapse
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build-gates
+          command='cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
+          log='build-gates/linux-x86_64-gnu-llama-cpu.output'
+          set +e
+          bash -c "$command" 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          set -e
+          binary='target/release/ck-synapse-worker-llama'
+          digest='unavailable'
+          if [ -f "$binary" ]; then digest=$(sha256sum "$binary" | cut -d ' ' -f1); fi
+          {
+            echo "target_triple=x86_64-unknown-linux-gnu"
+            echo "command=$command"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "machine_image=${ImageOS:-unknown}"
+            echo "budget_seconds=$LLAMA_BUILD_GATE_BUDGET_SECONDS"
+            echo "evidence_contract=$LLAMA_BUILD_EVIDENCE_CONTRACT"
+            echo "binary=$binary"
+            echo "sha256=$digest"
+            echo "execution_status=$([ "$status" -eq 0 ] && echo executed_successful || echo failed)"
+            echo "successful_output=$log"
+            echo "readiness_matrix_trigger=${{ github.event_name }}"
+            echo "skipped_is_not_pass=true"
+          } > build-gates/linux-x86_64-gnu-llama-cpu.txt
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+      - name: Windows llama CPU build gate
+        if: inputs.platform == 'windows'
+        working-directory: synapse
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-gates | Out-Null
+          $command = 'cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
+          $log = 'build-gates/windows-x86_64-msvc-llama-cpu.output'
+          & cargo build -p synapse-worker-llama --no-default-features --features cpu --release 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          $binary = 'target/release/ck-synapse-worker-llama.exe'
+          $digest = if (Test-Path $binary) { (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'unavailable' }
+          $execution = if ($status -eq 0) { 'executed_successful' } else { 'failed' }
+          @"
+          target_triple=x86_64-pc-windows-msvc
+          command=$command
+          rustc=$(rustc --version)
+          cargo=$(cargo --version)
+          machine_image=$env:ImageOS
+          budget_seconds=$env:LLAMA_BUILD_GATE_BUDGET_SECONDS
+          evidence_contract=$env:LLAMA_BUILD_EVIDENCE_CONTRACT
+          binary=$binary
+          sha256=$digest
+          execution_status=$execution
+          successful_output=$log
+          readiness_matrix_trigger=$env:GITHUB_EVENT_NAME
+          skipped_is_not_pass=true
+          "@ | Set-Content build-gates/windows-x86_64-msvc-llama-cpu.txt
+          if ($status -ne 0) { exit $status }
+      - name: Retain llama build-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-build-gates-${{ inputs.platform }}-${{ github.run_id }}
+          path: synapse/build-gates
+          if-no-files-found: ignore

@@ -13,7 +13,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
-STEPS = WORKFLOW["jobs"]["test"]["steps"]
+PORTABLE = yaml.safe_load((ROOT / ".github/workflows/portable.yml").read_text())
+SETUP = yaml.safe_load((ROOT / ".github/actions/ci-rust/action.yml").read_text())
+GUARDS = WORKFLOW["jobs"]["test"]["steps"]
+STEPS = GUARDS + [s for job in PORTABLE["jobs"].values() for s in job["steps"]]
 E2E_STEPS = WORKFLOW["jobs"]["e2e"]["steps"]
 
 
@@ -49,8 +52,10 @@ class E2eOutputTests(unittest.TestCase):
         self.env.pop("FAKE_SKIP", None)
         self.env.pop("FAKE_STATUS", None)
 
-    def run_step(self, name, platform="linux"):
-        script = step(name)["run"].replace("${{ matrix.name }}", platform)
+    def run_step(self, name, platform="linux", partition="1/1"):
+        script = (step(name)["run"].replace("${{ matrix.name }}", platform)
+                  .replace("${{ inputs.platform }}", platform)
+                  .replace("${{ matrix.partition }}", partition))
         return subprocess.run(
             ["bash", "-e", "-o", "pipefail", "-c", script],
             cwd=self.root,
@@ -63,20 +68,26 @@ class E2eOutputTests(unittest.TestCase):
         for platform in ("linux", "windows"):
             with self.subTest(platform=platform):
                 (self.root / "calls.jsonl").unlink(missing_ok=True)
-                run = self.run_step("nextest", platform)
-                self.assertEqual(run.returncode, 0, run.stderr)
-                self.assertIn("skipping optional worker checkpoint", run.stdout)
+                partitions = json.loads(WORKFLOW["jobs"][f"{platform}-checks"]["with"]["partitions"])
+                for partition in partitions:
+                    run = self.run_step("nextest", platform, partition)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertIn("skipping optional worker checkpoint", run.stdout)
                 e2e = self.run_step("skeleton e2e", platform)
                 self.assertEqual(e2e.returncode, 0, e2e.stderr)
                 guard = self.run_step("Assert no silently-skipped e2e", platform)
                 self.assertEqual(guard.returncode, 0, guard.stderr)
                 calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
-                self.assertEqual(len(calls), 2, "the guard must not rerun tests")
+                self.assertEqual(len(calls), len(partitions) + 1, "the guard must not rerun tests")
                 self.assertEqual([call[call.index("-E") + 1] for call in calls],
-                                 ["not binary(skeleton_e2e)", "binary(skeleton_e2e)"])
+                                 ["not binary(skeleton_e2e)"] * len(partitions) + ["binary(skeleton_e2e)"])
+                self.assertEqual([call[call.index("--partition") + 1] for call in calls[:-1]],
+                                 [f"count:{partition}" for partition in partitions])
+                for call in calls[:-1]:
+                    self.assertEqual(call[call.index("--retries") + 1], "0")
                 for call in calls:
                     self.assertEqual("--release" in call, platform == "windows")
-                self.assertIn("--no-capture", calls[1], "whole-process fixtures must remain serial")
+                self.assertIn("--no-capture", calls[-1], "whole-process fixtures must remain serial")
                 for call in calls:
                     self.assertIn("--locked", call)
 
@@ -101,7 +112,7 @@ class E2eOutputTests(unittest.TestCase):
         cache = step("Restore parity Rust cache")
         self.assertLess(STEPS.index(cache), STEPS.index(step("Parity manifest and evaluator tests")))
         self.assertEqual(cache["with"]["workspaces"], "synapse/bench/parity -> target")
-        root_cache = next(s for s in STEPS if s.get("uses") == "Swatinem/rust-cache@v2"
+        root_cache = next(s for s in SETUP["runs"]["steps"] if s.get("uses") == "Swatinem/rust-cache@v2"
                           and s["with"].get("workspaces") == "synapse")
         self.assertNotEqual(cache["with"]["prefix-key"], root_cache["with"]["prefix-key"])
 
