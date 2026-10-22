@@ -3935,6 +3935,11 @@ pub mod ane_residency {
         /// stopped). Direct-ANE lanes stay closed until the module restarts.
         #[error("engine_crashed: the direct-ANE compile scheduler stopped; the lane is closed until the module restarts")]
         SchedulerStopped,
+        /// The worker's old process could not be confirmed to have exited, so
+        /// it may still own the Neural Engine: the worker stays closed until
+        /// the module restarts, and its requests are refused at once.
+        #[error("engine_crashed: direct-ANE worker {worker_id} could not confirm that its old process exited; it is closed until the module restarts")]
+        WorkerClosed { worker_id: String },
         /// A compile, eviction or recovery task panicked or was cancelled.
         #[error("direct-ANE worker operation failed: {0}")]
         Panicked(String),
@@ -5029,18 +5034,27 @@ pub mod ane_residency {
         /// Recover a transport-faulted owner after the inference task releases its
         /// lease. The scheduler drains the worker's leases and in-flight compile
         /// (bounded by the admission wait timeout), restarts it, and answers
-        /// whether the replacement came up.
-        pub async fn recover(&self, worker: &Arc<dyn AneShapeWorker>) -> bool {
+        /// whether the replacement came up, or why not.
+        pub async fn recover(
+            &self,
+            worker: &Arc<dyn AneShapeWorker>,
+        ) -> Result<(), AneResidencyError> {
             self.recover_at_generation(worker, worker.generation())
                 .await
         }
 
         /// Ignore faults from an owner generation that has already been replaced.
+        ///
+        /// The wait is bounded end to end: the drain (admission wait timeout),
+        /// the scheduler's wait for the old process's exit
+        /// (`EXIT_CONFIRMATION_GIVE_UP`, after which it answers that the worker
+        /// is closed), and the replacement's start and model restore (another
+        /// admission wait timeout).
         pub async fn recover_at_generation(
             &self,
             worker: &Arc<dyn AneShapeWorker>,
             generation: u64,
-        ) -> bool {
+        ) -> Result<(), AneResidencyError> {
             let (reply, answer) = tokio::sync::oneshot::channel();
             if self
                 .inner
@@ -5051,9 +5065,17 @@ pub mod ane_residency {
                 })
                 .is_err()
             {
-                return false;
+                return Err(AneResidencyError::SchedulerStopped);
             }
-            answer.await.unwrap_or(false)
+            let bound = self.inner.wait_timeout * 2 + scheduler::EXIT_CONFIRMATION_GIVE_UP;
+            match tokio::time::timeout(bound, answer).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(_)) => Err(AneResidencyError::SchedulerStopped),
+                Err(_) => Err(AneResidencyError::Channel(format!(
+                    "worker recovery did not finish within {} s",
+                    bound.as_secs()
+                ))),
+            }
         }
 
         /// Stop new leases and retain reservations until the owner has confirmed
@@ -5618,6 +5640,7 @@ pub mod ane_residency {
         }
         .recover(worker)
         .await
+        .is_ok()
     }
 
     /// A held lease on one resident shape; dropping it releases the lease.
@@ -7286,7 +7309,8 @@ pub mod ane_residency {
                         // Recovery waits for leases to drain. Release qualification's
                         // own lease before joining the generation-scoped recovery.
                         drop(lease);
-                        self.supervisor
+                        let _ = self
+                            .supervisor
                             .recover_at_generation(&worker, fault_generation)
                             .await;
                         return Err(error);
@@ -7349,12 +7373,19 @@ pub mod ane_residency {
                 if let Some(retry_after_ms) = serving.channel.cooldown_remaining() {
                     return Err(AneResidencyError::Quarantined { retry_after_ms });
                 }
-                if serving.channel.faulted.load(Ordering::Acquire)
-                    && !serving.supervisor.recover(&worker).await
-                {
-                    return Err(AneResidencyError::Channel(
-                        "worker recovery could not confirm exit".into(),
-                    ));
+                if serving.channel.faulted.load(Ordering::Acquire) {
+                    match serving.supervisor.recover(&worker).await {
+                        Ok(()) => {}
+                        Err(
+                            error @ (AneResidencyError::WorkerClosed { .. }
+                            | AneResidencyError::SchedulerStopped),
+                        ) => return Err(error),
+                        Err(_) => {
+                            return Err(AneResidencyError::Channel(
+                                "worker recovery could not confirm exit".into(),
+                            ))
+                        }
+                    }
                 }
                 let fault_generation = Arc::new(AtomicU64::new(worker.generation()));
                 let result = if packing && !rerank {
@@ -7388,7 +7419,7 @@ pub mod ane_residency {
                         .await
                 };
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
-                    serving
+                    let _ = serving
                         .supervisor
                         .recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))
                         .await;
@@ -11798,13 +11829,12 @@ pub mod ane_residency {
             let serving = serving_fixture(&ledger).await;
             let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
             let fault_generation = worker.generation();
-            assert!(serving.supervisor.recover(&worker).await);
-            assert!(
-                serving
-                    .supervisor
-                    .recover_at_generation(&worker, fault_generation)
-                    .await
-            );
+            assert!(serving.supervisor.recover(&worker).await.is_ok());
+            assert!(serving
+                .supervisor
+                .recover_at_generation(&worker, fault_generation)
+                .await
+                .is_ok());
             assert_eq!(serving.supervisor.stats().restarts, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
             serving.retire().await.unwrap();

@@ -406,7 +406,7 @@ async fn recovering_head_does_not_block_other_workers() {
     let recovery = tokio::spawn({
         let supervisor = supervisor.clone();
         let worker = recovering_dyn.clone();
-        async move { supervisor.recover(&worker).await }
+        async move { supervisor.recover(&worker).await.is_ok() }
     });
     restarting.notified().await;
     let other_answer = tokio::time::timeout(Duration::from_secs(120), other_answer)
@@ -415,7 +415,10 @@ async fn recovering_head_does_not_block_other_workers() {
         .unwrap();
     assert!(other_answer.ok(), "{other_answer:?}");
     release_restart.notify_one();
-    assert!(recovery.await.unwrap());
+    // The restart was held past the scheduler's give-up on the old process's
+    // exit, so its caller was answered with an error then; the restart still
+    // completes and the worker rejoins.
+    assert!(!recovery.await.unwrap());
     assert!(head_answer.await.unwrap().ok());
     assert!(first_answer.await.unwrap().ok());
 }
@@ -429,7 +432,7 @@ async fn failed_restart_does_not_leave_the_worker_recovering() {
     let worker = fake_handle(&compiler, "worker");
     worker.fail_next_restart.store(true, Ordering::SeqCst);
     let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
-    assert!(!supervisor.recover(&worker_dyn).await);
+    assert!(supervisor.recover(&worker_dyn).await.is_err());
     assert!(
         !supervisor.inner.lock().recovering.contains("worker"),
         "a failed restart left the worker recovering for ever"
@@ -438,6 +441,7 @@ async fn failed_restart_does_not_leave_the_worker_recovering() {
         tokio::time::timeout(Duration::from_secs(5), supervisor.recover(&worker_dyn))
             .await
             .expect("a second recovery could not lead")
+            .is_ok()
     );
     assert_eq!(worker.restarts.load(Ordering::SeqCst), 1);
 }
@@ -743,8 +747,16 @@ async fn confirmed_exit_with_failed_replacement_leaves_no_ghost_slots() {
     drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
     drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 512).await.unwrap());
     assert_eq!(supervisor.inner.lock().reserved_executables(), 44);
+    // One slot is being evicted when the process exits: it goes too.
+    supervisor
+        .inner
+        .lock()
+        .slots
+        .get_mut(&queue_key("worker", QUEUE_GTE, 512))
+        .unwrap()
+        .state = SlotState::Evicting;
     worker.fail_next_restart.store(true, Ordering::SeqCst);
-    assert!(!supervisor.recover(&worker_dyn).await);
+    assert!(supervisor.recover(&worker_dyn).await.is_err());
     let state = supervisor.inner.lock();
     assert!(
         !state.slots.keys().any(|key| key.worker_id == "worker"),
@@ -996,7 +1008,7 @@ async fn recovery_start_elects_the_next_head_at_once() {
     let recovery = tokio::spawn({
         let supervisor = supervisor.clone();
         let blocked = blocked.clone();
-        async move { supervisor.recover(&blocked).await }
+        async move { supervisor.recover(&blocked).await.is_ok() }
     });
     let next = tokio::time::timeout(Duration::from_secs(30), next)
         .await
@@ -1027,7 +1039,7 @@ async fn recovered_entries_rejoin_behind_accepted_bounds() {
     let recovery = tokio::spawn({
         let supervisor = supervisor.clone();
         let worker = recovering_dyn.clone();
-        async move { supervisor.recover(&worker).await }
+        async move { supervisor.recover(&worker).await.is_ok() }
     });
     restarting.notified().await;
     // Ready in about 49.9 s without GTE@128 ahead, 54.5 s with it; its bound
@@ -1120,4 +1132,154 @@ async fn stopped_scheduler_fails_waiting_and_new_requests_promptly() {
         fresh.err()
     );
     drop(inference);
+}
+
+/// A recovery whose restart is refused because the worker is being retired
+/// has not stopped the old process, so nothing may be refunded yet: the
+/// worker's slots stay charged until the retirement confirms the exit.
+#[tokio::test(start_paused = true)]
+async fn retirement_refusing_a_recovery_keeps_the_live_process_charged() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 512).await.unwrap());
+    worker.retired.store(true, Ordering::SeqCst);
+    let refused = supervisor.recover(&worker_dyn).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        supervisor.inner.lock().reserved_executables(),
+        44,
+        "a refused restart refunded a process whose exit nobody confirmed"
+    );
+    supervisor
+        .retire(&worker_dyn, async { Ok(()) })
+        .await
+        .unwrap();
+    let state = supervisor.inner.lock();
+    assert!(!state.slots.keys().any(|key| key.worker_id == "worker"));
+    assert_eq!(state.reserved_executables(), 0, "the confirmed retirement refunds");
+}
+
+/// A restart that panics after the old process's exit was confirmed (while
+/// the replacement starts) still delivers that confirmation: the old
+/// process's slots are released instead of staying charged as ghosts.
+#[tokio::test(start_paused = true)]
+async fn replacement_panic_does_not_lose_a_confirmed_exit() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+    worker.panic_restart_after_exit.store(true, Ordering::SeqCst);
+    let outcome = supervisor.recover(&worker_dyn).await;
+    assert!(
+        matches!(outcome, Err(AneResidencyError::Panicked(_))),
+        "{outcome:?}"
+    );
+    let state = supervisor.inner.lock();
+    assert!(
+        !state.slots.keys().any(|key| key.worker_id == "worker"),
+        "a confirmed exit was lost with the restart's panic"
+    );
+    assert_eq!(state.reserved_executables(), 0);
+    assert!(!state.recovering.contains("worker"), "the worker can be recovered again");
+}
+
+/// A restart that panics before the old process's exit is confirmed leaves
+/// that process's ownership unknown, so its failed compile keeps holding the
+/// gate for the same grace as a restart that never returns, not less.
+#[tokio::test(start_paused = true)]
+async fn recovery_panic_before_exit_keeps_the_gate_for_the_grace() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    broken.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    broken.panic_restart_before_exit.store(true, Ordering::SeqCst);
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    let failed = ask_at(&supervisor, &compiler, &broken_dyn, QUEUE_GTE, 128, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!failed.ok(), "{failed:?}");
+    let failed_at = failed.at;
+    let other = fake_worker(&compiler, "other");
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, failed_at + 1.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(failed_at + 30.0)).await;
+    assert!(
+        compiler.compiles_of("other").is_empty(),
+        "a panicked recovery released the gate before the grace ended"
+    );
+    let answer = tokio::time::timeout(Duration::from_secs(60), answer)
+        .await
+        .expect("the gate was held past the grace")
+        .unwrap();
+    assert!(answer.ok(), "{answer:?}");
+    assert!(supervisor.inner.lock().recovering.contains("broken"));
+}
+
+/// When the old process's exit is never confirmed, a caller waiting on the
+/// worker's recovery is answered when the scheduler gives up, not left
+/// waiting for a restart that may never return.
+#[tokio::test(start_paused = true)]
+async fn recover_caller_is_answered_when_the_scheduler_gives_up() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    drop(supervisor.lease(&broken_dyn, QUEUE_GTE, 128).await.unwrap());
+    broken.exit_never_confirmed.store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(
+        scheduler::EXIT_CONFIRMATION_GIVE_UP + Duration::from_secs(5),
+        supervisor.recover(&broken_dyn),
+    )
+    .await
+    .expect("a recover() caller was not answered when the scheduler gave up");
+    assert!(
+        matches!(&outcome, Err(AneResidencyError::Channel(message)) if message.contains("not confirmed within 35 s")),
+        "{outcome:?}"
+    );
+    let again = tokio::time::timeout(Duration::from_secs(1), supervisor.recover(&broken_dyn))
+        .await
+        .expect("a later recover() caller waited on the abandoned restart");
+    assert!(again.is_err(), "{again:?}");
+}
+
+/// A restart that ends without confirming the old process's exit closes the
+/// worker until the module restarts: its recovery caller and later requests
+/// are refused at once with `WorkerClosed` instead of waiting out the
+/// admission bound, and it is not restarted again.
+#[tokio::test(start_paused = true)]
+async fn closed_worker_refuses_recovery_and_requests_at_once() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    drop(supervisor.lease(&broken_dyn, QUEUE_GTE, 128).await.unwrap());
+    broken.exit_unconfirmed.store(true, Ordering::SeqCst);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), supervisor.recover(&broken_dyn))
+        .await
+        .expect("a recover() caller waited after the restart ended");
+    assert!(
+        matches!(&outcome, Err(AneResidencyError::WorkerClosed { worker_id }) if worker_id == "broken"),
+        "{outcome:?}"
+    );
+    let refused = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.lease(&broken_dyn, QUEUE_GTE, 512),
+    )
+    .await
+    .expect("a request for a closed worker waited");
+    assert!(
+        matches!(refused, Err(AneResidencyError::WorkerClosed { .. })),
+        "{:?}",
+        refused.err()
+    );
+    let generation = broken.generation();
+    assert!(matches!(
+        supervisor.recover(&broken_dyn).await,
+        Err(AneResidencyError::WorkerClosed { .. })
+    ));
+    assert_eq!(broken.generation(), generation, "a closed worker was restarted again");
+    assert_eq!(supervisor.inner.lock().reserved_executables(), 22, "its slot stays charged");
 }

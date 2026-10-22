@@ -136,6 +136,14 @@ struct FakeCompileWorker {
     restart_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     replacement_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     exit_never_confirmed: std::sync::atomic::AtomicBool,
+    /// The worker is being retired: like the worker channel, a restart then
+    /// refuses before it stops the old process, so nothing confirms its exit.
+    retired: std::sync::atomic::AtomicBool,
+    /// The next restart panics before the old process's exit is confirmed.
+    panic_restart_before_exit: std::sync::atomic::AtomicBool,
+    /// The next restart panics after the old process's exit is confirmed,
+    /// while the replacement starts.
+    panic_restart_after_exit: std::sync::atomic::AtomicBool,
     restarts: AtomicU64,
     evictions: Mutex<Vec<(String, usize)>>,
 }
@@ -233,7 +241,13 @@ impl AneShapeWorker for FakeCompileWorker {
                 started.notify_one();
                 release.notified().await;
             }
+            if self.retired.load(Ordering::SeqCst) {
+                return Err(AneResidencyError::Channel("worker is retired".into()));
+            }
             self.generation.fetch_add(1, Ordering::SeqCst);
+            if self.panic_restart_before_exit.swap(false, Ordering::SeqCst) {
+                panic!("injected panic before the old process's exit is confirmed");
+            }
             if self.exit_never_confirmed.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -241,6 +255,9 @@ impl AneShapeWorker for FakeCompileWorker {
                 return Err(AneResidencyError::Channel("old owner exit unconfirmed".into()));
             }
             let _ = exited.send(());
+            if self.panic_restart_after_exit.swap(false, Ordering::SeqCst) {
+                panic!("injected panic while the replacement starts");
+            }
             let gate = self.replacement_gate.lock().unwrap().take();
             if let Some((started, release)) = gate {
                 started.notify_one();
@@ -272,6 +289,9 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         restart_gate: Mutex::new(None),
         replacement_gate: Mutex::new(None),
         exit_never_confirmed: Default::default(),
+        retired: Default::default(),
+        panic_restart_before_exit: Default::default(),
+        panic_restart_after_exit: Default::default(),
         restarts: AtomicU64::new(0),
         evictions: Mutex::new(Vec::new()),
     })

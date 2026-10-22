@@ -7176,6 +7176,15 @@ fn ane_lane_error_to_wire(
         wire.details = Some(json!({"lane_id": lane, "scheduler_stopped": true}));
         return wire;
     }
+    if let worker_host::ane_residency::AneResidencyError::WorkerClosed { worker_id } = &error {
+        // The worker's old process may still own the Neural Engine, so it
+        // stays closed until the module restarts; waiting cannot help.
+        let mut wire =
+            WireOperationError::from_stable(StableError::engine_crashed(None), error.to_string());
+        wire.details =
+            Some(json!({"lane_id": lane, "worker_id": worker_id, "worker_closed": true}));
+        return wire;
+    }
     let mut wire = ane_residency_error_to_wire(error);
     if wire.code == worker_host::ane_residency::ERR_ANE_SHAPE_COMPILING {
         if let Some(Value::Object(details)) = wire.details.as_mut() {

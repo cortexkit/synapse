@@ -13,7 +13,7 @@
 //! it; only this task changes queue entries, waiters, promises and slot
 //! lifecycles. Requests only add and drop leases.
 use super::*;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -78,7 +78,7 @@ pub(super) enum Msg {
     Recover {
         worker: Arc<dyn AneShapeWorker>,
         generation: u64,
-        reply: oneshot::Sender<bool>,
+        reply: RecoverReply,
     },
     Retire {
         worker: Arc<dyn AneShapeWorker>,
@@ -145,6 +145,7 @@ pub(super) enum AnswerKind {
     DeadlineExceeded,
     Resources(String),
     Channel(String),
+    WorkerClosed(String),
 }
 
 impl AnswerKind {
@@ -163,6 +164,7 @@ impl AnswerKind {
                 retry_after_ms: ANE_RESOURCES_RETRY_AFTER_MS,
             },
             Self::Channel(msg) => AneResidencyError::Channel(msg),
+            Self::WorkerClosed(worker_id) => worker_closed(&worker_id),
         }
     }
 
@@ -177,6 +179,7 @@ impl AnswerKind {
             },
             AneResidencyError::DeadlineExceeded => Self::DeadlineExceeded,
             AneResidencyError::ResourcesExhausted { msg, .. } => Self::Resources(msg.clone()),
+            AneResidencyError::WorkerClosed { worker_id } => Self::WorkerClosed(worker_id.clone()),
             other => Self::Channel(other.to_string()),
         }
     }
@@ -289,15 +292,21 @@ enum OpDone {
     Recover(Result<(), AneResidencyError>),
 }
 
+pub(super) type RecoverReply = oneshot::Sender<Result<(), AneResidencyError>>;
+
 struct Recovery {
     worker: Arc<dyn AneShapeWorker>,
     generation: u64,
-    replies: Vec<oneshot::Sender<bool>>,
+    replies: Vec<RecoverReply>,
     drain_deadline: tokio::time::Instant,
     started: bool,
     exit_deadline: Option<tokio::time::Instant>,
     exit_confirmed: bool,
     gave_up: bool,
+    /// The restart operation has ended without confirming the old process's
+    /// exit. The entry stays only so that the compile gate is still held
+    /// until `exit_deadline`, as for a restart that is still running.
+    finished: bool,
 }
 
 struct Retirement {
@@ -312,6 +321,7 @@ struct Effects {
     leases: Vec<(oneshot::Sender<Answer>, Answer)>,
     prepares: Vec<(oneshot::Sender<Prepared>, Prepared)>,
     bools: Vec<(oneshot::Sender<bool>, bool)>,
+    recoveries: Vec<(RecoverReply, Result<(), AneResidencyError>)>,
     units: Vec<oneshot::Sender<()>>,
     progress: bool,
 }
@@ -328,6 +338,11 @@ pub(super) struct Scheduler {
     op_guards: BTreeMap<tokio::task::Id, RequestAbandonment>,
     recoveries: BTreeMap<String, Recovery>,
     retirements: BTreeMap<String, Retirement>,
+    /// Workers closed until the module restarts: a restart ended, or the
+    /// scheduler gave up waiting, without the old process's exit confirmed,
+    /// so nobody knows whether it still owns the Neural Engine. Requests for
+    /// them are refused at once.
+    closed: BTreeSet<String>,
     answered: VecDeque<(u64, AnswerKind)>,
 }
 
@@ -362,6 +377,7 @@ impl Scheduler {
                 op_guards: BTreeMap::new(),
                 recoveries: BTreeMap::new(),
                 retirements: BTreeMap::new(),
+                closed: BTreeSet::new(),
                 answered: VecDeque::new(),
             },
             tx,
@@ -500,6 +516,18 @@ impl Scheduler {
                             .slots
                             .retain(|_, slot| slot.worker.worker_id() != worker_id);
                         state.recovering.remove(&worker_id);
+                        self.closed.remove(&worker_id);
+                        // A recovery that ended without confirming the exit
+                        // only held the gate; the retirement confirmed it.
+                        if self
+                            .recoveries
+                            .get(&worker_id)
+                            .is_some_and(|recovery| recovery.finished)
+                        {
+                            self.recoveries.remove(&worker_id);
+                        } else if let Some(recovery) = self.recoveries.get_mut(&worker_id) {
+                            recovery.exit_confirmed = true;
+                        }
                     } else {
                         give_up_gate(&mut state, &worker_id, None);
                     }
@@ -629,6 +657,9 @@ impl Scheduler {
         }
         for (sender, value) in effects.bools {
             let _ = sender.send(value);
+        }
+        for (sender, outcome) in effects.recoveries {
+            let _ = sender.send(outcome);
         }
         for sender in effects.units {
             let _ = sender.send(());
@@ -854,6 +885,12 @@ impl Scheduler {
                     Answer::Failed(AneResidencyError::Channel("worker is retired".into())),
                     effects,
                 );
+                continue;
+            }
+            if self.closed.contains(worker.worker_id()) {
+                // Closed until the module restarts: waiting cannot help.
+                let error = worker_closed(worker.worker_id());
+                self.answer(state, id, Answer::Failed(error), effects);
                 continue;
             }
             if state.recovering.contains(worker.worker_id()) {
@@ -1358,20 +1395,41 @@ impl Scheduler {
         state: &mut State,
         worker: &Arc<dyn AneShapeWorker>,
         generation: u64,
-        reply: Option<oneshot::Sender<bool>>,
+        reply: Option<RecoverReply>,
         now: tokio::time::Instant,
         effects: &mut Effects,
     ) {
         let id = worker.worker_id().to_owned();
         if state.retired.contains(&id) {
             if let Some(reply) = reply {
-                effects.bools.push((reply, false));
+                effects.recoveries.push((
+                    reply,
+                    Err(AneResidencyError::Channel("worker is retired".into())),
+                ));
             }
             return;
         }
         if worker.generation() != generation {
             if let Some(reply) = reply {
-                effects.bools.push((reply, true));
+                effects.recoveries.push((reply, Ok(())));
+            }
+            return;
+        }
+        // A closed worker cannot be restarted: its old process may still own
+        // the Neural Engine. A recovery that ended without confirming the exit
+        // but still holds the gate counts as closed too.
+        let (finished, gave_up) = self.recoveries.get(&id).map_or((false, false), |recovery| {
+            (recovery.finished, recovery.gave_up)
+        });
+        if self.closed.contains(&id) || finished {
+            if let Some(reply) = reply {
+                effects.recoveries.push((reply, Err(worker_closed(&id))));
+            }
+            return;
+        }
+        if gave_up {
+            if let Some(reply) = reply {
+                effects.recoveries.push((reply, Err(exit_not_confirmed())));
             }
             return;
         }
@@ -1389,6 +1447,7 @@ impl Scheduler {
             exit_deadline: None,
             exit_confirmed: false,
             gave_up: false,
+            finished: false,
         });
         if let Some(reply) = reply {
             recovery.replies.push(reply);
@@ -1424,7 +1483,7 @@ impl Scheduler {
                     state.rejoin(&id, now);
                     state.recovering.remove(&id);
                     for reply in recovery.replies {
-                        effects.bools.push((reply, true));
+                        effects.recoveries.push((reply, Ok(())));
                     }
                     effects.progress = true;
                     continue;
@@ -1444,6 +1503,16 @@ impl Scheduler {
                 recovery.gave_up = true;
                 let pid = recovery.worker.process_id();
                 give_up_gate(state, &id, pid);
+                // Whoever waits for this recovery is answered now rather than
+                // when (or if) the restart operation returns. The worker stays
+                // closed while that operation runs; it reopens only if the
+                // operation still confirms the old process's exit.
+                for reply in recovery.replies.drain(..) {
+                    effects.recoveries.push((reply, Err(exit_not_confirmed())));
+                }
+                if recovery.finished {
+                    self.recoveries.remove(&id);
+                }
                 effects.progress = true;
             }
         }
@@ -1465,8 +1534,19 @@ impl Scheduler {
                     });
                 }
             };
-            let (result, ()) = tokio::join!(worker.restart_with_exit_signal(exited), forward);
-            OpDone::Recover(result)
+            // The restart runs as its own task so that a panic in it (for
+            // example while the replacement starts) cannot drop the
+            // forwarder above before it has reported an exit that was already
+            // confirmed. Its guard aborts it if this operation is aborted.
+            let restart = AbortOnDrop(tokio::spawn(async move {
+                worker.restart_with_exit_signal(exited).await
+            }));
+            let (result, ()) = tokio::join!(restart.join(), forward);
+            OpDone::Recover(result.unwrap_or_else(|error| {
+                Err(AneResidencyError::Panicked(format!(
+                    "worker recovery task failed: {error}"
+                )))
+            }))
         };
         let task = self.ops.spawn(operation).id();
         self.op_kinds.insert(task, OpKind::Recover { worker_id });
@@ -2001,47 +2081,111 @@ impl Scheduler {
         now: tokio::time::Instant,
         effects: &mut Effects,
     ) {
-        let Some(recovery) = self.recoveries.remove(worker_id) else {
+        let Some(mut recovery) = self.recoveries.remove(worker_id) else {
             return;
         };
-        let succeeded = result.is_ok();
-        match result {
+        let outcome = match result {
             Ok(()) => {
                 state
                     .slots
                     .retain(|_, slot| slot.worker.worker_id() != worker_id);
                 state.rejoin(worker_id, now);
                 state.recovering.remove(worker_id);
+                self.closed.remove(worker_id);
                 state.stats.restarts += 1;
+                Ok(())
+            }
+            // Only the old process's confirmed exit lets its slots go. The
+            // error alone says nothing about it: a restart refused because the
+            // worker is being retired, or one that panicked, may never have
+            // stopped the old process.
+            Err(error) if recovery.exit_confirmed => {
+                tracing::warn!(target: "worker", worker_id, error = %error, "direct-ANE worker restart failed after the old process exited");
+                // Only the replacement failed. The old process's slots are
+                // gone with it, and a later request can recover the worker.
+                release_exited_worker(state, worker_id);
+                state.rejoin(worker_id, now);
+                state.recovering.remove(worker_id);
+                self.closed.remove(worker_id);
+                Err(error)
             }
             Err(error) => {
-                tracing::warn!(target: "worker", worker_id, error = %error, "direct-ANE worker restart failed");
-                if recovery.exit_confirmed
-                    || !recovery.worker.exit_unconfirmed()
-                        && !matches!(error, AneResidencyError::Panicked(_))
-                {
-                    // The old process exited; only the replacement failed. Its
-                    // slots are gone with it, and the worker can be recovered
-                    // again by a later request.
-                    release_exited_worker(state, worker_id);
-                    state.rejoin(worker_id, now);
-                    state.recovering.remove(worker_id);
-                } else {
-                    // The old process's exit could not be confirmed, so its
-                    // hardware ownership is unknown: the worker stays closed
-                    // with its slots charged, its queued compiles (which can
-                    // never run) are dropped, and only the compile gate is
-                    // released so other workers keep compiling.
-                    state.entries.retain(|key, _| key.worker_id != worker_id);
-                    if !recovery.gave_up {
-                        give_up_gate(state, worker_id, recovery.worker.process_id());
+                tracing::warn!(target: "worker", worker_id, error = %error, "direct-ANE worker restart failed without confirming the old process's exit");
+                // The old process's hardware ownership is unknown: the worker
+                // stays closed with its slots charged, and its queued compiles
+                // (which can never run) are dropped. Its compiling or failed
+                // slots keep holding the gate until `exit_deadline`, exactly
+                // as if the restart were still running, so an early error (or
+                // a panic) cannot release the gate sooner than that rule.
+                state.entries.retain(|key, _| key.worker_id != worker_id);
+                self.closed.insert(worker_id.to_owned());
+                if !recovery.gave_up {
+                    recovery.finished = true;
+                    let replies = std::mem::take(&mut recovery.replies);
+                    self.recoveries.insert(worker_id.to_owned(), recovery);
+                    for reply in replies {
+                        effects
+                            .recoveries
+                            .push((reply, Err(worker_closed(worker_id))));
                     }
+                    return;
                 }
+                Err(worker_closed(worker_id))
             }
-        }
+        };
         for reply in recovery.replies {
-            effects.bools.push((reply, succeeded));
+            let outcome = match &outcome {
+                Ok(()) => Ok(()),
+                Err(error) => Err(reissue(error)),
+            };
+            effects.recoveries.push((reply, outcome));
         }
+    }
+}
+
+/// A copy of a recovery's error for each caller waiting on it (the error
+/// type is not `Clone`, because of its I/O variant).
+fn reissue(error: &AneResidencyError) -> AneResidencyError {
+    match error {
+        AneResidencyError::WorkerClosed { worker_id } => worker_closed(worker_id),
+        AneResidencyError::Panicked(message) => AneResidencyError::Panicked(message.clone()),
+        AneResidencyError::WorkerErr { code, msg } => AneResidencyError::WorkerErr {
+            code: code.clone(),
+            msg: msg.clone(),
+        },
+        other => AneResidencyError::Channel(other.to_string()),
+    }
+}
+
+/// The refusal for a worker closed until the module restarts.
+fn worker_closed(worker_id: &str) -> AneResidencyError {
+    AneResidencyError::WorkerClosed {
+        worker_id: worker_id.to_owned(),
+    }
+}
+
+/// The answer to a recovery whose old process's exit was not confirmed within
+/// `EXIT_CONFIRMATION_GIVE_UP` while its restart is still running.
+fn exit_not_confirmed() -> AneResidencyError {
+    AneResidencyError::Channel(format!(
+        "the old worker process's exit was not confirmed within {} s; the worker stays closed while its restart continues",
+        EXIT_CONFIRMATION_GIVE_UP.as_secs()
+    ))
+}
+
+/// Aborts a spawned task when dropped, so a task spawned by an operation does
+/// not outlive that operation being aborted.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
