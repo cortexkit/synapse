@@ -1897,7 +1897,9 @@ async fn failed_retirement_shutdown_keeps_the_gate_for_the_grace() {
 /// A worker that keeps the production connector (as its channel does) does
 /// not keep the supervisor alive: once the last user drops the supervisor,
 /// it and its scheduler thread end, even after a retirement whose shutdown
-/// failed left the worker's slot charged.
+/// failed left the worker's slot charged. Unix only, like the connector type
+/// the fake worker keeps.
+#[cfg(unix)]
 #[test]
 fn production_connector_does_not_keep_the_supervisor_alive() {
     let supervisor = queue_supervisor();

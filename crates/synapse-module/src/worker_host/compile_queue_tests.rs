@@ -155,7 +155,8 @@ struct FakeCompileWorker {
     /// in `held_supervisor` already read as dispatched.
     dispatch_seen_at_wire: Mutex<Option<bool>>,
     /// A production worker connector the worker keeps, as the worker channel
-    /// does.
+    /// does. Unix only: the connector's stream type is a Unix socket there.
+    #[cfg(unix)]
     held_connector: Mutex<Option<AneWorkerConnector<tokio::net::UnixStream>>>,
 }
 
@@ -320,6 +321,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         evictions: Mutex::new(Vec::new()),
         held_supervisor: Mutex::new(None),
         dispatch_seen_at_wire: Mutex::new(None),
+        #[cfg(unix)]
         held_connector: Mutex::new(None),
     })
 }
