@@ -1,0 +1,62 @@
+name: Portable Rust CI setup
+description: Restore lane-specific Rust outputs without racing parallel cache writers
+inputs:
+  lane:
+    description: Build configuration owning this cache
+    required: true
+  save-cache:
+    description: Only one nextest shard writes the shared cache
+    default: 'true'
+  nextest:
+    description: Install nextest for test execution or catalogue discovery
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: synapse
+        # Keep the static-CRT cache generation; each lane retains its own
+        # clippy/debug/release/discovery outputs instead of evicting the others.
+        prefix-key: v2-static-crt
+        shared-key: ci-${{ inputs.lane }}
+        cache-workspace-crates: true
+        key: ${{ hashFiles('synapse/crates/**', 'synapse/bench/parity/src/**') }}
+        save-if: ${{ inputs.save-cache == 'true' }}
+
+    # Download and unpack the prebuilt cargo-nextest binary directly.
+    - name: Install cargo-nextest (linux)
+      if: inputs.nextest == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: curl --max-time 600 -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+    - name: Install cargo-nextest (windows)
+      if: inputs.nextest == 'true' && runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        curl.exe --fail --location --silent --show-error --ssl-revoke-best-effort `
+          --retry 3 --retry-delay 10 --retry-all-errors `
+          --output nextest.tar.gz https://get.nexte.st/latest/windows-tar
+        if ($LASTEXITCODE -ne 0) { throw "cargo-nextest download failed (curl exit $LASTEXITCODE)" }
+        tar zxf nextest.tar.gz -C "$env:USERPROFILE\.cargo\bin"
+        Remove-Item nextest.tar.gz
+
+    - name: Windows build env (libclang for bindgen)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (!(Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+          $attempts = 0
+          while ($true) {
+            $attempts++
+            choco install llvm -y --no-progress | Out-Null
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempts -ge 3) { throw "choco install llvm failed after $attempts attempts" }
+            Start-Sleep -Seconds 20
+          }
+        }
+        echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV

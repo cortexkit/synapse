@@ -2,41 +2,60 @@
 # pushed: the same workflow-shape assertions CI runs as its first step, run
 # here first because a drifted workflow would fail in seconds on CI anyway and
 # failing locally is free.
-bash scripts/check-train-preconditions.sh || refuse "train preconditions failed — see scripts/check-train-preconditions.sh"
-bash scripts/check-no-external-path-deps.sh || refuse "a Cargo path dependency resolves outside the repository — see scripts/check-no-external-path-deps.sh"
-python3 scripts/check-module-runtime-deps.py || refuse "shipped module includes daemon or presence — see scripts/check-module-runtime-deps.py"
+# Join every child before refusing, so a failed fast check cannot leave a
+# compiler running after train-push exits. Cross-target outputs have their own
+# directory so Cargo does not serialize them behind the native macOS build.
+synapse_preflight() {
+  local windows_pid native_pid windows_status=0 native_status=0
+  (
+    export CC_x86_64_pc_windows_gnu="$PWD/scripts/lib/zig-cc-windows.sh"
+    export AR_x86_64_pc_windows_gnu="$PWD/scripts/lib/zig-ar.sh"
+    export CARGO_TARGET_DIR="$PWD/target/train-windows-clippy"
+    cargo clippy --locked -p synapse-module --features test-support --all-targets \
+      --target x86_64-pc-windows-gnu -- -D warnings
+  ) &
+  windows_pid=$!
+  ( synapse_native_preflight ) &
+  native_pid=$!
+  wait "$windows_pid" || windows_status=$?
+  wait "$native_pid" || native_status=$?
+  [ "$windows_status" -eq 0 ] || refuse "Windows cross-clippy failed (native MSVC remains a CI gate)"
+  [ "$native_status" -eq 0 ] || refuse "repository/native preflight failed"
+}
 
-# CI compiles the portable workspace members. The Metal engine and Neural Engine
-# worker require a Mac, so this preflight is their only automated compile gate.
-# Keep it until CI has a Mac runner; otherwise changes to these crates could
-# merge without any automated native build.
-if [ "$(uname -s)" = "Darwin" ]; then
-  cargo fmt --all --check || refuse "macOS formatting failed"
-  # The MLX worker crate this block used to name is gone: it was deleted from
-  # the workspace, so there is no longer an MLX lane to gate here.
-  # Module clippy moved out of the default landing script, so keep its native
-  # macOS lint coverage here alongside the Mac-only engines.
-  mac_crates="-p synapse-module -p synapse-engine-owned -p synapse-worker-ane"
-  # The Metal toolchain lives in full Xcode; Command Line Tools alone cannot
-  # compile the shaders, and the failure is a confusing linker error rather
-  # than a missing-tool message.
-  if [ -d /Applications/Xcode.app ]; then
-    export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+synapse_native_preflight() {
+  bash scripts/check-train-preconditions.sh || refuse "train preconditions failed — see scripts/check-train-preconditions.sh"
+  bash scripts/check-no-external-path-deps.sh || refuse "a Cargo path dependency resolves outside the repository — see scripts/check-no-external-path-deps.sh"
+  python3 scripts/check-module-runtime-deps.py || refuse "shipped module includes daemon or presence — see scripts/check-module-runtime-deps.py"
+
+  # CI compiles the portable workspace members. The Metal engine and Neural Engine
+  # worker require a Mac, so this preflight is their only automated compile gate.
+  # Keep it until CI has a Mac runner; otherwise changes to these crates could
+  # merge without any automated native build.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    cargo fmt --all --check || refuse "macOS formatting failed"
+    # Module clippy moved out of the default landing script, so keep its native
+    # macOS lint coverage here alongside the Mac-only engines.
+    mac_crates="-p synapse-module -p synapse-engine-owned -p synapse-worker-ane"
+    # The Metal toolchain lives in full Xcode; Command Line Tools alone cannot
+    # compile the shaders, and the failure is a confusing linker error rather
+    # than a missing-tool message.
+    if [ -d /Applications/Xcode.app ]; then
+      export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+    fi
+    # --locked: the subc and commons crates are exact crates.io pins in the root
+    # Cargo.toml (no sibling path checkouts), so a Cargo.lock that would need
+    # rewriting means the committed lock is wrong, which is worth refusing.
+    # shellcheck disable=SC2086
+    cargo clippy --locked $mac_crates --all-targets -- -D warnings \
+      || refuse "native macOS module/engine crates failed clippy (see scripts/train-push.local.sh)"
+    cargo test --locked -p synapse-engine-owned --lib \
+      || refuse "synapse-engine-owned lib tests failed (CI cannot run these)"
   fi
-  # --locked: the subc and commons crates are exact crates.io pins in the root
-  # Cargo.toml (no sibling path checkouts), so a Cargo.lock that would need
-  # rewriting means the committed lock is wrong, which is worth refusing.
-  # shellcheck disable=SC2086
-  cargo clippy --locked $mac_crates --all-targets -- -D warnings \
-    || refuse "native macOS module/engine crates failed clippy (see scripts/train-push.local.sh)"
-  cargo test --locked -p synapse-engine-owned --lib \
-    || refuse "synapse-engine-owned lib tests failed (CI cannot run these)"
-fi
+}
 
-# Native Linux and MSVC clippy run in parallel CI lanes before changes can merge.
-# Repeating them with the zig cross-compiler serialized the push and did not check MSVC.
-# Keep the macOS-only gates above: neither CI lane can compile Metal/ANE crates.
-say "Linux and Windows clippy are CI gates; macOS-only clippy remains local"
+synapse_preflight
+say "Windows module cross-clippy and native preflight passed; native MSVC remains a CI gate"
 
 # The daily cron on tests.yml is this repository's only scheduled sample of
 # master against the current toolchain and runner images, which a push-only

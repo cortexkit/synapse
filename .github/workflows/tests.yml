@@ -33,33 +33,74 @@ env:
   # GPU build evidence is a readiness-matrix contract: GPU jobs run only on
   # workflow_dispatch, retain toolchain/package and binary digests plus output,
   # and mark skipped execution as not a pass. CPU gates remain push-triggered.
-  # Production crates gated by CI. Bench lanes are excluded on purpose:
-  # heavy engine deps (burn, candle, python venvs) with no gate value.
-  # Every workspace member that compiles on a runner without Metal or CUDA. The
-  # list is explicit rather than --workspace because the bench lanes and the
-  # macOS- and CUDA-only engines cannot build here, but anything portable left
-  # out is simply unbuilt and untested: the operator CLI shipped for weeks with
-  # its tests never once running in CI.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
 
 jobs:
+  # Reusable workflows keep the platform gates independent: Linux never waits
+  # for Windows, and every native lane starts immediately rather than in series.
+  linux-checks:
+    uses: ./.github/workflows/portable.yml
+    with:
+      platform: linux
+      runner: ubuntu-24.04
+      partitions: '["1/4", "2/4", "3/4", "4/4"]'
+
+  windows-checks:
+    uses: ./.github/workflows/portable.yml
+    with:
+      platform: windows
+      runner: windows-2025
+      # Windows spends about a minute running tests; release compilation is the
+      # bottleneck, so extra execution shards would add setup without useful work.
+      partitions: '["1/1"]'
+
+  linux-catalogue:
+    runs-on: ubuntu-24.04
+    # Share the exact discovery commands on both platforms, but not their
+    # results: a Windows failure must not turn the Linux aggregate red.
+    steps: &catalogue-steps
+      - uses: actions/checkout@v4
+        with:
+          path: synapse
+          fetch-depth: 0
+      - uses: ./synapse/.github/actions/ci-rust
+        with:
+          lane: catalogue
+          nextest: 'true'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install mutation checker dependency
+        run: python -m pip install PyYAML==6.0.3
+      - name: Install pinned mutation runner
+        working-directory: synapse
+        shell: bash
+        run: |
+          # Cache install records can outlive the corresponding executable.
+          want='ckdev-mutate 0.10.0'
+          cargo install --locked --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+          if [ "$(ckdev-mutate --version)" != "$want" ]; then
+            cargo install --locked --force --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+          fi
+          test "$(ckdev-mutate --version)" = "$want"
+      - name: Check mutation catalogue
+        working-directory: synapse
+        shell: bash
+        # Discovery uses package/feature-specific builds, not the push test set.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: ckdev-mutate check
+
+  windows-catalogue:
+    runs-on: windows-2025
+    steps: *catalogue-steps
+
   test:
+    name: linux-guards
+    runs-on: ubuntu-24.04
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - name: linux
-            runner: ubuntu-24.04
-          - name: windows
-            runner: windows-2025
-          # A macOS Metal/ANE lane requires Apple Silicon with real GPU/ANE
-          # access (hosted macOS runners virtualize the GPU), so that coverage
-          # runs on developer machines. Restore by registering a self-hosted
-          # Apple Silicon runner labeled `macos-metal` and adding:
-          # - name: macos-metal
-          #   runner: [self-hosted, macos-metal]
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+        name: [linux]
     steps:
       - name: Checkout synapse
         uses: actions/checkout@v4
@@ -70,16 +111,14 @@ jobs:
 
       # Validate the workflow before toolchain setup spends time.
       - name: Check train CI preconditions
-        if: matrix.name == 'linux'
         shell: bash
         run: |
           bash synapse/scripts/check-train-preconditions.sh
           python3 synapse/scripts/test-ci-e2e-output.py
           cd synapse
-          python3 -m unittest scripts.test_land_gates scripts.test_mutation_ci.MutationCiTests scripts.test_mutation_ci.MutationAuditTests -v
+          python3 -m unittest scripts.test_land_gates scripts.test_mutation_ci.MutationCiTests scripts.test_mutation_ci.MutationAuditTests scripts.test_ci_parallel -v
 
       - name: Check release-candidate guards
-        if: matrix.name == 'linux'
         shell: bash
         run: python3 synapse/scripts/check-release-candidate.py --self-test
 
@@ -91,7 +130,6 @@ jobs:
       # The release benchmark producer must keep emitting reports the tag
       # validator accepts; its fixtures run without any hardware.
       - name: Release benchmark producer tests
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: python3 -m unittest discover -s bench/harness -p 'test_release_matrix.py' -v
 
@@ -103,94 +141,21 @@ jobs:
       # workspace test run never reaches it. Its evaluator and manifest
       # validator gate releases, so test them here.
       - name: Restore parity Rust cache
-        if: matrix.name == 'linux'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: synapse/bench/parity -> target
           prefix-key: parity-v1
 
       - name: Parity manifest and evaluator tests
-        if: matrix.name == 'linux'
         working-directory: synapse/bench/parity
         timeout-minutes: 20
         run: cargo test --locked
 
-      # Direct prebuilt-binary install instead of taiki-e/install-action: the
-      # action's bootstrap script is broken by a runner-image bash regression
-      # (actions/partner-runner-images#169) and took every lane down with it.
-      # get.nexte.st serves the same prebuilt archives without a bootstrap layer.
-      - name: Install cargo-nextest (linux)
-        if: matrix.name == 'linux'
-        shell: bash
-        timeout-minutes: 10
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-
-      - name: Install cargo-nextest (windows)
-        if: matrix.name == 'windows'
-        shell: pwsh
-        # Windows curl uses schannel, which by default fails the whole TLS
-        # handshake when the certificate's revocation server can't be reached
-        # (CRYPT_E_REVOCATION_OFFLINE); a scheduled run failed that way.
-        # --ssl-revoke-best-effort still checks revocation when the server
-        # answers, and the retries cover a transient network failure. The exit
-        # check stops a failed download from surfacing later as a missing-file
-        # error from tar.
-        run: |
-          curl.exe --fail --location --silent --show-error --ssl-revoke-best-effort `
-            --retry 3 --retry-delay 10 --retry-all-errors `
-            --output nextest.tar.gz https://get.nexte.st/latest/windows-tar
-          if ($LASTEXITCODE -ne 0) { throw "cargo-nextest download failed (curl exit $LASTEXITCODE)" }
-          tar zxf nextest.tar.gz -C "$env:USERPROFILE\.cargo\bin"
-          Remove-Item nextest.tar.gz
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: synapse
-          # v2: CRT flavor lives in cmake's cached configure (CMakeCache.txt
-          # inside OUT_DIR) — a cache from the MD era keeps producing MD
-          # objects even after LLAMA_STATIC_CRT changes, because cmake reruns
-          # against its cached configuration. Bump to force clean configure.
-          prefix-key: v2-static-crt
-          # Retain workspace outputs too; dependency-only hits still rebuilt the
-          # Windows release tests for almost twelve minutes on a warm CI run.
-          cache-workspace-crates: true
-          key: ${{ hashFiles('synapse/crates/**', 'synapse/bench/parity/src/**') }}
-
-      # llama-cpp-sys-2 needs cmake everywhere and libclang (bindgen) on
-      # linux/windows. GitHub/Blacksmith images ship LLVM + CMake; these
-      # steps only pin the env vars the build scripts read.
-      - name: Windows build env (libclang for bindgen)
-        if: matrix.name == 'windows'
-        shell: pwsh
-        run: |
-          # GitHub-hosted windows images ship LLVM, so the existence guard
-          # usually skips this entirely; the retrying install stays for image
-          # drift. choco's CDN has failed with a bare exit 1 before — retry so
-          # a red here means the failure survived three attempts, not one bad
-          # CDN draw.
-          if (!(Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
-            $attempts = 0
-            while ($true) {
-              $attempts++
-              choco install llvm -y --no-progress | Out-Null
-              if ($LASTEXITCODE -eq 0) { break }
-              if ($attempts -ge 3) { throw "choco install llvm failed after $attempts attempts" }
-              Start-Sleep -Seconds 20
-            }
-          }
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-
-      # The repository is public, so a tracked home path, hostname or credential
-      # marker is a disclosure rather than untidiness. This ran only from a
-      # developer's shell until a leaked worktree path reached master, so it is
-      # a gate here: one lane is enough because the check reads tracked files.
       - name: public banlist
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: bash scripts/public-banlist-check.sh
 
       - name: CortexKit layout
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: bash scripts/check-cortexkit-layout.sh
 
@@ -198,14 +163,12 @@ jobs:
       # commit, never a path into a sibling checkout, whose releases would
       # leave Cargo.lock stale. The self-test proves the check can refuse.
       - name: no external path dependencies
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: |
           bash scripts/check-no-external-path-deps.sh --self-test
           bash scripts/check-no-external-path-deps.sh
 
       - name: shipped module excludes daemon and presence
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: python3 -m unittest scripts.test_module_runtime_deps -v
 
@@ -214,165 +177,37 @@ jobs:
       # changed that code without re-pinning and nothing noticed until a later
       # measurement run. The self-test needs only Python and the tracked files.
       - name: ANE campaign harness self-test
-        if: matrix.name == 'linux'
         working-directory: synapse
         run: bash bench/campaign/ane-direct-embed-harness.sh --self-test .
 
-      - name: fmt
-        working-directory: synapse
+  # Stable branch-protection contexts. always() is essential: skipped or
+  # cancelled children must produce a failing check, not a skipped green gate.
+  linux:
+    name: linux
+    if: ${{ always() }}
+    needs: [linux-checks, linux-catalogue, test]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every Linux gate
         shell: bash
-        run: |
-          set -euo pipefail
-          # `cargo fmt --all` follows path dependencies OUT of the workspace, so it
-          # formatted-checked ../commons and ../subconscious from here and could
-          # fail this job on a sibling's mid-edit file. Enumerate our own members
-          # and pass them explicitly. cargo tree is used rather than jq over
-          # cargo metadata because jq is not present on the windows runner and
-          # this step must behave identically on every leg.
-          members=$(cargo tree --workspace --depth 0 --prefix none | awk 'NF { print $1 }' | sort -u)
-          packages=()
-          while IFS= read -r member; do
-            if [[ -n "$member" ]]; then
-              packages+=(-p "$member")
-            fi
-          done <<< "$members"
-          if (( ${#packages[@]} == 0 )); then
-            echo "error: cargo tree returned an empty workspace member list; refusing vacuous fmt check" >&2
-            exit 1
-          fi
-          echo "Formatting $((${#packages[@]} / 2)) workspace members"
-          cargo fmt --check "${packages[@]}"
-
-      - name: clippy
-        working-directory: synapse
-        shell: bash
-        run: |
-          crates="$SYNAPSE_CRATES"
-          cargo clippy --locked $crates --all-targets -- -D warnings
-
-      # Windows tests run --release: rust links the release CRT even in debug
-      # builds, while cc-built C++ deps (esaxx, onig) follow the cargo profile
-      # — release everywhere is the only combination where every object agrees
-      # on MD_DynamicRelease (llama.cpp's cmake default matches cc's release
-      # default and rust's msvcrt default).
-      - name: nextest
-        working-directory: synapse
-        shell: bash
-        run: |
-          set -euo pipefail
-          crates="$SYNAPSE_CRATES"
-          profile=""
-          if [ "${{ matrix.name }}" = "windows" ]; then
-            profile="--release"
-          fi
-          # Wire/error documentation, store migrations, child-process environment
-          # scans and worker integration tests still block merging to master.
-          # Whole-process fixtures run in the scheduled/manual job below.
-          cargo nextest run --locked $crates $profile --retries 0 -E 'not binary(skeleton_e2e)'
-
-      # Catalogue validity remains required before changes can merge. Executable
-      # replay runs in the separate master and nightly workflows after merging.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install mutation checker dependency
-        run: python -m pip install PyYAML==6.0.3
-
-      - name: Install pinned mutation runner
-        working-directory: synapse
-        shell: bash
-        run: |
-          # A restored Rust cache can carry cargo's install record for this rev
-          # while ~/.cargo/bin still holds an older ckdev-mutate, so cargo skips
-          # the install. Check the version and force a reinstall when it differs.
-          want='ckdev-mutate 0.10.0'
-          cargo install --locked --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
-          if [ "$(ckdev-mutate --version)" != "$want" ]; then
-            cargo install --locked --force --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
-          fi
-          test "$(ckdev-mutate --version)" = "$want"
-
-      - name: Check mutation catalogue
-        working-directory: synapse
-        shell: bash
-        # Exact test discovery compiles targets too. Keep native dependencies
-        # on the release CRT used by Rust's Windows test executables.
         env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: ckdev-mutate check
+          NATIVE_RESULT: ${{ needs.linux-checks.result }}
+          CATALOGUE_RESULT: ${{ needs.linux-catalogue.result }}
+          GUARDS_RESULT: ${{ needs.test.result }}
+        run: test "$NATIVE_RESULT" = success && test "$CATALOGUE_RESULT" = success && test "$GUARDS_RESULT" = success
 
-      - name: Linux llama CPU build gate
-        if: matrix.name == 'linux'
-        working-directory: synapse
+  windows:
+    name: windows
+    if: ${{ always() }}
+    needs: [windows-checks, windows-catalogue]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every Windows gate
         shell: bash
-        run: |
-          set -o pipefail
-          mkdir -p build-gates
-          command='cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
-          log='build-gates/linux-x86_64-gnu-llama-cpu.output'
-          set +e
-          bash -c "$command" 2>&1 | tee "$log"
-          status=${PIPESTATUS[0]}
-          set -e
-          binary='target/release/ck-synapse-worker-llama'
-          digest='unavailable'
-          if [ -f "$binary" ]; then digest=$(sha256sum "$binary" | cut -d ' ' -f1); fi
-          {
-            echo "target_triple=x86_64-unknown-linux-gnu"
-            echo "command=$command"
-            echo "rustc=$(rustc --version)"
-            echo "cargo=$(cargo --version)"
-            echo "machine_image=${ImageOS:-unknown}"
-            echo "budget_seconds=$LLAMA_BUILD_GATE_BUDGET_SECONDS"
-            echo "evidence_contract=$LLAMA_BUILD_EVIDENCE_CONTRACT"
-            echo "binary=$binary"
-            echo "sha256=$digest"
-            echo "execution_status=$([ "$status" -eq 0 ] && echo executed_successful || echo failed)"
-            echo "successful_output=$log"
-            echo "readiness_matrix_trigger=${{ github.event_name }}"
-            echo "skipped_is_not_pass=true"
-          } > build-gates/linux-x86_64-gnu-llama-cpu.txt
-          if [ "$status" -ne 0 ]; then exit "$status"; fi
-
-      - name: Windows llama CPU build gate
-        if: matrix.name == 'windows'
-        working-directory: synapse
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force build-gates | Out-Null
-          $command = 'cargo build -p synapse-worker-llama --no-default-features --features cpu --release'
-          $log = 'build-gates/windows-x86_64-msvc-llama-cpu.output'
-          & cargo build -p synapse-worker-llama --no-default-features --features cpu --release 2>&1 | Tee-Object -FilePath $log
-          $status = $LASTEXITCODE
-          $binary = 'target/release/ck-synapse-worker-llama.exe'
-          $digest = if (Test-Path $binary) { (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'unavailable' }
-          $execution = if ($status -eq 0) { 'executed_successful' } else { 'failed' }
-          @"
-          target_triple=x86_64-pc-windows-msvc
-          command=$command
-          rustc=$(rustc --version)
-          cargo=$(cargo --version)
-          machine_image=$env:ImageOS
-          budget_seconds=$env:LLAMA_BUILD_GATE_BUDGET_SECONDS
-          evidence_contract=$env:LLAMA_BUILD_EVIDENCE_CONTRACT
-          binary=$binary
-          sha256=$digest
-          execution_status=$execution
-          successful_output=$log
-          readiness_matrix_trigger=$env:GITHUB_EVENT_NAME
-          skipped_is_not_pass=true
-          "@ | Set-Content build-gates/windows-x86_64-msvc-llama-cpu.txt
-          if ($status -ne 0) { exit $status }
-
-      - name: Retain llama build-gate evidence
-        if: always() && (matrix.name == 'linux' || matrix.name == 'windows')
-        uses: actions/upload-artifact@v4
-        with:
-          name: llama-build-gates-${{ matrix.name }}-${{ github.run_id }}
-          path: synapse/build-gates
-          if-no-files-found: ignore
+        env:
+          NATIVE_RESULT: ${{ needs.windows-checks.result }}
+          CATALOGUE_RESULT: ${{ needs.windows-catalogue.result }}
+        run: test "$NATIVE_RESULT" = success && test "$CATALOGUE_RESULT" = success
 
   # Whole-process fixtures are expensive and contend on shared process/build
   # resources under parallel nextest. Keep them serial, but off the push path.
