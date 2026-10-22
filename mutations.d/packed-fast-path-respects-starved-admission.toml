@@ -4,7 +4,7 @@ guards = "New packed arrivals cannot repeatedly lease the only eviction victim r
 file = "crates/synapse-module/src/worker_host/mod.rs"
 old = """
 if state.starved_head.is_some() {
-                return None;
+                return Ok(None);
             }"""
 new = "// NON-VACUITY BREAK: packed arrivals bypass the starved budget head."
 edits = []
