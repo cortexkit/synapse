@@ -110,15 +110,18 @@ impl SharedCompiler {
 /// A fake direct-ANE worker on the shared compiler. Like a real worker it has
 /// one stream: a compile or an eviction holds it, and a test can hold it to
 /// stand for a long inference. A test can also make the next admission
-/// panic, hold or fail the next restart (which starts a new generation, as a
-/// confirmed-exit restart does), and read which shapes were evicted.
+/// panic or fail, hold or fail the next restart (a successful restart
+/// increments the generation), report that the old process's exit could not
+/// be confirmed, and read which shapes were evicted.
 struct FakeCompileWorker {
     id: String,
     compiler: Arc<SharedCompiler>,
     stream: tokio::sync::Mutex<()>,
     generation: AtomicU64,
     panic_next_admit: std::sync::atomic::AtomicBool,
+    fail_next_admit: std::sync::atomic::AtomicBool,
     fail_next_restart: std::sync::atomic::AtomicBool,
+    exit_unconfirmed: std::sync::atomic::AtomicBool,
     restart_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     restarts: AtomicU64,
     evictions: Mutex<Vec<(String, usize)>>,
@@ -140,6 +143,9 @@ impl AneShapeWorker for FakeCompileWorker {
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
+    fn exit_unconfirmed(&self) -> bool {
+        self.exit_unconfirmed.load(Ordering::SeqCst)
+    }
     fn admit_shape<'a>(
         &'a self,
         model_ref: &'a str,
@@ -151,6 +157,12 @@ impl AneShapeWorker for FakeCompileWorker {
             let _stream = cancellable_wait(self.stream.lock()).await?;
             if self.panic_next_admit.swap(false, Ordering::SeqCst) {
                 panic!("injected panic in a fake admission");
+            }
+            if self.fail_next_admit.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::WorkerErr {
+                    code: "internal".into(),
+                    msg: "injected admission failure".into(),
+                });
             }
             self.compiler.compile(&self.id, model_ref, shape).await;
             Ok(AnePlacementInventory::default())
@@ -194,7 +206,9 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         stream: tokio::sync::Mutex::new(()),
         generation: AtomicU64::new(0),
         panic_next_admit: Default::default(),
+        fail_next_admit: Default::default(),
         fail_next_restart: Default::default(),
+        exit_unconfirmed: Default::default(),
         restart_gate: Mutex::new(None),
         restarts: AtomicU64::new(0),
         evictions: Mutex::new(Vec::new()),

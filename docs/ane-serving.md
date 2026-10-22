@@ -119,8 +119,10 @@ The queue head's prediction is checked against its bound before anything is
 dispatched or evicted for it. A wait on the compile queue that reaches the 600 s
 backstop is answered `shape_compiling` with a fresh prediction, not
 `ane_resources_exhausted`. A compile that failed or whose admission task
-panicked keeps the compile gate, and its budget, until its worker's restart
-confirms the old process exited. A recovering worker's queued compiles are not
+panicked keeps the compile gate, and its budget, until the old worker process's
+exit is confirmed. They are released then even if the replacement fails to start,
+so one broken worker does not stall the others; while the exit is unconfirmed
+they stay held. A recovering worker's queued compiles are not
 elected, so they cannot hold up other workers. Compile times are learned from the
 moment the admission reaches the worker, and never from retried compiles or
 packed programs.

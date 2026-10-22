@@ -4803,6 +4803,9 @@ pub mod ane_residency {
     }
 
     impl QueueTicket {
+        /// A ticket not yet registered for any shape; only tests use it, to
+        /// drive `next_step` by hand.
+        #[cfg(test)]
         fn enqueue(inner: &Arc<Inner>) -> Self {
             let mut state = inner.lock();
             state.next_ticket += 1;
@@ -6448,6 +6451,17 @@ pub mod ane_residency {
                     state.entries.retain(|key, _| key.worker_id != id);
                 } else {
                     state.recovering.remove(&id);
+                    // The old process's exit is confirmed, so a compile that
+                    // failed in it cannot still be running: release its hold
+                    // on the compile gate and its budget now, so a worker
+                    // whose restarts keep failing does not stall every other
+                    // worker's cold compiles. (A retiring worker's slots are
+                    // released by its retirement instead.)
+                    if !state.retired.contains(&id) {
+                        state.slots.retain(|_, slot| {
+                            slot.worker.worker_id() != id || slot.state != SlotState::Failed
+                        });
+                    }
                 }
             }
             inner.changed.notify_waiters();

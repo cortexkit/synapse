@@ -327,7 +327,9 @@ Each change below was made after a deterministic test failed against
   retirement confirms that the old worker process has exited, so a compile that
   may still be running cannot overlap another one. A panicked admission task is
   marked failed, and its worker is restarted on a task of its own, including on
-  the orphan path.
+  the orphan path. Once the old process's exit is confirmed, the failed slot
+  releases the gate and its budget even if the restart then fails, so one
+  broken worker cannot stall every other worker's cold compiles.
 - **One driver per orphaned entry.** The driver's queue ticket is created and
   recorded on the entry under the same lock as the decision to keep it, and that
   ticket never counts as a waiting request. A request is registered for its

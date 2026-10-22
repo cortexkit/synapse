@@ -152,3 +152,20 @@ expect_message = "ane_resources_exhausted"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-release-gate-after-confirmed-exit"
+guards = "A failed compile releases the compile gate and its budget once its old process's exit is confirmed, even if the restart fails"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "slot.worker.worker_id() != id || slot.state != SlotState::Failed"
+new = "true /* NON-VACUITY BREAK: hold the gate after confirmed exit */"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::failed_compile_releases_the_gate_once_exit_is_confirmed_even_if_restart_fails"]
+expect_message = "a failed compile with a confirmed exit still held the compile gate"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

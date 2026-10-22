@@ -630,3 +630,58 @@ async fn failed_admission_holds_the_gate_until_exit_is_confirmed() {
         "another worker compiled before the failed one's exit was confirmed"
     );
 }
+
+/// Once the old process's exit is confirmed, a compile that failed in it
+/// cannot still be running, so its slot releases the compile gate and its
+/// budget even when the restart then fails. One broken worker must not stall
+/// every other worker's cold compiles.
+#[tokio::test(start_paused = true)]
+async fn failed_compile_releases_the_gate_once_exit_is_confirmed_even_if_restart_fails() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    broken.fail_next_admit.store(true, Ordering::SeqCst);
+    broken.fail_next_restart.store(true, Ordering::SeqCst);
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    let failed = ask_at(&supervisor, &compiler, &broken_dyn, QUEUE_GTE, 128, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!failed.ok(), "{failed:?}");
+    let other = fake_worker(&compiler, "other");
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 1.0, None);
+    let answer = tokio::time::timeout(Duration::from_secs(30), answer)
+        .await
+        .expect("a failed compile with a confirmed exit still held the compile gate")
+        .unwrap();
+    assert!(answer.ok(), "{answer:?}");
+    let state = supervisor.inner.lock();
+    assert!(!state.slots.keys().any(|key| key.worker_id == "broken"));
+    assert!(!state.compile_running());
+    assert_eq!(state.reserved_executables(), 22);
+}
+
+/// While the old process's exit is unconfirmed, the failed compile may still
+/// be running, so its slot keeps holding the compile gate.
+#[tokio::test(start_paused = true)]
+async fn failed_compile_keeps_the_gate_while_exit_is_unconfirmed() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    broken.fail_next_admit.store(true, Ordering::SeqCst);
+    broken.fail_next_restart.store(true, Ordering::SeqCst);
+    broken.exit_unconfirmed.store(true, Ordering::SeqCst);
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    let failed = ask_at(&supervisor, &compiler, &broken_dyn, QUEUE_GTE, 128, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!failed.ok(), "{failed:?}");
+    let other = fake_worker(&compiler, "other");
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 1.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(60)).await;
+    assert!(
+        compiler.compiles_of("other").is_empty(),
+        "a compile started beside one whose process may still be running"
+    );
+    assert!(gate_held(&supervisor));
+    answer.abort();
+}
