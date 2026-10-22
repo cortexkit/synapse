@@ -36,6 +36,17 @@ Local compatibility changes:
   it); `hf-hub` enables only the synchronous `ureq` transport, and `tokenizers`
   disables default features, retaining `onig`. This avoids introducing unused
   asynchronous/download/trainer infrastructure into the serving binary.
+- Local modification, not upstream behaviour: `client::compile_network` removes
+  each layer program's compiler temp directory (`<temp>/<hex identifier>/`,
+  holding `model.mil`, `weights/weight.bin` and the compiler's `net.plist` and
+  `data`) once the program has loaded, and also when writing the files, the
+  compile or the load fails. Upstream never removes it, so every cold compile
+  left about twice the layer's weight size in the per-user temp folder. Only
+  that exact path is removed, never by pattern, because other applications
+  share the private compiler and temp folder. Compiles of the same program
+  share the directory under a shared `flock`; the last one to finish removes
+  it. The `client::tests` unit tests cover this with a stand-in for the
+  private compile and load.
 
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).

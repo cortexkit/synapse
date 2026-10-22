@@ -233,10 +233,28 @@ impl Model {
         os: &str,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<AnePlacementInventory> {
+        self.admit_progress_checking_space(shape, os, temp_volume_available, progress)
+    }
+
+    /// `admit_progress` with the free-space reading as a parameter, so tests
+    /// can simulate a full disk.
+    fn admit_progress_checking_space(
+        &mut self,
+        shape: usize,
+        os: &str,
+        available: impl FnOnce(&Path) -> std::io::Result<u64>,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<AnePlacementInventory> {
         let profile = crate::profile::LaneProfile::new();
         let cached = self.resident.contains_key(&shape);
         // Compile temporaries retain ANE programs until the autorelease pool drains.
         let result = ane::autoreleasepool(|_| {
+            // A resident shape compiles nothing, so only a compile needs room.
+            // The compiler works in the default per-user temp folder.
+            if !cached {
+                let dir = std::env::temp_dir();
+                ensure_compile_temp_space(&dir, available(&dir))?;
+            }
             self.admit_with_limit_progress(
                 shape,
                 os,
@@ -1758,6 +1776,180 @@ fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
         anyhow::anyhow!("ane_resources_exhausted:compile layer {layer}: {error}")
     } else {
         anyhow::Error::new(error).context(format!("compile layer {layer}"))
+    }
+}
+
+/// Free space the temp volume must have before a shape compile starts: 2 GiB.
+///
+/// Each layer's compile writes its MIL, its weights and the compiler's own
+/// output of the same size into the per-user temp folder, about 60 MB per
+/// layer for the Qwen3 and GTE profiles (1.7 GB per Qwen3 shape and 1.3 GB per
+/// GTE shape when nothing is removed). The vendored client removes each
+/// layer's directory once the layer loads, so a compile holds roughly one
+/// layer's worth at a time and the module runs at most four admissions at
+/// once: about 0.25 GB. 2 GiB covers that several times over and still holds a
+/// whole Qwen3 shape if a removal fails. Refusing up front is better than a
+/// compile that fails part-way on a full disk, which would also starve every
+/// other process writing to the same volume.
+pub const MIN_COMPILE_TEMP_FREE_BYTES: u64 = 2 << 30;
+
+/// Why a shape admission was refused before compiling: the temp volume has
+/// too little free space, or its free space could not be read. A check that
+/// could not look is a refusal, not a pass. The message starts with the wire
+/// code `ane_temp_space_low`.
+#[derive(Debug)]
+pub enum TempSpaceRefusal {
+    Low {
+        dir: std::path::PathBuf,
+        available_bytes: u64,
+        required_bytes: u64,
+    },
+    Unreadable {
+        dir: std::path::PathBuf,
+        error: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for TempSpaceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low {
+                dir,
+                available_bytes,
+                required_bytes,
+            } => write!(
+                f,
+                "ane_temp_space_low: {} has {available_bytes} bytes free; compiling a shape needs at least {required_bytes}",
+                dir.display()
+            ),
+            Self::Unreadable { dir, error } => write!(
+                f,
+                "ane_temp_space_low: cannot read the free space of {}: {error}",
+                dir.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TempSpaceRefusal {}
+
+fn ensure_compile_temp_space(dir: &Path, available: std::io::Result<u64>) -> Result<()> {
+    match available {
+        Ok(available_bytes) if available_bytes >= MIN_COMPILE_TEMP_FREE_BYTES => Ok(()),
+        Ok(available_bytes) => Err(TempSpaceRefusal::Low {
+            dir: dir.into(),
+            available_bytes,
+            required_bytes: MIN_COMPILE_TEMP_FREE_BYTES,
+        }
+        .into()),
+        Err(error) => Err(TempSpaceRefusal::Unreadable {
+            dir: dir.into(),
+            error,
+        }
+        .into()),
+    }
+}
+
+/// Bytes an unprivileged process can still write on the volume holding `dir`.
+/// Space macOS reports as purgeable is not counted.
+fn temp_volume_available(dir: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(u64::from(stats.f_bsize)))
+}
+
+#[cfg(test)]
+mod temp_space_tests {
+    use super::*;
+
+    fn empty_gte_model() -> Model {
+        Model {
+            profile: Profile::select("gte-modernbert-base.ane-direct-worker", "embed").unwrap(),
+            tensors: BTreeMap::new(),
+            resident: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn admission_refuses_before_compiling_when_temp_space_is_low() {
+        let mut model = empty_gte_model();
+        let error = model
+            .admit_progress_checking_space(
+                128,
+                "test-os",
+                |_| Ok(MIN_COMPILE_TEMP_FREE_BYTES - 1),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<TempSpaceRefusal>(),
+                Some(TempSpaceRefusal::Low { available_bytes, required_bytes, .. })
+                    if *available_bytes == MIN_COMPILE_TEMP_FREE_BYTES - 1
+                        && *required_bytes == MIN_COMPILE_TEMP_FREE_BYTES
+            ),
+            "{error:#}"
+        );
+        assert!(model.resident.is_empty());
+        let synapse_core::WorkerResponse::Err { code, .. } =
+            crate::worker::request_error(None, &error)
+        else {
+            panic!("a refusal is an error response");
+        };
+        assert_eq!(code, "ane_temp_space_low");
+    }
+
+    #[test]
+    fn unreadable_temp_space_is_a_refusal() {
+        let mut model = empty_gte_model();
+        let error = model
+            .admit_progress_checking_space(
+                128,
+                "test-os",
+                |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<TempSpaceRefusal>(),
+                Some(TempSpaceRefusal::Unreadable { .. })
+            ),
+            "{error:#}"
+        );
+        assert!(error.to_string().starts_with("ane_temp_space_low:"));
+    }
+
+    #[test]
+    fn enough_temp_space_lets_admission_proceed() {
+        // With room to compile, admission goes on to build the first layer's
+        // graph, which needs weights this test model does not have.
+        let mut model = empty_gte_model();
+        let error = model
+            .admit_progress_checking_space(
+                128,
+                "test-os",
+                |_| Ok(MIN_COMPILE_TEMP_FREE_BYTES),
+                &mut || Ok(()),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<TempSpaceRefusal>().is_none());
+        assert!(
+            error.to_string().starts_with("tensor_missing:"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn temp_volume_free_space_is_readable() {
+        // A nearly full disk can legitimately report zero bytes.
+        assert!(temp_volume_available(&std::env::temp_dir()).is_ok());
+        assert!(temp_volume_available(Path::new("/nonexistent/synapse")).is_err());
     }
 }
 
