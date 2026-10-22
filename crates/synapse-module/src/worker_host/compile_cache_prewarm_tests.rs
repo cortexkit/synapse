@@ -446,3 +446,35 @@ async fn prewarm_admission_stays_after_a_joined_request_promise_lapses() {
         "the prewarm admission was withdrawn when the promise lapsed"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *handle.admit_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
+    started.notified().await;
+    let preparation = {
+        let supervisor = supervisor.clone();
+        let lane = lane.clone();
+        tokio::spawn(async move { supervisor.prepare_packed_lease(&lane, QUEUE_QWEN).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !preparation.is_finished(),
+        "packed preparation gave up behind a prewarm admission"
+    );
+    release.notify_one();
+    // Once the prewarm admission ends, the packed program is admitted; the
+    // fake worker has no packed program, so that admission is refused.
+    let prepared = preparation.await.unwrap();
+    assert_eq!(
+        prepared.err().and_then(|error| error.code().map(str::to_owned)).as_deref(),
+        Some("unsupported_request")
+    );
+    assert_eq!(compiler.compiles_of("lane").len(), 1);
+}

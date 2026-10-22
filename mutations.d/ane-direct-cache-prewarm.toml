@@ -83,7 +83,12 @@ runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_host::ane_residency::tests::older_worker_without_cache_fields_keeps_full_compile_predictions"]
+expect_red = [
+    "worker_host::ane_residency::tests::learning_ignores_the_stream_wait_before_dispatch",
+    "worker_host::ane_residency::tests::machine_factor_corrects_unseen_shape_predictions",
+    "worker_host::ane_residency::tests::older_worker_without_cache_fields_keeps_full_compile_predictions",
+    "worker_host::ane_residency::tests::queued_entries_are_repriced_after_learning",
+]
 expect_message = "machine_factor.is_some()"
 platforms = ["linux", "macos"]
 timeout_s = 600
@@ -218,13 +223,15 @@ guards = "Packed preparation is not turned away by the scheduler because a backg
 file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
 old = "                            || (slot.state == SlotState::Admitting && !slot.prewarm))"
 new = "                            || slot.state == SlotState::Admitting) // NON-VACUITY BREAK"
-test_file = "crates/synapse-module/src/lib.rs"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
 runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch"]
-expect_message = "finished"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up",
+]
+expect_message = "packed preparation gave up behind a prewarm admission"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
@@ -240,7 +247,13 @@ runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch"]
+expect_red = [
+    "tests::tight_packing_admission_contention_keeps_resident_single_deadline_shape_compiling",
+    "tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch",
+    "tests::tight_packing_qualification_mismatch_disables_only_packing",
+    "tests::tight_packing_unpinned_lane_stays_standalone_and_over_width_rows_fall_back",
+    "tests::tight_packing_waits_for_cancelled_request_drain_before_preparation",
+]
 expect_message = "finished"
 platforms = ["linux", "macos"]
 timeout_s = 600
@@ -252,13 +265,15 @@ guards = "Packed preparation waits for a running prewarm admission instead of gi
 file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
 old = "                if only_prepare && !state.only_prewarm_running() {"
 new = "                if only_prepare { // NON-VACUITY BREAK"
-test_file = "crates/synapse-module/src/lib.rs"
+test_file = "crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs"
 runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch"]
-expect_message = "finished"
+expect_red = [
+    "worker_host::ane_residency::tests::packed_preparation_waits_for_a_prewarm_admission_instead_of_giving_up",
+]
+expect_message = "packed preparation gave up behind a prewarm admission"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
@@ -298,7 +313,10 @@ runner = "nextest"
 package = "synapse-core"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_protocol::tests::worker_side_decoding_ignores_unknown_fields"]
+expect_red = [
+    "worker_protocol::tests::worker_side_decoding_ignores_unknown_fields",
+    "worker_transport::unix::tests::non_owned_workers_pass_a_bound_host_with_both_fields_absent",
+]
 expect_message = "unknown field"
 platforms = ["linux", "macos"]
 timeout_s = 600
