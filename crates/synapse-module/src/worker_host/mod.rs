@@ -7190,6 +7190,8 @@ pub mod ane_residency {
         pub metadata: AneServingMetadata,
         active_requests: Arc<std::sync::atomic::AtomicUsize>,
         preparing_packed: std::sync::atomic::AtomicBool,
+        #[cfg(test)]
+        recovery_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     }
 
     struct RequestActivity(Arc<std::sync::atomic::AtomicUsize>);
@@ -7241,7 +7243,18 @@ pub mod ane_residency {
                 metadata,
                 active_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 preparing_packed: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                recovery_gate: Mutex::new(None),
             })
+        }
+
+        #[cfg(test)]
+        async fn hold_before_recovery(&self) {
+            let gate = self.recovery_gate.lock().unwrap().take();
+            if let Some((fault_observed, continue_recovery)) = gate {
+                fault_observed.notify_one();
+                continue_recovery.notified().await;
+            }
         }
 
         pub async fn retire(&self) -> Result<(), AneResidencyError> {
@@ -7395,6 +7408,8 @@ pub mod ane_residency {
                         // Recovery waits for leases to drain. Release qualification's
                         // own lease before joining the generation-scoped recovery.
                         drop(lease);
+                        #[cfg(test)]
+                        self.hold_before_recovery().await;
                         let _ = self
                             .supervisor
                             .recover_at_generation(&worker, fault_generation)
@@ -7505,6 +7520,8 @@ pub mod ane_residency {
                         .await
                 };
                 if matches!(&result, Err(AneResidencyError::Channel(_))) {
+                    #[cfg(test)]
+                    serving.hold_before_recovery().await;
                     let _ = serving
                         .supervisor
                         .recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))
