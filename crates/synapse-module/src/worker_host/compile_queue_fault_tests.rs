@@ -1943,3 +1943,41 @@ fn production_connector_does_not_keep_the_supervisor_alive() {
         "the scheduler's thread outlived its supervisor"
     );
 }
+
+/// The same flood on a single-threaded runtime, as the module's own scheduler
+/// thread uses: the compile operation shares the scheduler's thread, so it
+/// runs only because the scheduler yields while its mailbox stays full. The
+/// flood stops by itself after 10 s, so a scheduler that never yields fails
+/// this test instead of hanging it.
+#[tokio::test(flavor = "current_thread")]
+async fn busy_mailbox_does_not_starve_operations_on_a_single_thread() {
+    let compiler = SharedCompiler::new(0.01);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    *supervisor.inner.slow_nudges.lock().unwrap() = Some(Duration::from_millis(1));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooder = std::thread::spawn({
+        let inner = supervisor.inner.clone();
+        let stop = stop.clone();
+        move || {
+            let started = std::time::Instant::now();
+            while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(10) {
+                for _ in 0..3 {
+                    inner.nudge();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+    let asked = std::time::Instant::now();
+    let leased = supervisor.lease(&worker, QUEUE_GTE, 128).await;
+    let waited = asked.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    *supervisor.inner.slow_nudges.lock().unwrap() = None;
+    flooder.join().unwrap();
+    assert!(leased.is_ok(), "{:?}", leased.err());
+    assert!(
+        waited < Duration::from_secs(5),
+        "a busy mailbox starved the scheduler's own operations for {waited:?}"
+    );
+}

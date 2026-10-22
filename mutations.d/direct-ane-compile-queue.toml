@@ -386,3 +386,20 @@ expect_message = "the production connector kept the supervisor alive"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-busy-mailbox-yields"
+guards = "With its mailbox still full after a pass, the scheduler yields so operations on its own thread run"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                tokio::task::yield_now().await;"
+new = "                // NON-VACUITY BREAK: never yield."
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::busy_mailbox_does_not_starve_operations_on_a_single_thread"]
+expect_message = "a busy mailbox starved the scheduler's own operations"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
