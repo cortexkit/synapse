@@ -811,3 +811,19 @@ takes. It also times `compiledModelExists`.
   `worker_side_decoding_ignores_unknown_fields` in `synapse-core`. The worker
   test is `loaded_reports_the_cached_ladder_rungs`. Mutation rows are in
   `mutations.d/ane-direct-cache-prewarm.toml`.
+- **Hardware check on the M6 mini** (macOS 27.0, two repeats, run
+  20261022T193842Z, at `4f8d623d` with the kit's test-only patch).
+  `compiledModelExists` took 0.08–0.46 ms per layer, and the whole LOAD-time
+  check 352–364 ms for Qwen3's seven rungs.
+  - Cold case: prewarm compiled 128 in 37.6 s. A Qwen3@1024 request asked
+    during it started right after that one admission (its compile took
+    131.7 s). Then 256 was prewarmed, and 512 was skipped for budget.
+  - Cached case: prewarm loaded 128, 256 and 512 from aned in 3.5 s in total.
+    A Qwen3@4096 request with a 30 s deadline was served in 1.9 s, not
+    refused.
+  - Every `LOADED` report matched what the admissions then found in the cache.
+  - Two runs failed on the kit's own expectations, not on the product, and
+    the kit has since been corrected. The first cached run expected 512 cached
+    after the cold run had skipped it. In the second cold run, the kit's
+    purge reported every layer gone, yet a fresh worker found and loaded all
+    of them from the cache. Why the purge did not take there is unresolved.
