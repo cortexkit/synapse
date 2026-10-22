@@ -24,6 +24,39 @@ fn unique_label(label: &str) -> String {
     format!("{label}-{nanos:x}")
 }
 
+/// Runs the named test of this file alone in a child test process, and returns
+/// true only inside that child, where the caller runs its body.
+///
+/// These tests release the lane lock and take it again in this process. A
+/// sibling test thread that forks while the lock is held shares the locked open
+/// file description until its child execs (CLOEXEC closes it only at exec), so
+/// the re-take could lose that race with `ane_lane_busy` while the code under
+/// test is correct. Production starts no unrelated children while it re-takes
+/// the lock; the race exists only among parallel tests.
+fn run_alone(name: &str) -> bool {
+    const CHILD: &str = "SYNAPSE_COREML_LOCK_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let test = format!("tests::coreml_load_tests::{name}");
+    let output = synapse_core::without_launch_nonce(std::process::Command::new(
+        std::env::current_exe().unwrap(),
+    ))
+    .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+    .env(CHILD, "1")
+    .output()
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Require the named pass row, so a filter matching no test cannot pass.
+    assert!(
+        output.status.success() && stdout.contains(&format!("test {test} ... ok")),
+        "isolated CoreML lock test did not pass: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// Who holds or has open the lane lock file at `path`, for a failure message:
 /// the kernel's lock table entry for its inode and every process with a
 /// descriptor on it (Linux only).
@@ -198,6 +231,9 @@ async fn finish(fixture: CoreMlFixture) {
 
 #[tokio::test]
 async fn cold_coreml_load_ignores_another_direct_ane_lock_holder() {
+    if !run_alone("cold_coreml_load_ignores_another_direct_ane_lock_holder") {
+        return;
+    }
     let fixture = fixture("cold-coreml-lock-holder");
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
@@ -244,6 +280,9 @@ async fn cold_coreml_load_ignores_another_direct_ane_lock_holder() {
 
 #[tokio::test]
 async fn coreml_load_does_not_reacquire_a_released_supervisor_lock() {
+    if !run_alone("coreml_load_does_not_reacquire_a_released_supervisor_lock") {
+        return;
+    }
     let fixture = fixture(&unique_label("coreml-released-supervisor"));
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
@@ -301,6 +340,9 @@ async fn resume(state: &Arc<ModuleState>) {
 
 #[tokio::test]
 async fn coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock() {
+    if !run_alone("coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock") {
+        return;
+    }
     let fixture = fixture(&unique_label("coreml-pause-and-reload"));
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
