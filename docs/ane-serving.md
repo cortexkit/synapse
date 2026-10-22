@@ -238,6 +238,52 @@ at once as `ane_resources_exhausted`, without compiling; the residency
 supervisor evicts and retries. Only an unusable cached copy falls back to a
 compile.
 
+### Predictions use the cache
+
+While loading a model, the worker asks aned whether it holds the first and the
+last layer of each ladder rung. Layers compile in order within one admission,
+so a cached last layer means the whole rung was compiled once. Checking every
+layer would cost about as much as loading the rung. Both layers of all seven
+rungs take about 1.2 s of worker CPU for Qwen3. The worker logs one line:
+
+```text
+ane-direct compile cache check: model_ref=... cached=[128, 256, 512] checked=7 total_ms=1180.4
+```
+
+`LOADED` carries the cached rungs in the optional `ane_cached_shapes` field.
+`ADMITTED` carries the optional `cache_hit_layers` and `compiled_layers`
+counts. Both are additions to worker protocol v3 that need no version change:
+an older worker omits them, and an older module ignores them.
+
+The compile queue (`docs/design-ane-compile-scheduling.md` §7) predicts a rung
+reported cached at its load cost rather than its compile cost. Load times are
+learned separately from compile times and never change the machine factor. An
+admission predicted as a load that runs past twice that prediction plus 1 s is
+repriced as a compile, because aned is evidently compiling it. Knowledge of a
+cached rung comes from `LOADED` and from every admission the worker reports.
+With a worker that sends neither field, every rung is predicted and learned as
+a compile, as before.
+
+### Prewarm
+
+Once a direct-ANE catalog lane is ready (its self-check passed), the module
+loads rungs 128, 256 and 512 of it in the background:
+
+- at the lowest priority, one admission at a time, only while no request waits;
+- only into free executable budget and free shape slots, never evicting;
+- the first rung that does not fit ends the prewarm.
+
+Packed preparation outranks prewarm: it waits for a running prewarm admission
+instead of giving up. A request that arrives while a prewarm admission runs
+waits for that one admission, which is about 2 s on a cached machine and one
+small compile on a cold one. Unloading the lane, pausing the Neural Engine
+(`lanes.pause` unloads every lane) and retiring the worker cancel the rest.
+A running admission finishes first. Each worker is prewarmed once. The end is
+logged once at INFO, `direct-ANE prewarm finished` (or `cancelled`), with the
+fields `lane`, `loaded` (the rungs admitted), `loaded_from_cache` and
+`compiled` (how many of those rungs), `already_resident`,
+`skipped_for_budget`, `failed` and `total_ms`.
+
 Checks: `graph::compile::tests::identical_graphs_emit_identical_sources` and
 `client::tests::a_cached_program_is_loaded_without_writing_or_compiling` in the
 vendored binding (`cargo test --locked -p ane --lib`, macOS), and

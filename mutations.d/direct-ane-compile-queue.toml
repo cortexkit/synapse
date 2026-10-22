@@ -20,7 +20,7 @@ id = "ane-compile-queue-aging"
 guards = "A wide compile is passed only by compiles whose start key (arrival plus cost) is earlier"
 file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
 old = ".min_by_key(|(_, entry)| entry.order())"
-new = ".min_by_key(|(key, entry)| (state.estimate(key, entry.seed), entry.seq)) /* NON-VACUITY BREAK: no aging */"
+new = ".min_by_key(|(key, entry)| (state.estimate(key, entry.seed, entry.load_seed), entry.seq)) /* NON-VACUITY BREAK: no aging */"
 test_file = "crates/synapse-module/src/worker_host/compile_queue_tests.rs"
 runner = "nextest"
 package = "synapse-module"
@@ -93,6 +93,7 @@ old = """                        Err(error) => (
                             ))),
                             None,
                             now,
+                            None,
                         ),"""
 new = """                        Err(_) => return, // NON-VACUITY BREAK: a panicked compile is ignored"""
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"

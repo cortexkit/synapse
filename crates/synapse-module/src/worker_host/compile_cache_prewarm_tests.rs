@@ -228,6 +228,32 @@ async fn prewarm_never_delays_a_queued_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn prewarm_waits_for_a_request_in_its_gathering_window() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let lane = fake_worker(&compiler, "lane");
+    let other = fake_worker(&compiler, "other");
+    // The request waits 50 ms before its compile may start, so compiles
+    // asked for together start cheapest first. A prewarm signalled inside
+    // that window must not take the compiler first.
+    let request = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 0.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_millis(10)).await;
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128])
+        .unwrap();
+    let request = request.await.unwrap();
+    assert!(request.ok());
+    assert_close(
+        request.waited(),
+        standalone(QUEUE_GTE, 512) + 0.05,
+        0.02,
+        "the request started before the prewarm",
+    );
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(compiler.compiles_of("lane").len(), 1, "prewarm never ran");
+}
+
+#[tokio::test(start_paused = true)]
 async fn prewarm_skips_what_the_free_budget_cannot_hold_and_evicts_nothing() {
     let compiler = SharedCompiler::new(1.0);
     let supervisor = queue_supervisor();
@@ -336,13 +362,87 @@ async fn prewarm_loads_cached_shapes_without_compiling() {
         .map(|(_, shape, _)| *shape)
         .collect();
     assert_eq!(loads, [128, 256, 512]);
-    let state = supervisor.inner.lock();
-    assert_eq!(
-        state
+    let (key, slot_id) = {
+        let mut state = supervisor.inner.lock();
+        assert_eq!(
+            state
+                .slots
+                .values()
+                .filter(|slot| slot.state == SlotState::Resident)
+                .count(),
+            3
+        );
+        let (key, slot) = state
             .slots
-            .values()
-            .filter(|slot| slot.state == SlotState::Resident)
-            .count(),
-        3
+            .iter_mut()
+            .find(|(key, _)| key.shape == 128)
+            .unwrap();
+        slot.state = SlotState::Evicting;
+        (key.clone(), slot.id)
+    };
+    assert!(supervisor.evict(lane.clone(), key, slot_id).await);
+    // The lane was prewarmed once; another readiness signal for the same
+    // worker loads nothing again.
+    supervisor
+        .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256, 512])
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(handle.cached_loads.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_admission_stays_when_a_joined_request_is_cancelled() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    // A long inference holds the stream, so the prewarm admission has not
+    // reached the worker yet when a request joins it and is cancelled.
+    let stream = handle.stream.lock().await;
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
+    settle().await;
+    let joined = {
+        let supervisor = supervisor.clone();
+        let lane = lane.clone();
+        tokio::spawn(async move { supervisor.lease_until(&lane, QUEUE_QWEN, 128, None).await })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    joined.abort();
+    let _ = joined.await;
+    // Make sure the scheduler runs a pass while the admission still waits.
+    let _ = supervisor.inner.send(scheduler::Msg::Nudge);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(stream);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        compiler.compiles_of("lane").len(),
+        1,
+        "the prewarm admission was withdrawn with the request that joined it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn prewarm_admission_stays_after_a_joined_request_promise_lapses() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let handle = fake_handle(&compiler, "lane");
+    let lane: Arc<dyn AneShapeWorker> = handle.clone();
+    let stream = handle.stream.lock().await;
+    supervisor.prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128]).unwrap();
+    settle().await;
+    // Joins the waiting prewarm admission and is answered shape_compiling
+    // at its 1 s deadline, which records a promise on the admission.
+    let answer = ask_at(&supervisor, &compiler, &lane, QUEUE_QWEN, 128, 0.5, Some(1.0))
+        .await
+        .unwrap();
+    assert_eq!(answer.code.as_deref(), Some(ERR_ANE_SHAPE_COMPILING), "{answer:?}");
+    // Long after twice that promise, the stream frees.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    drop(stream);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        compiler.compiles_of("lane").len(),
+        1,
+        "the prewarm admission was withdrawn when the promise lapsed"
     );
 }

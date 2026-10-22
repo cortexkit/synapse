@@ -407,22 +407,17 @@ impl Prewarm {
                 .join(",")
         };
         let loaded: Vec<usize> = self.loaded.iter().map(|(shape, _)| *shape).collect();
-        let count = |pick: fn(&AdmissionOrigins) -> u32| {
+        // Rungs whose every layer came from aned's cache, and rungs with at
+        // least one compiled layer. A worker that does not report where
+        // layers came from counts in neither.
+        let reported = |pick: fn(&AdmissionOrigins) -> bool| {
             self.loaded
                 .iter()
-                .filter(|(_, origins)| origins.as_ref().is_some_and(|o| pick(o) > 0))
+                .filter(|(_, origins)| origins.as_ref().is_some_and(pick))
                 .count()
         };
-        let cached = self
-            .loaded
-            .iter()
-            .filter(|(_, origins)| {
-                origins
-                    .as_ref()
-                    .is_some_and(|o| o.compiled_layers == 0 && o.cache_hit_layers > 0)
-            })
-            .count();
-        let compiled = count(|o| o.compiled_layers);
+        let cached = reported(|o| o.compiled_layers == 0 && o.cache_hit_layers > 0);
+        let compiled = reported(|o| o.compiled_layers > 0);
         tracing::info!(
             target: "worker",
             lane = %self.lane,

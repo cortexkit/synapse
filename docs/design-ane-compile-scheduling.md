@@ -621,7 +621,7 @@ error.
 
 ## 7. Cache-aware predictions and prewarm (proposed)
 
-Status: **proposed, awaiting approval**. aned now keeps compiled programs across
+Status: **approved and implemented**, with the changes in 7.7. aned now keeps compiled programs across
 restarts (see "Compiled programs survive a worker restart" in
 `docs/ane-serving.md`), so a shape it holds loads in about 1–2 s instead of
 compiling for 12–230 s. The scheduler does not know that yet. It predicts a
@@ -781,3 +781,33 @@ Each guard also gets a mutation row. The hardware kit (M6 mini) restarts a
 worker on a cached machine and checks that `LOADED` lists the cached rungs, that
 a Qwen3@4096 request with a 30 s deadline is served, and how long prewarm
 takes. It also times `compiledModelExists`.
+
+### 7.7 Changes during implementation
+
+- **Packed preparation outranks prewarm.** The tight-packing lane tests showed
+  packed preparation being turned away behind a prewarm admission and never
+  retried, because a prewarm is not request activity. Preparation now treats
+  a running prewarm admission as no obstacle: it waits for it rather than
+  giving up, and prewarm starts nothing while preparation waits.
+- **A prewarm admission is never withdrawn.** A request that joins a prewarm
+  admission and is cancelled, or whose `shape_compiling` promise lapses, does
+  not withdraw it, because nobody asked for it in the first place. A resource
+  refusal ends the prewarm without evicting anything to retry.
+- **What the scheduler keys cache knowledge by.** `(model_ref, shape)`, not the
+  worker: aned files programs under the worker binary's signing identifier,
+  so every worker of a model shares them. Admissions of packed programs are
+  neither checked nor learned as loads.
+- **Logs.** The worker logs one line per cache check; the module logs one INFO
+  line when a lane's prewarm ends (see `docs/ane-serving.md`).
+- **Tests.** The table in 7.6 maps to
+  `crates/synapse-module/src/worker_host/compile_cache_prewarm_tests.rs`, with
+  `prewarm_never_delays_a_queued_request`,
+  `prewarm_waits_for_a_request_in_its_gathering_window`,
+  `prewarm_skips_what_the_free_budget_cannot_hold_and_evicts_nothing`,
+  `prewarm_refused_for_resources_evicts_nothing`,
+  `prewarm_stops_when_the_lane_retires`, the two withdrawal tests and
+  `prewarm_loads_cached_shapes_without_compiling`. The protocol tests are
+  `cache_fields_are_optional_in_both_directions` and
+  `worker_side_decoding_ignores_unknown_fields` in `synapse-core`. The worker
+  test is `loaded_reports_the_cached_ladder_rungs`. Mutation rows are in
+  `mutations.d/ane-direct-cache-prewarm.toml`.
