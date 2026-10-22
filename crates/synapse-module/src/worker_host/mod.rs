@@ -5434,8 +5434,8 @@ pub mod ane_residency {
         /// evicting and only within the free budget. Retiring the worker
         /// cancels what has not started. `lane` names the lane in the log line
         /// written when the prewarm ends. `notify` is called after each
-        /// prewarm admission ends and when the prewarm ends. A worker is
-        /// prewarmed at most once.
+        /// prewarm admission ends and when the prewarm finishes, but not when
+        /// retirement cancels it. A worker is prewarmed at most once.
         pub fn prewarm(
             &self,
             worker: &Arc<dyn AneShapeWorker>,

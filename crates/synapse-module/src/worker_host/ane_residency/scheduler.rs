@@ -395,9 +395,9 @@ struct Prewarm {
     /// The shape being admitted and the id of its slot. A completion is
     /// matched by slot id, so a stale one never touches a later admission.
     running: Option<(usize, u64)>,
-    /// Called after each prewarm admission ends and when the prewarm ends,
-    /// so work that waits for the worker to be free (packed preparation)
-    /// can try again.
+    /// Called after each prewarm admission ends and when the prewarm
+    /// finishes (not when retirement cancels it), so work that waits for the
+    /// worker to be free (packed preparation) can try again.
     notify: Option<PrewarmNotify>,
     /// Admitted shapes, with where their layers came from when reported.
     loaded: Vec<(usize, Option<AdmissionOrigins>)>,
@@ -716,10 +716,9 @@ impl Scheduler {
                     // for; one already on the wire finishes and goes with the
                     // worker.
                     if let Some(prewarm) = self.prewarms.remove(&id) {
+                        // No notification: the lane is going away, and a packed
+                        // preparation started now would race its unload.
                         prewarm.log("cancelled", now);
-                        if let Some(notify) = prewarm.notify {
-                            effects.notifications.push(notify);
-                        }
                     }
                     let undispatched: Vec<tokio::task::Id> = self
                         .op_kinds
