@@ -141,6 +141,11 @@ pub(super) enum Answer {
     /// The shape this request waited for has just been compiled; it may lease
     /// it ahead of a starved head during the 250 ms handoff.
     Ready,
+    /// The shape this request waited for has just been compiled, and the
+    /// request is a member of its handoff cohort. The membership travels with
+    /// the answer: if the answer is never read (the request went away, or
+    /// the send failed), dropping it leaves the cohort at once.
+    Joined(CohortMembership),
     Failed(AneResidencyError),
 }
 
@@ -346,6 +351,9 @@ struct Effects {
     bools: Vec<(oneshot::Sender<bool>, bool)>,
     recoveries: Vec<(RecoverReply, Result<(), AneResidencyError>)>,
     units: Vec<oneshot::Sender<()>>,
+    /// Cohort memberships to drop once the state lock is released (dropping
+    /// one locks the state).
+    memberships: Vec<CohortMembership>,
     progress: bool,
 }
 
@@ -723,6 +731,7 @@ impl Scheduler {
         for (sender, outcome) in effects.recoveries {
             let _ = sender.send(outcome);
         }
+        drop(effects.memberships);
         for sender in effects.units {
             let _ = sender.send(());
         }
@@ -739,6 +748,10 @@ impl Scheduler {
     /// Removes waiter `id` and queues its answer.
     fn answer(&mut self, state: &mut State, id: u64, answer: Answer, effects: &mut Effects) {
         let Some(waiter) = self.waiters.remove(&id) else {
+            // A membership must not be dropped under the state lock.
+            if let Answer::Joined(membership) = answer {
+                effects.memberships.push(membership);
+            }
             return;
         };
         state.leave_queue(id);
@@ -756,6 +769,11 @@ impl Scheduler {
                 match answer {
                     Answer::Lease { lease, .. } => Ok(Some(lease)),
                     Answer::Ready => Ok(None),
+                    Answer::Joined(membership) => {
+                        // Dropped after the state lock is released.
+                        effects.memberships.push(membership);
+                        Ok(None)
+                    }
                     Answer::Failed(error) => Err(error),
                 },
             )),
@@ -2059,8 +2077,14 @@ impl Scheduler {
                         continue;
                     }
                     // Answering removes the request from every cohort, so it
-                    // joins this one afterwards.
-                    self.answer(state, id, Answer::Ready, effects);
+                    // joins this one afterwards. Its membership is released
+                    // when it leases, or when the answer is dropped unread.
+                    let membership = CohortMembership {
+                        inner: inner.clone(),
+                        key: key.clone(),
+                        id,
+                    };
+                    self.answer(state, id, Answer::Joined(membership), effects);
                     state
                         .slots
                         .get_mut(&key)

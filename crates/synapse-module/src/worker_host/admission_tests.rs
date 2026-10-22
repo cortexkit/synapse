@@ -93,10 +93,14 @@ async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers
         .chain(joiners)
         .peekable();
     while let Some((id, answer)) = members.next() {
-        assert!(matches!(answer.await.unwrap(), scheduler::Answer::Ready));
+        let scheduler::Answer::Joined(membership) = answer.await.unwrap() else {
+            panic!("a pre-completion joiner was not handed the shape");
+        };
         let Some(lease) = supervisor.try_lease(&key(128), &worker, Some(id)).unwrap() else {
             panic!("a pre-completion joiner lost its handoff to the budget head");
         };
+        // Leasing through the cohort already left it.
+        drop(membership);
         if members.peek().is_some() {
             drop(lease);
             // Let the wakeup from this lease drop be handled first.

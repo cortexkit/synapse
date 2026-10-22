@@ -5345,11 +5345,11 @@ pub mod ane_residency {
                     Ok(Ok(scheduler::Answer::Ready)) => {
                         enter_wait(WaitPhase::Compile(shape));
                         cohort = Some(id);
-                        membership = Some(CohortMembership {
-                            inner: self.inner.clone(),
-                            key: key.clone(),
-                            id,
-                        });
+                    }
+                    Ok(Ok(scheduler::Answer::Joined(member))) => {
+                        enter_wait(WaitPhase::Compile(shape));
+                        cohort = Some(id);
+                        membership = Some(member);
                     }
                     Ok(Ok(scheduler::Answer::Failed(error))) => {
                         #[cfg(test)]

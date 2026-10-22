@@ -308,3 +308,20 @@ expect_message = "an expiry decided before its request was classified"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-unread-cohort-answer-leaves"
+guards = "A cohort membership carried by an unread or undeliverable answer leaves the handoff when the answer is dropped"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "                    .is_some_and(|slot| slot.joined.remove(&self.id) && slot.joined.is_empty())"
+new = "                    .is_some_and(|slot| false && slot.joined.remove(&self.id) && slot.joined.is_empty()) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::unread_cohort_answer_leaves_the_handoff_at_once"]
+expect_message = "an unread cohort answer kept its member in the handoff"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

@@ -508,7 +508,10 @@ async fn retry_that_has_not_decided_yet_keeps_the_orphan_entry() {
         "the orphan entry expired under a retry that had already enqueued"
     );
     assert!(wide_answer.await.unwrap().ok());
-    assert!(matches!(retry.await.unwrap(), scheduler::Answer::Ready));
+    assert!(matches!(
+        retry.await.unwrap(),
+        scheduler::Answer::Ready | scheduler::Answer::Joined(_)
+    ));
 }
 
 /// An orphan driver must not evict a resident shape
@@ -1792,4 +1795,39 @@ async fn late_exit_confirmation_does_not_release_the_replacement_slots() {
     }
     release.notify_one();
     assert!(compile.await.unwrap().ok());
+}
+
+/// A cohort member whose answer is never read (its request went away after
+/// the answer was sent) leaves the handoff cohort when that unread answer is
+/// dropped, instead of holding the handoff open for its full 250 ms.
+#[tokio::test(start_paused = true)]
+async fn unread_cohort_answer_leaves_the_handoff_at_once() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    let key = queue_key("worker", QUEUE_GTE, 128);
+    // GTE@128 compiles from about 0.05 s to 4.67 s; its handoff then lasts
+    // until about 4.92 s.
+    let owner = ask_at(&supervisor, &compiler, &worker, QUEUE_GTE, 128, 0.0, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs(1)).await;
+    let joiner = want_with_id(&supervisor, &worker, 9_003, 128, None);
+    tokio::time::sleep_until(compiler.epoch + Duration::from_secs_f64(4.75)).await;
+    assert!(
+        supervisor.inner.lock().slots[&key].joined.contains(&9_003),
+        "the joiner was meant to be in the open handoff"
+    );
+    // The request goes away without reading its answer.
+    drop(joiner);
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    {
+        let state = supervisor.inner.lock();
+        assert!(
+            !state.slots[&key].joined.contains(&9_003),
+            "an unread cohort answer kept its member in the handoff"
+        );
+        assert!(!state.slots[&key].handing_off(tokio::time::Instant::now()));
+    }
+    assert!(owner.await.unwrap().ok());
 }
