@@ -627,6 +627,7 @@ impl Scheduler {
         {
             let mut state = inner.lock();
             self.drop_departed(&mut state, now, &mut effects);
+            self.withdraw_unwanted_compiles(&state, now);
             self.expire_bounds(&mut state, now, &mut effects);
             end_handoffs(&mut state, now);
             self.drive_recoveries(&mut state, now, &mut effects);
@@ -759,6 +760,42 @@ impl Scheduler {
             for task in withdraw {
                 self.op_guards.remove(&task);
             }
+        }
+    }
+
+    /// A compile that has not reached its worker yet is withdrawn once nobody
+    /// waits for it and the last promise made for it has expired, so a
+    /// compile kept only for a promise does not reach the wire after that
+    /// promise lapsed. (A waiter leaving is handled by `drop_departed`.)
+    fn withdraw_unwanted_compiles(&mut self, state: &State, now: tokio::time::Instant) {
+        let withdraw: Vec<tokio::task::Id> = self
+            .op_kinds
+            .iter()
+            .filter(|(task, kind)| {
+                let OpKind::Compile {
+                    key,
+                    slot_id,
+                    retry: false,
+                    ..
+                } = kind
+                else {
+                    return false;
+                };
+                self.op_guards.contains_key(task)
+                    && !self.waiters.values().any(|waiter| waiter.key == *key)
+                    && state.slots.get(key).is_some_and(|slot| {
+                        slot.id == *slot_id
+                            && slot.state == SlotState::Admitting
+                            && slot.dispatched_at.is_none()
+                            && slot
+                                .promise
+                                .is_some_and(|promise| !promise_live(promise, now))
+                    })
+            })
+            .map(|(task, _)| *task)
+            .collect();
+        for task in withdraw {
+            self.op_guards.remove(&task);
         }
     }
 
@@ -1644,11 +1681,19 @@ impl Scheduler {
             .values()
             .filter(|retirement| retirement.reply.is_some())
             .map(|retirement| retirement.deadline);
+        // An undispatched compile is withdrawn when its promise lapses.
+        let lapses = state
+            .slots
+            .values()
+            .filter(|slot| slot.state == SlotState::Admitting && slot.dispatched_at.is_none())
+            .filter_map(|slot| slot.promise)
+            .map(|(at, delay)| at + delay * ORPHAN_EXPIRY_FACTOR);
         bounds
             .chain(entries.flatten())
             .chain(handoffs)
             .chain(recoveries)
             .chain(retirements)
+            .chain(lapses)
             .filter(|at| *at > now)
             .min()
     }

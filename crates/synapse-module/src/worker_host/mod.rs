@@ -5600,13 +5600,16 @@ pub mod ane_residency {
             Ok(Some(lease))
         }
 
-        /// Whether request `id` reserved the compile of `key` that is running.
+        /// Whether request `id` reserved the compile of `key` and that compile
+        /// has already reached the worker. Before then a cancelled owner simply
+        /// leaves, and the scheduler withdraws the compile if nobody else waits
+        /// for it and no promise is live, so nothing reaches the wire.
         fn owns_running_compile(&self, key: &ShapeKey, id: u64) -> bool {
-            self.inner
-                .lock()
-                .slots
-                .get(key)
-                .is_some_and(|slot| slot.state == SlotState::Admitting && slot.owner == Some(id))
+            self.inner.lock().slots.get(key).is_some_and(|slot| {
+                slot.state == SlotState::Admitting
+                    && slot.owner == Some(id)
+                    && slot.dispatched_at.is_some()
+            })
         }
 
         /// Test only: evicts a slot the test has marked `Evicting`, through
@@ -11941,6 +11944,43 @@ pub mod ane_residency {
             );
             assert_eq!(serving.supervisor.stats().admitted, 1);
             assert_eq!(ledger.lock().unwrap().connects["serving"], 1);
+        }
+
+        /// A serving caller that goes away while its compile is reserved but
+        /// still waits for the worker stream leaves nothing on the wire: its
+        /// serving task stops waiting, and the scheduler withdraws the compile
+        /// because nobody else waits for it and nothing was promised.
+        #[tokio::test]
+        async fn cancelled_serving_owner_withdraws_its_undispatched_compile() {
+            let ledger = SharedLedger::default();
+            let serving = serving_fixture(&ledger).await;
+            let busy = serving.channel.stream.lock().await;
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(200),
+                serving.infer(vec![vec![1]], false),
+            )
+            .await;
+            assert!(cancelled.is_err(), "the caller was meant to give up first");
+            let key = ShapeKey {
+                worker_id: "serving".into(),
+                model_ref: serving.metadata.model_ref.clone(),
+                shape: 128,
+                program: AneProgram::Single,
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while serving.supervisor.inner.lock().slots.contains_key(&key) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the cancelled owner's undispatched compile was not withdrawn");
+            drop(busy);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                ledger.lock().unwrap().admit_attempts.is_empty(),
+                "a compile nobody waited for reached the worker"
+            );
+            assert_eq!(serving.supervisor.inner.lock().reserved_executables(), 0);
         }
 
         #[tokio::test]

@@ -820,6 +820,63 @@ async fn promise_given_during_a_reserved_compile_survives_the_owner_cancelling()
     assert_queue_idle(&supervisor);
 }
 
+/// The same reserved compile, kept only for its promise, is withdrawn once
+/// that promise lapses while it still waits for the worker: nobody came back
+/// for it, so it never reaches the wire.
+#[tokio::test(start_paused = true)]
+async fn reserved_compile_is_withdrawn_when_its_promise_lapses_before_dispatch() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let key = queue_key("worker", QUEUE_QWEN, 512);
+    let inference = worker.stream.lock().await;
+    let owner = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker_dyn.clone();
+        async move { supervisor.lease(&worker, QUEUE_QWEN, 512).await }
+    });
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .get(&key)
+            .is_some_and(|slot| slot.state == SlotState::Admitting)
+    })
+    .await;
+    let deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+    let told = supervisor
+        .lease_until(&worker_dyn, QUEUE_QWEN, 512, deadline)
+        .await
+        .err()
+        .expect("the joiner cannot be served in 5 s");
+    let ShapeCompilingRetry(retry_after_ms) = ShapeCompilingRetry::of(&told);
+    owner.abort();
+    let _ = owner.await;
+    // Past twice the promised delay, with the worker still busy.
+    tokio::time::sleep(Duration::from_millis(retry_after_ms * 2 + 1_000)).await;
+    until_within(5, || !supervisor.inner.lock().slots.contains_key(&key)).await;
+    drop(inference);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        compiler.compiles_of("worker").is_empty(),
+        "a compile kept only for a lapsed promise reached the worker"
+    );
+    assert_queue_idle(&supervisor);
+}
+
+struct ShapeCompilingRetry(u64);
+
+impl ShapeCompilingRetry {
+    fn of(error: &AneResidencyError) -> Self {
+        match error {
+            AneResidencyError::ShapeCompiling { retry_after_ms, .. } => Self(*retry_after_ms),
+            other => panic!("expected shape_compiling, got {other:?}"),
+        }
+    }
+}
+
 /// A caller cancelled while its admission's resource-refusal retry evicts a
 /// victim does not lose the retry: the compile still completes.
 #[tokio::test(start_paused = true)]
