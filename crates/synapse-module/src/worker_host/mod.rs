@@ -5412,8 +5412,9 @@ pub mod ane_residency {
         /// Records what a worker's `LOAD` found in aned's compile cache: of the
         /// `checked` rungs of `model_ref`, those in `cached` load from aned's
         /// compiled copy and are predicted as loads, the others as compiles.
-        /// `checked_at` is when the check began (before `LOAD` was sent); a
-        /// rung an admission found cached after that instant keeps that.
+        /// `checked_at` is when the check began (before `LOAD` was sent). For a
+        /// rung an admission found cached after that instant, the admission's
+        /// result is kept instead of this check's.
         pub fn record_compile_cache(
             &self,
             model_ref: &str,
