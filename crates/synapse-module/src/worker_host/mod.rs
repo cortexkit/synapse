@@ -3731,6 +3731,14 @@ pub mod ane_residency {
         /// When the compile queue last predicted the awaited shape to be
         /// ready; a `shape_compiling` answer turns it into `retry_after_ms`.
         ready_at: Mutex<Option<tokio::time::Instant>>,
+        /// The supervisor and shape key of the compile this request waits
+        /// for, so an answer given by the caller's own timer can ask the
+        /// queue for a fresh prediction instead of the last recorded one.
+        compile_wait: Mutex<Option<(std::sync::Weak<Inner>, ShapeKey)>>,
+        /// The `shape_compiling` answer this request was given: when, and
+        /// the retry delay. The first answer wins, and that answer is the
+        /// promise its queued compile is kept for (until orphan expiry).
+        told: Mutex<Option<(tokio::time::Instant, std::time::Duration)>>,
         abandoned: std::sync::atomic::AtomicBool,
         abandonment: Notify,
     }
@@ -3740,6 +3748,8 @@ pub mod ane_residency {
             Self {
                 phase: Mutex::new(WaitPhase::Other),
                 ready_at: Mutex::new(None),
+                compile_wait: Mutex::new(None),
+                told: Mutex::new(None),
                 abandoned: std::sync::atomic::AtomicBool::new(false),
                 abandonment: Notify::new(),
             }
@@ -3757,11 +3767,56 @@ pub mod ane_residency {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
+
+        fn told(&self) -> Option<(tokio::time::Instant, std::time::Duration)> {
+            *self
+                .told
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// Records the answer given, unless an earlier one was recorded.
+        fn record_told(&self, error: &AneResidencyError) {
+            if let AneResidencyError::ShapeCompiling { retry_after_ms, .. } = error {
+                let mut told = self
+                    .told
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                told.get_or_insert((
+                    tokio::time::Instant::now(),
+                    std::time::Duration::from_millis(*retry_after_ms),
+                ));
+            }
+        }
+
+        /// The queue's current prediction for the compile this request
+        /// waits for, or the last one recorded when the queue cannot say.
+        fn fresh_ready(&self) -> Option<tokio::time::Instant> {
+            let waiting = self
+                .compile_wait
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            waiting
+                .and_then(|(inner, key)| {
+                    let inner = inner.upgrade()?;
+                    let state = inner.lock();
+                    state.predicted_ready(&key, tokio::time::Instant::now())
+                })
+                .or_else(|| self.ready_at())
+        }
     }
 
     tokio::task_local! {
         /// The wait phase of the serving request whose task this is.
         static REQUEST_WAITS: Arc<RequestWaits>;
+    }
+
+    tokio::task_local! {
+        /// Set by the worker channel when an admission is written to the
+        /// worker: the moment its compile was dispatched, after any wait for
+        /// the worker stream. The supervisor learns compile times from it.
+        static COMPILE_DISPATCHED: Arc<Mutex<Option<tokio::time::Instant>>>;
     }
 
     // The caller may disappear while dispatched I/O drains in its detached task.
@@ -3809,15 +3864,19 @@ pub mod ane_residency {
 
     /// `shape_compiling` for `shape`, whose retry delay is the time left until
     /// the predicted `ready` instant, but never below the documented minimum.
+    /// The answer is recorded for this task's serving request, if any, so
+    /// its queued compile is kept for the retry that answer promised.
     fn shape_compiling(shape: usize, ready: Option<tokio::time::Instant>) -> AneResidencyError {
         let predicted_ms = ready.map_or(0, |ready| {
             let left = ready.saturating_duration_since(tokio::time::Instant::now());
             u64::try_from(left.as_millis()).unwrap_or(u64::MAX)
         });
-        AneResidencyError::ShapeCompiling {
+        let error = AneResidencyError::ShapeCompiling {
             shape,
             retry_after_ms: predicted_ms.max(ANE_SHAPE_COMPILING_RETRY_AFTER_MS),
-        }
+        };
+        let _ = REQUEST_WAITS.try_with(|waits| waits.record_told(&error));
+        error
     }
 
     fn deadline_cause_error(
@@ -3842,6 +3901,10 @@ pub mod ane_residency {
                     .ready_at
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *waits
+                    .compile_wait
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             }
         });
     }
@@ -3856,6 +3919,24 @@ pub mod ane_residency {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = ready;
             }
         });
+    }
+
+    /// Records which queued or running compile this task's request waits for.
+    fn set_compile_wait(inner: &Arc<Inner>, key: &ShapeKey) {
+        let _ = REQUEST_WAITS.try_with(|waits| {
+            if !matches!(*waits.lock(), WaitPhase::Expired(_)) {
+                *waits
+                    .compile_wait
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((Arc::downgrade(inner), key.clone()));
+            }
+        });
+    }
+
+    /// The `shape_compiling` answer this task's request was given, if any.
+    fn told_retry() -> Option<(tokio::time::Instant, std::time::Duration)> {
+        REQUEST_WAITS.try_with(|waits| waits.told()).unwrap_or(None)
     }
 
     /// The deadline expired during a wait whose cause is `cause`. The first
@@ -3874,7 +3955,7 @@ pub mod ane_residency {
             })
             .unwrap_or(cause);
         let ready = REQUEST_WAITS
-            .try_with(|waits| waits.ready_at())
+            .try_with(|waits| waits.fresh_ready())
             .unwrap_or(None);
         deadline_cause_error(recorded, ready)
     }
@@ -4028,6 +4109,12 @@ pub mod ane_residency {
         /// Identifies the owning process, not just the stable worker name.
         fn generation(&self) -> u64 {
             0
+        }
+        /// Whether a restart could not confirm that the old worker process
+        /// exited. Its hardware ownership is then unknown, so the worker
+        /// stays closed rather than being retried.
+        fn exit_unconfirmed(&self) -> bool {
+            false
         }
         fn evict_shape_at_generation<'a>(
             &'a self,
@@ -4264,11 +4351,22 @@ pub mod ane_residency {
         packed_qualified: bool,
         joined: BTreeSet<u64>,
         handoff_until: Option<tokio::time::Instant>,
-        /// When the compile behind an `Admitting` slot was dispatched, its
+        /// When the compile behind an `Admitting` slot was reserved, its
         /// predicted duration, and the worker's seed estimate for it.
         compile_started: tokio::time::Instant,
         compile_cost: std::time::Duration,
         compile_seed: std::time::Duration,
+        /// The queue entry this compile came from, so an admission cancelled
+        /// before it reached the worker can be queued again in its old place.
+        queued_as: Option<QueuedPlace>,
+    }
+
+    /// Where a compile stood in the queue: its creation order and start key.
+    #[derive(Clone, Copy, Debug)]
+    struct QueuedPlace {
+        seq: u64,
+        enqueued_at: tokio::time::Instant,
+        start_key: tokio::time::Instant,
     }
 
     impl Slot {
@@ -4307,7 +4405,10 @@ pub mod ane_residency {
         /// aging. An entry of cost C can only be passed by entries that
         /// arrive less than C after it, so a wide compile still gets a turn.
         start_key: tokio::time::Instant,
-        cost: std::time::Duration,
+        /// The worker's seed estimate. The duration used in predictions is
+        /// recomputed from it on every read ([`State::estimate`]), so an
+        /// entry queued before the first measured compile is repriced once
+        /// the machine factor is known; only `start_key` stays fixed.
         seed: std::time::Duration,
         worker: Arc<dyn AneShapeWorker>,
         executables: usize,
@@ -4316,6 +4417,11 @@ pub mod ane_residency {
         /// finds the shape compiled, but only for [`ORPHAN_EXPIRY_FACTOR`]
         /// times that delay unless another request attaches.
         promise: Option<(tokio::time::Instant, std::time::Duration)>,
+        /// The queue ticket of the one task driving this entry while no
+        /// request waits for it. Recorded under the state lock when the
+        /// driver is created, so two requests leaving at once cannot start
+        /// two drivers, and never counted as a waiting request.
+        driver_ticket: Option<u64>,
     }
 
     impl QueuedCompile {
@@ -4326,7 +4432,7 @@ pub mod ane_residency {
         /// When this entry may start: compiles with a known cost wait a short
         /// gathering window so compiles requested together start cheapest first.
         fn gathered_at(&self) -> tokio::time::Instant {
-            if self.cost.is_zero() {
+            if self.seed.is_zero() {
                 self.enqueued_at
             } else {
                 self.enqueued_at + COMPILE_GATHER
@@ -4337,6 +4443,14 @@ pub mod ane_residency {
         fn orphan_expiry(&self) -> Option<tokio::time::Instant> {
             self.promise
                 .map(|(promised_at, retry)| promised_at + retry * ORPHAN_EXPIRY_FACTOR)
+        }
+
+        fn place(&self) -> QueuedPlace {
+            QueuedPlace {
+                seq: self.seq,
+                enqueued_at: self.enqueued_at,
+                start_key: self.start_key,
+            }
         }
     }
 
@@ -4421,19 +4535,26 @@ pub mod ane_residency {
             self.waiters.len() != queued
         }
 
+        /// Whether `worker_id` cannot compile now: it is being recovered or
+        /// retired. Its queued compiles keep their place but are not elected,
+        /// so they cannot hold up other workers' compiles.
+        fn worker_unavailable(&self, worker_id: &str) -> bool {
+            self.recovering.contains(worker_id) || self.retired.contains(worker_id)
+        }
+
         /// The queued request whose compile starts next: among requests whose
-        /// shape has no slot yet, the one whose queue entry has the smallest
-        /// start key, then the earliest in the queue. Requests not decided yet
-        /// come last.
+        /// shape has no slot yet and whose worker can compile, the one whose
+        /// queue entry has the smallest start key, then the earliest in the
+        /// queue. Requests not decided yet come last.
         fn budget_head(&self) -> Option<u64> {
             self.waiters
                 .iter()
                 .enumerate()
                 .filter(|(_, ticket)| {
-                    !self
-                        .waiter_keys
-                        .get(ticket)
-                        .is_some_and(|key| self.slots.contains_key(key))
+                    let key = self.waiter_keys.get(ticket);
+                    !key.is_some_and(|key| {
+                        self.slots.contains_key(key) || self.worker_unavailable(&key.worker_id)
+                    })
                 })
                 .min_by_key(|(position, ticket)| {
                     let entry = self
@@ -4460,9 +4581,11 @@ pub mod ane_residency {
             seed.mul_f64(self.machine_factor.unwrap_or(1.0))
         }
 
-        /// Records a finished compile so later predictions use it.
+        /// Records a standalone compile so later predictions use it. Only
+        /// single-shape programs are learned: the seed describes one shape,
+        /// so a packed program measured against it would skew the factor.
         fn learn(&mut self, key: &ShapeKey, seed: std::time::Duration, took: std::time::Duration) {
-            if seed.is_zero() || took.is_zero() {
+            if seed.is_zero() || took.is_zero() || key.program != AneProgram::Single {
                 return;
             }
             self.measured_costs
@@ -4474,10 +4597,14 @@ pub mod ane_residency {
             });
         }
 
+        /// Whether the module-wide compile gate is held: a compile is
+        /// running, or one failed and its worker's exit is not confirmed yet
+        /// (that compile may still be running in the old process). A failed
+        /// slot is removed only by recovery or retirement after confirmed exit.
         fn compile_running(&self) -> bool {
             self.slots
                 .values()
-                .any(|slot| slot.state == SlotState::Admitting)
+                .any(|slot| matches!(slot.state, SlotState::Admitting | SlotState::Failed))
         }
 
         fn running_remaining(&self, now: tokio::time::Instant) -> std::time::Duration {
@@ -4496,9 +4623,20 @@ pub mod ane_residency {
                 .min()
         }
 
+        /// Whether a request (not the entry's own driver) is queued for `key`,
+        /// counting one that has enqueued but not decided yet.
+        fn requested(&self, key: &ShapeKey) -> bool {
+            let driver = self.entries.get(key).and_then(|entry| entry.driver_ticket);
+            self.waiter_keys
+                .iter()
+                .any(|(ticket, waiting)| waiting == key && Some(*ticket) != driver)
+        }
+
         /// When `key` is predicted to be resident: the rest of the running
-        /// compile, then every queued compile ordered before it, then its own.
-        /// `None` when `key` is neither compiling nor queued.
+        /// compile, then every queued compile ordered before it, then its own,
+        /// each at its current estimate. Entries of workers that cannot compile
+        /// now are not elected, so they are not counted ahead. `None` when
+        /// `key` is neither compiling nor queued.
         fn predicted_ready(
             &self,
             key: &ShapeKey,
@@ -4511,11 +4649,13 @@ pub mod ane_residency {
             let entry = self.entries.get(key)?;
             let ahead: std::time::Duration = self
                 .entries
-                .values()
-                .filter(|other| other.order() < entry.order())
-                .map(|other| other.cost)
+                .iter()
+                .filter(|(other, queued)| {
+                    queued.order() < entry.order() && !self.worker_unavailable(&other.worker_id)
+                })
+                .map(|(other, queued)| self.estimate(other, queued.seed))
                 .sum();
-            Some(now + self.running_remaining(now) + ahead + entry.cost)
+            Some(now + self.running_remaining(now) + ahead + self.estimate(key, entry.seed))
         }
 
         /// Queues a cold compile for `key`. Its start key is `now + cost`,
@@ -4552,19 +4692,21 @@ pub mod ane_residency {
                     seq: self.next_entry,
                     enqueued_at: now,
                     start_key,
-                    cost,
                     seed,
                     worker: worker.clone(),
                     executables,
                     promise: None,
+                    driver_ticket: None,
                 },
             );
         }
 
         /// The next instant a waiting request must re-check its turn without
         /// another event: a handoff ending or a queue entry's gathering
-        /// window closing.
-        fn next_timer(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        /// window closing. `decided_at` must be the instant the request's last
+        /// decision used, so a window that closed after that decision still
+        /// wakes it (at once) instead of being skipped.
+        fn next_timer(&self, decided_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
             let handoff = self
                 .slots
                 .values()
@@ -4574,7 +4716,7 @@ pub mod ane_residency {
                 .entries
                 .values()
                 .map(QueuedCompile::gathered_at)
-                .filter(|at| *at > now);
+                .filter(|at| *at > decided_at);
             handoff.chain(gather).min()
         }
 
@@ -4634,6 +4776,11 @@ pub mod ane_residency {
         admission_gate: Option<Arc<tokio::sync::Mutex<()>>>,
         #[cfg(test)]
         lease_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        /// Holds a waiting request once, right after a decision to wait and
+        /// before its wakeup timer is armed, so a test can move the clock
+        /// between the two.
+        #[cfg(test)]
+        wait_decision_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
         #[cfg(unix)]
         lane_lock: Mutex<Option<AneDirectLaneLock>>,
         #[cfg(unix)]
@@ -4666,6 +4813,21 @@ pub mod ane_residency {
                 id,
             }
         }
+
+        /// Enqueues a request for `key`, registered for that key at once, so
+        /// a request that has not made its first decision yet already counts
+        /// as waiting for the shape (an orphaned entry is not expired under it).
+        fn enqueue_for(inner: &Arc<Inner>, key: &ShapeKey) -> Self {
+            let mut state = inner.lock();
+            state.next_ticket += 1;
+            let id = state.next_ticket;
+            state.waiters.push_back(id);
+            state.waiter_keys.insert(id, key.clone());
+            Self {
+                inner: inner.clone(),
+                id,
+            }
+        }
     }
 
     impl Drop for QueueTicket {
@@ -4673,32 +4835,58 @@ pub mod ane_residency {
             let mut state = self.inner.lock();
             let key = state.waiter_keys.get(&self.id).cloned();
             let removed = state.leave_queue(self.id);
-            // The last request for a queued compile has left. Keep the entry,
-            // driven by a task of its own, until its orphan expiry
-            // (ORPHAN_EXPIRY_FACTOR times the retry delay it promised);
-            // without a live promise nobody will come back for it.
             let mut orphan = None;
             if let Some(key) = key {
-                let still_wanted = state.waiter_keys.values().any(|waiting| *waiting == key);
-                if let Some(entry) = state.entries.get(&key).filter(|_| !still_wanted) {
-                    let live = entry
-                        .orphan_expiry()
-                        .is_some_and(|expiry| tokio::time::Instant::now() < expiry);
-                    if live && tokio::runtime::Handle::try_current().is_ok() {
-                        orphan = Some(key);
-                    } else {
-                        state.entries.remove(&key);
+                if let Some(entry) = state.entries.get_mut(&key) {
+                    if entry.driver_ticket == Some(self.id) {
+                        entry.driver_ticket = None;
                     }
                 }
+                orphan = adopt_orphan(&self.inner, &mut state, &key);
             }
             drop(state);
-            if let Some(key) = orphan {
-                tokio::spawn(drive_orphan(self.inner.clone(), key));
+            if let Some((key, ticket)) = orphan {
+                tokio::spawn(drive_orphan(self.inner.clone(), key, ticket));
             }
             if removed {
                 self.inner.changed.notify_waiters();
             }
         }
+    }
+
+    /// Called when a request for `key` has left. If no request waits for its
+    /// queued compile any more, keep the entry, driven by a task of its own,
+    /// until its orphan expiry ([`ORPHAN_EXPIRY_FACTOR`] times the retry delay
+    /// it promised); without a live promise nobody will come back for it, so
+    /// the entry is dropped. The driver's ticket is created here, under the
+    /// same lock as the decision, so there is never more than one driver.
+    /// Returns the key and ticket of a driver the caller must spawn.
+    fn adopt_orphan(
+        inner: &Arc<Inner>,
+        state: &mut State,
+        key: &ShapeKey,
+    ) -> Option<(ShapeKey, u64)> {
+        if state.requested(key) {
+            return None;
+        }
+        let entry = state.entries.get(key)?;
+        if entry.driver_ticket.is_some() {
+            return None;
+        }
+        let live = entry
+            .orphan_expiry()
+            .is_some_and(|expiry| tokio::time::Instant::now() < expiry);
+        if !live || tokio::runtime::Handle::try_current().is_err() {
+            state.entries.remove(key);
+            inner.changed.notify_waiters();
+            return None;
+        }
+        state.next_ticket += 1;
+        let ticket = state.next_ticket;
+        state.waiters.push_back(ticket);
+        state.waiter_keys.insert(ticket, key.clone());
+        state.entries.get_mut(key)?.driver_ticket = Some(ticket);
+        Some((key.clone(), ticket))
     }
 
     enum Step {
@@ -4712,6 +4900,10 @@ pub mod ane_residency {
         /// `Some(shape)`: the shape this request needs has a slot in
         /// `Admitting`, i.e. its executables are being compiled.
         Wait(Option<usize>),
+        /// The head's shape cannot be ready by its bound, predicted to be
+        /// ready at the given instant: answer it before dispatching or
+        /// evicting anything for it.
+        Refuse(tokio::time::Instant),
         Retired,
     }
 
@@ -4735,6 +4927,8 @@ pub mod ane_residency {
                     admission_gate: None,
                     #[cfg(test)]
                     lease_decision_gate: Mutex::new(None),
+                    #[cfg(test)]
+                    wait_decision_gate: Mutex::new(None),
                     #[cfg(unix)]
                     lane_lock: Mutex::new(None),
                     #[cfg(unix)]
@@ -4758,6 +4952,8 @@ pub mod ane_residency {
                     admission_gate: None,
                     #[cfg(test)]
                     lease_decision_gate: Mutex::new(None),
+                    #[cfg(test)]
+                    wait_decision_gate: Mutex::new(None),
                     lane_path: Some(lock.path().to_path_buf()),
                     lane_lock: Mutex::new(Some(lock)),
                 }),
@@ -5017,7 +5213,7 @@ pub mod ane_residency {
             let deadline = tokio::time::Instant::now() + self.inner.wait_timeout;
             // The latest moment this request can still use its shape.
             let bound = request_deadline.map_or(deadline, |request| request.min(deadline));
-            let ticket = QueueTicket::enqueue(&self.inner);
+            let ticket = QueueTicket::enqueue_for(&self.inner, &key);
             #[cfg(test)]
             admission_trace::queue(ticket.id, model_ref, shape);
             let outcome = self
@@ -5026,34 +5222,49 @@ pub mod ane_residency {
             // Keep the compile queued for a caller that was told to come back:
             // one answered `shape_compiling` here, or whose deadline expired
             // while it waited on a compile and was answered that by the
-            // serving task. A caller that simply went away gets no promise,
-            // so its queued compile is dropped with it.
-            let told_to_retry = match &outcome {
-                Err(AneResidencyError::ShapeCompiling { .. }) => true,
+            // serving task. The promise is exactly the delay that caller was
+            // given. A caller that simply went away gets no promise, so its
+            // queued compile is dropped with it.
+            let told = match &outcome {
+                Err(AneResidencyError::ShapeCompiling { retry_after_ms, .. }) => {
+                    Some(told_retry().unwrap_or((
+                        tokio::time::Instant::now(),
+                        std::time::Duration::from_millis(*retry_after_ms),
+                    )))
+                }
                 Err(AneResidencyError::Abandoned) => REQUEST_WAITS
                     .try_with(|waits| matches!(*waits.lock(), WaitPhase::Expired(Some(_))))
-                    .unwrap_or(false),
-                _ => false,
+                    .unwrap_or(false)
+                    .then(told_retry)
+                    .flatten(),
+                _ => None,
             };
-            if told_to_retry {
-                self.promise_on_exit(&key);
+            if let Some(told) = told {
+                self.promise_on_exit(&key, told);
             }
             outcome
         }
 
-        /// The request is leaving while its shape's compile is still queued:
-        /// record the retry delay it was (or would have been) given, so the
-        /// entry stays queued for a retry until its orphan expiry
-        /// ([`ORPHAN_EXPIRY_FACTOR`] times that delay).
-        fn promise_on_exit(&self, key: &ShapeKey) {
+        /// The request is leaving while its shape's compile is still queued,
+        /// having been told to retry after `told`: keep the entry queued for
+        /// that retry until its orphan expiry ([`ORPHAN_EXPIRY_FACTOR`] times
+        /// the delay). If no other request waits for it and its admission
+        /// already left the queue (it was cancelled before reaching the
+        /// worker and queued again), the entry's driver is started here.
+        fn promise_on_exit(
+            &self,
+            key: &ShapeKey,
+            told: (tokio::time::Instant, std::time::Duration),
+        ) {
             let mut state = self.inner.lock();
-            let now = tokio::time::Instant::now();
-            let Some(ready) = state.predicted_ready(key, now) else {
+            let Some(entry) = state.entries.get_mut(key) else {
                 return;
             };
-            if let Some(entry) = state.entries.get_mut(key) {
-                let minimum = std::time::Duration::from_millis(ANE_SHAPE_COMPILING_RETRY_AFTER_MS);
-                entry.promise = Some((now, ready.saturating_duration_since(now).max(minimum)));
+            entry.promise = Some(told);
+            let orphan = adopt_orphan(&self.inner, &mut state, key);
+            drop(state);
+            if let Some((key, ticket)) = orphan {
+                tokio::spawn(drive_orphan(self.inner.clone(), key, ticket));
             }
         }
 
@@ -5094,7 +5305,17 @@ pub mod ane_residency {
                     }
                 }
                 ensure_request_live()?;
-                match self.next_step(ticket.id, key, worker, executables) {
+                // One instant for the decision and for the wakeup it arms, so a
+                // gathering window that closes in between is not missed.
+                let decided_at = tokio::time::Instant::now();
+                match self.next_step_at(
+                    ticket.id,
+                    key,
+                    worker,
+                    executables,
+                    decided_at,
+                    Some(bound),
+                ) {
                     Step::Retired => {
                         return Err(AneResidencyError::Channel("worker is retired".into()))
                     }
@@ -5103,10 +5324,18 @@ pub mod ane_residency {
                         admission_trace::event("lease_grant", model_ref, shape);
                         return Ok(lease);
                     }
+                    Step::Refuse(ready) => {
+                        // Checked before dispatching or evicting anything:
+                        // the shape cannot be ready by the bound.
+                        enter_wait(WaitPhase::Compile(shape));
+                        set_ready(Some(ready));
+                        return Err(shape_compiling(shape, Some(ready)));
+                    }
                     Step::Admit(slot_id) => {
                         // The slot is Admitting from here on: a deadline that
                         // expires now expires on this shape's compile.
                         enter_wait(WaitPhase::Compile(key.shape));
+                        set_compile_wait(&self.inner, key);
                         let shape = key.shape;
                         let lease = self.admit(worker.clone(), key.clone(), slot_id).await?;
                         #[cfg(test)]
@@ -5120,19 +5349,34 @@ pub mod ane_residency {
                         return Ok(lease);
                     }
                     Step::Evict {
-                        key,
+                        key: victim,
                         slot_id,
                         owner,
                     } => {
-                        enter_wait(WaitPhase::Other);
-                        self.evict(owner, key, slot_id).await;
+                        // The head evicts to make room for its own compile, so
+                        // a deadline during the eviction is a wait on that
+                        // compile.
+                        enter_wait(WaitPhase::Compile(shape));
+                        set_compile_wait(&self.inner, key);
+                        self.evict(owner, victim, slot_id).await;
                     }
                     Step::Wait(compiling) => {
+                        #[cfg(test)]
+                        {
+                            let gate = self.inner.wait_decision_gate.lock().unwrap().take();
+                            if let Some((decided, resume)) = gate {
+                                decided.notify_one();
+                                resume.notified().await;
+                            }
+                        }
                         enter_wait(compiling.map_or(WaitPhase::Other, WaitPhase::Compile));
-                        let now = tokio::time::Instant::now();
+                        if compiling.is_some() {
+                            set_compile_wait(&self.inner, key);
+                        }
                         let (ready, timer) = {
                             let mut state = self.inner.lock();
-                            let ready = compiling.and_then(|_| state.predicted_ready(key, now));
+                            let ready =
+                                compiling.and_then(|_| state.predicted_ready(key, decided_at));
                             if ready.is_some_and(|ready| ready <= bound)
                                 && state.entries.contains_key(key)
                             {
@@ -5142,7 +5386,7 @@ pub mod ane_residency {
                             // cancels its handoff, and when a queued compile's
                             // gathering window closes; neither needs an
                             // unrelated notification.
-                            (ready, state.next_timer(now))
+                            (ready, state.next_timer(decided_at))
                         };
                         set_ready(ready);
                         if let Some(ready) = ready.filter(|ready| *ready > bound) {
@@ -5170,13 +5414,17 @@ pub mod ane_residency {
                                 Err(_) => true,
                             };
                         if timed_out {
-                            if request_deadline
-                                .is_some_and(|request| tokio::time::Instant::now() >= request)
-                            {
+                            let request_expired = request_deadline
+                                .is_some_and(|request| tokio::time::Instant::now() >= request);
+                            // A wait on the compile queue that reaches the bound
+                            // (the request's deadline, or the 600 s backstop when
+                            // it has none) is answered shape_compiling with the
+                            // queue's current prediction, and its compile stays
+                            // queued for the retry. Only a wait for budget keeps
+                            // the resource refusal.
+                            if request_expired || compiling.is_some() {
                                 #[cfg(test)]
                                 pass_worker_gate(worker).await;
-                                // Answer with the queue's current prediction, not the
-                                // one made when the wait began.
                                 let now = tokio::time::Instant::now();
                                 set_ready(
                                     compiling
@@ -5284,7 +5532,7 @@ pub mod ane_residency {
             model_ref: &str,
         ) -> Result<Option<AneShapeLease>, AneResidencyError> {
             let key = Self::packed_key(worker, model_ref);
-            let ticket = QueueTicket::enqueue(&self.inner);
+            let ticket = QueueTicket::enqueue_for(&self.inner, &key);
             loop {
                 {
                     let state = self.inner.lock();
@@ -5305,7 +5553,7 @@ pub mod ane_residency {
                     } => {
                         self.evict(owner, key, slot_id).await;
                     }
-                    Step::Wait(_) => return Ok(None),
+                    Step::Wait(_) | Step::Refuse(_) => return Ok(None),
                     Step::Retired => {
                         return Err(AneResidencyError::Channel("worker is retired".into()))
                     }
@@ -5437,6 +5685,30 @@ pub mod ane_residency {
             worker: &Arc<dyn AneShapeWorker>,
             executables: usize,
         ) -> Step {
+            self.next_step_at(
+                ticket,
+                key,
+                worker,
+                executables,
+                tokio::time::Instant::now(),
+                None,
+            )
+        }
+
+        /// Decides this request's next step at the instant `now`. A request
+        /// with a `bound` (its deadline, or the admission wait backstop) that
+        /// becomes the head is refused when its shape cannot be ready by then,
+        /// before anything is dispatched or evicted for it.
+        fn next_step_at(
+            &self,
+            ticket: u64,
+            key: &ShapeKey,
+            worker: &Arc<dyn AneShapeWorker>,
+            executables: usize,
+            now: tokio::time::Instant,
+            bound: Option<tokio::time::Instant>,
+        ) -> Step {
+            let instant = now;
             let mut state = self.inner.lock();
             if state.retired.contains(worker.worker_id()) {
                 return Step::Retired;
@@ -5482,12 +5754,18 @@ pub mod ane_residency {
             }
             // The shape needs a cold compile: it waits in the compile queue,
             // whose order decides which request may reserve budget next.
-            let instant = tokio::time::Instant::now();
             if !state.entries.contains_key(key) {
                 state.create_entry(key, worker, executables, instant);
             }
             if state.budget_head() != Some(ticket) {
                 return Step::Wait(Some(key.shape));
+            }
+            if let Some(ready) = bound.and_then(|bound| {
+                state
+                    .predicted_ready(key, instant)
+                    .filter(|ready| *ready > bound)
+            }) {
+                return Step::Refuse(ready);
             }
             let now = state.tick();
             let model_full = state.model_count(&key.model_ref) >= self.inner.limits.per_model;
@@ -5509,6 +5787,9 @@ pub mod ane_residency {
                     return Step::Wait(Some(key.shape));
                 }
                 let queued = state.entries.remove(key);
+                let compile_cost = queued
+                    .as_ref()
+                    .map_or(Default::default(), |entry| state.estimate(key, entry.seed));
                 state.next_slot += 1;
                 let id = state.next_slot;
                 state.slots.insert(
@@ -5526,12 +5807,11 @@ pub mod ane_residency {
                         joined: BTreeSet::new(),
                         handoff_until: None,
                         compile_started: instant,
-                        compile_cost: queued
-                            .as_ref()
-                            .map_or(Default::default(), |entry| entry.cost),
+                        compile_cost,
                         compile_seed: queued
                             .as_ref()
                             .map_or(Default::default(), |entry| entry.seed),
+                        queued_as: queued.as_ref().map(QueuedCompile::place),
                     },
                 );
                 state.leave_queue(ticket);
@@ -5593,6 +5873,7 @@ pub mod ane_residency {
             // if the waiting request is dropped part way through.
             let supervisor = self.clone();
             let waits = REQUEST_WAITS.try_with(Arc::clone).ok();
+            let (failed_worker, failed_key) = (worker.clone(), key.clone());
             #[cfg(test)]
             let trace = admission_trace::current();
             let task = tokio::spawn(async move {
@@ -5602,13 +5883,33 @@ pub mod ane_residency {
                         Some(gate) => Some(gate.lock().await),
                         None => None,
                     };
-                    match worker
-                        .admit_program(generation, &key.model_ref, key.shape, key.program)
-                        .await
-                    {
-                        Ok(inventory) => finish_admit(&inner, &key, slot_id, inventory),
+                    // Learn from the compile itself: from the moment the
+                    // admission reached the worker (after any wait for its
+                    // stream), or, for workers that do not report that, from
+                    // the call.
+                    let dispatched = Arc::new(Mutex::new(None));
+                    let called = tokio::time::Instant::now();
+                    let result = COMPILE_DISPATCHED
+                        .scope(
+                            dispatched.clone(),
+                            worker.admit_program(
+                                generation,
+                                &key.model_ref,
+                                key.shape,
+                                key.program,
+                            ),
+                        )
+                        .await;
+                    match result {
+                        Ok(inventory) => {
+                            let started = dispatched
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .unwrap_or(called);
+                            finish_admit(&inner, &key, slot_id, inventory, Some(started.elapsed()))
+                        }
                         Err(AneResidencyError::Abandoned) => {
-                            forget_failed_admission(&inner, &key, slot_id);
+                            requeue_cancelled_admission(&inner, &key, slot_id);
                             Err(AneResidencyError::Abandoned)
                         }
                         Err(error) if worker.generation() != generation => {
@@ -5637,9 +5938,27 @@ pub mod ane_residency {
                 let operation = admission_trace::scope(trace, operation);
                 operation.await
             });
-            task.await.map_err(|error| {
-                AneResidencyError::Channel(format!("shape admission task failed: {error}"))
-            })?
+            match task.await {
+                Ok(result) => result,
+                Err(error) => {
+                    // The admission task panicked or was cancelled. Its compile
+                    // may already be running in the worker, so the slot keeps
+                    // holding the compile gate and its budget (as Failed)
+                    // until the worker's restart confirms the old process has
+                    // exited; that restart then removes the slot. The
+                    // recovery runs on its own task so a caller that goes away
+                    // cannot stop it half way.
+                    mark_failed_admission(&self.inner, &failed_key, slot_id);
+                    let inner = self.inner.clone();
+                    let _ = tokio::spawn(async move {
+                        recover_worker_at_generation(&inner, &failed_worker, generation).await
+                    })
+                    .await;
+                    Err(AneResidencyError::Channel(format!(
+                        "shape admission task failed: {error}"
+                    )))
+                }
+            }
         }
 
         async fn evict(&self, owner: Arc<dyn AneShapeWorker>, key: ShapeKey, slot_id: u64) -> bool {
@@ -5732,12 +6051,18 @@ pub mod ane_residency {
     }
 
     /// Keeps a queued compile moving after the last request waiting for it
-    /// has left (refused early, deadline expired or abandoned), so the retry
-    /// it was told to make finds the shape compiled. It holds a queue ticket
-    /// like a request, without a deadline, and stops when the shape is
-    /// compiled, its worker retires, or no request has attached by the time
-    /// the entry's promise expires.
-    async fn drive_orphan(inner: Arc<Inner>, key: ShapeKey) {
+    /// has left (it was answered shape_compiling), so the retry it was told
+    /// to make finds the shape compiled. It holds the queue ticket created
+    /// for it by [`adopt_orphan`], without a deadline, and stops when the
+    /// shape is compiled, its worker retires, or no request has attached by
+    /// the entry's orphan expiry. It does not evict while another compile
+    /// runs, and once it has evicted for its compile it commits to that
+    /// compile, so it never frees a resident shape and then expires.
+    async fn drive_orphan(inner: Arc<Inner>, key: ShapeKey, ticket: u64) {
+        let ticket = QueueTicket {
+            inner: inner.clone(),
+            id: ticket,
+        };
         let supervisor = AneResidencySupervisor {
             inner: inner.clone(),
         };
@@ -5749,13 +6074,13 @@ pub mod ane_residency {
         else {
             return;
         };
-        let ticket = QueueTicket::enqueue(&inner);
+        let mut committed = false;
         loop {
             let notified = inner.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let now = tokio::time::Instant::now();
-            let (expiry, timer) = {
+            let (expiry, timer, gate_held) = {
                 let mut state = inner.lock();
                 if state.retired.contains(worker.worker_id()) {
                     state.entries.remove(&key);
@@ -5765,21 +6090,23 @@ pub mod ane_residency {
                     // Started or dropped by someone else.
                     return;
                 };
-                let attached = state
-                    .waiter_keys
-                    .iter()
-                    .any(|(other, waiting)| *other != ticket.id && *waiting == key);
-                let expiry = entry.orphan_expiry();
-                if !attached && expiry.is_none_or(|expiry| now >= expiry) {
+                let attached = state.requested(&key);
+                let expiry = entry.orphan_expiry().filter(|_| !attached && !committed);
+                if !attached && !committed && expiry.is_none_or(|expiry| now >= expiry) {
                     // Clearing the promise lets the ticket's drop remove the entry.
                     if let Some(entry) = state.entries.get_mut(&key) {
                         entry.promise = None;
                     }
                     return;
                 }
-                (expiry.filter(|_| !attached), state.next_timer(now))
+                (expiry, state.next_timer(now), state.compile_running())
             };
-            match supervisor.next_step(ticket.id, &key, &worker, executables) {
+            let step = if gate_held && !committed {
+                Step::Wait(Some(key.shape))
+            } else {
+                supervisor.next_step_at(ticket.id, &key, &worker, executables, now, None)
+            };
+            match step {
                 Step::Leased(lease) => {
                     drop(lease);
                     return;
@@ -5803,9 +6130,10 @@ pub mod ane_residency {
                     slot_id,
                     owner,
                 } => {
+                    committed = true;
                     supervisor.evict(owner, victim, slot_id).await;
                 }
-                Step::Wait(_) => {
+                Step::Wait(_) | Step::Refuse(_) => {
                     let wake = [expiry, timer].into_iter().flatten().min();
                     match wake {
                         Some(until) => {
@@ -5858,6 +6186,50 @@ pub mod ane_residency {
             .is_some_and(|slot| slot.id == slot_id && slot.state == SlotState::Admitting)
         {
             state.slots.remove(key);
+        }
+        drop(state);
+        inner.changed.notify_waiters();
+    }
+
+    /// The admission was cancelled before it reached the worker, so nothing
+    /// is compiling and the slot is released. If its caller was answered
+    /// shape_compiling (and told to retry), or other requests joined it, the
+    /// compile goes back into the queue in its old place; the caller's
+    /// promise then keeps it there.
+    fn requeue_cancelled_admission(inner: &Inner, key: &ShapeKey, slot_id: u64) {
+        let told = REQUEST_WAITS
+            .try_with(|waits| matches!(*waits.lock(), WaitPhase::Expired(Some(_))))
+            .unwrap_or(false);
+        let mut state = inner.lock();
+        let Some(slot) = state
+            .slots
+            .get(key)
+            .filter(|slot| slot.id == slot_id && slot.state == SlotState::Admitting)
+        else {
+            drop(state);
+            inner.changed.notify_waiters();
+            return;
+        };
+        let joined_waiting = slot
+            .joined
+            .iter()
+            .any(|ticket| state.waiters.contains(ticket));
+        let requeue = slot
+            .queued_as
+            .filter(|_| told || joined_waiting)
+            .map(|place| QueuedCompile {
+                seq: place.seq,
+                enqueued_at: place.enqueued_at,
+                start_key: place.start_key,
+                seed: slot.compile_seed,
+                worker: slot.worker.clone(),
+                executables: slot.executables,
+                promise: None,
+                driver_ticket: None,
+            });
+        state.slots.remove(key);
+        if let Some(entry) = requeue {
+            state.entries.insert(key.clone(), entry);
         }
         drop(state);
         inner.changed.notify_waiters();
@@ -5929,7 +6301,8 @@ pub mod ane_residency {
             .admit_program(generation, &key.model_ref, key.shape, key.program)
             .await
         {
-            Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory),
+            // Not a standalone sample: it followed a refusal and an eviction.
+            Ok(inventory) => finish_admit(&supervisor.inner, &key, slot_id, inventory, None),
             Err(AneResidencyError::Abandoned) => {
                 forget_failed_admission(&supervisor.inner, &key, slot_id);
                 Err(AneResidencyError::Abandoned)
@@ -5958,11 +6331,14 @@ pub mod ane_residency {
         }
     }
 
+    /// `took` is the measured standalone compile time, if this admission is
+    /// one; retried compiles pass `None` and teach nothing.
     fn finish_admit(
         inner: &Arc<Inner>,
         key: &ShapeKey,
         slot_id: u64,
         inventory: AnePlacementInventory,
+        took: Option<std::time::Duration>,
     ) -> Result<AneShapeLease, AneResidencyError> {
         let mut state = inner.lock();
         let now = state.tick();
@@ -5973,7 +6349,7 @@ pub mod ane_residency {
             )));
         };
         let inventory = Arc::new(inventory);
-        let measured = (slot.compile_seed, slot.compile_started.elapsed());
+        let seed = slot.compile_seed;
         slot.state = SlotState::Resident;
         slot.handoff_until = Some(tokio::time::Instant::now() + ADMISSION_HANDOFF);
         slot.leases = 1;
@@ -5983,7 +6359,9 @@ pub mod ane_residency {
             sink.push(Arc::clone(&inventory));
         }
         state.stats.admitted += 1;
-        state.learn(key, measured.0, measured.1);
+        if let Some(took) = took {
+            state.learn(key, seed, took);
+        }
         state.sample();
         drop(state);
         inner.changed.notify_waiters();
@@ -6055,6 +6433,23 @@ pub mod ane_residency {
         }
         if let Err(error) = worker.restart().await {
             tracing::warn!(target:"worker",worker_id=%id,error=%error,"direct-ANE worker restart failed; reservations retained");
+            // The worker's slots (and a failed compile's hold on the compile
+            // gate) stay until a later recovery confirms the exit. When the old
+            // process's exit could not be confirmed, its hardware ownership is
+            // unknown: the worker stays closed, and its queued compiles, which
+            // can never run, are dropped. Otherwise it is no longer marked
+            // recovering, so a later request can lead a new attempt instead
+            // of waiting for ever. Either way the recovering worker's queue
+            // entries are never elected; only a failed compile's slot can
+            // still hold the module-wide compile gate.
+            {
+                let mut state = inner.lock();
+                if worker.exit_unconfirmed() {
+                    state.entries.retain(|key, _| key.worker_id != id);
+                } else {
+                    state.recovering.remove(&id);
+                }
+            }
             inner.changed.notify_waiters();
             return false;
         }
@@ -6563,7 +6958,11 @@ pub mod ane_residency {
             };
             *phase = WaitPhase::Expired(cause);
             drop(phase);
-            deadline_cause_error(cause, waits.ready_at())
+            // Ask the queue now: the prediction recorded when the wait began
+            // can be stale by the whole wait.
+            let error = deadline_cause_error(cause, waits.fresh_ready());
+            waits.record_told(&error);
+            error
         }
 
         /// Lets a test hold an expired wait between its deadline expiring and
@@ -6782,6 +7181,17 @@ pub mod ane_residency {
                 faulted: &self.faulted,
                 completed: false,
             };
+            if matches!(
+                request,
+                WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneAdmitPacked { .. }
+            ) {
+                let _ = COMPILE_DISPATCHED.try_with(|dispatched| {
+                    *dispatched
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(tokio::time::Instant::now());
+                });
+            }
             #[cfg(test)]
             let compile_clock = matches!(request, WorkerRequest::AneAdmitShape { .. })
                 .then(|| CompileRpcClock(std::time::Instant::now()));
@@ -6873,6 +7283,9 @@ pub mod ane_residency {
         }
         fn generation(&self) -> u64 {
             self.generation.load(Ordering::Acquire)
+        }
+        fn exit_unconfirmed(&self) -> bool {
+            self.exit_unconfirmed.load(Ordering::Acquire)
         }
 
         fn admit_shape<'a>(
@@ -9358,6 +9771,9 @@ pub mod ane_residency {
             fn generation(&self) -> u64 {
                 self.0.generation()
             }
+            fn exit_unconfirmed(&self) -> bool {
+                self.0.exit_unconfirmed.load(Ordering::Acquire)
+            }
             fn admit_shape_at_generation<'a>(
                 &'a self,
                 generation: u64,
@@ -10824,6 +11240,7 @@ pub mod ane_residency {
 
         include!("admission_tests.rs");
         include!("compile_queue_tests.rs");
+        include!("compile_queue_fault_tests.rs");
 
         #[tokio::test]
         async fn executable_budget_refuses_before_hardware_limit() {
@@ -11191,6 +11608,17 @@ pub mod ane_residency {
             gate.release(GateSite::Inner);
             release.notify_one();
             inference.await.unwrap().unwrap();
+            // The caller was told shape_compiling, so the compile it was told
+            // to wait for still runs once the stream is free.
+            let model_ref = serving.metadata.model_ref.clone();
+            until(|| {
+                ledger
+                    .lock()
+                    .unwrap()
+                    .resident
+                    .contains(&(model_ref.clone(), 1024))
+            })
+            .await;
             assert_eq!(
                 compiling_at_classification, None,
                 "the admit must still be queued"

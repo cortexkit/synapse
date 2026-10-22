@@ -315,3 +315,45 @@ of the mini's Neural Engine.
   queues in arrival order, never gathers, and is never refused early. Test
   channels backed by instant mock workers use that; production seeds always
   come from the pinned manifest.
+
+### Changes after the October audit of `5631cba9`
+
+Each change below was made after a deterministic test failed against
+`5631cba9`. The tests are in
+`crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs`.
+
+- **A failed compile holds the gate until exit is confirmed.** The gate counts
+  both `Admitting` and `Failed` slots. A failed slot leaves only when recovery or
+  retirement confirms that the old worker process has exited, so a compile that
+  may still be running cannot overlap another one. A panicked admission task is
+  marked failed, and its worker is restarted on a task of its own, including on
+  the orphan path.
+- **One driver per orphaned entry.** The driver's queue ticket is created and
+  recorded on the entry under the same lock as the decision to keep it, and that
+  ticket never counts as a waiting request. A request is registered for its
+  shape when it enqueues, so a retry that has not decided yet counts as attached.
+  A driver does not evict while another compile runs. Once it has evicted, it is
+  committed to its compile and no longer expires.
+- **Promises are what the caller was told.** An entry is kept only for a caller
+  answered `shape_compiling`, for twice the `retry_after_ms` that caller
+  received. When the caller's own timer answers first, the module asks the
+  queue for a fresh prediction instead of reusing the one from the start of the
+  wait. An admission cancelled before it reached the worker goes back into the
+  queue in its old place when its caller was told to retry or other requests
+  joined it.
+- **Refusal before dispatch or eviction.** The queue head's prediction is
+  checked against its bound before it reserves, dispatches or evicts anything. A
+  wait on the compile queue that reaches the 600 s backstop is answered
+  `shape_compiling`, with a fresh prediction and a kept promise. Only a wait for
+  budget keeps `ane_resources_exhausted`.
+- **Learning.** The clock starts when the admission is written to the worker,
+  after any wait for its stream. Compiles retried after a resource refusal, and
+  packed programs, are not learned. Queued entries keep their start key, but
+  their predicted duration is recomputed from the current estimate on every read.
+- **Wakeups and recovery.** A waiting request arms its wakeup timer from the
+  same instant as its decision, so the end of a gathering window is never
+  skipped. Entries whose worker is recovering or retired are not elected, so
+  they cannot block other workers. A failed restart clears `recovering`, so a
+  later recovery can try again. The exception is a restart that could not
+  confirm the old process's exit: that worker stays closed, as before, and its
+  queued compiles are dropped.

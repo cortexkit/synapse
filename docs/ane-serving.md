@@ -115,6 +115,16 @@ retires, so a caller that never retries does not keep compiling and evicting
 shapes others use. A new compile is not ordered ahead of a queued one if that
 would make an accepted request miss its bound.
 
+The queue head's prediction is checked against its bound before anything is
+dispatched or evicted for it. A wait on the compile queue that reaches the 600 s
+backstop is answered `shape_compiling` with a fresh prediction, not
+`ane_resources_exhausted`. A compile that failed or whose admission task
+panicked keeps the compile gate, and its budget, until its worker's restart
+confirms the old process exited. A recovering worker's queued compiles are not
+elected, so they cannot hold up other workers. Compile times are learned from the
+moment the admission reaches the worker, and never from retried compiles or
+packed programs.
+
 The supervisor reserves at most **100 layer executables**, including pending
 admissions and evictions. A leased shape is never an eviction candidate. Eviction
 refunds its charge only after the worker acknowledges release; a busy stream is

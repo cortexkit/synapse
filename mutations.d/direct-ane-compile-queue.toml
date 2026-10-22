@@ -82,3 +82,73 @@ expect_message = "alone it takes"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-panic-holds-gate-until-restart"
+guards = "A panicked admission is marked failed and its worker restarted at once; the gate is released only by that confirmed restart"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "mark_failed_admission(&self.inner, &failed_key, slot_id);"
+new = "// NON-VACUITY BREAK: panic leaves the slot Admitting"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::panicking_orphan_admission_releases_the_gate_after_confirmed_restart"]
+expect_message = "the panicked admission's worker was not restarted promptly"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-single-orphan-driver"
+guards = "Only one orphan driver exists per queued compile, so orphan expiry holds after two refusals before a yield"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """        if entry.driver_ticket.is_some() {
+            return None;
+        }"""
+new = "        // NON-VACUITY BREAK: a second driver may be started"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::two_refusals_before_a_yield_still_expire_the_orphan"]
+expect_message = "the orphan entry outlived twice its promise"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-requeue-cancelled-admission"
+guards = "An admission cancelled before reaching the worker is queued again when its caller was told shape_compiling"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = ".filter(|_| told || joined_waiting)"
+new = ".filter(|_| false && (told || joined_waiting)) /* NON-VACUITY BREAK */"
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::deadline_on_an_own_admit_queued_behind_inference_is_shape_compiling"]
+expect_message = "condition never held"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-backstop-is-shape-compiling"
+guards = "A wait on the compile queue that reaches the 600 s backstop is answered shape_compiling and keeps its compile"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "if request_expired || compiling.is_some() {"
+new = "if request_expired /* NON-VACUITY BREAK */ {"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::accepted_wait_past_the_600s_bound_is_shape_compiling_and_keeps_its_compile"]
+expect_message = "ane_resources_exhausted"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

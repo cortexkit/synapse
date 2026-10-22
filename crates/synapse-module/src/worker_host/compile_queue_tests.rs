@@ -107,9 +107,27 @@ impl SharedCompiler {
     }
 }
 
+/// A fake direct-ANE worker on the shared compiler. Like a real worker it has
+/// one stream: a compile or an eviction holds it, and a test can hold it to
+/// stand for a long inference. A test can also make the next admission
+/// panic, hold or fail the next restart (which starts a new generation, as a
+/// confirmed-exit restart does), and read which shapes were evicted.
 struct FakeCompileWorker {
     id: String,
     compiler: Arc<SharedCompiler>,
+    stream: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
+    panic_next_admit: std::sync::atomic::AtomicBool,
+    fail_next_restart: std::sync::atomic::AtomicBool,
+    restart_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    restarts: AtomicU64,
+    evictions: Mutex<Vec<(String, usize)>>,
+}
+
+impl FakeCompileWorker {
+    fn evicted(&self) -> Vec<(String, usize)> {
+        self.evictions.lock().unwrap().clone()
+    }
 }
 
 impl AneShapeWorker for FakeCompileWorker {
@@ -117,7 +135,10 @@ impl AneShapeWorker for FakeCompileWorker {
         &self.id
     }
     fn stream_idle(&self) -> bool {
-        true
+        self.stream.try_lock().is_ok()
+    }
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
     fn admit_shape<'a>(
         &'a self,
@@ -125,27 +146,63 @@ impl AneShapeWorker for FakeCompileWorker {
         shape: usize,
     ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
         Box::pin(async move {
+            // Nothing reaches the worker until its stream is free, so a
+            // caller that goes away before then cancels the admission.
+            let _stream = cancellable_wait(self.stream.lock()).await?;
+            if self.panic_next_admit.swap(false, Ordering::SeqCst) {
+                panic!("injected panic in a fake admission");
+            }
             self.compiler.compile(&self.id, model_ref, shape).await;
             Ok(AnePlacementInventory::default())
         })
     }
     fn evict_shape<'a>(
         &'a self,
-        _: &'a str,
-        _: usize,
+        model_ref: &'a str,
+        shape: usize,
     ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let _stream = cancellable_wait(self.stream.lock()).await?;
+            self.evictions
+                .lock()
+                .unwrap()
+                .push((model_ref.to_owned(), shape));
+            Ok(())
+        })
     }
     fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let gate = self.restart_gate.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+            if self.fail_next_restart.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::Channel("injected restart failure".into()));
+            }
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
-fn fake_worker(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<dyn AneShapeWorker> {
+fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorker> {
     Arc::new(FakeCompileWorker {
         id: id.into(),
         compiler: compiler.clone(),
+        stream: tokio::sync::Mutex::new(()),
+        generation: AtomicU64::new(0),
+        panic_next_admit: Default::default(),
+        fail_next_restart: Default::default(),
+        restart_gate: Mutex::new(None),
+        restarts: AtomicU64::new(0),
+        evictions: Mutex::new(Vec::new()),
     })
+}
+
+fn fake_worker(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<dyn AneShapeWorker> {
+    fake_handle(compiler, id)
 }
 
 /// What a request got, and when (seconds since the compiler's epoch).
@@ -215,6 +272,17 @@ fn queue_supervisor() -> AneResidencySupervisor {
     AneResidencySupervisor::new(AneResidencyLimits::default())
 }
 
+/// Nothing is queued and the compile gate is free.
+fn assert_queue_idle(supervisor: &AneResidencySupervisor) {
+    let state = supervisor.inner.lock();
+    assert!(
+        state.entries.is_empty(),
+        "queued compiles left behind: {:?}",
+        state.entries.keys().collect::<Vec<_>>()
+    );
+    assert!(!state.compile_running(), "the compile gate is still held");
+}
+
 fn assert_close(actual: f64, expected: f64, tolerance: f64, what: &str) {
     assert!(
         (actual - expected).abs() <= expected * tolerance,
@@ -248,6 +316,7 @@ async fn small_compile_beside_wide_finishes_in_its_standalone_time() {
         "Qwen3@4096 took {:.1} s, more than its own and the small compile's time ({wide_limit:.1} s)",
         wide_answer.waited()
     );
+    assert_queue_idle(&supervisor);
 }
 
 #[tokio::test(start_paused = true)]
@@ -283,6 +352,7 @@ async fn at_most_one_cold_compile_runs_across_workers() {
         "more than one shape compile ran at once: {:?}",
         compiler.records()
     );
+    assert_queue_idle(&supervisor);
 }
 
 #[tokio::test(start_paused = true)]
@@ -310,6 +380,7 @@ async fn queued_compiles_start_cheapest_first() {
     // first (GTE@512 8.1 s, Qwen3@128 10.6 s, Qwen3@4096 84.6 s), not in
     // arrival order.
     assert_eq!(order, ["first", "gte", "qwen", "wide"]);
+    assert_queue_idle(&supervisor);
 }
 
 #[tokio::test(start_paused = true)]
@@ -426,6 +497,7 @@ async fn predicted_overrun_refuses_early_with_honest_retry() {
     assert!(retried.waited() < 0.05, "retry waited {:.2} s", retried.waited());
     assert_eq!(compiler.compiles_of("small").len(), 1);
     assert!(wide_answer.await.unwrap().ok());
+    assert_queue_idle(&supervisor);
 }
 
 #[tokio::test(start_paused = true)]
@@ -574,6 +646,7 @@ async fn orphaned_entry_expires_after_twice_its_promise() {
         "an entry nobody came back for kept compiling: {:?}",
         compiler.compiles_of("small")
     );
+    assert_queue_idle(&supervisor);
 }
 
 #[tokio::test(start_paused = true)]
