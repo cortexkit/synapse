@@ -1197,13 +1197,23 @@ async fn stopped_scheduler_fails_waiting_and_new_requests_promptly() {
     let supervisor = queue_supervisor();
     let worker = fake_handle(&compiler, "worker");
     let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    // A resident shape: leasing it needs no message to the scheduler, so
+    // only the lane's closed flag can refuse it.
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 2048).await.unwrap());
     let inference = worker.stream.lock().await;
     let waiting = tokio::spawn({
         let supervisor = supervisor.clone();
         let worker = worker_dyn.clone();
         async move { supervisor.lease(&worker, QUEUE_GTE, 128).await }
     });
-    until(|| !supervisor.inner.lock().slots.is_empty()).await;
+    until(|| {
+        supervisor
+            .inner
+            .lock()
+            .slots
+            .contains_key(&queue_key("worker", QUEUE_GTE, 128))
+    })
+    .await;
     supervisor
         .inner
         .scheduler_task
@@ -1220,6 +1230,11 @@ async fn stopped_scheduler_fails_waiting_and_new_requests_promptly() {
         matches!(waited, Err(AneResidencyError::SchedulerStopped)),
         "{:?}",
         waited.err()
+    );
+    let resident = supervisor.lease(&worker_dyn, QUEUE_GTE, 2048).await;
+    assert!(
+        matches!(resident, Err(AneResidencyError::SchedulerStopped)),
+        "a resident shape was leased after the scheduler stopped"
     );
     let fresh = tokio::time::timeout(
         Duration::from_secs(1),

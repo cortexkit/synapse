@@ -85,11 +85,37 @@ async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers
         supervisor.try_lease(&key(128), &worker, None).unwrap().is_none(),
         "post-completion traffic must not extend the handoff"
     );
-    for (id, answer) in std::iter::once((original, original_answer)).chain(joiners) {
+    // The handoff's own timer; the head must not have to wait for it.
+    let handoff_until = supervisor.inner.lock().slots[&key(128)]
+        .handoff_until
+        .expect("the completed shape opened a handoff");
+    let mut members = std::iter::once((original, original_answer))
+        .chain(joiners)
+        .peekable();
+    while let Some((id, answer)) = members.next() {
         assert!(matches!(answer.await.unwrap(), scheduler::Answer::Ready));
         let Some(lease) = supervisor.try_lease(&key(128), &worker, Some(id)).unwrap() else {
             panic!("a pre-completion joiner lost its handoff to the budget head");
         };
+        if members.peek().is_some() {
+            drop(lease);
+            // Let the wakeup from this lease drop be handled first.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        }
+        // The last member still holds its lease, so no lease drop wakes the
+        // scheduler: only the last-member nudge can end the handoff before its
+        // timer.
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while supervisor.inner.lock().slots[&key(128)]
+                .handoff_until
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the handoff outlived its last member's lease until its timer");
         drop(lease);
     }
     drop(
@@ -98,6 +124,10 @@ async fn joined_admission_hands_off_before_a_starved_head_and_excludes_newcomers
             .expect("the finite handoff must stop protecting the shape after its cohort drains")
             .unwrap()
             .unwrap(),
+    );
+    assert!(
+        tokio::time::Instant::now() < handoff_until,
+        "the head waited for the handoff timer although the last cohort member had leased"
     );
     assert!(ledger.lock().unwrap().events.contains(&"evict model 128".into()));
 }
