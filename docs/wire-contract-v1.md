@@ -130,11 +130,17 @@ message. A failed download carries `error` beside `state` in its flat status.
   Loaded fingerprint mismatch: `{model_id, expected_fingerprint, actual_fingerprint}`.
   Corrupt blobs are quarantined and affected installs/pins invalidated; other
   blobs are untouched. Explicit download repairs the file; serving never fetches.
-- `module_restarted` — permanent, not safe to retry the same job. Non-terminal
-  downloads fail and clean up on restart; committed installs survive. Submit a
-  new download attempt. No catalog-specific details object is added.
+- `module_restarted` — transient, safe to retry the same request. The module
+  restarted before this job or download finished, so that job id stays terminal;
+  resubmitting the request starts a new attempt. Non-terminal downloads fail and
+  clean up on restart; committed installs survive. No catalog-specific details
+  object is added.
 - `deadline_exceeded` — transient, not safe to retry the same request; request budget expired before
-  readiness. No catalog-specific details object is added.
+  readiness. The deadline is part of the request, and an inline batch records
+  nothing under its `request_key`, so resending it unchanged recomputes from the
+  start under the same budget. Resend it smaller, or with a fresh deadline and
+  key. A same-key resend of a durable job returns that job while it is active.
+  No catalog-specific details object is added.
 - Wrong-task `invalid_request` — permanent, not safe to retry unchanged;
   `{catalog_id, requested_task, catalog_task}`, without load or network I/O.
 - Derived-id management `invalid_request` — permanent, not safe to retry unchanged;
