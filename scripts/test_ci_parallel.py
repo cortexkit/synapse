@@ -74,7 +74,9 @@ class ParallelCiTests(unittest.TestCase):
 class LocalPreflightTests(unittest.TestCase):
     def run_preflight(self, windows_status=0, native_status=0):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # Resolve symlinks: on macOS the temporary folder is reached through
+            # /var -> /private/var, and the preflight records physical paths.
+            root = Path(temp).resolve()
             tools = root / "bin"
             tools.mkdir()
             # The two clippy invocations rendezvous before finishing. A serial
