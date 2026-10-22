@@ -940,6 +940,7 @@ impl Scheduler {
         // The starved-head barrier is recomputed by every pass; requests
         // behind the head starved in the previous pass keep waiting in order.
         let previous_starved = state.starved_head.take();
+        let mut held_by_barrier = false;
         let ids: Vec<u64> = self.waiters.keys().copied().collect();
         for id in ids {
             let Some(waiter) = self.waiters.get_mut(&id) else {
@@ -985,6 +986,7 @@ impl Scheduler {
                         let slot = &state.slots[&key];
                         let cohort = slot.handing_off(now) && slot.joined.contains(&id);
                         if !cohort && !prepare && previous_starved.is_some_and(|head| id > head) {
+                            held_by_barrier = true;
                             continue;
                         }
                         let tick = state.tick();
@@ -1023,6 +1025,12 @@ impl Scheduler {
             }
         }
         self.decide_queue(inner, state, now, effects);
+        // A request held only by the previous pass's starved head is decided
+        // again at once when that barrier changed (for example, the head was
+        // answered by a message), instead of waiting for an unrelated event.
+        if held_by_barrier && state.starved_head != previous_starved {
+            effects.progress = true;
+        }
     }
 
     /// Elects the queued compile that starts next and acts for it. The head

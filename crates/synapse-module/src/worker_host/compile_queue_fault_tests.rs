@@ -1483,3 +1483,23 @@ async fn transport_fault_releases_the_gate_once_exit_is_confirmed_even_if_restar
     assert!(!state.recovering.contains("broken"), "the worker can be recovered again");
     assert_eq!(state.reserved_executables(), 22);
 }
+
+/// A request for a resident shape held behind a starved head is granted in
+/// the same decision round once that barrier is gone, not left waiting for
+/// an unrelated event or its own deadline. The test leaves a barrier behind
+/// with no request under it, as a head answered between two passes does.
+#[tokio::test(start_paused = true)]
+async fn resident_request_behind_a_lapsed_starvation_barrier_is_granted() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    drop(supervisor.lease(&worker, QUEUE_GTE, 128).await.unwrap());
+    supervisor.inner.lock().starved_head = Some(0);
+    let leased = tokio::time::timeout(
+        Duration::from_secs(1),
+        supervisor.lease(&worker, QUEUE_GTE, 128),
+    )
+    .await
+    .expect("a resident request stayed behind a starvation barrier that had lapsed");
+    assert!(leased.is_ok(), "{:?}", leased.err());
+}
