@@ -2,7 +2,20 @@
 
 Status: **approved and implemented**, with option A of section 3, the orphan
 expiry rule of section 1, and the changes recorded under "Changes during
-implementation" at the end. The hardware check on the M4 mini is pending.
+implementation" at the end. The hardware check on the M4 mini (macOS 27.0
+26A428, 3 repeats at `7f096b96`) passed 13 of 15 scheduling arm runs. No two
+compiles overlapped, and there was no resource refusal. Every compile started
+in start-key order, within 0.003 s of the previous one ending, after the 50 ms
+gathering window. The two misses were single compiles that ran slower than
+their standalone time in the same repeat, with nothing else compiling:
+
+- In one `together` run, GTE@128 started first, 0.07 s after its request, and
+  compiled in 9.8 s against 5.8 s standalone.
+- In one `batch` run, the makespan of 139.6 s equals the sum of that arm's six
+  serial compiles. Qwen3@128 took 20.1 s against 12.2 s standalone.
+
+The standalone times themselves varied between repeats: Qwen3@128 took
+12.2–24.0 s.
 
 ## Why
 
