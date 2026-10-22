@@ -10106,7 +10106,7 @@ pub mod ane_residency {
                 .await;
             assert!(
                 matches!(result, Err(AneResidencyError::SchedulerStopped)),
-                "{result:?}"
+                "a packed request was served after the lane closed: {result:?}"
             );
             assert_eq!(
                 peer.lock().unwrap().requests.len(),
