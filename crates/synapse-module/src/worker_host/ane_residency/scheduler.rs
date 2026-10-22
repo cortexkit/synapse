@@ -202,6 +202,9 @@ impl AnswerKind {
 pub(super) struct DispatchCell {
     at: Mutex<Option<tokio::time::Instant>>,
     slot_id: u64,
+    /// Where the slot's dispatch instant is recorded at once, so nobody can
+    /// read the slot as undispatched while its admission is on the wire.
+    inner: std::sync::Weak<Inner>,
     /// Weak, like every sender an operation holds, so that an operation
     /// still running does not keep the scheduler alive after the supervisor
     /// is gone.
@@ -211,6 +214,16 @@ pub(super) struct DispatchCell {
 impl DispatchCell {
     pub(super) fn mark(&self) {
         let now = tokio::time::Instant::now();
+        if let Some(inner) = self.inner.upgrade() {
+            let mut state = inner.lock();
+            if let Some(slot) = state
+                .slots
+                .values_mut()
+                .find(|slot| slot.id == self.slot_id)
+            {
+                slot.dispatched_at = Some(now);
+            }
+        }
         *self
             .at
             .lock()
@@ -1458,6 +1471,7 @@ impl Scheduler {
         let cell = Arc::new(DispatchCell {
             at: Mutex::new(None),
             slot_id,
+            inner: Arc::downgrade(inner),
             report,
         });
         #[cfg(test)]

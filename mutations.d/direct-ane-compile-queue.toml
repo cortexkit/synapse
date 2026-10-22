@@ -325,3 +325,24 @@ expect_message = "an unread cohort answer kept its member in the handoff"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-dispatch-recorded-at-the-wire"
+guards = "A compile's dispatch instant is recorded in the shared state when its admission reaches the worker, not when the scheduler handles the report"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """
+        let now = tokio::time::Instant::now();
+        if let Some(inner) = self.inner.upgrade() {"""
+new = """
+        let now = tokio::time::Instant::now();
+        if let Some(inner) = self.inner.upgrade().filter(|_| false) { // NON-VACUITY BREAK"""
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::dispatch_is_visible_the_moment_the_admission_reaches_the_worker"]
+expect_message = "the slot read as undispatched after its admission reached the worker"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

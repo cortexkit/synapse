@@ -151,6 +151,9 @@ struct FakeCompileWorker {
     evictions: Mutex<Vec<(String, usize)>>,
     /// A supervisor the worker keeps, as the worker channel's connector does.
     held_supervisor: Mutex<Option<AneResidencySupervisor>>,
+    /// Whether, right after the last admission reached this worker, its slot
+    /// in `held_supervisor` already read as dispatched.
+    dispatch_seen_at_wire: Mutex<Option<bool>>,
 }
 
 impl FakeCompileWorker {
@@ -187,6 +190,13 @@ impl AneShapeWorker for FakeCompileWorker {
                 ));
             }
             scheduler::mark_compile_dispatched();
+            let held = self.held_supervisor.lock().unwrap().clone();
+            if let Some(supervisor) = held {
+                let seen = supervisor.inner.lock().slots.values().any(|slot| {
+                    slot.worker.worker_id() == self.id && slot.dispatched_at.is_some()
+                });
+                *self.dispatch_seen_at_wire.lock().unwrap() = Some(seen);
+            }
             let gate = self.admit_gate.lock().unwrap().take();
             if let Some((started, release)) = gate {
                 started.notify_one();
@@ -306,6 +316,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         restarts: AtomicU64::new(0),
         evictions: Mutex::new(Vec::new()),
         held_supervisor: Mutex::new(None),
+        dispatch_seen_at_wire: Mutex::new(None),
     })
 }
 

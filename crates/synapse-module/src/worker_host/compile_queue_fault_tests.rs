@@ -1831,3 +1831,25 @@ async fn unread_cohort_answer_leaves_the_handoff_at_once() {
     }
     assert!(owner.await.unwrap().ok());
 }
+
+/// A compile's dispatch is visible in the shared state the moment its
+/// admission reaches the worker, not only once the scheduler handles the
+/// report: a cancelled owner deciding whether its compile is running must
+/// never read it as undispatched while it is on the wire.
+#[tokio::test(start_paused = true)]
+async fn dispatch_is_visible_the_moment_the_admission_reaches_the_worker() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "worker");
+    *worker.held_supervisor.lock().unwrap() = Some(supervisor.clone());
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    let compiled = ask_at(&supervisor, &compiler, &worker_dyn, QUEUE_GTE, 128, 0.0, None);
+    assert!(compiled.await.unwrap().ok());
+    let seen = worker.dispatch_seen_at_wire.lock().unwrap().take();
+    *worker.held_supervisor.lock().unwrap() = None;
+    assert_eq!(
+        seen,
+        Some(true),
+        "the slot read as undispatched after its admission reached the worker"
+    );
+}
