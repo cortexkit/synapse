@@ -619,3 +619,165 @@ error.
   designed. A cohort member leases through the fast path. The barrier ends when
   the last member leases, or at the scheduler's 250 ms timer.
 
+## 7. Cache-aware predictions and prewarm (proposed)
+
+Status: **proposed, awaiting approval**. aned now keeps compiled programs across
+restarts (see "Compiled programs survive a worker restart" in
+`docs/ane-serving.md`), so a shape it holds loads in about 1–2 s instead of
+compiling for 12–230 s. The scheduler does not know that yet. It predicts a
+full compile, for example about 114 s for Qwen3@4096, and refuses early with a
+long `retry_after_ms` a request that would be served in a second. It also
+learns every admission as a compile. After a restart on a cached machine, the
+first loads (about 1.5 s against a 10.6 s seed) pull the machine factor down
+to about 0.15, and a shape that really is cold is then under-predicted about
+seven times.
+
+### 7.1 What the scheduler knows about the cache
+
+**The check.** A shape is cached when aned holds its layers' programs. To ask
+aned (`compiledModelExists`), the worker needs each layer's identifier, which
+means building the layer graph and hashing its MIL text and weights. Measured
+on the M5 Max (release build, Qwen3-sized weights, no Neural Engine use), graph
+build plus identifier takes per layer:
+
+| Width | 128–2048 | 4096 | 8192 |
+|---|---:|---:|---:|
+| ms per layer | 56–67 | 97 | 191 |
+| every layer of a Qwen3 shape (28) | 1.6–1.9 s | 2.7 s | 5.4 s |
+| first and last layer only | 0.11–0.14 s | 0.19 s | 0.38 s |
+
+Checking every layer of the whole ladder costs about 17 s of worker CPU, close
+to what loading the shapes would cost. A cached admission already spends most
+of its 1.3–1.8 s on this same work. **Proposal: check the first and the last
+layer.** A shape's layers are compiled in order within one admission, so a
+cached last layer means the whole shape was compiled once. A gap in the
+middle (aned removing single programs) is caught at admission (7.3). The
+whole ladder then costs about 1.2 s. The `compiledModelExists` call itself
+could not be timed here: production holds the Neural Engine. The hardware kit
+times it.
+
+**When it runs.** Once, in the worker's `LOAD`, for every ladder rung, after
+the weights are read. Afterwards, knowledge comes from admissions: a shape
+admitted successfully since is cached. The scheduler keeps a table
+`cached[(model_ref, shape)]` with three values: cached, not cached, unknown.
+
+- Each `LOADED` overwrites the model's row.
+- Each successful admission sets the shape to cached, because a compile leaves
+  the program in aned's cache.
+- Nothing else invalidates the table. aned empties its cache on an OS update,
+  which needs a reboot, so the module restarts and loads again. aned can also
+  drop programs after 14 days without use or under storage pressure while the
+  module runs. Admission handles that case (7.3).
+
+**How it is used.** `State::estimate` returns the **load cost** for a shape
+marked cached, and the compile cost otherwise (the compile path is unchanged).
+Load costs are learned separately: `measured_loads[(model_ref, shape)]` from
+admissions that loaded every layer from the cache. Load samples never update
+the machine factor. Until a shape's load has been measured, the load seed is
+`layers ×` 0.10 s up to width 2048, 0.15 s at 4096 and 0.30 s at 8192. These
+values are the CPU cost above plus aned's 3.5–45 ms load, rounded up: about
+2.8 s for Qwen3@512 and 8.4 s at 8192. Start keys use the same estimate, so
+cached shapes start first. A cached load still goes through the one-compile
+gate, because it may turn into a compile.
+
+### 7.2 Protocol: two optional reply fields, no version bump
+
+- `LOADED` gains `ane_cached_shapes: [usize]`, the ladder rungs whose first
+  and last layer aned holds. Omitted when absent.
+- `ADMITTED` gains `cache_hit_layers: u32` and `compiled_layers: u32`, the
+  counts the worker already logs. Omitted when absent.
+
+Nothing else changes: no new request, no HELLO field, no
+`WORKER_PROTOCOL_VERSION` bump, no `EngineIdentity` or fingerprint change.
+
+- **An older worker** sends neither field. Every shape stays unknown and is
+  predicted as a compile, and every admission is learned as a compile. That is
+  today's behaviour.
+- **An older module** reading a newer worker ignores the fields, because
+  `WorkerResponse` does not deny unknown fields. A protocol test pins that, so
+  adding `deny_unknown_fields` later turns a test red.
+
+The worker needs one function from the vendored binding: whether aned holds a
+graph's program. The binding already has `compiled_model_exists` on the
+in-memory model, so the new function is a small wrapper next to
+`program_identifier`. `VENDORED.md` and the harness pin are updated to match.
+
+### 7.3 A cached load that compiles after all
+
+If aned dropped the program after the check, or the cached copy fails to load,
+the worker compiles that layer (`load_program`, unchanged). The prediction
+stays correct:
+
+- A slot admitted as cached also records the shape's compile estimate. Once
+  its admission has run longer than twice its load estimate plus 1 s, its
+  remaining time becomes `compile estimate − elapsed`, but at least one layer.
+  Requests queued behind it then get honest predictions within seconds of the
+  miss, rather than a load's worth of time each pass.
+- On completion, `compiled_layers == layers` is learned as a compile and
+  `cache_hit_layers == layers` as a load. A mix is not learned, because it
+  measures neither cost. The shape is cached afterwards in either case.
+- A request that was accepted on the load prediction and misses its deadline
+  is answered `shape_compiling` with a fresh prediction: the existing path.
+
+### 7.4 Prewarm
+
+When a direct-ANE catalog lane becomes ready, that is after its self-check
+passed, the module sends the scheduler `Prewarm { worker, model_ref, shapes:
+[128, 256, 512] ∩ published ladder }`. The scheduler keeps a per-worker list
+and owns it like everything else:
+
+- **Lowest priority.** In a pass, a prewarm shape starts only if no request is
+  waiting or queued, no compile entry exists, and the compile gate is free.
+  Then it is reserved and dispatched like a compile with no owner and no
+  waiter. A request that arrives later for the same shape joins it.
+- **No eviction, within the budget.** A prewarm shape starts only if the free
+  budget already holds it (`reserved + executables ≤ 100`) and the per-model
+  (4) and total (8) shape limits allow it. It never evicts, so it never
+  touches a leased shape or one with waiters. Shapes are taken in order, and
+  the first one that does not fit ends that lane's prewarm, with one INFO
+  line. Qwen3 alone takes 84 executables. With a GTE shape resident (22),
+  78 are free, so 128 and 256 prewarm and 512 does not.
+- **Delay to requests.** Prewarm never starts ahead of a queued request, so it
+  cannot break an accepted bound. A request that arrives while a prewarm
+  admission runs waits for that one admission; a running admission cannot be
+  stopped without a protocol change. Its prediction counts that admission,
+  as for any running compile. On a cached machine that is at most about 2 s.
+  On a cold M4 it is at most one small compile: by the seed table about 11 s
+  at 128, 14 s at 256 and 21 s at 512, and measured runs varied up to twice
+  that. Going smallest first keeps each step short.
+- **Cancellation.** Lane unload, pause and retirement all retire the worker
+  (`AneServing::retire`). Retirement drops that worker's prewarm list. A
+  prewarm admission already running finishes and is then released by the
+  retirement, as any running admission is today.
+- **Pause and self-check.** `lanes.pause` unloads every Neural Engine lane, so
+  prewarm stops with it. After resume, a lane prewarms again when it next
+  becomes ready. Prewarm is queued only after the self-check, so the self-check
+  never waits behind it, and a lane whose self-check fails is never prewarmed.
+
+On a cached machine, the three Qwen3 shapes load in about 5 s. On a cold
+machine they compile in about 46 s by the M4 seed table, before traffic needs
+them.
+
+### 7.5 Out of scope
+
+No fingerprint, numeric profile or `REVISION` change. The bucket ladder, the
+100-executable budget and the shape limits stay as they are. Packed programs
+are not checked against the cache and are predicted as today.
+
+### 7.6 Tests (each fails on the base commit first)
+
+| Test | Asserts |
+|---|---|
+| `cached_shape_is_predicted_at_load_cost_and_not_refused_early` | a Qwen3@4096 request with a 30 s deadline, on a worker whose `LOADED` reported 4096 cached, waits and is served, not refused with about 114 s |
+| `cached_load_that_compiles_is_repriced_as_a_compile` | the fake reports cached but compiles: after the miss grace, a queued request's prediction includes the compile, and only a full compile is learned as one |
+| `cached_loads_do_not_change_the_machine_factor` | after three cached admissions, an uncached shape is predicted at its seed |
+| `prewarm_never_delays_a_queued_request_or_evicts` | with a request queued, prewarm does not start; with a resident leased shape and a short budget, prewarm skips instead of evicting |
+| `prewarm_stops_when_the_lane_retires_or_pauses` | retirement during prewarm leaves no further prewarm admissions |
+| `older_worker_without_cache_fields_keeps_full_compile_predictions` | `LOADED` and `ADMITTED` without the fields: predictions, refusals and learning are today's |
+| `admitted_and_loaded_decode_with_and_without_cache_fields` (synapse-core) | round trip and unknown-field tolerance |
+| worker: `loaded_reports_the_cached_ladder_rungs` | with a fake binding, only rungs whose first and last layer are cached are listed |
+
+Each guard also gets a mutation row. The hardware kit (M6 mini) restarts a
+worker on a cached machine and checks that `LOADED` lists the cached rungs, that
+a Qwen3@4096 request with a 30 s deadline is served, and how long prewarm
+takes. It also times `compiledModelExists`.
