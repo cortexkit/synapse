@@ -1989,6 +1989,19 @@ impl Scheduler {
                     );
                 }
             }
+            Err(error)
+                if dispatched.is_none() && !matches!(error, AneResidencyError::Panicked(_)) =>
+            {
+                // Refused before the admission reached the worker (the
+                // channel is faulted or quarantined, not connected, or of
+                // another generation): nothing is compiling and the worker
+                // holds nothing for it. So the slot goes at once, without
+                // holding the gate, and the worker is not restarted for it; a
+                // fault that needs a restart is recovered by the request that
+                // met it.
+                state.slots.remove(&key);
+                self.answer_owner(state, &key, owner, error, effects);
+            }
             Err(error) if worker.generation() != generation => {
                 // A recovery restarted the worker under this compile; its exit
                 // confirmation removes the slot.

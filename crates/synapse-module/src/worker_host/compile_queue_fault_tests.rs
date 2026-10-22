@@ -1422,3 +1422,64 @@ async fn busy_mailbox_does_not_starve_decisions_or_completions() {
         leased.map(|lease| lease.err())
     );
 }
+
+/// An admission refused before it reached the worker (here: the channel is
+/// faulted) is a definite outcome: nothing is compiling, so the gate is not
+/// held, the slot is not kept, and the worker is not restarted for it.
+#[tokio::test(start_paused = true)]
+async fn refusal_before_the_wire_is_definite() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let refusing = fake_handle(&compiler, "refusing");
+    refusing
+        .refuse_next_admit_before_wire
+        .store(true, Ordering::SeqCst);
+    let refusing_dyn: Arc<dyn AneShapeWorker> = refusing.clone();
+    let generation = refusing.generation();
+    let refused = ask_at(&supervisor, &compiler, &refusing_dyn, QUEUE_GTE, 512, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!refused.ok(), "{refused:?}");
+    let other = fake_worker(&compiler, "other");
+    let compiled = tokio::time::timeout(
+        Duration::from_secs(30),
+        ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 2048, compiler.now(), None),
+    )
+    .await
+    .expect("a refusal before the wire held the compile gate")
+    .unwrap();
+    assert!(compiled.ok(), "{compiled:?}");
+    assert_eq!(refusing.generation(), generation, "the worker was restarted");
+    let state = supervisor.inner.lock();
+    assert!(!state.recovering.contains("refusing"));
+    assert!(!state.slots.keys().any(|key| key.worker_id == "refusing"));
+}
+
+/// The same as the definite-error case, after a transport fault (an unknown
+/// outcome): the failed compile holds the gate only until the old process's
+/// exit is confirmed, even when the replacement then fails. Only the exit
+/// confirmation can release it here; a failed restart alone releases nothing.
+#[tokio::test(start_paused = true)]
+async fn transport_fault_releases_the_gate_once_exit_is_confirmed_even_if_restart_fails() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let broken = fake_handle(&compiler, "broken");
+    broken.transport_fail_next_admit.store(true, Ordering::SeqCst);
+    broken.fail_next_restart.store(true, Ordering::SeqCst);
+    let broken_dyn: Arc<dyn AneShapeWorker> = broken.clone();
+    let failed = ask_at(&supervisor, &compiler, &broken_dyn, QUEUE_GTE, 128, 0.0, None)
+        .await
+        .unwrap();
+    assert!(!failed.ok(), "{failed:?}");
+    let other = fake_worker(&compiler, "other");
+    let answer = ask_at(&supervisor, &compiler, &other, QUEUE_GTE, 512, 1.0, None);
+    let answer = tokio::time::timeout(Duration::from_secs(30), answer)
+        .await
+        .expect("a transport-faulted compile with a confirmed exit still held the gate")
+        .unwrap();
+    assert!(answer.ok(), "{answer:?}");
+    let state = supervisor.inner.lock();
+    assert!(!state.slots.keys().any(|key| key.worker_id == "broken"));
+    assert!(!state.recovering.contains("broken"), "the worker can be recovered again");
+    assert_eq!(state.reserved_executables(), 22);
+}

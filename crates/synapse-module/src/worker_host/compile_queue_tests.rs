@@ -125,6 +125,9 @@ struct FakeCompileWorker {
     fail_next_admit: std::sync::atomic::AtomicBool,
     /// The next admission's connection fails (an unknown outcome).
     transport_fail_next_admit: std::sync::atomic::AtomicBool,
+    /// The next admission is refused before anything reaches the worker, as
+    /// the worker channel refuses on a faulted or unconnected stream.
+    refuse_next_admit_before_wire: std::sync::atomic::AtomicBool,
     /// The worker refuses the next admission for lack of Neural Engine
     /// resources.
     exhaust_next_admit: std::sync::atomic::AtomicBool,
@@ -176,6 +179,11 @@ impl AneShapeWorker for FakeCompileWorker {
             // Nothing reaches the worker until its stream is free, so a
             // caller that goes away before then cancels the admission.
             let _stream = cancellable_wait(self.stream.lock()).await?;
+            if self.refuse_next_admit_before_wire.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::Channel(
+                    "worker connection requires confirmed-exit restart".into(),
+                ));
+            }
             scheduler::mark_compile_dispatched();
             let gate = self.admit_gate.lock().unwrap().take();
             if let Some((started, release)) = gate {
@@ -281,6 +289,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         panic_next_admit: Default::default(),
         fail_next_admit: Default::default(),
         transport_fail_next_admit: Default::default(),
+        refuse_next_admit_before_wire: Default::default(),
         exhaust_next_admit: Default::default(),
         fail_next_evict: Default::default(),
         admit_gate: Mutex::new(None),
