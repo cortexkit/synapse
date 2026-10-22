@@ -47,9 +47,27 @@ fn run_alone(name: &str) -> bool {
     .output()
     .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        let combined = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        // Lead with the child's whole panic message, including assertion values,
+        // before libtest's blank-line-separated output for the isolated process.
+        let reason = combined
+            .lines()
+            .skip_while(|line| !line.contains("panicked at"))
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reason = if reason.is_empty() {
+            "isolated CoreML lock test failed without a panic message"
+        } else {
+            &reason
+        };
+        panic!("{reason}\n{combined}");
+    }
     // Require the named pass row, so a filter matching no test cannot pass.
     assert!(
-        output.status.success() && stdout.contains(&format!("test {test} ... ok")),
+        stdout.contains(&format!("test {test} ... ok")),
         "isolated CoreML lock test did not pass: {}\n{stdout}\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr)

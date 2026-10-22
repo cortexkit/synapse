@@ -85,7 +85,7 @@ build_timeout_s = 1800
 
 [[control]]
 id = "ane-compile-queue-panic-observed"
-guards = "The scheduler observes a panicked compile itself: the slot holds the gate as failed and the worker is restarted, whoever asked for the compile"
+guards = "The scheduler observes an orphan-driven compile panic: the slot holds the gate as failed until the worker restart confirms exit"
 file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
 old = """                        Err(error) => (
                             Err(AneResidencyError::Panicked(format!(
@@ -100,8 +100,31 @@ runner = "nextest"
 package = "synapse-module"
 target = "--lib"
 select = "expected"
-expect_red = ["worker_host::ane_residency::tests::panicking_orphan_admission_releases_the_gate_after_confirmed_restart", "worker_host::ane_residency::tests::panic_after_the_direct_caller_is_cancelled_is_still_cleaned_up"]
+expect_red = ["worker_host::ane_residency::tests::panicking_orphan_admission_releases_the_gate_after_confirmed_restart"]
 expect_message = "the panicked admission's worker was not restarted promptly"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-cancelled-caller-panic-observed"
+guards = "The scheduler observes a compile panic after its direct caller is cancelled, recovers the worker, and releases the gate"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """                        Err(error) => (
+                            Err(AneResidencyError::Panicked(format!(
+                                "shape admission task failed: {error}"
+                            ))),
+                            None,
+                            now,
+                        ),"""
+new = """                        Err(_) => return, // NON-VACUITY BREAK: a panicked compile is ignored"""
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::panic_after_the_direct_caller_is_cancelled_is_still_cleaned_up"]
+expect_message = "a panicked compile with a cancelled caller stranded the gate"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800

@@ -1,0 +1,37 @@
+[[control]]
+id = "residency-serving-generation-qualified-recovery"
+guards = "A real serving fault retains its exchange generation when another caller completes restoration before serving requests recovery"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = ".recover_at_generation(&worker, fault_generation.load(Ordering::Acquire))"
+new = ".recover_at_generation(&worker, worker.generation()) /* NON-VACUITY BREAK: restart a restored owner for its predecessor's fault */"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::serving_fault_after_completed_restore_does_not_restart_restored_owner"]
+expect_message = "stale serving fault restarted the restored owner"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "residency-packed-generation-qualified-recovery"
+guards = "A packed qualification fault retains its exchange generation when another caller completes restoration before qualification requests recovery"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """let _ = self
+                            .supervisor
+                            .recover_at_generation(&worker, fault_generation)"""
+new = """let _ = self
+                            .supervisor
+                            .recover_at_generation(&worker, worker.generation()) /* NON-VACUITY BREAK: restart a restored owner for an old qualification fault */"""
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::packed_qualification_fault_after_completed_restore_does_not_restart_restored_owner"]
+expect_message = "stale qualification fault restarted the restored owner"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

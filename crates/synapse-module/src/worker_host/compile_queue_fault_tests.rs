@@ -1281,6 +1281,137 @@ async fn retirement_refusing_a_recovery_keeps_the_live_process_charged() {
     assert_eq!(state.reserved_executables(), 0, "the confirmed retirement refunds");
 }
 
+#[tokio::test(start_paused = true)]
+async fn retirement_between_precheck_and_grant_refuses_before_dispatch() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    let checked = Arc::new(Notify::new());
+    let continue_grant = Arc::new(Notify::new());
+    *supervisor.inner.lease_decision_gate.lock().unwrap() =
+        Some((checked.clone(), continue_grant.clone()));
+    let pending = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker.clone();
+        async move { supervisor.lease(&worker, QUEUE_GTE, 128).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), checked.notified())
+        .await
+        .unwrap();
+    // Keep the fake transport able to admit: a closed channel's refusal must
+    // not hide a missing scheduler check for a worker retired after precheck.
+    supervisor.retire(&worker, async { Ok(()) }).await.unwrap();
+    continue_grant.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(60), pending)
+        .await
+        .expect("retired request was not refused promptly")
+        .unwrap();
+    let error = match answer {
+        Ok(_) => panic!("retired owner must not acquire an Admitting reservation"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, AneResidencyError::Channel(ref message) if message == "worker is retired"));
+    let state = supervisor.inner.lock();
+    assert_eq!(state.reserved_executables(), 0);
+    assert!(state.slots.is_empty());
+    assert!(state.entries.is_empty());
+    assert!(compiler.compiles_of("worker").is_empty());
+}
+
+#[tokio::test]
+async fn serving_fault_after_completed_restore_does_not_restart_restored_owner() {
+    let ledger = SharedLedger::default();
+    let serving = serving_fixture(&ledger).await;
+    let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+    let generation = worker.generation();
+    let fault_observed = Arc::new(Notify::new());
+    let continue_recovery = Arc::new(Notify::new());
+    *serving.recovery_gate.lock().unwrap() =
+        Some((fault_observed.clone(), continue_recovery.clone()));
+    ledger.lock().unwrap().fail_inference = true;
+    let pending = tokio::spawn({
+        let serving = serving.clone();
+        async move { serving.infer(vec![vec![1]], false).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), fault_observed.notified())
+        .await
+        .expect("serving did not observe its transport fault");
+    assert_eq!(ledger.lock().unwrap().inference_frames, 1);
+    assert!(serving.channel.faulted.load(Ordering::Acquire));
+    assert_eq!(worker.generation(), generation);
+    // The serving request has observed its transport fault and is held just
+    // before requesting recovery. Finish a separate caller's restore first.
+    tokio::time::timeout(Duration::from_secs(5), serving.supervisor.recover(&worker))
+        .await
+        .expect("independent restore did not finish")
+        .unwrap();
+    assert!(!serving.channel.faulted.load(Ordering::Acquire));
+    assert_eq!(worker.generation(), generation + 1);
+    assert_eq!(serving.supervisor.stats().restarts, 1);
+    assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
+    continue_recovery.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("serving did not finish its delayed recovery request")
+        .unwrap();
+    assert!(matches!(result, Err(AneResidencyError::Channel(_))));
+    assert_eq!(
+        serving.supervisor.stats().restarts,
+        1,
+        "stale serving fault restarted the restored owner"
+    );
+    assert_eq!(worker.generation(), generation + 1);
+    assert_eq!(ledger.lock().unwrap().connects["serving"], 2);
+    assert_eq!(serving.infer(vec![vec![1]], false).await.unwrap(), vec![vec![128.0]]);
+    serving.retire().await.unwrap();
+}
+
+#[tokio::test]
+async fn packed_qualification_fault_after_completed_restore_does_not_restart_restored_owner() {
+    let peer = Arc::new(Mutex::new(PackedPeer {
+        disconnect_qualification: true,
+        ..Default::default()
+    }));
+    let serving = packed_peer(false, peer).await;
+    let worker: Arc<dyn AneShapeWorker> = serving.channel.clone();
+    let generation = worker.generation();
+    let fault_observed = Arc::new(Notify::new());
+    let continue_recovery = Arc::new(Notify::new());
+    *serving.recovery_gate.lock().unwrap() =
+        Some((fault_observed.clone(), continue_recovery.clone()));
+    let pending = tokio::spawn({
+        let serving = serving.clone();
+        async move { serving.prepare_packed().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), fault_observed.notified())
+        .await
+        .expect("packed qualification did not observe its transport fault");
+    assert!(serving.channel.faulted.load(Ordering::Acquire));
+    assert_eq!(worker.generation(), generation);
+    // The packed qualification request has observed its transport fault and
+    // released its lease. Restore the worker before its delayed recovery runs.
+    tokio::time::timeout(Duration::from_secs(5), serving.supervisor.recover(&worker))
+        .await
+        .expect("independent restore waited on qualification's lease")
+        .unwrap();
+    assert!(!serving.channel.faulted.load(Ordering::Acquire));
+    assert_eq!(worker.generation(), generation + 1);
+    assert_eq!(serving.supervisor.stats().restarts, 1);
+    continue_recovery.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("qualification did not finish its delayed recovery request")
+        .unwrap();
+    assert!(matches!(result, Err(AneResidencyError::Channel(_))));
+    assert_eq!(
+        serving.supervisor.stats().restarts,
+        1,
+        "stale qualification fault restarted the restored owner"
+    );
+    assert_eq!(worker.generation(), generation + 1);
+    assert_eq!(serving.infer(vec![vec![41; 1]], false).await.unwrap(), vec![vec![41.0]]);
+}
+
 /// A restart that panics after the old process's exit was confirmed (while
 /// the replacement starts) still delivers that confirmation: the old
 /// process's slots are released instead of staying charged as ghosts.
