@@ -13,6 +13,19 @@ inputs:
 runs:
   using: composite
   steps:
+    # Hosted Windows runners are disposable. Avoid scanning every restored or
+    # newly compiled object file on the build's critical path.
+    - name: Configure Windows Defender for hosted CI builds
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $paths = @($env:GITHUB_WORKSPACE, $env:TEMP, $env:RUNNER_TEMP, "$env:USERPROFILE\.cargo")
+        $paths = @($paths | Where-Object { $_ } | Select-Object -Unique)
+        Add-MpPreference -ExclusionPath $paths
+        Set-MpPreference -DisableRealtimeMonitoring $true
+        Get-MpPreference | Select-Object DisableRealtimeMonitoring, ExclusionPath | Format-List
+        Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
+
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
@@ -20,8 +33,9 @@ runs:
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: synapse
-        # Keep the static-CRT cache generation; each lane retains its own
-        # clippy/debug/release/discovery outputs instead of evicting the others.
+        # Retain the generation so existing compiled outputs remain reusable.
+        # "static-crt" is a legacy label, not a C runtime linkage setting.
+        # Each lane retains its own outputs instead of evicting the others.
         prefix-key: v2-static-crt
         shared-key: ci-${{ inputs.lane }}
         cache-workspace-crates: true

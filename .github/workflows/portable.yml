@@ -82,7 +82,7 @@ jobs:
           set -euo pipefail
           crates="$SYNAPSE_CRATES"
           profile=""
-          # Windows C++ dependencies must agree with Rust's release CRT.
+          # Non-debug C++ objects avoid mixing debug and release MSVC runtimes.
           if [ "${{ inputs.platform }}" = "windows" ]; then profile="--release"; fi
           cargo nextest run --locked $crates $profile --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
 

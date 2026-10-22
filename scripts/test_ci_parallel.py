@@ -18,6 +18,19 @@ SETUP = yaml.safe_load((ROOT / ".github/actions/ci-rust/action.yml").read_text()
 
 
 class ParallelCiTests(unittest.TestCase):
+    def test_windows_defender_tuning_precedes_cache_restore(self):
+        steps = SETUP["runs"]["steps"]
+        defender = next(s for s in steps if s.get("name") == "Configure Windows Defender for hosted CI builds")
+        self.assertEqual(defender["if"], "runner.os == 'Windows'")
+        self.assertEqual(defender["shell"], "pwsh")
+        self.assertNotIn("continue-on-error", defender)
+        self.assertLess(steps.index(defender), next(i for i, s in enumerate(steps) if s.get("uses") == "Swatinem/rust-cache@v2"))
+        for path in ("$env:GITHUB_WORKSPACE", "$env:TEMP", "$env:RUNNER_TEMP", "$env:USERPROFILE\\.cargo"):
+            self.assertIn(path, defender["run"])
+        self.assertIn("Add-MpPreference -ExclusionPath $paths", defender["run"])
+        self.assertIn("Set-MpPreference -DisableRealtimeMonitoring $true", defender["run"])
+        self.assertIn("Get-MpComputerStatus", defender["run"])
+
     def test_aggregates_refuse_failed_skipped_and_cancelled_children(self):
         for platform in ("linux", "windows"):
             gate = WORKFLOW["jobs"][platform]

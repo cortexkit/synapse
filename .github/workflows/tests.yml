@@ -49,7 +49,7 @@ jobs:
     with:
       platform: windows
       runner: windows-2025
-      # Windows spends about a minute running tests; release compilation is the
+      # Windows spends about a minute running tests; compilation is the
       # bottleneck, so extra execution shards would add setup without useful work.
       partitions: '["1/1"]'
 
