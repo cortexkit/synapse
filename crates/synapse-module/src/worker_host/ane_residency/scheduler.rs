@@ -2064,9 +2064,9 @@ impl Scheduler {
         }
     }
 
-    /// Records the end of a prewarm admission. A failed one ends its lane's
-    /// prewarm: the worker is recovering or refused for lack of resources,
-    /// and loading more in the background would only add to that.
+    /// Records the end of a prewarm admission. Any failed admission ends its
+    /// lane's prewarm, so nothing more is admitted in the background for a
+    /// worker that just failed one.
     fn prewarm_finished(
         &mut self,
         key: &ShapeKey,

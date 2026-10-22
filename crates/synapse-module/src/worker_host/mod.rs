@@ -4287,7 +4287,8 @@ pub mod ane_residency {
 
     /// The ladder rungs a newly ready direct-ANE catalog lane loads in the
     /// background, at the lowest priority, so the common short lengths are
-    /// resident before requests need them.
+    /// usually resident before requests need them. They are loaded only while
+    /// no request waits and only into free budget.
     pub const ANE_PREWARM_SHAPES: [usize; 3] = [128, 256, 512];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

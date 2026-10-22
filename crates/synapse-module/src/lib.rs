@@ -30724,8 +30724,9 @@ async fn run_lane_check(
 
 /// Once a direct-ANE catalog lane is ready (its self-check passed), its
 /// common short shapes are loaded in the background at the lowest priority,
-/// so the first requests at those lengths do not wait for them. The
-/// supervisor ignores a repeated call for the same worker.
+/// so that later requests at those lengths usually find them resident. The
+/// supervisor loads them only while no request waits and only into free
+/// budget, and ignores a repeated call for the same worker.
 fn start_direct_ane_prewarm(runtime: &RuntimeState, model: &EmbeddingModel) {
     #[cfg(unix)]
     if let EmbedBackend::DirectAne(engine) = &model.backend {
