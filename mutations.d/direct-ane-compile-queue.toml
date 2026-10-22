@@ -363,3 +363,26 @@ expect_message = "a failed retirement shutdown released the gate before the grac
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-connector-holds-supervisor-weakly"
+guards = "The production worker connector does not keep the supervisor (and its scheduler thread) alive after its last user drops it"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """
+        let supervisor = Arc::downgrade(&supervisor.inner);
+        Box::new(move || {"""
+new = """
+        let keep = supervisor.clone(); // NON-VACUITY BREAK: hold the supervisor strongly
+        let supervisor = Arc::downgrade(&supervisor.inner);
+        Box::new(move || {
+            let _ = &keep;"""
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::production_connector_does_not_keep_the_supervisor_alive"]
+expect_message = "the production connector kept the supervisor alive"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

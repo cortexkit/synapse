@@ -1893,3 +1893,53 @@ async fn failed_retirement_shutdown_keeps_the_gate_for_the_grace() {
         .unwrap();
     assert!(answer.ok(), "{answer:?}");
 }
+
+/// A worker that keeps the production connector (as its channel does) does
+/// not keep the supervisor alive: once the last user drops the supervisor,
+/// it and its scheduler thread end, even after a retirement whose shutdown
+/// failed left the worker's slot charged.
+#[test]
+fn production_connector_does_not_keep_the_supervisor_alive() {
+    let supervisor = queue_supervisor();
+    let (signal, exited) = std::sync::mpsc::channel();
+    *supervisor.inner.scheduler_exit_signal.lock().unwrap() = Some(signal);
+    // Started from a thread without a Tokio runtime, the scheduler runs on
+    // its own thread, as the module's does.
+    supervisor.inner.send(scheduler::Msg::Nudge).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let compiler = runtime.block_on(async { SharedCompiler::new(0.001) });
+    let worker = fake_handle(&compiler, "worker");
+    *worker.held_connector.lock().unwrap() = Some(direct_worker_connector(
+        crate::worker_host::WorkerHostConfig::new("no-such-worker", "no-such-runtime"),
+        &supervisor,
+    ));
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    runtime.block_on(async {
+        drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+        let shutdown = supervisor
+            .retire(&worker_dyn, async {
+                Err(AneResidencyError::Channel("injected shutdown failure".into()))
+            })
+            .await;
+        assert!(shutdown.is_err());
+    });
+    assert_eq!(supervisor.inner.lock().reserved_executables(), 22, "its slot stays charged");
+    let inner = Arc::downgrade(&supervisor.inner);
+    drop((supervisor, worker, worker_dyn));
+    let started = std::time::Instant::now();
+    while inner.upgrade().is_some() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the production connector kept the supervisor alive"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        exited.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the scheduler's thread outlived its supervisor"
+    );
+}

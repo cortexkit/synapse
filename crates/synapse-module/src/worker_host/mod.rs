@@ -6955,6 +6955,60 @@ pub mod ane_residency {
         }
     }
 
+    /// Spawns and connects a direct-ANE worker process for a worker channel.
+    /// The connector lives as long as its channel, and the channel lives in
+    /// the supervisor's slots, so it holds the supervisor only weakly: a
+    /// strong reference made a cycle that kept the supervisor, its lane lock
+    /// and its scheduler thread alive after the last engine was dropped.
+    #[cfg(unix)]
+    fn direct_worker_connector(
+        config: super::WorkerHostConfig,
+        supervisor: &AneResidencySupervisor,
+    ) -> AneWorkerConnector<tokio::net::UnixStream> {
+        let supervisor = Arc::downgrade(&supervisor.inner);
+        Box::new(move || {
+            let mut config = config.clone();
+            let inherited = match supervisor.upgrade() {
+                Some(inner) => AneResidencySupervisor { inner }.inherited_lane_lock(),
+                None => Err(AneResidencyError::SchedulerStopped),
+            };
+            Box::pin(async move {
+                config.inherited_lane_lock = inherited?;
+                let mut host = super::WorkerHost::new(config);
+                host.ping()
+                    .await
+                    .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
+                let super::WorkerConnection {
+                    stream,
+                    mut child,
+                    packed,
+                    ..
+                } = host.connection.take().ok_or_else(|| {
+                    AneResidencyError::Channel("spawned worker has no connection".into())
+                })?;
+                Ok(AneWorkerSession {
+                    pid: child.id(),
+                    packed,
+                    stream,
+                    confirm_exit: Box::pin(async move {
+                        match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                            .await
+                        {
+                            Ok(status) => {
+                                status.map_err(AneResidencyError::Io)?;
+                            }
+                            Err(_) => {
+                                child.start_kill().map_err(AneResidencyError::Io)?;
+                                child.wait().await.map_err(AneResidencyError::Io)?;
+                            }
+                        }
+                        Ok(())
+                    }),
+                })
+            })
+        })
+    }
+
     /// The production owner of one direct-ANE worker and its I/O runtime.
     #[cfg(unix)]
     pub struct DirectAneEngine {
@@ -6989,48 +7043,7 @@ pub mod ane_residency {
             let normalize = config.normalize;
             let timeout = config.request_timeout;
             let load_timeout = super::liveness::SETUP_IDLE;
-            let connector_supervisor = supervisor.clone();
-            let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
-                let mut config = config.clone();
-                let inherited = connector_supervisor.inherited_lane_lock();
-                Box::pin(async move {
-                    config.inherited_lane_lock = inherited?;
-                    let mut host = super::WorkerHost::new(config);
-                    host.ping()
-                        .await
-                        .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
-                    let super::WorkerConnection {
-                        stream,
-                        mut child,
-                        packed,
-                        ..
-                    } = host.connection.take().ok_or_else(|| {
-                        AneResidencyError::Channel("spawned worker has no connection".into())
-                    })?;
-                    Ok(AneWorkerSession {
-                        pid: child.id(),
-                        packed,
-                        stream,
-                        confirm_exit: Box::pin(async move {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                child.wait(),
-                            )
-                            .await
-                            {
-                                Ok(status) => {
-                                    status.map_err(AneResidencyError::Io)?;
-                                }
-                                Err(_) => {
-                                    child.start_kill().map_err(AneResidencyError::Io)?;
-                                    child.wait().await.map_err(AneResidencyError::Io)?;
-                                }
-                            }
-                            Ok(())
-                        }),
-                    })
-                })
-            });
+            let connector = direct_worker_connector(config, &supervisor);
             let channel =
                 Arc::new(runtime.block_on(AneWorkerChannel::connect(id, max_frame, connector))?);
             let request = WorkerRequest::Load {

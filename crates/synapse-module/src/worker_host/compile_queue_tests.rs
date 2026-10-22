@@ -154,6 +154,9 @@ struct FakeCompileWorker {
     /// Whether, right after the last admission reached this worker, its slot
     /// in `held_supervisor` already read as dispatched.
     dispatch_seen_at_wire: Mutex<Option<bool>>,
+    /// A production worker connector the worker keeps, as the worker channel
+    /// does.
+    held_connector: Mutex<Option<AneWorkerConnector<tokio::net::UnixStream>>>,
 }
 
 impl FakeCompileWorker {
@@ -317,6 +320,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         evictions: Mutex::new(Vec::new()),
         held_supervisor: Mutex::new(None),
         dispatch_seen_at_wire: Mutex::new(None),
+        held_connector: Mutex::new(None),
     })
 }
 
