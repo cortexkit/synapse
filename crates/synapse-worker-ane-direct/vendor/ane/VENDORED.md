@@ -64,16 +64,21 @@ Local compatibility changes:
   compiledModelExists` reports a cached program for the identifier (the
   selector is feature-detected; a missing selector counts as not cached), it
   calls `loadWithQoS:` alone, writing no sources and calling no compile. On a
-  miss, or if that load fails, it compiles as before (write sources,
-  `compileWithQoS:`, `loadWithQoS:`, remove the sources) from a fresh model
-  object. A load without a cached program fails aned's bundle verification,
+  miss, or if that load fails because the cached copy is unusable, it
+  compiles as before (write sources, `compileWithQoS:`, `loadWithQoS:`,
+  remove the sources) from a fresh model object. A cached load refused for
+  lack of Neural Engine resources (`Error::is_resource_refusal`) is returned
+  unchanged without compiling. The binding keeps only the `NSError`
+  description, so that test matches the refusal's phrase on load errors
+  only. A load without a cached program fails aned's bundle verification,
   and `compileWithQoS:` always recompiles, so neither shortcut is used.
   `Graph::compile_gated` and `client::compile_network_gated` run a caller
   check just before a compile (never before a cached load), and
   `Executable::origin` reports `ProgramOrigin::CacheHit` or `Compiled`. The
   development accessor `Graph::program_identifier` returns the identifier
   without compiling. The `client::tests` unit tests cover the hit, miss,
-  failed-hit and refused-compile sequences with a stand-in program.
+  failed-hit, resource-refused hit and refused-compile sequences with a
+  stand-in program.
 
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).

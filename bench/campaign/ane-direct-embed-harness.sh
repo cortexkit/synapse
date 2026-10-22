@@ -33,7 +33,7 @@ MODEL_COMPONENT_SHA256 = {
 # Pin the checksum manifest itself so a candidate cannot bless edited binding
 # sources by recomputing their checksums. The vendored copy includes local fixes
 # and is not identified solely by its upstream revision.
-VENDOR_CHECKSUM_SHA256 = "e774a9afd37ed402fa1cddd97c1e3183561d482da388faae10711800cc7a1587"
+VENDOR_CHECKSUM_SHA256 = "2b6e90fb74a99fe71cfe28fa3505aaa4f365b69fa498e2bff35cd9fc5bc2cfef"
 PROBE_MAIN_SHA256 = "6fb9f3e6666501d3d721c538d13634ea48e38dd4c7baa80d07ea41e975118a1a"
 CARGO_TOML_SHA256 = "08fa29887f44c848dc65b0eaee1c20b851984d6d3bc2a70b5c8d0df953d34a71"
 CARGO_LOCK_SHA256 = "d538c5e8a902f6270c44115b289c9cc98cba75cfeee119300a95aa8257841566"

@@ -1819,7 +1819,7 @@ mod cpu_rotation_tests {
 }
 
 fn admission_error(error: ane::Error, layer: usize) -> anyhow::Error {
-    if matches!(&error, ane::Error::Load(message) if message.contains("no ANE resources")) {
+    if error.is_resource_refusal() {
         anyhow::anyhow!("ane_resources_exhausted:compile layer {layer}: {error}")
     } else {
         anyhow::Error::new(error).context(format!("compile layer {layer}"))

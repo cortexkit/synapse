@@ -43,3 +43,17 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+impl Error {
+    /// Whether the Neural Engine refused to load a program for lack of
+    /// capacity, which the worker reports as `ane_resources_exhausted`.
+    ///
+    /// The binding keeps only the `NSError`'s description, not its domain or
+    /// code, so there is no typed form to test. This matches the narrowest
+    /// thing available: a load failure whose description contains the phrase
+    /// the framework uses for that refusal. Compile and evaluate failures
+    /// never count, whatever their text.
+    pub fn is_resource_refusal(&self) -> bool {
+        matches!(self, Self::Load(message) if message.contains("no ANE resources"))
+    }
+}

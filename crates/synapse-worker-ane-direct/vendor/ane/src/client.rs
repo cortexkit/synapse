@@ -234,9 +234,13 @@ impl LayerProgram for InMemoryProgram {
 /// mismatch). And `compile` never consults the cache, so compiling a cached
 /// program repeats the whole compile.
 ///
-/// If the cached load fails anyway (for example because aned evicted the
-/// copy after the check), the program is compiled from a fresh model object,
-/// since the failed load may have left the first one in an unknown state.
+/// If the cached load fails because the copy is unusable (for example aned
+/// evicted it after the check, or it fails aned's bundle verification), the
+/// program is compiled from a fresh model object, since the failed load may
+/// have left the first one in an unknown state. A resource refusal is
+/// different: compiling would not make room, so every layer would compile and
+/// then be refused the same way while holding the machine's compiler. That
+/// error is returned at once and unchanged, for the caller to evict and retry.
 /// `before_compile` runs only on the compile path, right before the sources
 /// are written.
 pub(crate) fn load_program<P: LayerProgram, E: From<Error>>(
@@ -250,6 +254,7 @@ pub(crate) fn load_program<P: LayerProgram, E: From<Error>>(
     if program.compiled_model_exists() {
         match program.load() {
             Ok(()) => return Ok((program, ProgramOrigin::CacheHit)),
+            Err(error) if error.is_resource_refusal() => return Err(error.into()),
             Err(error) => {
                 eprintln!(
                     "ane: loading cached program {} failed, compiling it instead: {error}",
@@ -581,7 +586,8 @@ mod tests {
     /// and records every call in a log shared with the test.
     struct FakeProgram {
         cached: bool,
-        cached_load_fails: bool,
+        /// The description a cached load fails with, if it fails.
+        cached_load_error: Option<&'static str>,
         dir: PathBuf,
         log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     }
@@ -603,14 +609,21 @@ mod tests {
         }
 
         fn load(&self) -> Result<(), Error> {
-            if self.cached && self.cached_load_fails {
+            if self.cached
+                && let Some(message) = self.cached_load_error
+            {
                 self.log.borrow_mut().push("load-failed");
-                return Err(Error::Load("verifyBundleAtPath: hash mismatch".into()));
+                return Err(Error::Load(message.into()));
             }
             self.log.borrow_mut().push("load");
             Ok(())
         }
     }
+
+    /// How a cached load fails when aned's copy cannot be used.
+    const UNUSABLE_COPY: &str = "verifyBundleAtPath: hash mismatch";
+    /// How a load fails when the Neural Engine has no room for the program.
+    const NO_RESOURCES: &str = "no ANE resources (transient; retry)";
 
     #[derive(Debug)]
     enum GateError {
@@ -630,7 +643,7 @@ mod tests {
     fn run_load_program(
         root: &TempRoot,
         cached: bool,
-        cached_load_fails: bool,
+        cached_load_error: Option<&'static str>,
         gate: Result<(), GateError>,
     ) -> (Result<ProgramOrigin, GateError>, Vec<&'static str>) {
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -640,7 +653,7 @@ mod tests {
             created += 1;
             Ok(FakeProgram {
                 cached: cached && created == 1,
-                cached_load_fails,
+                cached_load_error,
                 dir: root.0.join(ID),
                 log: log.clone(),
             })
@@ -657,7 +670,7 @@ mod tests {
     #[test]
     fn a_cached_program_is_loaded_without_writing_or_compiling() {
         let root = TempRoot::new("cache-hit");
-        let (result, calls) = run_load_program(&root, true, false, Ok(()));
+        let (result, calls) = run_load_program(&root, true, None, Ok(()));
         assert_eq!(result.unwrap(), ProgramOrigin::CacheHit);
         // No temp-space gate, no sources, no compile.
         assert_eq!(calls, ["new", "exists", "load"]);
@@ -667,7 +680,7 @@ mod tests {
     #[test]
     fn an_uncached_program_is_compiled_then_loaded() {
         let root = TempRoot::new("cache-miss");
-        let (result, calls) = run_load_program(&root, false, false, Ok(()));
+        let (result, calls) = run_load_program(&root, false, None, Ok(()));
         assert_eq!(result.unwrap(), ProgramOrigin::Compiled);
         // No load is tried before the compile: on a miss it would make the
         // framework write sources that aned rejects.
@@ -678,7 +691,7 @@ mod tests {
     #[test]
     fn a_failed_cached_load_falls_back_to_compiling_a_fresh_model() {
         let root = TempRoot::new("cache-hit-fails");
-        let (result, calls) = run_load_program(&root, true, true, Ok(()));
+        let (result, calls) = run_load_program(&root, true, Some(UNUSABLE_COPY), Ok(()));
         assert_eq!(result.unwrap(), ProgramOrigin::Compiled);
         assert_eq!(
             calls,
@@ -696,13 +709,35 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_refusal_on_a_cached_load_is_returned_without_compiling() {
+        // Compiling cannot make room on the Neural Engine: the caller must
+        // evict and retry, so the refusal comes back at once and unchanged.
+        let root = TempRoot::new("cache-hit-no-resources");
+        let (result, calls) = run_load_program(&root, true, Some(NO_RESOURCES), Ok(()));
+        assert!(
+            matches!(&result, Err(GateError::Ane(Error::Load(message))) if message == NO_RESOURCES),
+            "{result:?}"
+        );
+        assert_eq!(calls, ["new", "exists", "load-failed"]);
+        assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn only_a_load_without_ane_resources_is_a_resource_refusal() {
+        assert!(Error::Load(NO_RESOURCES.into()).is_resource_refusal());
+        assert!(!Error::Load(UNUSABLE_COPY.into()).is_resource_refusal());
+        assert!(!Error::Compile(NO_RESOURCES.into()).is_resource_refusal());
+        assert!(!Error::Evaluate(NO_RESOURCES.into()).is_resource_refusal());
+    }
+
+    #[test]
     fn a_refused_compile_writes_and_compiles_nothing() {
         let root = TempRoot::new("gate-refuses");
-        for (cached, cached_load_fails) in [(false, false), (true, true)] {
+        for (cached, cached_load_error) in [(false, None), (true, Some(UNUSABLE_COPY))] {
             let (result, calls) = run_load_program(
                 &root,
                 cached,
-                cached_load_fails,
+                cached_load_error,
                 Err(GateError::Refused("no room")),
             );
             assert!(

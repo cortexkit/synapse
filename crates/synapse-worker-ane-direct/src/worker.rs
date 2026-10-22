@@ -181,7 +181,11 @@ pub(crate) fn request_error(req_id: Option<String>, failure: &anyhow::Error) -> 
     if let WorkerResponse::Err { code, msg, .. } = &mut response {
         // Layer context is a diagnostic, not an error class. Inspect the typed
         // cause even when compilation added one or more contextual messages.
-        if failure.chain().any(|cause| matches!(cause.downcast_ref::<ane::Error>(), Some(ane::Error::Load(message)) if message.contains("no ANE resources"))) {
+        if failure.chain().any(|cause| {
+            cause
+                .downcast_ref::<ane::Error>()
+                .is_some_and(ane::Error::is_resource_refusal)
+        }) {
             *code = "ane_resources_exhausted".into();
         }
         *msg = format!("{failure:#}");

@@ -170,6 +170,19 @@ The cache is aned's: an OS update, 14 days without use, storage pressure or a
 changed signing identifier empties it, and the next admission compiles once.
 Neither the cache nor its disk use is visible to Synapse.
 
+aned files each cached program under the worker binary's code-signing
+identifier, not under its code hash. Production signs the worker with
+`codesign --identifier ck-synapse-worker-ane-direct`, so a rebuilt or upgraded
+worker that keeps that identifier still finds the programs its predecessor
+compiled; a worker signed under another identifier (an unsigned `cargo build`
+is linker-signed as `ck_synapse_worker_ane_direct-<hash>`) has its own, empty
+cache. Keep the identifier stable across deploys.
+
+A cached load that the Neural Engine refuses for lack of resources is returned
+at once as `ane_resources_exhausted`, without compiling; the residency
+supervisor evicts and retries. Only an unusable cached copy falls back to a
+compile.
+
 Checks: `graph::compile::tests::identical_graphs_emit_identical_sources` and
 `client::tests::a_cached_program_is_loaded_without_writing_or_compiling` in the
 vendored binding (`cargo test --locked -p ane --lib`, macOS), and

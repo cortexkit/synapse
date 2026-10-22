@@ -61,3 +61,23 @@ platforms = ["macos"]
 timeout_s = 600
 build_timeout_s = 1800
 desk_only = "The direct-ANE backend compiles only on macOS; CI has no Apple runner for it. Replay the shape-level temp-space check on a Mac."
+
+[[control]]
+id = "ane-direct-cached-load-resource-refusal"
+guards = "A resource refusal on a cached load is returned at once instead of compiling every layer and being refused again"
+file = "crates/synapse-worker-ane-direct/vendor/ane/src/client.rs"
+old = "            Err(error) if error.is_resource_refusal() => return Err(error.into()),\n"
+new = "            // NON-VACUITY BREAK: resource refusals fall back to compiling\n"
+edits = []
+test_file = "crates/synapse-worker-ane-direct/vendor/ane/src/client.rs"
+runner = "cargo"
+package = "ane"
+target = "--lib"
+select = "expected"
+expect_red = ["client::tests::a_resource_refusal_on_a_cached_load_is_returned_without_compiling"]
+expect_message = "Ok(Compiled)"
+only = false
+platforms = ["macos"]
+timeout_s = 600
+build_timeout_s = 1800
+desk_only = "The vendored ANE binding compiles only on macOS; CI has no Apple runner for it. Replay the unclassified cached-load failure on a Mac."
