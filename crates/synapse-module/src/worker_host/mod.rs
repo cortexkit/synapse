@@ -10084,10 +10084,12 @@ pub mod ane_residency {
             );
         }
 
-        /// After the compile scheduler stops, a request whose rows are all
-        /// served by the resident packed program is refused like any other
-        /// (`SchedulerStopped`, which the wire reports as `engine_crashed`),
-        /// and nothing reaches the worker.
+        /// Once the lane is closed (the compile scheduler stopped), a request
+        /// whose rows are all served by the resident packed program is refused
+        /// like any other (`SchedulerStopped`, which the wire reports as
+        /// `engine_crashed`), and nothing reaches the worker. The slot table
+        /// is left as it was, so only the packed lease's own check of the
+        /// closed flag can refuse it.
         #[tokio::test]
         async fn packed_requests_are_refused_after_the_scheduler_stops() {
             let peer = Arc::new(Mutex::new(PackedPeer::default()));
@@ -10096,19 +10098,8 @@ pub mod ane_residency {
             serving
                 .supervisor
                 .inner
-                .scheduler_task
-                .lock()
-                .unwrap()
-                .take()
-                .expect("the scheduler was started")
-                .abort();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !serving.supervisor.inner.closed.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the stopped scheduler did not close the lane");
+                .closed
+                .store(true, Ordering::Release);
             let before = peer.lock().unwrap().requests.len();
             let result = serving
                 .infer_packed(vec![vec![41; 127], vec![42; 129]])
@@ -10120,7 +10111,7 @@ pub mod ane_residency {
             assert_eq!(
                 peer.lock().unwrap().requests.len(),
                 before,
-                "a packed request reached the worker after the scheduler stopped"
+                "a packed request reached the worker after the lane closed"
             );
         }
 

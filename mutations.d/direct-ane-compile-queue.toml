@@ -173,3 +173,104 @@ expect_message = "ghost slots after a confirmed exit"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-refund-only-on-confirmed-exit"
+guards = "A restart that failed without confirming the old process's exit (for example refused because the worker is being retired) refunds nothing and opens no gate"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "            Err(error) if recovery.exit_confirmed => {"
+new = "            Err(error) if recovery.exit_confirmed || !recovery.worker.exit_unconfirmed() && !matches!(error, AneResidencyError::Panicked(_)) => { // NON-VACUITY BREAK: infer the exit from the error"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::retirement_refusing_a_recovery_keeps_the_live_process_charged"]
+expect_message = "a refused restart refunded a process whose exit nobody confirmed"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-packed-lease-after-scheduler-death"
+guards = "A packed lease is refused once the compile scheduler has stopped, like an ordinary lease"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = """
+        ) -> Result<Option<AneShapeLease>, AneResidencyError> {
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Err(AneResidencyError::SchedulerStopped);
+            }
+            let key = Self::packed_key(worker, model_ref);"""
+new = """
+        ) -> Result<Option<AneShapeLease>, AneResidencyError> {
+            if false && self.inner.closed.load(Ordering::Acquire) { // NON-VACUITY BREAK
+                return Err(AneResidencyError::SchedulerStopped);
+            }
+            let key = Self::packed_key(worker, model_ref);"""
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::packed_requests_are_refused_after_the_scheduler_stops"]
+expect_message = "a packed request reached the worker after the lane closed"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-undispatched-owner-leaves"
+guards = "A cancelled serving owner keeps waiting only for a compile that has reached the worker; an undispatched one is withdrawn"
+file = "crates/synapse-module/src/worker_host/mod.rs"
+old = "                    && slot.dispatched_at.is_some()"
+new = "                    && (slot.dispatched_at.is_some() || true) // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/mod.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::cancelled_serving_owner_withdraws_its_undispatched_compile"]
+expect_message = "undispatched compile was not withdrawn"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-exit-survives-restart-panic"
+guards = "A restart that panics after the old process's exit was confirmed still delivers that confirmation"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = """
+            let restart = AbortOnDrop(tokio::spawn(async move {
+                worker.restart_with_exit_signal(exited).await
+            }));
+            let (result, exited) = tokio::join!(restart.join(), forward);"""
+new = """
+            // NON-VACUITY BREAK: the restart's panic drops the forwarder.
+            let (result, exited) = tokio::join!(async { Ok::<_, tokio::task::JoinError>(worker.restart_with_exit_signal(exited).await) }, forward);"""
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::replacement_panic_does_not_lose_a_confirmed_exit"]
+expect_message = "a confirmed exit was lost with the restart's panic"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "ane-compile-queue-unconfirmed-restart-keeps-the-gate"
+guards = "A restart that ends (error or panic) without a confirmed exit keeps the failed compile's gate until the 35 s give-up"
+file = "crates/synapse-module/src/worker_host/ane_residency/scheduler.rs"
+old = "                    recovery.finished = true;"
+new = "                    recovery.finished = true; recovery.gave_up = true; give_up_gate(state, worker_id, None); // NON-VACUITY BREAK"
+test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["worker_host::ane_residency::tests::recovery_panic_before_exit_keeps_the_gate_for_the_grace"]
+expect_message = "a panicked recovery released the gate before the grace ended"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800
