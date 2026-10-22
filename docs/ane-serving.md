@@ -146,7 +146,8 @@ reports remain historical artifacts, not schema 2 inputs.
 ## Compiled programs survive a worker restart
 
 macOS's `aned` keeps compiled Neural Engine programs on disk, keyed by the
-program's content identifier (hashes of its MIL text, weights and options) and
+program's content identifier (hashes of its MIL text, the Model Intermediate
+Language program the binding emits, and of its weights and options) and
 the worker's code-signing identifier. The vendored binding emits constants in a
 fixed order, so the same layer at the same shape always has the same identifier.
 When aned already holds that program, the worker loads it without writing
