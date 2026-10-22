@@ -12,6 +12,18 @@ struct CoreMlFixture {
     expect_inherited_lock: Arc<AtomicBool>,
 }
 
+/// A fixture label no other process can share. The root directory, and with
+/// it the direct-ANE lock file these tests take, is named after the label,
+/// the process id and a counter; test processes in different PID namespaces
+/// (separate build jobs on one machine) can share a temporary directory and
+/// a process id, and then their lock files collided (`ane_lane_busy`).
+fn unique_label(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("{label}-{nanos:x}")
+}
+
 fn fixture(label: &str) -> CoreMlFixture {
     let (root, descriptor) = test_storage_descriptor(label);
     let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
@@ -181,7 +193,7 @@ async fn cold_coreml_load_ignores_another_direct_ane_lock_holder() {
 
 #[tokio::test]
 async fn coreml_load_does_not_reacquire_a_released_supervisor_lock() {
-    let fixture = fixture("coreml-released-supervisor");
+    let fixture = fixture(&unique_label("coreml-released-supervisor"));
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
         .to_path_buf();
@@ -238,7 +250,7 @@ async fn resume(state: &Arc<ModuleState>) {
 
 #[tokio::test]
 async fn coreml_pause_unloads_then_resume_only_inherits_an_already_held_lock() {
-    let fixture = fixture("coreml-pause-and-reload");
+    let fixture = fixture(&unique_label("coreml-pause-and-reload"));
     let path = runtime_ane_lock_path(&fixture.state.runtime)
         .unwrap()
         .to_path_buf();
