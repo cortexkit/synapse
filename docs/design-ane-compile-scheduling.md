@@ -359,3 +359,196 @@ Each change below was made after a deterministic test failed against
   later recovery can try again. The exception is a restart that could not
   confirm the old process's exit: that worker stays closed, as before, and its
   queued compiles are dropped.
+
+## 6. Rebuild: one scheduler task (proposed after the second audit of `c85405b3`)
+
+Status: **proposed, not implemented.** Most findings of the second audit come
+from request tasks and orphan drivers driving the queue at the same time, each
+under its own lock acquisitions, instants and cancellation. The rebuild moves
+every queue decision into one task.
+
+### 6.1 One task owns the scheduling state
+
+`AneResidencySupervisor` starts a scheduler task that alone owns:
+
+- queue entries and their start keys;
+- waiters and the promises given to them;
+- slot reservations and the 100-executable budget;
+- the one-compile gate;
+- measured costs and the machine factor;
+- recovery state per worker.
+
+The scheduler runs one loop:
+
+1. Wait for the earliest of: a message, its next timer, or a finished operation.
+2. Take one instant, `now`.
+3. Decide everything that changed, at `now`.
+4. Spawn the resulting compile, evict and recover operations into a `JoinSet`
+   the scheduler awaits itself.
+5. Compute the next wake-up from the same `now`: gather windows, handoff ends,
+   promise expiries and waiter bounds.
+
+Operations report back by finishing, and a compile also sends a "dispatched at"
+message. A panic or `JoinError` therefore always reaches the scheduler, whoever
+asked for the work.
+
+Resident leases are the one piece of state shared with requests (6.3). They sit
+in a small residency table behind a short mutex. The scheduler is the only
+writer of slot states; requests only add or drop leases.
+
+### 6.2 Requests never drive the queue
+
+A request that cannot lease a resident shape sends `Want { shape key, worker
+generation, executables, bound }` with a reply channel, and awaits one answer:
+
+- **Ready:** the shape is resident and this waiter may lease it (6.3).
+- **`shape_compiling { retry_after_ms }`:** the scheduler's prediction at the
+  instant it decided, which is also the promise it records.
+
+The scheduler answers at the bound itself: the waiter's bound is one of its
+timers. So a direct `lease_until` caller and a serving request get the same
+fresh prediction.
+
+When the serving caller's own timer fires during a compile wait, it sends
+`Expired` and awaits the scheduler's answer. The scheduler records one decision
+per waiter, so the caller path and the inner path cannot give different delays.
+Stream-wait classification asks the scheduler for the running compile's remaining
+time, instead of using the 1000 ms floor.
+
+Cancelling a request just drops its receiver; the scheduler notices the closed
+channel on its next pass. Whether a compile stays queued is decided only by the
+scheduler, from what it promised:
+
+- an entry lives while a waiter is attached, or until twice its last promise;
+- promises belong to the compile, not to a request: they move from the entry to
+  the slot at reservation, and back if the compile is withdrawn.
+
+There are no orphan driver tasks.
+
+Compile and evict operations are never tied to a request's cancellation. While
+an operation still waits for the worker stream, the scheduler can withdraw it
+with its own token. It does so only when the entry has no waiter and no live
+promise. That keeps "a caller that went away leaves nothing on the wire" true,
+which the existing cancellation test checks.
+
+### 6.3 Resident leases stay on the fast path
+
+Inference leases each rung with `try_lease`: one lock of the residency mutex. It
+checks that the slot is `Resident` and of the current generation, and that no
+scheduler barrier is set on it, then increments `leases`. There is no message
+and no await. Dropping the lease decrements under the same lock, and notifies the
+scheduler only when it has asked to hear about that slot: it is waiting for a
+victim, or a handoff cohort is open.
+
+The scheduler sets a barrier in two cases:
+
+- while a starved head has a turn, as `behind_starved_head` does today;
+- for non-cohort requests during a 250 ms handoff.
+
+A request that finds a barrier, or no resident slot, falls back to `Want`.
+Eviction marks a slot `Evicting` under the same mutex, so a lease and an
+eviction cannot race. The uncontended mutex costs tens of nanoseconds on the hot
+path. The scheduler round trip (mpsc plus oneshot, a few microseconds) is paid
+only on a cold or contended rung.
+
+### 6.4 Failures
+
+- **Definite worker error** (the worker answered `ERR`, for example
+  `compile_failed`): nothing can still be compiling, so the gate is released at
+  once.
+  - The slot's executables stay charged until the worker rolls back or the
+    worker is recovered, as today. A failed slot no longer counts as running.
+  - Recovery, where it runs, no longer blocks other workers' compiles.
+- **Transport fault, timeout or panic** (the outcome is unknown): the slot
+  holds the gate only until the old process's exit is confirmed.
+  - The worker trait's restart is split into two steps: stop and confirm exit,
+    then start a replacement and restore its models.
+  - The scheduler gets exit confirmation as its own event, so the gate is
+    released before the replacement starts, not after it.
+  - While exit is unconfirmed, predictions count the failed slot as one layer
+    of remaining time per pass, not zero.
+- **After a confirmed exit,** every slot of the old generation is removed and
+  refunded, whatever its state: `Resident`, `Evicting`, `Failed` or
+  `Admitting`. Late results from that generation are ignored by slot id. This
+  removes the ghost slots left by a failed replacement.
+- **Exit never confirmed:** the worker stays closed, its entries are dropped and
+  its slots stay charged, as today. Other workers keep compiling, but only once
+  no slot of that worker can still be compiling.
+
+### 6.5 Recovery
+
+Starting recovery is a scheduler event, so the next pass re-elects heads and
+re-checks bounds at once; there is no missed notify.
+
+A recovering worker's entries are not elected and not counted ahead of anyone.
+When the worker rejoins, its entries keep their start keys, but each is placed
+under the accepted-bound rule, the same rule a newcomer follows. An entry that
+would push an accepted waiter past its bound goes behind that waiter.
+
+### 6.6 Learning
+
+The compile operation reports its dispatch instant, the moment the admission
+reaches the worker:
+
+- the running prediction counts from dispatch, not from reservation;
+- the sample is `finish − dispatch`;
+- retried compiles and packed programs are not learned.
+
+Queued predictions are re-estimated on every pass from the current estimate.
+Start keys stay fixed.
+
+### 6.7 What stays the same
+
+- The wire contract as amended in this change: `shape_compiling` with a
+  predicted `retry_after_ms` of at least 1000, possibly before the deadline.
+- Fingerprints, the bucket ladder and the 100-executable budget, with the
+  per-model and total limits.
+- Eviction preference.
+- Cheapest first with aging, the 50 ms gathering window, and the
+  accepted-bound rule.
+- The orphan expiry factor of 2.
+- The 250 ms handoff, which becomes a scheduler timer. When a compile finishes,
+  its waiters get Ready and a 250 ms cohort barrier. The barrier ends when every
+  cohort member has leased or left, or when the timer fires, whichever comes
+  first; that is today's rule.
+
+### 6.8 Tests
+
+All existing compile-queue and fault tests keep their assertions wherever the
+behaviour stays.
+
+Tests that now call `next_step`, `QueueTicket` or `inner.lock()` directly are
+rewritten to drive `Want` messages. They read state through a test-only
+`snapshot()` query that returns entries, slots, gate and promises. The
+assertions are kept; only how the state is reached changes.
+
+The 600 s backstop test asserts the predicted `retry_after_ms` (about 7.64 s),
+not just the code.
+
+Each finding of the second audit becomes a test or is ruled out by the
+structure:
+
+| Finding | Test, or why it cannot happen |
+|---|---|
+| Ghost old-generation slots after confirmed exit and failed replacement (P1) | Test: a resident shape on W, then a confirmed exit, then a failed replacement. Assert no W slot is left, no `Evicting` charge survives, and no lease is granted. |
+| Promise lost when a joiner was told and the owner was cancelled before the wire; promise given while `Admitting` | Test: B is told `shape_compiling` while A is `Admitting` behind inference, then A's caller is cancelled. Assert one compile, the same start key and a kept promise. The structure helps too: no request can cancel an operation. |
+| Exhaustion-retry `Abandoned` arms forget the compile | Test: cancel the caller during the retry's eviction. Assert the compile still runs. |
+| Direct caller at the backstop gets 1000 ms | The backstop test asserts the about 7.64 s prediction. |
+| Failed slot holds the gate through replacement restore | Test: hold the replacement start after exit is confirmed. Assert a healthy worker compiles meanwhile. |
+| Definite `ERR` holds the gate through drain and restart; prediction ignores failed slots | Test: `compile_failed` while that worker has a lease in flight. Assert another worker compiles at once. |
+| Committed orphan evicts again, or starves the queue after a failed eviction | No drivers. Test: a failed eviction plus an expired promise do not block a smaller request that fits. |
+| `gate_held` check-then-act race | One owner: there is no second lock acquisition. |
+| Handoff lost wakeup | One instant per pass, and the handoff is a timer. Test: a handoff boundary crossed between decision and timer. |
+| Panic cleanup depends on the awaiting future | The scheduler awaits the `JoinSet`. Test: abort a direct `lease_until` after reservation, then panic the admission. Assert the cleanup runs and another worker compiles. |
+| No wakeup when recovery begins | Recovery is an event. Test: start recovery with no other event and assert the next head is elected. |
+| Recovering entries rejoin ahead of accepted bounds | Test: an accepted waiter keeps its bound when X's entry rejoins. |
+| Requeue/adopt race | No requeue or adopt: a promise moves with its compile inside one task. |
+| Running prediction counts from reservation | Test: hold an admission behind inference and check the prediction right after dispatch. |
+| Inner and caller expiry give different delays | One decision per waiter. Test: both timers fire together and the answer equals the recorded promise. |
+
+The first audit's tests stay. Some first-audit findings can no longer happen,
+such as two orphan drivers or the gather wakeup race. Their tests stay as
+regression checks on behaviour that can still be observed, such as an expired
+promise leaving no entry and a head waking at the end of its gathering window.
+
+The hardware kit is unchanged; whether to re-run it is decided after review.
