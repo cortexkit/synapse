@@ -1281,6 +1281,43 @@ async fn retirement_refusing_a_recovery_keeps_the_live_process_charged() {
     assert_eq!(state.reserved_executables(), 0, "the confirmed retirement refunds");
 }
 
+#[tokio::test(start_paused = true)]
+async fn retirement_between_precheck_and_grant_refuses_before_dispatch() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_worker(&compiler, "worker");
+    let checked = Arc::new(Notify::new());
+    let continue_grant = Arc::new(Notify::new());
+    *supervisor.inner.lease_decision_gate.lock().unwrap() =
+        Some((checked.clone(), continue_grant.clone()));
+    let pending = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let worker = worker.clone();
+        async move { supervisor.lease(&worker, QUEUE_GTE, 128).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), checked.notified())
+        .await
+        .unwrap();
+    // Keep the fake transport able to admit: a closed channel's refusal must
+    // not hide a missing scheduler check for a worker retired after precheck.
+    supervisor.retire(&worker, async { Ok(()) }).await.unwrap();
+    continue_grant.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(60), pending)
+        .await
+        .expect("retired request was not refused promptly")
+        .unwrap();
+    let error = match answer {
+        Ok(_) => panic!("retired owner must not acquire an Admitting reservation"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, AneResidencyError::Channel(ref message) if message == "worker is retired"));
+    let state = supervisor.inner.lock();
+    assert_eq!(state.reserved_executables(), 0);
+    assert!(state.slots.is_empty());
+    assert!(state.entries.is_empty());
+    assert!(compiler.compiles_of("worker").is_empty());
+}
+
 /// A restart that panics after the old process's exit was confirmed (while
 /// the replacement starts) still delivers that confirmation: the old
 /// process's slots are released instead of staying charged as ghosts.
