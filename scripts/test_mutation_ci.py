@@ -73,6 +73,30 @@ class MutationAuditTests(unittest.TestCase):
             "every nightly platform needs feature-off worker binaries before the baseline",
         )
 
+    def test_master_replay_builds_feature_off_gpu_workers_before_replay(self):
+        from pathlib import Path
+        import yaml
+
+        workflow = yaml.safe_load(Path(".github/workflows/mutations-master.yml").read_text())
+        steps = workflow["jobs"]["replay"]["steps"]
+        replay_index = next(
+            i for i, step in enumerate(steps)
+            if step.get("name") == "Replay full catalogue"
+        )
+        fixture_command = (
+            "cargo build --locked --no-default-features "
+            "-p synapse-worker-cuda -p synapse-worker-vulkan"
+        )
+        self.assertTrue(
+            any(
+                step.get("run", "").strip() == fixture_command
+                and step.get("shell") == "bash"
+                and "if" not in step
+                for step in steps[:replay_index]
+            ),
+            "the master replay's baseline needs feature-off worker binaries on every platform",
+        )
+
     def test_expected_selection_is_removed_without_changing_anchors(self):
         import runpy
         import tomllib

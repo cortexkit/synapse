@@ -51,6 +51,12 @@ jobs:
             cargo install --locked --force --git https://github.com/cortexkit/commons --rev 5d005f453c892a09147ffb5e991c06966ff9b4a2 cortexkit-mutate
           fi
           test "$(ckdev-mutate --version)" = "$want"
+      # synapse-module tests launch these binaries to assert feature-off refusal;
+      # compiling those tests alone does not build the worker executables, so
+      # without this step the replay's baseline fails before any row runs.
+      - name: Build feature-off GPU worker refusal fixtures
+        shell: bash
+        run: cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
       # A full master replay catches regressions in helpers and fixtures that
       # are neither an edit target nor the test_file selected by --diff.
       - name: Replay full catalogue
