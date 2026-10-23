@@ -802,7 +802,11 @@ async fn machine_factor_corrects_unseen_shape_predictions() {
         .await
         .unwrap();
     assert_eq!(refused.code.as_deref(), Some(ERR_ANE_SHAPE_COMPILING), "{refused:?}");
-    assert!(refused.waited() < 0.01, "refused after {:.2} s", refused.waited());
+    assert!(
+        refused.waited() < 0.01,
+        "compile learning did not correct an unseen shape: refused after {:.2} s",
+        refused.waited()
+    );
     let running_start = compiler.compiles_of("running")[0].start;
     let expected = running_start + 1.3 * standalone(QUEUE_QWEN, 2048)
         + 1.3 * standalone(QUEUE_GTE, 128)

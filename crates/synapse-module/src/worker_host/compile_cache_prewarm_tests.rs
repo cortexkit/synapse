@@ -131,7 +131,11 @@ async fn cached_loads_do_not_change_the_machine_factor() {
         );
         assert!(answer.await.unwrap().ok());
     }
-    assert_eq!(supervisor.inner.lock().machine_factor, None);
+    assert_eq!(
+        supervisor.inner.lock().machine_factor,
+        None,
+        "cached loads changed the machine factor"
+    );
     // Qwen3@2048 is not cached: its seed (41.7 s) still applies, so a 30 s
     // deadline is refused at once rather than accepted on a factor learned
     // from 1.7 s loads.
@@ -596,6 +600,7 @@ async fn prewarm_resumes_after_a_recovery_releases_its_admission() {
         .prewarm(&lane, QUEUE_QWEN, "qwen-lane", &[128, 256], None)
         .unwrap();
     started.notified().await;
+    let interrupted_slot_id = supervisor.inner.lock().slots.values().next().unwrap().id;
     let recovery = {
         let supervisor = supervisor.clone();
         let lane = lane.clone();
@@ -603,10 +608,19 @@ async fn prewarm_resumes_after_a_recovery_releases_its_admission() {
     };
     recovery.await.unwrap().unwrap();
     assert_eq!(handle.restarts.load(Ordering::SeqCst), 1);
-    assert!(
-        supervisor.inner.lock().slots.is_empty(),
-        "the confirmed exit did not release the prewarm admission's slot"
-    );
+    {
+        let state = supervisor.inner.lock();
+        assert!(
+            state.slots.values().all(|slot| slot.id != interrupted_slot_id),
+            "the confirmed exit did not release the prewarm admission's slot"
+        );
+        // The interrupted admission still owns the stream until its gate is
+        // released, even though recovery removed its residency slot.
+        assert!(
+            state.slots.is_empty(),
+            "prewarm started while the worker stream was in use after recovery"
+        );
+    }
     // The old process's admission ends only now, after its slot is gone.
     release.notify_one();
     tokio::time::sleep(Duration::from_secs(120)).await;

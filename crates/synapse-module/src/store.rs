@@ -12466,7 +12466,11 @@ mod tests {
                 crate::sha256_file(p).ok()
             })
             .unwrap();
-        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a changed file identity reused verification"
+        );
         assert_eq!(result.as_deref(), Some(digest.as_str()));
         std::fs::remove_dir_all(root).unwrap();
     }
