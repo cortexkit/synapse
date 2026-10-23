@@ -52,6 +52,21 @@ edition = "2021"
 rust-version = "1.89"
 license = "MIT"
 
+# Windows test builds keep release assertions and native build settings without
+# paying for full optimization of the workspace's many test executables.
+[profile.ci-test]
+inherits = "release"
+opt-level = 1
+codegen-units = 256
+debug-assertions = false
+overflow-checks = false
+
+# Non-workspace dependencies stay fully optimized for inference and timing tests;
+# Cargo's wildcard package override excludes workspace members.
+[profile.ci-test.package."*"]
+opt-level = 3
+codegen-units = 16
+
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

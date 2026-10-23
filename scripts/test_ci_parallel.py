@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 import yaml
@@ -78,10 +79,54 @@ class ParallelCiTests(unittest.TestCase):
             setup = next(s["with"] for s in job["steps"] if s.get("uses") == "./synapse/.github/actions/ci-rust")
             lanes.append(setup["lane"])
             if name == "nextest":
+                self.assertEqual(setup["lane"],
+                                 "${{ inputs.platform == 'windows' && 'nextest-ci-test-v1' || 'nextest' }}")
                 self.assertEqual(setup["save-cache"], "${{ startsWith(matrix.partition, '1/') }}")
             else:
                 self.assertNotIn("save-cache", setup)
         self.assertEqual(len(set(lanes)), len(lanes))
+
+    def test_windows_profile_keeps_release_semantics_and_optimized_dependencies(self):
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        profile = manifest["profile"]["ci-test"]
+        self.assertEqual(profile["inherits"], "release")
+        self.assertEqual(profile["opt-level"], 1)
+        self.assertEqual(profile["codegen-units"], 256)
+        self.assertIs(profile["debug-assertions"], False)
+        self.assertIs(profile["overflow-checks"], False)
+        self.assertEqual(profile["package"], {"*": {"opt-level": 3, "codegen-units": 16}})
+
+    def test_nextest_profile_changes_only_windows_build_not_test_selection(self):
+        job = PORTABLE["jobs"]["nextest"]
+        step = next(s for s in job["steps"] if s.get("name") == "nextest")
+        packages = ["synapse-core", "synapse-native-probe", "synapse-module", "synapse-certify",
+                    "synapse-certify-runner", "synapse-worker-llama", "owned-decode-worker",
+                    "synapse-worker-decode", "synapse-opctl", "synapse-engine-cuda",
+                    "synapse-worker-cuda", "synapse-worker-vulkan"]
+        expected_crates = list(itertools.chain.from_iterable(("-p", p) for p in packages))
+        self.assertEqual(PORTABLE["env"]["SYNAPSE_CRATES"].split(), expected_crates)
+        for platform, partition in (("linux", "2/4"), ("windows", "1/1")):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                cargo = root / "cargo"
+                cargo.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                                 "from pathlib import Path\n"
+                                 "Path('args.json').write_text(json.dumps(sys.argv[1:]))\n")
+                cargo.chmod(0o755)
+                script = (step["run"].replace("${{ inputs.platform }}", platform)
+                          .replace("${{ matrix.partition }}", partition))
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", script], cwd=root,
+                    env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
+                             SYNAPSE_CRATES=PORTABLE["env"]["SYNAPSE_CRATES"]),
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                build = ["--cargo-profile", "ci-test", "--timings", "--cargo-verbose"] if platform == "windows" else []
+                self.assertEqual(json.loads((root / "args.json").read_text()),
+                                 ["nextest", "run", "--locked"] + expected_crates + build +
+                                 ["--retries", "0", "--partition", f"count:{partition}",
+                                  "-E", "not binary(skeleton_e2e)"])
 
 
 class LocalPreflightTests(unittest.TestCase):

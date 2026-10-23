@@ -71,7 +71,8 @@ jobs:
           path: synapse
       - uses: ./synapse/.github/actions/ci-rust
         with:
-          lane: nextest
+          # Isolate the new profile from immutable release-profile cache hits.
+          lane: ${{ inputs.platform == 'windows' && 'nextest-ci-test-v1' || 'nextest' }}
           nextest: 'true'
           # All shards restore the same compiled outputs; only the first saves.
           save-cache: ${{ startsWith(matrix.partition, '1/') }}
@@ -81,10 +82,20 @@ jobs:
         run: |
           set -euo pipefail
           crates="$SYNAPSE_CRATES"
-          profile=""
-          # Non-debug C++ objects avoid mixing debug and release MSVC runtimes.
-          if [ "${{ inputs.platform }}" = "windows" ]; then profile="--release"; fi
-          cargo nextest run --locked $crates $profile --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
+          build_options=""
+          # Inherit release's non-debug native builds, not its expensive Rust
+          # optimization. Verbose Cargo output records fresh/dirty cache reasons.
+          if [ "${{ inputs.platform }}" = "windows" ]; then
+            build_options="--cargo-profile ci-test --timings --cargo-verbose"
+          fi
+          cargo nextest run --locked $crates $build_options --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
+      - name: Retain Windows test build timings
+        if: always() && inputs.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nextest-timings-${{ github.run_id }}
+          path: synapse/target/cargo-timings/
+          if-no-files-found: warn
 
   llama:
     runs-on: ${{ inputs.runner }}

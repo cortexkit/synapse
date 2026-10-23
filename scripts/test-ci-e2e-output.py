@@ -85,8 +85,14 @@ class E2eOutputTests(unittest.TestCase):
                                  [f"count:{partition}" for partition in partitions])
                 for call in calls[:-1]:
                     self.assertEqual(call[call.index("--retries") + 1], "0")
-                for call in calls:
-                    self.assertEqual("--release" in call, platform == "windows")
+                # Push tests use a cheaper release-derived Cargo profile; nightly
+                # whole-process fixtures still exercise the actual release build.
+                for call in calls[:-1]:
+                    self.assertNotIn("--release", call)
+                    self.assertEqual("--cargo-profile" in call, platform == "windows")
+                    if platform == "windows":
+                        self.assertEqual(call[call.index("--cargo-profile") + 1], "ci-test")
+                self.assertEqual("--release" in calls[-1], platform == "windows")
                 self.assertIn("--no-capture", calls[-1], "whole-process fixtures must remain serial")
                 for call in calls:
                     self.assertIn("--locked", call)
