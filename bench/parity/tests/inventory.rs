@@ -51,7 +51,7 @@ fn module_defaults_are_read_from_the_module_source() {
     assert_eq!(defaults["jobs"]["bulk_quantum_tokens"], 3072);
     assert_eq!(defaults["jobs"]["execution_ttl_ms"], 24 * 60 * 60 * 1000);
     assert_eq!(defaults["inline"].len(), 7);
-    assert_eq!(defaults["jobs"].len(), 5);
+    assert_eq!(defaults["jobs"].len(), 4);
 }
 
 #[test]
