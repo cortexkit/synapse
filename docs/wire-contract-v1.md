@@ -39,8 +39,8 @@ Download statuses are flat inside `result`.
 ## 2. Errors (stable codes, typed recovery)
 
 Checks: `stable_errors_are_exhaustively_documented_and_keep_wire_names`
-(`wire_contract` integration target), `remote_error_classes_are_frozen` (core),
-and `embed_query_deadline_one_returns_typed_rejection` (skeleton e2e).
+(`wire_contract` integration target) and
+`embed_query_deadline_one_returns_typed_rejection` (skeleton e2e).
 
 Every error: {code, class: transient|permanent, retry_after_ms?,
 safe_to_retry_same_request, message, details?}. `details` is an optional object.
@@ -50,8 +50,8 @@ a permanent code.
 The `code` field uses two vocabularies. Core `StableErrorCode` supplies
 `queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
 `substitution_rejected`, `artifact_invalid`, `engine_crashed`,
-`probe_required`, `migration_required`, and `module_restarted` here, plus the
-remote additions below. Owned-decode refusals use a separate vocabulary:
+`probe_required`, `migration_required`, and `module_restarted` here.
+Owned-decode refusals use a separate vocabulary:
 `grammar_disabled` is not a `StableErrorCode`; it is emitted for constrained
 `microllm.oneshot` requests when grammar is disabled by module or approval
 configuration, or when no certified enabled owned-decode grammar lane is
@@ -68,17 +68,6 @@ available.
   evidence, a driver API below 12040, or compute capability below 7.5.
   **Consumer disposition:** do not retry on the unchanged host; select a
   non-CUDA lane or provide a compatible driver and device before retrying.
-- `op_not_supported_for_remote` — class `permanent`. Emitted when gateway v1
-  receives a remote request or calibration for a task it cannot serve, including
-  remote `rerank.score` and `microllm.oneshot` requests and non-embed remote
-  profiles. **Consumer disposition:** do not retry the same operation against
-  that remote profile; select a compatible local lane or supported remote embed
-  operation.
-- `sentinel_calibration_refused` — class `permanent`. Emitted when remote
-  sentinel calibration detects provider self-noise that prevents a trustworthy
-  drift gate from being derived. **Consumer disposition:** treat the profile as
-  uncertified; do not retry the same calibration, and start a new probe only
-  after correcting the provider or profile behavior.
 - `model_not_installed` — class `permanent`, no `retry_after_ms`, not safe to
   retry the same request. Emitted when a catalog model is requested on a backend
   that has no install record for the entry's current manifest. `details`:
@@ -229,7 +218,7 @@ integration target). The operation-specific skeleton and catalog e2e tests prove
 runtime behavior; inventory checks alone do not prove numerical execution.
 
 The management registry in this snapshot is `embed.query`, `embed.batch`,
-`embed.result`, `job.resume`, `rerank.score`, `microllm.oneshot`,
+`embed.result`, `rerank.score`, `microllm.oneshot`,
 `owned_decode.admit_session`, `owned_decode.decode`, `owned_decode.snapshot`,
 `owned_decode.continue`, `owned_decode.abort`, `owned_decode.close`,
 `owned_decode.session_status`, `owned_decode.disable`, `owned_decode.revoke`,
@@ -293,8 +282,7 @@ New durable `embed.batch` submissions are refused before job diversion. Already
 queued jobs that encounter the fence fail transiently with the same `lane_paused`
 error; admitted execution drains normally. Replay the identical `embed.batch`
 request (same `request_key` and content) after the pause clears to start a fresh
-attempt and reuse retained checkpoints. `job.resume` is for re-authentication,
-not lane pauses. Checkpoint reuse is bounded by job result retention.
+attempt and reuse retained checkpoints. Checkpoint reuse is bounded by job result retention.
 Pause/resume are mutate operations and therefore refused on flow-scoped routes.
 
 Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measurement`,
@@ -327,8 +315,7 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     readable while the job is still running; `pages_available` on job status
     is the visible committed-page count. The default page is 512 KiB; page
     order is job-internal (length-sorted execution) — items carry ids, KEY
-    WRITES BY ID, never by position. This behavior is identical for local and
-    remote jobs. Pages survive restart until the result-retention TTL.
+    WRITES BY ID, never by position. Pages survive restart until the result-retention TTL.
     `request_key` makes resubmission idempotent: the same key and digest attach
     to or resume the same work; a different digest is `idempotency_conflict`.
     After a terminal restart failure, a fresh attempt keeps prior committed
@@ -427,7 +414,7 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     discrete bucket envelopes; omitted when unloaded or when the lane accepts continuous
     lengths up to `max_tokens`.
   - `dims` (positive integer) — output embedding vector dimensions. Present when
-    reported by the loaded model or declared by a remote profile; omitted when unknown.
+    reported by the loaded model; omitted when unknown.
   - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
   - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
   - `certified` (boolean, optional) — whether verified certification evidence exists for this
@@ -919,8 +906,8 @@ This field is additive and backwards-compatible; existing consumers reading only
 
 ## 7. Consumer integration
 
-Checks: `job_resume_respawns_remote_job_and_pages_are_readable` and
-`embed_query_row_over_ceiling_reports_submitted_and_content_hashes` (skeleton e2e).
+Checks: `embed_query_row_over_ceiling_reports_submitted_and_content_hashes`
+(skeleton e2e).
 
 - Persist the envelope fingerprint verbatim and the alias-table epoch with an
   index. Treat a different fingerprint as a different vector space unless an
@@ -932,8 +919,7 @@ Checks: `job_resume_respawns_remote_job_and_pages_are_readable` and
 
 ## 8. Operational notes
 
-Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host) and
-`job_resume_respawns_remote_job_and_pages_are_readable` (skeleton e2e).
+Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host).
 
 - Crash domain: llama.cpp runs in supervised single-lane workers; engine
   crashes are typed (engine_crashed, transient with budget → quarantine as
@@ -948,120 +934,25 @@ Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host) an
   re-poll jobs (prior-generation jobs are terminal module_restarted).
 
 
-## 9. Additive wire contract v1.1: remote gateway and durable pages
+## 9. Durable pages
 
-Checks: `remote_gateway_declares_calibrates_checkpoints_trips_and_recovers` and
-`job_resume_respawns_remote_job_and_pages_are_readable` (skeleton e2e);
-`credential_failure_dispositions_follow_class_not_code` (remote runtime library).
+Every embed job status carries `pages_available` (download jobs do not).
+`embed.result` serves committed pages while the job is queued, running, done, or
+failed. A page commit atomically publishes item results, page metadata and the
+incremented visible count. Previously committed pages remain readable after a
+later failure.
 
-All v1.1 fields are additive. Local responses retain their existing shapes unless
-this section explicitly aligns durable-page behavior across both lanes.
+The request digest binds the operation, model, constraints, ordered item IDs and
+per-item content hashes. Reusing a request key with different content returns
+permanent `idempotency_conflict`. Same-key/same-digest resubmission resumes from
+committed item IDs.
 
-### Provenance
+`embed.query`, `embed.batch` and `rerank.score` ignore unknown request fields,
+including the retired `accept_declared` field. `microllm.oneshot` remains strict
+and no longer accepts that field.
 
-Remote responses use the real `EngineIdentity` object and add `remote` as an
-optional sibling of `engine`:
-
-```json
-"provenance": {
-  "engine": {
-    "engine": "remote_openai_compatible",
-    "version": "<adapter semver>",
-    "build_flags": {}
-  },
-  "remote": {
-    "provider": "example-provider",
-    "deployment": "api.example.org",
-    "assurance": "declared"
-  }
-}
-```
-
-`build_flags` is a string-keyed object: it is an empty object or is omitted by
-serde when empty, never an array. `remote` is absent for local lanes. No existing
-provenance field changes shape. Owned-decode responses may add the optional
-`chain_k` provenance field; legacy readers must ignore additive provenance fields
-and no request wire field is introduced.
-
-For `assurance: "declared"`, `content_sha256` hashes the exact post-truncation
-text Synapse submitted to the provider. In this lane, “embedded” means
-“submitted to the provider”; provider-side preprocessing is part of the declared
-risk accepted by the caller. `submitted_sha256` echoes the SHA-256 of the
-received text bytes before any truncation.
-
-### Request opt-in
-
-`embed.query`, `embed.batch`, `rerank.score`, and `microllm.oneshot` accept
-`accept_declared: bool`, defaulting to `false`. Requesting a model whose identity
-assurance is declared without `accept_declared: true` fails permanently with
-`declared_identity_not_accepted`.
-
-### Durable job status and resume
-
-A credential pause has this status payload:
-
-```json
-{
-  "state": "paused_needs_reauth",
-  "logical_handle": "provider-handle",
-  "paused_at_ms": 1780000000000,
-  "resume_deadline_ms": 1780086400000,
-  "action": "reauth"
-}
-```
-
-The execution TTL is suspended while paused; `resume_deadline_ms` is the only
-active clock. Consumers resume with `job.resume {job_id}` after repairing
-credentials, or by resubmitting the same request key and digest. Deadline expiry
-transitions durably to terminal `needs_reauth_expired`; result retention starts
-at that terminal transition.
-
-Every embed job status carries `pages_available` (download jobs do not). `embed.result` serves any committed
-page whose index is below that count while the job is queued, running, paused,
-done, or failed. A page commit atomically makes its item results, page metadata,
-and incremented visible count observable. Previously committed pages remain
-readable after a later failure, including continuity quarantine. This
-page-while-running rule applies equally to local and remote jobs.
-
-The request digest is bound at admission to the operation, `synapse_model_id`,
-constraints, ordered item ids, and per-item content hashes. Remote-bound digests
-also bind `remote_profile_hash` and `logical_handle`; local digests omit those
-two fields. Reusing a request key with different bound content is the permanent
-`idempotency_conflict` error. Same-key/same-digest resubmission resumes from
-committed item ids.
-
-### Provider request ids
-
-When the provider returns no request id, `provider_request_id` is omitted
-entirely; it is never `null` or an empty string. Success envelopes and error
-payloads carry the final attempt's `provider_request_id`, limited to 128 bytes.
-Job pages carry `provider_request_ids: [string]`, one per sub-batch, limited to
-16 entries. Missing entries are omitted, and `provider_request_ids` itself is
-omitted when the resulting array is empty.
-
-### Stable error-code union and credential mapping
-
-Every error retains `{code, class, retry_after_ms?,
-safe_to_retry_same_request, message, details?}`. The complete remote additions are:
-
-- `declared_identity_not_accepted` — permanent.
-- `remote_identity_drift` — permanent; the model is quarantined.
-- `provider_unavailable` — transient.
-- `provider_protocol_violation` — permanent; the model is quarantined.
-- `idempotency_conflict` — permanent.
-- `needs_reauth` — permanent-shaped inline rejection naming the logical handle.
-- `needs_reauth_expired` — permanent terminal job failure.
-- `remote_deployment_changed` — permanent boot or serve refusal.
-- `credential_config_invalid` — permanent vault-handle `not_found` or malformed
-  configuration; it is never retried.
-
-Remote paths reuse these baseline codes unchanged: `module_restarted` (the
-existing post-restart job state), `invalid_request`, and `probe_required`.
-Credential mapping is exact: vault `not_found` or malformed data maps to
-`credential_config_invalid`; an unreachable or restarting credentials module
-maps to transient `provider_unavailable`; `vault_locked` or `needs_reauth`
-enters the pause path for jobs and returns inline `needs_reauth` for inline
-operations.
+Owned-decode responses may add optional `chain_k` provenance. Legacy readers must
+ignore additive provenance fields; this introduces no request field.
 
 ## 10. Compatibility and load-time verification
 

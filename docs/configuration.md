@@ -2,10 +2,11 @@
 
 ## Prepare a configuration example
 
-Synapse reads `SYNAPSE_CONFIG_PATH` when supplied. Otherwise it resolves project
-`.cortexkit/synapse.jsonc` and user `cortexkit/synapse.jsonc` configuration. Remote
-provider configuration comes from the user tier when both tiers exist. Only one
-module instance may hold the singleton lease on a machine.
+Synapse reads `SYNAPSE_CONFIG_PATH` when supplied. Otherwise it uses project
+`.cortexkit/synapse.jsonc`, falling back to user `cortexkit/synapse.jsonc` only when
+no project file exists. Only one module instance may hold the singleton lease on
+a machine. `remote_providers` is rejected: remote providers were removed; modules
+should call providers directly.
 
 Create a new example file rather than overwriting an existing configuration:
 

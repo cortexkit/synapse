@@ -23,10 +23,6 @@ mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
-#[cfg(test)]
-mod rerank_readout_tests;
-// Provider adapters stay module-private so credentials and remote identity checks
-// cannot be bypassed by a second public call path.
 /// Certification probes, immutable fixture batteries and oracles,
 /// scheduler-evidence ingestion, the approval-backed serving predicate, and
 /// validation of all twelve owned-metal-decode release requirements. The source
@@ -61,8 +57,8 @@ pub mod owned_decode_routing;
 /// Sidecar completions never receive authority to commit target decode state.
 #[path = "../owned-decode-sidecar/mod.rs"]
 pub mod owned_decode_sidecar;
-#[allow(dead_code)]
-mod remote;
+#[cfg(test)]
+mod rerank_readout_tests;
 mod rollback;
 mod store;
 pub use store::{
@@ -105,14 +101,6 @@ mod catalog_token_identity_tests;
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use owned_decode_certification::probe::ProbeSnapshot;
-use remote::{
-    config::{validate_remote_providers, ConfiguredProvider, RemoteProviderConfig, RemoteTask},
-    gateway::{RemoteEmbedVector, RemoteGateway, RemoteGatewayError},
-    runtime::RemoteClass,
-    vault::SubcVaultCredentialClient,
-    ContinuityCheck,
-};
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -124,7 +112,7 @@ use store::{
     OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal, OwnedDecodeCertificationRow,
     OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs,
     StoredModelConfig, CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
-    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_PAUSED_NEEDS_REAUTH, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandler,
@@ -163,6 +151,7 @@ use synapse_engine_owned::{
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use tracing::Instrument;
+use url::Url;
 
 impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
     fn admission_boundary_matches(
@@ -303,8 +292,7 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         );
     }
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
-    let connection_file = subc_connection_file_from_args()?;
-    let handler = SynapseHandler::new(module_id.clone(), connection_file);
+    let handler = SynapseHandler::new(module_id.clone());
     // `serve` takes the handler, so keep a handle on the one slot the stop line
     // needs: how the daemon connection ended, which the SDK reports to the
     // handler just before `serve` returns.
@@ -409,20 +397,6 @@ fn module_id_from_environment(
     }
 }
 
-fn subc_connection_file_from_args() -> Result<PathBuf, ModuleError> {
-    let mut args = env::args_os().skip(1);
-    while let Some(argument) = args.next() {
-        if argument == "--subc" {
-            return args.next().map(PathBuf::from).ok_or_else(|| {
-                ModuleError::Config("--subc requires a connection file path".to_string())
-            });
-        }
-    }
-    Err(ModuleError::Config(
-        "missing required --subc connection file path".to_string(),
-    ))
-}
-
 fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLease, ModuleError> {
     let lease_root = synapse_lease_root()?;
     let store = FileLeaseStore::new(lease_root);
@@ -508,7 +482,6 @@ struct SynapseHandler {
 
 struct SynapseHandlerInner {
     module_id: String,
-    connection_file: PathBuf,
     state: OnceLock<Arc<ModuleState>>,
     initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
     #[cfg(feature = "test-support")]
@@ -591,8 +564,6 @@ struct ModuleState {
     profile_activation_epoch: u64,
     runtime: Arc<RuntimeState>,
     model_cache: Arc<ModelCache>,
-    continuity_check: Arc<dyn ContinuityCheck>,
-    remote_gateway: Arc<RemoteGateway>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -921,8 +892,6 @@ pub(crate) struct ModuleConfig {
     cache_max_bytes: u64,
     #[serde(default)]
     dev: DevConfig,
-    #[serde(default)]
-    remote_providers: Vec<RemoteProviderConfig>,
 }
 
 impl Default for ModuleConfig {
@@ -945,7 +914,6 @@ impl Default for ModuleConfig {
             decode_chain_k: default_decode_chain_k(),
             cache_max_bytes: default_cache_max_bytes(),
             dev: DevConfig::default(),
-            remote_providers: Vec::new(),
         }
     }
 }
@@ -1298,10 +1266,6 @@ impl AdmissionTelemetry {
 
     fn record_jobs_failed(&self, count: u64) {
         self.jobs_failed.fetch_add(count, Ordering::Relaxed);
-    }
-
-    fn record_job_inherited(&self) {
-        self.jobs_inherited.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_jobs_inherited(&self, count: u64) {
@@ -1920,8 +1884,6 @@ struct EmbedQueryParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    #[serde(default)]
-    accept_declared: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1946,8 +1908,6 @@ struct EmbedBatchParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    #[serde(default)]
-    accept_declared: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1969,8 +1929,6 @@ struct RerankScoreParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    #[serde(default)]
-    accept_declared: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2001,8 +1959,6 @@ struct MicroLlmOneshotParams {
     allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    #[serde(default, rename = "accept_declared")]
-    _accept_declared: bool,
     /// Set only by the session API; once a persistent session reserves
     /// owned-decode KV state, force the same worker identity instead of switching
     /// to a separate llama runtime.
@@ -2052,13 +2008,6 @@ struct EmbedBatchJobWork {
     total_tokens: u64,
 }
 
-struct RemoteEmbedBatchJobWork {
-    profile: Arc<remote::config::ConfiguredRemoteProfile>,
-    request_digest: String,
-    items: Vec<EmbedBatchItem>,
-    deadline_ms: u64,
-}
-
 struct PreparedJobPage {
     page_no: u32,
     bytes: Vec<u8>,
@@ -2070,11 +2019,6 @@ struct EmbedResultParams {
     job_id: String,
     #[serde(default)]
     page: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JobResumeParams {
-    job_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2443,11 +2387,10 @@ impl Clock for SystemClock {
 }
 
 impl SynapseHandler {
-    fn new(module_id: String, connection_file: PathBuf) -> Self {
+    fn new(module_id: String) -> Self {
         Self {
             inner: Arc::new(SynapseHandlerInner {
                 module_id,
-                connection_file,
                 state: OnceLock::new(),
                 initialization: OnceLock::new(),
                 #[cfg(feature = "test-support")]
@@ -2470,9 +2413,6 @@ impl SynapseHandler {
         let store = Arc::new(SynapseStore::open(&descriptor)?);
         let module_generation = store.next_module_generation()?;
         let config = load_module_config()?;
-        let configured_remote =
-            validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
-        bind_remote_provider_urls(&store, &configured_remote)?;
         validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
         let release_catalog = runtime_release_catalog()?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
@@ -2504,21 +2444,8 @@ impl SynapseHandler {
             .ok_or_else(|| {
                 ModuleError::Config("profile activation epoch is missing".to_string())
             })?;
-        let vault_client = Arc::new(SubcVaultCredentialClient::new(
-            self.inner.connection_file.clone(),
-        ));
-        let remote_gateway = Arc::new(
-            RemoteGateway::new(
-                Arc::clone(&store),
-                configured_remote,
-                vault_client,
-                machine_profile_hash.clone(),
-            )
-            .map_err(|error| ModuleError::Config(error.message))?,
-        );
         let runtime = Arc::new(RuntimeState::from_catalog(config, catalog_models)?);
         reconcile_startup_orphans(&store, module_generation, &runtime.admission_telemetry)?;
-        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         let state = Arc::new(ModuleState {
             module_id: self.inner.module_id.clone(),
             store,
@@ -2530,8 +2457,6 @@ impl SynapseHandler {
             profile_activation_epoch,
             runtime,
             model_cache,
-            continuity_check,
-            remote_gateway,
         });
         startup_catalog_runtime(&state)?;
         Ok(state)
@@ -2874,25 +2799,6 @@ async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
         worker_rss_mb,
         "activity"
     );
-}
-
-fn bind_remote_provider_urls(
-    store: &SynapseStore,
-    providers: &[ConfiguredProvider],
-) -> Result<(), ModuleError> {
-    let now = now_ms();
-    let mut active_hashes = Vec::new();
-    for provider in providers {
-        for profile in &provider.models {
-            store.bind_remote_profile_url(
-                &profile.remote_profile_hash,
-                provider.base_url.as_str(),
-            )?;
-            active_hashes.push(profile.remote_profile_hash.clone());
-        }
-    }
-    store.sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)?;
-    Ok(())
 }
 
 fn sync_and_load_catalog_models(
@@ -4007,19 +3913,6 @@ fn run_background_maintenance_at(state: &ModuleState, now: u64) {
     if let Err(error) = state.store.purge_expired_jobs(now) {
         tracing::warn!(target: "maintenance", error = %error, "job purge sweep failed");
     }
-    let active_hashes = state
-        .remote_gateway
-        .profiles()
-        .iter()
-        .map(|profile| profile.remote_profile_hash.clone())
-        .collect::<Vec<_>>();
-    if let Err(error) =
-        state
-            .store
-            .sweep_remote_url_bindings(&active_hashes, now, 7 * 24 * 60 * 60 * 1_000)
-    {
-        tracing::warn!(target: "maintenance", error = %error, "URL binding sweep failed");
-    }
     match state.runtime.owned_decode_sessions.lock() {
         Ok(mut sessions) => {
             sessions.evict_expired_closed_sessions(now);
@@ -4270,7 +4163,6 @@ async fn dispatch_request(
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
         "embed.result" => embed_result(state, request.params).await,
-        "job.resume" => job_resume(state, request.params).await,
         "rerank.score" => rerank_score(state, request.params).await,
         "microllm.oneshot" => microllm_oneshot(state, request.params).await,
         "owned_decode.admit_session" | "admit_session" => {
@@ -5309,7 +5201,6 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         required_fingerprint: None,
         allow_equivalent: false,
         required_epoch: None,
-        _accept_declared: false,
         owned_only: true,
     };
     let worker_stream = match route_owned_decode_wire(
@@ -6081,19 +5972,8 @@ async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         Ok(value) => value,
         Err(error) => return channel_error("invalid_request", error.to_string()),
     };
-    let request_digest =
-        compute_request_digest("model.load", "management", None, None, &params_json, &[]);
-    let admission = match state.store.admit_job(
-        &request_key,
-        &request_digest,
-        "model.load",
-        state.module_generation,
-        None,
-        &params_json,
-        now,
-        state.runtime.jobs.execution_ttl_ms,
-        state.runtime.jobs.result_retention_ttl_ms,
-    ) {
+    let request_digest = compute_request_digest("model.load", "management", &params_json, &[]);
+    let admission = match state.store.admit_job(&request_key, &request_digest, "model.load", state.module_generation, &params_json, now, state.runtime.jobs.execution_ttl_ms, state.runtime.jobs.result_retention_ttl_ms) {
         Ok(admission) => admission,
         Err(SynapseStoreError::IdempotencyConflict { .. }) => {
             return result_outcome(error_payload(
@@ -8668,13 +8548,6 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    if params
-        .model
-        .as_deref()
-        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
-    {
-        return remote_embed_query(state, params).await;
-    }
     let catalog_sequences = match preflight_catalog_sequences(
         &state,
         params.model.as_deref(),
@@ -8718,12 +8591,9 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) = ensure_pre_tokenization_certified(
-        &state,
-        &model,
-        CertificationClass::Embedding,
-        params.accept_declared,
-    ) {
+    if let Err(error) =
+        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Embedding)
+    {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -8806,236 +8676,6 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     .await
 }
 
-async fn remote_embed_query(state: Arc<ModuleState>, params: EmbedQueryParams) -> HandlerOutcome {
-    let model_id = params
-        .model
-        .as_deref()
-        .expect("remote query has an explicit model");
-    let profile = state
-        .remote_gateway
-        .profile(model_id)
-        .expect("remote query profile was checked before dispatch");
-    if profile.task != RemoteTask::Embed {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::op_not_supported_for_remote(),
-                "the named remote profile does not support embed.query",
-            ),
-        ));
-    }
-    if !params.accept_declared {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::declared_identity_not_accepted(),
-                "remote profiles require accept_declared=true",
-            ),
-        ));
-    }
-    if let Err(error) = check_remote_fingerprint_constraints(
-        &profile,
-        params.target_fingerprint.as_deref(),
-        params.required_fingerprint.as_deref(),
-        params.required_epoch,
-        &state,
-    ) {
-        return result_outcome(error_payload(&state, error));
-    }
-    let id = params.id.unwrap_or_else(|| "query".to_string());
-    if let Err(error) = state.remote_gateway.ensure_certified(&profile).await {
-        return remote_error_outcome(&state, error);
-    }
-    let request_bytes = request_bytes_for_texts([params.text.as_str()]);
-    let job_id = state
-        .runtime
-        .activity_telemetry
-        .next_inline_job_id(state.module_generation);
-    let started = Instant::now();
-    let deadline_ms = params
-        .deadline_ms
-        .unwrap_or(state.runtime.inline.deadline_ms);
-    let estimated_ms = match state.remote_gateway.predicted_finish_ms(
-        &profile,
-        params.text.split_whitespace().count().max(1) as u64,
-        now_ms(),
-    ) {
-        Ok(estimate) => estimate,
-        Err(error) => return remote_error_outcome(&state, error),
-    };
-    if estimated_ms > deadline_ms {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::deadline_exceeded(),
-                format!(
-                    "predicted remote finish {estimated_ms}ms exceeds deadline {deadline_ms}ms"
-                ),
-            ),
-        ));
-    }
-    let _admission = match state.runtime.admit_inline(
-        &profile.synapse_model_id,
-        Some(&job_id),
-        QueueClass::Interactive,
-        request_bytes,
-        params.deadline_ms,
-        params.max_queue_ms,
-    ) {
-        Ok(admission) => admission,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let original_count = params.text.split_whitespace().count().max(1) as u32;
-    match state
-        .remote_gateway
-        .embed(
-            &profile,
-            &[params.text],
-            RemoteClass::Interactive,
-            deadline_ms,
-        )
-        .await
-    {
-        Ok(result) => remote_embed_success(
-            &state,
-            &profile,
-            vec![id],
-            vec![original_count],
-            result,
-            &job_id,
-            started,
-        ),
-        Err(error) => {
-            log_job_failed(
-                &profile.synapse_model_id,
-                &job_id,
-                "remote",
-                &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
-                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            );
-            remote_error_outcome(&state, error)
-        }
-    }
-}
-
-fn remote_embed_success(
-    state: &ModuleState,
-    profile: &remote::config::ConfiguredRemoteProfile,
-    ids: Vec<String>,
-    original_token_counts: Vec<u32>,
-    result: remote::gateway::RemoteEmbeddingResult,
-    job_id: &str,
-    started: Instant,
-) -> HandlerOutcome {
-    let tokens = result
-        .token_counts
-        .iter()
-        .map(|count| u64::from(*count))
-        .sum();
-    let disclosures = original_token_counts
-        .iter()
-        .zip(&result.token_counts)
-        .map(|(submitted, effective)| TruncationDisclosure {
-            submitted_tokens: *submitted,
-            effective_tokens: *effective,
-            truncated: effective < submitted,
-        })
-        .collect::<Vec<_>>();
-    let vectors = ids
-        .into_iter()
-        .zip(result.vectors)
-        .zip(result.submitted_texts)
-        .zip(result.submitted_sha256s)
-        .map(
-            |(((id, vector), text), submitted_sha256)| RemoteEmbedVector {
-                id,
-                vector,
-                content_sha256: sha256_text(&text),
-                submitted_sha256,
-            },
-        )
-        .collect::<Vec<_>>();
-    let dims = profile.dims.min(u32::MAX as usize) as u32;
-    let table_epoch = state
-        .store
-        .alias_table()
-        .map(|table| table.table_epoch)
-        .unwrap_or(0);
-    let mut envelope = json!({
-        "fingerprint": profile.fingerprint,
-        "table_epoch": table_epoch,
-        "dims": dims,
-        "provenance": state.remote_gateway.provenance(profile),
-        "module_generation": state.module_generation,
-        "equivalent_to": [],
-        "assurance": "declared",
-        "identity_revision": profile.identity_revision,
-        "payload": {
-            "vectors": vectors,
-            "real_token_counts": result.token_counts,
-            "truncation_disclosures": disclosures,
-        },
-    });
-    if let Some(provider_request_id) = result.provider_request_id {
-        envelope["provider_request_id"] = Value::String(provider_request_id);
-    }
-    state
-        .runtime
-        .activity_telemetry
-        .record_completed_tokens(tokens);
-    log_job_done(&profile.synapse_model_id, job_id, "remote", tokens, started);
-    result_outcome(envelope)
-}
-
-fn remote_error_outcome(state: &ModuleState, error: RemoteGatewayError) -> HandlerOutcome {
-    let mut payload = json!({
-        "module_generation": state.module_generation,
-        "error": WireOperationError::from_stable(error.stable, error.message),
-    });
-    if let Some(provider_request_id) = error.provider_request_id {
-        payload["provider_request_id"] = Value::String(provider_request_id);
-    }
-    result_outcome(payload)
-}
-
-fn check_remote_fingerprint_constraints(
-    profile: &remote::config::ConfiguredRemoteProfile,
-    target_fingerprint: Option<&str>,
-    required_fingerprint: Option<&str>,
-    required_epoch: Option<u64>,
-    state: &ModuleState,
-) -> Result<(), WireOperationError> {
-    if target_fingerprint
-        .into_iter()
-        .chain(required_fingerprint)
-        .any(|required| required != profile.fingerprint.0)
-    {
-        return Err(WireOperationError::from_stable(
-            StableError::substitution_rejected(),
-            "the remote profile fingerprint does not satisfy the request constraint",
-        ));
-    }
-    if let Some(required_epoch) = required_epoch {
-        let current_epoch = state
-            .store
-            .alias_table()
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("read alias table: {error}"),
-                )
-            })?
-            .table_epoch;
-        if current_epoch != required_epoch {
-            return Err(WireOperationError::from_stable(
-                StableError::substitution_rejected(),
-                format!("required table epoch {required_epoch} does not match current epoch {current_epoch}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn sha256_text(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
@@ -9056,14 +8696,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    if params
-        .model
-        .as_deref()
-        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
-    {
-        return remote_embed_batch(state, params).await;
-    }
-    let mut job_params = json!({"model":params.model,"required_fingerprint":params.required_fingerprint,"target_fingerprint":params.target_fingerprint,"allow_equivalent":params.allow_equivalent,"required_epoch":params.required_epoch,"accept_declared":params.accept_declared,"request_key":params.request_key});
+    let mut job_params = json!({"model":params.model,"required_fingerprint":params.required_fingerprint,"target_fingerprint":params.target_fingerprint,"allow_equivalent":params.allow_equivalent,"required_epoch":params.required_epoch,"request_key":params.request_key});
     let items = match batch_items(params.items, params.texts) {
         Ok(items) => items,
         Err(message) => return channel_error("invalid_request", message),
@@ -9147,12 +8780,9 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) = ensure_pre_tokenization_certified(
-        &state,
-        &model,
-        CertificationClass::Embedding,
-        params.accept_declared,
-    ) {
+    if let Err(error) =
+        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Embedding)
+    {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -9213,14 +8843,13 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let request_digest = compute_request_digest(
         "embed.batch",
         &model.model_id,
-        None,
-        None,
         &json!({
             "target_fingerprint": params.target_fingerprint,
             "required_fingerprint": params.required_fingerprint,
             "allow_equivalent": params.allow_equivalent,
             "required_epoch": params.required_epoch,
-            "accept_declared": params.accept_declared,
+            // Preserve the historical local digest so retained request keys still replay.
+            "accept_declared": false,
         }),
         &digest_items,
     );
@@ -9280,443 +8909,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     .await
 }
 
-async fn remote_embed_batch(state: Arc<ModuleState>, params: EmbedBatchParams) -> HandlerOutcome {
-    let model_id = params
-        .model
-        .as_deref()
-        .expect("remote batch has an explicit model");
-    let profile = state
-        .remote_gateway
-        .profile(model_id)
-        .expect("remote batch profile was checked before dispatch");
-    if profile.task != RemoteTask::Embed {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::op_not_supported_for_remote(),
-                "the named remote profile does not support embed.batch",
-            ),
-        ));
-    }
-    if !params.accept_declared {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::declared_identity_not_accepted(),
-                "remote profiles require accept_declared=true",
-            ),
-        ));
-    }
-    let items = match batch_items(params.items, params.texts) {
-        Ok(items) if !items.is_empty() => items,
-        Ok(_) => return channel_error("invalid_request", "embed.batch requires at least one item"),
-        Err(message) => return channel_error("invalid_request", message),
-    };
-    if let Err(error) = check_remote_fingerprint_constraints(
-        &profile,
-        params.target_fingerprint.as_deref(),
-        params.required_fingerprint.as_deref(),
-        params.required_epoch,
-        &state,
-    ) {
-        return result_outcome(error_payload(&state, error));
-    }
-    if let Err(error) = state.remote_gateway.ensure_certified(&profile).await {
-        return remote_error_outcome(&state, error);
-    }
-    let counts = items
-        .iter()
-        .map(|item| {
-            item.text
-                .split_whitespace()
-                .count()
-                .max(1)
-                .min(u32::MAX as usize) as u32
-        })
-        .collect::<Vec<_>>();
-    let total_tokens = counts.iter().map(|count| u64::from(*count)).sum::<u64>();
-    let request_bytes = request_bytes_for_texts(items.iter().map(|item| item.text.as_str()));
-    let digest_items = items
-        .iter()
-        .map(|item| (item.id.clone(), sha256_text(&item.text)))
-        .collect::<Vec<_>>();
-    let request_digest = compute_request_digest(
-        "embed.batch",
-        &profile.synapse_model_id,
-        Some(&profile.remote_profile_hash),
-        state.remote_gateway.logical_handle(&profile).as_deref(),
-        &json!({
-            "target_fingerprint": params.target_fingerprint,
-            "required_fingerprint": params.required_fingerprint,
-            "allow_equivalent": params.allow_equivalent,
-            "required_epoch": params.required_epoch,
-            "accept_declared": true,
-        }),
-        &digest_items,
-    );
-    let deadline_ms = params
-        .deadline_ms
-        .unwrap_or(state.runtime.inline.deadline_ms);
-    let estimated_ms =
-        match state
-            .remote_gateway
-            .predicted_finish_ms(&profile, total_tokens, now_ms())
-        {
-            Ok(estimate) => estimate,
-            Err(error) => return remote_error_outcome(&state, error),
-        };
-    if estimated_ms > deadline_ms {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::deadline_exceeded(),
-                format!(
-                    "predicted remote finish {estimated_ms}ms exceeds deadline {deadline_ms}ms"
-                ),
-            ),
-        ));
-    }
-    if items.len() > state.runtime.inline.max_items
-        || total_tokens > state.runtime.inline.max_tokens
-    {
-        return submit_remote_embed_batch_job(
-            state,
-            params.request_key,
-            RemoteEmbedBatchJobWork {
-                profile,
-                request_digest,
-                items,
-                deadline_ms,
-            },
-        )
-        .await;
-    }
-    let job_id = state
-        .runtime
-        .activity_telemetry
-        .next_inline_job_id(state.module_generation);
-    let started = Instant::now();
-    let _admission = match state.runtime.admit_inline(
-        &profile.synapse_model_id,
-        Some(&job_id),
-        QueueClass::Bulk,
-        request_bytes,
-        params.deadline_ms,
-        params.max_queue_ms,
-    ) {
-        Ok(admission) => admission,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-    let texts = items.into_iter().map(|item| item.text).collect::<Vec<_>>();
-    match state
-        .remote_gateway
-        .embed(&profile, &texts, RemoteClass::Bulk, deadline_ms)
-        .await
-    {
-        Ok(result) => remote_embed_success(&state, &profile, ids, counts, result, &job_id, started),
-        Err(error) => {
-            log_job_failed(
-                &profile.synapse_model_id,
-                &job_id,
-                "remote",
-                &WireOperationError::from_stable(error.stable.clone(), &error.message).code,
-                started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            );
-            remote_error_outcome(&state, error)
-        }
-    }
-}
-
-async fn submit_remote_embed_batch_job(
-    state: Arc<ModuleState>,
-    request_key: Option<String>,
-    work: RemoteEmbedBatchJobWork,
-) -> HandlerOutcome {
-    let Some(request_key) = request_key.filter(|key| !key.trim().is_empty()) else {
-        return channel_error(
-            "invalid_request",
-            "job-shaped remote embed.batch requires a non-empty request_key",
-        );
-    };
-    let now = now_ms();
-    let logical_handle = state.remote_gateway.logical_handle(&work.profile);
-    let admission = match state.store.admit_job(
-        &request_key,
-        &work.request_digest,
-        "embed.batch",
-        state.module_generation,
-        logical_handle.as_deref(),
-        &json!({
-            "remote_profile_hash": work.profile.remote_profile_hash,
-            "model": work.profile.synapse_model_id,
-            "items": work.items.iter().map(|item| json!({"id": item.id, "text": item.text})).collect::<Vec<_>>(),
-            "deadline_ms": work.deadline_ms,
-            "accept_declared": true,
-        }),
-        now,
-        state.runtime.jobs.execution_ttl_ms,
-        state.runtime.jobs.result_retention_ttl_ms,
-    ) {
-        Ok(admission) => admission,
-        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
-            return result_outcome(error_payload(
-                &state,
-                WireOperationError::from_stable(
-                    StableError::idempotency_conflict(),
-                    format!("request_key '{request_key}' was already used for different request content"),
-                ),
-            ))
-        }
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    let record = admission.record().clone();
-    let job_minted = matches!(admission, JobAdmission::Admitted(_));
-    if job_minted {
-        state.runtime.admission_telemetry.record_job_minted();
-        log_job_admitted(&work.profile.synapse_model_id, &record.job_id);
-        spawn_remote_embed_batch_job(Arc::clone(&state), record.job_id.clone(), work);
-    }
-    result_outcome(job_status_payload(&state, &record))
-}
-
-fn spawn_remote_embed_batch_job(
-    state: Arc<ModuleState>,
-    job_id: String,
-    work: RemoteEmbedBatchJobWork,
-) {
-    tokio::spawn(async move {
-        execute_remote_embed_batch_job(state, job_id, work).await;
-    });
-}
-
-async fn execute_remote_embed_batch_job(
-    state: Arc<ModuleState>,
-    job_id: String,
-    work: RemoteEmbedBatchJobWork,
-) {
-    let record = match state
-        .store
-        .claim_job_attempt(&job_id, state.module_generation, now_ms())
-    {
-        Ok(JobAttemptClaim::Claimed(record)) => record,
-        Ok(JobAttemptClaim::Attached { .. } | JobAttemptClaim::NotClaimable(_)) => return,
-        Err(_) => {
-            log_stored_embed_failure(&state, &job_id, "store_failure");
-            return;
-        }
-    };
-    if let Err(error) = state.remote_gateway.ensure_certified(&work.profile).await {
-        fail_job_with_wire_error(
-            &state,
-            &job_id,
-            error.stable.class == ErrorClass::Transient,
-            WireOperationError::from_stable(error.stable, error.message),
-        );
-        return;
-    }
-    let started = Instant::now();
-    let mut completed_tokens = 0_u64;
-    let committed = match state.store.committed_item_ids(&record.request_digest) {
-        Ok(committed) => committed,
-        Err(error) => {
-            fail_job_with_wire_error(
-                &state,
-                &job_id,
-                true,
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("read remote checkpoints: {error}"),
-                ),
-            );
-            return;
-        }
-    };
-    let pending = work
-        .items
-        .into_iter()
-        .filter(|item| !committed.contains(&item.id))
-        .collect::<Vec<_>>();
-    let chunk_size = state.runtime.inline.max_items.max(1);
-    let mut page_no = record.page_count;
-    for chunk in pending.chunks(chunk_size) {
-        let ids = chunk.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-        let texts = chunk
-            .iter()
-            .map(|item| item.text.clone())
-            .collect::<Vec<_>>();
-        let original_counts = texts
-            .iter()
-            .map(|text| {
-                text.split_whitespace()
-                    .count()
-                    .max(1)
-                    .min(u32::MAX as usize) as u32
-            })
-            .collect::<Vec<_>>();
-        let result = match state
-            .remote_gateway
-            .embed(&work.profile, &texts, RemoteClass::Bulk, work.deadline_ms)
-            .await
-        {
-            Ok(result) => result,
-            Err(error) if error.stable == StableError::needs_reauth() => {
-                if let Some(handle) = state.remote_gateway.logical_handle(&work.profile) {
-                    let _ = state.store.pause_job_needs_reauth(
-                        &job_id,
-                        &handle,
-                        now_ms(),
-                        state.runtime.jobs.resume_deadline_ms,
-                    );
-                    log_stored_embed_failure(&state, &job_id, "needs_reauth");
-                } else {
-                    fail_job_with_wire_error(
-                        &state,
-                        &job_id,
-                        false,
-                        WireOperationError::from_stable(error.stable, error.message),
-                    );
-                }
-                return;
-            }
-            Err(error) => {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    error.stable.class == ErrorClass::Transient,
-                    WireOperationError::from_stable(error.stable, error.message),
-                );
-                return;
-            }
-        };
-        let provider_request_id = result.provider_request_id.clone();
-        completed_tokens = completed_tokens.saturating_add(
-            result
-                .token_counts
-                .iter()
-                .map(|count| u64::from(*count))
-                .sum::<u64>(),
-        );
-        let disclosures = original_counts
-            .iter()
-            .zip(&result.token_counts)
-            .map(|(submitted, effective)| TruncationDisclosure {
-                submitted_tokens: *submitted,
-                effective_tokens: *effective,
-                truncated: effective < submitted,
-            })
-            .collect::<Vec<_>>();
-        let vectors = ids
-            .iter()
-            .cloned()
-            .zip(result.vectors)
-            .zip(result.submitted_texts)
-            .zip(result.submitted_sha256s)
-            .map(
-                |(((id, vector), text), submitted_sha256)| RemoteEmbedVector {
-                    id,
-                    vector,
-                    content_sha256: sha256_text(&text),
-                    submitted_sha256,
-                },
-            )
-            .collect::<Vec<_>>();
-        let mut page_value = json!({
-            "fingerprint": work.profile.fingerprint,
-            "table_epoch": state.store.alias_table().map(|table| table.table_epoch).unwrap_or(0),
-            "dims": work.profile.dims,
-            "provenance": state.remote_gateway.provenance(&work.profile),
-            "module_generation": state.module_generation,
-            "equivalent_to": [],
-            "assurance": "declared",
-            "identity_revision": work.profile.identity_revision,
-            "payload": {
-                "vectors": vectors,
-                "real_token_counts": result.token_counts,
-                "truncation_disclosures": disclosures,
-            },
-        });
-        if let Some(provider_request_id) = provider_request_id.as_ref() {
-            page_value["provider_request_ids"] = json!([provider_request_id]);
-        }
-        let page_bytes = match serde_json::to_vec(&page_value) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    false,
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(None),
-                        format!("serialize remote result page: {error}"),
-                    ),
-                );
-                return;
-            }
-        };
-        let checkpoints = vectors
-            .iter()
-            .map(|vector| CheckpointItem {
-                item_id: vector.id.clone(),
-                result: serde_json::to_vec(vector).expect("remote checkpoint serializes"),
-                provider_request_id: provider_request_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        if let Err(error) =
-            state
-                .store
-                .commit_job_page(&job_id, page_no, &page_bytes, &checkpoints, now_ms())
-        {
-            fail_job_with_wire_error(
-                &state,
-                &job_id,
-                true,
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("atomically commit remote checkpoint page: {error}"),
-                ),
-            );
-            return;
-        }
-        page_no = page_no.saturating_add(1);
-    }
-    let summary = json!({
-        "job_id": job_id,
-        "state": JOB_STATE_DONE,
-        "page_count": page_no,
-        "module_generation": state.module_generation,
-        "fingerprint": work.profile.fingerprint,
-        "assurance": "declared",
-        "identity_revision": work.profile.identity_revision,
-        "provenance": state.remote_gateway.provenance(&work.profile),
-    });
-    match state.store.finish_job(&job_id, &summary, now_ms()) {
-        Ok(()) => {
-            state.runtime.admission_telemetry.record_job_completed();
-            state
-                .runtime
-                .activity_telemetry
-                .record_completed_tokens(completed_tokens);
-            log_job_done(
-                &work.profile.synapse_model_id,
-                &job_id,
-                "remote",
-                completed_tokens,
-                started,
-            );
-        }
-        Err(error) => fail_job_with_wire_error(
-            &state,
-            &job_id,
-            true,
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("finish remote checkpoint job: {error}"),
-            ),
-        ),
-    }
-}
-
 async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Rerank) {
         Ok(guard) => guard,
@@ -9732,19 +8924,6 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             )
         }
     };
-    if params
-        .model
-        .as_deref()
-        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
-    {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::op_not_supported_for_remote(),
-                "rerank.score is not supported for remote profiles in gateway v1",
-            ),
-        ));
-    }
     if params.candidates.is_empty() {
         return channel_error(
             "invalid_request",
@@ -9819,12 +8998,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     }
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) = ensure_pre_tokenization_certified(
-        &state,
-        &model,
-        CertificationClass::Rerank,
-        params.accept_declared,
-    ) {
+    if let Err(error) =
+        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Rerank)
+    {
         return result_outcome(error_payload(&state, error));
     }
     if let Err(error) = check_fingerprint_constraints(
@@ -9978,7 +9154,6 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         dims: 1,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
-            remote: None,
             owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
@@ -10012,19 +9187,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             )
         }
     };
-    if params
-        .model
-        .as_deref()
-        .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
-    {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::op_not_supported_for_remote(),
-                "microllm.oneshot is not supported for remote profiles in gateway v1",
-            ),
-        ));
-    }
     let ceiling = state.runtime.microllm_max_tokens;
     if params.max_tokens > ceiling {
         return channel_error(
@@ -10207,7 +9369,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         dims: 0,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
-            remote: None,
             owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
@@ -11774,7 +10935,6 @@ async fn route_owned_decode_wire(
         dims: 0,
         provenance: ResponseProvenance {
             engine,
-            remote: None,
             owned_decode: synapse_core::OwnedDecodeResponseProvenance {
                 lane: Some(provenance.lane.clone()),
                 worker: Some(provenance.worker.clone()),
@@ -11860,8 +11020,6 @@ fn update_digest_json(hasher: &mut Sha256, value: &Value) {
 fn compute_request_digest(
     op: &str,
     synapse_model_id: &str,
-    remote_profile_hash: Option<&str>,
-    logical_handle: Option<&str>,
     constraints: &Value,
     items: &[(String, String)],
 ) -> String {
@@ -11869,14 +11027,8 @@ fn compute_request_digest(
     update_digest_bytes(&mut hasher, b"synapse-request-digest-v1");
     update_digest_bytes(&mut hasher, op.as_bytes());
     update_digest_bytes(&mut hasher, synapse_model_id.as_bytes());
-    hasher.update([u8::from(remote_profile_hash.is_some())]);
-    if let Some(remote_profile_hash) = remote_profile_hash {
-        update_digest_bytes(&mut hasher, remote_profile_hash.as_bytes());
-    }
-    hasher.update([u8::from(logical_handle.is_some())]);
-    if let Some(logical_handle) = logical_handle {
-        update_digest_bytes(&mut hasher, logical_handle.as_bytes());
-    }
+    // Keep these two bytes zero so existing durable request digests remain stable.
+    hasher.update([0, 0]);
     update_digest_json(&mut hasher, constraints);
     hasher.update((items.len() as u64).to_be_bytes());
     for (item_id, content_hash) in items {
@@ -11898,22 +11050,12 @@ async fn submit_embed_batch_job(
         );
     };
     let now = now_ms();
-    let admission = match state.store.admit_job(
-        &request_key,
-        &work.request_digest,
-        "embed.batch",
-        state.module_generation,
-        None,
-        &json!({
-            "model": work.model.model_id.clone(),
-            "items": work.ids.len(),
-            "request_bytes": work.request_bytes,
-            "total_tokens": work.total_tokens,
-        }),
-        now,
-        state.runtime.jobs.execution_ttl_ms,
-        state.runtime.jobs.result_retention_ttl_ms,
-    ) {
+    let admission = match state.store.admit_job(&request_key, &work.request_digest, "embed.batch", state.module_generation, &json!({
+        "model": work.model.model_id.clone(),
+        "items": work.ids.len(),
+        "request_bytes": work.request_bytes,
+        "total_tokens": work.total_tokens,
+    }), now, state.runtime.jobs.execution_ttl_ms, state.runtime.jobs.result_retention_ttl_ms) {
         Ok(admission) => admission,
         Err(SynapseStoreError::IdempotencyConflict { .. }) => {
             return result_outcome(error_payload(
@@ -11966,18 +11108,6 @@ async fn execute_embed_batch_job(
             return;
         }
     };
-
-    if !enforce_checkpoint_continuity(
-        &state,
-        &job_id,
-        &record.request_digest,
-        &work.model.model_id,
-        record.logical_handle.as_deref(),
-    )
-    .await
-    {
-        return;
-    }
 
     let started = Instant::now();
     let requested_tokens = work.total_tokens;
@@ -12154,74 +11284,6 @@ async fn execute_embed_batch_job(
                 format!("finish completed job pages: {error}"),
             ),
         ),
-    }
-}
-
-async fn apply_checkpoint_continuity(
-    store: &SynapseStore,
-    continuity_check: &dyn ContinuityCheck,
-    job_id: &str,
-    request_digest: &str,
-    synapse_model_id: &str,
-    logical_handle: Option<&str>,
-    now_ms: u64,
-) -> Result<bool, SynapseStoreError> {
-    if store.checkpoint_count(request_digest)? == 0 {
-        return Ok(true);
-    }
-    match continuity_check
-        .check(request_digest, synapse_model_id, logical_handle)
-        .await
-    {
-        Ok(()) => Ok(true),
-        Err(error) => {
-            store.quarantine_job_for_continuity(
-                job_id,
-                &format!("continuity check failed before appending checkpoints: {error}"),
-                now_ms,
-            )?;
-            Ok(false)
-        }
-    }
-}
-
-async fn enforce_checkpoint_continuity(
-    state: &ModuleState,
-    job_id: &str,
-    request_digest: &str,
-    synapse_model_id: &str,
-    logical_handle: Option<&str>,
-) -> bool {
-    match apply_checkpoint_continuity(
-        &state.store,
-        state.continuity_check.as_ref(),
-        job_id,
-        request_digest,
-        synapse_model_id,
-        logical_handle,
-        now_ms(),
-    )
-    .await
-    {
-        Ok(allowed) => {
-            if !allowed {
-                log_stored_embed_failure(state, job_id, "remote_identity_drift");
-                state.runtime.admission_telemetry.record_job_failed();
-            }
-            allowed
-        }
-        Err(error) => {
-            fail_job_with_wire_error(
-                state,
-                job_id,
-                true,
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("inspect checkpoint continuity trigger: {error}"),
-                ),
-            );
-            false
-        }
     }
 }
 
@@ -12429,7 +11491,6 @@ fn embed_result_pages(
                             format!("serialize checkpoint item: {error}"),
                         )
                     })?,
-                    provider_request_id: None,
                 })
             })
             .collect::<Result<Vec<_>, WireOperationError>>()?;
@@ -12439,7 +11500,6 @@ fn embed_result_pages(
             dims,
             provenance: ResponseProvenance {
                 engine: model.engine_identity.clone(),
-                remote: None,
                 owned_decode: Default::default(),
             },
             module_generation: state.module_generation,
@@ -12547,13 +11607,9 @@ fn log_stored_embed_failure(state: &ModuleState, job_id: &str, code: &str) {
         .and_then(|r| r.params_json.as_ref())
         .and_then(|p| p["model"].as_str())
         .unwrap_or("unknown");
-    let lane = if state.remote_gateway.is_remote(model_id) {
-        "remote"
-    } else {
-        model_slot_snapshot(&state.runtime, model_id)
-            .map(|s| execution_lane_for_engine(&s.spec.engine))
-            .unwrap_or("unknown")
-    };
+    let lane = model_slot_snapshot(&state.runtime, model_id)
+        .map(|s| execution_lane_for_engine(&s.spec.engine))
+        .unwrap_or("unknown");
     let wall_ms = record
         .as_ref()
         .map(|r| now_ms().saturating_sub(r.created_ms))
@@ -12573,24 +11629,6 @@ fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
         if record.state == JOB_STATE_DONE {
             map.insert("page_count".to_string(), Value::from(record.page_count));
         }
-        if record.state == JOB_STATE_PAUSED_NEEDS_REAUTH {
-            if let Some(logical_handle) = &record.logical_handle {
-                map.insert(
-                    "logical_handle".to_string(),
-                    Value::String(logical_handle.clone()),
-                );
-            }
-            if let Some(paused_at_ms) = record.paused_at_ms {
-                map.insert("paused_at_ms".to_string(), Value::from(paused_at_ms));
-            }
-            if let Some(resume_deadline_ms) = record.resume_deadline_ms {
-                map.insert(
-                    "resume_deadline_ms".to_string(),
-                    Value::from(resume_deadline_ms),
-                );
-            }
-            map.insert("action".to_string(), Value::String("reauth".to_string()));
-        }
         if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT
         {
             map.insert(
@@ -12606,134 +11644,6 @@ fn job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
         }
     }
     payload
-}
-
-async fn job_resume(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: JobResumeParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid job.resume params: {error}"),
-            )
-        }
-    };
-    let now = now_ms();
-    let prior_generation = state
-        .store
-        .get_job(&params.job_id)
-        .ok()
-        .flatten()
-        .map(|record| record.module_generation);
-    let resumed = match state.store.resume_paused_job(
-        &params.job_id,
-        state.module_generation,
-        now,
-        state.runtime.jobs.execution_ttl_ms,
-    ) {
-        Ok(resumed) => resumed,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    if resumed && prior_generation.is_some_and(|gen| gen < state.module_generation) {
-        state.runtime.admission_telemetry.record_job_inherited();
-    }
-    let record = match state.store.get_job(&params.job_id) {
-        Ok(Some(record)) => record,
-        Ok(None) => return channel_error("invalid_request", "unknown or expired job_id"),
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    // Re-spawn execution for the resumed job. Only remote jobs pause for
-    // re-authentication (vault_locked / needs_reauth), so only remote batch
-    // jobs need re-dispatch here.
-    if resumed
-        && record.kind == "embed.batch"
-        && record
-            .params_json
-            .as_ref()
-            .and_then(|params| params.get("model"))
-            .and_then(Value::as_str)
-            .is_some_and(|model_id| state.remote_gateway.is_remote(model_id))
-    {
-        if let Err(error) =
-            respawn_resumed_remote_job(&state, &record, record.logical_handle.as_deref())
-        {
-            fail_job_with_wire_error(&state, &record.job_id, false, error);
-        }
-    }
-    let record = match state.store.get_job(&params.job_id) {
-        Ok(Some(record)) => record,
-        Ok(None) => return channel_error("store_failure", "resumed job disappeared"),
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    result_outcome(job_status_payload(&state, &record))
-}
-
-/// Re-dispatch a resumed remote job from its stored request parameters. Paused
-/// jobs are not selected by a background queue consumer, so resumption must
-/// explicitly start the same execution task used for initial admission.
-fn respawn_resumed_remote_job(
-    state: &Arc<ModuleState>,
-    record: &JobRecord,
-    logical_handle: Option<&str>,
-) -> Result<(), WireOperationError> {
-    let params_json = record.params_json.as_ref().ok_or_else(|| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            "resumed remote job has no stored request parameters",
-        )
-    })?;
-    let model_id = params_json
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                "resumed remote job parameters are missing model",
-            )
-        })?;
-    let profile = state.remote_gateway.profile(model_id).ok_or_else(|| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("remote profile not found for model '{model_id}'"),
-        )
-    })?;
-    if let Some(logical_handle) = logical_handle {
-        let gateway_handle = state.remote_gateway.logical_handle(&profile);
-        if gateway_handle.as_deref() != Some(logical_handle) {
-            return Err(WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                "resumed job credential handle no longer matches the configured provider",
-            ));
-        }
-    }
-    let items_value = params_json.get("items").ok_or_else(|| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            "resumed remote job parameters are missing items",
-        )
-    })?;
-    let items: Vec<EmbedBatchItem> =
-        serde_json::from_value(items_value.clone()).map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("resumed remote job items are invalid: {error}"),
-            )
-        })?;
-    let deadline_ms = params_json
-        .get("deadline_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(state.runtime.inline.deadline_ms);
-    spawn_remote_embed_batch_job(
-        Arc::clone(state),
-        record.job_id.clone(),
-        RemoteEmbedBatchJobWork {
-            profile,
-            request_digest: record.request_digest.clone(),
-            items,
-            deadline_ms,
-        },
-    );
-    Ok(())
 }
 
 async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -12787,9 +11697,7 @@ async fn embed_result(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     }
 
     match record.state.as_str() {
-        JOB_STATE_QUEUED | JOB_STATE_RUNNING | JOB_STATE_PAUSED_NEEDS_REAUTH => {
-            result_outcome(job_status_payload(&state, &record))
-        }
+        JOB_STATE_QUEUED | JOB_STATE_RUNNING => result_outcome(job_status_payload(&state, &record)),
         JOB_STATE_FAILED_TRANSIENT | JOB_STATE_FAILED_PERMANENT => {
             result_outcome(job_status_payload(&state, &record))
         }
@@ -12898,7 +11806,6 @@ async fn embed_tokenized(
         dims,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
-            remote: None,
             owned_decode: Default::default(),
         },
         module_generation: state.module_generation,
@@ -14026,12 +12933,11 @@ fn ensure_pre_tokenization_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
     class: CertificationClass,
-    accept_declared: bool,
 ) -> Result<(), WireOperationError> {
     if model.engine_identity.build_flags.contains_key("profile") {
         Ok(())
     } else {
-        ensure_model_certified(state, model, class, accept_declared)
+        ensure_model_certified(state, model, class)
     }
 }
 
@@ -14050,7 +12956,6 @@ async fn ensure_profile_request_certified(
             } else {
                 CertificationClass::Rerank
             },
-            false,
         )?;
     }
     Ok(())
@@ -14060,7 +12965,6 @@ fn ensure_model_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
     certification_class: CertificationClass,
-    accept_declared: bool,
 ) -> Result<(), WireOperationError> {
     if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
         return Ok(());
@@ -14099,8 +13003,6 @@ fn ensure_model_certified(
             certification_class,
             &state.machine_profile_hash,
             &model.certification_fingerprint,
-            &model.model_id,
-            accept_declared,
         )
     };
     if let Err(error) = &result {
@@ -14128,8 +13030,6 @@ fn ensure_fingerprint_certified(
     certification_class: CertificationClass,
     machine_profile_hash: &str,
     fingerprint: &Fingerprint,
-    model_id: &str,
-    accept_declared: bool,
 ) -> Result<(), WireOperationError> {
     match store.get_cert_row(certification_class, machine_profile_hash, fingerprint) {
         Ok(Some(_)) => return Ok(()),
@@ -14142,75 +13042,47 @@ fn ensure_fingerprint_certified(
         }
     }
 
-    match declared_certification_for_request(store, fingerprint, model_id, accept_declared) {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            let failed_probe = store
-                .get_probe_row(certification_class, machine_profile_hash, fingerprint)
-                .map_err(|error| {
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(Some(100)),
-                        format!("read probe outcome row: {error}"),
-                    )
-                })?
-                .filter(|row| row.status == CertificationStatus::Uncertified);
-            if let Some(row) = failed_probe {
-                let reason = row
-                    .evidence
-                    .get("blocking_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("probe_failed");
-                return Err(WireOperationError::from_stable(
-                    StableError::not_certified(),
-                    format!(
-                        "fingerprint {} is uncertified on machine profile {}: {}",
-                        fingerprint.0, machine_profile_hash, reason
-                    ),
-                ));
-            }
-            let stale = store
-                .has_stale_cert_row(certification_class, machine_profile_hash, fingerprint)
-                .unwrap_or(false);
-            let message = if stale {
-                format!(
-                    "fingerprint {} has only stale certification rows for a different machine profile",
-                    fingerprint.0
-                )
-            } else {
-                format!(
-                    "fingerprint {} is not certified on machine profile {}",
-                    fingerprint.0, machine_profile_hash
-                )
-            };
-            Err(WireOperationError::from_stable(
-                StableError::not_certified(),
-                message,
-            ))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn declared_certification_for_request(
-    store: &SynapseStore,
-    fingerprint: &Fingerprint,
-    model_id: &str,
-    accept_declared: bool,
-) -> Result<Option<CertificationRow>, WireOperationError> {
-    match store.declared_cert_row_for_fingerprint(fingerprint) {
-        Ok(Some(row)) if accept_declared => Ok(Some(row)),
-        Ok(Some(_)) => Err(WireOperationError::from_stable(
-            StableError::declared_identity_not_accepted(),
+    let failed_probe = store
+        .get_probe_row(certification_class, machine_profile_hash, fingerprint)
+        .map_err(|error| {
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                format!("read probe outcome row: {error}"),
+            )
+        })?
+        .filter(|row| row.status == CertificationStatus::Uncertified);
+    if let Some(row) = failed_probe {
+        let reason = row
+            .evidence
+            .get("blocking_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("probe_failed");
+        return Err(WireOperationError::from_stable(
+            StableError::not_certified(),
             format!(
-                "model '{model_id}' has declared identity assurance; set accept_declared=true to opt in"
+                "fingerprint {} is uncertified on machine profile {}: {}",
+                fingerprint.0, machine_profile_hash, reason
             ),
-        )),
-        Ok(None) => Ok(None),
-        Err(error) => Err(WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("read declared certification rows: {error}"),
-        )),
+        ));
     }
+    let stale = store
+        .has_stale_cert_row(certification_class, machine_profile_hash, fingerprint)
+        .unwrap_or(false);
+    let message = if stale {
+        format!(
+            "fingerprint {} has only stale certification rows for a different machine profile",
+            fingerprint.0
+        )
+    } else {
+        format!(
+            "fingerprint {} is not certified on machine profile {}",
+            fingerprint.0, machine_profile_hash
+        )
+    };
+    Err(WireOperationError::from_stable(
+        StableError::not_certified(),
+        message,
+    ))
 }
 
 async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -14247,19 +13119,8 @@ async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         "models": model_filter.clone(),
         "deadline_ms": params.deadline_ms,
     });
-    let request_digest =
-        compute_request_digest("probe", "management", None, None, &params_json, &[]);
-    let admission = match state.store.admit_job(
-        &request_key,
-        &request_digest,
-        "probe",
-        state.module_generation,
-        None,
-        &params_json,
-        now,
-        state.runtime.jobs.execution_ttl_ms,
-        state.runtime.jobs.result_retention_ttl_ms,
-    ) {
+    let request_digest = compute_request_digest("probe", "management", &params_json, &[]);
+    let admission = match state.store.admit_job(&request_key, &request_digest, "probe", state.module_generation, &params_json, now, state.runtime.jobs.execution_ttl_ms, state.runtime.jobs.result_retention_ttl_ms) {
         Ok(admission) => admission,
         Err(SynapseStoreError::IdempotencyConflict { .. }) => {
             return result_outcome(error_payload(
@@ -14419,42 +13280,6 @@ async fn execute_probe_job(
         selected_models.push(model);
     }
 
-    for profile in state
-        .remote_gateway
-        .profiles()
-        .into_iter()
-        .filter(|profile| {
-            model_filter.is_empty()
-                || model_filter
-                    .iter()
-                    .any(|model_id| model_id == &profile.synapse_model_id)
-        })
-    {
-        match state
-            .remote_gateway
-            .calibrate(&profile, state.module_generation, now_ms())
-            .await
-        {
-            Ok(()) => lane_results.push(json!({
-                "model_id": profile.synapse_model_id,
-                "fingerprint": profile.fingerprint,
-                "assurance": "declared",
-                "identity_revision": profile.identity_revision,
-                "passed": true,
-                "status": "certified",
-                "probe": "remote_sentinel_calibration",
-            })),
-            Err(error) => {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    error.stable.class == ErrorClass::Transient,
-                    WireOperationError::from_stable(error.stable, error.message),
-                );
-                return;
-            }
-        }
-    }
     let mut certified_vectors = Vec::new();
     for model in selected_models {
         let probe_result = match model.task {
@@ -16847,26 +15672,15 @@ fn lane_blocking_reason(
 }
 
 fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: bool) -> Value {
-    let (machine_profile_hash, remote_profile_hash, identity_revision) = match &row.key {
-        CertificationKey::Measured {
-            machine_profile_hash,
-        } => (Some(machine_profile_hash.as_str()), None, None),
-        CertificationKey::Declared {
-            machine_profile_hash,
-            remote_profile_hash,
-            identity_revision,
-        } => (
-            Some(machine_profile_hash.as_str()),
-            Some(remote_profile_hash.as_str()),
-            Some(identity_revision.as_str()),
-        ),
-    };
+    let CertificationKey::Measured {
+        machine_profile_hash,
+    } = &row.key;
     json!({
         "assurance_class": row.assurance_class,
         "status": row.status,
         "machine_profile_hash": machine_profile_hash,
-        "remote_profile_hash": remote_profile_hash,
-        "identity_revision": identity_revision,
+        "remote_profile_hash": null,
+        "identity_revision": null,
         "numeric_profile_id": row.numeric_profile_id,
         "fingerprint": row.fingerprint,
         "certified_at_ms": row.certified_at_ms,
@@ -17707,7 +16521,6 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
         lane_pause::project(&state.runtime, &mut row);
         models.push(row);
     }
-    models.extend(state.remote_gateway.catalog_entries());
     models.sort_by(|left, right| left["model_id"].as_str().cmp(&right["model_id"].as_str()));
     json!({
         "module_generation": state.module_generation,
@@ -17802,7 +16615,6 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("embed.query", Query),
         op("embed.batch", Query),
         op("embed.result", Query),
-        op("job.resume", Mutate),
         op("rerank.score", Query),
         op("microllm.oneshot", Query),
         op("owned_decode.admit_session", Mutate),
@@ -17934,12 +16746,7 @@ fn load_module_config_with_environment(
     if let Some(cwd) = cwd {
         let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
         if project_path.is_file() {
-            let mut project = load_module_config_file(&project_path, ConfigTier::Project)?;
-            if user_path.is_file() {
-                project.remote_providers =
-                    load_module_config_file(&user_path, ConfigTier::User)?.remote_providers;
-            }
-            return Ok(project);
+            return load_module_config_file(&project_path, ConfigTier::Project);
         }
     }
     if user_path.is_file() {
@@ -17980,14 +16787,12 @@ fn parse_module_config_json(
 ) -> Result<ModuleConfig, ModuleError> {
     let stripped = strip_json_comments(contents);
     let value: Value = serde_json::from_str(&stripped).map_err(ModuleError::Json)?;
-    if matches!(tier, ConfigTier::Project)
-        && value
-            .as_object()
-            .is_some_and(|object| object.contains_key("remote_providers"))
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("remote_providers"))
     {
         return Err(ModuleError::Config(
-            "remote_providers is user-tier only and may not appear in project-tier config"
-                .to_string(),
+            "remote_providers were removed; modules should call providers directly".to_string(),
         ));
     }
     if matches!(tier, ConfigTier::Project)
@@ -18017,7 +16822,6 @@ fn parse_module_config_json(
         }
     })?;
     validate_decode_chain_k(config.decode_chain_k)?;
-    validate_remote_providers(&config.remote_providers).map_err(ModuleError::Config)?;
     Ok(config)
 }
 
@@ -18405,8 +17209,8 @@ mod tests {
         let profile = "gte-modernbert-base.owned-vulkan";
         let state = catalog_test_state(&root, &descriptor, profile);
         let model = state.runtime.loaded_models().into_iter().next().unwrap();
-        let error = ensure_model_certified(&state, &model, CertificationClass::Embedding, true)
-            .unwrap_err();
+        let error =
+            ensure_model_certified(&state, &model, CertificationClass::Embedding).unwrap_err();
         assert_eq!(error.code, "self_check_failed");
         let refs = synapse_certify::self_check::load(profile).unwrap();
         let mut outputs = refs
@@ -18436,9 +17240,7 @@ mod tests {
         let (id, key) = profile_preload_check_key(&state, &model, profile).unwrap();
         let generation = catalog_check_generation(&state, &id, &key).unwrap();
         complete_profile_preload_check(&state, profile, &id, generation, &evaluation).unwrap();
-        assert!(
-            ensure_model_certified(&state, &model, CertificationClass::Embedding, true).is_ok()
-        );
+        assert!(ensure_model_certified(&state, &model, CertificationClass::Embedding).is_ok());
         let Output::Embedding(vector) = &mut outputs.get_mut("short-0").unwrap().output else {
             unreachable!()
         };
@@ -18461,7 +17263,7 @@ mod tests {
         );
         assert_eq!(profile_preload_check_status(&state, &id).unwrap(), "failed");
         assert_eq!(
-            ensure_model_certified(&state, &model, CertificationClass::Embedding, true)
+            ensure_model_certified(&state, &model, CertificationClass::Embedding)
                 .unwrap_err()
                 .code,
             "self_check_failed"
@@ -20796,7 +19598,6 @@ mod tests {
                 "sha256:expired-catalog-job",
                 "embed.batch",
                 state.module_generation,
-                None,
                 &params,
                 now_ms() - 10_000,
                 1,
@@ -21269,7 +20070,7 @@ mod tests {
 
     #[test]
     fn flow_routes_get_queries_only_and_other_routes_are_unchanged() {
-        let handler = SynapseHandler::new("synapse".into(), PathBuf::new());
+        let handler = SynapseHandler::new("synapse".into());
         let inner = &handler.inner;
         let flow = bind_with_scope(1, Some("flow-7"));
         let plain = bind_with_scope(2, None);
@@ -21320,7 +20121,7 @@ mod tests {
 
     #[test]
     fn the_flow_refusal_names_the_method_and_the_flow() {
-        let handler = SynapseHandler::new("synapse".into(), PathBuf::new());
+        let handler = SynapseHandler::new("synapse".into());
         let flow = bind_with_scope(3, Some("flow-9"));
         handler.inner.record_bind_scope(&flow);
         match handler.inner.flow_refusal(&flow.handle, "model.load") {
@@ -21944,16 +20745,6 @@ mod tests {
             runtime
         };
         let runtime = Arc::new(runtime);
-        let remote_gateway = Arc::new(
-            RemoteGateway::new(
-                Arc::clone(&store),
-                Vec::new(),
-                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
-                machine_profile_hash.clone(),
-            )
-            .expect("empty remote gateway initializes"),
-        );
-        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         Arc::new(ModuleState {
             module_id: "synapse-test".to_string(),
             store,
@@ -21967,8 +20758,6 @@ mod tests {
             model_cache: Arc::new(ModelCache::new(
                 std::env::temp_dir().join("synapse-test-cache"),
             )),
-            continuity_check,
-            remote_gateway,
         })
     }
 
@@ -22807,7 +21596,7 @@ mod tests {
             })
             .expect("current certification stores");
 
-        let healthy_handler = SynapseHandler::new("synapse-test".to_string(), PathBuf::new());
+        let healthy_handler = SynapseHandler::new("synapse-test".to_string());
         assert!(healthy_handler
             .inner
             .state
@@ -22835,7 +21624,7 @@ mod tests {
                 .expect("staleness records"),
             Some(13)
         );
-        let stale_handler = SynapseHandler::new("synapse-test".to_string(), PathBuf::new());
+        let stale_handler = SynapseHandler::new("synapse-test".to_string());
         assert!(stale_handler
             .inner
             .state
@@ -23209,16 +21998,6 @@ mod tests {
             RuntimeState::from_catalog(module_config, vec![stuck_model_spec()])
                 .expect("test runtime initializes"),
         );
-        let remote_gateway = Arc::new(
-            RemoteGateway::new(
-                Arc::clone(&store),
-                Vec::new(),
-                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
-                machine_profile_hash.clone(),
-            )
-            .expect("empty remote gateway initializes"),
-        );
-        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         let state = Arc::new(ModuleState {
             module_id: "synapse-test".to_string(),
             store: Arc::clone(&store),
@@ -23230,8 +22009,6 @@ mod tests {
             profile_activation_epoch,
             runtime,
             model_cache,
-            continuity_check,
-            remote_gateway,
         });
 
         // The source blob alone is exactly at the watermark, so this sweep runs
@@ -23334,16 +22111,6 @@ mod tests {
             )
             .expect("test runtime initializes"),
         );
-        let remote_gateway = Arc::new(
-            RemoteGateway::new(
-                Arc::clone(&store),
-                Vec::new(),
-                Arc::new(SubcVaultCredentialClient::new(PathBuf::from("unused-subc"))),
-                machine_profile_hash.clone(),
-            )
-            .expect("empty remote gateway initializes"),
-        );
-        let continuity_check: Arc<dyn ContinuityCheck> = remote_gateway.continuity.clone();
         let state = Arc::new(ModuleState {
             module_id: "synapse-test".to_string(),
             store,
@@ -23355,8 +22122,6 @@ mod tests {
             profile_activation_epoch,
             runtime,
             model_cache: Arc::clone(&model_cache),
-            continuity_check,
-            remote_gateway,
         });
         (state, model_cache, root, cache_root)
     }
@@ -24172,43 +22937,49 @@ mod tests {
     }
 
     #[test]
-    fn project_tier_rejects_remote_providers_with_security_boundary_error() {
-        let error = parse_module_config_json(
-            r#"{"remote_providers": []}"#,
-            "project",
-            ConfigTier::Project,
-        )
-        .expect_err("project tier must not control remote credentials or endpoints");
-        assert_eq!(
-            error.to_string(),
-            "config: remote_providers is user-tier only and may not appear in project-tier config"
-        );
+    fn remote_providers_removed_from_all_config_tiers() {
+        for tier in [ConfigTier::User, ConfigTier::Project] {
+            for providers in ["[]", "null", "[{}]"] {
+                let error = parse_module_config_json(
+                    &format!(r#"{{"remote_providers":{providers}}}"#),
+                    "test",
+                    tier,
+                )
+                .expect_err("remote provider configuration must fail closed");
+                assert_eq!(
+                    error.to_string(),
+                    "config: remote_providers were removed; modules should call providers directly"
+                );
+            }
+        }
     }
 
     #[test]
-    fn user_tier_parses_declared_remote_provider() {
-        let config = parse_module_config_json(
-            r#"{
-                "remote_providers": [{
-                    "name": "mock",
-                    "base_url": "http://127.0.0.1:8080/v1",
-                    "adapter": {"kind": "openai_compatible"},
-                    "auth": {"kind": "none"},
-                    "models": [{
-                        "synapse_model_id": "remote-embed",
-                        "task": "embed",
-                        "model": "mock-embed",
-                        "identity_revision": "r1",
-                        "dims": 3,
-                        "input_profile_id": "whitespace-v1"
-                    }]
-                }]
-            }"#,
-            "user",
-            ConfigTier::User,
-        )
-        .expect("user tier may configure remote providers");
-        assert_eq!(config.remote_providers.len(), 1);
+    fn embed_query_ignores_retired_accept_declared() {
+        let params: EmbedQueryParams = serde_json::from_value(json!({
+            "text": "query", "accept_declared": false
+        }))
+        .expect("published callers still send accept_declared on embed.query");
+        assert_eq!(params.text, "query");
+    }
+
+    #[test]
+    fn embed_batch_ignores_retired_accept_declared() {
+        let params: EmbedBatchParams = serde_json::from_value(json!({
+            "texts": ["query"], "accept_declared": false
+        }))
+        .expect("published callers still send accept_declared on embed.batch");
+        assert_eq!(params.texts, ["query"]);
+    }
+
+    #[test]
+    fn rerank_score_ignores_retired_accept_declared() {
+        let params: RerankScoreParams = serde_json::from_value(json!({
+            "query": "query", "candidates": ["document"], "accept_declared": false
+        }))
+        .expect("published callers still send accept_declared on rerank.score");
+        assert_eq!(params.query, "query");
+        assert_eq!(params.candidates, ["document"]);
     }
 
     #[test]
@@ -24330,42 +23101,29 @@ mod tests {
     }
 
     #[test]
-    fn request_digest_is_canonical_and_binds_order_content_and_remote_identity() {
+    fn request_digest_is_canonical_and_binds_order_and_content() {
         let items = vec![
             ("a".to_string(), sha256_hex(b"first")),
             ("b".to_string(), sha256_hex(b"second")),
         ];
         let constraints_a: Value = serde_json::from_str(r#"{"z":1,"a":true}"#).unwrap();
         let constraints_b: Value = serde_json::from_str(r#"{"a":true,"z":1}"#).unwrap();
-        let local =
-            compute_request_digest("embed.batch", "model", None, None, &constraints_a, &items);
+        let local = compute_request_digest("embed.batch", "model", &constraints_a, &items);
         assert_eq!(
             local,
-            compute_request_digest("embed.batch", "model", None, None, &constraints_b, &items,)
+            compute_request_digest("embed.batch", "model", &constraints_b, &items)
         );
         let mut reordered = items.clone();
         reordered.reverse();
         assert_ne!(
             local,
-            compute_request_digest(
-                "embed.batch",
-                "model",
-                None,
-                None,
-                &constraints_a,
-                &reordered,
-            )
+            compute_request_digest("embed.batch", "model", &constraints_a, &reordered)
         );
+        let mut changed = items;
+        changed[0].1 = sha256_hex(b"changed");
         assert_ne!(
             local,
-            compute_request_digest(
-                "embed.batch",
-                "model",
-                Some("remote-profile"),
-                Some("vault/provider"),
-                &constraints_a,
-                &items,
-            )
+            compute_request_digest("embed.batch", "model", &constraints_a, &changed)
         );
     }
 
@@ -26961,7 +25719,6 @@ mod tests {
                 "orphan-digest-1",
                 "embed.batch",
                 1,
-                None,
                 &json!({"model": "test"}),
                 1000,
                 10_000,
@@ -31606,8 +30363,6 @@ async fn submit_catalog_embed_job(
     let digest = compute_request_digest(
         "embed.batch",
         &catalog::lane_id(&entry.id, &backend.backend),
-        None,
-        None,
         &params,
         &[],
     );
@@ -31631,7 +30386,6 @@ async fn submit_catalog_embed_job(
             &digest,
             "embed.batch",
             state.module_generation,
-            None,
             &params,
             now_ms(),
             state.runtime.jobs.execution_ttl_ms,
