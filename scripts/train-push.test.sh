@@ -153,6 +153,7 @@ if [ "${1:-}" = "api" ]; then
       repos/*/branches/*/protection/required_status_checks) api_path="$arg" ;;
       repos/*/commits/*/check-runs?*) api_path="$arg" ;;
       repos/*/commits/*/status?*) api_path="$arg" ;;
+      repos/*/actions/runs/*/jobs?per_page=100) api_path="$arg" ;;
     esac
   done
   case "$api_path" in
@@ -162,6 +163,17 @@ if [ "${1:-}" = "api" ]; then
         exit 1
       fi
       cat "$STATE/log_tail" 2>/dev/null || true
+      exit 0
+      ;;
+    repos/*/actions/runs/*/jobs?per_page=100)
+      poll_count="$(cat "$STATE/jobs_api_polls" 2>/dev/null || echo 0)"
+      poll_count=$((poll_count + 1))
+      printf '%s\n' "$poll_count" > "$STATE/jobs_api_polls"
+      if [ -f "$STATE/jobs_api_response.json" ]; then
+        cat "$STATE/jobs_api_response.json"
+      else
+        printf '[{"total_count":0,"jobs":[]}]\n'
+      fi
       exit 0
       ;;
   esac
@@ -251,6 +263,19 @@ fi
 
 if [ "$json" = "status,conclusion,jobs,url" ]; then
   : > "$STATE/watch_seen"
+  watch_poll_count="$(cat "$STATE/watch_poll_count" 2>/dev/null || echo 0)"
+  watch_poll_count=$((watch_poll_count + 1))
+  printf '%s\n' "$watch_poll_count" > "$STATE/watch_poll_count"
+  if [ -f "$STATE/watch_complete_after" ] &&
+    [ "$watch_poll_count" -ge "$(cat "$STATE/watch_complete_after")" ]; then
+    echo completed > "$STATE/watch_status"
+    if [ -f "$STATE/watch_final_conclusion" ]; then
+      cp "$STATE/watch_final_conclusion" "$STATE/conclusion"
+    fi
+    if [ -f "$STATE/watch_final_failed_job" ]; then
+      cp "$STATE/watch_final_failed_job" "$STATE/failed_job"
+    fi
+  fi
   watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
   printf '%s\n' "$watch_status" > "$STATE/recorded_status"
   if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
@@ -510,9 +535,10 @@ run_train() {
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
       TRAIN_PUSH_GH_RETRY_DELAYS="${TRAIN_PUSH_TEST_GH_RETRY_DELAYS:-30 60 120 240}" \
-      WATCH_CI_RESOLVE_ATTEMPTS=1 \
+       WATCH_CI_RESOLVE_ATTEMPTS=1 \
        WATCH_CI_RESOLVE_SLEEP=0 \
        WATCH_CI_POLL_SLEEP=0.02 \
+       TRAIN_PUSH_QUEUED_LIMIT_MIN="${TRAIN_PUSH_TEST_QUEUED_LIMIT_MIN:-10}" \
        TRAIN_PUSH_PARENT_ATTEMPTS="${TRAIN_PUSH_TEST_PARENT_ATTEMPTS:-200}" \
        TRAIN_PUSH_PARENT_SLEEP=0.02 \
        TRAIN_PUSH_REQUIRED_CHECK_ATTEMPTS="${TRAIN_PUSH_TEST_REQUIRED_CHECK_ATTEMPTS:-360}" \
@@ -631,6 +657,9 @@ if args[:1] == ['api']:
         sys.exit(0)
     if '/commits/' in endpoint and ('/check-runs?' in endpoint or '/status?' in endpoint):
         print('')
+        sys.exit(0)
+    if '/actions/runs/' in endpoint and endpoint.endswith('/jobs?per_page=100'):
+        print(json.dumps([{'total_count': 0, 'jobs': []}]))
         sys.exit(0)
     sys.exit('unexpected fake API query: ' + repr(args))
 if args[:2] == ['run', 'rerun']:
@@ -1323,6 +1352,70 @@ test_ci_conclusion_guard() {
   fi
 }
 
+test_queued_job_without_runner_fails_after_bound() {
+  local dir base created_at jobs_api_polls
+  dir="$(new_fixture queued-unavailable)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  add_train_commit "$dir/work" queued-unavailable
+  echo in_progress > "$dir/ci-state/watch_status"
+  echo 2 > "$dir/ci-state/watch_complete_after"
+  echo failure > "$dir/ci-state/watch_final_conclusion"
+  echo "Other failure|9101" > "$dir/ci-state/watch_final_failed_job"
+  created_at="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  python3 - "$dir/ci-state/jobs_api_response.json" "$created_at" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+created_at = sys.argv[2]
+path.write_text(json.dumps([{"total_count": 1, "jobs": [{
+    "name": "Unserved Linux", "status": "queued", "created_at": created_at,
+    "labels": ["custom-unavailable-label"], "runner_name": None, "runner_id": None,
+}]}]))
+PY
+  TRAIN_PUSH_TEST_QUEUED_LIMIT_MIN=1 run_train "$dir" queued-unavailable
+  jobs_api_polls="$(cat "$dir/ci-state/jobs_api_polls" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" = 1 ] &&
+    [[ "$LAST_OUT" == *"CI_QUEUED_UNSERVED job='Unserved Linux'"* ]] &&
+    [[ "$LAST_OUT" == *"labels=[custom-unavailable-label]"* ]] &&
+    [[ "$LAST_OUT" == *"waited="*" minutes"* ]] &&
+    [[ "$LAST_OUT" == *"no runner serves that label"* ]] &&
+    [ "$jobs_api_polls" -ge 1 ] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
+    [ -n "$(origin_ref "$dir" "refs/heads/train/queued-unavailable")" ]; then
+    ok "a queued job with no serving runner fails after the bound and keeps the train branch"
+  else
+    fail "a queued job with no serving runner fails after the bound and keeps the train branch"
+  fi
+}
+
+test_queued_job_waits_while_another_job_runs() {
+  local dir created_at jobs_api_polls watch_polls
+  dir="$(new_fixture queued-running)"
+  add_train_commit "$dir/work" queued-running
+  echo in_progress > "$dir/ci-state/watch_status"
+  echo 2 > "$dir/ci-state/watch_complete_after"
+  created_at="$(python3 -c 'from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  python3 - "$dir/ci-state/jobs_api_response.json" "$created_at" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+created_at = sys.argv[2]
+path.write_text(json.dumps([{"total_count": 2, "jobs": [
+    {"name": "Queued Linux", "status": "queued", "created_at": created_at,
+     "labels": ["ubuntu-latest"], "runner_name": None, "runner_id": None},
+    {"name": "Active Windows", "status": "in_progress", "created_at": created_at,
+     "labels": ["windows-latest"], "runner_name": "hosted-1", "runner_id": 123},
+]}]))
+PY
+  run_train "$dir" queued-running
+  jobs_api_polls="$(cat "$dir/ci-state/jobs_api_polls" 2>/dev/null || echo 0)"
+  watch_polls="$(cat "$dir/ci-state/watch_poll_count" 2>/dev/null || echo 0)"
+  if [ "$LAST_RC" = 0 ] && [ "$jobs_api_polls" -ge 1 ] && [ "$watch_polls" -ge 2 ] &&
+    [[ "$LAST_OUT" != *"no runner serves that label"* ]]; then
+    ok "an over-limit queued job waits while another job is running"
+  else
+    fail "an over-limit queued job waits while another job is running"
+  fi
+}
+
 test_required_check_waits_for_every_context() {
   local dir sha polls
   dir="$(new_fixture required-check-wait)"
@@ -1479,6 +1572,8 @@ run_stack_tests() {
   test_fetch_failure_boundaries
   test_stack_chain
   test_ci_conclusion_guard
+  test_queued_job_without_runner_fails_after_bound
+  test_queued_job_waits_while_another_job_runs
   test_required_check_waits_for_every_context
   test_required_check_waits_on_land_recovery
   test_required_check_failure_is_red
@@ -1629,6 +1724,8 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   fetch-retry) test_fetch_race_retry ;;
   fetch-boundaries) test_fetch_failure_boundaries ;;
   ci-conclusion) test_ci_conclusion_guard ;;
+  queued-unavailable) test_queued_job_without_runner_fails_after_bound ;;
+  queued-running) test_queued_job_waits_while_another_job_runs ;;
   required-check-wait) test_required_check_waits_for_every_context ;;
   required-check-land) test_required_check_waits_on_land_recovery ;;
   required-check-failure) test_required_check_failure_is_red ;;
@@ -1641,10 +1738,12 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   race-lock) test_race_lock ;;
   stacked) run_stack_tests ;;
 esac
-if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == required-check-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = protection-unreadable ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == queued-* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == required-check-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = protection-unreadable ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
   [ "$failures" = 0 ] || exit 1
   if [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
     echo "train-push.test.sh: race-lock case passed ($checks checks)"
+  elif [[ "${TRAIN_PUSH_TEST_CASE:-}" == queued-* ]]; then
+    echo "train-push.test.sh: queued cases passed ($checks checks)"
   elif [[ "${TRAIN_PUSH_TEST_CASE:-}" == required-check-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = protection-unreadable ]; then
     echo "train-push.test.sh: required-check case passed ($checks checks)"
   else

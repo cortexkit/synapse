@@ -1322,6 +1322,7 @@ if [ "$recover_existing" -eq 1 ]; then
     fi
     set +e
     (cd "$REPO" && REPO="$repo_slug" WATCH_CI_BRANCH="$train_ref" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+      TRAIN_PUSH_QUEUED_LIMIT_MIN="${TRAIN_PUSH_QUEUED_LIMIT_MIN:-10}" \
       WATCH_CI_ATTEMPT="$rerun_attempt" \
       "$script_dir/watch-ci.sh" "$watch_target") 2>&1 | tee "$watch_log"
     watch_rc="${PIPESTATUS[0]}"
@@ -1845,6 +1846,7 @@ while true; do
   say "watching CI for $head_sha on $train_ref in $repo_slug (round $round of $max_rounds)"
   set +e
   (cd "$REPO" && REPO="$repo_slug" WATCH_CI_BRANCH="$train_ref" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+    TRAIN_PUSH_QUEUED_LIMIT_MIN="${TRAIN_PUSH_QUEUED_LIMIT_MIN:-10}" \
     "$script_dir/watch-ci.sh" "$head_sha") 2>&1 | tee "$watch_log"
   watch_rc="${PIPESTATUS[0]}"
   set -e

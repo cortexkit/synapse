@@ -66,12 +66,17 @@ RESOLVE_ATTEMPTS="${WATCH_CI_RESOLVE_ATTEMPTS:-40}"
 RESOLVE_SLEEP="${WATCH_CI_RESOLVE_SLEEP:-15}"
 POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
 POLL_MAX_SLEEP="${WATCH_CI_POLL_MAX_SLEEP:-900}"
+QUEUED_LIMIT_MIN="${TRAIN_PUSH_QUEUED_LIMIT_MIN:-10}"
 HEARTBEAT="${WATCH_CI_HEARTBEAT:-}"
 WATCH_ATTEMPT="${WATCH_CI_ATTEMPT:-}"
 if ! [[ "$POLL_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
   ! [[ "$POLL_MAX_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
   [ "$(awk -v value="$POLL_MAX_SLEEP" 'BEGIN { print (value > 0) ? 1 : 0 }')" != 1 ]; then
   echo "watch-ci: poll sleep values must be non-negative numbers and the maximum must be positive" >&2
+  exit 2
+fi
+if ! [[ "$QUEUED_LIMIT_MIN" =~ ^[0-9]+$ ]]; then
+  echo "watch-ci: TRAIN_PUSH_QUEUED_LIMIT_MIN must be a non-negative integer" >&2
   exit 2
 fi
 if [ -n "$WATCH_ATTEMPT" ]; then
@@ -90,6 +95,9 @@ GH_ERROR_ATTEMPTS=0
 GH_ERROR_MAX_ATTEMPTS=4
 GH_LAST_ERROR=""
 RUN_STATE_ERROR_ATTEMPTS=0
+JOBS_API_ERROR_ATTEMPTS=0
+JOBS_API_ERROR_MAX_ATTEMPTS=4
+JOBS_API_LAST_ERROR=""
 
 watcher_start_time() {
   ps -p "$$" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
@@ -154,6 +162,31 @@ watch_run_view_checked() {
   return 1
 }
 
+find_unserved_queued_job() {
+  # Dependent jobs can remain queued while parallel jobs are still running.
+  # Only treat an unassigned queued job as stalled after all jobs stop running.
+  jq -c --argjson limit_minutes "$QUEUED_LIMIT_MIN" '
+    [.[] | .jobs[]?] as $jobs
+    | if ([$jobs[] | select(.status == "in_progress")] | length) > 0 then null
+      else
+        [
+          $jobs[]
+          | select(.status == "queued" and .runner_name == null and .runner_id == null)
+          | . as $job
+          | (try ($job.created_at | fromdateiso8601) catch null) as $created
+          | select($created != null)
+          | ((now - $created) / 60) as $waited_minutes
+          | select($waited_minutes > $limit_minutes)
+          | {
+              name: ($job.name // "<unnamed>" | tostring),
+              labels: (($job.labels // []) | map(tostring) | join(", ")),
+              waited_minutes: ($waited_minutes | floor)
+            }
+        ][0] // null
+      end
+  ' <<< "$1"
+}
+
 poll_delay_cap() {
   awk -v delay="$1" -v maximum="$POLL_MAX_SLEEP" \
     'BEGIN { if (delay > maximum) delay = maximum; printf "%.3f", delay }'
@@ -165,6 +198,7 @@ poll_delay_double() {
 }
 
 POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+JOBS_API_POLL_DELAY="$POLL_DELAY"
 
 # Unusable run-state replies are not evidence that the run is still progressing.
 # Back off on transient payload problems, but stop before malformed data can keep
@@ -207,6 +241,25 @@ poll_gh_error_wait() {
     exit 5
   }
   POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
+}
+
+jobs_api_error_wait() {
+  if run_not_found "$JOBS_API_LAST_ERROR"; then
+    report_run_not_found "$JOBS_API_LAST_ERROR"
+  fi
+  JOBS_API_ERROR_ATTEMPTS=$((JOBS_API_ERROR_ATTEMPTS + 1))
+  if [ "$JOBS_API_ERROR_ATTEMPTS" -ge "$JOBS_API_ERROR_MAX_ATTEMPTS" ]; then
+    printf 'watch-ci: jobs API query for run %s failed after %s attempts (%s): %s\n' \
+      "$RID" "$JOBS_API_ERROR_ATTEMPTS" "repos/$REPO/actions/runs/$RID/jobs" \
+      "$JOBS_API_LAST_ERROR" >&2
+    exit 5
+  fi
+  watch_sleep "$JOBS_API_POLL_DELAY" || {
+    printf 'watch-ci: sleep before jobs API retry failed for run %s: %s\n' \
+      "$RID" "$JOBS_API_LAST_ERROR" >&2
+    exit 5
+  }
+  JOBS_API_POLL_DELAY="$(poll_delay_double "$JOBS_API_POLL_DELAY")"
 }
 
 undetermined() {
@@ -371,6 +424,39 @@ while true; do
       done
     fi
     exit 1
+  fi
+
+  if [ "$STATUS" != "completed" ]; then
+    if ! RUN_JOBS=$("$OPERATOR_GH" api --paginate --slurp \
+      "repos/$REPO/actions/runs/$RID/jobs?per_page=100" 2>"$GH_ERROR_FILE"); then
+      JOBS_API_LAST_ERROR="$(tail -n 1 "$GH_ERROR_FILE" 2>/dev/null || true)"
+      [ -n "$JOBS_API_LAST_ERROR" ] || JOBS_API_LAST_ERROR="gh api exited without an error message"
+      jobs_api_error_wait
+      continue
+    fi
+    if ! jq -e 'type == "array" and all(.[]; (.jobs | type) == "array")' \
+      <<< "$RUN_JOBS" >/dev/null 2>&1; then
+      JOBS_API_LAST_ERROR="gh api returned an unusable jobs response"
+      jobs_api_error_wait
+      continue
+    fi
+    if ! UNSERVED_QUEUED_JOB=$(find_unserved_queued_job "$RUN_JOBS" 2>"$GH_ERROR_FILE"); then
+      JOBS_API_LAST_ERROR="$(tail -n 1 "$GH_ERROR_FILE" 2>/dev/null || true)"
+      [ -n "$JOBS_API_LAST_ERROR" ] || JOBS_API_LAST_ERROR="could not parse the jobs API response"
+      jobs_api_error_wait
+      continue
+    fi
+    JOBS_API_ERROR_ATTEMPTS=0
+    JOBS_API_LAST_ERROR=""
+    JOBS_API_POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+    if [ "$UNSERVED_QUEUED_JOB" != "null" ]; then
+      QUEUED_NAME=$(jq -r '.name' <<< "$UNSERVED_QUEUED_JOB")
+      QUEUED_LABELS=$(jq -r '.labels' <<< "$UNSERVED_QUEUED_JOB")
+      QUEUED_WAITED_MIN=$(jq -r '.waited_minutes' <<< "$UNSERVED_QUEUED_JOB")
+      printf "CI_QUEUED_UNSERVED job='%s' status=queued runner=none labels=[%s] waited=%s minutes; no runner serves that label\n" \
+        "$QUEUED_NAME" "$QUEUED_LABELS" "$QUEUED_WAITED_MIN"
+      exit 1
+    fi
   fi
 
   if [ "$STATUS" = "completed" ]; then
