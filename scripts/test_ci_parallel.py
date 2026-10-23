@@ -85,6 +85,10 @@ class LocalPreflightTests(unittest.TestCase):
                 for name in ("check-train-preconditions.sh", "check-no-external-path-deps.sh",
                              "check-module-runtime-deps.py"):
                     (checkout / "scripts" / name).write_text("")
+                # Mirror the repository's ignore rule: importing remote_gate writes a
+                # .pyc that embeds the source mtime, which differs between the two
+                # copies and would otherwise change the tree fingerprint.
+                (checkout / ".gitignore").write_text("__pycache__/\n")
                 subprocess.run(["git", "init", "-q", str(checkout)], check=True)
             import sys
             cargo = tools / "cargo"
