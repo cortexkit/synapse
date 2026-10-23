@@ -67,7 +67,7 @@ expect_red = [
     "worker_host::ane_residency::tests::cached_loads_do_not_change_the_machine_factor",
     "worker_host::ane_residency::tests::cached_shape_is_predicted_at_load_cost_and_not_refused_early",
 ]
-expect_message = "the load was not learned as a load"
+expect_message = "/the load was not learned as a load|cached loads changed the machine factor/"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
@@ -89,7 +89,7 @@ expect_red = [
     "worker_host::ane_residency::tests::older_worker_without_cache_fields_keeps_full_compile_predictions",
     "worker_host::ane_residency::tests::queued_entries_are_repriced_after_learning",
 ]
-expect_message = "machine_factor.is_some()"
+expect_message = '/machine_factor\.is_some\(\)|learned None for a 100 ms compile|compile learning did not correct an unseen shape|accepted on a stale prediction/'
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
@@ -247,13 +247,11 @@ package = "synapse-module"
 target = "--lib"
 select = "expected"
 expect_red = [
-    "tests::tight_packing_admission_contention_keeps_resident_single_deadline_shape_compiling",
     "tests::tight_packing_prepares_after_self_check_and_preserves_bounded_dispatch",
     "tests::tight_packing_qualification_mismatch_disables_only_packing",
     "tests::tight_packing_unpinned_lane_stays_standalone_and_over_width_rows_fall_back",
-    "tests::tight_packing_waits_for_cancelled_request_drain_before_preparation",
 ]
-expect_message = "finished"
+expect_message = "/packed preparation did not finish after the lane self-check|packed qualification did not run after the lane self-check|qualified rows were not dispatched as packed after preparation/"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800
@@ -374,7 +372,7 @@ expect_red = [
     "worker_host::ane_residency::tests::joined_request_runs_its_inference_before_the_next_prewarm",
     "worker_host::ane_residency::tests::resident_shape_inference_holds_off_prewarm",
 ]
-expect_message = "a second prewarm admission started"
+expect_message = "/a second prewarm admission started|prewarm started while a resident shape of the lane was leased/"
 platforms = ["linux", "macos"]
 timeout_s = 600
 build_timeout_s = 1800

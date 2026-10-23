@@ -18512,7 +18512,8 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
-                .finished
+                .finished,
+            "packed preparation did not finish after the lane self-check"
         );
         assert!(catalog_lane_lock(&fixture.state.runtime, PACKING_TEST_LANE)
             .try_lock()
@@ -18598,12 +18599,14 @@ mod tests {
             .await
             .unwrap();
         packing_attempt_settled(&fixture.state).await;
-        assert!(peer
-            .lock()
-            .unwrap()
-            .requests
-            .iter()
-            .any(|request| matches!(request, WorkerRequest::EmbedPacked { .. })));
+        assert!(
+            peer.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| matches!(request, WorkerRequest::EmbedPacked { .. })),
+            "packed qualification did not run after the lane self-check"
+        );
         peer.lock().unwrap().requests.clear();
         for _ in 0..2 {
             assert_eq!(
@@ -18866,7 +18869,7 @@ mod tests {
             .unwrap(),
             vec![vec![41.0], vec![42.0], vec![43.0]]
         );
-        assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedPacked { items, .. } if items.len() == 2)));
+        assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedPacked { items, .. } if items.len() == 2)), "qualified rows were not dispatched as packed after preparation");
         assert!(peer.lock().unwrap().requests.iter().any(|request| matches!(request, WorkerRequest::EmbedBatch { items, .. } if items.len() == 1 && items[0].n_tokens == 257)));
         assert!(fixture.engine.serving.prepare_packed().await.unwrap());
         fixture

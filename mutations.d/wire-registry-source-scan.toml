@@ -13,8 +13,11 @@ package = "synapse-module"
 target = "--test wire_contract"
 hub = "Every management operation must be documented, asserted by the runtime registry unit inventory and source-parsed consumer wire inventory."
 hub_targets = ["synapse-module::synapse_module"]
-expect_red = ["management_registry_matches_wire_contract"]
-expect_message = "assertion `left == right` failed"
+expect_red = [
+    "management_registry_matches_wire_contract",
+    "tests::wire_contract_documents_every_management_operation",
+]
+expect_message = '/assertion `left == right` failed|wire contract is missing registered operations: \["models\.undocumented"\]/'
 only = false
 timeout_s = 600
 build_timeout_s = 1800
