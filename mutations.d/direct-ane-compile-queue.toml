@@ -117,6 +117,7 @@ old = """                        Err(error) => (
                             ))),
                             None,
                             now,
+                            None,
                         ),"""
 new = """                        Err(_) => return, // NON-VACUITY BREAK: a panicked compile is ignored"""
 test_file = "crates/synapse-module/src/worker_host/compile_queue_fault_tests.rs"
