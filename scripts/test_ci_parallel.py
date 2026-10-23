@@ -185,10 +185,19 @@ sys.exit(subprocess.run(args[args.index('--') + 1:], cwd=os.environ['REMOTE_ROOT
     env=dict(os.environ, REMOTE='1')).returncode)
 ''')
             ck.chmod(0o755)
-            for name in ("gh", "xcrun", "ckdev-mutate"):
+            for name in ("gh", "xcrun"):
                 tool = tools / name
                 tool.write_text("#!/bin/sh\nexit 0\n")
                 tool.chmod(0o755)
+            mutate = tools / "ckdev-mutate"
+            mutate.write_text(f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+name = 'windows' if os.getenv('REMOTE') == '1' else 'native'
+with (Path(os.environ['EVENTS']) / (name + '.mutate')).open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+''')
+            mutate.chmod(0o755)
             result = subprocess.run(
                 [sys.executable, "-c", "import runpy; from unittest.mock import patch; "
                  "p=patch('platform.system', return_value='Darwin'); p.start(); "
@@ -208,6 +217,12 @@ sys.exit(subprocess.run(args[args.index('--') + 1:], cwd=os.environ['REMOTE_ROOT
             self.assertIn("TREE linux ", result.stdout)
             self.assertIn("TREE macos ", result.stdout)
             self.assertIn("TIMING preflight wall", result.stdout)
+            # The build-free anchors check runs on the local half only; the full
+            # catalogue check is left to CI and must not run in either half.
+            local_mutate = (root / "native.mutate").read_text().splitlines()
+            self.assertEqual([json.loads(line) for line in local_mutate],
+                             [["--version"], ["check", "--anchors-only"]])
+            self.assertFalse((root / "windows.mutate").exists(), result.stdout)
             return result
 
     def test_windows_cross_clippy_overlaps_native_preflight(self):

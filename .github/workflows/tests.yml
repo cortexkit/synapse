@@ -76,10 +76,10 @@ jobs:
         shell: bash
         run: |
           # Cache install records can outlive the corresponding executable.
-          want='ckdev-mutate 0.10.0'
-          cargo install --locked --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+          want='ckdev-mutate 0.12.7'
+          cargo install --locked --git https://github.com/cortexkit/commons --rev 5d005f453c892a09147ffb5e991c06966ff9b4a2 cortexkit-mutate
           if [ "$(ckdev-mutate --version)" != "$want" ]; then
-            cargo install --locked --force --git https://github.com/cortexkit/commons --rev a2db1cfd9149424257bbed675c55434d0915138e cortexkit-mutate
+            cargo install --locked --force --git https://github.com/cortexkit/commons --rev 5d005f453c892a09147ffb5e991c06966ff9b4a2 cortexkit-mutate
           fi
           test "$(ckdev-mutate --version)" = "$want"
       - name: Check mutation catalogue

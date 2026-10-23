@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository preflight: portable builds on MOTOR, Apple builds on the Mac."""
+"""Repository preflight: portable builds on MOTOR; catalogue anchors and Apple builds locally."""
 
 import os
 from pathlib import Path
@@ -16,7 +16,6 @@ def remote_commands():
         ["rustc", "--version"],
         ["cargo", "clippy", "--version"],
         ["cargo", "nextest", "--version"],
-        ["ckdev-mutate", "--version"],
         ["bash", "scripts/check-train-preconditions.sh"],
         ["bash", "scripts/check-no-external-path-deps.sh"],
         ["python3", "scripts/check-module-runtime-deps.py"],
@@ -26,7 +25,20 @@ def remote_commands():
          "CARGO_TARGET_DIR=target/train-windows-clippy",
          "cargo", "clippy", "--locked", "-p", "synapse-module", "--features", "test-support",
          "--all-targets", "--target", "x86_64-pc-windows-gnu", "--", "-D", "warnings"],
-        ["ckdev-mutate", "check"],
+    ]
+
+
+def catalogue_commands():
+    # The anchors-only check validates catalogue shape, files, anchors and that
+    # each mutant applies cleanly, in about a second and without starting
+    # Cargo. The full check, which compiles every test target to confirm test
+    # names, took about five minutes on the build server and stays a required
+    # CI job (linux-catalogue and windows-catalogue in tests.yml). This runs on
+    # the local half because it builds nothing and because --anchors-only needs
+    # ckdev-mutate 0.12.8 or newer, which the build server does not have yet.
+    return [
+        ["ckdev-mutate", "--version"],
+        ["ckdev-mutate", "check", "--anchors-only"],
     ]
 
 
@@ -44,13 +56,15 @@ def macos_commands():
     ]
 
 
+def local_commands(system):
+    return catalogue_commands() + (macos_commands() if system == "Darwin" else [])
+
+
 def main():
-    local = []
-    if platform.system() == "Darwin":
-        if Path("/Applications/Xcode.app").is_dir():
-            os.environ.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
-        local = macos_commands()
-    return run(remote_commands(), local, vcpus=4)
+    system = platform.system()
+    if system == "Darwin" and Path("/Applications/Xcode.app").is_dir():
+        os.environ.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
+    return run(remote_commands(), local_commands(system), vcpus=4)
 
 
 if __name__ == "__main__":
