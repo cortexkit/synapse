@@ -203,7 +203,6 @@ const OWNED_DECODE_PROBE_TIMEOUT_MS: u64 = 900_000;
 const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
-const DEFAULT_RESUME_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 3_072;
 const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
@@ -292,6 +291,7 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         );
     }
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
+    subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone());
     // `serve` takes the handler, so keep a handle on the one slot the stop line
     // needs: how the daemon connection ended, which the SDK reports to the
@@ -395,6 +395,20 @@ fn module_id_from_environment(
              (the launch nonce descriptor could not be read: {error})"
         ))),
     }
+}
+
+fn subc_connection_file_from_args() -> Result<PathBuf, ModuleError> {
+    let mut args = env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--subc" {
+            return args.next().map(PathBuf::from).ok_or_else(|| {
+                ModuleError::Config("--subc requires a connection file path".to_string())
+            });
+        }
+    }
+    Err(ModuleError::Config(
+        "missing required --subc connection file path".to_string(),
+    ))
 }
 
 fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLease, ModuleError> {
@@ -1103,9 +1117,6 @@ struct JobConfig {
     execution_ttl_ms: u64,
     #[serde(default = "default_job_result_retention_ttl_ms")]
     result_retention_ttl_ms: u64,
-    #[allow(dead_code)]
-    #[serde(default = "default_resume_deadline_ms")]
-    resume_deadline_ms: u64,
     #[serde(default = "default_job_result_page_bytes")]
     result_page_bytes: usize,
     #[serde(default = "default_job_bulk_quantum_tokens")]
@@ -1117,7 +1128,6 @@ impl Default for JobConfig {
         Self {
             execution_ttl_ms: default_job_execution_ttl_ms(),
             result_retention_ttl_ms: default_job_result_retention_ttl_ms(),
-            resume_deadline_ms: default_resume_deadline_ms(),
             result_page_bytes: default_job_result_page_bytes(),
             bulk_quantum_tokens: default_job_bulk_quantum_tokens(),
         }
@@ -1187,10 +1197,6 @@ fn default_job_execution_ttl_ms() -> u64 {
 
 fn default_job_result_retention_ttl_ms() -> u64 {
     DEFAULT_JOB_RESULT_RETENTION_TTL_MS
-}
-
-fn default_resume_deadline_ms() -> u64 {
-    DEFAULT_RESUME_DEADLINE_MS
 }
 
 fn default_job_result_page_bytes() -> usize {
@@ -23081,8 +23087,7 @@ mod tests {
             r#"{
                 "jobs": {
                     "execution_ttl_ms": 10,
-                    "result_retention_ttl_ms": 20,
-                    "resume_deadline_ms": 30
+                    "result_retention_ttl_ms": 20
                 }
             }"#,
             "test",
@@ -23091,13 +23096,21 @@ mod tests {
         .unwrap();
         assert_eq!(split.jobs.execution_ttl_ms, 10);
         assert_eq!(split.jobs.result_retention_ttl_ms, 20);
-        assert_eq!(split.jobs.resume_deadline_ms, 30);
 
         // Pre-release rename, no compatibility surface: the old key must fail
         // loudly (deny_unknown_fields) instead of being silently accepted.
         let legacy =
             parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test", ConfigTier::User);
         assert!(legacy.is_err(), "legacy ttl_ms key must be rejected");
+        assert!(
+            parse_module_config_json(
+                r#"{"jobs":{"resume_deadline_ms":30}}"#,
+                "test",
+                ConfigTier::User,
+            )
+            .is_err(),
+            "retired remote reauthentication deadline must be rejected"
+        );
     }
 
     #[test]

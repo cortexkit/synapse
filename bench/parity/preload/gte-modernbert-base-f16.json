@@ -31,8 +31,7 @@
     "bulk_quantum_tokens": 3072,
     "execution_ttl_ms": 86400000,
     "result_page_bytes": 524288,
-    "result_retention_ttl_ms": 86400000,
-    "resume_deadline_ms": 86400000
+    "result_retention_ttl_ms": 86400000
   },
   "max_tokens": 8192,
   "model_id": "gte-modernbert-base-f16",

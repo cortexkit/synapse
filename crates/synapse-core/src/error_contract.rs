@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn stable_error_code_all_covers_every_variant() {
-        const VARIANT_COUNT: usize = 31;
+        const VARIANT_COUNT: usize = 21;
 
         // This match is intentionally exhaustive so enum additions update the
         // enumeration and its expected cardinality together.

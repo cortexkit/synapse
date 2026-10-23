@@ -1477,7 +1477,6 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
         "jobs": {
             "execution_ttl_ms": 60_000,
             "result_retention_ttl_ms": 60_000,
-            "resume_deadline_ms": 60_000,
             "result_page_bytes": 4_096,
             "bulk_quantum_tokens": 16
         }
@@ -1760,7 +1759,6 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
         "jobs": {
             "execution_ttl_ms": 60_000,
             "result_retention_ttl_ms": 60_000,
-            "resume_deadline_ms": 60_000,
             "result_page_bytes": 4_096,
             "bulk_quantum_tokens": 16
         }
