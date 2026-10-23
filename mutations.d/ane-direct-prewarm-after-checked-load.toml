@@ -1,0 +1,20 @@
+[[control]]
+id = "ane-prewarm-after-checked-load"
+guards = "A direct-ANE lane loaded with a persisted passing self-check starts its background prewarm, since the lane check that would start it never runs"
+file = "crates/synapse-module/src/lib.rs"
+old = """            start_ready_lane_work(&state.runtime, &model);
+        }
+    });"""
+new = """            start_packed_preparation(&state.runtime, &model); // NON-VACUITY BREAK
+        }
+    });"""
+test_file = "crates/synapse-module/src/lib.rs"
+runner = "nextest"
+package = "synapse-module"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::lane_loaded_with_a_persisted_passing_check_starts_the_prewarm"]
+expect_message = "the prewarm must load its shapes on a lane loaded already checked"
+platforms = ["linux", "macos"]
+timeout_s = 600
+build_timeout_s = 1800

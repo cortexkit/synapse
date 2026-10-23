@@ -410,6 +410,8 @@ struct Prewarm {
     failed: Option<(usize, String)>,
     /// How often a recovery released the running admission's slot.
     interrupted: u32,
+    /// Whether an admission has started, so the first start is logged once.
+    admitted_any: bool,
 }
 
 impl Prewarm {
@@ -821,6 +823,14 @@ impl Scheduler {
                 } => {
                     let id = worker.worker_id().to_owned();
                     if !state.retired.contains(&id) && self.prewarmed.insert(id.clone()) {
+                        tracing::info!(
+                            target: "worker",
+                            lane = %lane,
+                            model_ref = %model_ref,
+                            worker_id = %id,
+                            shapes = ?shapes,
+                            "direct-ANE prewarm accepted"
+                        );
                         self.prewarms.insert(
                             id,
                             Prewarm {
@@ -836,9 +846,18 @@ impl Scheduler {
                                 skipped: Vec::new(),
                                 failed: None,
                                 interrupted: 0,
+                                admitted_any: false,
                             },
                         );
                         effects.progress = true;
+                    } else {
+                        tracing::debug!(
+                            target: "worker",
+                            lane = %lane,
+                            worker_id = %id,
+                            retired = state.retired.contains(&id),
+                            "direct-ANE prewarm ignored: worker retired or already prewarmed"
+                        );
                     }
                 }
                 #[cfg(test)]
@@ -2141,8 +2160,23 @@ impl Scheduler {
                 if let Some(slot) = state.slots.get_mut(&key) {
                     slot.prewarm = true;
                     let slot_id = slot.id;
-                    self.prewarms.get_mut(&id).expect("listed above").running =
-                        Some((key.shape, slot_id));
+                    let prewarm = self.prewarms.get_mut(&id).expect("listed above");
+                    prewarm.running = Some((key.shape, slot_id));
+                    if !prewarm.admitted_any {
+                        prewarm.admitted_any = true;
+                        tracing::info!(
+                            target: "worker",
+                            lane = %prewarm.lane,
+                            model_ref = %key.model_ref,
+                            worker_id = %id,
+                            shape = key.shape,
+                            waited_ms = u64::try_from(
+                                now.saturating_duration_since(prewarm.started).as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                            "direct-ANE prewarm started its first admission"
+                        );
+                    }
                 }
                 effects.progress = true;
                 return;

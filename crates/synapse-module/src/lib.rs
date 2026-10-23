@@ -6589,22 +6589,7 @@ async fn load_catalog_model_task(
             let cold_load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
             let model = Arc::new(model);
             set_model_slot_ready(&state.runtime, &model_id, Arc::clone(&model), cold_load_ms);
-            if packed_lane_enabled(&state.runtime, &model) {
-                let state = state.clone();
-                let model = model.clone();
-                tokio::spawn(async move {
-                    // Reloading a lane with a persisted passing self-check skips
-                    // run_lane_check, so schedule its preparation here instead.
-                    // Wait for the load owner to release the lifecycle lock first.
-                    let guard = catalog_lane_lock(&state.runtime, &model.model_id)
-                        .lock_owned()
-                        .await;
-                    drop(guard);
-                    if profile_check_passed(&state, &model.model_id).is_ok_and(|m| m.is_some()) {
-                        start_packed_preparation(&state.runtime, &model);
-                    }
-                });
-            }
+            start_work_for_already_checked_lane(&state, &model);
             Ok(model)
         }
         Err(error) => {
@@ -20130,6 +20115,56 @@ mod tests {
         finish_ane_lane_fixture(fixture).await;
     }
 
+    /// After a restart the lane's self-check is usually already persisted as
+    /// passed, so requests take the passed-check fast path and the lane check
+    /// (which starts the prewarm after a fresh pass) never runs. The load must
+    /// then start the prewarm itself, or the short shapes are only ever
+    /// loaded by the requests that need them.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn lane_loaded_with_a_persisted_passing_check_starts_the_prewarm() {
+        use synapse_core::WorkerRequest;
+        let (fixture, peer) = packing_lane_fixture(ModuleConfig::default(), true).await;
+        let model = ensure_profile_preload_ready(fixture.state.clone(), PACKING_TEST_LANE, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .runtime
+                .lane_check_tasks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "with a persisted passing check, readiness must not start a lane check"
+        );
+        start_work_for_already_checked_lane(&fixture.state, &model);
+        let admitted = || {
+            peer.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter_map(|request| match request {
+                    WorkerRequest::AneAdmitShape { shape, .. } => Some(*shape),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let prewarmed = tokio::time::timeout(Duration::from_secs(5), async {
+            while admitted().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            prewarmed.is_ok(),
+            "the prewarm must load its shapes on a lane loaded already checked, saw {:?}",
+            admitted()
+        );
+        assert_eq!(admitted(), vec![128, 256, 512]);
+        drop(model);
+        finish_ane_lane_fixture(fixture).await;
+    }
+
     /// Whether a self-check (or unload) holds or is queued for the lane's
     /// serving gate: once a writer is queued, new readers cannot enter.
     #[cfg(unix)]
@@ -30717,9 +30752,48 @@ async fn run_lane_check(
             )
         })?;
     let model = check_profile_model(state, model, guard).await?;
-    start_packed_preparation(&state.runtime, &model);
-    start_direct_ane_prewarm(&state.runtime, &model);
+    start_ready_lane_work(&state.runtime, &model);
     Ok(model)
+}
+
+/// Background work for a lane whose numerical self-check has passed: packed
+/// preparation and the direct-ANE prewarm. Each does nothing for a lane it
+/// does not apply to and ignores a repeated start for the same lane load.
+fn start_ready_lane_work(runtime: &Arc<RuntimeState>, model: &Arc<EmbeddingModel>) {
+    start_packed_preparation(runtime, model);
+    start_direct_ane_prewarm(runtime, model);
+}
+
+/// Whether [`start_direct_ane_prewarm`] applies to `model`: a direct-ANE
+/// catalog lane.
+fn direct_ane_prewarm_enabled(runtime: &RuntimeState, model: &EmbeddingModel) -> bool {
+    is_direct_ane(model) && resolved_catalog_lane(runtime, &model.model_id).is_some()
+}
+
+/// Called when a lane finishes loading. A lane whose self-check already
+/// passed under its current key (persisted from an earlier run, which is the
+/// usual case after a restart) is ready at once: requests take the
+/// passed-check fast path and `run_lane_check` never runs for this load. The
+/// work `run_lane_check` starts after a passing check is started here
+/// instead, once the load owner has released the lane's lifecycle lock. A
+/// lane whose check has not passed gets that work from `run_lane_check`.
+fn start_work_for_already_checked_lane(state: &Arc<ModuleState>, model: &Arc<EmbeddingModel>) {
+    if !packed_lane_enabled(&state.runtime, model)
+        && !direct_ane_prewarm_enabled(&state.runtime, model)
+    {
+        return;
+    }
+    let state = state.clone();
+    let model = model.clone();
+    tokio::spawn(async move {
+        let guard = catalog_lane_lock(&state.runtime, &model.model_id)
+            .lock_owned()
+            .await;
+        drop(guard);
+        if profile_check_passed(&state, &model.model_id).is_ok_and(|m| m.is_some()) {
+            start_ready_lane_work(&state.runtime, &model);
+        }
+    });
 }
 
 /// Once a direct-ANE catalog lane is ready (its self-check passed), its
@@ -30730,7 +30804,7 @@ async fn run_lane_check(
 fn start_direct_ane_prewarm(runtime: &Arc<RuntimeState>, model: &EmbeddingModel) {
     #[cfg(unix)]
     if let EmbedBackend::DirectAne(engine) = &model.backend {
-        if resolved_catalog_lane(runtime, &model.model_id).is_some() {
+        if direct_ane_prewarm_enabled(runtime, model) {
             // Packed preparation that gave up while a prewarm admission held
             // the worker or its budget is retried when that admission ends;
             // the launcher does nothing for a lane without packing.
