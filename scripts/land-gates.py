@@ -85,11 +85,21 @@ def module_fixtures():
 
 
 def full_gates():
+    # --full keeps the complete catalogue check, which compiles test targets to
+    # confirm every expected test name, on the build server.
     return [["ckdev-mutate", "check"], *module_fixtures(),
         ["cargo", "check", "--locked", "-p", "synapse-module", "--features", "test-support"],
         cargo_test("synapse-module", "--features", "test-support", "--lib", "--test", "it", "--test", "skeleton_e2e"),
         ["cargo", "clippy", "--locked", "-p", "synapse-module", "--features", "test-support", "--all-targets", "--", "-D", "warnings"],
     ]
+
+
+def catalogue_anchor_gates():
+    # Fast mode checks only catalogue shape, files, anchors and clean mutant
+    # application. That starts no Cargo and takes about a second, so it runs on
+    # the local half; --anchors-only also needs ckdev-mutate 0.12.8 or newer,
+    # which the build server does not have yet. CI still runs the full check.
+    return [["ckdev-mutate", "--version"], ["ckdev-mutate", "check", "--anchors-only"]]
 
 
 def changed_paths(base):
@@ -172,8 +182,9 @@ def main():
     # Contract tests may also be selected by the diff; do not run identical commands twice.
     commands = list(dict.fromkeys(tuple(command) for command in commands))
     portable, native = split_commands(commands, platform.system())
+    local = [] if args.full else catalogue_anchor_gates()
     if args.plan:
-        print(json.dumps(portable + native, indent=2))
+        print(json.dumps(local + portable + native, indent=2))
         return 0
     versions = [["cargo", "--version"], ["rustc", "--version"], ["cargo", "nextest", "--version"]]
     if args.full:
@@ -181,7 +192,9 @@ def main():
     print("Landing mode: " + ("full portable module" if args.full else "fast; broad integration and native clippy remain CI gates"), flush=True)
     if native and Path("/Applications/Xcode.app").is_dir():
         os.environ.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
-    return run(versions + portable, versions[:3] + native if native else [], vcpus=4)
+    if native:
+        local += versions[:3] + native
+    return run(versions + portable, local, vcpus=4)
 
 
 if __name__ == "__main__":

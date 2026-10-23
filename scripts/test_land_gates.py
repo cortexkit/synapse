@@ -1,8 +1,15 @@
 """Exercise landing selection without substituting fakes for the real gates."""
 
+from contextlib import redirect_stdout
+import io
+import json
 from pathlib import Path
+import platform
 import runpy
+import subprocess
+import sys
 import unittest
+from unittest.mock import patch
 
 
 HELPERS = runpy.run_path(str(Path(__file__).with_name("land-gates.py")))
@@ -73,6 +80,34 @@ class LandingSelectionTests(unittest.TestCase):
         self.assertIn("--test", gates[4])
         self.assertIn("skeleton_e2e", gates[4])
         self.assertEqual(gates[-1][1], "clippy")
+
+    def test_fast_mode_checks_only_catalogue_anchors_without_building(self):
+        # Fast landing runs the build-free anchors check; only --full adds the
+        # complete catalogue check, which compiles every test target.
+        self.assertEqual(HELPERS["catalogue_anchor_gates"](), [
+            ["ckdev-mutate", "--version"], ["ckdev-mutate", "check", "--anchors-only"]])
+        fast = HELPERS["static_gates"]() + HELPERS["contract_tests"]() + HELPERS["module_fixtures"]()
+        self.assertNotIn(["ckdev-mutate", "check"], fast)
+
+    def plan(self, *flags):
+        replies = {"merge-base": "base\n", "diff": "", "ls-files": "", "metadata": '{"packages": []}'}
+
+        def check_output(command, **_):
+            return next(reply for word, reply in replies.items() if word in command)
+
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["land-gates.py", "--plan", *flags]), \
+                patch.object(subprocess, "check_output", side_effect=check_output), \
+                patch.object(platform, "system", return_value="Linux"), redirect_stdout(output):
+            self.assertEqual(HELPERS["main"](), 0)
+        return [list(command) for command in json.loads(output.getvalue())]
+
+    def test_landing_plan_runs_the_full_catalogue_check_only_with_full(self):
+        fast, full = self.plan(), self.plan("--full")
+        self.assertEqual(fast[:2], HELPERS["catalogue_anchor_gates"]())
+        self.assertNotIn(["ckdev-mutate", "check"], fast)
+        self.assertIn(["ckdev-mutate", "check"], full)
+        self.assertNotIn(["ckdev-mutate", "check", "--anchors-only"], full)
 
     def test_only_apple_test_commands_stay_on_the_mac(self):
         portable = HELPERS["static_gates"]() + HELPERS["full_gates"]() + HELPERS["contract_tests"]()
