@@ -7,6 +7,35 @@ Command Line Tools alone do not supply `metal`/`metallib`. Hardware tests need t
 actual platform, pinned model files and any explicit opt-in described by the test.
 A portable test pass or a skipped hardware case is not hardware certification.
 
+## Landing execution location
+
+Run portable Cargo checks, Clippy, tests, Nextest and `ckdev-mutate check` on the
+Linux build server, not on the Mac. With the agent shell use `runon: "linux,4c"`
+(8 vCPUs for workspace suites). From a shell use `ck motor run --vcpus 4 --cwd
+"$PWD" -- COMMAND...`; it snapshots the current checkout, including dirty source.
+Only release builds being placed here and checks requiring Apple frameworks,
+Metal, Swift or actual macOS behavior belong on the Mac. A mutation catalogue
+check compiles test targets to discover names; it is not a cheap local lint.
+
+`scripts/land-gates.sh` routes its portable plan to MOTOR; `--full` adds the
+catalogue, fixtures, module check/tests and Clippy. When invoked on macOS, narrow
+tests for Apple-only packages and the module's active macOS-gated tests run locally;
+on Linux those native implementations are not verified. On macOS,
+`scripts/train-push.local.sh` joins remote Windows GNU
+cross-Clippy, formatting, repository checks and catalogue validation with native
+Clippy for `synapse-module`, `synapse-engine-owned`, `synapse-worker-ane`, plus
+the engine-owned library tests. Native MSVC remains a CI gate. Both halves print
+source-content fingerprints and refuse a mismatched snapshot or a tree changed
+during verification. Each step and the combined wall time are printed. Only
+MOTOR exit 200 (refused before start) retries, every 15 seconds for up to 3 minutes;
+connection loss, timeouts and check failures are never resubmitted.
+
+Preflight orchestration tests (Python with PyYAML installed):
+
+```sh
+python3 -m unittest scripts.test_ci_parallel scripts.test_remote_gate scripts.test_land_gates -v
+```
+
 ## Portable module gates
 
 ```sh

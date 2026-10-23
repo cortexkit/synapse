@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Fast local feedback, not a substitute for the train's native CI gates."""
+"""Fast landing feedback on MOTOR, not a substitute for native CI gates."""
 
 import argparse
 import json
 import os
 from pathlib import Path
-import shlex
+import platform
 import subprocess
-import time
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.lib.remote_gate import run
 
 
 def cargo_test(package, *selection):
@@ -95,6 +98,54 @@ def changed_paths(base):
     return sorted(set((committed + untracked).strip("\0").split("\0")) - {""})
 
 
+def split_commands(commands, system):
+    # These package targets include macOS-gated cases. Linux omits those cases
+    # and cannot verify the macOS-specific paths; ignored tests remain disabled.
+    mac_packages = {"synapse-engine-owned", "synapse-worker-ane", "synapse-worker-ane-direct",
+                    "synapse-worker-decode", "synapse-worker-llama"}
+    portable, native = [], []
+    for command in commands:
+        mac_test = (system == "Darwin" and tuple(command[:2]) == ("cargo", "test")
+                    and "-p" in command and command[command.index("-p") + 1] in mac_packages)
+        (native if mac_test else portable).append(command)
+        if (system == "Darwin" and tuple(command[:2]) == ("cargo", "test") and "-p" in command
+                and command[command.index("-p") + 1] == "synapse-module"):
+            native.extend(module_macos_tests(command))
+    native = list(dict.fromkeys(tuple(command) for command in native))
+    return portable, native
+
+
+def module_macos_tests(command):
+    # The broad module suite is portable, but cfg(macos) hides these active tests
+    # on Linux. Retain only those cases locally, with their original opt-ins and
+    # missing-model skips; this does not enable ignored hardware tests.
+    tests = {
+        "lib": ["direct_ane_models_reuse_one_runtime_supervisor",
+                "stress_schema_rejects_missing_counts_wrong_types_and_invalid_shapes",
+                "compile_duration_summary_reports_independent_even_and_odd_medians"],
+        "it": ["kv_runtime_matrix_proves_warm_reuse_reclamation_and_lifecycle_faults"],
+        "skeleton_e2e": ["probe_worker_death_fails_the_durable_job_with_engine_crashed",
+                         "ane_probe_placement_ping_runs_outside_the_module_runtime",
+                         "embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash",
+                         "probe_owned_gte_modernbert_certifies_against_family_reference",
+                         "owned_gte_rerank_loads_certifies_and_serves_deterministically",
+                         "owned_gte_inline_embed_batch_throughput_sweep"],
+    }
+    targets, names = [], []
+    for target, cases in tests.items():
+        selected = ("--tests" in command or (target == "lib" and "--lib" in command)
+                    or any(tuple(command[i:i + 2]) == ("--test", target) for i in range(len(command) - 1)))
+        if selected:
+            targets.extend(["--lib"] if target == "lib" else ["--test", target])
+            names.extend(cases)
+    if not names:
+        return []
+    fixtures = module_fixtures()[1:] if "skeleton_e2e" in targets else []
+    return [*fixtures, ["cargo", "nextest", "run", "--locked", "-p", "synapse-module", "--features", "test-support",
+             *targets, "--retries", "0", "--test-threads", "4", "-E",
+             " | ".join(f"test({name})" for name in names)]]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true", help="also run portable module builds, integration/e2e and clippy")
@@ -120,27 +171,17 @@ def main():
         commands += narrow
     # Contract tests may also be selected by the diff; do not run identical commands twice.
     commands = list(dict.fromkeys(tuple(command) for command in commands))
+    portable, native = split_commands(commands, platform.system())
     if args.plan:
-        print(json.dumps(commands, indent=2))
+        print(json.dumps(portable + native, indent=2))
         return 0
-    for tool in (["cargo", "--version"], ["rustc", "--version"], ["cargo", "nextest", "--version"]):
-        subprocess.run(tool, check=True)
+    versions = [["cargo", "--version"], ["rustc", "--version"], ["cargo", "nextest", "--version"]]
     if args.full:
-        subprocess.run(["ckdev-mutate", "--version"], check=True)
+        versions.append(["ckdev-mutate", "--version"])
     print("Landing mode: " + ("full portable module" if args.full else "fast; broad integration and native clippy remain CI gates"), flush=True)
-    environment = dict(os.environ)
-    # Nested Cargo calls must not rediscover a host sccache wrapper in a sandbox.
-    environment.setdefault("RUSTC_WRAPPER", "")
-    environment.setdefault("CARGO_BUILD_RUSTC_WRAPPER", "")
-    for command in commands:
-        print("\n$ " + shlex.join(command), flush=True)
-        start = time.monotonic()
-        result = subprocess.run(command, env=environment)
-        print(f"TIMING {time.monotonic() - start:.2f}s exit={result.returncode}: {shlex.join(command)}", flush=True)
-        if result.returncode:
-            return result.returncode
-    print(f"Passed {len(commands)} landing stages", flush=True)
-    return 0
+    if native and Path("/Applications/Xcode.app").is_dir():
+        os.environ.setdefault("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
+    return run(versions + portable, versions[:3] + native if native else [], vcpus=4)
 
 
 if __name__ == "__main__":

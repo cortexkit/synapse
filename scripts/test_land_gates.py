@@ -74,6 +74,44 @@ class LandingSelectionTests(unittest.TestCase):
         self.assertIn("skeleton_e2e", gates[4])
         self.assertEqual(gates[-1][1], "clippy")
 
+    def test_only_apple_test_commands_stay_on_the_mac(self):
+        portable = HELPERS["static_gates"]() + HELPERS["full_gates"]() + HELPERS["contract_tests"]()
+        apple = [HELPERS["cargo_test"](package, "--lib") for package in (
+            "synapse-engine-owned", "synapse-worker-ane", "synapse-worker-ane-direct",
+            "synapse-worker-decode", "synapse-worker-llama")]
+        remote, native = HELPERS["split_commands"]([tuple(c) for c in portable + apple], "Darwin")
+        self.assertEqual(remote, [tuple(c) for c in portable])
+        module_native = HELPERS["module_macos_tests"](tuple(HELPERS["full_gates"]()[4]))
+        self.assertEqual(native, [tuple(c) for c in module_native + apple])
+        remote, native = HELPERS["split_commands"](portable + apple, "Linux")
+        self.assertEqual(remote, portable + apple)
+        self.assertEqual(native, [])
+
+    def test_module_native_filter_keeps_all_ten_active_mac_cases_only(self):
+        command = tuple(HELPERS["full_gates"]()[4])
+        native = HELPERS["module_macos_tests"](command)
+        self.assertEqual(len(native), 2)
+        self.assertEqual(native[0], HELPERS["module_fixtures"]()[1])
+        self.assertEqual(native[-1][:3], ["cargo", "nextest", "run"])
+        expression = native[-1][-1]
+        self.assertEqual(expression.count("test("), 10)
+        for case in ("direct_ane_models_reuse_one_runtime_supervisor",
+                     "kv_runtime_matrix_proves_warm_reuse_reclamation_and_lifecycle_faults",
+                     "ane_probe_placement_ping_runs_outside_the_module_runtime",
+                     "owned_gte_inline_embed_batch_throughput_sweep"):
+            self.assertIn(f"test({case})", expression)
+        self.assertNotIn("--run-ignored", native[-1])
+
+    def test_narrow_module_native_filter_does_not_broaden_target_selection(self):
+        for target, count in (("it", 1), ("skeleton_e2e", 6), ("wire_contract", 0)):
+            command = HELPERS["cargo_test"]("synapse-module", "--features", "test-support", "--test", target)
+            native = HELPERS["module_macos_tests"](command)
+            if count:
+                self.assertEqual(native[-1][-1].count("test("), count)
+                self.assertNotIn("--lib", native[-1])
+            else:
+                self.assertEqual(native, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
