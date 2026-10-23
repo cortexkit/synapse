@@ -74,65 +74,78 @@ class ParallelCiTests(unittest.TestCase):
 class LocalPreflightTests(unittest.TestCase):
     def run_preflight(self, windows_status=0, native_status=0):
         with tempfile.TemporaryDirectory() as temp:
-            # Resolve symlinks: on macOS the temporary folder is reached through
-            # /var -> /private/var, and the preflight records physical paths.
             root = Path(temp).resolve()
             tools = root / "bin"
             tools.mkdir()
-            # The two clippy invocations rendezvous before finishing. A serial
-            # implementation times out instead of passing a timing-based guess.
+            local, remote = root / "local", root / "remote"
+            for checkout in (local, remote):
+                (checkout / "scripts/lib").mkdir(parents=True)
+                for name in ("train-preflight.py", "lib/remote_gate.py"):
+                    (checkout / "scripts" / name).write_text((ROOT / "scripts" / name).read_text())
+                for name in ("check-train-preconditions.sh", "check-no-external-path-deps.sh",
+                             "check-module-runtime-deps.py"):
+                    (checkout / "scripts" / name).write_text("")
+                subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            import sys
             cargo = tools / "cargo"
-            cargo.write_text("""#!/usr/bin/env python3
+            cargo.write_text(f"#!{sys.executable}\n" + '''
 import json, os, sys, time
 from pathlib import Path
 args = sys.argv[1:]
-if args[0] != 'clippy':
+remote = os.getenv('REMOTE') == '1'
+name = 'windows' if remote else 'native'
+events = Path(os.environ['EVENTS'])
+with (events / (name + '.commands')).open('a') as log:
+    log.write(json.dumps(args) + '\\n')
+if args[0] != 'clippy' or '--version' in args:
     sys.exit(0)
-windows = '--target' in args
-name = 'windows' if windows else 'native'
-other = 'native' if windows else 'windows'
-Path(name + '.json').write_text(json.dumps({'args': args, 'target': os.getenv('CARGO_TARGET_DIR'),
-    'cc': os.getenv('CC_x86_64_pc_windows_gnu'), 'ar': os.getenv('AR_x86_64_pc_windows_gnu')}))
+assert ('--target' in args) == remote
+Path(events / (name + '.json')).write_text(json.dumps({'args': args,
+    'target': os.getenv('CARGO_TARGET_DIR'), 'cc': os.getenv('CC_x86_64_pc_windows_gnu'),
+    'ar': os.getenv('AR_x86_64_pc_windows_gnu')}))
+other = 'native' if remote else 'windows'
 deadline = time.monotonic() + 5
-while not Path(other + '.json').exists():
+while not (events / (other + '.json')).exists():
     if time.monotonic() > deadline:
         sys.exit(90)
     time.sleep(0.01)
-Path(name + '.joined').touch()
-sys.exit(int(os.environ['WINDOWS_STATUS' if windows else 'NATIVE_STATUS']))
-""")
+(events / (name + '.joined')).touch()
+sys.exit(int(os.environ['WINDOWS_STATUS' if remote else 'NATIVE_STATUS']))
+''')
             cargo.chmod(0o755)
-            for name, body in {
-                "uname": "echo Darwin",
-                "bash": "exit 0",
-                "python3": "exit 0",
-                "gh": "exit 0",
-            }.items():
+            ck = tools / "ck"
+            ck.write_text(f"#!{sys.executable}\n" + '''
+import os, subprocess, sys
+args = sys.argv[1:]
+assert args[:2] == ['motor', 'run']
+assert args[args.index('--vcpus') + 1] == '4'
+sys.exit(subprocess.run(args[args.index('--') + 1:], cwd=os.environ['REMOTE_ROOT'],
+    env=dict(os.environ, REMOTE='1')).returncode)
+''')
+            ck.chmod(0o755)
+            for name in ("gh", "xcrun", "ckdev-mutate"):
                 tool = tools / name
-                tool.write_text(f"#!/bin/sh\n{body}\n")
+                tool.write_text("#!/bin/sh\nexit 0\n")
                 tool.chmod(0o755)
-            # The cargo fixture's interpreter must be real, not the checker stub.
-            import sys
-            cargo.write_text(cargo.read_text().replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
             result = subprocess.run(
-                ["/bin/bash", "-e", "-c",
-                 'refuse() { echo "$*"; exit 1; }; say() { :; }; source "$PREFLIGHT"'],
-                cwd=root,
+                [sys.executable, "-c", "import runpy; from unittest.mock import patch; "
+                 "p=patch('platform.system', return_value='Darwin'); p.start(); "
+                 "runpy.run_path('scripts/train-preflight.py', run_name='__main__')"],
+                cwd=local,
                 env=dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}",
-                         PREFLIGHT=str(ROOT / "scripts/train-push.local.sh"),
+                         REMOTE_ROOT=str(remote), EVENTS=str(root),
                          WINDOWS_STATUS=str(windows_status), NATIVE_STATUS=str(native_status)),
                 text=True, capture_output=True, timeout=15,
             )
             windows = json.loads((root / "windows.json").read_text())
-            self.assertEqual(windows["args"], [
-                "clippy", "--locked", "-p", "synapse-module", "--features", "test-support",
-                "--all-targets", "--target", "x86_64-pc-windows-gnu", "--", "-D", "warnings",
-            ])
-            self.assertEqual(windows["target"], str(root / "target/train-windows-clippy"))
-            self.assertEqual(windows["cc"], str(root / "scripts/lib/zig-cc-windows.sh"))
-            self.assertEqual(windows["ar"], str(root / "scripts/lib/zig-ar.sh"))
-            self.assertTrue((root / "windows.joined").exists())
-            self.assertTrue((root / "native.joined").exists())
+            self.assertEqual(windows["target"], "target/train-windows-clippy")
+            self.assertEqual(windows["cc"], "x86_64-w64-mingw32-gcc")
+            self.assertEqual(windows["ar"], "x86_64-w64-mingw32-ar")
+            self.assertTrue((root / "windows.joined").exists(), result.stdout + result.stderr)
+            self.assertTrue((root / "native.joined").exists(), result.stdout + result.stderr)
+            self.assertIn("TREE linux ", result.stdout)
+            self.assertIn("TREE macos ", result.stdout)
+            self.assertIn("TIMING preflight wall", result.stdout)
             return result
 
     def test_windows_cross_clippy_overlaps_native_preflight(self):
