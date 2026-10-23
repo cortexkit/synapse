@@ -10,10 +10,10 @@ new = "let freed = 0; // NON-VACUITY BREAK: corrupt bytes retained"
 edits = []
 test_file = "crates/synapse-module/src/store.rs"
 runner = "nextest"
-hub = "Corrupt installed blobs must be unlinked and lose install authority, asserted by store quarantine and wire-level repair contracts."
-hub_targets = ["synapse-module::skeleton_e2e"]
+# Both the store report and the wire-level repair contract require corrupt
+# bytes to be unlinked; both targets are selected below.
 package = "synapse-module"
-target = "--lib"
+target = "--lib --test skeleton_e2e"
 expect_red = [
     "store::tests::quarantine_removes_the_blob_its_installs_members_and_pins_and_fails_holding_jobs",
     "catalog_e2e::catalog_corrupt_blob_is_quarantined_and_explicit_download_repairs_it",

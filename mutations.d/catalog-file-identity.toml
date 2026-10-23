@@ -9,8 +9,8 @@ new = 'AND (?9 IS NOT NULL) AND (?10 IS NOT NULL))", // NON-VACUITY BREAK'
 edits = []
 test_file = "crates/synapse-module/src/store.rs"
 runner = "nextest"
-hub = "Cached digests may attest only unchanged trusted bytes, asserted by timestamp invalidation and same-size corruption with restored mtime."
-hub_targets = ["synapse-module::skeleton_e2e"]
+# Both timestamp-only changes and same-size corruption with restored mtime
+# must invalidate an existing cached verification.
 package = "synapse-module"
 target = "--lib"
 expect_red = [
