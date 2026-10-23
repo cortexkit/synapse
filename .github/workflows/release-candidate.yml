@@ -270,18 +270,14 @@ jobs:
         run: |
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
-          # Protocol 0.31 leaves frame encoding and the handshake unchanged. Its
-          # only additions are two optional daemon-to-module fields (call_mode on
-          # route.bind, expires_at_ms on ScopeStamp) that an older daemon simply
-          # omits, and client-rs derives the call mode from the scope when
-          # call_mode is absent. Synapse does not declare call-modes/v1, so it
-          # needs nothing a 0.20.53 daemon lacks. SUBC confirmed the ck-subc
-          # floor stays at requires_core 0.20.53 for 0.31.x.
+          # Synapse reads no project identity from routes and does not declare
+          # scope-workdir/v1, so it needs no newer daemon feature. The ck-subc
+          # floor of requires_core 0.20.53 was rechecked with SUBC for 0.33.x.
           # A new protocol minor needs that floor rechecked with SUBC.
           case "$protocol" in
-            0.31.*) ;;
+            0.33.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.31.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              echo "subc-protocol is $protocol, not 0.33.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
