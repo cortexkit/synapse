@@ -657,18 +657,7 @@ async fn queued_catalog_batch_gets_retryable_pause_without_loading() {
     let digest = "queued-pause-digest";
     let record = fixture
         .state
-        .store
-        .admit_job(
-            "queued-pause",
-            digest,
-            "embed.batch",
-            1,
-            None,
-            &params,
-            now_ms(),
-            60_000,
-            60_000,
-        )
+        .store.admit_job("queued-pause", digest, "embed.batch", 1, &params, now_ms(), 60_000, 60_000)
         .unwrap()
         .record()
         .clone();
@@ -704,18 +693,7 @@ async fn queued_catalog_batch_gets_retryable_pause_without_loading() {
     end_pause(&fixture.state).await;
     let replay = fixture
         .state
-        .store
-        .admit_job(
-            "queued-pause",
-            digest,
-            "embed.batch",
-            1,
-            None,
-            &json!({"model":ANE_TEST_LANE,"texts":["a"],"request_key":"queued-pause"}),
-            now_ms(),
-            60_000,
-            60_000,
-        )
+        .store.admit_job("queued-pause", digest, "embed.batch", 1, &json!({"model":ANE_TEST_LANE,"texts":["a"],"request_key":"queued-pause"}), now_ms(), 60_000, 60_000)
         .unwrap();
     assert!(matches!(replay, JobAdmission::Admitted(_)));
     assert_ne!(replay.record().job_id, record.job_id);

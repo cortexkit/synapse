@@ -5,24 +5,22 @@
 Synapse is a local inference service. It runs as the `synapse` module on the subc
 bus (binary `ck-synapse`) and serves embedding, reranking and small-model generation
 to other fleet modules. Some engines run inside the module process; the rest run in
-supervised worker processes that the module spawns and talks to over local IPC. A
-remote gateway can forward work to external providers instead. The same repository
-holds a benchmark and research tree (`bench/`) where candidate backends are measured
-before they become production engines or workers.
+supervised worker processes that the module spawns and talks to over local IPC.
+Modules needing hosted inference call their provider directly. The repository also
+holds a benchmark and research tree (`bench/`) for candidate backends.
 
 ## Major pieces
 
 **Build stamp helper** (`crates/synapse-build-stamp`). A standard-library-only Cargo build dependency that shares worktree-aware Git revision and clean/dirty stamping across module and worker build scripts.
 
 **`synapse-module`** (`crates/synapse-module`). The subc module and the only process
-consumers talk to. It registers the management operations, loads layered config
+consumers talk to. It registers management operations, loads config
 (`SYNAPSE_CONFIG_PATH`, else `.cortexkit/synapse.jsonc` in the working directory,
-else `cortexkit/synapse.jsonc` in the user config dir; when both exist, remote
-providers come from the user file),
-tokenizes requests, admits jobs through the scheduler, owns the SQLite store (model
-cache, durable jobs and result pages, certification and approval rows, aliases), runs
-certification probes, and dispatches work to an in-process engine, a worker, or the
-remote gateway. Owned-generation logic lives in sibling directories of `src/`:
+else `cortexkit/synapse.jsonc` in the user config dir), tokenizes requests, admits
+jobs through the scheduler, owns the SQLite store (model cache, durable jobs and
+result pages, certification and approval rows, aliases), runs certification probes,
+and dispatches work to an in-process engine or worker.
+Owned-generation logic lives in sibling directories of `src/`:
 `owned-decode-routing` (lane selection, ANE split-prefill routing),
 `owned-decode-grammar-scheduler` (JSON-schema grammar compilation, decode quantum
 scheduling), `owned-decode-certification`, `owned-decode-sidecar` and
@@ -46,8 +44,7 @@ does not link it; it runs only inside `ck-synapse-worker-cuda`.
 
 There is no CPU embedding lane: embedding and reranking run only on synapse's own
 GPU and Neural Engine engines. A host with no runnable backend for a model gets
-`backend_unavailable`, never a CPU fallback; consumers may opt into the remote
-gateway. ONNX Runtime survives only as a bench reference.
+`backend_unavailable`, never a CPU fallback. ONNX Runtime survives only as a bench reference.
 
 **Workers.** Each is a separate binary the module spawns, handshakes with, and
 supervises. Which ones a release ships is decided by the release workflow, not
@@ -68,10 +65,6 @@ by their presence here:
   fixed-window Qwen3 prefill on the Neural Engine and hands the KV cache to the decode
   worker.
 
-**Remote gateway** (`crates/synapse-module/src/remote`). Sends work to external
-OpenAI-compatible providers through `ProviderRuntime` pools with circuit breakers and
-latency estimators. Credentials come from the vault over the subc `claustrum` route;
-the HTTP client refuses redirects and checks loopback rules before sending.
 
 **`synapse-opctl`** (`crates/synapse-opctl`, binary `ck-synapse-opctl`). Operator CLI
 that calls the module's management operations over the subc daemon: model status,
@@ -99,7 +92,6 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
 | Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
 | Core ML materialization | `crates/synapse-module/src/ane_artifact.rs` | digest-keyed extraction of Core ML bundles |
 | Worker host | `crates/synapse-module/src/worker_host/mod.rs` | spawn, handshake, requests, restarts |
-| Remote gateway | `crates/synapse-module/src/remote/` | provider pools, HTTP client, vault |
 | Decode routing | `crates/synapse-module/owned-decode-routing/` | lane choice, ANE prefill router |
 | Grammar and decode scheduler | `crates/synapse-module/owned-decode-grammar-scheduler/` | schema → token constraint, quantum scheduling |
 | Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TokenBatch` |
@@ -130,8 +122,8 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
    fetches files. The module verifies cached members, lazily loads and self-checks
    catalog lanes without probes or approvals. Free-form/legacy lanes keep their
    existing probe/certification gates (owned generation also needs approval).
-5. The work runs on the chosen lane: the in-process owned Metal engine, a worker
-   over the worker protocol, or the remote gateway.
+5. The work runs on the chosen lane: the in-process owned Metal engine or a worker
+   over the worker protocol.
 6. Results are committed in pages as the job runs. Callers read them with
    `embed.result`; pages are readable while the job is still running and survive a
    restart until the retention TTL. Items carry ids and page order is not item order.
@@ -183,7 +175,7 @@ quality. `bench/run-matrix.sh` and `bench/run-night.sh` run the lanes in sequenc
 ## Longer pages
 
 - Wire contract and error codes: [`docs/wire-contract-v1.md`](docs/wire-contract-v1.md)
-- Module architecture and remote boundary: [`docs/architecture.md`](docs/architecture.md)
+- Module architecture: [`docs/architecture.md`](docs/architecture.md)
 - Worker protocol and supervision: [`docs/worker-protocol.md`](docs/worker-protocol.md)
 - Direct ANE ownership and recovery: [`docs/ane-serving.md`](docs/ane-serving.md)
 - Configuration: [`docs/configuration.md`](docs/configuration.md)

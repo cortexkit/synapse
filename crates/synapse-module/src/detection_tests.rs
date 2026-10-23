@@ -702,7 +702,7 @@ fn ack(storage: Option<Value>) -> ModuleHelloAckBody {
 #[tokio::test]
 #[should_panic(expected = "synapse boot failed after HELLO_ACK")]
 async fn failed_blocking_boot_panics_with_boot_message() {
-    let handler = SynapseHandler::new("synapse-test".into(), PathBuf::new());
+    let handler = SynapseHandler::new("synapse-test".into());
     handler
         .on_hello_ack(&ack(Some(json!({"malformed":"storage"}))))
         .await;
@@ -737,7 +737,7 @@ async fn joined_boot_fixture() {
         },
     };
     let ack = ack(Some(serde_json::to_value(descriptor).unwrap()));
-    let handler = SynapseHandler::new("synapse-test".into(), PathBuf::new());
+    let handler = SynapseHandler::new("synapse-test".into());
     let waiting = async {
         // This loop polling while boot is still pending is the proof that boot
         // runs off the executor. The bound only turns a blocked executor into a

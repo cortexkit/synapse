@@ -19,7 +19,7 @@ crates/                     production Rust crates
   synapse-core/             shared types, engine traits, tokenizer, worker protocol, scheduler
   synapse-engine-cuda/      CUDA embedding engine (PTX kernel ports)
   synapse-engine-owned/     Metal embedding engine, Metal decode kernels, owned-decode supervisor (macOS)
-  synapse-module/           the subc module (ck-synapse): ops, store, worker host, remote gateway
+  synapse-module/           the subc module (ck-synapse): ops, store, worker host
   synapse-native-probe/     safe wrappers for the Windows system calls the machine profile reads
   synapse-opctl/            operator CLI (ck-synapse-opctl)
   synapse-worker-ane/       Core ML / Neural Engine embedding worker (Rust launcher + Swift)

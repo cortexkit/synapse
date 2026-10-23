@@ -22,7 +22,6 @@ const APPROVAL_MIGRATION_SEED_DIGEST: &str =
     "a799f7e694991b0fd47902f9959c168990d5b0a3ec6ce2e7d6d3ac184bf80103";
 pub const JOB_STATE_QUEUED: &str = "queued";
 pub const JOB_STATE_RUNNING: &str = "running";
-pub const JOB_STATE_PAUSED_NEEDS_REAUTH: &str = "paused_needs_reauth";
 pub const JOB_STATE_DONE: &str = "done";
 pub const JOB_STATE_FAILED_TRANSIENT: &str = "failed_transient";
 pub const JOB_STATE_FAILED_PERMANENT: &str = "failed_permanent";
@@ -798,6 +797,34 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 15,
+        statements: r#"
+            DROP TABLE remote_url_bindings;
+            DELETE FROM cert_rows
+                WHERE assurance_class = 'declared' OR certification_class IN ('declared', 'remote');
+            DROP INDEX cert_rows_declared_identity_v1;
+            DROP INDEX cert_rows_remote_identity_v1;
+            UPDATE jobs SET state = 'failed_permanent', active_attempt_id = NULL,
+                terminal_at_ms = updated_ms,
+                error_json = CAST('{"code":"invalid_request","class":"permanent","safe_to_retry_same_request":false,"message":"remote providers were removed; modules should call providers directly"}' AS BLOB)
+                WHERE state = 'paused_needs_reauth';
+            DROP INDEX jobs_resume_deadline_idx;
+            ALTER TABLE jobs DROP COLUMN logical_handle;
+            ALTER TABLE jobs DROP COLUMN paused_at_ms;
+            ALTER TABLE jobs DROP COLUMN resume_deadline_ms;
+            ALTER TABLE remote_checkpoints RENAME TO checkpoints;
+            ALTER TABLE checkpoints DROP COLUMN provider_request_id;
+            ALTER TABLE result_pages DROP COLUMN provider_request_ids_json;
+            DROP TRIGGER remote_checkpoint_immutable;
+            DROP INDEX remote_checkpoints_page_idx;
+            CREATE INDEX checkpoints_page_idx ON checkpoints(request_digest, page_no);
+            CREATE TRIGGER checkpoint_immutable BEFORE UPDATE ON checkpoints
+            BEGIN
+                SELECT RAISE(ABORT, 'checkpoint is immutable');
+            END;
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -824,8 +851,7 @@ const RESTORE_APPLICATION_TABLES: &[&str] = &[
     "profile_rotation_certification_outcomes",
     "profile_rotation_events",
     "profile_state",
-    "remote_checkpoints",
-    "remote_url_bindings",
+    "checkpoints",
     "result_pages",
     "serving_approvals",
     "serving_artifacts",
@@ -863,7 +889,7 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
     "serving_approvals",
     "serving_certification_records",
     "serving_artifacts",
-    "remote_checkpoints",
+    "checkpoints",
     "result_pages",
     "download_key_bindings",
     "download_acquisitions",
@@ -879,7 +905,6 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
     "perf_rows",
     "approval_digest_corruption_events",
     "cert_row_rebuild_events",
-    "remote_url_bindings",
     "models",
     "approvals",
     "approval_migration_markers",
@@ -928,12 +953,6 @@ pub enum SynapseStoreError {
         request_key: String,
         existing_digest: String,
         requested_digest: String,
-    },
-    #[error("remote profile '{remote_profile_hash}' changed base URL from '{previous_url}' to '{requested_url}'")]
-    RemoteDeploymentChanged {
-        remote_profile_hash: String,
-        previous_url: String,
-        requested_url: String,
     },
     #[error("cert_rows_rebuild_failed: {0}")]
     CertRowsRebuildFailed(String),
@@ -1055,14 +1074,12 @@ pub struct CatalogSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum AssuranceClass {
     Measured,
-    Declared,
 }
 
 impl AssuranceClass {
     fn as_str(self) -> &'static str {
         match self {
             Self::Measured => "measured",
-            Self::Declared => "declared",
         }
     }
 
@@ -1071,7 +1088,6 @@ impl AssuranceClass {
     fn parse(value: &str) -> Result<Self, SynapseStoreError> {
         match value {
             "measured" => Ok(Self::Measured),
-            "declared" => Ok(Self::Declared),
             other => Err(SynapseStoreError::Decode(format!(
                 "unknown assurance class '{other}'"
             ))),
@@ -1088,8 +1104,6 @@ impl AssuranceClass {
 #[serde(rename_all = "snake_case")]
 pub enum CertificationClass {
     MeasuredOwnedDecode,
-    Declared,
-    Remote,
     Embedding,
     Rerank,
     LegacyOwnedDecode,
@@ -1099,8 +1113,6 @@ impl CertificationClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MeasuredOwnedDecode => "measured_owned_decode",
-            Self::Declared => "declared",
-            Self::Remote => "remote",
             Self::Embedding => "embedding",
             Self::Rerank => "rerank",
             Self::LegacyOwnedDecode => "legacy_owned_decode",
@@ -1110,8 +1122,6 @@ impl CertificationClass {
     fn parse(value: &str) -> Result<Self, SynapseStoreError> {
         match value {
             "measured_owned_decode" => Ok(Self::MeasuredOwnedDecode),
-            "declared" => Ok(Self::Declared),
-            "remote" => Ok(Self::Remote),
             "embedding" => Ok(Self::Embedding),
             "rerank" => Ok(Self::Rerank),
             "legacy_owned_decode" => Ok(Self::LegacyOwnedDecode),
@@ -1894,14 +1904,7 @@ impl CertificationStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CertificationKey {
-    Measured {
-        machine_profile_hash: String,
-    },
-    Declared {
-        machine_profile_hash: String,
-        remote_profile_hash: String,
-        identity_revision: String,
-    },
+    Measured { machine_profile_hash: String },
 }
 
 impl CertificationKey {
@@ -1910,21 +1913,12 @@ impl CertificationKey {
             Self::Measured {
                 machine_profile_hash,
             } => machine_profile_hash.clone(),
-            Self::Declared {
-                machine_profile_hash,
-                remote_profile_hash,
-                identity_revision,
-            } => hex::encode(Sha256::digest(
-                serde_json::to_vec(&(machine_profile_hash, remote_profile_hash, identity_revision))
-                    .expect("declared certification key serializes"),
-            )),
         }
     }
 
     fn assurance_class(&self) -> AssuranceClass {
         match self {
             Self::Measured { .. } => AssuranceClass::Measured,
-            Self::Declared { .. } => AssuranceClass::Declared,
         }
     }
 }
@@ -1993,12 +1987,6 @@ pub struct JobRecord {
     pub terminal_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_attempt_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_handle: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paused_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_deadline_ms: Option<u64>,
     pub page_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_json: Option<Value>,
@@ -2035,7 +2023,6 @@ pub enum JobAttemptClaim {
 pub struct CheckpointItem {
     pub item_id: String,
     pub result: Vec<u8>,
-    pub provider_request_id: Option<String>,
 }
 
 impl JobAdmission {
@@ -4263,13 +4250,6 @@ impl SynapseStore {
                 "certification assurance class does not match its key variant".to_string(),
             ));
         }
-        if row.assurance_class == AssuranceClass::Declared
-            && row.status != CertificationStatus::Certified
-        {
-            return Err(SynapseStoreError::Decode(
-                "declared certification rows must be certified".to_string(),
-            ));
-        }
         let evidence_json = serde_json::to_string(&row.evidence)?;
         let (
             certification_class,
@@ -4284,19 +4264,8 @@ impl SynapseStore {
                 CertificationClass::LegacyOwnedDecode,
                 CertificationStatus::Uncertified,
                 Some(machine_profile_hash.as_str()),
-                None,
-                None,
-            ),
-            CertificationKey::Declared {
-                machine_profile_hash,
-                remote_profile_hash,
-                identity_revision,
-            } => (
-                CertificationClass::Declared,
-                row.status,
-                Some(machine_profile_hash.as_str()),
-                Some(remote_profile_hash.as_str()),
-                Some(identity_revision.as_str()),
+                None::<&str>,
+                None::<&str>,
             ),
         };
         self.store.with_conn_fenced(|tx| {
@@ -4306,18 +4275,7 @@ impl SynapseStore {
                      machine_profile_hash, remote_profile_hash, identity_revision,
                      numeric_profile_id, fingerprint, certified_at_ms, os_build,
                      module_generation, evidence_json
-                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                  ON CONFLICT (key_hash, fingerprint)
-                  WHERE certification_class = 'declared' DO UPDATE SET
-                     status = excluded.status,
-                     machine_profile_hash = excluded.machine_profile_hash,
-                     remote_profile_hash = excluded.remote_profile_hash,
-                     identity_revision = excluded.identity_revision,
-                     numeric_profile_id = excluded.numeric_profile_id,
-                     certified_at_ms = excluded.certified_at_ms,
-                     os_build = excluded.os_build,
-                     module_generation = excluded.module_generation,
-                     evidence_json = excluded.evidence_json",
+                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     certification_class.as_str(),
                     row.assurance_class.as_str(),
@@ -4975,24 +4933,6 @@ impl SynapseStore {
                 "class-scoped certification identity must be non-empty".to_string(),
             ));
         }
-        if matches!(
-            row.certification_class,
-            CertificationClass::Declared | CertificationClass::Remote
-        ) && (row
-            .remote_profile_hash
-            .as_deref()
-            .map(str::is_empty)
-            .unwrap_or(true)
-            || row
-                .identity_revision
-                .as_deref()
-                .map(str::is_empty)
-                .unwrap_or(true))
-        {
-            return Err(SynapseStoreError::Decode(
-                "declared and remote rows require remote profile and identity revision".to_string(),
-            ));
-        }
         let evidence_json = serde_json::to_string(&row.evidence)?;
         let class = row.certification_class.as_str();
         let sql = format!(
@@ -5184,49 +5124,6 @@ impl SynapseStore {
             )
         })?;
         Ok(count > 0)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_declared_cert_row(
-        &self,
-        machine_profile_hash: &str,
-        remote_profile_hash: &str,
-        identity_revision: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        let key = CertificationKey::Declared {
-            machine_profile_hash: machine_profile_hash.to_string(),
-            remote_profile_hash: remote_profile_hash.to_string(),
-            identity_revision: identity_revision.to_string(),
-        };
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'declared' AND key_hash = ?1 AND fingerprint = ?2"
-                ),
-                params![key.key_hash(), &fingerprint.0],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
-    }
-
-    pub fn declared_cert_row_for_fingerprint(
-        &self,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'declared' AND fingerprint = ?1 ORDER BY certified_at_ms DESC LIMIT 1"
-                ),
-                params![&fingerprint.0],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
     }
 
     pub fn current_profile_activation_epoch(&self) -> Result<Option<u64>, SynapseStoreError> {
@@ -5834,103 +5731,6 @@ impl SynapseStore {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn bind_remote_profile_url(
-        &self,
-        remote_profile_hash: &str,
-        normalized_base_url: &str,
-    ) -> Result<(), SynapseStoreError> {
-        let profile = remote_profile_hash.to_string();
-        let requested_url = normalized_base_url.to_string();
-        let previous = self.store.with_conn_fenced(|tx| {
-            let previous = tx
-                .query_row(
-                    "SELECT last_base_url FROM remote_url_bindings WHERE remote_profile_hash = ?1",
-                    params![profile],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if previous.is_none() {
-                tx.execute(
-                    "INSERT INTO remote_url_bindings (
-                         remote_profile_hash, last_base_url, missing_since_ms
-                     ) VALUES (?1, ?2, NULL)",
-                    params![profile, requested_url],
-                )?;
-            } else if previous.as_deref() == Some(requested_url.as_str()) {
-                tx.execute(
-                    "UPDATE remote_url_bindings SET missing_since_ms = NULL
-                     WHERE remote_profile_hash = ?1",
-                    params![profile],
-                )?;
-            }
-            Ok(previous)
-        })?;
-        if let Some(previous_url) = previous {
-            if previous_url != requested_url {
-                return Err(SynapseStoreError::RemoteDeploymentChanged {
-                    remote_profile_hash: remote_profile_hash.to_string(),
-                    previous_url,
-                    requested_url,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    pub fn sweep_remote_url_bindings(
-        &self,
-        active_remote_profile_hashes: &[String],
-        now_ms: u64,
-        removal_grace_ms: u64,
-    ) -> Result<usize, SynapseStoreError> {
-        let active = active_remote_profile_hashes
-            .iter()
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-        let removed = self.store.with_conn_fenced(|tx| {
-            let mut stmt = tx
-                .prepare("SELECT remote_profile_hash, missing_since_ms FROM remote_url_bindings")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-            let mut removed = 0;
-            for (profile, missing_since_ms) in rows {
-                if active.contains(profile.as_str()) {
-                    tx.execute(
-                        "UPDATE remote_url_bindings SET missing_since_ms = NULL
-                         WHERE remote_profile_hash = ?1",
-                        params![profile],
-                    )?;
-                    continue;
-                }
-                match missing_since_ms {
-                    None => {
-                        tx.execute(
-                            "UPDATE remote_url_bindings SET missing_since_ms = ?2
-                             WHERE remote_profile_hash = ?1",
-                            params![profile, now_ms as i64],
-                        )?;
-                    }
-                    Some(missing_since)
-                        if now_ms >= (missing_since as u64).saturating_add(removal_grace_ms) =>
-                    {
-                        removed += tx.execute(
-                            "DELETE FROM remote_url_bindings WHERE remote_profile_hash = ?1",
-                            params![profile],
-                        )?;
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(removed)
-        })?;
-        Ok(removed)
-    }
-
     pub fn store_perf_row(&self, row: &PerfRow) -> Result<(), SynapseStoreError> {
         let details_json = serde_json::to_string(&row.details)?;
         self.store.with_conn_fenced(|tx| {
@@ -6203,7 +6003,6 @@ impl SynapseStore {
         request_digest: &str,
         kind: &str,
         module_generation: u64,
-        logical_handle: Option<&str>,
         params_json: &Value,
         now_ms: u64,
         execution_ttl_ms: u64,
@@ -6218,33 +6017,12 @@ impl SynapseStore {
         let request_key = request_key.to_string();
         let request_digest = request_digest.to_string();
         let kind = kind.to_string();
-        let logical_handle = logical_handle.map(str::to_string);
         let admission = self.store.with_conn_fenced(|tx| {
             expire_jobs_tx(tx, now_ms as i64)?;
             purge_retained_jobs_tx(tx, now_ms as i64)?;
             if let Some(existing) = job_by_request_key_tx(tx, &request_key)? {
                 if existing.request_digest != request_digest {
                     return Ok(TxAdmission::Conflict(existing.request_digest));
-                }
-                if existing.state == JOB_STATE_PAUSED_NEEDS_REAUTH {
-                    tx.execute(
-                        "UPDATE jobs SET state = ?1, module_generation = ?2, updated_ms = ?3,
-                             execution_expires_ms = ?4, active_attempt_id = NULL,
-                             paused_at_ms = NULL, resume_deadline_ms = NULL, params_json = ?5
-                         WHERE job_id = ?6 AND state = ?7",
-                        params![
-                            JOB_STATE_QUEUED,
-                            module_generation as i64,
-                            now_ms as i64,
-                            now_ms.saturating_add(execution_ttl_ms) as i64,
-                            params_bytes,
-                            existing.job_id,
-                            JOB_STATE_PAUSED_NEEDS_REAUTH,
-                        ],
-                    )?;
-                    return Ok(TxAdmission::Ready(Box::new(JobAdmission::Admitted(
-                        job_by_id_tx(tx, &existing.job_id)?.expect("resumed job is readable"),
-                    ))));
                 }
                 if !existing.is_terminal_failed() {
                     return Ok(TxAdmission::Ready(Box::new(JobAdmission::Existing(
@@ -6264,11 +6042,11 @@ impl SynapseStore {
                      job_id, request_key, request_digest, kind, module_generation, state,
                      created_ms, updated_ms, execution_expires_ms,
                      result_retention_ttl_ms, terminal_at_ms, active_attempt_id,
-                     logical_handle, paused_at_ms, resume_deadline_ms, params_json,
+                     params_json,
                      result_json, error_json, page_count
                  ) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, NULL, NULL,
-                     ?10, NULL, NULL, ?11, NULL, NULL, ?12
+                     ?10, NULL, NULL, ?11
                  )",
                 params![
                     job_id,
@@ -6280,7 +6058,6 @@ impl SynapseStore {
                     now_ms as i64,
                     now_ms.saturating_add(execution_ttl_ms) as i64,
                     result_retention_ttl_ms as i64,
-                    logical_handle,
                     params_bytes,
                     page_count,
                 ],
@@ -6384,29 +6161,6 @@ impl SynapseStore {
                 "page commit must contain at least one checkpoint item".to_string(),
             ));
         }
-        let mut provider_request_ids = Vec::new();
-        for item in items {
-            if let Some(provider_request_id) = item.provider_request_id.as_deref() {
-                if provider_request_id.is_empty() || provider_request_id.len() > 128 {
-                    return Err(SynapseStoreError::Decode(
-                        "provider request ids must contain 1..=128 bytes".to_string(),
-                    ));
-                }
-                if !provider_request_ids.contains(&provider_request_id) {
-                    provider_request_ids.push(provider_request_id);
-                }
-            }
-        }
-        if provider_request_ids.len() > 16 {
-            return Err(SynapseStoreError::Decode(
-                "a committed page may contain at most 16 provider request ids".to_string(),
-            ));
-        }
-        let provider_request_ids_json = if provider_request_ids.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_vec(&provider_request_ids)?)
-        };
         self.store.with_conn_fenced(|tx| {
             let (request_digest, visible_page_count, state): (String, i64, String) = tx.query_row(
                 "SELECT request_digest, page_count, state FROM jobs WHERE job_id = ?1",
@@ -6425,28 +6179,21 @@ impl SynapseStore {
             }
             tx.execute(
                 "INSERT INTO result_pages (
-                     request_digest, page_no, page_json, provider_request_ids_json, committed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    request_digest,
-                    page_no as i64,
-                    page_json,
-                    provider_request_ids_json,
-                    now_ms as i64,
-                ],
+                     request_digest, page_no, page_json, committed_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![request_digest, page_no as i64, page_json, now_ms as i64,],
             )?;
             for item in items {
                 tx.execute(
-                    "INSERT INTO remote_checkpoints (
+                    "INSERT INTO checkpoints (
                          request_digest, item_id, result, page_no,
-                         provider_request_id, committed_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         committed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         request_digest,
                         item.item_id,
                         item.result,
                         page_no as i64,
-                        item.provider_request_id,
                         now_ms as i64,
                     ],
                 )?;
@@ -6510,81 +6257,6 @@ impl SynapseStore {
         Ok(())
     }
 
-    pub fn quarantine_job_for_continuity(
-        &self,
-        job_id: &str,
-        message: &str,
-        now_ms: u64,
-    ) -> Result<(), SynapseStoreError> {
-        self.fail_job(
-            job_id,
-            false,
-            &serde_json::json!({
-                "code": "remote_identity_drift",
-                "class": "permanent",
-                "safe_to_retry_same_request": false,
-                "message": message,
-            }),
-            now_ms,
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn pause_job_needs_reauth(
-        &self,
-        job_id: &str,
-        logical_handle: &str,
-        now_ms: u64,
-        resume_window_ms: u64,
-    ) -> Result<bool, SynapseStoreError> {
-        let changed = self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "UPDATE jobs SET state = ?1, updated_ms = ?2, execution_expires_ms = NULL,
-                     active_attempt_id = NULL, logical_handle = ?3, paused_at_ms = ?2,
-                     resume_deadline_ms = ?4
-                 WHERE job_id = ?5 AND state IN (?6, ?7)",
-                params![
-                    JOB_STATE_PAUSED_NEEDS_REAUTH,
-                    now_ms as i64,
-                    logical_handle,
-                    now_ms.saturating_add(resume_window_ms) as i64,
-                    job_id,
-                    JOB_STATE_QUEUED,
-                    JOB_STATE_RUNNING,
-                ],
-            )
-        })?;
-        Ok(changed > 0)
-    }
-
-    pub fn resume_paused_job(
-        &self,
-        job_id: &str,
-        module_generation: u64,
-        now_ms: u64,
-        execution_ttl_ms: u64,
-    ) -> Result<bool, SynapseStoreError> {
-        let changed = self.store.with_conn_fenced(|tx| {
-            expire_jobs_tx(tx, now_ms as i64)?;
-            tx.execute(
-                "UPDATE jobs SET state = ?1, module_generation = ?2, updated_ms = ?3,
-                     execution_expires_ms = ?4, active_attempt_id = NULL,
-                     paused_at_ms = NULL, resume_deadline_ms = NULL, error_json = NULL,
-                     terminal_at_ms = NULL
-                 WHERE job_id = ?5 AND state = ?6 AND resume_deadline_ms > ?3",
-                params![
-                    JOB_STATE_QUEUED,
-                    module_generation as i64,
-                    now_ms as i64,
-                    now_ms.saturating_add(execution_ttl_ms) as i64,
-                    job_id,
-                    JOB_STATE_PAUSED_NEEDS_REAUTH,
-                ],
-            )
-        })?;
-        Ok(changed > 0)
-    }
-
     pub fn fail_prior_generation_incomplete_jobs(
         &self,
         current_generation: u64,
@@ -6597,7 +6269,7 @@ impl SynapseStore {
                 "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
                      execution_expires_ms = NULL, active_attempt_id = NULL,
                      error_json = ?3, result_json = NULL
-                 WHERE module_generation < ?4 AND state IN (?5, ?6, ?7) AND kind <> ?8",
+                 WHERE module_generation < ?4 AND state IN (?5, ?6) AND kind <> ?7",
                 params![
                     JOB_STATE_FAILED_TRANSIENT,
                     now_ms as i64,
@@ -6605,7 +6277,6 @@ impl SynapseStore {
                     current_generation as i64,
                     JOB_STATE_QUEUED,
                     JOB_STATE_RUNNING,
-                    JOB_STATE_PAUSED_NEEDS_REAUTH,
                     // Download jobs fail at startup through
                     // fail_interrupted_download_jobs, which also runs their
                     // staging and blob cleanup.
@@ -6655,7 +6326,7 @@ impl SynapseStore {
     pub fn checkpoint_count(&self, request_digest: &str) -> Result<u64, SynapseStoreError> {
         let count = self.store.with_conn(|conn| {
             conn.query_row(
-                "SELECT COUNT(1) FROM remote_checkpoints WHERE request_digest = ?1",
+                "SELECT COUNT(1) FROM checkpoints WHERE request_digest = ?1",
                 params![request_digest],
                 |row| row.get::<_, i64>(0),
             )
@@ -6669,7 +6340,7 @@ impl SynapseStore {
     ) -> Result<std::collections::BTreeSet<String>, SynapseStoreError> {
         let ids = self.store.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT item_id FROM remote_checkpoints
+                "SELECT item_id FROM checkpoints
                  WHERE request_digest = ?1 ORDER BY page_no, item_id",
             )?;
             let ids = stmt
@@ -7014,11 +6685,11 @@ impl SynapseStore {
                              job_id, request_key, request_digest, kind, module_generation,
                              state, created_ms, updated_ms, execution_expires_ms,
                              result_retention_ttl_ms, terminal_at_ms, active_attempt_id,
-                             logical_handle, paused_at_ms, resume_deadline_ms, params_json,
+                             params_json,
                              result_json, error_json, page_count
                          ) VALUES (
                              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, ?8, NULL, NULL,
-                             NULL, NULL, NULL, ?9, NULL, NULL, 0
+                             ?9, NULL, NULL, 0
                          )",
                         params![
                             job_id,
@@ -7905,13 +7576,6 @@ fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Resu
         "message": "durable job execution TTL expired",
     }))
     .expect("execution expiry error serializes");
-    let reauth_error = serde_json::to_vec(&serde_json::json!({
-        "code": "needs_reauth_expired",
-        "class": "permanent",
-        "safe_to_retry_same_request": false,
-        "message": "credential reauthentication deadline expired",
-    }))
-    .expect("reauth expiry error serializes");
     // Download jobs have no execution TTL: they are admitted with a NULL
     // execution_expires_ms, and the kind filter keeps them exempt even if a
     // deadline were ever written. They end only through their own commit,
@@ -7929,18 +7593,7 @@ fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Resu
             DOWNLOAD_JOB_KIND,
         ],
     )?;
-    let reauth_expired = tx.execute(
-        "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
-             active_attempt_id = NULL, error_json = ?3
-         WHERE state = ?4 AND resume_deadline_ms <= ?2",
-        params![
-            JOB_STATE_FAILED_PERMANENT,
-            now_ms,
-            reauth_error,
-            JOB_STATE_PAUSED_NEEDS_REAUTH,
-        ],
-    )?;
-    Ok(execution_expired + reauth_expired)
+    Ok(execution_expired)
 }
 
 fn expire_job_tx(
@@ -7955,13 +7608,6 @@ fn expire_job_tx(
         "message": "durable job execution TTL expired",
     }))
     .expect("execution expiry error serializes");
-    let reauth_error = serde_json::to_vec(&serde_json::json!({
-        "code": "needs_reauth_expired",
-        "class": "permanent",
-        "safe_to_retry_same_request": false,
-        "message": "credential reauthentication deadline expired",
-    }))
-    .expect("reauth expiry error serializes");
     tx.execute(
         "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
              execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
@@ -7975,18 +7621,6 @@ fn expire_job_tx(
             JOB_STATE_QUEUED,
             JOB_STATE_RUNNING,
             DOWNLOAD_JOB_KIND,
-        ],
-    )?;
-    tx.execute(
-        "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
-             active_attempt_id = NULL, error_json = ?3
-         WHERE job_id = ?4 AND state = ?5 AND resume_deadline_ms <= ?2",
-        params![
-            JOB_STATE_FAILED_PERMANENT,
-            now_ms,
-            reauth_error,
-            job_id,
-            JOB_STATE_PAUSED_NEEDS_REAUTH,
         ],
     )?;
     Ok(())
@@ -8025,7 +7659,7 @@ fn purge_retained_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqli
         )?;
         if remaining == 0 {
             tx.execute(
-                "DELETE FROM remote_checkpoints WHERE request_digest = ?1",
+                "DELETE FROM checkpoints WHERE request_digest = ?1",
                 params![digest],
             )?;
             tx.execute(
@@ -8058,8 +7692,8 @@ fn job_by_id_tx(
 
 const JOB_SELECT_SQL: &str = "SELECT job_id, request_key, request_digest, kind,
         module_generation, state, created_ms, updated_ms, execution_expires_ms,
-        result_retention_ttl_ms, terminal_at_ms, active_attempt_id, logical_handle,
-        paused_at_ms, resume_deadline_ms, page_count, result_json, error_json, params_json FROM jobs";
+        result_retention_ttl_ms, terminal_at_ms, active_attempt_id,
+        page_count, result_json, error_json, params_json FROM jobs";
 
 fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -8085,8 +7719,6 @@ struct RawCertificationRow {
     assurance_class: String,
     status: String,
     machine_profile_hash: Option<String>,
-    remote_profile_hash: Option<String>,
-    identity_revision: Option<String>,
     numeric_profile_id: Option<String>,
     fingerprint: String,
     certified_at_ms: u64,
@@ -8171,8 +7803,6 @@ fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
         assurance_class: row.get(0)?,
         status: row.get(1)?,
         machine_profile_hash: row.get(2)?,
-        remote_profile_hash: row.get(3)?,
-        identity_revision: row.get(4)?,
         numeric_profile_id: row.get(5)?,
         fingerprint: row.get(6)?,
         certified_at_ms: row.get::<_, i64>(7)? as u64,
@@ -8272,23 +7902,6 @@ fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, Synapse
             machine_profile_hash: row.machine_profile_hash.ok_or_else(|| {
                 SynapseStoreError::Decode(
                     "measured certification row has no machine profile key".to_string(),
-                )
-            })?,
-        },
-        AssuranceClass::Declared => CertificationKey::Declared {
-            machine_profile_hash: row.machine_profile_hash.ok_or_else(|| {
-                SynapseStoreError::Decode(
-                    "declared certification row has no machine profile key".to_string(),
-                )
-            })?,
-            remote_profile_hash: row.remote_profile_hash.ok_or_else(|| {
-                SynapseStoreError::Decode(
-                    "declared certification row has no remote profile key".to_string(),
-                )
-            })?,
-            identity_revision: row.identity_revision.ok_or_else(|| {
-                SynapseStoreError::Decode(
-                    "declared certification row has no identity revision".to_string(),
                 )
             })?,
         },
@@ -9486,13 +9099,10 @@ fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
         result_retention_ttl_ms: row.get::<_, i64>(9)? as u64,
         terminal_at_ms: row.get::<_, Option<i64>>(10)?.map(|value| value as u64),
         active_attempt_id: row.get(11)?,
-        logical_handle: row.get(12)?,
-        paused_at_ms: row.get::<_, Option<i64>>(13)?.map(|value| value as u64),
-        resume_deadline_ms: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
-        page_count: row.get::<_, i64>(15)? as u32,
-        result_json: decode_optional_json(row.get(16)?, 16)?,
-        error_json: decode_optional_json(row.get(17)?, 17)?,
-        params_json: decode_optional_json(row.get(18)?, 18)?,
+        page_count: row.get::<_, i64>(12)? as u32,
+        result_json: decode_optional_json(row.get(13)?, 13)?,
+        error_json: decode_optional_json(row.get(14)?, 14)?,
+        params_json: decode_optional_json(row.get(15)?, 15)?,
     })
 }
 
@@ -9932,7 +9542,6 @@ mod tests {
                 request_digest,
                 kind,
                 generation,
-                None,
                 &serde_json::json!({"items": 2}),
                 now_ms,
                 execution_ttl_ms,
@@ -9942,7 +9551,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_marks_queued_running_and_paused_attempts_failed_without_losing_pages() {
+    fn restart_marks_queued_and_running_attempts_failed_without_losing_pages() {
         let (root, descriptor) = temp_descriptor("restart-jobs");
         let store = SynapseStore::open(&descriptor).unwrap();
         let generation = store.next_module_generation().unwrap();
@@ -9979,26 +9588,10 @@ mod tests {
                 &[CheckpointItem {
                     item_id: "item-1".to_string(),
                     result: br#"{"id":"item-1"}"#.to_vec(),
-                    provider_request_id: None,
                 }],
                 13,
             )
             .unwrap();
-        let paused = admit(
-            &store,
-            "paused-key",
-            "paused-digest",
-            generation,
-            14,
-            1_000,
-            500,
-        )
-        .record()
-        .job_id
-        .clone();
-        assert!(store
-            .pause_job_needs_reauth(&paused, "vault/provider", 15, 1_000)
-            .unwrap());
         let probe = admit_kind(
             &store,
             "probe-key",
@@ -10021,8 +9614,8 @@ mod tests {
                 20,
             )
             .unwrap();
-        assert_eq!(failed, 4);
-        for job_id in [queued, running.clone(), paused, probe] {
+        assert_eq!(failed, 3);
+        for job_id in [queued, running.clone(), probe] {
             let job = store
                 .get_job_at(&job_id, 21)
                 .unwrap()
@@ -10051,7 +9644,6 @@ mod tests {
                 "digest-b",
                 "embed.batch",
                 generation,
-                None,
                 &serde_json::json!({"items": 2}),
                 102,
                 1_000,
@@ -10113,29 +9705,14 @@ mod tests {
         assert!(store
             .commit_job_page(&job_id, 0, br#"{"page":0}"#, &[], 1_002)
             .is_err());
-        assert!(store
-            .commit_job_page(
-                &job_id,
-                0,
-                br#"{"page":0}"#,
-                &[CheckpointItem {
-                    item_id: "invalid-provider-id".to_string(),
-                    result: vec![0],
-                    provider_request_id: Some(String::new()),
-                }],
-                1_002,
-            )
-            .is_err());
         let duplicate_items = [
             CheckpointItem {
                 item_id: "item-1".to_string(),
                 result: vec![1],
-                provider_request_id: None,
             },
             CheckpointItem {
                 item_id: "item-1".to_string(),
                 result: vec![2],
-                provider_request_id: None,
             },
         ];
         assert!(store
@@ -10160,7 +9737,6 @@ mod tests {
                 &[CheckpointItem {
                     item_id: "item-1".to_string(),
                     result: vec![1],
-                    provider_request_id: None,
                 }],
                 1_004,
             )
@@ -10191,144 +9767,6 @@ mod tests {
             .get_job_page(&resumed.record().job_id, 0)
             .unwrap()
             .is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    struct FakeContinuityCheck {
-        calls: std::sync::atomic::AtomicUsize,
-        fail: bool,
-    }
-
-    #[subc_client_rs::async_trait]
-    impl crate::remote::ContinuityCheck for FakeContinuityCheck {
-        async fn check(
-            &self,
-            _request_digest: &str,
-            _synapse_model_id: &str,
-            _logical_handle: Option<&str>,
-        ) -> Result<(), crate::remote::ContinuityError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
-                Err(crate::remote::ContinuityError::new("sentinel mismatch"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn restart_resubmission_runs_continuity_and_failure_preserves_prior_pages() {
-        let (root, descriptor) = temp_descriptor("continuity");
-        let first_job = {
-            let store = SynapseStore::open(&descriptor).unwrap();
-            let generation = store.next_module_generation().unwrap();
-            let job_id = admit(
-                &store,
-                "continuity-key",
-                "continuity-digest",
-                generation,
-                100,
-                1_000,
-                500,
-            )
-            .record()
-            .job_id
-            .clone();
-            assert!(store.mark_job_running(&job_id, generation, 101).unwrap());
-            store
-                .commit_job_page(
-                    &job_id,
-                    0,
-                    br#"{"page":0}"#,
-                    &[CheckpointItem {
-                        item_id: "item-1".to_string(),
-                        result: vec![1],
-                        provider_request_id: None,
-                    }],
-                    102,
-                )
-                .unwrap();
-            job_id
-        };
-
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let generation = store.next_module_generation().unwrap();
-        store
-            .fail_prior_generation_incomplete_jobs(
-                generation,
-                &serde_json::json!({"code": "module_restarted"}),
-                110,
-            )
-            .unwrap();
-        let resumed = admit(
-            &store,
-            "continuity-key",
-            "continuity-digest",
-            generation,
-            111,
-            1_000,
-            500,
-        );
-        let resumed_id = resumed.record().job_id.clone();
-        assert_ne!(resumed_id, first_job);
-        assert_eq!(resumed.record().page_count, 1);
-        assert!(matches!(
-            store
-                .claim_job_attempt(&resumed_id, generation, 112)
-                .unwrap(),
-            JobAttemptClaim::Claimed(_)
-        ));
-        let check = FakeContinuityCheck {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            fail: true,
-        };
-        assert!(!crate::apply_checkpoint_continuity(
-            &store,
-            &check,
-            &resumed_id,
-            "continuity-digest",
-            "remote-model",
-            Some("vault/provider"),
-            113,
-        )
-        .await
-        .unwrap());
-        assert_eq!(check.calls.load(Ordering::SeqCst), 1);
-        let quarantined = store.get_job_at(&resumed_id, 114).unwrap().unwrap();
-        assert_eq!(quarantined.state, JOB_STATE_FAILED_PERMANENT);
-        assert_eq!(
-            quarantined.error_json.unwrap()["code"],
-            "remote_identity_drift"
-        );
-        assert!(store.get_job_page(&resumed_id, 0).unwrap().is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pause_suspends_execution_ttl_and_deadline_expires_lazily_and_in_sweep() {
-        let (root, descriptor) = temp_descriptor("pause-ttl");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let generation = store.next_module_generation().unwrap();
-        let job_id = admit(&store, "pause-key", "pause-digest", generation, 100, 20, 50)
-            .record()
-            .job_id
-            .clone();
-        assert!(store
-            .pause_job_needs_reauth(&job_id, "vault/provider", 110, 100)
-            .unwrap());
-        assert_eq!(store.purge_expired_jobs(150).unwrap(), 0);
-        let paused = store.get_job_at(&job_id, 150).unwrap().unwrap();
-        assert_eq!(paused.state, JOB_STATE_PAUSED_NEEDS_REAUTH);
-        assert_eq!(paused.execution_expires_ms, None);
-        assert_eq!(paused.resume_deadline_ms, Some(210));
-
-        assert_eq!(store.purge_expired_jobs(210).unwrap(), 0);
-        let expired = store.get_job_at(&job_id, 210).unwrap().unwrap();
-        assert_eq!(expired.state, JOB_STATE_FAILED_PERMANENT);
-        assert_eq!(expired.error_json.unwrap()["code"], "needs_reauth_expired");
-        assert_eq!(store.purge_expired_jobs(259).unwrap(), 0);
-        assert_eq!(store.purge_expired_jobs(260).unwrap(), 1);
-        assert!(store.get_job_at(&job_id, 260).unwrap().is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10363,6 +9801,106 @@ mod tests {
     }
 
     #[test]
+    fn remote_removal_migrates_v14_and_preserves_finished_jobs_and_pages() {
+        let (root, descriptor) = temp_descriptor("remote-removal-v14");
+        let now = unix_now_ms() as i64;
+        {
+            let legacy = open_sqlite(&descriptor).unwrap();
+            legacy.migrate(NAMESPACE, &MIGRATIONS[..14]).unwrap();
+            legacy
+                .with_conn_fenced(|tx| {
+                    tx.execute(
+                        "INSERT INTO jobs (job_id, request_key, request_digest, kind,
+                        module_generation, state, created_ms, updated_ms,
+                        result_retention_ttl_ms, terminal_at_ms, params_json, result_json,
+                        page_count, logical_handle)
+                     VALUES ('finished', 'key', 'digest', 'embed.batch', 1, 'done', ?1, ?1,
+                        86400000, ?1, X'7B7D', X'7B7D', 1, 'vault/provider')",
+                        params![now],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO jobs (job_id, request_key, request_digest, kind,
+                        module_generation, state, created_ms, updated_ms,
+                        result_retention_ttl_ms, params_json, logical_handle,
+                        paused_at_ms, resume_deadline_ms)
+                     VALUES ('paused', 'paused-key', 'paused-digest', 'embed.batch', 1,
+                        'paused_needs_reauth', ?1, ?1, 86400000, X'7B7D',
+                        'vault/provider', ?1, ?1 + 86400000)",
+                        params![now],
+                    )?;
+                    tx.execute_batch(
+                        r#"
+                    INSERT INTO result_pages (request_digest, page_no, page_json,
+                        provider_request_ids_json, committed_at)
+                    VALUES ('digest', 0, X'7B7D', X'5B22726571225D', 1);
+                    INSERT INTO remote_checkpoints (request_digest, item_id, result,
+                        page_no, provider_request_id, committed_at)
+                    VALUES ('digest', 'item', X'7B7D', 0, 'req', 1);
+                    INSERT INTO remote_url_bindings (remote_profile_hash, last_base_url)
+                    VALUES ('remote', 'https://example.test');
+                    INSERT INTO cert_rows (certification_class, assurance_class, status,
+                        key_hash, remote_profile_hash, identity_revision, fingerprint,
+                        certified_at_ms, os_build, module_generation, evidence_json)
+                    VALUES ('declared', 'declared', 'certified', 'remote', 'remote', 'r1',
+                        'remote', 1, 'os', 1, '{"remote_sentinel":{}}');
+                    INSERT INTO cert_rows (certification_class, assurance_class, status,
+                        key_hash, machine_profile_hash, fingerprint,
+                        certified_at_ms, os_build, module_generation, evidence_json)
+                    VALUES ('embedding', 'measured', 'certified', 'local', 'local',
+                        'local', 1, 'os', 1, '{}');
+                "#,
+                    )
+                })
+                .unwrap();
+        }
+        let store = SynapseStore::open(&descriptor).unwrap();
+        assert_eq!(newest_schema_version(), 15);
+        let finished = store.get_job("finished").unwrap().unwrap();
+        assert_eq!(finished.state, JOB_STATE_DONE);
+        assert_eq!(finished.request_digest, "digest");
+        assert_eq!(finished.terminal_at_ms, Some(now as u64));
+        assert_eq!(finished.result_retention_ttl_ms, 86_400_000);
+        assert_eq!(finished.page_count, 1);
+        assert_eq!(finished.result_json, Some(serde_json::json!({})));
+        assert_eq!(
+            store.get_job_page("finished", 0).unwrap(),
+            Some(b"{}".to_vec())
+        );
+        assert_eq!(
+            store.committed_item_ids("digest").unwrap(),
+            ["item".to_string()].into()
+        );
+        let paused = store.get_job("paused").unwrap().unwrap();
+        assert_eq!(paused.state, JOB_STATE_FAILED_PERMANENT);
+        assert_eq!(paused.error_json.unwrap()["code"], "invalid_request");
+        assert_eq!(paused.terminal_at_ms, Some(now as u64));
+        assert!(store
+            .get_cert_row(
+                CertificationClass::Embedding,
+                "local",
+                &Fingerprint("local".into())
+            )
+            .unwrap()
+            .is_some());
+        store.store.with_conn(|conn| {
+            let remote_rows: i64 = conn.query_row("SELECT COUNT(*) FROM cert_rows WHERE assurance_class = 'declared' OR certification_class = 'remote'", [], |row| row.get(0))?;
+            assert_eq!(remote_rows, 0);
+            for retired in ["remote_url_bindings", "remote_checkpoints"] {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [retired], |row| row.get(0))?;
+                assert_eq!(count, 0, "retired table {retired}");
+            }
+            let mut columns = conn.prepare("SELECT name FROM pragma_table_info('jobs')")?;
+            let columns = columns.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            for retired in ["logical_handle", "paused_at_ms", "resume_deadline_ms"] {
+                assert!(!columns.iter().any(|column| column == retired), "retired column {retired}");
+            }
+            Ok(())
+        }).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn schema_trigger_set_is_exactly_the_known_guards() {
         // The migration fence above can only exercise guards that exist when it
         // runs. Rows announce themselves (fixtures start failing without them);
@@ -10393,8 +9931,7 @@ mod tests {
             triggers,
             vec![
                 "catalog_member_verification_cleanup".to_string(),
-                "remote_checkpoint_immutable".to_string(),
-                "remote_url_binding_identity_immutable".to_string(),
+                "checkpoint_immutable".to_string(),
             ],
         );
         drop(store);
@@ -10409,8 +9946,8 @@ mod tests {
         // v1-v5 job and v1-v8 cert arms remain empty; the v6 job writer and v9 cert
         // writer populate them at the first compatible coupling. The approval writer
         // also creates the marker and rotation writer creates parent/child ledger rows.
-        // Migration 6 creates both SQL triggers (remote_checkpoint_immutable and
-        // remote_url_binding_identity_immutable) unconditionally, so they need no
+        // The migrations create the checkpoint immutability trigger unconditionally,
+        // so it needs no
         // separate armed-state row. Module generation/table epoch, the approval
         // marker, and profile state are conditionally meaningful guard state; their
         // real writers run in v1/v3/v9. The corruption-event table is intentionally
@@ -10524,45 +10061,18 @@ mod tests {
                         store.store
                     }
                     6 => {
-                        let store = SynapseStore { store };
+                        store.with_conn_fenced(|tx| tx.execute_batch(r#"
+                            INSERT INTO jobs (job_id, request_key, request_digest, kind,
+                                module_generation, state, created_ms, updated_ms,
+                                result_retention_ttl_ms, params_json, page_count)
+                            VALUES ('job_step', 'step-key', 'legacy:step-job', 'embed.batch',
+                                1, 'running', 1005, 1007, 86400000, X'7B7D', 1);
+                            INSERT INTO result_pages (request_digest, page_no, page_json, committed_at)
+                            VALUES ('legacy:step-job', 0, CAST('{"items":[{"id":"item-1","value":1}]}' AS BLOB), 1007);
+                            INSERT INTO remote_checkpoints (request_digest, item_id, result, page_no, committed_at)
+                            VALUES ('legacy:step-job', 'item-1', X'7B7D', 0, 1007);
+                        "#)).unwrap();
                         store
-                            .bind_remote_profile_url(
-                                "remote-profile-hash",
-                                "https://remote.example.test/v1",
-                            )
-                            .unwrap();
-                        let job_id = store
-                            .admit_job(
-                                "step-key",
-                                "legacy:step-job",
-                                "embed.batch",
-                                1,
-                                Some("cache-lease:remote-profile"),
-                                &serde_json::json!({"items": ["item-1"]}),
-                                1_005,
-                                60_000,
-                                86_400_000,
-                            )
-                            .unwrap()
-                            .record()
-                            .job_id
-                            .clone();
-                        assert!(job_id.starts_with("job_"));
-                        assert!(store.mark_job_running(&job_id, 1, 1_006).unwrap());
-                        store
-                            .commit_job_page(
-                                &job_id,
-                                0,
-                                br#"{"items":[{"id":"item-1","value":1}]}"#,
-                                &[CheckpointItem {
-                                    item_id: "item-1".to_string(),
-                                    result: br#"{"id":"item-1","value":1}"#.to_vec(),
-                                    provider_request_id: Some("provider-request-1".to_string()),
-                                }],
-                                1_007,
-                            )
-                            .unwrap();
-                        store.store
                     }
                     7 | 8 => store,
                     9 => {
@@ -10715,7 +10225,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10..=14 => store,
+                    10..=15 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -10831,8 +10341,7 @@ mod tests {
                 "module_meta" => 1,
                 "jobs" => 1,
                 "result_pages" => 1,
-                "remote_checkpoints" => 1,
-                "remote_url_bindings" => 1,
+                "checkpoints" => 1,
                 "alias_rows" => 2,
                 "models" => 4,
                 "cert_rows" => 1,
@@ -11054,8 +10563,6 @@ mod tests {
             CertificationClass::Embedding,
             &with_hash,
             &fingerprint,
-            "ane-model",
-            false,
         )
         .expect_err("a changed ANE profile must require re-probing");
         assert_eq!(refused.code, "not_certified");
@@ -11112,8 +10619,6 @@ mod tests {
             CertificationClass::Embedding,
             "machine-a",
             &fingerprint,
-            "owned-qwen3",
-            false,
         )
         .expect_err("an uncertified decode outcome must refuse future owned requests");
         assert_eq!(refused.code, "not_certified");
@@ -11164,8 +10669,6 @@ mod tests {
             CertificationClass::Rerank,
             "legacy-profile-hash",
             &fingerprint,
-            "rerank-model",
-            false,
         )
         .expect_err("embedding evidence must not admit a rerank lane");
         assert_eq!(refused.code, "not_certified");
@@ -11216,83 +10719,6 @@ mod tests {
             )
             .unwrap()
             .is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn declared_certifications_use_remote_profile_keys() {
-        let (root, descriptor) = temp_descriptor("declared-cert");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let fingerprint = Fingerprint("declared-fp".to_string());
-        let row = CertificationRow {
-            assurance_class: AssuranceClass::Declared,
-            status: CertificationStatus::Certified,
-            key: CertificationKey::Declared {
-                machine_profile_hash: "machine-a".to_string(),
-                remote_profile_hash: "remote-profile".to_string(),
-                identity_revision: "r1".to_string(),
-            },
-            numeric_profile_id: NumericProfileId("np".to_string()),
-            fingerprint: fingerprint.clone(),
-            certified_at_ms: 10,
-            os_build: String::new(),
-            module_generation: 1,
-            evidence: serde_json::json!({"sentinels": 5}),
-        };
-        store.store_cert_row(&row).unwrap();
-        assert_eq!(
-            store
-                .get_declared_cert_row("machine-a", "remote-profile", "r1", &fingerprint)
-                .unwrap(),
-            Some(row)
-        );
-        assert!(store
-            .get_cert_row(CertificationClass::Rerank, "remote-profile", &fingerprint)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_declared_cert_row("machine-b", "remote-profile", "r1", &fingerprint)
-            .unwrap()
-            .is_none());
-        let rejected = crate::declared_certification_for_request(
-            &store,
-            &fingerprint,
-            "declared-model",
-            false,
-        )
-        .unwrap_err();
-        assert_eq!(rejected.code, "declared_identity_not_accepted");
-        assert!(crate::declared_certification_for_request(
-            &store,
-            &fingerprint,
-            "declared-model",
-            true,
-        )
-        .unwrap()
-        .is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn url_bindings_reject_changes_and_remove_missing_profiles_after_grace() {
-        let (root, descriptor) = temp_descriptor("url-binding");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        store
-            .bind_remote_profile_url("profile", "https://provider.example/v1")
-            .unwrap();
-        store
-            .bind_remote_profile_url("profile", "https://provider.example/v1")
-            .unwrap();
-        assert!(matches!(
-            store.bind_remote_profile_url("profile", "https://moved.example/v1"),
-            Err(SynapseStoreError::RemoteDeploymentChanged { .. })
-        ));
-        assert_eq!(store.sweep_remote_url_bindings(&[], 100, 50).unwrap(), 0);
-        assert_eq!(store.sweep_remote_url_bindings(&[], 149, 50).unwrap(), 0);
-        assert_eq!(store.sweep_remote_url_bindings(&[], 150, 50).unwrap(), 1);
-        store
-            .bind_remote_profile_url("profile", "https://moved.example/v1")
-            .unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -11729,28 +11155,15 @@ mod tests {
             .unwrap()
             .is_none());
 
-        for class in [
-            CertificationClass::Declared,
-            CertificationClass::Remote,
-            CertificationClass::Embedding,
-            CertificationClass::Rerank,
-        ] {
+        for class in [CertificationClass::Embedding, CertificationClass::Rerank] {
             let class_row = ClassScopedCertificationRow {
                 certification_class: class,
-                assurance_class: AssuranceClass::Declared,
+                assurance_class: AssuranceClass::Measured,
                 status: CertificationStatus::Certified,
                 key_hash: format!("key-{}", class.as_str()),
                 machine_profile_hash: None,
-                remote_profile_hash: matches!(
-                    class,
-                    CertificationClass::Declared | CertificationClass::Remote
-                )
-                .then(|| "remote-profile".to_string()),
-                identity_revision: matches!(
-                    class,
-                    CertificationClass::Declared | CertificationClass::Remote
-                )
-                .then(|| "identity-v1".to_string()),
+                remote_profile_hash: None,
+                identity_revision: None,
                 numeric_profile_id: None,
                 fingerprint: Fingerprint("shared-fp".to_string()),
                 certified_at_ms: 1,
@@ -11773,7 +11186,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(class_count, 4);
+        assert_eq!(class_count, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12814,7 +12227,7 @@ mod tests {
                     INSERT INTO result_pages (
                         request_digest, page_no, page_json, committed_at
                     ) VALUES ('digest-{seed}', 0, X'7B7D', 2);
-                    INSERT INTO remote_checkpoints (
+                    INSERT INTO checkpoints (
                         request_digest, item_id, result, page_no, committed_at
                     ) VALUES ('digest-{seed}', 'item-{seed}', X'7B7D', 0, 2);
                     INSERT INTO alias_rows (
@@ -12841,8 +12254,6 @@ mod tests {
                         throughput_tok_s, single_item_latency_p50_ms
                     ) VALUES ('machine-{seed}', 'embed.batch', 'balanced', 'model-{seed}',
                               'numeric-{seed}', 'knob-{seed}', 'engine', 1, 'os', 1, 3.0, 5.0);
-                    INSERT INTO remote_url_bindings (remote_profile_hash, last_base_url)
-                    VALUES ('remote-{seed}', 'https://{seed}.example.test');
                     INSERT INTO approvals (
                         schema_revision, model_id, decode_fingerprint, enabled,
                         grammar_enabled, updated_at_ms, evidence_requirements_revision,
@@ -14038,7 +13449,6 @@ mod tests {
                 "load-digest",
                 "model.load",
                 1,
-                None,
                 &serde_json::json!({}),
                 10,
                 100,

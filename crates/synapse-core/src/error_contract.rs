@@ -25,17 +25,7 @@ pub enum StableErrorCode {
     MigrationRequired,
     ModuleRestarted,
     InvalidRequest,
-    DeclaredIdentityNotAccepted,
-    RemoteIdentityDrift,
-    ProviderUnavailable,
-    ProviderProtocolViolation,
     IdempotencyConflict,
-    NeedsReauth,
-    NeedsReauthExpired,
-    RemoteDeploymentChanged,
-    CredentialConfigInvalid,
-    OpNotSupportedForRemote,
-    SentinelCalibrationRefused,
     ModelNotInstalled,
     UnknownModel,
     SelfCheckFailed,
@@ -46,7 +36,7 @@ pub enum StableErrorCode {
 
 impl StableErrorCode {
     /// Every stable error code in declaration order.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 21] = [
         Self::QueueFull,
         Self::SequenceTooLong,
         Self::DeadlineExceeded,
@@ -61,17 +51,7 @@ impl StableErrorCode {
         Self::MigrationRequired,
         Self::ModuleRestarted,
         Self::InvalidRequest,
-        Self::DeclaredIdentityNotAccepted,
-        Self::RemoteIdentityDrift,
-        Self::ProviderUnavailable,
-        Self::ProviderProtocolViolation,
         Self::IdempotencyConflict,
-        Self::NeedsReauth,
-        Self::NeedsReauthExpired,
-        Self::RemoteDeploymentChanged,
-        Self::CredentialConfigInvalid,
-        Self::OpNotSupportedForRemote,
-        Self::SentinelCalibrationRefused,
         Self::ModelNotInstalled,
         Self::UnknownModel,
         Self::SelfCheckFailed,
@@ -242,99 +222,9 @@ impl StableError {
         )
     }
 
-    pub const fn declared_identity_not_accepted() -> Self {
-        Self::new(
-            StableErrorCode::DeclaredIdentityNotAccepted,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn remote_identity_drift() -> Self {
-        Self::new(
-            StableErrorCode::RemoteIdentityDrift,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn provider_unavailable(retry_after_ms: Option<u64>) -> Self {
-        Self::new(
-            StableErrorCode::ProviderUnavailable,
-            ErrorClass::Transient,
-            retry_after_ms,
-            true,
-        )
-    }
-
-    pub const fn provider_protocol_violation() -> Self {
-        Self::new(
-            StableErrorCode::ProviderProtocolViolation,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
     pub const fn idempotency_conflict() -> Self {
         Self::new(
             StableErrorCode::IdempotencyConflict,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn needs_reauth() -> Self {
-        Self::new(
-            StableErrorCode::NeedsReauth,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn needs_reauth_expired() -> Self {
-        Self::new(
-            StableErrorCode::NeedsReauthExpired,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn remote_deployment_changed() -> Self {
-        Self::new(
-            StableErrorCode::RemoteDeploymentChanged,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn credential_config_invalid() -> Self {
-        Self::new(
-            StableErrorCode::CredentialConfigInvalid,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn op_not_supported_for_remote() -> Self {
-        Self::new(
-            StableErrorCode::OpNotSupportedForRemote,
-            ErrorClass::Permanent,
-            None,
-            false,
-        )
-    }
-
-    pub const fn sentinel_calibration_refused() -> Self {
-        Self::new(
-            StableErrorCode::SentinelCalibrationRefused,
             ErrorClass::Permanent,
             None,
             false,
@@ -408,7 +298,7 @@ mod tests {
 
     #[test]
     fn stable_error_code_all_covers_every_variant() {
-        const VARIANT_COUNT: usize = 31;
+        const VARIANT_COUNT: usize = 21;
 
         // This match is intentionally exhaustive so enum additions update the
         // enumeration and its expected cardinality together.
@@ -428,17 +318,7 @@ mod tests {
                 | StableErrorCode::MigrationRequired
                 | StableErrorCode::ModuleRestarted
                 | StableErrorCode::InvalidRequest
-                | StableErrorCode::DeclaredIdentityNotAccepted
-                | StableErrorCode::RemoteIdentityDrift
-                | StableErrorCode::ProviderUnavailable
-                | StableErrorCode::ProviderProtocolViolation
                 | StableErrorCode::IdempotencyConflict
-                | StableErrorCode::NeedsReauth
-                | StableErrorCode::NeedsReauthExpired
-                | StableErrorCode::RemoteDeploymentChanged
-                | StableErrorCode::CredentialConfigInvalid
-                | StableErrorCode::OpNotSupportedForRemote
-                | StableErrorCode::SentinelCalibrationRefused
                 | StableErrorCode::ModelNotInstalled
                 | StableErrorCode::UnknownModel
                 | StableErrorCode::SelfCheckFailed
@@ -467,17 +347,7 @@ mod tests {
             StableError::migration_required(),
             StableError::module_restarted(),
             StableError::invalid_request(),
-            StableError::declared_identity_not_accepted(),
-            StableError::remote_identity_drift(),
-            StableError::provider_unavailable(Some(1_000)),
-            StableError::provider_protocol_violation(),
             StableError::idempotency_conflict(),
-            StableError::needs_reauth(),
-            StableError::needs_reauth_expired(),
-            StableError::remote_deployment_changed(),
-            StableError::credential_config_invalid(),
-            StableError::op_not_supported_for_remote(),
-            StableError::sentinel_calibration_refused(),
             StableError::model_not_installed(),
             StableError::unknown_model(),
             StableError::self_check_failed(),
@@ -630,29 +500,5 @@ mod tests {
             Value::Object(map) => map,
             other => panic!("details must be a JSON object, got {other}"),
         }
-    }
-
-    #[test]
-    fn remote_error_classes_are_frozen() {
-        for error in [
-            StableError::invalid_request(),
-            StableError::declared_identity_not_accepted(),
-            StableError::remote_identity_drift(),
-            StableError::provider_protocol_violation(),
-            StableError::idempotency_conflict(),
-            StableError::needs_reauth(),
-            StableError::needs_reauth_expired(),
-            StableError::remote_deployment_changed(),
-            StableError::credential_config_invalid(),
-            StableError::op_not_supported_for_remote(),
-            StableError::sentinel_calibration_refused(),
-        ] {
-            assert_eq!(error.class, ErrorClass::Permanent);
-            assert!(!error.safe_to_retry_same_request);
-        }
-        let unavailable = StableError::provider_unavailable(Some(250));
-        assert_eq!(unavailable.class, ErrorClass::Transient);
-        assert!(unavailable.safe_to_retry_same_request);
-        assert_eq!(unavailable.retry_after_ms, Some(250));
     }
 }

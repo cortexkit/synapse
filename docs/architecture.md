@@ -3,7 +3,7 @@
 Synapse is a local inference module on the subc bus. Consumers use the `synapse`
 route for embedding, reranking and generation. The module owns tokenization,
 admission, identity, durable jobs and result pages. Inference runs in an owned
-engine or a supervised worker; configured remote profiles use the gateway.
+engine or a supervised worker. Modules needing hosted inference call providers directly.
 
 ## Module boundary
 
@@ -61,14 +61,6 @@ acknowledged release or confirmed process exit. See [ANE serving](ane-serving.md
 Core ML materialization uses digest-keyed stable paths so compiled specialization
 can be reused rather than extracted to a new path on every load.
 
-## Remote boundary
-
-The gateway uses declared provider identity, input assurance, bounded retries and
-circuit-breaker state. Declared identity requires caller opt-in; credentials and
-HTTP transport failures have distinct recovery behavior. Redirects are refused.
-Remote requests use the same durable item/page discipline as local requests;
-provider preprocessing is not represented as local numerical certification.
-The additive remote fields and recovery codes are in the wire contract.
 
 ## Documentation and evidence
 

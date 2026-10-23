@@ -53,7 +53,6 @@ hex = { workspace = true }
 half = "2"
 safetensors = "0.6.2"
 reqwest = { workspace = true }
-httpdate = { workspace = true }
 url = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-log = { workspace = true }

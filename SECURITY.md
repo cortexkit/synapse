@@ -17,7 +17,7 @@ it in a public discussion.
 ## Scope and coordinated disclosure
 
 Reports about model/artifact integrity, worker isolation, IPC authentication,
-remote credential handling, durable-state authority or dependency vulnerabilities
+tampering with persisted jobs or approvals, or dependency vulnerabilities
 are welcome. Identify the actual Synapse version and configuration so maintainers
 can assess applicability. This policy does not promise support for every
 historical version or a fixed response timeline.

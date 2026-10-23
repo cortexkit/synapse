@@ -4,7 +4,7 @@ Synapse is a local inference service on the subc bus. It provides embedding,
 reranking and small-model generation through the `synapse` module, with explicit
 model installation, stable numerical identity, bounded scheduling and durable
 result pages. Owned engines and supervised workers isolate inference from the
-management surface. Configured remote profiles require explicit identity opt-in.
+management surface. Modules needing hosted inference call providers directly.
 A missing local backend produces a typed refusal, not an automatic CPU fallback.
 
 ## Workspace crates
