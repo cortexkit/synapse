@@ -25907,6 +25907,29 @@ mod routing_identity_dump_tests {
 #[cfg(test)]
 mod catalog_runtime_tests {
     use super::*;
+
+    /// Waits for a fixture download to reach a terminal state and asserts it
+    /// committed. The bound only guards against a hang, so it matches the
+    /// end-to-end catalog suite's 15 s: the download path makes several
+    /// durable store writes, and a busy Windows runner has taken over 5 s for
+    /// them. A timeout reports the job's last state, so a real stall is
+    /// distinguishable from a slow runner.
+    async fn wait_for_committed_download(state: &Arc<ModuleState>, job: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let record = state.store.get_job(job).unwrap().unwrap();
+            if !store::is_download_non_terminal(&record.state) {
+                assert_eq!(record.state, "committed", "{record:?}");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download {job} still {} after 15 s: {record:?}",
+                record.state
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     use crate::tests::{
         catalog_test_model, response_result, test_machine_profile, test_module_state,
         test_storage_descriptor,
@@ -26809,17 +26832,7 @@ mod catalog_runtime_tests {
             "models.download",
         );
         assert_eq!(accepted["state"], "queued");
-        let job = accepted["job_id"].as_str().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let record = state.store.get_job(job).unwrap().unwrap();
-            if !store::is_download_non_terminal(&record.state) {
-                assert_eq!(record.state, "committed", "{record:?}");
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_committed_download(&state, accepted["job_id"].as_str().unwrap()).await;
 
         let load_attempts_path = root.join("catalog-load-attempts");
         let lane_env = "SYNAPSE_TEST_CATALOG_FAULT_LANE";
@@ -27041,16 +27054,7 @@ mod catalog_runtime_tests {
         );
         assert_eq!(accepted["state"], "queued");
         let job = accepted["job_id"].as_str().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let record = state.store.get_job(job).unwrap().unwrap();
-            if !store::is_download_non_terminal(&record.state) {
-                assert_eq!(record.state, "committed", "{record:?}");
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_committed_download(&state, job).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let same = response_result(
             models_download(
