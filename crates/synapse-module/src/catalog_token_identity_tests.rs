@@ -246,9 +246,9 @@ fn capture_cases(assets: &Path) -> Vec<Value> {
 // request path under test.
 //
 // To audit or recapture the fixture, run this test on a checkout of the
-// reference commit with SYNAPSE_TOKEN_IDENTITY_CAPTURE set to an output path:
-// the captured sequences are written there before they are compared, so a
-// mismatch still leaves the full capture for review.
+// reference commit (`MASTER` above) with SYNAPSE_TOKEN_IDENTITY_CAPTURE set
+// to an output path: the captured sequences are written there before they
+// are compared, so a mismatch still leaves the full capture for review.
 #[test]
 #[ignore = "requires checksum-pinned upstream tokenizer/config files in SYNAPSE_TOKEN_IDENTITY_ASSETS; fetch with scripts/fetch-token-identity-assets.py"]
 fn catalog_boundary_token_ids_match_master() {

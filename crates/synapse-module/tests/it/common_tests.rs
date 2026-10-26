@@ -69,7 +69,7 @@ async fn whole_process_without_home_holds_lease_at_native_data_home() {
 
     // Connecting happens after lease acquisition. Hold the TCP connection
     // without authentication or HELLO_ACK so profile and store boot stay out
-    // of this root test, and check the actual lease while the child is alive.
+    // of this test, and check the actual lease while the child is alive.
     let connected = timeout(Duration::from_secs(10), async {
         tokio::select! {
             connection = listener.accept() => connection.map_err(|error| error.to_string()),
