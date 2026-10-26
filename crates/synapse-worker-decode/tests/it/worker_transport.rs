@@ -185,17 +185,17 @@ struct CheckpointFixture {
     references: std::collections::BTreeMap<String, Vec<u32>>,
 }
 
-fn checkpoint_fixture() -> Option<CheckpointFixture> {
-    let snapshot = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)?;
+fn checkpoint_fixture() -> CheckpointFixture {
+    let snapshot = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B")
+        .map(PathBuf::from)
+        .expect("set SYNAPSE_OWNED_DECODE_QWEN3_0_6B to the Qwen3 0.6B checkpoint");
     let model = snapshot.join("model.safetensors");
     let tokenizer = snapshot.join("tokenizer.json");
-    if !model.is_file() || !tokenizer.is_file() {
-        eprintln!(
-            "skipping worker decode checkpoint e2e: {} is missing model.safetensors or tokenizer.json",
-            snapshot.display()
-        );
-        return None;
-    }
+    assert!(
+        model.is_file() && tokenizer.is_file(),
+        "{} is missing model.safetensors or tokenizer.json",
+        snapshot.display()
+    );
     let fixture_root =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/campaign/decode-fixtures");
     let prompts = std::fs::read_to_string(fixture_root.join("decode-prompts.jsonl"))
@@ -219,12 +219,12 @@ fn checkpoint_fixture() -> Option<CheckpointFixture> {
         .into_iter()
         .map(|row| (row.id, row.tokens))
         .collect();
-    Some(CheckpointFixture {
+    CheckpointFixture {
         model,
         tokenizer,
         prompts,
         references,
-    })
+    }
 }
 
 fn sha256_file(path: &std::path::Path) -> String {
@@ -396,10 +396,7 @@ fn checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint() {
     };
     use synapse_module::owned_decode_routing::DecodeDispatch;
 
-    let Some(fixture) = checkpoint_fixture() else {
-        eprintln!("skipping worker decode checkpoint e2e: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
-        return;
-    };
+    let fixture = checkpoint_fixture();
     assert_eq!(fixture.prompts.len(), 20);
     let tokenizer = tokenizers::Tokenizer::from_file(&fixture.tokenizer).expect("load tokenizer");
     let budget_path = runtime_dir("battery-budget").join("budget.json");
@@ -490,10 +487,7 @@ fn checkpoint_worker_socket_is_token_exact_and_carries_compiled_constraint() {
 fn checkpoint_worker_crash_redispatches_once_then_quarantines() {
     use synapse_module::owned_decode_routing::{error::OwnedDecodeError, DecodeDispatch};
 
-    let Some(fixture) = checkpoint_fixture() else {
-        eprintln!("skipping worker crash checkpoint e2e: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
-        return;
-    };
+    let fixture = checkpoint_fixture();
     let tokenizer = tokenizers::Tokenizer::from_file(&fixture.tokenizer).expect("load tokenizer");
     let prompt_ids = tokenizer
         .encode(fixture.prompts[0].prompt.as_str(), true)

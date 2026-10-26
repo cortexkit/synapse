@@ -461,26 +461,6 @@ fn canonical_checkout_round_trip_and_unknown_fields_rejected() {
 }
 
 #[test]
-fn validate_dispatch_uses_supplied_clean_candidate_source() {
-    let assets = Assets::new();
-    for record in matrix(&assets) {
-        write_record(&record, &assets.0).unwrap();
-    }
-    let source = "a".repeat(40);
-    let report = synapse_certify::command::dispatch(
-        synapse_certify::command::Command::Validate {
-            assets: assets.0.clone(),
-            checkout: assets.0.clone(),
-        },
-        Some(&source),
-        &catalog(),
-    )
-    .unwrap();
-    assert_eq!(report["source_commit"], source);
-    assert_eq!(report["eligible"].as_array().unwrap().len(), 30);
-}
-
-#[test]
 fn shipped_validate_entry_point_accepts_a_complete_synthetic_matrix() {
     let assets = Assets::new();
     for record in matrix(&assets) {
@@ -496,13 +476,19 @@ fn shipped_validate_entry_point_accepts_a_complete_synthetic_matrix() {
     let command = synapse_certify::command::parse(&arguments)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        command,
+        synapse_certify::command::Command::Validate {
+            assets: assets.0.clone(),
+            checkout: assets.0.clone(),
+        }
+    );
     let source = "a".repeat(40);
     let report = synapse_certify::command::dispatch(command, Some(&source), &catalog()).unwrap();
     assert_eq!(report["source_commit"], source);
-    assert_eq!(
-        report["eligible"].as_array().unwrap().len(),
-        derive_cells(&catalog().lanes).len()
-    );
+    let eligible = report["eligible"].as_array().unwrap().len();
+    assert_eq!(eligible, derive_cells(&catalog().lanes).len());
+    assert_eq!(eligible, 30);
 }
 
 #[test]

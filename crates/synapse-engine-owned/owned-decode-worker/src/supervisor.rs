@@ -44,12 +44,15 @@ pub trait Clock {
     fn now(&self) -> Timestamp;
 }
 
-/// A manually driven clock for deterministic fixtures.
+/// A manually driven clock for deterministic fixtures. Compiled only for tests
+/// or with the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct ManualClock {
     now: std::cell::Cell<Timestamp>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManualClock {
     #[must_use]
     pub fn new(start: Timestamp) -> Self {
@@ -67,6 +70,7 @@ impl ManualClock {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
         self.now.get()

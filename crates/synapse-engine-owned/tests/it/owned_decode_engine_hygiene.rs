@@ -8,7 +8,6 @@
 //!   (the Q8_0Tensor quantizer is deterministic and reproducible).
 //! - The four decode lanes (Qwen3 f16, Qwen3 Q8_0, LFM2 f16, LFM2 Q8_0) are
 //!   structurally present and correctly typed.
-//! - K=1 constrained stepping is supported via the DecodeConstraint trait.
 //! - The greedy-top-1 selector is byte-identical to the spike's selector.
 
 #![cfg(target_os = "macos")]
@@ -16,8 +15,7 @@
 use std::path::Path;
 
 use synapse_engine_owned::owned_decode_engine::{
-    DecodeConstraint, DecodeKernel, JsonConstraint, Q8_0Tensor, TokenVocabulary, TopLogit,
-    WeightQuantization, GREEDY_TOP1, SUPPORTED_BUCKETS,
+    Q8_0Tensor, WeightQuantization, GREEDY_TOP1, SUPPORTED_BUCKETS,
 };
 
 /// No source file under the production owned-decode-engine module may reference
@@ -117,29 +115,6 @@ fn four_decode_lanes_are_structurally_present() {
 
     // The greedy-top-1 selector is the only supported sampling mode.
     assert_eq!(GREEDY_TOP1, "greedy_top1");
-}
-
-/// K=1 constrained stepping is supported: the DecodeConstraint trait and
-/// JsonConstraint type are available. The constraint computes a token mask
-/// that the decode loop applies before each content-token commit.
-#[test]
-fn k1_constrained_stepping_is_supported() {
-    // The DecodeConstraint trait is the interface the decode loop uses for
-    // constrained stepping at K=1 (one token per quantum). The JsonConstraint
-    // implements it. We verify the types are reachable; full end-to-end
-    // constrained decoding requires a tokenizer and Metal GPU, which are
-    // exercised by the macos-metal CI lane.
-    fn _trait_check<C: DecodeConstraint>(_constraint: &C) {}
-    fn _json_constraint_reachable(_c: &JsonConstraint) {}
-    fn _token_vocabulary_reachable(_v: &TokenVocabulary) {}
-    fn _top_logit_reachable(_t: &TopLogit) {}
-
-    // The DecodeKernel trait's chain_span defaults to 1 (K=1 baseline).
-    // This is the production baseline: no chaining, fully instrumented
-    // per-token path, byte-identical to the pinned fixtures.
-    fn _decode_kernel_check<K: DecodeKernel>(kernel: &K) {
-        assert_eq!(kernel.chain_span(), 1, "production baseline is K=1");
-    }
 }
 
 /// The Q8_0 block layout matches the GGUF spec: 2-byte f16 scale + 32 i8

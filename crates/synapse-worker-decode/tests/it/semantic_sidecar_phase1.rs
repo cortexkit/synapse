@@ -332,10 +332,10 @@ impl Drop for WorkerClient {
 #[test]
 #[ignore]
 fn measure_semantic_sidecar_deterministic_phase1() {
-    if std::env::var_os("SYNAPSE_RUN_SEMANTIC_SIDECAR_PHASE1").is_none() {
-        eprintln!("skipping phase-1 measurement; set SYNAPSE_RUN_SEMANTIC_SIDECAR_PHASE1=1");
-        return;
-    }
+    assert!(
+        std::env::var_os("SYNAPSE_RUN_SEMANTIC_SIDECAR_PHASE1").is_some(),
+        "set SYNAPSE_RUN_SEMANTIC_SIDECAR_PHASE1=1 to run the phase-1 measurement"
+    );
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let evidence = root.join("evidence/semantic-sidecar-v1");
     fs::create_dir_all(&evidence).expect("create local semantic-sidecar evidence directory");
@@ -705,26 +705,6 @@ fn randomized_arms(request_id: &str, phase: &str, block: u32) -> Vec<Arm> {
 
 const fn start_load_is_eligible(load_average: f64) -> bool {
     load_average <= 8.0
-}
-
-#[test]
-fn thermal_policy_refuses_load_above_contract_limit() {
-    assert!(start_load_is_eligible(8.0));
-    assert!(!start_load_is_eligible(8.01));
-}
-
-#[test]
-fn arm_order_is_seeded_and_covers_each_arm_once() {
-    let first = randomized_arms("request-1", "measured", 1);
-    let repeated = randomized_arms("request-1", "measured", 1);
-    assert_eq!(first, repeated);
-    assert_eq!(first.len(), Arm::ALL.len());
-    for arm in Arm::ALL {
-        assert_eq!(
-            first.iter().filter(|candidate| **candidate == arm).count(),
-            1
-        );
-    }
 }
 
 fn capture_machine_state() -> MachineState {

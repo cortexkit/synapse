@@ -44,7 +44,7 @@ From the repository root:
 cargo build --locked -p synapse-module -p synapse-opctl
 cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
 cargo check --locked -p synapse-module --features test-support
-cargo test --locked -p synapse-module --features test-support --lib --test it --test skeleton_e2e --test wire_contract
+cargo test --locked -p synapse-module --features test-support,e2e --lib --test it --test skeleton_e2e --test wire_contract
 cargo test --locked -p synapse-certify --lib --test records
 cargo fmt --all --check
 bash scripts/public-banlist-check.sh

@@ -18,10 +18,10 @@
 //!   at a non-terminal boundary ([`boundary`]).
 //! - Crash-budget persistence, quarantine, and the single permitted worker-crash
 //!   redispatch ([`budget`], [`supervisor`]).
-//! - Process supervision and fault injection ([`worker`]).
-//! - The `decode-ownership-manifest-v1` fault sites and an ownership ledger the
-//!   fixtures use to prove no double free, invalid free, use-after-free, or leak
-//!   ([`ownership`]).
+//! - Process supervision ([`worker`]). The scripted fault-injection worker and
+//!   the manual clock that the fixtures drive are compiled only for this crate's
+//!   own tests or with the `test-support` feature, so they never ship in a
+//!   production binary.
 //!
 //! The wire deadline and cancellation literals are mirrored from the module-owned
 //! `owned-decode-wire-error-bindings-v1` manifest in [`wire_error_bindings`].
@@ -32,7 +32,6 @@ pub mod boundary;
 pub mod budget;
 pub mod error;
 pub mod identity;
-pub mod ownership;
 pub mod protocol;
 pub mod streaming;
 pub mod supervisor;
@@ -49,10 +48,6 @@ pub use identity::{
     DecodeIdentity, QuarantineKey, RuntimeManifest, SchedulerRuntimeRecord, CONSTRAINT_ENCODING_ID,
     WORKER_PROTOCOL_ID,
 };
-pub use ownership::{
-    OwnershipFaultSite, OwnershipLedger, OwnershipViolation, ResidentStateKind,
-    OWNERSHIP_MANIFEST_REVISION,
-};
 pub use protocol::{
     FinalResponse, FinishReason, FrameEnvelope, GenerateCancel, GenerateContinue,
     GenerateInstallHintBank, GenerateProgress, GenerateStart, HintBankInstalled, Sampling,
@@ -62,12 +57,16 @@ pub use streaming::{
     AbortOutcome, RetainedPrefix, RetentionPreflight, StreamRequest, StreamingSupervisor,
     StreamingSupervisorError, SupervisionCycle, WorkerDeathOutcome,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use supervisor::ManualClock;
 pub use supervisor::{
-    Clock, GenerationOutcome, GenerationRequest, ManualClock, Provenance, SuccessOutput,
-    Supervisor, TerminalControl,
+    Clock, GenerationOutcome, GenerationRequest, Provenance, SuccessOutput, Supervisor,
+    TerminalControl,
 };
 pub use validation::{validate_start, StartAuthorization, WorkerStartContext};
 pub use worker::{
-    CancelAck, DecodeWorker, HintBankSource, NoHintBankSource, ScriptedEvent, ScriptedLog,
-    ScriptedWorkerFactory, SidecarHintBankPickup, SteppedFrame, WorkerFactory, WorkerFault,
+    CancelAck, DecodeWorker, HintBankSource, NoHintBankSource, SidecarHintBankPickup, SteppedFrame,
+    WorkerFactory, WorkerFault,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use worker::{ScriptedEvent, ScriptedLog, ScriptedWorkerFactory};

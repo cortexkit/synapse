@@ -7,19 +7,17 @@ use synapse_core::{EmbedEngine, RuntimeConfig, TokenBatch, ValidatedArtifact};
 use synapse_engine_owned::{ModelFamily, OwnedDType, OwnedMetalEmbedEngine};
 
 #[test]
+#[ignore = "requires a local gte-modernbert-base safetensors snapshot"]
 fn gte_public_load_and_inference_cover_8192_context() {
-    let Some(snapshot) = gte_snapshot() else {
-        eprintln!("skipping owned-metal GTE full-context test: local snapshot is missing");
-        return;
-    };
+    let snapshot = gte_snapshot().expect(
+        "set SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT or cache Alibaba-NLP/gte-modernbert-base",
+    );
     for required in ["model.safetensors", "config.json"] {
-        if !snapshot.join(required).is_file() {
-            eprintln!(
-                "skipping owned-metal GTE full-context test: {required} is missing from {}",
-                snapshot.display()
-            );
-            return;
-        }
+        assert!(
+            snapshot.join(required).is_file(),
+            "{required} is missing from {}",
+            snapshot.display()
+        );
     }
 
     let cache = unique_temp_dir("owned-metal-gte-full-context");

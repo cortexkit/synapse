@@ -4,12 +4,12 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-description = "Supervised owned-metal-decode worker protocol, crash budget, quarantine, and ownership manifest."
+description = "Supervised owned-metal-decode worker protocol, crash budget and quarantine."
 publish = false
 
 # The layer is pure Rust: it models the module-side supervisor for the
 # `owned-metal-decode-worker-v1` protocol (framing, start validation, residency,
-# terminal-control boundaries, crash budget, quarantine, ownership). It does not
+# terminal-control boundaries, crash budget, quarantine). It does not
 # link Metal and does not depend on `synapse-engine-owned`, so its fixtures run
 # on any host without a GPU. The real Metal worker satisfies the `DecodeWorker`
 # transport trait defined here.
@@ -20,6 +20,16 @@ synapse-core = { path = "../../synapse-core" }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1.0.69"
+
+[features]
+# Exposes the scripted fault-injection worker and the manual clock that the
+# fixtures drive. Production dependents leave it off, so those doubles are not
+# compiled into ck-synapse or the decode worker.
+test-support = []
+
+[dev-dependencies]
+# Turns on this crate's own test-support feature for its integration tests.
+owned-decode-worker = { path = ".", features = ["test-support"] }
 
 [lib]
 name = "owned_decode_worker"

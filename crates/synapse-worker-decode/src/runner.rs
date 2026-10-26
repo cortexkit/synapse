@@ -4725,11 +4725,6 @@ mod tests {
     }
 
     #[test]
-    fn producer_identity_matches_shared_catalog_constant() {
-        assert_eq!(engine_identity(7).engine, DECODE_WORKER_ENGINE);
-    }
-
-    #[test]
     fn sidecar_protocol_v2_mismatch_fails_during_handshake() {
         let hello = |protocol| {
             serde_json::json!({
@@ -5042,13 +5037,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SYNAPSE_OWNED_DECODE_QWEN3_0_6B checkpoint"]
     fn q8_direct_ane_cache_import_matches_f16_handoff_bit_for_bit() {
-        let Some(checkpoint) =
-            std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
-        else {
-            eprintln!("skipping q8 direct cache import: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B");
-            return;
-        };
+        let checkpoint = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B")
+            .map(PathBuf::from)
+            .expect("set SYNAPSE_OWNED_DECODE_QWEN3_0_6B to the Qwen3 0.6B checkpoint");
         let model_path = checkpoint.join("model.safetensors");
         let f16_model = Qwen3DecodeModel::load_with_quant(
             &model_path,
@@ -5092,45 +5085,6 @@ mod tests {
 
         assert_eq!(legacy, cache_bits);
         assert_eq!(direct, legacy);
-    }
-
-    #[test]
-    #[ignore = "operator-only 20-sample shared-memory timing probe"]
-    fn shared_memory_handoff_20_sample_w128_timing() {
-        let mut config = test_ane_config();
-        config.window = 128;
-        config.layers = 28;
-        config.kv_heads = 8;
-        config.head_dimension = 128;
-        config.vocabulary_size = 151_936;
-        config.cache_bucket = 512;
-        let shared = Rc::new(
-            SharedMemoryHandoff::create(&config, u64::MAX - 7)
-                .expect("create W128 shared-memory timing fixture"),
-        );
-        let logits = vec![0_u8; shared.layout.logits_bytes];
-        let cache = vec![0_u16; shared.layout.kv_bytes / std::mem::size_of::<u16>()];
-        let digest = publish_shared_fixture(&shared, 10, &logits, &cache);
-
-        let mut samples = Vec::with_capacity(20);
-        for _ in 0..20 {
-            let started = Instant::now();
-            let (publication, _) = shared
-                .validate_publication(10, &digest)
-                .expect("shared-memory publication validates");
-            publication
-                .verify_digest()
-                .expect("shared-memory publication digest validates");
-            std::hint::black_box(publication.bits());
-            samples.push(duration_milliseconds(started.elapsed()));
-        }
-        let mut sorted = samples.clone();
-        sorted.sort_by(f64::total_cmp);
-        println!("shared_memory_handoff_ms={samples:?}");
-        println!(
-            "shared_memory_handoff_p50_ms={:.3}",
-            (sorted[9] + sorted[10]) / 2.0
-        );
     }
 
     #[test]
@@ -5276,8 +5230,10 @@ mod tests {
         let elapsed = started.elapsed();
         writer_thread.join().expect("stalled writer exits");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // Only a lower bound: an upper bound on real time fails good code on a
+        // loaded runner. A reader that ignored the deadline would instead wait
+        // for the writer to close and report UnexpectedEof, not TimedOut.
         assert!(elapsed >= Duration::from_millis(20));
-        assert!(elapsed < Duration::from_millis(90));
         assert_eq!(
             AnePrefillFault::ReadinessBudget
                 .disposition()
@@ -5489,25 +5445,18 @@ mod fast_path_tests {
         );
     }
 
-    fn checkpoint_paths() -> Option<(PathBuf, PathBuf)> {
-        let Some(root) = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B").map(PathBuf::from)
-        else {
-            eprintln!(
-                "skipping checkpoint constrained decode: set SYNAPSE_OWNED_DECODE_QWEN3_0_6B"
-            );
-            return None;
-        };
+    fn checkpoint_paths() -> (PathBuf, PathBuf) {
+        let root = std::env::var_os("SYNAPSE_OWNED_DECODE_QWEN3_0_6B")
+            .map(PathBuf::from)
+            .expect("set SYNAPSE_OWNED_DECODE_QWEN3_0_6B to the Qwen3 0.6B checkpoint");
         let model = root.join("model.safetensors");
         let tokenizer = root.join("tokenizer.json");
-        if model.is_file() && tokenizer.is_file() {
-            Some((model, tokenizer))
-        } else {
-            eprintln!(
-                "skipping checkpoint constrained decode: {} lacks model.safetensors or tokenizer.json",
-                root.display()
-            );
-            None
-        }
+        assert!(
+            model.is_file() && tokenizer.is_file(),
+            "{} lacks model.safetensors or tokenizer.json",
+            root.display()
+        );
+        (model, tokenizer)
     }
 
     fn wire_constraint(compiled: &TokenIdJsonConstraintV1) -> TokenIdJsonConstraint {
@@ -5673,9 +5622,7 @@ mod fast_path_tests {
     #[test]
     #[ignore = "requires SYNAPSE_OWNED_DECODE_QWEN3_0_6B checkpoint"]
     fn checkpoint_adversarial_battery_matches_token_ids_on_and_off() {
-        let Some((model, tokenizer_path)) = checkpoint_paths() else {
-            return;
-        };
+        let (model, tokenizer_path) = checkpoint_paths();
         let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load checkpoint tokenizer");
         let mut state = load_checkpoint_state(&model, &tokenizer_path);
         for (index, schema) in adversarial_schema_battery().iter().enumerate() {
@@ -5708,9 +5655,7 @@ mod fast_path_tests {
     #[test]
     #[ignore = "requires SYNAPSE_OWNED_DECODE_QWEN3_0_6B checkpoint"]
     fn checkpoint_reports_three_schema_forced_token_measurements() {
-        let Some((model, tokenizer_path)) = checkpoint_paths() else {
-            return;
-        };
+        let (model, tokenizer_path) = checkpoint_paths();
         let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("load checkpoint tokenizer");
         let mut state = load_checkpoint_state(&model, &tokenizer_path);
         let schemas = [

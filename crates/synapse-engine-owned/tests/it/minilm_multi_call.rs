@@ -10,23 +10,19 @@ use synapse_engine_owned::{OwnedDType, OwnedMetalEmbedEngine};
 use tokenizers::{Tokenizer, TruncationParams};
 
 #[test]
+#[ignore = "requires a local all-MiniLM-L6-v2 safetensors snapshot"]
 fn minilm_reuses_precompiled_packages_across_calls() {
-    let Some(snapshot) = minilm_snapshot() else {
-        eprintln!(
-            "skipping owned-metal MiniLM multi-call test: local safetensors snapshot is missing"
-        );
-        return;
-    };
+    let snapshot = minilm_snapshot().expect(
+        "set SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT or cache sentence-transformers/all-MiniLM-L6-v2",
+    );
     let model_path = snapshot.join("model.safetensors");
     let tokenizer_path = snapshot.join("tokenizer.json");
-    if !model_path.is_file() || !tokenizer_path.is_file() {
-        eprintln!(
-            "skipping owned-metal MiniLM multi-call test: missing {} or {}",
-            model_path.display(),
-            tokenizer_path.display()
-        );
-        return;
-    }
+    assert!(
+        model_path.is_file() && tokenizer_path.is_file(),
+        "missing {} or {}",
+        model_path.display(),
+        tokenizer_path.display()
+    );
 
     let cache = unique_temp_dir("owned-metal-packages");
     let mut runtime = RuntimeConfig::default();

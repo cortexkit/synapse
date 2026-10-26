@@ -22,7 +22,7 @@ hard links, and a cross-filesystem copy would no longer execute the attested fil
 The candidate's `certify source` stamp must match the runner's clean source.
 Dirty or missing provenance refuses validation.
 
-Checks: `validate_dispatch_uses_supplied_clean_candidate_source`,
+Checks: `shipped_validate_entry_point_accepts_a_complete_synthetic_matrix`,
 `validate_dispatch_without_clean_source_refuses_and_writes_nothing`, and
 `executed_digest_is_extracted_file_not_zip_sidecar` in
 `crates/synapse-certify/tests/records.rs`. These check source binding and execution

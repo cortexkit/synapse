@@ -30,7 +30,7 @@ def narrow_tests(metadata, changed, root):
             except ValueError:
                 continue
             targets = package["targets"]
-            choices = selected.setdefault(package["name"], set())
+            choices = selected.setdefault(package["name"], {})
             if relative.parts[0] == "tests":
                 # Helpers can be imported by any integration target. If the path
                 # does not identify one target, conservatively run all of them.
@@ -40,16 +40,28 @@ def narrow_tests(metadata, changed, root):
                         and Path(t["src_path"]).parent in path.parents
                     )
                 )]
-                choices.update(("--test", t["name"]) for t in matching)
+                for t in matching:
+                    choices[("--test", t["name"])] = t
                 if not matching:
-                    choices.add(("--tests",))
+                    # Cargo skips targets whose required features are off, so
+                    # --tests leaves feature-gated e2e targets out.
+                    choices[("--tests",)] = None
             else:
-                choices.update(("--lib",) for t in targets if "lib" in t["kind"])
-                choices.update(("--bin", t["name"]) for t in targets if "bin" in t["kind"])
+                choices.update({("--lib",): t for t in targets if "lib" in t["kind"]})
+                choices.update({("--bin", t["name"]): t for t in targets if "bin" in t["kind"]})
             break
-    return [cargo_test(package, *(["--features", "test-support"] if package == "synapse-module" else []), *choice)
+    return [cargo_test(package, *features(package, target), *choice)
             for package, choices in sorted(selected.items())
-            for choice in sorted(choices)]
+            for choice, target in sorted(choices.items(), key=lambda item: item[0])]
+
+
+def features(package, target):
+    """Features a named target needs: its required features, plus test-support for the module."""
+    wanted = ["test-support"] if package == "synapse-module" else []
+    for feature in (target or {}).get("required-features") or []:
+        if feature not in wanted:
+            wanted.append(feature)
+    return ["--features", ",".join(wanted)] if wanted else []
 
 
 def static_gates():
@@ -87,8 +99,8 @@ def module_fixtures():
 def full_gates():
     return [*module_fixtures(),
         ["cargo", "check", "--locked", "-p", "synapse-module", "--features", "test-support"],
-        cargo_test("synapse-module", "--features", "test-support", "--lib", "--test", "it", "--test", "skeleton_e2e"),
-        ["cargo", "clippy", "--locked", "-p", "synapse-module", "--features", "test-support", "--all-targets", "--", "-D", "warnings"],
+        cargo_test("synapse-module", "--features", "test-support,e2e", "--lib", "--test", "it", "--test", "skeleton_e2e"),
+        ["cargo", "clippy", "--locked", "-p", "synapse-module", "--features", "test-support,e2e", "--all-targets", "--", "-D", "warnings"],
     ]
 
 
@@ -128,8 +140,7 @@ def module_macos_tests(command):
                          "ane_probe_placement_ping_runs_outside_the_module_runtime",
                          "embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash",
                          "probe_owned_gte_modernbert_certifies_against_family_reference",
-                         "owned_gte_rerank_loads_certifies_and_serves_deterministically",
-                         "owned_gte_inline_embed_batch_throughput_sweep"],
+                         "owned_gte_rerank_loads_certifies_and_serves_deterministically"],
     }
     targets, names = [], []
     for target, cases in tests.items():
@@ -141,12 +152,35 @@ def module_macos_tests(command):
     if not names:
         return []
     fixtures = module_fixtures()[1:] if "skeleton_e2e" in targets else []
-    return [*fixtures, ["cargo", "nextest", "run", "--locked", "-p", "synapse-module", "--features", "test-support",
-             *targets, "--retries", "0", "--test-threads", "4", "-E",
+    selection = ["-p", "synapse-module", "--features",
+                 "test-support,e2e" if "skeleton_e2e" in targets else "test-support", *targets]
+    # A renamed or deleted test would otherwise drop out of the union filter
+    # silently, so list the targets first and refuse any name that matches nothing.
+    check = ["python3", "scripts/land-gates.py", "--require-tests", json.dumps(names), "--",
+             "cargo", "nextest", "list", "--locked", *selection, "--message-format", "json"]
+    return [*fixtures, check, ["cargo", "nextest", "run", "--locked", *selection,
+             "--retries", "0", "--test-threads", "4", "-E",
              " | ".join(f"test({name})" for name in names)]]
 
 
+def unmatched_tests(listing, names):
+    """Names that no listed test contains, the way nextest's test() filter matches."""
+    listed = [name for suite in listing.get("rust-suites", {}).values()
+              for name in suite.get("testcases", {})]
+    return [name for name in names if not any(name in test for test in listed)]
+
+
+def require_tests(names, list_command):
+    listing = json.loads(subprocess.check_output(list_command, text=True))
+    missing = unmatched_tests(listing, names)
+    for name in missing:
+        print(f"land-gates: macOS test name matches no test: {name}", file=sys.stderr)
+    return 1 if missing else 0
+
+
 def main():
+    if sys.argv[1:2] == ["--require-tests"] and sys.argv[3:4] == ["--"]:
+        return require_tests(json.loads(sys.argv[2]), sys.argv[4:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--full", action="store_true", help="also run portable module builds, integration/e2e and clippy")
     parser.add_argument("--base", default="origin/master", help="diff base for narrow tests (includes working tree and untracked files)")

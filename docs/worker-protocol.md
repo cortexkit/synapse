@@ -70,7 +70,7 @@ Run from the repository root:
 ```sh
 cargo test --locked -p synapse-core --lib --test child_process
 cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
-cargo test --locked -p synapse-module --features test-support --lib --test it --test skeleton_e2e
+cargo test --locked -p synapse-module --features test-support,e2e --lib --test it --test skeleton_e2e
 ```
 
 Run the Windows transport tests on Windows as well; a Linux pass cannot exercise

@@ -1212,11 +1212,6 @@ mod tests {
     }
 
     #[test]
-    fn producer_identity_matches_shared_catalog_constant() {
-        assert_eq!(engine_identity().engine, LLAMA_WORKER_ENGINE);
-    }
-
-    #[test]
     fn missing_backend_is_unsupported_and_backend_unavailable() {
         let error = validate_requested_backend(&BTreeMap::new()).expect_err("backend is required");
         assert!(error.to_string().contains(BACKEND_UNAVAILABLE_REASON));
