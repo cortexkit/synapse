@@ -37,24 +37,24 @@ class ParallelCiTests(unittest.TestCase):
             gate = WORKFLOW["jobs"][platform]
             self.assertEqual(gate["name"], platform)
             self.assertEqual(gate["if"], "${{ always() }}")
-            expected_needs = [f"{platform}-checks", f"{platform}-catalogue"] + (["test"] if platform == "linux" else [])
+            expected_needs = [f"{platform}-checks"] + (["test"] if platform == "linux" else [])
             self.assertEqual(gate["needs"], expected_needs)
             script = gate["steps"][0]["run"]
             statuses = ("success", "failure", "cancelled", "skipped")
-            for native, catalogue, guards in itertools.product(statuses, repeat=3):
-                with self.subTest(platform=platform, native=native, catalogue=catalogue, guards=guards):
+            for native, guards in itertools.product(statuses, repeat=2):
+                with self.subTest(platform=platform, native=native, guards=guards):
                     result = subprocess.run(
                         ["bash", "-e", "-c", script],
-                        env=dict(os.environ, NATIVE_RESULT=native, CATALOGUE_RESULT=catalogue, GUARDS_RESULT=guards),
+                        env=dict(os.environ, NATIVE_RESULT=native, GUARDS_RESULT=guards),
                         capture_output=True,
                     )
-                    expected = native == catalogue == "success" and (platform == "windows" or guards == "success")
+                    expected = native == "success" and (platform == "windows" or guards == "success")
                     self.assertEqual(result.returncode == 0, expected)
 
     def test_native_lanes_start_independently_and_shards_cover_the_suite(self):
         jobs = PORTABLE["jobs"]
         self.assertEqual(set(jobs), {"clippy", "nextest", "llama"})
-        for job in list(jobs.values()) + [WORKFLOW["jobs"][f"{p}-catalogue"] for p in ("linux", "windows")]:
+        for job in jobs.values():
             self.assertNotIn("needs", job)
             self.assertNotIn("if", job)
             self.assertNotIn("continue-on-error", job)
@@ -74,8 +74,7 @@ class ParallelCiTests(unittest.TestCase):
         self.assertTrue(cache["cache-workspace-crates"])
         self.assertEqual(cache["save-if"], "${{ inputs.save-cache == 'true' }}")
         lanes = []
-        jobs = dict(PORTABLE["jobs"], catalogue=WORKFLOW["jobs"]["linux-catalogue"])
-        for name, job in jobs.items():
+        for name, job in PORTABLE["jobs"].items():
             setup = next(s["with"] for s in job["steps"] if s.get("uses") == "./synapse/.github/actions/ci-rust")
             lanes.append(setup["lane"])
             if name == "nextest":
@@ -189,15 +188,6 @@ sys.exit(subprocess.run(args[args.index('--') + 1:], cwd=os.environ['REMOTE_ROOT
                 tool = tools / name
                 tool.write_text("#!/bin/sh\nexit 0\n")
                 tool.chmod(0o755)
-            mutate = tools / "ckdev-mutate"
-            mutate.write_text(f"#!{sys.executable}\n" + '''
-import json, os, sys
-from pathlib import Path
-name = 'windows' if os.getenv('REMOTE') == '1' else 'native'
-with (Path(os.environ['EVENTS']) / (name + '.mutate')).open('a') as log:
-    log.write(json.dumps(sys.argv[1:]) + '\\n')
-''')
-            mutate.chmod(0o755)
             result = subprocess.run(
                 [sys.executable, "-c", "import runpy; from unittest.mock import patch; "
                  "p=patch('platform.system', return_value='Darwin'); p.start(); "
@@ -217,12 +207,6 @@ with (Path(os.environ['EVENTS']) / (name + '.mutate')).open('a') as log:
             self.assertIn("TREE linux ", result.stdout)
             self.assertIn("TREE macos ", result.stdout)
             self.assertIn("TIMING preflight wall", result.stdout)
-            # The build-free anchors check runs on the local half only; the full
-            # catalogue check is left to CI and must not run in either half.
-            local_mutate = (root / "native.mutate").read_text().splitlines()
-            self.assertEqual([json.loads(line) for line in local_mutate],
-                             [["--version"], ["check", "--anchors-only"]])
-            self.assertFalse((root / "windows.mutate").exists(), result.stdout)
             return result
 
     def test_windows_cross_clippy_overlaps_native_preflight(self):

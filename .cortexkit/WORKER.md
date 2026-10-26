@@ -7,22 +7,32 @@ Command Line Tools alone do not supply `metal`/`metallib`. Hardware tests need t
 actual platform, pinned model files and any explicit opt-in described by the test.
 A portable test pass or a skipped hardware case is not hardware certification.
 
+## What to run for a change
+
+Implement the change, then run only the filtered tests for the code you touched,
+plus `cargo fmt --all --check` and Clippy for the touched crates, on the build
+server (`runon: "linux,4c"`). For a bug fix, add one ordinary test that fails
+without the fix, and show that once: revert only the fix, run that test, see it
+fail. Do not write mutation rows, break proofs or deliberate-break controls
+(edits that break production code on purpose to prove some test notices), and
+do not run full suites or repeat runs to prove stability. The head runs the full
+suite once per integrated batch, and CI runs it before master.
+
 ## Landing execution location
 
-Run portable Cargo checks, Clippy, tests, Nextest and `ckdev-mutate check` on the
-Linux build server, not on the Mac. With the agent shell use `runon: "linux,4c"`
-(8 vCPUs for workspace suites). From a shell use `ck motor run --vcpus 4 --cwd
-"$PWD" -- COMMAND...`; it snapshots the current checkout, including dirty source.
-Only release builds being placed here and checks requiring Apple frameworks,
-Metal, Swift or actual macOS behavior belong on the Mac. A mutation catalogue
-check compiles test targets to discover names; it is not a cheap local lint.
+Run portable Cargo checks, Clippy, tests and Nextest on the Linux build server,
+not on the Mac. With the agent shell use `runon: "linux,4c"`. From a shell use
+`ck motor run --vcpus 4 --cwd "$PWD" -- COMMAND...`; it snapshots the current
+checkout, including dirty source. Only release builds being placed here and
+checks requiring Apple frameworks, Metal, Swift or actual macOS behavior belong
+on the Mac.
 
 `scripts/land-gates.sh` routes its portable plan to MOTOR; `--full` adds the
-catalogue, fixtures, module check/tests and Clippy. When invoked on macOS, narrow
+fixtures, module check/tests and Clippy. When invoked on macOS, narrow
 tests for Apple-only packages and the module's active macOS-gated tests run locally;
 on Linux those native implementations are not verified. On macOS,
 `scripts/train-push.local.sh` joins remote Windows GNU
-cross-Clippy, formatting, repository checks and catalogue validation with native
+cross-Clippy, formatting and repository checks with native
 Clippy for `synapse-module`, `synapse-engine-owned`, `synapse-worker-ane`, plus
 the engine-owned library tests. Native MSVC remains a CI gate. Both halves print
 source-content fingerprints and refuse a mismatched snapshot or a tree changed
@@ -38,6 +48,9 @@ python3 -m unittest scripts.test_ci_parallel scripts.test_remote_gate scripts.te
 
 ## Portable module gates
 
+These are the module's gate commands; pick the ones that cover what you touched
+and filter the tests to it.
+
 ```sh
 cargo --version
 rustc --version
@@ -47,13 +60,10 @@ cargo test --locked -p synapse-module --features test-support --lib --test it --
 cargo fmt --all --check
 bash scripts/public-banlist-check.sh
 bash scripts/check-cortexkit-layout.sh
-ckdev-mutate check
 ```
 
 Feature-off GPU worker builds are required refusal fixtures for the module
-library tests; they do not exercise GPU hardware. Use the `ckdev-mutate` revision pinned in `.github/workflows/tests.yml`, with
-cargo-nextest and the workflow's Python dependencies. The catalogue is the
-`mutations.d/` fragment directory; do not add a legacy `mutations.toml` shim.
+library tests; they do not exercise GPU hardware.
 `cargo fmt --all --check` is silent on success; record its version and exit status.
 
 ## Documentation, release and helper gates
@@ -68,7 +78,7 @@ bash bench/campaign/ane-direct-embed-harness.sh --self-test .
 bash scripts/train-push.test.sh
 ```
 
-Doc changes can affect include_str!, mutation anchors and release inputs.
+Doc changes can affect include_str! and release inputs.
 `bench/campaign/ane-direct-embed-pack.jsonc` selects document excerpts by literal
 path and line range; update those ranges when the referenced text moves.
 Keep every live reader's required files tracked. Public docs are
@@ -84,7 +94,7 @@ processes to obtain hardware. Release
 certification executes extracted candidate assets through same-filesystem hard
 links under development names; never rebuild or copy the attested binaries.
 
-Before committing, inspect the diff, run the relevant package tests and formatting,
-and confirm that deliberate mutation controls have been restored. Use
+Before committing, inspect the diff and run the filtered tests and formatting for
+what you touched. Use
 [development verification](../docs/development.md) and
 [backend certification](../docs/backend-certification.md) for exact procedures.

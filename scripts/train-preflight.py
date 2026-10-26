@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository preflight: portable builds on MOTOR; catalogue anchors and Apple builds locally."""
+"""Repository preflight: portable builds on MOTOR; Apple builds locally."""
 
 import os
 from pathlib import Path
@@ -28,20 +28,6 @@ def remote_commands():
     ]
 
 
-def catalogue_commands():
-    # The anchors-only check validates catalogue shape, files, anchors and that
-    # each mutant applies cleanly, in about a second and without starting
-    # Cargo. The full check, which compiles every test target to confirm test
-    # names, took about five minutes on the build server and stays a required
-    # CI job (linux-catalogue and windows-catalogue in tests.yml). This runs on
-    # the local half because it builds nothing and because --anchors-only needs
-    # ckdev-mutate 0.12.8 or newer, which the build server does not have yet.
-    return [
-        ["ckdev-mutate", "--version"],
-        ["ckdev-mutate", "check", "--anchors-only"],
-    ]
-
-
 def macos_commands():
     # These packages compile Metal/Objective-C or Swift, or lint the module's
     # macOS-only Metal integration. Linux clippy cannot replace this coverage.
@@ -57,7 +43,7 @@ def macos_commands():
 
 
 def local_commands(system):
-    return catalogue_commands() + (macos_commands() if system == "Darwin" else [])
+    return macos_commands() if system == "Darwin" else []
 
 
 def main():

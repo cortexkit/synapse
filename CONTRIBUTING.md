@@ -21,7 +21,7 @@ Keep the pull request to the issue's scope; a second improvement noticed along t
 What a review checks:
 
 - **It builds where we cannot see it.** CI runs Linux and Windows. The macOS Metal, CUDA, and Vulkan lanes are manual gates a maintainer dispatches — say if your change touches them so we run the right one.
-- **The tests fail without the fix.** We mutation-check: a test that passes on unpatched code proves nothing, and we will say so.
+- **The tests fail without the fix.** We revert the fix and run the test: a test that passes on unpatched code proves nothing, and we will say so.
 - **No new suppressions.** No `as any`-equivalents: `#[allow(...)]` added to quiet a real lint, `unsafe` without a stated invariant, an ignored test, or a widened tolerance to make a gate pass.
 - **Comments explain the reason,** for a reader who was not in the discussion. No references to issue numbers, review rounds, or "as discussed".
 - **`Cargo.lock` at `origin/master` bytes.** Leave the lock as it is unless your change needs a dependency bump, and if it does, say so in the issue. The subc crates move together at exact versions, so a bump to one of them usually means bumping the set.

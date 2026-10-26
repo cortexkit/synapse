@@ -1,7 +1,7 @@
 # This hook is sourced by the train driver. Keep portable compilation on MOTOR;
 # on macOS, join it with Mac-only checks before the driver can push the train.
 python3 scripts/train-preflight.py || refuse "repository preflight failed (see step timings and TREE fingerprints above)"
-say "Remote Windows cross-clippy/catalogue and native preflight passed; native MSVC remains a CI gate"
+say "Remote Windows cross-clippy and native preflight passed; native MSVC remains a CI gate"
 
 # The daily cron on tests.yml is this repository's only scheduled sample of
 # master against the current toolchain and runner images, which a push-only

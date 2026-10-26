@@ -133,21 +133,9 @@ class PreflightPlanTests(unittest.TestCase):
             "--all-targets", "--target", "x86_64-pc-windows-gnu", "--", "-D", "warnings"])
         self.assertIn("CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc", windows)
 
-    def test_preflight_checks_catalogue_anchors_locally_and_leaves_the_full_check_to_ci(self):
-        # The full check compiles every test target and took about five minutes
-        # on the build server; CI's catalogue jobs keep running it. The
-        # preflight runs only the build-free anchors check, on every host.
-        anchors = ["ckdev-mutate", "check", "--anchors-only"]
-        remote = PREFLIGHT["remote_commands"]()
-        for system in ("Darwin", "Linux"):
-            with self.subTest(system=system):
-                local = PREFLIGHT["local_commands"](system)
-                self.assertEqual([c for c in local if c[:1] == ["ckdev-mutate"]],
-                                 [["ckdev-mutate", "--version"], anchors])
-        self.assertEqual([c for c in remote if c[:1] == ["ckdev-mutate"]], [])
-        self.assertEqual(PREFLIGHT["local_commands"]("Linux"), PREFLIGHT["catalogue_commands"]())
-        self.assertEqual(PREFLIGHT["local_commands"]("Darwin"),
-                         PREFLIGHT["catalogue_commands"]() + PREFLIGHT["macos_commands"]())
+    def test_preflight_runs_nothing_locally_except_on_macos(self):
+        self.assertEqual(PREFLIGHT["local_commands"]("Linux"), [])
+        self.assertEqual(PREFLIGHT["local_commands"]("Darwin"), PREFLIGHT["macos_commands"]())
 
     def test_all_existing_mac_coverage_is_preserved(self):
         native = PREFLIGHT["macos_commands"]()

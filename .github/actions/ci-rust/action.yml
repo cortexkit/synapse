@@ -8,7 +8,7 @@ inputs:
     description: Only one nextest shard writes the shared cache
     default: 'true'
   nextest:
-    description: Install nextest for test execution or catalogue discovery
+    description: Install nextest for test execution
     default: 'false'
 runs:
   using: composite

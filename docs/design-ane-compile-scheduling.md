@@ -256,8 +256,7 @@ asserted that a second worker's compile is dispatched while another compile runs
 which this design forbids. Its eviction claim stays: the idle stream is evicted
 before the long compile ends. Its admission claim is reversed: the admission
 starts after the long compile. The test is now
-`eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends`, and the
-mutation catalogue row that names it is updated. The FIFO statements in
+`eviction_prefers_an_idle_stream_and_evicts_before_the_long_compile_ends`. The FIFO statements in
 `docs/ane-serving.md` ("Admission fairness and eviction") and in the
 `ane_residency` module comment are updated to match. The handoff and busy-stream
 eviction tests pass unchanged.
@@ -805,7 +804,7 @@ are not checked against the cache and are predicted as today.
 | `admitted_and_loaded_decode_with_and_without_cache_fields` (synapse-core) | round trip and unknown-field tolerance |
 | worker: `loaded_reports_the_cached_ladder_rungs` | with a fake binding, only rungs whose first and last layer are cached are listed |
 
-Each guard also gets a mutation row. The hardware kit (M6 mini) restarts a
+The hardware kit (M6 mini) restarts a
 worker on a cached machine and checks that `LOADED` lists the cached rungs, that
 a Qwen3@4096 request with a 30 s deadline is served, and how long prewarm
 takes. It also times `compiledModelExists`.
@@ -837,8 +836,7 @@ takes. It also times `compiledModelExists`.
   `prewarm_loads_cached_shapes_without_compiling`. The protocol tests are
   `cache_fields_are_optional_in_both_directions` and
   `worker_side_decoding_ignores_unknown_fields` in `synapse-core`. The worker
-  test is `loaded_reports_the_cached_ladder_rungs`. Mutation rows are in
-  `mutations.d/ane-direct-cache-prewarm.toml`.
+  test is `loaded_reports_the_cached_ladder_rungs`.
 - **Hardware check on the M6 mini** (macOS 27.0, two repeats, run
   20261022T193842Z, at `4f8d623d` with the kit's test-only patch).
   `compiledModelExists` took 0.08–0.46 ms per layer, and the whole LOAD-time

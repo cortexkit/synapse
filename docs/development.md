@@ -1,9 +1,28 @@
 # Development and verification
 
-## Build and test a narrow change
+## Build and test a change
 
-From the repository root, keep the committed `Cargo.lock` unchanged and use
-`--locked` so Cargo refuses dependency resolution that would rewrite it:
+Implement the change, then run only the filtered tests for the code you touched,
+plus formatting and Clippy for the touched crates. Run them on the Linux build
+server (`ck motor run --vcpus 4 --cwd "$PWD" -- COMMAND...`, or
+`runon: "linux,4c"` from the agent shell), from the repository root, with
+`--locked` so Cargo refuses dependency resolution that would rewrite the
+committed `Cargo.lock`:
+
+```sh
+cargo test --locked -p <crate> <test-filter>
+cargo fmt --all --check
+cargo clippy --locked -p <crate> --all-targets -- -D warnings
+```
+
+For a bug fix, add one ordinary test that fails without the fix, and show that
+once: revert only the fix, run that test, see it fail, then restore the fix.
+
+Do not write mutation rows, break proofs or deliberate-break controls (edits
+that break production code on purpose to prove some test notices), and do not
+run full suites or repeat runs to prove stability. The head runs the full suite
+once per integrated batch, and CI runs it before master. For reference, the
+module's full portable set is:
 
 ```sh
 cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
@@ -59,53 +78,3 @@ cargo test --locked -p synapse-core --test dev_binary_guard
 scanner does not accept a nearby safe spawn as protection for an unsafe one.
 Remove only copies or links created by your own completed run, never a live
 installed executable.
-
-## Validate and replay mutation controls
-
-Use the mutation-runner version pinned by `.github/workflows/tests.yml` and its
-required cargo-nextest/Python dependencies. The executable is `ckdev-mutate`.
-`mutations.d/` is discovered beside the default catalogue path; do not create a
-second root catalogue. Each TOML control in `mutations.d/` names the exact test
-that must fail when its production guard is deliberately broken, plus a
-property-specific expected failure message. Compilation failures and timeouts
-are not successful catches.
-
-```sh
-ckdev-mutate --version
-cargo nextest --version
-ckdev-mutate check
-mkdir -p target/mutations
-ckdev-mutate run --diff origin/master --report target/mutations/diff.json
-```
-
-`--diff` selects committed changes. Run one mutation process per checkout. The
-runner restores source bytes; never check out a target while a mutant is running,
-or you may erase the deliberate break and manufacture a passing proof. Keep any
-evidence needed for review outside regenerable build directories after replay.
-
-Train CI checks catalogue validity but does not replay mutants. The separate
-master workflow replays all rows after landing; the nightly breadth audit uses
-four independent shards per OS. Run the command above explicitly when a change
-needs pre-landing mutation evidence rather than waiting for those asynchronous
-checks.
-
-## Add a proved control
-
-Read the guard and its production callers. Use the exact live anchor and exact
-full test name, then prove the row rather than hand-writing a catch claim:
-
-```sh
-ckdev-mutate prove --id example-refusal --guards 'state the prevented failure' \
-  --file path/to/source.rs --old 'exact live anchor' --new 'deliberate break' \
-  --test-file path/to/test.rs --package package-name --target=--lib \
-  --expect-red module::tests::exact_full_name --expect-message 'property-specific failure' \
-  --select expected --report target/mutations/example.json
-ckdev-mutate check
-```
-
-Verify that the named test goes red for the intended assertion and that unrelated
-tests do not fail. A filtered proof is not a breadth claim. A `hub` row names the
-shared property and additional affected targets and must not use filtered
-selection. `desk_only` and platform skips are obligations, not hardware proof.
-After a run, inspect the diff and lockfile before committing; restore only owned
-mutations, not somebody else's uncommitted implementation.

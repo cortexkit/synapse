@@ -74,20 +74,11 @@ class LandingSelectionTests(unittest.TestCase):
 
     def test_full_builds_fixtures_before_module_tests(self):
         gates = HELPERS["full_gates"]()
-        self.assertEqual(gates[0], ["ckdev-mutate", "check"])
-        self.assertEqual(gates[1][:5], ["cargo", "build", "--locked", "--no-default-features", "-p"])
-        self.assertIn("synapse-probe-stub", gates[2])
-        self.assertIn("--test", gates[4])
-        self.assertIn("skeleton_e2e", gates[4])
+        self.assertEqual(gates[0][:5], ["cargo", "build", "--locked", "--no-default-features", "-p"])
+        self.assertIn("synapse-probe-stub", gates[1])
+        self.assertIn("--test", gates[3])
+        self.assertIn("skeleton_e2e", gates[3])
         self.assertEqual(gates[-1][1], "clippy")
-
-    def test_fast_mode_checks_only_catalogue_anchors_without_building(self):
-        # Fast landing runs the build-free anchors check; only --full adds the
-        # complete catalogue check, which compiles every test target.
-        self.assertEqual(HELPERS["catalogue_anchor_gates"](), [
-            ["ckdev-mutate", "--version"], ["ckdev-mutate", "check", "--anchors-only"]])
-        fast = HELPERS["static_gates"]() + HELPERS["contract_tests"]() + HELPERS["module_fixtures"]()
-        self.assertNotIn(["ckdev-mutate", "check"], fast)
 
     def plan(self, *flags):
         replies = {"merge-base": "base\n", "diff": "", "ls-files": "", "metadata": '{"packages": []}'}
@@ -102,12 +93,12 @@ class LandingSelectionTests(unittest.TestCase):
             self.assertEqual(HELPERS["main"](), 0)
         return [list(command) for command in json.loads(output.getvalue())]
 
-    def test_landing_plan_runs_the_full_catalogue_check_only_with_full(self):
+    def test_landing_plan_adds_module_builds_tests_and_clippy_only_with_full(self):
         fast, full = self.plan(), self.plan("--full")
-        self.assertEqual(fast[:2], HELPERS["catalogue_anchor_gates"]())
-        self.assertNotIn(["ckdev-mutate", "check"], fast)
-        self.assertIn(["ckdev-mutate", "check"], full)
-        self.assertNotIn(["ckdev-mutate", "check", "--anchors-only"], full)
+        self.assertEqual(fast[0], HELPERS["static_gates"]()[0])
+        for gate in HELPERS["full_gates"]():
+            self.assertIn(gate, full)
+        self.assertNotIn(HELPERS["full_gates"]()[-1], fast)
 
     def test_only_apple_test_commands_stay_on_the_mac(self):
         portable = HELPERS["static_gates"]() + HELPERS["full_gates"]() + HELPERS["contract_tests"]()
@@ -116,14 +107,14 @@ class LandingSelectionTests(unittest.TestCase):
             "synapse-worker-decode", "synapse-worker-llama")]
         remote, native = HELPERS["split_commands"]([tuple(c) for c in portable + apple], "Darwin")
         self.assertEqual(remote, [tuple(c) for c in portable])
-        module_native = HELPERS["module_macos_tests"](tuple(HELPERS["full_gates"]()[4]))
+        module_native = HELPERS["module_macos_tests"](tuple(HELPERS["full_gates"]()[3]))
         self.assertEqual(native, [tuple(c) for c in module_native + apple])
         remote, native = HELPERS["split_commands"](portable + apple, "Linux")
         self.assertEqual(remote, portable + apple)
         self.assertEqual(native, [])
 
     def test_module_native_filter_keeps_all_ten_active_mac_cases_only(self):
-        command = tuple(HELPERS["full_gates"]()[4])
+        command = tuple(HELPERS["full_gates"]()[3])
         native = HELPERS["module_macos_tests"](command)
         self.assertEqual(len(native), 2)
         self.assertEqual(native[0], HELPERS["module_fixtures"]()[1])

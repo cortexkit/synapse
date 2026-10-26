@@ -70,8 +70,7 @@ def check(workflow: object, portable: dict) -> list[str]:
         branches = [branches]
     if not isinstance(branches, list) or "train/**" not in branches:
         failures.append("train precondition failed: push trigger does not include branch train/**")
-    # Train and master use the same blocking checks. Replay is asynchronous in
-    # the separate master/nightly workflows; catalogue validity still blocks both.
+    # Train and master use the same blocking checks.
     if not isinstance(branches, list) or "master" not in branches:
         failures.append("train precondition failed: push trigger does not include branch master")
 
@@ -137,11 +136,10 @@ def check(workflow: object, portable: dict) -> list[str]:
         } or "if" in caller or caller.get("continue-on-error", False):
             failures.append(f"train precondition failed: {platform} portable gates drifted")
         gate = jobs.get(platform, {})
-        expected_needs = [f"{platform}-checks", f"{platform}-catalogue"] + (["test"] if platform == "linux" else [])
-        expected_run = 'test "$NATIVE_RESULT" = success && test "$CATALOGUE_RESULT" = success'
+        expected_needs = [f"{platform}-checks"] + (["test"] if platform == "linux" else [])
+        expected_run = 'test "$NATIVE_RESULT" = success'
         expected_env = {
             "NATIVE_RESULT": "${{ needs." + platform + "-checks.result }}",
-            "CATALOGUE_RESULT": "${{ needs." + platform + "-catalogue.result }}",
         }
         if platform == "linux":
             expected_run += ' && test "$GUARDS_RESULT" = success'
@@ -156,10 +154,9 @@ def check(workflow: object, portable: dict) -> list[str]:
                 or gate_steps[0].get("continue-on-error", False)):
             failures.append(f"train precondition failed: {platform} aggregate must require every gate")
 
-    independent_jobs = list(native_jobs.values()) + [jobs.get(f"{p}-catalogue", {}) for p in ("linux", "windows")]
     if set(native_jobs) != {"clippy", "nextest", "llama"} or any(
         "if" in job or "needs" in job or job.get("continue-on-error", False)
-        for job in independent_jobs
+        for job in native_jobs.values()
     ):
         failures.append("train precondition failed: native gates must run independently and unconditionally")
     nextest = native_jobs.get("nextest", {})
@@ -167,15 +164,6 @@ def check(workflow: object, portable: dict) -> list[str]:
         "fail-fast": False, "matrix": {"partition": "${{ fromJSON(inputs.partitions) }}"},
     }:
         failures.append("train precondition failed: nextest must run every partition")
-
-    for platform in ("linux", "windows"):
-        steps = jobs.get(f"{platform}-catalogue", {}).get("steps", [])
-        catalogue = [s for s in steps if isinstance(s, dict) and s.get("name") == "Check mutation catalogue"]
-        if len(catalogue) != 1 or catalogue[0].get("if") is not None or not any(
-            line.strip() == "ckdev-mutate check"
-            for line in str(catalogue[0].get("run", "")).splitlines()
-        ):
-            failures.append("train precondition failed: mutation catalogue check must be unconditional")
 
     concurrency = workflow.get("concurrency") if isinstance(workflow, dict) else None
     group = concurrency.get("group") if isinstance(concurrency, dict) else None
@@ -198,20 +186,14 @@ def control_workflow() -> tuple[dict, dict]:
             "uses": "./.github/workflows/portable.yml",
             "with": {"platform": platform, "runner": runner, "partitions": partitions},
         }
-        jobs[f"{platform}-catalogue"] = {"steps": [
-            {"name": "Check mutation catalogue", "run": "ckdev-mutate check"},
-        ]}
-        gate_env = {
-            "NATIVE_RESULT": "${{ needs." + platform + "-checks.result }}",
-            "CATALOGUE_RESULT": "${{ needs." + platform + "-catalogue.result }}",
-        }
-        gate_run = 'test "$NATIVE_RESULT" = success && test "$CATALOGUE_RESULT" = success'
+        gate_env = {"NATIVE_RESULT": "${{ needs." + platform + "-checks.result }}"}
+        gate_run = 'test "$NATIVE_RESULT" = success'
         if platform == "linux":
             gate_env["GUARDS_RESULT"] = "${{ needs.test.result }}"
             gate_run += ' && test "$GUARDS_RESULT" = success'
         jobs[platform] = {
             "name": platform, "if": "${{ always() }}",
-            "needs": [f"{platform}-checks", f"{platform}-catalogue"] + (["test"] if platform == "linux" else []),
+            "needs": [f"{platform}-checks"] + (["test"] if platform == "linux" else []),
             "steps": [{"env": gate_env, "run": gate_run}],
         }
     for job_id, (condition, _reason) in ALLOWED_JOB_CONDITIONS.items():
@@ -243,12 +225,6 @@ def self_test() -> list[str]:
     def no_master(w, p):
         w[True]["push"]["branches"].remove("master")
 
-    def no_mutations(w, p):
-        w["jobs"]["linux-catalogue"]["steps"][0]["run"] = "true"
-
-    def conditional_mutations(w, p):
-        w["jobs"]["linux-catalogue"]["steps"][0]["if"] = "inputs.platform == 'linux'"
-
     def job_if(w, p):
         w["jobs"]["test"]["if"] = "github.ref == 'refs/heads/master'"
 
@@ -273,8 +249,6 @@ def self_test() -> list[str]:
     arms = [
         (no_train, "push trigger does not include branch train/**"),
         (no_master, "push trigger does not include branch master"),
-        (no_mutations, "mutation catalogue check must be unconditional"),
-        (conditional_mutations, "mutation catalogue check must be unconditional"),
         (job_if, "path-dependent if at job 'test':"),
         (step_if, "path-dependent if at job 'test', step 'build'"),
         (gate_drift, f"manual gate allow-list drift at job '{manual_job}'"),
