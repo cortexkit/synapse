@@ -144,10 +144,8 @@ async fn hosted_hello_ping_unsupported_rerank_then_ping() {
 }
 
 #[test]
+#[cfg(not(feature = "vulkan"))]
 fn feature_disabled_probe_is_one_json_and_exit_two() {
-    if cfg!(feature = "vulkan") {
-        return;
-    }
     for model in [
         None,
         Some("gte-modernbert-base"),

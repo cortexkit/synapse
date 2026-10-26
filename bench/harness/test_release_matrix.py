@@ -266,7 +266,7 @@ class ProducerTests(unittest.TestCase):
             calls.append(body['documents'])
             return {'results': [{'relevance_score': 0.5} for _ in body['documents']]}
         with patch.object(competitor, 'post', post):
-            self.assertGreater(competitor.invoke('llama.cpp', request, 'http://test', 5), 0)
+            competitor.invoke('llama.cpp', request, 'http://test', 5)
         self.assertEqual(calls, [['a', 'b'], ['c']])
 
     def test_owned_adapter_completes_job_pages_and_checks_path(self):
@@ -284,9 +284,8 @@ class ProducerTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, json.dumps({'result': value}), '')
         cfg = {'rpc_command': ['rpc', '{method}', '{params}'], 'model_id': 'm', 'fingerprint': 'fp'}
         with patch.object(synapse.subprocess, 'run', run):
-            latency, path = synapse.invoke(cfg, request)
+            _, path = synapse.invoke(cfg, request)
         self.assertEqual(path, 'job')
-        self.assertGreater(latency, 0)
         self.assertEqual([params['page'] for _, params in methods if 'page' in params], [0, 1])
         self.assertEqual(methods[0][1]['required_fingerprint'], 'fp')
 

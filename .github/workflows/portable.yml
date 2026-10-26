@@ -20,6 +20,10 @@ env:
   # Explicit portable production crates: Metal/CUDA-only engines and heavy
   # benchmark workspaces cannot build on hosted CPU runners.
   SYNAPSE_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
+  # Clippy still covers synapse-worker-decode, but nextest leaves it out: its
+  # runner and integration tests are all cfg(target_os = "macos"), so off macOS
+  # it compiles and runs nothing.
+  SYNAPSE_TEST_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
 
 jobs:
   clippy:
@@ -81,14 +85,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crates="$SYNAPSE_CRATES"
+          crates="$SYNAPSE_TEST_CRATES"
           build_options=""
           # Inherit release's non-debug native builds, not its expensive Rust
           # optimization. Verbose Cargo output records fresh/dirty cache reasons.
           if [ "${{ inputs.platform }}" = "windows" ]; then
             build_options="--cargo-profile ci-test --timings --cargo-verbose"
           fi
-          cargo nextest run --locked $crates $build_options --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
+          # The whole-process e2e targets need the e2e feature, so they are not
+          # built here; the scheduled e2e lane runs them.
+          cargo nextest run --locked $crates --features synapse-module/test-support $build_options --retries 0 --partition 'count:${{ matrix.partition }}' -E 'not binary(skeleton_e2e)'
       - name: Retain Windows test build timings
         if: always() && inputs.platform == 'windows'
         uses: actions/upload-artifact@v4

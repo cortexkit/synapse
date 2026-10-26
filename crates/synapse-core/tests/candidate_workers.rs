@@ -10,11 +10,10 @@ use synapse_core::{
 #[tokio::test]
 #[ignore = "requires release-candidate binaries in CANDIDATE_BIN_DIR"]
 async fn candidate_hosted_protocol_matrix() {
-    let Some(root) = std::env::var_os("CANDIDATE_BIN_DIR") else {
-        eprintln!("skipping candidate protocol matrix: CANDIDATE_BIN_DIR is unset");
-        return;
-    };
-    let root = PathBuf::from(root);
+    let root = PathBuf::from(
+        std::env::var_os("CANDIDATE_BIN_DIR")
+            .expect("set CANDIDATE_BIN_DIR to the release-candidate binary directory"),
+    );
     assert!(root.is_absolute(), "CANDIDATE_BIN_DIR must be absolute");
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let scratch = std::env::temp_dir().join(format!("candidate-module-{}", std::process::id()));

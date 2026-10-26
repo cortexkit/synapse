@@ -131,7 +131,18 @@ fn hosted_worker_hello_ping_unsupported_rerank_ping() {
         DEFAULT_MAX_FRAME_BYTES,
     )
     .unwrap();
-    let _: WorkerResponse = read_json_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES).unwrap();
+    // A missing-model LOAD must come back as a typed refusal for this request.
+    // Without the `cuda` feature the refusal is specifically `backend_missing`.
+    match read_json_frame::<_, WorkerResponse>(&mut stream, DEFAULT_MAX_FRAME_BYTES).unwrap() {
+        WorkerResponse::Err { req_id, code, .. } => {
+            assert_eq!(req_id.as_deref(), Some("load"));
+            #[cfg(not(feature = "cuda"))]
+            assert_eq!(code, "backend_missing");
+            #[cfg(feature = "cuda")]
+            assert!(!code.is_empty());
+        }
+        other => panic!("missing-model LOAD was not refused: {other:?}"),
+    }
     write_json_frame(
         &mut stream,
         &WorkerRequest::Shutdown {},

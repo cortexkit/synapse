@@ -309,7 +309,8 @@ impl<T> LaneScheduler<T> {
         }
     }
 
-    pub fn start_bulk_quantum_for_test(&mut self, until_ms: u64) {
+    #[cfg(test)]
+    fn start_bulk_quantum_for_test(&mut self, until_ms: u64) {
         self.running_quantum = Some(RunningQuantum {
             queue_class: QueueClass::Bulk,
             until_ms,

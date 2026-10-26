@@ -67,6 +67,22 @@ overflow-checks = false
 opt-level = 3
 codegen-units = 16
 
+# Tests launch workers through synapse_core::dev_binary::ckdev_binary, which
+# SHA-256 hashes the whole executable (often 100+ MB in a debug build) on every
+# launch. Unoptimized hashing dominated those tests, so optimize only the hash
+# crates in dev builds. Release builds and the code under test are unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.dev.package.cpufeatures]
+opt-level = 3
+
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

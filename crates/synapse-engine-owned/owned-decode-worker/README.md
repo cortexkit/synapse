@@ -33,10 +33,9 @@ A pure-Rust state machine that supervises the owned Metal decode worker:
   attempt-local sequence reset, `generation_id` preserved). Timeout,
   protocol-fatal, and startup failures are terminal after one charge.
 - **Process supervision and fault injection** via the `DecodeWorker` /
-  `WorkerFactory` traits and a `ScriptedWorkerFactory` test double.
-- **`decode-ownership-manifest-v1`** fault sites plus an `OwnershipLedger` the
-  fixtures use to prove no double free, invalid free, use-after-free, or leak at
-  every fault site.
+  `WorkerFactory` traits and a `ScriptedWorkerFactory` test double. The double
+  and the `ManualClock` are compiled only for this crate's tests or with the
+  `test-support` feature.
 
 It does **not** link Metal and does **not** depend on `synapse-engine-owned`, so
 its fixtures run on any host. The real Metal worker satisfies the `DecodeWorker`
@@ -61,8 +60,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All gates pass: 43 library unit tests, 30 protocol-behavior fixtures, and 12
-ownership-safety fixtures (85 total).
+The integration fixtures turn on the `test-support` feature through the
+crate's self dev-dependency.
 
 ## Fixture coverage
 
@@ -83,12 +82,6 @@ ownership-safety fixtures (85 total).
 - the single crash redispatch: token-zero restart, sequence reset, delayed
   prior-session rejection, `generation_id` preservation, at most one redispatch,
   and redispatch barred by deadline / cancellation / exhausted budget.
-
-`tests/ownership_fixtures.rs` proves the four ownership-safety properties at
-every `decode-ownership-manifest-v1` fault site (allocation, ownership transfer,
-partial initialization, generation, cancellation, timeout cleanup, unload,
-shutdown, LFM2 conv-cache FFI). The mandatory `macos-metal` lane runs the real
-worker under AddressSanitizer against the same fault-site IDs.
 
 ## Wire-error bindings
 

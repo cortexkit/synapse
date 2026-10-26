@@ -100,10 +100,13 @@ class ParallelCiTests(unittest.TestCase):
         step = next(s for s in job["steps"] if s.get("name") == "nextest")
         packages = ["synapse-core", "synapse-native-probe", "synapse-module", "synapse-certify",
                     "synapse-certify-runner", "synapse-worker-llama", "owned-decode-worker",
-                    "synapse-worker-decode", "synapse-opctl", "synapse-engine-cuda",
+                    "synapse-opctl", "synapse-engine-cuda",
                     "synapse-worker-cuda", "synapse-worker-vulkan"]
         expected_crates = list(itertools.chain.from_iterable(("-p", p) for p in packages))
-        self.assertEqual(PORTABLE["env"]["SYNAPSE_CRATES"].split(), expected_crates)
+        self.assertEqual(PORTABLE["env"]["SYNAPSE_TEST_CRATES"].split(), expected_crates)
+        # Clippy still covers the macOS-only decode worker, which has no tests off macOS.
+        self.assertEqual(PORTABLE["env"]["SYNAPSE_CRATES"].split(),
+                         expected_crates[:14] + ["-p", "synapse-worker-decode"] + expected_crates[14:])
         for platform, partition in (("linux", "2/4"), ("windows", "1/1")):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -117,13 +120,14 @@ class ParallelCiTests(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-e", "-o", "pipefail", "-c", script], cwd=root,
                     env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
-                             SYNAPSE_CRATES=PORTABLE["env"]["SYNAPSE_CRATES"]),
+                             SYNAPSE_TEST_CRATES=PORTABLE["env"]["SYNAPSE_TEST_CRATES"]),
                     text=True, capture_output=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 build = ["--cargo-profile", "ci-test", "--timings", "--cargo-verbose"] if platform == "windows" else []
                 self.assertEqual(json.loads((root / "args.json").read_text()),
-                                 ["nextest", "run", "--locked"] + expected_crates + build +
+                                 ["nextest", "run", "--locked"] + expected_crates +
+                                 ["--features", "synapse-module/test-support"] + build +
                                  ["--retries", "0", "--partition", f"count:{partition}",
                                   "-E", "not binary(skeleton_e2e)"])
 

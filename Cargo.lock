@@ -5031,6 +5031,7 @@ dependencies = [
 name = "owned-decode-worker"
 version = "0.0.0"
 dependencies = [
+ "owned-decode-worker",
  "serde",
  "serde_json",
  "sha2",

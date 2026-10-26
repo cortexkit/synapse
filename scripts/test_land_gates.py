@@ -18,8 +18,9 @@ ROOT = Path("/checkout")
 
 def package(name, directory, targets):
     return {"name": name, "manifest_path": str(ROOT / directory / "Cargo.toml"), "targets": [
-        {"name": target, "kind": [kind], "src_path": str(ROOT / directory / path)}
-        for target, kind, path in targets
+        {"name": target, "kind": [kind], "src_path": str(ROOT / directory / path),
+         "required-features": list(required)}
+        for target, kind, path, *required in targets
     ]}
 
 
@@ -32,6 +33,7 @@ class LandingSelectionTests(unittest.TestCase):
                 ("module", "lib", "src/lib.rs"),
                 ("it", "test", "tests/it/main.rs"),
                 ("wire_contract", "test", "tests/wire_contract.rs"),
+                ("skeleton_e2e", "test", "tests/skeleton_e2e.rs", "e2e"),
             ]),
         ]}
 
@@ -58,6 +60,10 @@ class LandingSelectionTests(unittest.TestCase):
         self.assertEqual(self.select("crates/module/tests/wire_contract.rs"), [
             HELPERS["cargo_test"]("synapse-module", "--features", "test-support", "--test", "wire_contract")])
 
+    def test_feature_gated_target_gets_its_required_features(self):
+        self.assertEqual(self.select("crates/module/tests/skeleton_e2e.rs"), [
+            HELPERS["cargo_test"]("synapse-module", "--features", "test-support,e2e", "--test", "skeleton_e2e")])
+
     def test_shared_helper_conservatively_selects_integration_tests(self):
         self.assertEqual(self.select("crates/module/tests/common/mod.rs"), [
             HELPERS["cargo_test"]("synapse-module", "--features", "test-support", "--tests")])
@@ -78,6 +84,7 @@ class LandingSelectionTests(unittest.TestCase):
         self.assertIn("synapse-probe-stub", gates[1])
         self.assertIn("--test", gates[3])
         self.assertIn("skeleton_e2e", gates[3])
+        self.assertIn("e2e", gates[3][gates[3].index("--features") + 1].split(","))
         self.assertEqual(gates[-1][1], "clippy")
 
     def plan(self, *flags):
@@ -113,31 +120,63 @@ class LandingSelectionTests(unittest.TestCase):
         self.assertEqual(remote, portable + apple)
         self.assertEqual(native, [])
 
-    def test_module_native_filter_keeps_all_ten_active_mac_cases_only(self):
+    def test_module_native_filter_keeps_active_mac_cases_only(self):
         command = tuple(HELPERS["full_gates"]()[3])
         native = HELPERS["module_macos_tests"](command)
-        self.assertEqual(len(native), 2)
         self.assertEqual(native[0], HELPERS["module_fixtures"]()[1])
-        self.assertEqual(native[-1][:3], ["cargo", "nextest", "run"])
-        expression = native[-1][-1]
-        self.assertEqual(expression.count("test("), 10)
+        run = native[-1]
+        self.assertEqual(run[:3], ["cargo", "nextest", "run"])
+        self.assertIn("e2e", run[run.index("--features") + 1].split(","))
+        expression = run[-1]
         for case in ("direct_ane_models_reuse_one_runtime_supervisor",
                      "kv_runtime_matrix_proves_warm_reuse_reclamation_and_lifecycle_faults",
-                     "ane_probe_placement_ping_runs_outside_the_module_runtime",
-                     "owned_gte_inline_embed_batch_throughput_sweep"):
+                     "ane_probe_placement_ping_runs_outside_the_module_runtime"):
             self.assertIn(f"test({case})", expression)
-        self.assertNotIn("--run-ignored", native[-1])
+        self.assertNotIn("--run-ignored", run)
+
+    def test_module_native_names_are_checked_against_the_listed_targets(self):
+        command = tuple(HELPERS["full_gates"]()[3])
+        check, run = HELPERS["module_macos_tests"](command)[-2:]
+        self.assertEqual(check[:3], ["python3", "scripts/land-gates.py", "--require-tests"])
+        names = json.loads(check[3])
+        self.assertEqual(" | ".join(f"test({name})" for name in names), run[-1])
+        listing = check[check.index("--") + 1:]
+        self.assertEqual(listing[:3], ["cargo", "nextest", "list"])
+        # The listing must build exactly what the run builds.
+        selection = run[run.index("-p"):run.index("--retries")]
+        self.assertEqual(listing[listing.index("-p"):listing.index("--message-format")], selection)
+
+    def test_a_name_that_matches_no_listed_test_is_refused(self):
+        listing = {"rust-suites": {"synapse-module::it": {"testcases": {
+            "kv::kv_runtime_matrix_proves_warm_reuse": {}}}}}
+        unmatched = HELPERS["unmatched_tests"]
+        self.assertEqual(unmatched(listing, ["kv_runtime_matrix"]), [])
+        self.assertEqual(unmatched(listing, ["kv_runtime_matrix", "renamed_away"]), ["renamed_away"])
+        self.assertEqual(unmatched({"rust-suites": {}}, ["anything"]), ["anything"])
+
+    def test_require_tests_fails_when_listing_lacks_a_name(self):
+        listing = json.dumps({"rust-suites": {"bin": {"testcases": {"mod::present": {}}}}})
+        with patch.object(subprocess, "check_output", return_value=listing) as list_tests, \
+                redirect_stdout(io.StringIO()), patch.object(sys, "stderr", io.StringIO()):
+            self.assertEqual(HELPERS["require_tests"](["present"], ["cargo", "nextest", "list"]), 0)
+            self.assertEqual(HELPERS["require_tests"](["present", "gone"], ["cargo", "nextest", "list"]), 1)
+        self.assertEqual(list_tests.call_args.args[0], ["cargo", "nextest", "list"])
 
     def test_narrow_module_native_filter_does_not_broaden_target_selection(self):
-        for target, count in (("it", 1), ("skeleton_e2e", 6), ("wire_contract", 0)):
+        lib_case = "test(direct_ane_models_reuse_one_runtime_supervisor)"
+        it_case = "test(kv_runtime_matrix_proves_warm_reuse_reclamation_and_lifecycle_faults)"
+        e2e_case = "test(ane_probe_placement_ping_runs_outside_the_module_runtime)"
+        for target, present, absent in (("it", [it_case], [lib_case, e2e_case]),
+                                        ("skeleton_e2e", [e2e_case], [lib_case, it_case])):
             command = HELPERS["cargo_test"]("synapse-module", "--features", "test-support", "--test", target)
-            native = HELPERS["module_macos_tests"](command)
-            if count:
-                self.assertEqual(native[-1][-1].count("test("), count)
-                self.assertNotIn("--lib", native[-1])
-            else:
-                self.assertEqual(native, [])
-
+            run = HELPERS["module_macos_tests"](command)[-1]
+            self.assertNotIn("--lib", run)
+            for case in present:
+                self.assertIn(case, run[-1])
+            for case in absent:
+                self.assertNotIn(case, run[-1])
+        command = HELPERS["cargo_test"]("synapse-module", "--features", "test-support", "--test", "wire_contract")
+        self.assertEqual(HELPERS["module_macos_tests"](command), [])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

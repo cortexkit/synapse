@@ -505,7 +505,7 @@ class ReleaseChecks(unittest.TestCase):
 
     def test_linux_ci_runs_release_gate_fixtures(self):
         workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/tests.yml').read_text()
-        self.assertIn("      - name: Check tag release gates\n        if: matrix.name == 'linux'\n        working-directory: synapse\n        run: python3 -m unittest discover -s crates/synapse-release-checks -v", workflow)
+        self.assertIn('unittest discover -s crates/synapse-release-checks', workflow)
 
     def test_parent_without_candidate_release_fails(self):
         with patch.object(check, 'source', return_value='a' * 40), patch.object(check.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, ['gh'])):

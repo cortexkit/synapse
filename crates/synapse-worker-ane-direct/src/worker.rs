@@ -960,9 +960,12 @@ mod supervisor_tests {
             if let Some(status) = child.0.try_wait().unwrap() {
                 break status;
             }
+            // Generous on purpose: a watcher that misses owner death never exits,
+            // while a tight real-time bound would fail a correct watcher on a
+            // loaded machine.
             assert!(
-                disconnected.elapsed() < Duration::from_secs(1),
-                "owner death did not interrupt busy worker promptly"
+                disconnected.elapsed() < Duration::from_secs(10),
+                "owner death did not interrupt busy worker"
             );
             std::thread::sleep(Duration::from_millis(5));
         };

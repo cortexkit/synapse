@@ -198,6 +198,11 @@ fn test_launches_use_development_images() {
     test_trees(&root.join("crates"), &mut failures, &mut count);
     test_trees(&root.join("bench"), &mut failures, &mut count);
     println!("scanned {count} Rust sources (integration tests and inline test code)");
+    // A wrong root or a broken walk would scan nothing and pass vacuously.
+    assert!(
+        count > 100,
+        "scanned only {count} Rust sources; the test-tree walk is broken"
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 

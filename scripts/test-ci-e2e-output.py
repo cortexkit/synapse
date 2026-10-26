@@ -37,19 +37,15 @@ class E2eOutputTests(unittest.TestCase):
             "with Path('calls.jsonl').open('a') as f:\n"
             "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "selection = sys.argv[sys.argv.index('-E') + 1]\n"
-            "if selection == 'not binary(skeleton_e2e)':\n"
-            "    print('skipping optional worker checkpoint')\n"
-            "else:\n"
-            "    print('skipping missing e2e fixture' if os.getenv('FAKE_SKIP') else 'e2e fixture ran')\n"
+            "if selection != 'not binary(skeleton_e2e)':\n"
             "    sys.exit(int(os.getenv('FAKE_STATUS', '0')))\n"
         )
         cargo.chmod(0o755)
         self.env = dict(os.environ)
         self.env.update(
             PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}",
-            SYNAPSE_CRATES="-p synapse-module -p synapse-worker-llama",
+            SYNAPSE_TEST_CRATES="-p synapse-module -p synapse-worker-llama",
         )
-        self.env.pop("FAKE_SKIP", None)
         self.env.pop("FAKE_STATUS", None)
 
     def run_step(self, name, platform="linux", partition="1/1"):
@@ -64,7 +60,7 @@ class E2eOutputTests(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_push_and_nightly_partition_once_and_guard_reuses_output(self):
+    def test_push_partitions_once_and_nightly_runs_only_the_e2e_binary(self):
         for platform in ("linux", "windows"):
             with self.subTest(platform=platform):
                 (self.root / "calls.jsonl").unlink(missing_ok=True)
@@ -72,13 +68,10 @@ class E2eOutputTests(unittest.TestCase):
                 for partition in partitions:
                     run = self.run_step("nextest", platform, partition)
                     self.assertEqual(run.returncode, 0, run.stderr)
-                    self.assertIn("skipping optional worker checkpoint", run.stdout)
                 e2e = self.run_step("skeleton e2e", platform)
                 self.assertEqual(e2e.returncode, 0, e2e.stderr)
-                guard = self.run_step("Assert no silently-skipped e2e", platform)
-                self.assertEqual(guard.returncode, 0, guard.stderr)
                 calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
-                self.assertEqual(len(calls), len(partitions) + 1, "the guard must not rerun tests")
+                self.assertEqual(len(calls), len(partitions) + 1)
                 self.assertEqual([call[call.index("-E") + 1] for call in calls],
                                  ["not binary(skeleton_e2e)"] * len(partitions) + ["binary(skeleton_e2e)"])
                 self.assertEqual([call[call.index("--partition") + 1] for call in calls[:-1]],
@@ -94,25 +87,17 @@ class E2eOutputTests(unittest.TestCase):
                         self.assertEqual(call[call.index("--cargo-profile") + 1], "ci-test")
                 self.assertEqual("--release" in calls[-1], platform == "windows")
                 self.assertIn("--no-capture", calls[-1], "whole-process fixtures must remain serial")
+                # The e2e targets require the e2e feature; only the nightly lane builds them.
+                self.assertIn("e2e", calls[-1][calls[-1].index("--features") + 1].split(","))
+                for call in calls[:-1]:
+                    self.assertEqual(call[call.index("--features") + 1], "synapse-module/test-support")
                 for call in calls:
                     self.assertIn("--locked", call)
 
-    def test_fixture_skip_is_refused(self):
-        self.env["FAKE_SKIP"] = "1"
-        run = self.run_step("skeleton e2e")
-        self.assertEqual(run.returncode, 0, run.stderr)
-        guard = self.run_step("Assert no silently-skipped e2e")
-        self.assertNotEqual(guard.returncode, 0, "a skipping first run must fail the guard")
-        self.assertIn("fixture e2e silently skipped", guard.stdout)
-
-    def test_nextest_failure_survives_tee(self):
+    def test_nextest_failure_fails_the_e2e_step(self):
         self.env["FAKE_STATUS"] = "42"
         run = self.run_step("skeleton e2e")
         self.assertEqual(run.returncode, 42, run.stderr)
-
-    def test_missing_transcript_is_refused(self):
-        guard = self.run_step("Assert no silently-skipped e2e")
-        self.assertNotEqual(guard.returncode, 0)
 
     def test_parity_cache_precedes_tests_and_covers_its_target(self):
         cache = step("Restore parity Rust cache")

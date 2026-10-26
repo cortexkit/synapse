@@ -76,7 +76,7 @@ Portable mock-transport proof, from the repository root:
 
 ```sh
 cargo build --locked --no-default-features -p synapse-worker-cuda -p synapse-worker-vulkan
-cargo test --locked -p synapse-module --features test-support --lib --test it --test skeleton_e2e
+cargo test --locked -p synapse-module --features test-support,e2e --lib --test it --test skeleton_e2e
 ```
 
 For a real candidate, follow [backend certification](backend-certification.md).

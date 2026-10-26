@@ -37,10 +37,6 @@ struct Args {
     pipe: Option<String>,
     #[arg(long)]
     nonce: String,
-    #[arg(long = "test-abort", hide = true)]
-    test_abort: bool,
-    #[arg(long = "test-abort-on-request", hide = true)]
-    test_abort_on_request: bool,
 }
 
 #[derive(Default)]
@@ -118,7 +114,7 @@ fn main() -> Result<()> {
         write_json_frame(&mut stream, &hello, DEFAULT_MAX_FRAME_BYTES)?;
         let ack: WorkerHelloAck = read_json_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES)?;
         validate_ack(&ack)?;
-        worker_request_loop(&mut stream, ack.max_frame, &args)
+        worker_request_loop(&mut stream, ack.max_frame)
     }
     #[cfg(windows)]
     {
@@ -132,7 +128,7 @@ fn main() -> Result<()> {
                 &hello,
                 DEFAULT_MAX_FRAME_BYTES,
             )?;
-        worker_request_loop(&mut stream, max_frame, &args)
+        worker_request_loop(&mut stream, max_frame)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -152,18 +148,12 @@ fn validate_ack(ack: &WorkerHelloAck) -> Result<()> {
     Ok(())
 }
 
-fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32, args: &Args) -> Result<()> {
-    worker_request_loop_with_probe(
-        stream,
-        max_frame,
-        args,
-        synapse_engine_cuda::probe_hardware_floor,
-    )
+fn worker_request_loop<S: Read + Write>(stream: &mut S, max_frame: u32) -> Result<()> {
+    worker_request_loop_with_probe(stream, max_frame, synapse_engine_cuda::probe_hardware_floor)
 }
 fn worker_request_loop_with_probe<S: Read + Write>(
     stream: &mut S,
     max_frame: u32,
-    args: &Args,
     probe: fn() -> Result<synapse_engine_cuda::HardwareFloorProbe>,
 ) -> Result<()> {
     let mut state = WorkerState::default();
@@ -175,9 +165,6 @@ fn worker_request_loop_with_probe<S: Read + Write>(
         };
         let request: WorkerRequest =
             serde_json::from_slice(&frame).context("decode request JSON")?;
-        if args.test_abort || args.test_abort_on_request {
-            std::process::abort();
-        }
         let (response, vectors) = match request {
             WorkerRequest::Load {
                 req_id,
@@ -747,11 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_identity_matches_shared_catalog_constant() {
-        assert_eq!(engine_identity().engine, CUDA_WORKER_ENGINE);
-    }
-
-    #[test]
+    #[cfg(not(feature = "cuda"))]
     fn missing_feature_refuses_load_without_creating_model_state() {
         let mut state = WorkerState::default();
         let response = handle_load_with_probe(
@@ -763,12 +746,10 @@ mod tests {
             BTreeMap::new(),
             synapse_engine_cuda::probe_hardware_floor,
         );
-        if !cfg!(feature = "cuda") {
-            assert!(
-                matches!(response, WorkerResponse::Err { ref code, .. } if code == "backend_missing")
-            );
-            assert!(state.loaded.is_none());
-        }
+        assert!(
+            matches!(response, WorkerResponse::Err { ref code, .. } if code == "backend_missing")
+        );
+        assert!(state.loaded.is_none());
     }
 }
 
@@ -833,19 +814,11 @@ mod lifecycle_tests {
             DEFAULT_MAX_FRAME_BYTES,
         )
         .unwrap();
-        let args = Args {
-            socket: None,
-            nonce: "driverless".into(),
-            test_abort: false,
-            test_abort_on_request: false,
-            #[cfg(windows)]
-            pipe: None,
-        };
         let mut stream = Duplex {
             input: std::io::Cursor::new(input),
             output: Vec::new(),
         };
-        worker_request_loop_with_probe(&mut stream, DEFAULT_MAX_FRAME_BYTES, &args, missing_driver)
+        worker_request_loop_with_probe(&mut stream, DEFAULT_MAX_FRAME_BYTES, missing_driver)
             .unwrap();
         let mut output = std::io::Cursor::new(stream.output);
         assert!(

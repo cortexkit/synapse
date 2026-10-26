@@ -85,8 +85,6 @@ output vector, so two kernel revisions can be compared element by element.
 It requires cosine >= 0.999, unit norm within 1e-3, fp16 score error <= 0.02,
 gap-gated top-10 order and Kendall tau >= 0.99. Package directories must not
 contain config.json. AMD/NVIDIA release certification remains separate.
-`--test gpu_scaling`, run in the same environment, times one row at each length
-from 512 to 8192 tokens.
 
 Measured on MoltenVK plain compute (API 1.3; float16, 16-bit storage and subgroup
 arithmetic supported; cooperative matrices unavailable):
