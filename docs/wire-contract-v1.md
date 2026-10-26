@@ -1,15 +1,14 @@
 # Synapse wire contract v1 (consumer snapshot)
 
 Status: SNAPSHOT of v1.1 with explicit catalog installation and owned-only local embedding/reranking.
-Authoritative examples: `crates/synapse-module/tests/skeleton_e2e.rs` and
-`crates/synapse-module/tests/soak.rs`. This document restates the consumer contract;
+Authoritative examples: `crates/synapse-module/tests/skeleton_e2e.rs`. This document
+restates the consumer contract;
 on disagreement, fix the document against the executable API tests.
 
 ## 1. Envelope (inference payloads)
 
-Checks: `embed_query_preloaded_minilm_returns_vectors_and_envelope`,
-`embed_batch_preloaded_minilm_preserves_order_and_envelope` (skeleton e2e), and
-`tests::wire_contract_documents_every_embed_vector_field` (module library).
+Checks: `embed_query_preloaded_minilm_returns_vectors_and_envelope` and
+`embed_batch_preloaded_minilm_preserves_order_and_envelope` (skeleton e2e).
 
 Management responses wrap operation payloads as `{"result": <payload>}`.
 The fields below describe inference payloads, not every management result.
