@@ -32,8 +32,43 @@ fn calls(block: &Block) -> Vec<String> {
     visitor.0
 }
 
+const EXPECTED_ORDER: [&str; 3] = [
+    "ModelCache::default_root",
+    "migrate_compiled_catalog_digests",
+    "sync_and_load_catalog_models",
+];
+
 #[test]
 fn initialize_migrates_digests_after_cache_root_and_before_catalog_reconciliation() {
+    // Control: the visitor must tell a missing, misordered or duplicated
+    // migration call apart from the right sequence, or the check below
+    // could pass on any initialize body.
+    let wrong: [Block; 4] = [
+        syn::parse_quote!({
+            ModelCache::default_root();
+            sync_and_load_catalog_models();
+        }),
+        syn::parse_quote!({
+            migrate_compiled_catalog_digests();
+            ModelCache::default_root();
+            sync_and_load_catalog_models();
+        }),
+        syn::parse_quote!({
+            ModelCache::default_root();
+            sync_and_load_catalog_models();
+            migrate_compiled_catalog_digests();
+        }),
+        syn::parse_quote!({
+            ModelCache::default_root();
+            migrate_compiled_catalog_digests();
+            migrate_compiled_catalog_digests();
+            sync_and_load_catalog_models();
+        }),
+    ];
+    for block in &wrong {
+        assert_ne!(calls(block), EXPECTED_ORDER);
+    }
+
     let file = syn::parse_file(include_str!("../src/lib.rs")).unwrap();
     let blocks = file
         .items
@@ -49,45 +84,5 @@ fn initialize_migrates_digests_after_cache_root_and_before_catalog_reconciliatio
         })
         .collect::<Vec<_>>();
     assert_eq!(blocks.len(), 1, "expected exactly one initialize method");
-    assert_eq!(
-        calls(&blocks[0]),
-        [
-            "ModelCache::default_root",
-            "migrate_compiled_catalog_digests",
-            "sync_and_load_catalog_models",
-        ]
-    );
-}
-
-#[test]
-fn migration_order_guard_detects_missing_duplicate_and_misordered_calls() {
-    let expected = [
-        "ModelCache::default_root",
-        "migrate_compiled_catalog_digests",
-        "sync_and_load_catalog_models",
-    ];
-    for block in [
-        syn::parse_quote!({
-            ModelCache::default_root();
-            sync_and_load_catalog_models();
-        }),
-        syn::parse_quote!({
-            migrate_compiled_catalog_digests();
-            ModelCache::default_root();
-            sync_and_load_catalog_models();
-        }),
-        syn::parse_quote!({
-            ModelCache::default_root();
-            sync_and_load_catalog_models();
-            migrate_compiled_catalog_digests();
-        }),
-        syn::parse_quote!({
-            ModelCache::default_root();
-            migrate_compiled_catalog_digests();
-            migrate_compiled_catalog_digests();
-            sync_and_load_catalog_models();
-        }),
-    ] {
-        assert_ne!(calls(&block), expected);
-    }
+    assert_eq!(calls(&blocks[0]), EXPECTED_ORDER);
 }

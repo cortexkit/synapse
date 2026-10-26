@@ -124,7 +124,7 @@ async fn two_refusals_before_a_yield_still_expire_the_orphan() {
 
 /// Learning starts at compile dispatch, not at reservation, so a
 /// stream held by inference does not count as compile time.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn learning_ignores_the_stream_wait_before_dispatch() {
     let ledger = SharedLedger::default();
     ledger.lock().unwrap().admit_delay = Duration::from_millis(100);

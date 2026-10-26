@@ -124,74 +124,6 @@ fn no_workspace_source_reads_the_launch_nonce_around_the_sdk() {
     );
 }
 
-#[test]
-fn the_scan_flags_direct_reads_and_leaves_other_nonces_alone() {
-    for read in [
-        r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE").ok();"#,
-        r#"let fd = env::var_os("SUBC_LAUNCH_NONCE_FD");"#,
-        "let nonce = env::var_os(SUBC_LAUNCH_NONCE_ENV);",
-        "let fd = std::env::var(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV);",
-        r#"let nonce = env::var("SUBC_LAUNCH_NONCE"); // read the nonce"#,
-    ] {
-        assert_eq!(direct_nonce_reads(read).len(), 1, "not flagged: {read}");
-    }
-    for fine in [
-        "// The SUBC_LAUNCH_NONCE copy is going away.",
-        "/// Reads `SUBC_LAUNCH_NONCE_FD` through the SDK.",
-        "let nonce = subc_client_rs::launch_nonce();",
-    ] {
-        assert!(direct_nonce_reads(fine).is_empty(), "flagged: {fine}");
-    }
-
-    // The decode worker passes its sidecar a nonce of its own on `--nonce`.
-    // That argument is not the module's launch nonce (the worker mints it to
-    // recognise its own sidecar), so it must not trip the scan; this reads the real
-    // file so the check follows the code if it moves.
-    let runner = workspace_root().join("crates/synapse-worker-decode/src/runner.rs");
-    let source = std::fs::read_to_string(&runner).expect("read the decode worker runner");
-    assert!(
-        source.contains("\"--nonce\""),
-        "the decode worker no longer passes --nonce; update this check"
-    );
-    assert!(shipped_sources(&workspace_root()).contains(&runner.canonicalize().unwrap()));
-    assert!(direct_nonce_reads(&source).is_empty());
-}
-
-/// Runs the whole tree scan, inventory walk included, over a scratch workspace
-/// with a read planted in a nested member's `src/`, and in places the walk must
-/// skip. The snippet controls above prove the line matcher; this proves the
-/// walk actually reaches the files the matcher is meant to see.
-#[test]
-fn the_tree_scan_finds_a_read_planted_in_a_nested_member() {
-    let root = std::env::temp_dir().join(format!(
-        "synapse-tests/nonce-scan-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let read = r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE");"#;
-    for (file, body) in [
-        ("crates/outer/inner/src/deep/lib.rs", read),
-        ("bench/lane/src/main.rs", "fn main() {}"),
-        ("crates/outer/target/debug/build/gen.rs", read),
-        ("crates/outer/tests/fixture.rs", read),
-    ] {
-        let path = root.join(file);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
-    }
-    let offenders = tree_nonce_reads(&root);
-    std::fs::remove_dir_all(&root).unwrap();
-    // Built from components so the expected path uses the platform separator,
-    // the same way the scan renders the path it walked.
-    let planted: PathBuf = ["crates", "outer", "inner", "src", "deep", "lib.rs"]
-        .iter()
-        .collect();
-    assert_eq!(offenders, vec![format!("{}:1: {read}", planted.display())]);
-}
-
 /// The probe test stub reports whether a child inherited the nonce variables,
 /// so reading them is its whole job. It builds only with `test-support` and is
 /// never shipped.
@@ -225,54 +157,6 @@ fn nonce_reads_in_file(path: &Path, source: &str) -> Vec<(usize, String)> {
                 ))
         })
         .collect()
-}
-
-#[test]
-fn helper_exception_allows_only_removals_in_the_helper_file() {
-    let helper = Path::new("crates/synapse-core/src/child_process.rs");
-    let removal = "command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_ENV);";
-    assert!(nonce_reads_in_file(helper, removal).is_empty());
-    assert_eq!(
-        nonce_reads_in_file(Path::new("crates/other/src/lib.rs"), removal).len(),
-        1
-    );
-    assert_eq!(
-        nonce_reads_in_file(
-            helper,
-            "std::env::var(subc_os::launch_nonce::LAUNCH_NONCE_ENV);"
-        )
-        .len(),
-        1
-    );
-}
-
-#[test]
-fn only_the_probe_stub_and_test_only_files_may_read_the_nonce_variables() {
-    let read = "std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV);";
-    assert!(nonce_reads_in_file(Path::new(PROBE_STUB), read).is_empty());
-    // The exemption is the exact stub path, not every test binary.
-    assert_eq!(
-        nonce_reads_in_file(
-            Path::new("crates/synapse-module/src/bin/timeout_worker.rs"),
-            read
-        )
-        .len(),
-        1
-    );
-    assert!(nonce_reads_in_file(
-        Path::new("crates/control/src/lib.rs"),
-        &format!("#![cfg(test)]\n{read}")
-    )
-    .is_empty());
-    // The attribute counts only when it leads the file.
-    assert_eq!(
-        nonce_reads_in_file(
-            Path::new("crates/control/src/lib.rs"),
-            &format!("{read}\n#![cfg(test)]")
-        )
-        .len(),
-        1
-    );
 }
 
 // Production constructors must be wrapped in without_launch_nonce (or its tokio
@@ -340,41 +224,201 @@ fn every_shipped_command_strips_the_launch_nonce() {
     );
 }
 
+/// Which scanner a control case runs, with the path it pretends to scan.
+#[derive(Debug)]
+enum Scan {
+    /// The line matcher alone.
+    Line,
+    /// The nonce-read scan with its per-file exemptions.
+    File(&'static str),
+    /// The unstripped-`Command` scan.
+    Command(&'static str),
+}
+
+/// Line numbers each scanner reports for `source`.
+fn flagged_lines(scan: &Scan, source: &str) -> Vec<usize> {
+    match scan {
+        Scan::Line => direct_nonce_reads(source)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect(),
+        Scan::File(path) => nonce_reads_in_file(Path::new(path), source)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect(),
+        Scan::Command(path) => unstripped_commands(Path::new(path), source)
+            .iter()
+            .map(|offender| {
+                offender[path.len() + 1..]
+                    .split(':')
+                    .next()
+                    .and_then(|line| line.parse().ok())
+                    .unwrap_or_else(|| panic!("unparseable offender: {offender}"))
+            })
+            .collect(),
+    }
+}
+
+/// Controls for the two scans above: each planted source must be flagged on
+/// exactly the expected lines, so a scanner that stopped matching (or started
+/// matching everything) fails here rather than passing the tree scans silently.
 #[test]
-fn command_scan_control_reports_unstripped_constructor_by_file_and_line() {
-    let path = Path::new("crates/control/src/lib.rs");
-    let planted = "fn launch() {\n    let child = Command::new(\"worker\").spawn();\n}\n";
-    assert_eq!(
-        unstripped_commands(path, planted),
-        vec!["crates/control/src/lib.rs:2: let child = Command::new(\"worker\").spawn();"]
-    );
-    assert!(unstripped_commands(
-        path,
-        "let command = without_launch_nonce(Command::new(\"worker\"));"
-    )
-    .is_empty());
-    assert!(unstripped_commands(
-        path,
-        "let command = without_launch_nonce(\nCommand::new(\"worker\"));"
-    )
-    .is_empty());
-    assert!(unstripped_commands(
-        path,
-        "#[cfg(test)]\nmod tests {\nlet command = Command::new(\"worker\");\n}\n"
-    )
-    .is_empty());
-    // A whole test-only file is skipped, but only when the attribute leads the
-    // file: the same attribute after production code skips nothing.
-    assert!(unstripped_commands(
-        path,
-        "// test file\n#![cfg(test)]\nlet command = Command::new(\"worker\");\n"
-    )
-    .is_empty());
-    assert_eq!(
-        unstripped_commands(
-            path,
-            "let command = Command::new(\"worker\");\n#![cfg(test)]\n"
+fn scanner_controls_flag_planted_reads_and_honour_only_the_listed_exemptions() {
+    const HELPER: &str = "crates/synapse-core/src/child_process.rs";
+    const OTHER: &str = "crates/control/src/lib.rs";
+    const REMOVAL: &str = "command.env_remove(subc_os::launch_nonce::LAUNCH_NONCE_ENV);";
+    const READ: &str = "std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV);";
+    let lead_test_only = format!("#![cfg(test)]\n{READ}");
+    let trail_test_only = format!("{READ}\n#![cfg(test)]");
+    let cases: Vec<(Scan, &str, &[usize])> = vec![
+        // Direct reads by name or by constant are flagged, comment or not.
+        (
+            Scan::Line,
+            r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE").ok();"#,
+            &[1],
         ),
-        vec!["crates/control/src/lib.rs:1: let command = Command::new(\"worker\");"]
+        (
+            Scan::Line,
+            r#"let fd = env::var_os("SUBC_LAUNCH_NONCE_FD");"#,
+            &[1],
+        ),
+        (
+            Scan::Line,
+            "let nonce = env::var_os(SUBC_LAUNCH_NONCE_ENV);",
+            &[1],
+        ),
+        (
+            Scan::Line,
+            "let fd = std::env::var(subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV);",
+            &[1],
+        ),
+        (
+            Scan::Line,
+            r#"let nonce = env::var("SUBC_LAUNCH_NONCE"); // read the nonce"#,
+            &[1],
+        ),
+        // Comments and the SDK accessor are fine.
+        (
+            Scan::Line,
+            "// The SUBC_LAUNCH_NONCE copy is going away.",
+            &[],
+        ),
+        (
+            Scan::Line,
+            "/// Reads `SUBC_LAUNCH_NONCE_FD` through the SDK.",
+            &[],
+        ),
+        (
+            Scan::Line,
+            "let nonce = subc_client_rs::launch_nonce();",
+            &[],
+        ),
+        // Only the helper file may name the constants, and only to remove them.
+        (Scan::File(HELPER), REMOVAL, &[]),
+        (Scan::File(OTHER), REMOVAL, &[1]),
+        (
+            Scan::File(HELPER),
+            "std::env::var(subc_os::launch_nonce::LAUNCH_NONCE_ENV);",
+            &[1],
+        ),
+        // The exemption is the exact probe stub path, not every test binary.
+        (Scan::File(PROBE_STUB), READ, &[]),
+        (
+            Scan::File("crates/synapse-module/src/bin/timeout_worker.rs"),
+            READ,
+            &[1],
+        ),
+        // A test-only file is skipped only when the attribute leads the file.
+        (Scan::File(OTHER), &lead_test_only, &[]),
+        (Scan::File(OTHER), &trail_test_only, &[1]),
+        // Unwrapped constructors are flagged; wrapped ones, including one
+        // rustfmt split across lines, and #[cfg(test)] items are not.
+        (
+            Scan::Command(OTHER),
+            "fn launch() {\n    let child = Command::new(\"worker\").spawn();\n}\n",
+            &[2],
+        ),
+        (
+            Scan::Command(OTHER),
+            "let command = without_launch_nonce(Command::new(\"worker\"));",
+            &[],
+        ),
+        (
+            Scan::Command(OTHER),
+            "let command = without_launch_nonce(\nCommand::new(\"worker\"));",
+            &[],
+        ),
+        (
+            Scan::Command(OTHER),
+            "#[cfg(test)]\nmod tests {\nlet command = Command::new(\"worker\");\n}\n",
+            &[],
+        ),
+        (
+            Scan::Command(OTHER),
+            "// test file\n#![cfg(test)]\nlet command = Command::new(\"worker\");\n",
+            &[],
+        ),
+        (
+            Scan::Command(OTHER),
+            "let command = Command::new(\"worker\");\n#![cfg(test)]\n",
+            &[1],
+        ),
+    ];
+    for (scan, source, expected) in &cases {
+        assert_eq!(
+            &flagged_lines(scan, source),
+            expected,
+            "{scan:?} over:\n{source}"
+        );
+    }
+    // The command scan names the file, line and code it flagged.
+    assert_eq!(
+        unstripped_commands(Path::new(OTHER), "let child = Command::new(\"worker\");"),
+        vec![format!("{OTHER}:1: let child = Command::new(\"worker\");")]
     );
+
+    // The decode worker passes its sidecar a nonce of its own on `--nonce`.
+    // That argument is not the module's launch nonce (the worker mints it to
+    // recognise its own sidecar), so it must not trip the scan; this reads the
+    // real file so the check follows the code if it moves.
+    let runner = workspace_root().join("crates/synapse-worker-decode/src/runner.rs");
+    let source = std::fs::read_to_string(&runner).expect("read the decode worker runner");
+    assert!(
+        source.contains("\"--nonce\""),
+        "the decode worker no longer passes --nonce; update this check"
+    );
+    assert!(shipped_sources(&workspace_root()).contains(&runner.canonicalize().unwrap()));
+    assert!(direct_nonce_reads(&source).is_empty());
+
+    // The whole tree scan, inventory walk included, over a scratch workspace
+    // with a read planted in a nested member's `src/` and in places the walk
+    // must skip: the line controls prove the matcher, this proves the walk
+    // reaches the files the matcher is meant to see.
+    let root = std::env::temp_dir().join(format!(
+        "synapse-tests/nonce-scan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let read = r#"let nonce = std::env::var("SUBC_LAUNCH_NONCE");"#;
+    for (file, body) in [
+        ("crates/outer/inner/src/deep/lib.rs", read),
+        ("bench/lane/src/main.rs", "fn main() {}"),
+        ("crates/outer/target/debug/build/gen.rs", read),
+        ("crates/outer/tests/fixture.rs", read),
+    ] {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    let offenders = tree_nonce_reads(&root);
+    std::fs::remove_dir_all(&root).unwrap();
+    // Built from components so the expected path uses the platform separator,
+    // the same way the scan renders the path it walked.
+    let planted: PathBuf = ["crates", "outer", "inner", "src", "deep", "lib.rs"]
+        .iter()
+        .collect();
+    assert_eq!(offenders, vec![format!("{}:1: {read}", planted.display())]);
 }

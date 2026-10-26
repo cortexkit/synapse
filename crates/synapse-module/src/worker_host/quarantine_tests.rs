@@ -93,22 +93,25 @@ fn batch() -> TokenBatch {
     }
 }
 
-async fn quarantined_host(catalog: bool) -> (WorkerHost, LoadedModel, PathBuf) {
-    let (mut host, root) = host(catalog);
-    let first = peer(&mut host, 1, true);
+async fn load(host: &mut WorkerHost) -> LoadedModel {
     let mut cfg = RuntimeConfig::default();
     cfg.values
         .insert("artifact_path".into(), "/tmp/quarantine-fixture".into());
-    let model = host
-        .load_model(
-            &ValidatedArtifact {
-                digest: String::new(),
-                format: "mock".into(),
-            },
-            &cfg,
-        )
-        .await
-        .unwrap();
+    host.load_model(
+        &ValidatedArtifact {
+            digest: String::new(),
+            format: "mock".into(),
+        },
+        &cfg,
+    )
+    .await
+    .unwrap()
+}
+
+async fn quarantined_host(catalog: bool) -> (WorkerHost, LoadedModel, PathBuf) {
+    let (mut host, root) = host(catalog);
+    let first = peer(&mut host, 1, true);
+    let model = load(&mut host).await;
     assert!(matches!(
         host.embed_batch(&model, batch()).await,
         Err(WorkerHostError::EngineCrashed { .. })
@@ -203,5 +206,44 @@ async fn catalog_unload_clears_quarantine_without_waiting_for_cooldown() {
     assert_eq!(host.health_snapshot().quarantined_models, 0);
     assert!(host.quarantine_until.is_empty());
     assert!(host.crashes.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// Strikes count consecutive faults: a request served between two faults
+// resets the count, so fault, success, fault leaves one strike and no
+// quarantine.
+#[tokio::test]
+async fn a_served_request_between_two_faults_clears_strikes_without_quarantine() {
+    let (mut host, root) = host(false);
+    let first = peer(&mut host, 1, true);
+    let model = load(&mut host).await;
+    assert!(matches!(
+        host.embed_batch(&model, batch()).await,
+        Err(WorkerHostError::EngineCrashed { .. })
+    ));
+    first.await.unwrap();
+    assert_eq!(host.health_snapshot().crash_count_window, 1);
+
+    let serving = peer(&mut host, 2, false);
+    assert_eq!(
+        host.embed_batch(&model, batch()).await.unwrap(),
+        vec![vec![9.0]]
+    );
+    assert_eq!(
+        host.health_snapshot().crash_count_window,
+        0,
+        "a served request must clear strikes"
+    );
+    host.kill_current().await;
+    serving.await.unwrap();
+
+    let last = peer(&mut host, 3, true);
+    assert!(matches!(
+        host.embed_batch(&model, batch()).await,
+        Err(WorkerHostError::EngineCrashed { .. })
+    ));
+    last.await.unwrap();
+    assert_eq!(host.health_snapshot().crash_count_window, 1);
+    assert_eq!(host.health_snapshot().quarantined_models, 0);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -244,6 +244,11 @@ fn capture_cases(assets: &Path) -> Vec<Value> {
 // receivers by this same harness on the reference commit. Full upstream
 // tokenizer bytes are checksum-verified; expected ids are not computed by the
 // request path under test.
+//
+// To audit or recapture the fixture, run this test on a checkout of the
+// reference commit with SYNAPSE_TOKEN_IDENTITY_CAPTURE set to an output path:
+// the captured sequences are written there before they are compared, so a
+// mismatch still leaves the full capture for review.
 #[test]
 #[ignore = "requires checksum-pinned upstream tokenizer/config files in SYNAPSE_TOKEN_IDENTITY_ASSETS; fetch with scripts/fetch-token-identity-assets.py"]
 fn catalog_boundary_token_ids_match_master() {
@@ -253,6 +258,13 @@ fn catalog_boundary_token_ids_match_master() {
     .unwrap();
     assert_eq!(golden["master_commit"], MASTER);
     let actual = capture_cases(&assets());
+    if let Some(output) = env::var_os("SYNAPSE_TOKEN_IDENTITY_CAPTURE") {
+        fs::write(
+            &output,
+            serde_json::to_vec_pretty(&json!({"master_commit":MASTER,"cases":actual})).unwrap(),
+        )
+        .unwrap();
+    }
     let expected = golden["cases"].as_array().unwrap();
     assert_eq!(actual.len(), 20);
     assert_eq!(expected.len(), actual.len());
@@ -267,23 +279,4 @@ fn catalog_boundary_token_ids_match_master() {
             actual["lane_id"], actual["method"], actual["case"]
         );
     }
-}
-
-#[test]
-#[ignore = "capture tool: run only on the reference source snapshot, never to update expectations from the candidate"]
-fn capture_master_boundary_token_ids() {
-    let output = PathBuf::from(
-        env::var_os("SYNAPSE_TOKEN_IDENTITY_CAPTURE").expect("set the master capture output path"),
-    );
-    let cases = capture_cases(&assets());
-    fs::write(
-        &output,
-        serde_json::to_vec_pretty(&json!({"master_commit":MASTER,"cases":cases})).unwrap(),
-    )
-    .unwrap();
-    eprintln!(
-        "captured {} literal boundary sequences from {MASTER} into {}",
-        cases.len(),
-        output.display()
-    );
 }

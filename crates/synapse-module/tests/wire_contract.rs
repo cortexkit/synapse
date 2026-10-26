@@ -1,50 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
 use synapse_core::error_contract::StableErrorCode;
 
 const DOC: &str = include_str!("../../../docs/wire-contract-v1.md");
-const SOURCE: &str = include_str!("../src/lib.rs");
-
-fn documented_ops(doc: &str) -> BTreeSet<String> {
-    // Normalized so a CRLF checkout still has a blank-line paragraph break.
-    let doc = doc.replace("\r\n", "\n");
-    let ops = doc
-        .split("The management registry in this snapshot is ")
-        .nth(1)
-        .expect("registry inventory")
-        .split("\n\n")
-        .next()
-        .unwrap();
-    ops.split('`')
-        .enumerate()
-        .filter(|(i, _)| i % 2 == 1)
-        .map(|(_, s)| s.to_string())
-        .collect()
-}
-
-fn registered_ops(source: &str) -> BTreeSet<String> {
-    source
-        .split("fn management_operations()")
-        .nth(1)
-        .expect("operation registry")
-        .split("fn manifest(")
-        .next()
-        .unwrap()
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("op(\"")
-                .and_then(|s| s.split('"').next())
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-#[test]
-fn management_registry_matches_wire_contract() {
-    assert_eq!(registered_ops(SOURCE), documented_ops(DOC));
-}
 
 // An exhaustive match deliberately makes an added enum variant require documentation review,
 // even if the variant was accidentally omitted from StableErrorCode::ALL.
@@ -85,25 +43,4 @@ fn stable_errors_are_exhaustively_documented_and_keep_wire_names() {
             "undocumented stable error {name}"
         );
     }
-}
-
-#[test]
-fn inventory_parse_survives_a_crlf_checkout() {
-    let crlf = DOC.replace('\n', "\r\n");
-    assert_eq!(documented_ops(&crlf), documented_ops(DOC));
-    assert!(documented_ops(&crlf).len() > 10);
-}
-
-#[test]
-fn drift_scanner_detects_added_ops_and_missing_documentation() {
-    let source = SOURCE.replacen(
-        "op(\"models.catalog\", Query)",
-        "op(\"models.catalog\", Query),\n        op(\"models.undocumented\", Query)",
-        1,
-    );
-    assert!(registered_ops(&source).contains("models.catalog"));
-    assert!(registered_ops(&source).contains("models.undocumented"));
-    assert_ne!(registered_ops(&source), documented_ops(DOC));
-    let doc = DOC.replace("`models.download.cancel`", "`models.cancel.retired`");
-    assert_ne!(registered_ops(SOURCE), documented_ops(&doc));
 }

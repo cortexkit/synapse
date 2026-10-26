@@ -197,23 +197,14 @@ async fn open_route() -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, Test
     open_route_with_preloads(None).await
 }
 
-/// Every segment the module's logger wrote under `data_home`, concatenated.
-fn module_log_text(data_home: &Path) -> String {
-    let logs = data_home.join("cortexkit").join(MODULE_ID).join("logs");
-    let mut text = String::new();
-    for entry in std::fs::read_dir(&logs).into_iter().flatten().flatten() {
-        text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
-    }
-    text
-}
-
-/// A restart must be readable from the module's own log. Without a start and a
-/// stop line, a module that restarts and serves nothing writes nothing at all,
-/// and a clean shutdown looks the same in the log as a process that was killed
-/// outright. Closing the daemon side is what a daemon cut does to a module, so
-/// the stop line is asserted on that path, not on a kill.
+/// A daemon cut closes the daemon side of the module's connection. The module
+/// must then exit on its own with a success status and give up its singleton
+/// lease, so a restarted module can take it. The stop is asserted on that
+/// path, not on a kill.
 #[tokio::test]
-async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
+async fn module_exits_cleanly_and_releases_its_lease_when_the_daemon_connection_closes() {
+    use cortexkit_lease::{FileLeaseStore, LeaseKey, LeaseStore};
+
     // The daemon runs each accepted connection as a detached task, so aborting
     // its accept loop leaves the module's connection open and the module never
     // sees it close. Running the daemon on a runtime of its own lets the test
@@ -230,14 +221,14 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
     })
     .join()
     .expect("start the daemon on its own runtime");
-    let data_home = unique_temp_dir("synapse-lifecycle-log");
-    std::fs::create_dir_all(&data_home).unwrap();
-    let data_home_arg = data_home.to_string_lossy().into_owned();
+    let lease_root = unique_temp_dir("synapse-lifecycle-lease");
+    std::fs::create_dir_all(&lease_root).unwrap();
+    let lease_root_arg = lease_root.to_string_lossy().into_owned();
     let module = spawn_synapse_module_with_env(
         &daemon.connection_file_path,
         None,
         None,
-        &[("XDG_DATA_HOME", data_home_arg.as_str())],
+        &[("CORTEXKIT_LEASE_ROOT", lease_root_arg.as_str())],
     );
     // Registration alone is not enough before tearing the daemon down: the
     // daemon records the module as registered before its HELLO_ACK reaches the
@@ -246,10 +237,12 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
     // A route the module has answered proves it finished the handshake.
     let (daemon, mut module, consumer, _route) =
         open_route_for_started_module(daemon, module).await;
+    let singleton = LeaseKey::new(MODULE_ID, "file", "singleton");
     assert!(
-        module_log_text(&data_home).contains("synapse started"),
-        "a registered module must have logged its start; log: {}",
-        module_log_text(&data_home)
+        FileLeaseStore::new(&lease_root)
+            .acquire(&singleton)
+            .is_err(),
+        "a serving module must hold its singleton lease"
     );
 
     drop(consumer);
@@ -264,23 +257,10 @@ async fn module_logs_start_and_stop_across_a_daemon_connection_close() {
         "module exited unexpectedly: {}",
         describe_exit_status(&status)
     );
-    let log = module_log_text(&data_home);
-    assert!(
-        log.contains("synapse stopped"),
-        "a module whose daemon connection closed must log that it stopped; log: {log}"
-    );
-    // The stop line must say how the connection ended. The daemon went away
-    // without a GOODBYE here, which the SDK reports as a clean close (`eof`)
-    // or, if the socket was torn down with data still unread, a reset.
-    let stop_line = log
-        .lines()
-        .find(|line| line.contains("synapse stopped"))
-        .unwrap_or_default();
-    assert!(
-        stop_line.contains("reason=eof") || stop_line.contains("reason=reset"),
-        "the stop line must carry the connection-end reason of a daemon that vanished; \
-         line: {stop_line}"
-    );
+    FileLeaseStore::new(&lease_root)
+        .acquire(&singleton)
+        .expect("a stopped module must have released its singleton lease");
+    let _ = std::fs::remove_dir_all(lease_root);
 }
 
 /// The daemon hands each module its launch nonce on descriptor 3 (named by
@@ -736,14 +716,10 @@ async fn probe_refuses_lane_without_matching_reference_fixture() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash() {
-    let Some(snapshot) = minilm_safetensors_snapshot() else {
-        eprintln!("skipping owned-metal MiniLM e2e: local safetensors snapshot is missing");
-        return;
-    };
-    let Some(owned_preloads) = minilm_preload_config() else {
-        eprintln!("skipping owned-metal cross-dtype e2e: local safetensors snapshot is missing");
-        return;
-    };
+    let snapshot = minilm_safetensors_snapshot()
+        .expect("owned-metal MiniLM e2e needs the local safetensors snapshot");
+    let owned_preloads = minilm_preload_config()
+        .expect("owned-metal cross-dtype e2e needs the local safetensors snapshot");
     let _lock = acquire_minilm_e2e_lock();
     let daemon = start_daemon().await;
     let cache = unique_temp_dir("synapse-owned-model-cache");
@@ -890,19 +866,14 @@ async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
-    let Some(snapshot) = gte_safetensors_snapshot() else {
-        eprintln!("skipping owned-metal GTE probe e2e: local HF snapshot is missing");
-        return;
-    };
+    let snapshot =
+        gte_safetensors_snapshot().expect("owned-metal GTE probe e2e needs the local HF snapshot");
     for required in ["model.safetensors", "tokenizer.json", "config.json"] {
-        if !snapshot.join(required).exists() {
-            eprintln!(
-                "skipping owned-metal GTE probe e2e: {} is missing from {}",
-                required,
-                snapshot.display()
-            );
-            return;
-        }
+        assert!(
+            snapshot.join(required).exists(),
+            "owned-metal GTE probe e2e needs {required} in {}",
+            snapshot.display()
+        );
     }
     let _lock = acquire_minilm_e2e_lock();
     let (_daemon, _module, mut consumer, route) = open_route().await;
@@ -1023,10 +994,8 @@ async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
-    let Some(snapshot) = gte_reranker_safetensors_snapshot() else {
-        eprintln!("skipping owned-metal rerank e2e: local GTE reranker snapshot is missing");
-        return;
-    };
+    let snapshot = gte_reranker_safetensors_snapshot()
+        .expect("owned-metal rerank e2e needs the local GTE reranker snapshot");
     for required in ["model.safetensors", "tokenizer.json", "config.json"] {
         assert!(
             snapshot.join(required).is_file(),
@@ -1228,203 +1197,6 @@ async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
         .contains("sequence-classification head"));
 }
 
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn owned_gte_inline_embed_batch_throughput_sweep() {
-    // Timing bounds need an intentionally quiet GPU, not merely a cached model
-    // on a shared developer machine. Correctness tests remain checkpoint-gated.
-    if std::env::var("SYNAPSE_RUN_HARDWARE_PERF").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping hardware performance sweep: set SYNAPSE_RUN_HARDWARE_PERF=1 to run owned_gte_inline_embed_batch_throughput_sweep on a quiet GPU"
-        );
-        return;
-    }
-    let snapshot = gte_safetensors_snapshot().expect("local GTE ModernBERT snapshot is required");
-    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
-        assert!(
-            snapshot.join(required).exists(),
-            "GTE snapshot is missing {}",
-            required
-        );
-    }
-    let config = serde_json::json!({
-        "inline": { "max_items": 256, "max_tokens": 200_000 },
-        "jobs": { "bulk_quantum_tokens": 3_072 }
-    })
-    .to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        70_000,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": snapshot,
-                "files": {
-                    "model": {
-                        "url": "model.safetensors",
-                        "sha256": test_sha256(snapshot.join("model.safetensors"))
-                    },
-                    "tokenizer": {
-                        "url": "tokenizer.json",
-                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
-                    },
-                    "config": {
-                        "url": "config.json",
-                        "sha256": test_sha256(snapshot.join("config.json"))
-                    }
-                },
-                "engine": "owned-metal",
-                "family": "gte-modernbert",
-                "dtype": "f16",
-                "execution": "explicit",
-                "model_id": "gte-modernbert-base-f16",
-                "task": "embed",
-                "pooling": "mean",
-                "normalize": true,
-                "max_tokens": 512,
-                "pin": true,
-                "request_key": "owned-gte-throughput-load-v2"
-            }
-        }),
-    )
-    .await;
-    let load_job = accepted["result"]["job_id"]
-        .as_str()
-        .expect("throughput model.load returns job id");
-    let ready = poll_model_load_job(&mut consumer, route, 70_001, load_job).await;
-    assert_eq!(
-        ready["result"]["state"], "ready",
-        "GTE load failed: {ready:?}"
-    );
-    run_probe_job(
-        &mut consumer,
-        route,
-        70_002,
-        serde_json::json!({ "models": ["gte-modernbert-base-f16"] }),
-    )
-    .await;
-
-    let fixture_text = |index: usize| {
-        (0..45)
-            .map(|word| format!("retrieval fixture item {index} token {word}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let make_items = |count: usize| {
-        (0..count)
-            .map(|index| {
-                serde_json::json!({
-                    "id": format!("item-{index}"),
-                    "text": fixture_text(index)
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    let warmup = route_request(
-        &mut consumer,
-        route,
-        70_010,
-        serde_json::json!({
-            "method": "embed.batch",
-            "params": {
-                "model": "gte-modernbert-base-f16",
-                "items": make_items(1),
-                "accept_declared": true
-            }
-        }),
-    )
-    .await;
-    assert_eq!(
-        warmup["result"]["vectors"].as_array().map(Vec::len),
-        Some(1),
-        "warmup response: {warmup:?}"
-    );
-
-    let mut rows = Vec::new();
-    for (offset, batch_size) in [8_usize, 16, 32, 64, 128, 256].into_iter().enumerate() {
-        let started = Instant::now();
-        let response = route_request(
-            &mut consumer,
-            route,
-            70_100 + offset as u64,
-            serde_json::json!({
-                "method": "embed.batch",
-                "params": {
-                    "model": "gte-modernbert-base-f16",
-                    "items": make_items(batch_size),
-                    "accept_declared": true
-                }
-            }),
-        )
-        .await;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let vectors = response["result"]["vectors"].as_array().unwrap();
-        assert_eq!(vectors.len(), batch_size);
-        let tokens = response["result"]["real_token_counts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap())
-            .sum::<u64>();
-        let ms_per_item = elapsed_ms / batch_size as f64;
-        let throughput = tokens as f64 / (elapsed_ms / 1_000.0);
-        eprintln!(
-            "owned GTE throughput row batch={batch_size} tokens={tokens} elapsed_ms={elapsed_ms:.3} ms_per_item={ms_per_item:.3} tok_per_s={throughput:.1}"
-        );
-        if let Some(previous) = rows.last() {
-            assert!(
-                ms_per_item <= previous * 1.4,
-                "batch={batch_size} has a local throughput cliff: {ms_per_item:.3}ms/item after {previous:.3}ms/item"
-            );
-        }
-        if batch_size >= 64 {
-            // Regression floor, not a performance target. This sweep exists to
-            // catch the quanta-slicing class where inline batches execute as
-            // serial per-quantum engine calls (observed collapse: ~1.5k tok/s,
-            // a 7-10x drop). The floor must hold on the slowest CI machine:
-            // the M1 Max runner saturates this wire path at ~9.8k tok/s while
-            // an M5 Max does 14-15k, so a 10k gate calibrated on the M5 fails
-            // healthy M1 runs. 6k passes every healthy machine with margin and
-            // still fails the collapse class by 4x.
-            assert!(
-                throughput >= 6_000.0,
-                "batch={batch_size} throughput {throughput:.1} tok/s is below the 6k regression floor"
-            );
-        }
-        rows.push(ms_per_item);
-    }
-
-    let mut query_samples = Vec::new();
-    for index in 0..5 {
-        let started = Instant::now();
-        let response = route_request(
-            &mut consumer,
-            route,
-            70_200 + index,
-            serde_json::json!({
-                "method": "embed.query",
-                "params": {
-                    "model": "gte-modernbert-base-f16",
-                    "id": "query",
-                    "text": fixture_text(0),
-                    "accept_declared": true
-                }
-            }),
-        )
-        .await;
-        assert_eq!(response["result"]["vectors"].as_array().unwrap().len(), 1);
-        query_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    query_samples.sort_by(f64::total_cmp);
-    eprintln!(
-        "owned GTE embed.query p50_ms={:.3} samples={query_samples:?}",
-        query_samples[query_samples.len() / 2]
-    );
-}
-
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let preloads = deterministic_preload_config();
@@ -1617,85 +1389,47 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     }
 }
 
+/// Every row reports the hash of the text it was sent and the hash of the
+/// text it embedded: equal under the token ceiling, different (and disclosed
+/// as truncated) over it, for single queries and for each row of a batch.
 #[tokio::test]
-async fn embed_query_row_over_ceiling_reports_submitted_and_content_hashes() {
-    let preloads = deterministic_preload_config();
-    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 40).await;
-
-    let submitted_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
-    let expected_submitted_sha = sha256_hex(submitted_text.as_bytes());
-
-    let body = route_request(
-        &mut consumer,
-        route,
-        10,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": "test-minilm", "id": "over-cap-query", "text": &submitted_text }
-        }),
-    )
-    .await;
-
-    let result = &body["result"];
-    let vector = &result["vectors"][0];
-    let submitted_sha = vector["submitted_sha256"]
-        .as_str()
-        .expect("submitted_sha256 present");
-    let content_sha = vector["content_sha256"]
-        .as_str()
-        .expect("content_sha256 present");
-    let disclosure = &result["truncation_disclosures"][0];
-    let is_truncated = disclosure["truncated"].as_bool().expect("truncated bool");
-
-    assert_eq!(submitted_sha, expected_submitted_sha);
-    assert_ne!(content_sha, submitted_sha);
-    assert!(is_truncated);
-}
-
-#[tokio::test]
-async fn embed_query_row_under_ceiling_reports_equal_hashes() {
-    let preloads = deterministic_preload_config();
-    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 40).await;
-
-    let submitted_text = "hello world";
-    let expected_submitted_sha = sha256_hex(submitted_text.as_bytes());
-
-    let body = route_request(
-        &mut consumer,
-        route,
-        11,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": "test-minilm", "id": "under-cap-query", "text": submitted_text }
-        }),
-    )
-    .await;
-
-    let result = &body["result"];
-    let vector = &result["vectors"][0];
-    let submitted_sha = vector["submitted_sha256"]
-        .as_str()
-        .expect("submitted_sha256 present");
-    let content_sha = vector["content_sha256"]
-        .as_str()
-        .expect("content_sha256 present");
-    let disclosure = &result["truncation_disclosures"][0];
-    let is_truncated = disclosure["truncated"].as_bool().expect("truncated bool");
-
-    assert_eq!(submitted_sha, expected_submitted_sha);
-    assert_eq!(content_sha, submitted_sha);
-    assert!(!is_truncated);
-}
-
-#[tokio::test]
-async fn embed_batch_with_mixed_over_cap_and_short_rows_returns_all_vectors() {
+async fn embed_rows_report_submitted_and_content_hashes_around_the_ceiling() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     certify_preloaded_models(&mut consumer, route, 40).await;
 
     let over_cap_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
+    for (correlation, id, text, truncated) in [
+        (10, "over-cap-query", over_cap_text.as_str(), true),
+        (11, "under-cap-query", "hello world", false),
+    ] {
+        let body = route_request(
+            &mut consumer,
+            route,
+            correlation,
+            serde_json::json!({
+                "method": "embed.query",
+                "params": { "model": "test-minilm", "id": id, "text": text }
+            }),
+        )
+        .await;
+        let result = &body["result"];
+        let vector = &result["vectors"][0];
+        let submitted_sha = vector["submitted_sha256"]
+            .as_str()
+            .expect("submitted_sha256 present");
+        let content_sha = vector["content_sha256"]
+            .as_str()
+            .expect("content_sha256 present");
+        assert_eq!(submitted_sha, sha256_hex(text.as_bytes()), "{id}");
+        assert_eq!(content_sha != submitted_sha, truncated, "{id}");
+        assert_eq!(
+            result["truncation_disclosures"][0]["truncated"].as_bool(),
+            Some(truncated),
+            "{id}"
+        );
+    }
+
     let short_text_1 = "short alpha";
     let short_text_2 = "short beta";
 
@@ -3163,60 +2897,43 @@ async fn singleton_lease_blocks_second_module_on_same_daemon() {
     drop(first);
 }
 
+/// A grammar request is refused as `grammar_disabled` both when the module
+/// gate is off and when the gate is on but no certified owned-decode lane
+/// exists; the message names which of the two applies.
 #[tokio::test]
-async fn microllm_grammar_disabled_when_module_gate_is_off() {
-    let config = serde_json::json!({ "grammar_enabled": false }).to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    let frame = raw_route_frame(
-        &mut consumer,
-        route,
-        90_001,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": "missing",
-                "prompt": "yes or no",
-                "max_tokens": 4,
-                "grammar": "root ::= \"yes\" | \"no\""
-            }
-        }),
-    )
-    .await;
-    assert_eq!(frame.header.ty, FrameType::Error);
-    let body: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body["code"], "grammar_disabled");
-    assert!(body["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("disabled in module config"));
-}
-
-#[tokio::test]
-async fn microllm_grammar_disabled_without_certified_owned_lane() {
-    let config = serde_json::json!({ "grammar_enabled": true }).to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    let frame = raw_route_frame(
-        &mut consumer,
-        route,
-        90_002,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": "any",
-                "prompt": "yes or no",
-                "max_tokens": 4,
-                "grammar": "root ::= \"yes\" | \"no\""
-            }
-        }),
-    )
-    .await;
-    assert_eq!(frame.header.ty, FrameType::Error);
-    let body: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(body["code"], "grammar_disabled");
-    assert!(body["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("certified and enabled owned-decode"));
+async fn microllm_grammar_disabled_when_gate_is_off_or_no_certified_owned_lane() {
+    for (grammar_enabled, correlation, reason) in [
+        (false, 90_001, "disabled in module config"),
+        (true, 90_002, "certified and enabled owned-decode"),
+    ] {
+        let config = serde_json::json!({ "grammar_enabled": grammar_enabled }).to_string();
+        let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
+        let frame = raw_route_frame(
+            &mut consumer,
+            route,
+            correlation,
+            serde_json::json!({
+                "method": "microllm.oneshot",
+                "params": {
+                    "model": "missing",
+                    "prompt": "yes or no",
+                    "max_tokens": 4,
+                    "grammar": "root ::= \"yes\" | \"no\""
+                }
+            }),
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Error, "{reason}");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "grammar_disabled", "{reason}: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(reason),
+            "{reason}: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3446,21 +3163,21 @@ async fn certified_owned_checkpoint_lane(
     derived_digest: Option<&str>,
     constrained_serve: bool,
 ) {
-    let Some(snapshot) = std::env::var_os(checkpoint_env).map(PathBuf::from) else {
-        eprintln!("skipping certified owned wire e2e: set {checkpoint_env}");
-        return;
-    };
-    let Some(worker_bin) = std::env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from)
-    else {
-        eprintln!("skipping certified owned wire e2e: set SYNAPSE_OWNED_DECODE_WORKER_BIN");
-        return;
-    };
+    let snapshot = std::env::var_os(checkpoint_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("certified owned wire e2e needs {checkpoint_env}"));
+    let worker_bin = std::env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN")
+        .map(PathBuf::from)
+        .expect("certified owned wire e2e needs SYNAPSE_OWNED_DECODE_WORKER_BIN");
     let model_path = snapshot.join("model.safetensors");
     let tokenizer_path = snapshot.join("tokenizer.json");
-    if !model_path.is_file() || !tokenizer_path.is_file() || !worker_bin.is_file() {
-        eprintln!("skipping certified owned wire e2e: checkpoint or worker binary is missing");
-        return;
-    }
+    assert!(
+        model_path.is_file() && tokenizer_path.is_file() && worker_bin.is_file(),
+        "certified owned wire e2e needs {}, {} and {}",
+        model_path.display(),
+        tokenizer_path.display(),
+        worker_bin.display()
+    );
     let worker_runtime = std::env::temp_dir().join(format!(
         "sod-{}-{}-{}",
         &family[..1],
@@ -3589,64 +3306,60 @@ async fn certified_owned_checkpoint_lane(
     assert!(constrained_result["provenance"]["constraint_fingerprint"].is_string());
 }
 
+/// Each certified owned decode lane probes through the real worker, then
+/// serves exact tokens; the Qwen3 f16 lane also serves a constrained request.
+/// Needs both checkpoints and the decode worker binary.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore]
-async fn certified_owned_oneshot_and_constraint_serve_after_real_worker_probe() {
-    certified_owned_checkpoint_lane(
-        "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
-        "qwen3-0.6b-decode-f16",
-        "qwen3-0.6b",
-        "f16",
-        None,
-        true,
-    )
-    .await;
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore]
-async fn checkpoint_lfm2_f16_certified_owned_lane_serves_exact_tokens() {
-    certified_owned_checkpoint_lane(
-        "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
-        "lfm2-1.2b-decode-f16",
-        "lfm2-1.2b",
-        "f16",
-        None,
-        false,
-    )
-    .await;
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore]
-async fn checkpoint_qwen3_q8_0_certified_owned_lane_serves_exact_tokens() {
-    certified_owned_checkpoint_lane(
-        "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
-        "qwen3-0.6b-decode-q8_0",
-        "qwen3-0.6b",
-        "q8_0",
-        Some("17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2"),
-        false,
-    )
-    .await;
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore]
-async fn checkpoint_lfm2_q8_0_certified_owned_lane_serves_exact_tokens() {
-    certified_owned_checkpoint_lane(
-        "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
-        "lfm2-1.2b-decode-q8_0",
-        "lfm2-1.2b",
-        "q8_0",
-        Some("5874faabdce2567dcc0e7339e9547d79421ba312c71e3442c9cc3c4ed3cb47d0"),
-        false,
-    )
-    .await;
+async fn checkpoint_certified_owned_lanes_serve_exact_tokens() {
+    // (checkpoint variable, model id, family, quantisation, derived digest,
+    // serve a constrained request)
+    let lanes = [
+        (
+            "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
+            "qwen3-0.6b-decode-f16",
+            "qwen3-0.6b",
+            "f16",
+            None,
+            true,
+        ),
+        (
+            "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
+            "lfm2-1.2b-decode-f16",
+            "lfm2-1.2b",
+            "f16",
+            None,
+            false,
+        ),
+        (
+            "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
+            "qwen3-0.6b-decode-q8_0",
+            "qwen3-0.6b",
+            "q8_0",
+            Some("17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2"),
+            false,
+        ),
+        (
+            "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
+            "lfm2-1.2b-decode-q8_0",
+            "lfm2-1.2b",
+            "q8_0",
+            Some("5874faabdce2567dcc0e7339e9547d79421ba312c71e3442c9cc3c4ed3cb47d0"),
+            false,
+        ),
+    ];
+    for (checkpoint_env, model_id, family, quant, derived_digest, constrained_serve) in lanes {
+        certified_owned_checkpoint_lane(
+            checkpoint_env,
+            model_id,
+            family,
+            quant,
+            derived_digest,
+            constrained_serve,
+        )
+        .await;
+    }
 }
 
 #[test]

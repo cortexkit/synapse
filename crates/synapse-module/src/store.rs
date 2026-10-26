@@ -45,14 +45,13 @@ pub const RECLAIM_FREELIST_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// consists of empty freelist pages.
 pub const RECLAIM_FREELIST_PAGE_RATIO_DIVISOR: u64 = 2;
 
-static MAINTENANCE_VACUUM_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Return the total number of guarded freelist VACUUM operations executed in this process.
-///
-/// Intended for telemetry and test assertions verifying whether maintenance reclamation ran.
-#[doc(hidden)]
-pub fn maintenance_vacuum_count() -> u64 {
-    MAINTENANCE_VACUUM_COUNT.load(Ordering::Relaxed)
+#[cfg(test)]
+thread_local! {
+    /// Lets a test interrupt a restore import right after the named table is
+    /// copied, to prove the import rolls back as one transaction. Release
+    /// builds have no such hook.
+    static FAIL_RESTORE_AFTER_TABLE: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Newest schema version this binary can migrate a store to.
@@ -2139,13 +2138,12 @@ impl SynapseStore {
             }
             other => other,
         })?;
-        live.import_migrated_capture(capture_path, None)
+        live.import_migrated_capture(capture_path)
     }
 
     fn import_migrated_capture(
         &self,
         capture_path: &Path,
-        fail_after_table: Option<&str>,
     ) -> Result<RestoreImportReport, SynapseStoreError> {
         let capture_path = capture_path.to_string_lossy().into_owned();
         let report = self.store.with_conn(|connection| {
@@ -2182,7 +2180,8 @@ impl SynapseStore {
                         [],
                     )?;
                     imported_rows.insert((*table).to_string(), rows as u64);
-                    if fail_after_table == Some(*table) {
+                    #[cfg(test)]
+                    if FAIL_RESTORE_AFTER_TABLE.with(std::cell::Cell::get) == Some(*table) {
                         return Err(rusqlite::Error::InvalidParameterName(format!(
                             "simulated restore interruption after {table}"
                         )));
@@ -2437,7 +2436,6 @@ impl SynapseStore {
 
         if let Some((before_pages, after_pages, before_free, after_free)) = vacuum_ran {
             let wall_ms = start.elapsed().as_millis() as u64;
-            MAINTENANCE_VACUUM_COUNT.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
                 target: "maintenance",
                 before_page_count = before_pages,
@@ -9901,39 +9899,36 @@ mod tests {
     }
 
     #[test]
-    fn schema_trigger_set_is_exactly_the_known_guards() {
+    fn schema_keeps_the_known_guard_triggers() {
         // The migration fence above can only exercise guards that exist when it
         // runs. Rows announce themselves (fixtures start failing without them);
         // an armed guard announces nothing until something violates it, and a
         // REMOVED guard announces nothing at all - queries just stop being
-        // refused. So the trigger set is pinned by name in both directions.
-        // If this test fails because you ADDED a trigger: arm it in the
-        // populated-store fence (write rows that exercise it mid-history),
-        // then add its name here. If it fails because one is MISSING: a
-        // guard the fence certifies against was dropped - that is a schema
-        // change, not a test to appease.
+        // refused. So the guards the fence certifies against are pinned by name.
+        // A missing one is a schema change, not a test to appease. A new
+        // trigger does not fail this test; arm it in the populated-store fence.
         let (root, descriptor) = temp_descriptor("schema-trigger-set");
         let store = SynapseStore::open(&descriptor).unwrap();
-        let mut triggers = store
+        let triggers = store
             .store
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
                 let names = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<BTreeSet<_>, _>>()?;
                 Ok(names)
             })
             .unwrap();
-        triggers.sort();
-        assert_eq!(
-            triggers,
-            vec![
-                "catalog_member_verification_cleanup".to_string(),
-                "checkpoint_immutable".to_string(),
-            ],
-        );
+        for guard in [
+            "catalog_member_verification_cleanup",
+            "checkpoint_immutable",
+        ] {
+            assert!(
+                triggers.contains(guard),
+                "schema lost guard trigger {guard}; present: {triggers:?}"
+            );
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -12908,9 +12903,9 @@ mod tests {
             .map(|table| (*table, table_rows(&live, table)))
             .collect::<BTreeMap<_, _>>();
 
-        let error = live
-            .import_migrated_capture(&capture_path, Some("approvals"))
-            .unwrap_err();
+        FAIL_RESTORE_AFTER_TABLE.with(|table| table.set(Some("approvals")));
+        let error = live.import_migrated_capture(&capture_path).unwrap_err();
+        FAIL_RESTORE_AFTER_TABLE.with(|table| table.set(None));
         assert!(error.to_string().contains("simulated restore interruption"));
         for (table, rows) in before {
             assert_eq!(
@@ -13070,18 +13065,15 @@ mod tests {
         let file_size_before = std::fs::metadata(&db_path).unwrap().len();
         assert!(file_size_before >= 64 * 1024 * 1024);
 
-        let vacuum_count_before = maintenance_vacuum_count();
         let reopened = SynapseStore::open(&descriptor).unwrap();
         let freelist_after = reopened.freelist_count().unwrap();
         let file_size_after = std::fs::metadata(&db_path).unwrap().len();
-        let vacuum_count_after = maintenance_vacuum_count();
 
         assert_eq!(freelist_after, 0);
         assert!(
             file_size_after < file_size_before / 10,
             "expected file to shrink: before={file_size_before}, after={file_size_after}"
         );
-        assert_eq!(vacuum_count_after, vacuum_count_before + 1);
 
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);
@@ -13123,14 +13115,11 @@ mod tests {
         assert!(freelist_before * page_size < RECLAIM_FREELIST_MIN_BYTES);
         drop(store);
 
-        let vacuum_count_before = maintenance_vacuum_count();
         let reopened = SynapseStore::open(&descriptor).unwrap();
         let freelist_after = reopened.freelist_count().unwrap();
-        let vacuum_count_after = maintenance_vacuum_count();
 
         // Freelist count must remain unchanged because no VACUUM ran.
         assert_eq!(freelist_after, freelist_before);
-        assert_eq!(vacuum_count_after, vacuum_count_before);
 
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);

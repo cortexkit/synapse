@@ -72,12 +72,16 @@ async fn malformed_reply_faults(corruption: Corruption) {
             let mut frame = (body.len() as u32).to_le_bytes().to_vec();
             frame.extend(body);
             // Valid bytes, but no complete progress frame within the idle window.
-            // Small writes must not each create a new inactivity allowance.
-            for chunk in frame.chunks(2) {
+            // Small writes must not each create a new inactivity allowance. One
+            // byte per 150 ms keeps each write inside the window but spreads the
+            // frame over many seconds, so a host that renewed per write would
+            // fault far later than the bound below. A correct host faults after
+            // one window and drops the stream, which ends this loop.
+            for chunk in frame.chunks(1) {
                 if worker.write_all(chunk).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
             }
             return;
         }
@@ -162,7 +166,7 @@ async fn malformed_reply_faults(corruption: Corruption) {
         Corruption::FragmentedProgress | Corruption::LateRawAfterHeader
     ) {
         assert!(
-            started.elapsed() >= window && started.elapsed() < Duration::from_millis(700),
+            started.elapsed() >= window && started.elapsed() < Duration::from_secs(5),
             "partial bytes and a terminal header must not renew the original idle deadline"
         );
     }

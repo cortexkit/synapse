@@ -32,6 +32,23 @@ fn test_descriptor(root: &Path) -> StorageDescriptor {
     }
 }
 
+/// The page counts a VACUUM log line reports, as `(before, after)`.
+fn logged_page_counts(log: &str) -> Vec<(u64, u64)> {
+    let field = |line: &str, name: &str| {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(name))
+            .and_then(|value| value.trim_matches('"').parse::<u64>().ok())
+    };
+    log.lines()
+        .filter_map(|line| {
+            Some((
+                field(line, "before_page_count=")?,
+                field(line, "after_page_count=")?,
+            ))
+        })
+        .collect()
+}
+
 #[test]
 fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     let log_dir = unique_dir("logs");
@@ -85,11 +102,11 @@ fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     assert_eq!(freelist_after, freelist_before);
     drop(reopened_below);
 
-    // Verify maintenance log line is absent
+    // No VACUUM ran, so nothing reported reclaimed pages.
     let log_content = fs::read_to_string(log_handle.path()).unwrap_or_default();
     assert!(
-        !log_content.contains("synapse.maintenance:"),
-        "expected no synapse.maintenance line when below threshold, found:\n{log_content}"
+        logged_page_counts(&log_content).is_empty(),
+        "expected no VACUUM report when below threshold, found:\n{log_content}"
     );
 
     // Case 2: Store above threshold reopened -> assert VACUUM ran and log line present.
@@ -136,27 +153,20 @@ fn maintenance_log_absent_below_threshold_and_present_above_threshold() {
     );
     drop(reopened_above);
 
-    // Verify maintenance log line is present with expected fields
+    // Exactly one VACUUM was reported, with the page counts it really saw.
     let log_content_after = fs::read_to_string(log_handle.path()).unwrap_or_default();
-    let maintenance_lines = log_content_after
-        .lines()
-        .filter(|line| line.contains("synapse.maintenance:"))
-        .collect::<Vec<_>>();
+    let reports = logged_page_counts(&log_content_after);
     assert_eq!(
-        maintenance_lines.len(),
+        reports.len(),
         1,
-        "expected exactly 1 synapse.maintenance line, found:\n{log_content_after}"
+        "expected exactly 1 VACUUM report, found:\n{log_content_after}"
     );
-    let line = maintenance_lines[0];
+    let (logged_before, logged_after) = reports[0];
+    assert_eq!(logged_before, page_count_above_before);
     assert!(
-        line.contains("before_page_count="),
-        "missing before_page_count: {line}"
+        logged_after < logged_before / 10,
+        "logged page counts must show the shrink: {logged_before} -> {logged_after}"
     );
-    assert!(
-        line.contains("after_page_count="),
-        "missing after_page_count: {line}"
-    );
-    assert!(line.contains("wall_ms="), "missing wall_ms: {line}");
 
     let _ = fs::remove_dir_all(below_root);
     let _ = fs::remove_dir_all(above_root);

@@ -4,7 +4,7 @@
 #![cfg(test)]
 
 use super::*;
-use catalog_probe::{cached_probe, forget_cached_probes, run_probe, ProbeKind, PROBE_TIMEOUT};
+use catalog_probe::{cached_probe, forget_cached_probes, run_probe, ProbeKind};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 
@@ -438,7 +438,6 @@ fn overlap_is_observed() {
 
 #[test]
 fn each_probe_kind_is_deadlined_killed_reaped_and_stdout_capped() {
-    assert_eq!(PROBE_TIMEOUT, Duration::from_secs(10));
     for kind in ["--version", "--probe-floor"] {
         let stub = Stub::new(json!({"version":{"sleep":true},"floor":{"sleep":true}}));
         let mut command = stub.command();

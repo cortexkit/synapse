@@ -295,7 +295,7 @@ fn tokens_from_prompt_digest(prompt: &Value) -> Vec<u32> {
 }
 
 #[test]
-fn fidelity_run_records_all_twenty_pinned_prompts_before_registry_approval() {
+fn pinned_battery_holds_twenty_prompts_and_registry_gates_fidelity_evidence() {
     let manifest_root = battery_root();
     let manifest_bytes =
         fs::read(manifest_root.join("manifest.json")).expect("read manifest bytes");
@@ -313,7 +313,7 @@ fn fidelity_run_records_all_twenty_pinned_prompts_before_registry_approval() {
     let prompts = manifest["prompts"].as_array().expect("pinned prompts");
     assert_eq!(prompts.len(), 20);
     let mut categories = BTreeMap::new();
-    for (prompt_index, prompt) in prompts.iter().enumerate() {
+    for prompt in prompts {
         *categories
             .entry(prompt["category"].as_str().expect("prompt category"))
             .or_insert(0usize) += 1;
@@ -322,29 +322,6 @@ fn fidelity_run_records_all_twenty_pinned_prompts_before_registry_approval() {
             sha256_hex(&fs::read(prompt_path).expect("read pinned prompt")),
             prompt["sha256"].as_str().expect("prompt digest"),
             "prompt fixture bytes must match the recorded digest for {}",
-            prompt["id"]
-        );
-        let llama_oracle_tokens = tokens_from_prompt_digest(prompt);
-        let owned_serial_tokens = llama_oracle_tokens.clone();
-        let owned_speculative_tokens = owned_serial_tokens.clone();
-        assert!(
-            compare_streams(
-                &owned_serial_tokens,
-                &llama_oracle_tokens,
-                u32::try_from(prompt_index).expect("twenty prompts fit in u32"),
-            )
-            .is_empty(),
-            "serial token IDs must match the pinned llama.cpp oracle for {}",
-            prompt["id"]
-        );
-        assert!(
-            compare_streams(
-                &owned_speculative_tokens,
-                &owned_serial_tokens,
-                u32::try_from(prompt_index).expect("twenty prompts fit in u32"),
-            )
-            .is_empty(),
-            "speculative token IDs must match certified serial decode for {}",
             prompt["id"]
         );
     }

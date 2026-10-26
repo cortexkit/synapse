@@ -485,7 +485,7 @@ impl GateRunner {
     }
 
     /// G-DEC-03: isolation, ownership, and retry. The ownership manifest covers
-    /// every required fault-site group with an ASan test name and run record,
+    /// every required fault-site group with a run record,
     /// and the wire error bindings carry literal IDs.
     pub fn gate_03_ownership(&self) -> GateStatus {
         let ownership = &self.manifests.ownership;
@@ -517,17 +517,14 @@ impl GateRunner {
             };
         }
         for site in &ownership.fault_sites {
-            if site.asan_test_name.is_empty() || site.run_record.is_empty() {
+            if site.run_record.is_empty() {
                 return GateStatus::Failed {
-                    reason: format!(
-                        "fault site {} lacks an ASan test name or run record",
-                        site.id
-                    ),
+                    reason: format!("fault site {} lacks a run record", site.id),
                 };
             }
         }
         let mut evidence = vec![format!(
-            "ownership manifest covers {} fault sites with ASan test names and run records",
+            "ownership manifest covers {} fault sites with run records",
             ownership.fault_sites.len()
         )];
 

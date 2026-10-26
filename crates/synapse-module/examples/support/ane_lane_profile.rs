@@ -351,27 +351,3 @@ pub(super) async fn run(workload: &Workload, out: &Path) -> Result<()> {
     );
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn portable_errors_keep_lock_cause_without_user_paths() {
-        let error = sanitized_error(
-            &json!({"code":"engine_crashed","message":"ane_lane_busy: holds /private/user/cache/lock", "details":{"path":"/private/user/cache"}}),
-        );
-        assert_eq!(
-            error,
-            json!({"code":"engine_crashed","cause":"ane_lane_busy"})
-        );
-        assert!(sanitized_error(&Value::Null).is_null());
-    }
-
-    #[test]
-    fn real_text_prefix_counts_the_catalog_terminal_token() {
-        let tokenizer: tokenizers::Tokenizer = serde_json::from_str(r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"WhitespaceSplit"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"a":1,"b":2,"c":3},"unk_token":"[UNK]"}}"#).unwrap();
-        let text = text_at_length(&tokenizer, "a b c", 3).unwrap();
-        assert_eq!(tokenizer.encode(text, false).unwrap().len() + 1, 3);
-    }
-}

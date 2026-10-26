@@ -21,6 +21,7 @@ path = "src/main.rs"
 name = "synapse-worker-timeout-mock"
 path = "src/bin/timeout_worker.rs"
 test = false
+required-features = ["test-support"]
 
 [[bin]]
 name = "synapse-probe-stub"
@@ -28,9 +29,18 @@ path = "src/bin/probe_stub.rs"
 test = false
 required-features = ["test-support"]
 
+# The end-to-end suite spawns a daemon and the module binary per test and needs
+# model files, so it runs only in the scheduled lane, which passes
+# `--features e2e`. Ordinary test runs neither build nor run it.
+[[test]]
+name = "skeleton_e2e"
+path = "tests/skeleton_e2e.rs"
+required-features = ["e2e"]
+
 [features]
 default = []
 test-support = ["synapse-engine-owned/test-support"]
+e2e = ["test-support"]
 
 [dependencies]
 anyhow = { workspace = true }

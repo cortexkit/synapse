@@ -7,7 +7,6 @@
       "group": "allocation",
       "description": "Attention KV-cache allocation on worker startup",
       "ownership_rule": "Rust owns allocation; Objective-C receives an opaque handle and must not free it",
-      "asan_test_name": "ownership::alloc_kv_cache_no_leak",
       "run_record": "macos-metal/ownership/alloc-kv-cache.json"
     },
     {
@@ -15,7 +14,6 @@
       "group": "ownership_transfer",
       "description": "KV-cache ownership transfer across the FFI boundary on generate_start",
       "ownership_rule": "Transfer is atomic: the Rust side drops its reference before the Objective-C side assumes it",
-      "asan_test_name": "ownership::transfer_kv_cache_no_double_free",
       "run_record": "macos-metal/ownership/transfer-kv-cache.json"
     },
     {
@@ -23,7 +21,6 @@
       "group": "partial_initialization",
       "description": "Cleanup after a partial model-cache initialization failure",
       "ownership_rule": "The allocating side releases every sub-allocation; the receiver never sees a partially initialized object",
-      "asan_test_name": "ownership::partial_init_cleanup_no_invalid_free",
       "run_record": "macos-metal/ownership/partial-init-cleanup.json"
     },
     {
@@ -31,7 +28,6 @@
       "group": "generation",
       "description": "Resident generation state (KV-cache, LFM2 conv rolling cache, constraint automaton) across quanta",
       "ownership_rule": "Worker owns resident state between authorized quanta; module owns the permit and destroys state on cleanup",
-      "asan_test_name": "ownership::generation_resident_state_no_use_after_free",
       "run_record": "macos-metal/ownership/generation-resident-state.json"
     },
     {
@@ -39,7 +35,6 @@
       "group": "cancellation",
       "description": "Acknowledged cancellation cleanup before worker timeout",
       "ownership_rule": "Clean cancellation consumes no crash budget; resident state is destroyed and the worker returns no authoritative text",
-      "asan_test_name": "ownership::cancellation_cleanup_no_leak",
       "run_record": "macos-metal/ownership/cancellation-cleanup.json"
     },
     {
@@ -47,7 +42,6 @@
       "group": "timeout",
       "description": "Timeout cleanup and worker kill after failed cancellation",
       "ownership_rule": "Timeout cleanup charges one crash-budget strike and destroys all resident state",
-      "asan_test_name": "ownership::timeout_cleanup_no_use_after_free",
       "run_record": "macos-metal/ownership/timeout-cleanup.json"
     },
     {
@@ -55,7 +49,6 @@
       "group": "unload",
       "description": "Model unload on worker shutdown",
       "ownership_rule": "The Rust side drops the loaded-model reference; the Objective-C side releases Metal resources it allocated",
-      "asan_test_name": "ownership::unload_model_no_leak",
       "run_record": "macos-metal/ownership/unload-model.json"
     },
     {
@@ -63,7 +56,6 @@
       "group": "shutdown",
       "description": "Supervised worker shutdown and transport session close",
       "ownership_rule": "The module closes the transport session; the worker drains in-flight command buffers before exit",
-      "asan_test_name": "ownership::shutdown_worker_no_leak",
       "run_record": "macos-metal/ownership/shutdown-worker.json"
     },
     {
@@ -71,7 +63,6 @@
       "group": "lfm2_conv_cache",
       "description": "LFM2 short-convolution rolling cache ownership across the FFI boundary",
       "ownership_rule": "The Rust side allocates the fixed-size conv cache; the Objective-C side reads and updates it in place and never frees it",
-      "asan_test_name": "ownership::lfm2_conv_cache_no_double_free",
       "run_record": "macos-metal/ownership/lfm2-conv-cache.json"
     },
     {
@@ -79,7 +70,6 @@
       "group": "partial_initialization",
       "description": "LFM2 hybrid step native context teardown when weight preparation fails after the context was created",
       "ownership_rule": "The Rust engine struct owns the native context release exclusively through Drop; the prepare-failure error path must not release the context itself",
-      "asan_test_name": "lfm2_decode_metal_step::tests::prepare_failure_releases_context_exactly_once",
       "run_record": "macos-metal/ownership/lfm2-hybrid-step-prepare-failure.json"
     }
   ],

@@ -1181,7 +1181,7 @@ async fn catalog_multi_backend_resolver_refuses_substitution_before_load() {
 }
 
 #[cfg(target_os = "macos")]
-fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> {
+fn real_catalog_fixture(id: &str) -> (Value, BTreeMap<String, PathBuf>) {
     let mut catalog: Value =
         serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
     let entry = catalog["models"]
@@ -1216,24 +1216,21 @@ fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> 
             searched,
         ),
     };
-    let Some(snapshot) = snapshot else {
-        eprintln!(
-            "skipping Metal catalog serve: no safetensors snapshot found under {}",
+    let snapshot = snapshot.unwrap_or_else(|| {
+        panic!(
+            "Metal catalog serve needs a safetensors snapshot under {}",
             searched.display()
-        );
-        return None;
-    };
+        )
+    });
     let mut files = BTreeMap::new();
     for file in entry["files"].as_array().unwrap() {
         let local = snapshot.join(file["path"].as_str().unwrap());
-        if !local.is_file() {
-            eprintln!(
-                "skipping Metal catalog serve: missing {} (snapshot search {})",
-                local.display(),
-                searched.display()
-            );
-            return None;
-        }
+        assert!(
+            local.is_file(),
+            "Metal catalog serve needs {} (snapshot search {})",
+            local.display(),
+            searched.display()
+        );
         assert_eq!(
             std::fs::metadata(&local).unwrap().len(),
             file["size_bytes"].as_u64().unwrap(),
@@ -1255,15 +1252,13 @@ fn real_catalog_fixture(id: &str) -> Option<(Value, BTreeMap<String, PathBuf>)> 
         files.insert(path, local);
     }
     catalog["catalog_revision"] = 717.into();
-    Some((catalog, files))
+    (catalog, files)
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_real_metal_redirect_download_self_checks_and_serves_without_probe() {
-    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("gte-modernbert-base");
     let expected_fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
     let mut h =
         CatalogHarness::start_catalog("redirect", None, catalog, files, "metal", None).await;
@@ -1376,9 +1371,7 @@ fn directory_bytes(path: &Path) -> u64 {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_cold_install_load_continues_after_five_seconds_and_checks_on_first_request() {
-    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("gte-modernbert-base");
     let pin = catalog["models"][0]["backends"][0]["fingerprint"].clone();
     let mut h =
         CatalogHarness::start_catalog("ok", None, catalog, files, "metal", Some("load:stall"))
@@ -1445,9 +1438,7 @@ async fn catalog_cold_install_load_continues_after_five_seconds_and_checks_on_fi
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
-    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("gte-modernbert-base");
     let mut h = CatalogHarness::start_catalog(
         "ok",
         None,
@@ -1494,7 +1485,6 @@ async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
         .unwrap()
         .iter()
         .any(|holder| holder["kind"] == "self_check"));
-    let started = Instant::now();
     let second = h
         .call(
             "embed.query",
@@ -1502,9 +1492,21 @@ async fn catalog_real_metal_stalled_self_check_keeps_single_flight_holder() {
         )
         .await;
     assert_eq!(second["error"]["code"], "deadline_exceeded");
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "a second numerical check must not start while one remains in flight"
+    let unload = h
+        .call(
+            "model.unload",
+            serde_json::json!({"model_id":"gte-modernbert-base-metal"}),
+        )
+        .await;
+    assert_eq!(
+        unload["error"]["details"]["holders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|holder| holder["kind"] == "self_check")
+            .count(),
+        1,
+        "a second numerical check must not start while one remains in flight: {unload}"
     );
     sleep(Duration::from_secs(11)).await;
     let late = h.call("models.list", serde_json::json!({})).await;
@@ -1585,9 +1587,7 @@ async fn catalog_native_non_macos_lists_metal_as_unsupported_without_override() 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() {
-    let Some((catalog, files)) = real_catalog_fixture("qwen3-embedding-0.6b") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("qwen3-embedding-0.6b");
     let fingerprint = catalog["models"]
         .as_array()
         .unwrap()
@@ -1652,9 +1652,7 @@ async fn catalog_real_qwen_embedding_serves_catalog_and_lane_ids_then_unloads() 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_real_reranker_loaded_metadata_is_pinned() {
-    let Some((catalog, files)) = real_catalog_fixture("gte-reranker-modernbert-base") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("gte-reranker-modernbert-base");
     let mut h = CatalogHarness::start_catalog("ok", None, catalog, files, "metal", None).await;
     let accepted = h.download("gte-reranker-modernbert-base", "real").await;
     let done = h
@@ -1716,12 +1714,10 @@ async fn catalog_free_form_load_refusals_happen_before_network_io() {
     let mut main = base.clone();
     main["revision"] = "main".into();
     requests.push(main);
-    for engine in ["ort", "llama"] {
-        let mut request = base.clone();
-        request["engine"] = engine.into();
-        request["revision"] = "a".repeat(40).into();
-        requests.push(request);
-    }
+    let mut llama = base.clone();
+    llama["engine"] = "llama".into();
+    llama["revision"] = "a".repeat(40).into();
+    requests.push(llama);
     let mut reserved = base.clone();
     reserved["model_id"] = "gte-modernbert-base".into();
     reserved["revision"] = "a".repeat(40).into();
@@ -1762,9 +1758,7 @@ async fn catalog_free_form_load_refusals_happen_before_network_io() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn catalog_real_numerical_failure_persists_and_pinned_requests_fail_closed() {
-    let Some((mut catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
-        return;
-    };
+    let (mut catalog, files) = real_catalog_fixture("gte-modernbert-base");
     let fingerprint = catalog["models"][0]["backends"][0]["fingerprint"].clone();
     for vector in catalog["models"][0]["self_check"]["reference"]["vectors"]
         .as_array_mut()
@@ -1977,9 +1971,7 @@ async fn wait_failed_catalog_load(h: &mut CatalogHarness, lane: &str) -> Value {
 #[tokio::test]
 async fn catalog_failed_load_after_inline_timeout_reaches_next_request_and_retry_is_single_flight()
 {
-    let Some((catalog, files)) = real_catalog_fixture("gte-modernbert-base") else {
-        return;
-    };
+    let (catalog, files) = real_catalog_fixture("gte-modernbert-base");
     let root = unique_temp_dir("catalog-load-attempts");
     std::fs::create_dir_all(&root).unwrap();
     let counter = root.join("attempts");

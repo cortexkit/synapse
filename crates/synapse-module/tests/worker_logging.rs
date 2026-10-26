@@ -39,8 +39,10 @@ fn runtime_config() -> RuntimeConfig {
     config
 }
 
+/// Polls for up to 5 s: the bound only catches a hang, so it leaves room for
+/// a loaded runner.
 async fn wait_for_log(path: &std::path::Path, needle: &str) -> String {
-    for _ in 0..100 {
+    for _ in 0..200 {
         let contents = fs::read_to_string(path).unwrap_or_default();
         if contents.contains(needle) {
             return contents;

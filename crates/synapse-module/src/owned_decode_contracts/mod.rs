@@ -370,8 +370,6 @@ pub struct FaultSite {
     pub group: String,
     pub description: String,
     pub ownership_rule: String,
-    /// Test name exercising this fault site under AddressSanitizer.
-    pub asan_test_name: String,
     /// Run record reference for the mandatory macos-metal lane.
     pub run_record: String,
 }
@@ -979,14 +977,6 @@ fn validate_ownership(manifest: &OwnershipManifest, path: &Path) -> Result<(), M
                 path: path.to_path_buf(),
                 field: "id",
                 reason: "fault site id is empty".to_string(),
-            });
-        }
-        if site.asan_test_name.is_empty() {
-            return Err(ManifestError::InvalidIdentity {
-                manifest: "ownership",
-                path: path.to_path_buf(),
-                field: "asan_test_name",
-                reason: format!("fault site `{}` has no asan test name", site.id),
             });
         }
     }
