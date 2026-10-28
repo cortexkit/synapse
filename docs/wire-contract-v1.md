@@ -462,6 +462,12 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   (`not_certified`/`probe_required`) until the (machine, fingerprint) pair is
   certified. Lane-1 worker-backed `microllm.oneshot` routes retain their existing
   dispatch path and do not acquire the owned-lane certification gate.
+  New free-form `owned-metal` registrations reject contradictory pooling with
+  `invalid_request`: GTE ModernBERT embed requires `cls`, GTE rerank requires
+  `mean`, and Qwen3 embed/rerank require `last` (omitted pooling still defaults
+  to `mean` and is rejected when it contradicts the readout). Existing persisted
+  registrations, including matching preload ids, retain their declarations and
+  fingerprints.
 
 ### Catalog serving and migration
 

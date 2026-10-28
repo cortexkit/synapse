@@ -2814,6 +2814,13 @@ fn sync_and_load_catalog_models(
     cache: &ModelCache,
 ) -> Result<Vec<StoredModelConfig>, ModuleError> {
     let now = now_ms();
+    // Only rows present before startup are legacy registrations. A duplicate
+    // preload id in this startup must not bypass new-registration validation.
+    let persisted_ids: BTreeSet<_> = store
+        .catalog_models()?
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect();
     for (index, preload) in config.preload_models.clone().into_iter().enumerate() {
         let id = preload
             .model_id
@@ -2833,6 +2840,9 @@ fn sync_and_load_catalog_models(
             continue;
         }
         let spec = build_preload_catalog_model(index, preload, &config.inline, &config.jobs)?;
+        if !persisted_ids.contains(&id) {
+            validate_new_owned_metal_readout(&spec).map_err(ModuleError::Config)?;
+        }
         store.upsert_model(&spec, now)?;
     }
 
@@ -3644,6 +3654,46 @@ fn build_stored_model_config(
         worker_bin,
         worker_runtime_dir,
     })
+}
+
+fn owned_metal_readout_pooling(family: OwnedFamily, task: ModelTask) -> Option<WorkerPooling> {
+    match (family, task) {
+        (OwnedFamily::GteModernBert, ModelTask::Embed) => Some(WorkerPooling::Cls),
+        (OwnedFamily::GteModernBert, ModelTask::Rerank) => Some(WorkerPooling::Mean),
+        (OwnedFamily::Qwen3, ModelTask::Embed | ModelTask::Rerank) => Some(WorkerPooling::Last),
+        _ => None,
+    }
+}
+
+// Call only at new-registration boundaries, never while rebuilding stored
+// configs: legacy declarations are part of persisted vector fingerprints.
+fn validate_new_owned_metal_readout(spec: &StoredModelConfig) -> Result<(), String> {
+    if spec.engine != "owned-metal" || spec.engine_identity.build_flags.contains_key("profile") {
+        return Ok(());
+    }
+    let family = spec
+        .owned_family
+        .as_deref()
+        .ok_or_else(|| "owned-metal registration is missing family".to_string())?;
+    let family = OwnedFamily::parse(family).map_err(|error| error.to_string())?;
+    let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(expected) = owned_metal_readout_pooling(family, task) {
+        if spec.pooling != expected.as_str() {
+            let operation = match task {
+                ModelTask::Embed => "embedding",
+                ModelTask::Rerank => "reranking",
+                ModelTask::Generate => "generation",
+            };
+            return Err(format!(
+                "owned-metal {} {operation} computes {}; declare \"pooling\": \"{}\"",
+                family.as_str(),
+                expected.as_str(),
+                expected.as_str()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn owned_tokenizer_max_tokens(max_tokens: usize, owned: Option<&OwnedCatalogConfig>) -> usize {
@@ -8117,6 +8167,13 @@ async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params:
             &state.runtime.inline,
             &state.runtime.jobs,
         )?;
+        validate_new_owned_metal_readout(&spec).map_err(|message| {
+            catalog_wire_error(
+                "invalid_request",
+                json!({"model_id": spec.model_id}),
+                message,
+            )
+        })?;
         register_runtime_catalog_model(&state.runtime, spec.clone())?;
         state.store.upsert_model(&spec, now_ms()).map_err(|error| {
             transient_model_load_error(format!(
@@ -17059,6 +17116,9 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod owned_metal_readout_tests {
+        include!("owned_metal_readout_tests.rs");
+    }
     #[cfg(unix)]
     mod coreml_load_tests {
         include!("coreml_load_tests.rs");
@@ -23836,6 +23896,25 @@ mod tests {
                 .contains_key(PROJECTION_DTYPE_CONFIG_KEY));
             assert!(!spec.engine_identity.build_flags.contains_key("profile"));
             assert_eq!(spec.fingerprint.0, pinned);
+            let (root, descriptor) = test_storage_descriptor("persisted-metal-pin");
+            let store = SynapseStore::open(&descriptor).unwrap();
+            store.upsert_model(&spec, 1).unwrap();
+            let config = ModuleConfig {
+                inline,
+                jobs,
+                ..ModuleConfig::default()
+            };
+            let restored = sync_and_load_catalog_models(
+                &store,
+                &config,
+                &runtime_release_catalog().unwrap(),
+                &ModelCache::new(root.join("cache")),
+            )
+            .unwrap();
+            assert_eq!(restored, vec![spec]);
+            assert_eq!(restored[0].fingerprint.0, pinned);
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
