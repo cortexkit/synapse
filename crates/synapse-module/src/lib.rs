@@ -4013,9 +4013,10 @@ impl ModuleHandler for SynapseHandler {
         let _ = self.inner.connection_end.set(end);
     }
 
-    /// Keep the daemon health status `ok` while publishing certification metrics as
-    /// `{ certification: { certification_stale, stale_since_ms, lanes: [{ model_id,
-    /// workload, certified }] } }`. Health reads stored rows only; it never runs probes.
+    /// Report degraded health when probe-dependent lanes refuse requests because
+    /// certification is stale, so `ck health` and fleet watchers see the refusal.
+    /// Catalog self-check lanes and stale performance alone do not degrade health.
+    /// Health reads stored rows only; it never runs probes.
     async fn health(&self) -> HealthReport {
         let Some(state) = self.state() else {
             return HealthReport::ok();
@@ -4034,8 +4035,52 @@ impl ModuleHandler for SynapseHandler {
         } else {
             format!("ok; {}", detail_parts.join("; "))
         };
+        let stale_lanes = if health.certification_stale {
+            catalog_measurement_summary(&state)
+                .lanes
+                .into_iter()
+                .filter(|lane| {
+                    lane.measurements.certification_stale
+                        && lane_requires_certification(&lane.slot)
+                        && !lane
+                            .slot
+                            .spec
+                            .engine_identity
+                            .build_flags
+                            .contains_key("profile")
+                })
+                .map(|lane| lane.slot.spec.model_id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let (status, detail) = if stale_lanes.is_empty() {
+            (subc_client_rs::HealthStatus::Ok, detail)
+        } else {
+            let names = stale_lanes
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let names = if stale_lanes.len() <= 3
+                && names.len() <= 120
+                && !names.chars().any(char::is_control)
+            {
+                format!(" ({names})")
+            } else {
+                String::new()
+            };
+            (
+                subc_client_rs::HealthStatus::Degraded,
+                format!(
+                    "{} lane(s){names} refuse requests: certification is stale after a machine profile change, such as a macOS update. Re-certify with: ck-synapse-opctl probe run",
+                    stale_lanes.len()
+                ),
+            )
+        };
         HealthReport {
-            status: subc_client_rs::HealthStatus::Ok,
+            status,
             detail: Some(detail),
             metrics: Some(serde_json::to_value(&health).expect("module health should serialize")),
         }
@@ -21602,7 +21647,14 @@ mod tests {
             .set(test_module_state(Arc::clone(&store), profile_b))
             .is_ok());
         let stale = stale_handler.health().await;
-        assert!(matches!(stale.status, subc_client_rs::HealthStatus::Ok));
+        assert!(matches!(
+            stale.status,
+            subc_client_rs::HealthStatus::Degraded
+        ));
+        assert_eq!(
+            stale.detail.as_deref(),
+            Some("1 lane(s) (stuck-model) refuse requests: certification is stale after a machine profile change, such as a macOS update. Re-certify with: ck-synapse-opctl probe run")
+        );
         let stale_metrics = stale.metrics.expect("health has metrics");
         assert_eq!(
             stale_metrics["certification"]["certification_stale"],
