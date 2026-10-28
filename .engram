@@ -9,7 +9,6 @@
 # records, and rig setup.
 .cortexkit/prefrontal/prompts/
 .cortexkit/prefrontal/drafts/
-.cortexkit/prefrontal/plans/
 .cortexkit/prefrontal/specs/
 .cortexkit/prefrontal/audit/
 .cortexkit/prefrontal/review/
