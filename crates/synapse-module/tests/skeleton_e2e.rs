@@ -906,7 +906,7 @@ async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
                 "execution": "explicit",
                 "model_id": "gte-modernbert-base-f16",
                 "task": "embed",
-                "pooling": "mean",
+                "pooling": "cls",
                 "normalize": true,
                 "max_tokens": 512,
                 "pin": true,
