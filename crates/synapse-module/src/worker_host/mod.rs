@@ -1576,6 +1576,21 @@ impl WorkerEngine {
         Ok(host.health_snapshot())
     }
 
+    /// Reads this model's crash fence without expiring it or restarting a worker.
+    pub(crate) fn model_quarantined(&self, model: &LoadedModel) -> Result<bool, WorkerHostError> {
+        let host = self.lock_host()?;
+        Ok(host
+            .loaded_models
+            .get(&model.model_id)
+            .is_some_and(|loaded| {
+                host.quarantined.contains(&loaded.crash_key)
+                    && host
+                        .quarantine_until
+                        .get(&loaded.crash_key)
+                        .is_none_or(|until| host.now() < *until)
+            }))
+    }
+
     pub fn ping(&self) -> Result<WorkerPing, WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime().block_on(host.ping())

@@ -198,15 +198,21 @@ certified-equivalent profile, else substitution_rejected/not_certified).
 
 ## 4. Flow-scoped routes
 
-Checks: `tests::flow_routes_get_queries_only_and_other_routes_are_unchanged` and
+Checks: `tests::flow_routes_serve_only_diagnostics_and_other_routes_are_unchanged` and
 `tests::the_flow_refusal_names_the_method_and_the_flow` (module library).
 
-Synapse does not declare the `flow-scopes/v1` capability, so the daemon keeps
-routes whose scope carries a `flow_id` away from it. If such a route is bound
-anyway, synapse serves on it only the operations declared `query` in its
-management registry. Every other method, including the mutations and any
-undeclared name, gets the channel-level error `flow_scope_refused`, naming the
-method and the flow. Routes without a `flow_id` are unaffected.
+Synapse declares `flow-scopes/v1` and lists only `diagnostics.findings` in
+`flow_operations`. On routes whose scope carries a `flow_id`, Synapse serves
+only that operation. Every other method, including other queries, mutations and
+undeclared names, gets the channel-level error `flow_scope_refused`, naming the
+method and the flow. Query classification is not an unattended-access policy:
+inference queries can load models and consume hardware. The other operations on
+routes without a `flow_id` are unaffected.
+
+`diagnostics.findings` accepts head scopes and daemon-authorized flow scopes;
+bare worker/ephemeral scopes and unauthorized flows receive `permission_refused`.
+Unscoped management routes remain available to operator clients. Route scope,
+not request params, establishes flow identity and authorization.
 
 ## 5. Operations
 
@@ -227,7 +233,47 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
 `approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
-`lanes.resume`, and `lanes.status`.
+`lanes.resume`, `lanes.status`, and `diagnostics.findings`.
+
+- **diagnostics.findings** {window_ms?} — read-only query. Omitted/null params
+  mean `{}`; `window_ms` omitted/null defaults to 21,600,000 ms (six hours).
+  Otherwise it must be an integer in 1–604,800,000 inclusive (seven days).
+  Non-object params, extra params and invalid windows receive `invalid_request`;
+  an unreadable health store receives `store_failure`, not an empty diagnosis.
+  Returns `{result: {generated_at_ms, window_ms, findings}}`, with an empty
+  `findings: []` for healthy evidence. The module's Unix-epoch millisecond clock
+  supplies `generated_at_ms`. Each finding contains `check`, `key`, `severity`,
+  positive `count`, `first_seen_ms`, `last_seen_ms`, `summary`, `samples`, and
+  `hint`. Guidance appears only in `hint`; clients must not execute it automatically.
+  Findings are severity ordered (`error`, then `warn`); ties use the order below.
+  Checks read existing runtime catalog, certification, admission and self-check
+  state: they never load a model, execute inference, run a probe or repair state.
+  All current checks describe standing conditions, even if they predate the
+  requested window; there is no recent-history scan.
+  - `certification_stale` (`error`): counts exactly the certification-required,
+    non-profile lanes whose previous certification no longer permits serving,
+    using the same lane selection as module health. Samples carry `lane_id` and
+    `stale_since_ms` (the persisted first observed mismatch, or null if unknown).
+    `first_seen_ms` uses that timestamp, otherwise the recorded profile rotation,
+    otherwise report time. `hint` is `Re-certify with: ck-synapse-opctl probe run`.
+  - `catalog_self_check_failed` (`warn`): installed runtime catalog lanes with a
+    failed current on-device self-check. Samples contain `lane_id` and
+    `checked_at_ms`; the earliest check supplies `first_seen_ms` (report time if
+    unknown). Raw failure reasons are not returned.
+  - `worker_quarantined` (`warn`): runtime lanes with a current in-memory worker
+    crash fence or a cached quarantine load refusal. Samples contain `lane_id`
+    and `cached`: true means the refusal has no recorded expiry and may outlive
+    the fence. No quarantine start time is held, so both evidence timestamps use
+    report time. Host-wide quarantine counts are not attributed to unrelated lanes.
+  `last_seen_ms` is report time for these standing checks. Counts precede sample
+  trimming; samples are sorted by lane id, capped at five per finding. The entire
+  compact response body stays strictly below 65,536 bytes: samples are removed
+  from the first finding with evidence until it fits, then tail findings if
+  necessary, preserving retained counts. There is no pagination or truncation
+  flag. Only lane identifiers, check times and bounded status evidence are
+  returned—never prompts, inputs, embeddings, raw errors, artifact paths or
+  machine-profile details. Performance-stale alone is omitted because it does
+  not refuse serving and must not wake an owner as a certification failure.
 
 - **lanes.pause** {scope: "neural_engine", duration_ms, reason} — mutate. Starts
   a volatile pause of every direct-ANE and Core ML ANE lane, including cold lanes.

@@ -18,6 +18,7 @@ mod ane_artifact;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
+mod diagnostics_findings;
 mod engram_catalog;
 mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
@@ -506,6 +507,7 @@ struct SynapseHandlerInner {
     /// Recorded at bind; `flow_refusal` uses it to refuse methods on such
     /// routes.
     flow_routes: Mutex<HashMap<RouteHandle, String>>,
+    diagnostics_routes: Mutex<HashMap<RouteHandle, bool>>,
     /// How the daemon connection ended, set once by the SDK's end-of-connection
     /// callback and read by the `synapse stopped` log line.
     connection_end: Arc<OnceLock<ConnectionEnd>>,
@@ -515,6 +517,16 @@ impl SynapseHandlerInner {
     /// Remembers whether a bound route's scope belongs to a flow. The stamp is
     /// fixed for the route's life, so recording it once at bind is enough.
     fn record_bind_scope(&self, req: &RouteBindRequest) {
+        let diagnostics_allowed = req.scope.as_ref().is_none_or(|scope| {
+            if scope.attributes.flow_id.is_some() {
+                scope.owner_authorized
+            } else {
+                scope.kind == subc_protocol::scope::ScopeKind::Head
+            }
+        });
+        if let Ok(mut routes) = self.diagnostics_routes.lock() {
+            routes.insert(req.handle, diagnostics_allowed);
+        }
         let flow_id = req
             .scope
             .as_ref()
@@ -532,11 +544,9 @@ impl SynapseHandlerInner {
     }
 
     /// A flow acts for its owner without the owner present, so on a flow's
-    /// route synapse serves only the operations it declares as queries, which
-    /// give every caller the same answer. Every other method (the mutations
-    /// that change what the whole machine serves, and any name not declared at
-    /// all) is refused by name. Without this, a flow would load, remove or
-    /// approve models as its owner.
+    /// route synapse serves only diagnostics.findings. Other queries can load
+    /// models or run inference, so query classification alone is not a safe
+    /// allowlist for unattended diagnosis.
     fn flow_refusal(&self, route: &RouteHandle, method: &str) -> Option<HandlerOutcome> {
         let flow_id = match self.flow_routes.lock() {
             Ok(flows) => flows.get(route).cloned()?,
@@ -544,17 +554,14 @@ impl SynapseHandlerInner {
             // refuse rather than serve a mutation unchecked.
             Err(_) => "unknown".to_string(),
         };
-        let declared_query = management_operations()
-            .iter()
-            .any(|op| op.name == method && op.kind == ManagementOperationKind::Query);
-        if declared_query {
+        if method == "diagnostics.findings" {
             return None;
         }
         Some(channel_error(
             "flow_scope_refused",
             format!(
                 "{method} is not available on a flow-scoped route (flow {flow_id}): \
-                 flows may call only synapse's query operations"
+                  flows may call only diagnostics.findings"
             ),
         ))
     }
@@ -2403,6 +2410,7 @@ impl SynapseHandler {
                 initialize_count: std::sync::atomic::AtomicUsize::new(0),
                 approval_operators: Mutex::new(HashMap::new()),
                 flow_routes: Mutex::new(HashMap::new()),
+                diagnostics_routes: Mutex::new(HashMap::new()),
                 connection_end: Arc::new(OnceLock::new()),
             }),
         }
@@ -4054,6 +4062,9 @@ impl ModuleHandler for SynapseHandler {
         if let Ok(mut flows) = self.inner.flow_routes.lock() {
             flows.remove(handle);
         }
+        if let Ok(mut routes) = self.inner.diagnostics_routes.lock() {
+            routes.remove(handle);
+        }
     }
 
     /// Remembers how the daemon connection ended so the `synapse stopped` line
@@ -4085,25 +4096,7 @@ impl ModuleHandler for SynapseHandler {
         } else {
             format!("ok; {}", detail_parts.join("; "))
         };
-        let stale_lanes = if health.certification_stale {
-            catalog_measurement_summary(&state)
-                .lanes
-                .into_iter()
-                .filter(|lane| {
-                    lane.measurements.certification_stale
-                        && lane_requires_certification(&lane.slot)
-                        && !lane
-                            .slot
-                            .spec
-                            .engine_identity
-                            .build_flags
-                            .contains_key("profile")
-                })
-                .map(|lane| lane.slot.spec.model_id)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let stale_lanes = lanes_refusing_for_stale_certification(&state);
         let (status, detail) = if stale_lanes.is_empty() {
             (subc_client_rs::HealthStatus::Ok, detail)
         } else {
@@ -4168,6 +4161,20 @@ impl ModuleHandler for SynapseHandler {
             .flow_refusal(&ctx.route_handle(), &envelope.method)
         {
             return refusal;
+        }
+        if envelope.method == "diagnostics.findings"
+            && !self
+                .inner
+                .diagnostics_routes
+                .lock()
+                .ok()
+                .and_then(|routes| routes.get(&ctx.route_handle()).copied())
+                .unwrap_or(false)
+        {
+            return channel_error(
+                "permission_refused",
+                "diagnostics.findings requires a head, authorized flow, or unscoped management route",
+            );
         }
         let approved_by = self
             .inner
@@ -4254,6 +4261,7 @@ async fn dispatch_request(
     approved_by: Option<&str>,
 ) -> HandlerOutcome {
     match request.method.as_str() {
+        "diagnostics.findings" => diagnostics_findings::handle(&state, request.params),
         "lanes.pause" => lane_pause::pause(state, request.params).await,
         "lanes.resume" => lane_pause::resume(state).await,
         "lanes.status" => result_outcome(lane_pause::status(&state.runtime)),
@@ -15718,6 +15726,28 @@ fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::Work
         .and_then(|model| worker_health_for_model(model))
 }
 
+/// Lanes whose previously measured certification no longer permits serving.
+/// Profile-backed lanes use their on-device self-check instead of legacy rows.
+fn lanes_refusing_for_stale_certification(state: &ModuleState) -> Vec<String> {
+    let mut lanes = catalog_measurement_summary(state)
+        .lanes
+        .into_iter()
+        .filter(|lane| {
+            lane.measurements.certification_stale
+                && lane_requires_certification(&lane.slot)
+                && !lane
+                    .slot
+                    .spec
+                    .engine_identity
+                    .build_flags
+                    .contains_key("profile")
+        })
+        .map(|lane| lane.slot.spec.model_id)
+        .collect::<Vec<_>>();
+    lanes.sort();
+    lanes
+}
+
 fn lane_requires_certification(slot: &ModelSlotSnapshot) -> bool {
     slot.spec.task != ModelTask::Generate.as_str()
         || matches!(
@@ -16709,6 +16739,7 @@ fn management_operations() -> Vec<ManagementOperation> {
     };
 
     vec![
+        op("diagnostics.findings", Query),
         op("certify.observations", Query),
         op("lanes.pause", Mutate),
         op("lanes.resume", Mutate),
@@ -16776,10 +16807,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
             // paging relies on.
             concurrency: Concurrency::ModuleManaged,
         }])
-        // Capability grammar is not adopted yet: leaving the block unset keeps the
-        // pre-capability manifest contract, and consumers keep addressing synapse
-        // by module id and operation name.
-        .capabilities(None)
+        // Unattended flows may read diagnoses, never infer or change serving state.
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["flow-scopes/v1".to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
+        .flow_operations(Some(vec!["diagnostics.findings".to_string()]))
         // Examined and none declarable (Some([]) is the wire form of that claim;
         // None would mean the vocabulary is un-adopted): synapse mutates nothing
         // outside its own store and models directory, and observation-anchored
@@ -20221,7 +20255,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_routes_get_queries_only_and_other_routes_are_unchanged() {
+    fn flow_routes_serve_only_diagnostics_and_other_routes_are_unchanged() {
         let handler = SynapseHandler::new("synapse".into());
         let inner = &handler.inner;
         let flow = bind_with_scope(1, Some("flow-7"));
@@ -20230,26 +20264,29 @@ mod tests {
         inner.record_bind_scope(&plain);
 
         let operations = management_operations();
-        let queries = operations
-            .iter()
-            .filter(|op| op.kind == ManagementOperationKind::Query)
-            .count();
-        let mutations = operations.len() - queries;
-        // Denominators: a list with no queries or no mutations would make the
-        // loop below vacuous.
-        assert!(
-            queries > 0 && mutations > 0,
-            "{queries} queries, {mutations} mutations"
+        let manifest = manifest("synapse");
+        assert_eq!(
+            manifest.flow_operations,
+            Some(vec!["diagnostics.findings".into()])
         );
+        assert_eq!(
+            manifest.capabilities.as_ref().unwrap().provides,
+            vec!["flow-scopes/v1"]
+        );
+        manifest.validate_flow_operations().unwrap();
+        assert!(operations.iter().any(
+            |op| op.name == "diagnostics.findings" && op.kind == ManagementOperationKind::Query
+        ));
+        assert!(operations.iter().any(|op| op.name == "embed.query"));
         for op in &operations {
             let on_flow = refusal_code(inner.flow_refusal(&flow.handle, &op.name));
-            if op.kind == ManagementOperationKind::Query {
-                assert_eq!(on_flow, None, "query {} must be served to a flow", op.name);
+            if op.name == "diagnostics.findings" {
+                assert_eq!(on_flow, None, "diagnosis must be served to a flow");
             } else {
                 assert_eq!(
                     on_flow.as_deref(),
                     Some("flow_scope_refused"),
-                    "mutation {} must be refused on a flow route",
+                    "{} must be refused on a flow route, even if it is a query",
                     op.name
                 );
             }
@@ -20269,6 +20306,21 @@ mod tests {
                 "{undeclared}"
             );
         }
+        let mut head = bind_with_scope(3, None);
+        head.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Head;
+        let mut unauthorized_flow = bind_with_scope(4, Some("flow-8"));
+        unauthorized_flow.scope.as_mut().unwrap().owner_authorized = false;
+        inner.record_bind_scope(&head);
+        inner.record_bind_scope(&unauthorized_flow);
+        let routes = inner.diagnostics_routes.lock().unwrap();
+        assert_eq!(routes.get(&flow.handle), Some(&true));
+        assert_eq!(
+            routes.get(&plain.handle),
+            Some(&false),
+            "bare workers cannot read diagnostics"
+        );
+        assert_eq!(routes.get(&head.handle), Some(&true));
+        assert_eq!(routes.get(&unauthorized_flow.handle), Some(&false));
     }
 
     #[test]
