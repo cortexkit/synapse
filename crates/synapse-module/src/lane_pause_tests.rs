@@ -353,6 +353,31 @@ async fn pause_releases_fresh_open_global_lock_and_resume_holds_it_again() {
 
 #[tokio::test]
 async fn pause_auto_expires_with_tokio_time_without_resume() {
+    const CHILD: &str = "SYNAPSE_LANE_PAUSE_LOCK_TEST_CHILD";
+    const TEST: &str =
+        "tests::lane_pause_tests::pause_auto_expires_with_tokio_time_without_resume";
+    if std::env::var_os(CHILD).is_none() {
+        // Another test can fork a child while we hold the lane lock; the child
+        // keeps the inherited lock held until exec.
+        // That transient holder would make expiry retry on a frozen Tokio clock.
+        // Isolate the lock lifetime from unrelated test threads spawning children.
+        let output = synapse_core::without_launch_nonce(std::process::Command::new(
+            std::env::current_exe().unwrap(),
+        ))
+        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {TEST} ... ok")),
+            "isolated lane-pause lock test did not pass: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let fixture = installed_ready_ane_fixture().await;
     let path = install_lock(&fixture);
     start_pause(&fixture.state).await;
@@ -573,6 +598,30 @@ async fn pause_rejects_121_minutes() {
 
 #[tokio::test]
 async fn pause_reacquire_contention_keeps_refusing_instead_of_serving() {
+    const CHILD: &str = "SYNAPSE_LANE_PAUSE_LOCK_TEST_CHILD";
+    const TEST: &str =
+        "tests::lane_pause_tests::pause_reacquire_contention_keeps_refusing_instead_of_serving";
+    if std::env::var_os(CHILD).is_none() {
+        // Another test can fork a child while we hold the lane lock; the child
+        // keeps the inherited lock held until exec.
+        // Run the release/re-take assertion without unrelated test threads spawning.
+        let output = synapse_core::without_launch_nonce(std::process::Command::new(
+            std::env::current_exe().unwrap(),
+        ))
+        .args([TEST, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {TEST} ... ok")),
+            "isolated lane-pause lock test did not pass: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let fixture = installed_ready_ane_fixture().await;
     let path = install_lock(&fixture);
     start_pause(&fixture.state).await;
