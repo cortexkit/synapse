@@ -271,10 +271,10 @@ jobs:
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
           # Synapse reads no project identity from routes and does not declare
-          # scope-workdir/v1, so subc-protocol 0.33 asks nothing new of the
-          # daemon: its only addition is an optional tool-call member the daemon
-          # relays unread. SUBC confirmed the ck-subc floor stays at
-          # requires_core 0.20.53 for 0.33.x.
+          # scope-workdir/v1. subc-protocol 0.33.5 adds the optional flow_operations
+          # allowlist; older daemons drop it and register Synapse as before.
+          # For 0.33.x the ck-subc floor stays at requires_core 0.20.53;
+          # Synapse also enforces its diagnostics-only flow guard locally.
           # A new protocol minor needs that floor rechecked with SUBC.
           case "$protocol" in
             0.33.*) ;;
