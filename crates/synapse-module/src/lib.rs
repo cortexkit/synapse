@@ -3848,6 +3848,12 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
         // runs them (Vulkan runs on Linux and Windows). The IPC transport differs
         // by OS and does not affect the vectors, so it stays out of the identity.
         // The legacy arms above keep it, because live fingerprints depend on it.
+        //
+        // The version strings in this function ("protocol-v1", "protocol-v2") are
+        // frozen fingerprint inputs, not the worker wire protocol: the workers now
+        // speak protocol 3, which HELLO reports separately. They also surface as
+        // `provenance.engine.version`. Changing one rotates every pinned fingerprint
+        // on that lane and invalidates stored vectors, so leave them as they are.
         "owned-vulkan" | "ane-direct-worker" => {
             Ok(worker_catalog_identity(engine_name, "protocol-v2", &[]))
         }
