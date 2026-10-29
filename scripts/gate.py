@@ -237,12 +237,18 @@ def worker(job, expected):
 
 
 def snapshot(destination):
-    """Overlay current source inputs onto a shallow independent local clone."""
+    """Overlay current source inputs onto a detached worktree of this repository.
+
+    MOTOR ships a checkout to the runner as a git bundle against history the
+    runner already has, so the snapshot needs full history. A shallow clone
+    fails there with `bundle_rejected` before any check runs. A worktree shares
+    this repository's object store, costs no copy, and the caller's
+    `git worktree prune` cleans it up after `rmtree`.
+    """
     names = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]).split(b"\0")
     destination = validate_snapshot_path(destination, destination.name)
-    subprocess.run(["git", "clone", "--quiet", "--depth", "1", "--no-checkout",
-                    Path.cwd().resolve().as_uri(), str(destination)], check=True)
-    subprocess.run(["git", "-C", str(destination), "config", "core.autocrlf", "false"], check=True)
+    subprocess.run(["git", "worktree", "add", "--quiet", "--detach", "--no-checkout",
+                    str(destination), "HEAD"], check=True)
     # Seed the index without checking out files, so deleted source inputs stay
     # deleted and tracked-but-ignored files retain their tracked status.
     subprocess.run(["git", "-C", str(destination), "reset", "--mixed", "--quiet", "HEAD"], check=True)
