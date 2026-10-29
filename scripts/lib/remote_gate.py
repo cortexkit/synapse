@@ -90,6 +90,22 @@ def motor(command):
         time.sleep(15)
 
 
+def motor_command(command, *, cwd=None, vcpus=4, platform=None, timeout=3600,
+                  net=False, return_paths=()):
+    """Build MOTOR argv for a checkout root, shared by preflight and the full gate."""
+    args = ["ck", "motor", "run"]
+    if platform:
+        args += ["--platform", platform]
+    if platform != "windows":
+        args += ["--vcpus", str(vcpus)]
+    args += ["--timeout", str(timeout), "--cwd", str(Path.cwd() if cwd is None else cwd)]
+    if net:
+        args.append("--net")
+    for path in return_paths:
+        args += ["--return-path", str(path)]
+    return args + ["--", *command]
+
+
 def run(remote_commands, local_commands=(), vcpus=4):
     start = time.monotonic()
     expected = fingerprint()
@@ -103,11 +119,9 @@ def run(remote_commands, local_commands=(), vcpus=4):
                                   json.dumps(local_commands)])
     remote_status = 1
     try:
-        remote_status = motor([
-            "ck", "motor", "run", "--vcpus", str(vcpus), "--timeout", "3600",
-            "--cwd", str(Path.cwd()), "--", "python3", helper, "--worker", "linux",
-            expected, json.dumps(remote_commands),
-        ])
+        remote_status = motor(motor_command([
+            "python3", helper, "--worker", "linux", expected, json.dumps(remote_commands),
+        ], vcpus=vcpus))
     finally:
         local_status = local.wait() if local else 0
     current = fingerprint()

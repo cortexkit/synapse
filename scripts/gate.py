@@ -23,7 +23,7 @@ import urllib.request
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.lib.remote_gate import fingerprint
+from scripts.lib.remote_gate import fingerprint, motor_command
 
 
 @dataclass
@@ -279,12 +279,11 @@ class Runner:
     def run(self, job):
         start = time.monotonic()
         checkout = self.scratch / job.name
-        command = ["ck", "motor", "run", "--platform", job.platform,
-                   "--timeout", "7200", "--net", "--cwd", str(checkout)]
-        if job.platform == "linux":
-            command += ["--vcpus", str(job.vcpus), "--return-path", str(checkout / "target/gate-evidence.zip")]
-        command += ["--", "bash", "scripts/gate.sh", "--worker",
-                    json.dumps(asdict(job)), self.expected]
+        command = motor_command(
+            ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected],
+            cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=True,
+            return_paths=[checkout / "target/gate-evidence.zip"] if job.platform == "linux" else [],
+        )
         print(f"JOB {job.name}: {shlex.join(command[:command.index('--')])}", flush=True)
         try:
             with self.lock:
@@ -339,15 +338,23 @@ def parallel(runner, jobs):
     return failure, results
 
 
+def snapshot_directory():
+    """Keep job snapshots outside the submitting checkout; MOTOR rejects nested roots."""
+    checkout = Path.cwd().resolve()
+    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
+    if parent == checkout or checkout in parent.parents:
+        parent = Path("/tmp").resolve()
+    if parent == checkout or checkout in parent.parents:
+        raise ValueError("no temporary directory outside the submitting checkout")
+    return Path(tempfile.mkdtemp(prefix="synapse-gate-", dir=parent))
+
+
 def run_gate(phases):
     start = time.monotonic()
     expected = fingerprint()
     print(f"TREE requested {expected}", flush=True)
-    scratch_root = Path("target/scratch").resolve()
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="gate-", dir=scratch_root))
+    scratch = snapshot_directory()
     evidence = Path(".cortexkit/internal-docs/investigations/gate") / scratch.name
-    evidence.mkdir(parents=True, exist_ok=True)
     runner = Runner(expected, scratch, evidence)
     timings, status = [], 1
     old_handlers = {}
@@ -357,6 +364,7 @@ def run_gate(phases):
         raise KeyboardInterrupt
 
     try:
+        evidence.mkdir(parents=True, exist_ok=True)
         for signum in (signal.SIGTERM, signal.SIGINT):
             old_handlers[signum] = signal.signal(signum, interrupt)
         # Prepare independent identical checkouts before any compiler starts.
@@ -378,6 +386,9 @@ def run_gate(phases):
         runner.cancel()
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
+        # All MOTOR clients have joined, including cancelled jobs, before their
+        # temporary source checkouts are removed. Retained evidence lives elsewhere.
+        shutil.rmtree(scratch)
         if fingerprint() != expected:
             print("FAIL: submitting source changed during verification", flush=True)
             status = status or 1

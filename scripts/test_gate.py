@@ -6,9 +6,12 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +21,28 @@ Job, Step = GATE["Job"], GATE["Step"]
 
 
 class PlanTests(unittest.TestCase):
+    def test_snapshot_directory_honors_tmpdir_and_resolves_nested_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, outside = root / "checkout", root / "outside"
+            inside = checkout / "target/tmp"
+            inside.mkdir(parents=True)
+            outside.mkdir()
+            alias = root / "tmp-alias"
+            alias.symlink_to(inside, target_is_directory=True)
+            previous = Path.cwd()
+            try:
+                os.chdir(checkout)
+                for configured, expected in ((outside, outside.resolve()), (alias, Path("/tmp").resolve())):
+                    with patch.dict(os.environ, TMPDIR=str(configured)):
+                        snapshot = GATE["snapshot_directory"]()
+                    try:
+                        self.assertEqual(snapshot.parent, expected)
+                    finally:
+                        shutil.rmtree(snapshot)
+            finally:
+                os.chdir(previous)
+
     def test_snapshot_preserves_dirty_untracked_deleted_and_executable_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -146,12 +171,23 @@ else:
                     self.assertEqual(environment["CARGO_HOME"], "/immutable-cache")
                     self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
 
-    def invoke(self, statuses, two_phases=True):
+    def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools, events = root / "bin", root / "events"
             tools.mkdir()
             events.mkdir()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            (checkout / ".gitignore").write_text("target/\n.cortexkit/\n")
+            (checkout / "source").write_text("snapshot input")
+            (checkout / ".github/workflows").mkdir(parents=True)
+            for name in ("tests.yml", "portable.yml"):
+                (checkout / ".github/workflows" / name).write_text((ROOT / ".github/workflows" / name).read_text())
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+            nested_temp = checkout / "target/custom-tmp"
+            nested_temp.mkdir(parents=True)
             ck = tools / "ck"
             ck.write_text(f"#!{sys.executable}\n" + r'''
 import json, os, signal, sys, time
@@ -162,10 +198,16 @@ job = json.loads(args[-2])
 name = job['name']
 events = Path(os.environ['FAKE_EVENTS'])
 (events / (name + '.json')).write_text(json.dumps(args))
+cwd = Path(args[args.index('--cwd') + 1]).resolve()
+checkout = Path(os.environ['FAKE_CHECKOUT']).resolve()
+if checkout in cwd.parents:
+    print('lease_mismatch: --cwd overlaps the submitting checkout', flush=True)
+    sys.exit(200)
 def cancelled(signum, frame):
     (events / (name + '.cancelled')).touch()
     sys.exit(203)
 signal.signal(signal.SIGTERM, cancelled)
+(events / (name + '.ready')).touch()
 if name != 'quick':
     deadline = time.monotonic() + 5
     while len(list(events.glob('*suite.json'))) != 2 or not (events / 'linux-llama-parity.json').exists():
@@ -193,17 +235,78 @@ sys.exit(status)
             status = 0
             with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                             FAKE_EVENTS=str(events), FAKE_STATUSES=json.dumps(statuses),
-                            FAKE_HOLD="1" if any(statuses.get(j.name, 0) for j in second) else "0"), \
+                            FAKE_CHECKOUT=str(checkout), TMPDIR=str(nested_temp),
+                            FAKE_HOLD="1" if interrupt or any(statuses.get(j.name, 0) for j in second) else "0"), \
                     redirect_stdout(output):
                 results = []
-                for jobs in phases:
-                    status, result = GATE["parallel"](runner, jobs)
-                    results.append(result)
-                    if status:
-                        break
+                if interrupt:
+                    child = subprocess.Popen([sys.executable, str(ROOT / "scripts/gate.py")], cwd=checkout,
+                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not all((events / (j.name + ".ready")).exists() for j in second):
+                            if child.poll() is not None or time.monotonic() > deadline:
+                                self.fail("gate did not launch every parallel job before interrupt")
+                            time.sleep(.01)
+                        child.send_signal(signal.SIGINT)
+                        text, _ = child.communicate(timeout=10)
+                        output.write(text)
+                        status = child.returncode
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate()
+                elif through_gate:
+                    previous = Path.cwd()
+                    try:
+                        os.chdir(checkout)
+                        status = GATE["run_gate"](phases)
+                    finally:
+                        os.chdir(previous)
+                else:
+                    for jobs in phases:
+                        status, result = GATE["parallel"](runner, jobs)
+                        results.append(result)
+                        if status:
+                            break
             recorded = {p.stem: json.loads(p.read_text()) for p in events.glob("*.json")}
             completed = {p.name for p in events.iterdir()}
+            if through_gate or interrupt:
+                for args in recorded.values():
+                    cwd = Path(args[args.index("--cwd") + 1]).resolve()
+                    self.assertNotIn(checkout.resolve(), cwd.parents,
+                                     "MOTOR --cwd must not be beneath the checkout, including target/")
+                    self.assertFalse(cwd.parent.exists(), "temporary snapshots must be removed after joining jobs")
             return status, results, recorded, completed, output.getvalue()
+
+    def test_motor_cwd_never_uses_checkout_target_even_with_nested_tmpdir(self):
+        status, _, recorded, _, output = self.invoke({}, through_gate=True)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(len(recorded), 4)
+        self.assertIn("Phase 2", output)
+
+    def test_snapshot_cleanup_after_job_failure(self):
+        status, _, _, completed, output = self.invoke({"windows-suite": 7}, through_gate=True)
+        self.assertEqual(status, 7, output)
+        self.assertIn("linux-suite.cancelled", completed)
+        self.assertIn("linux-llama-parity.cancelled", completed)
+
+    def test_snapshot_cleanup_after_ctrl_c_joins_cancelled_jobs(self):
+        status, _, _, completed, output = self.invoke({}, interrupt=True)
+        self.assertEqual(status, 130, output)
+        for name in ("linux-suite", "windows-suite", "linux-llama-parity"):
+            self.assertIn(name + ".cancelled", completed)
+
+    def test_snapshot_cleanup_when_evidence_setup_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory) / "snapshot"
+            scratch.mkdir()
+            with redirect_stdout(io.StringIO()), \
+                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda: scratch), \
+                    patch.object(Path, "mkdir", side_effect=PermissionError("evidence directory is not writable")):
+                with self.assertRaises(PermissionError):
+                    GATE["run_gate"](([], []))
+            self.assertFalse(scratch.exists())
 
     def test_parallel_launch_platforms_resources_and_snapshot_isolation(self):
         status, results, recorded, completed, output = self.invoke({})

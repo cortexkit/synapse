@@ -18,6 +18,11 @@ PREFLIGHT = runpy.run_path(str(Path(__file__).with_name("train-preflight.py")))
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_motor_command_defaults_to_current_checkout_root(self):
+        self.assertEqual(remote_gate.motor_command(["python3", "worker.py"]), [
+            "ck", "motor", "run", "--vcpus", "4", "--timeout", "3600", "--cwd", str(Path.cwd()),
+            "--", "python3", "worker.py"])
+
     @unittest.skipIf(os.name == "nt", "simulates NTFS mode loss on a POSIX host")
     def test_windows_fingerprint_uses_index_modes_and_disk_contents(self):
         with tempfile.TemporaryDirectory() as temp:
