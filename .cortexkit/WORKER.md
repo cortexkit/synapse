@@ -9,41 +9,79 @@ A portable test pass or a skipped hardware case is not hardware certification.
 
 ## What to run for a change
 
-Implement the change, then run only the filtered tests for the code you touched,
+While iterating, run only the filtered tests for the code you touched,
 plus `cargo fmt --all --check` and Clippy for the touched crates, on the build
 server (`runon: "linux,4c"`). For a bug fix, add one ordinary test that fails
 without the fix, and show that once: revert only the fix, run that test, see it
 fail. Do not write mutation rows, break proofs or deliberate-break controls
 (edits that break production code on purpose to prove some test notices), and
-do not run full suites or repeat runs to prove stability. The head runs the full
-suite once per integrated batch, and CI runs it before master.
+do not repeat runs to prove stability. Before delivering, run `scripts/gate.sh`:
+it is the single push-CI parity gate, with fast guards first and full Linux and
+native Windows suites on the build servers in parallel. CI confirms this result;
+do not wait for CI to discover failures. A filtered iteration check or
+`scripts/gate.sh --fast` is not a full delivery gate.
+
+## Standing pre-approvals
+
+Routine verification repairs do not need a question or permission pause:
+
+- Refresh path-dependent standalone lockfiles whenever their dependencies move.
+  `scripts/check-path-deps.py` discovers standalone workspaces as well as the
+  root; use its diagnostics to identify the affected lockfiles, regenerate only
+  those files on a build server, and retain `--locked` in verification.
+- Regenerate a pinned golden when the output differs only by the stated cause.
+  Explain that cause and inspect the diff; unrelated output changes still need
+  investigation rather than a blanket re-pin.
+- Feature-list corrections and test-only seam fixes are pre-approved. Keep them
+  scoped and verify the affected feature/test configuration.
+- Submit build/test jobs to the build servers without asking. Never compile on
+  the Mac except macOS-only Metal/ANE type-checks, with
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
 ## Landing execution location
 
 Run portable Cargo checks, Clippy, tests and Nextest on the Linux build server,
 not on the Mac. With the agent shell use `runon: "linux,4c"`. From a shell use
 `ck motor run --vcpus 4 --cwd "$PWD" -- COMMAND...`; it snapshots the current
-checkout, including dirty source. Only release builds being placed here and
-checks requiring Apple frameworks, Metal, Swift or actual macOS behavior belong
-on the Mac.
+checkout, including dirty source. Native Windows checks use the Windows build
+server, not Linux GNU cross-compilation. Only macOS-only Metal/ANE type-checks
+belong on the Mac, with the full Xcode `DEVELOPER_DIR` above. Hardware execution
+still needs the hardware owner's arrangement and explicit opt-ins below.
 
-`scripts/land-gates.sh` routes its portable plan to MOTOR; `--full` adds the
-fixtures, module check/tests and Clippy. When invoked on macOS, narrow
-tests for Apple-only packages and the module's active macOS-gated tests run locally;
-on Linux those native implementations are not verified. On macOS,
-`scripts/train-push.local.sh` joins remote Windows GNU
-cross-Clippy, formatting and repository checks with native
-Clippy for `synapse-module`, `synapse-engine-owned`, `synapse-worker-ane`, plus
-the engine-owned library tests. Native MSVC remains a CI gate. Both halves print
-source-content fingerprints and refuse a mismatched snapshot or a tree changed
-during verification. Each step and the combined wall time are printed. Only
-MOTOR exit 200 (refused before start) retries, every 15 seconds for up to 3 minutes;
-connection loss, timeouts and check failures are never resubmitted.
+`scripts/gate.sh` reads executable push steps from the CI workflows. Phase 1
+runs the guard scripts, workflow/release/doc-contract self-tests and formatting
+on a small Linux job. Phase 2 runs full Linux Clippy/Nextest, native MSVC
+Clippy/Nextest/llama, and Linux llama/parity jobs concurrently. Linux uses one
+16-core nextest run over the union of CI's four shards. Every job prints its
+failing step and duration; the gate prints a phase timing table and preserves
+logs/build evidence under `.cortexkit/internal-docs/investigations/gate/`.
+Independent source snapshots refuse mismatched fingerprints and source changes.
+A refused, cancelled, disconnected or timed-out job is never a pass or silently
+resubmitted. Runner prerequisites are stable Rust with Clippy/rustfmt, Nextest,
+and native MSVC/LLVM on Windows; Phase 1 bootstraps hash-pinned pure-Python
+PyYAML under the ignored target directory without modifying system Python.
+The Linux suite jobs provision hash-pinned CMake 3.31.6 under their temporary
+directory because the shared MOTOR image does not supply CMake. Runner Rust
+toolchains are immutable: the gate probes their versions/components instead of
+trying to update shared rustup state. Keep the provisioned release synchronized
+with CI's moving stable toolchain.
+If locked metadata cannot resolve from the immutable offline Cargo cache, the
+job switches to a writable temporary `CARGO_HOME` with network fetches enabled;
+warm cached jobs keep their existing paths and outputs.
+
+`scripts/train-push.local.sh` invokes this gate before every train without
+changing the shared train driver. For an explicitly chosen small doc-only
+landing, `TRAIN_GATE_FAST=1` uses the previous preflight (`gate.sh --fast`), not
+full parity. The older `land-gates.sh` remains a changed-target iteration helper;
+its `--full` means module coverage, not push-CI parity. Legacy helpers retain
+their Apple-only coverage but are not permission to compile portable code on
+the Mac. Their MOTOR exit-200 retry budget remains 3 minutes; the full gate
+fails immediately on refusal so no unexecuted suite is presented as verified.
 
 Preflight orchestration tests (Python with PyYAML installed):
 
 ```sh
-python3 -m unittest scripts.test_ci_parallel scripts.test_remote_gate scripts.test_land_gates -v
+python3 -m unittest scripts.test_ci_parallel scripts.test_remote_gate scripts.test_land_gates scripts.test_gate -v
 ```
 
 ## Portable module gates
@@ -95,6 +133,6 @@ certification executes extracted candidate assets through same-filesystem hard
 links under development names; never rebuild or copy the attested binaries.
 
 Before committing, inspect the diff and run the filtered tests and formatting for
-what you touched. Use
+what you touched, followed by `scripts/gate.sh` before delivery. Use
 [development verification](../docs/development.md) and
 [backend certification](../docs/backend-certification.md) for exact procedures.

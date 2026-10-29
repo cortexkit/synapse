@@ -17,6 +17,14 @@ def fingerprint():
     names = subprocess.check_output(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
     ).split(b"\0")
+    # NTFS does not preserve POSIX executable bits. The snapshot's Git index
+    # carries those bits across platforms; contents still come from disk.
+    index_modes = {}
+    if os.name == "nt":
+        for entry in subprocess.check_output(["git", "ls-files", "--stage", "-z"]).split(b"\0"):
+            if entry:
+                metadata, name = entry.split(b"\t", 1)
+                index_modes[name] = metadata.split()[0]
     digest = hashlib.sha256()
     for name in sorted(set(names) - {b""}):
         path = Path(os.fsdecode(name))
@@ -27,7 +35,8 @@ def fingerprint():
         if stat.S_ISLNK(mode):
             kind, content = b"symlink", os.fsencode(os.readlink(path))
         elif stat.S_ISREG(mode):
-            kind = b"executable" if mode & 0o111 else b"file"
+            executable = index_modes.get(name) == b"100755" if os.name == "nt" else mode & 0o111
+            kind = b"executable" if executable else b"file"
             content = path.read_bytes()
         else:
             raise ValueError(f"unsupported snapshot input: {path}")

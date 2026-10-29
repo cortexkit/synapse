@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import io
 import os
 from pathlib import Path
+from pathlib import PosixPath
 import runpy
 import subprocess
 import tempfile
@@ -17,6 +18,27 @@ PREFLIGHT = runpy.run_path(str(Path(__file__).with_name("train-preflight.py")))
 
 
 class SnapshotTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "simulates NTFS mode loss on a POSIX host")
+    def test_windows_fingerprint_uses_index_modes_and_disk_contents(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = PosixPath(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "script").write_text("source")
+            (root / "script").chmod(0o755)
+            subprocess.run(["git", "-C", str(root), "add", "script"], check=True)
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                expected = remote_gate.fingerprint()
+                (root / "script").chmod(0o644)
+                with patch.object(remote_gate.os, "name", "nt"), \
+                        patch.object(remote_gate, "Path", PosixPath):
+                    self.assertEqual(remote_gate.fingerprint(), expected)
+                    (root / "script").write_text("dirty")
+                    self.assertNotEqual(remote_gate.fingerprint(), expected)
+            finally:
+                os.chdir(previous)
+
     def test_fingerprint_covers_dirty_untracked_deleted_modes_and_symlinks(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

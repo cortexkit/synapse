@@ -1,7 +1,12 @@
-# This hook is sourced by the train driver. Keep portable compilation on MOTOR;
-# on macOS, join it with Mac-only checks before the driver can push the train.
-python3 scripts/train-preflight.py || refuse "repository preflight failed (see step timings and TREE fingerprints above)"
-say "Remote Windows cross-clippy and native preflight passed; native MSVC remains a CI gate"
+# This repository-owned hook is sourced by the shared train driver. Full push-CI
+# parity is the default; doc-only landings may explicitly choose legacy preflight.
+if [ "${TRAIN_GATE_FAST:-0}" = 1 ]; then
+  bash scripts/gate.sh --fast || refuse "fast repository preflight failed"
+  say "Fast repository preflight passed (not full push-CI parity)"
+else
+  bash scripts/gate.sh || refuse "repository gate failed (see named job/step and phase timings above)"
+  say "Full push-CI parity gate passed"
+fi
 
 # The daily cron on tests.yml is this repository's only scheduled sample of
 # master against the current toolchain and runner images, which a push-only

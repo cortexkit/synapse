@@ -72,7 +72,7 @@ jobs:
           bash synapse/scripts/check-train-preconditions.sh
           python3 synapse/scripts/test-ci-e2e-output.py
           cd synapse
-          python3 -m unittest scripts.test_land_gates scripts.test_ci_parallel -v
+          python3 -m unittest scripts.test_land_gates scripts.test_ci_parallel scripts.test_gate scripts.test_remote_gate -v
 
       - name: Check release-candidate guards
         shell: bash
