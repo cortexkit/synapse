@@ -15,11 +15,11 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import tarfile
 import threading
 import time
 import urllib.request
+import uuid
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -237,9 +237,15 @@ def worker(job, expected):
 
 
 def snapshot(destination):
-    """Copy source inputs, including dirty files, to an independent MOTOR workspace."""
+    """Overlay current source inputs onto a shallow independent local clone."""
     names = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]).split(b"\0")
-    destination.mkdir(parents=True)
+    destination = validate_snapshot_path(destination, destination.name)
+    subprocess.run(["git", "clone", "--quiet", "--depth", "1", "--no-checkout",
+                    Path.cwd().resolve().as_uri(), str(destination)], check=True)
+    subprocess.run(["git", "-C", str(destination), "config", "core.autocrlf", "false"], check=True)
+    # Seed the index without checking out files, so deleted source inputs stay
+    # deleted and tracked-but-ignored files retain their tracked status.
+    subprocess.run(["git", "-C", str(destination), "reset", "--mixed", "--quiet", "HEAD"], check=True)
     for raw in sorted(set(names) - {b""}):
         source = Path(os.fsdecode(raw))
         if not source.exists() and not source.is_symlink():
@@ -250,14 +256,12 @@ def snapshot(destination):
             target.symlink_to(os.readlink(source))
         else:
             shutil.copy2(source, target)
-    subprocess.run(["git", "init", "-q", str(destination)], check=True)
-    subprocess.run(["git", "-C", str(destination), "config", "core.autocrlf", "false"], check=True)
     subprocess.run(["git", "-C", str(destination), "add", "--all"], check=True)
-    # MOTOR snapshots a Git checkout, so give this isolated index a HEAD without
-    # changing the submitting branch or inheriting signing/hooks configuration.
+    # Commit even a clean source snapshot without changing the submitting branch
+    # or inheriting signing/hooks configuration.
     subprocess.run(["git", "-C", str(destination), "-c", "user.name=Synapse gate",
                     "-c", "user.email=gate@localhost", "-c", "commit.gpgsign=false",
-                    "-c", "core.hooksPath=/dev/null", "commit", "-qm", "gate source snapshot"], check=True)
+                    "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-qm", "gate source snapshot"], check=True)
 
 
 class Runner:
@@ -278,7 +282,7 @@ class Runner:
 
     def run(self, job):
         start = time.monotonic()
-        checkout = self.scratch / job.name
+        checkout = validate_snapshot_path(self.scratch / job.name, job.name)
         command = motor_command(
             ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected],
             cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=True,
@@ -338,15 +342,21 @@ def parallel(runner, jobs):
     return failure, results
 
 
-def snapshot_directory():
-    """Keep job snapshots outside the submitting checkout; MOTOR rejects nested roots."""
+def validate_snapshot_path(path, label):
+    """Refuse side checkouts outside the build runner's allowed roots or inside the source."""
     checkout = Path.cwd().resolve()
-    parent = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
-    if parent == checkout or checkout in parent.parents:
-        parent = Path("/tmp").resolve()
-    if parent == checkout or checkout in parent.parents:
-        raise ValueError("no temporary directory outside the submitting checkout")
-    return Path(tempfile.mkdtemp(prefix="synapse-gate-", dir=parent))
+    path = Path(path).resolve()
+    if path == checkout or checkout in path.parents:
+        raise ValueError(f"{label}: snapshot_path_rejected: destination is under the checkout: {path}")
+    if sys.platform == "darwin" and Path("/Users") not in path.parents:
+        raise ValueError(f"{label}: workspace_key_rejected: destination outside runner-owned roots [/Users]: {path}")
+    return path
+
+
+def snapshot_directory():
+    """Use the side-checkout area under the user's home, never the system temp root."""
+    base = Path.home() / "Work/Projects/CortexKit-scratch/synapse-gate"
+    return validate_snapshot_path(base / uuid.uuid4().hex, "snapshot root")
 
 
 def run_gate(phases):
@@ -364,6 +374,10 @@ def run_gate(phases):
         raise KeyboardInterrupt
 
     try:
+        for jobs in phases:
+            for job in jobs:
+                validate_snapshot_path(scratch / job.name, job.name)
+        scratch.mkdir(parents=True)
         evidence.mkdir(parents=True, exist_ok=True)
         for signum in (signal.SIGTERM, signal.SIGINT):
             old_handlers[signum] = signal.signal(signum, interrupt)
@@ -388,7 +402,11 @@ def run_gate(phases):
             signal.signal(signum, handler)
         # All MOTOR clients have joined, including cancelled jobs, before their
         # temporary source checkouts are removed. Retained evidence lives elsewhere.
-        shutil.rmtree(scratch)
+        try:
+            if scratch.exists():
+                shutil.rmtree(scratch)
+        finally:
+            subprocess.run(["git", "worktree", "prune"], check=True)
         if fingerprint() != expected:
             print("FAIL: submitting source changed during verification", flush=True)
             status = status or 1

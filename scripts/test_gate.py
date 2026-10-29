@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import runpy
-import shutil
 import signal
 import subprocess
 import sys
@@ -20,26 +19,48 @@ ROOT = Path(__file__).resolve().parent.parent
 Job, Step = GATE["Job"], GATE["Step"]
 
 
+def commit_fixture(checkout):
+    subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Gate test", "-c", "user.email=gate@localhost",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"], check=True)
+
+
 class PlanTests(unittest.TestCase):
-    def test_snapshot_directory_honors_tmpdir_and_resolves_nested_symlinks(self):
+    def test_macos_side_checkouts_resolve_under_users_not_tmpdir(self):
+        home = Path("/Users/synapse-gate-test")
+        with patch.object(sys, "platform", "darwin"), patch.object(Path, "home", return_value=home), \
+                patch.dict(os.environ, TMPDIR="/private/var/folders/not-a-workspace"):
+            directory = GATE["snapshot_directory"]()
+            self.assertEqual(directory.parent, home / "Work/Projects/CortexKit-scratch/synapse-gate")
+            for jobs in GATE["plan"]():
+                for job in jobs:
+                    destination = GATE["validate_snapshot_path"](directory / job.name, job.name)
+                    self.assertIn(Path("/Users"), destination.parents)
+                    self.assertNotIn(Path.cwd().resolve(), destination.parents)
+
+    def test_invalid_macos_or_nested_destinations_refuse_up_front_by_name(self):
+        with patch.object(sys, "platform", "darwin"), patch.object(Path, "mkdir") as mkdir:
+            with self.assertRaisesRegex(ValueError, "quick: workspace_key_rejected.*outside runner-owned roots"):
+                GATE["validate_snapshot_path"](Path("/private/tmp/synapse-gate/quick"), "quick")
+            with self.assertRaisesRegex(ValueError, "quick: snapshot_path_rejected.*under the checkout"):
+                GATE["validate_snapshot_path"](Path.cwd() / "target/quick", "quick")
+            with patch.object(Path, "home", return_value=Path("/private/tmp/home")):
+                with self.assertRaisesRegex(ValueError, "snapshot root: workspace_key_rejected"):
+                    GATE["snapshot_directory"]()
+            mkdir.assert_not_called()
+
+    def test_side_checkout_base_resolves_symlinks_before_accepting_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkout, outside = root / "checkout", root / "outside"
-            inside = checkout / "target/tmp"
-            inside.mkdir(parents=True)
-            outside.mkdir()
-            alias = root / "tmp-alias"
-            alias.symlink_to(inside, target_is_directory=True)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            alias = root / "home-alias"
+            alias.symlink_to(checkout, target_is_directory=True)
             previous = Path.cwd()
             try:
                 os.chdir(checkout)
-                for configured, expected in ((outside, outside.resolve()), (alias, Path("/tmp").resolve())):
-                    with patch.dict(os.environ, TMPDIR=str(configured)):
-                        snapshot = GATE["snapshot_directory"]()
-                    try:
-                        self.assertEqual(snapshot.parent, expected)
-                    finally:
-                        shutil.rmtree(snapshot)
+                with patch.object(Path, "home", return_value=alias):
+                    with self.assertRaisesRegex(ValueError, "snapshot root: snapshot_path_rejected"):
+                        GATE["snapshot_directory"]()
             finally:
                 os.chdir(previous)
 
@@ -53,6 +74,7 @@ class PlanTests(unittest.TestCase):
             (source / "deleted").write_text("remove me")
             (source / ".gitignore").write_text("ignored\n")
             subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            commit_fixture(source)
             (source / "tracked").write_text("dirty")
             (source / "deleted").unlink()
             (source / "new").write_text("untracked")
@@ -68,6 +90,8 @@ class PlanTests(unittest.TestCase):
                 subprocess.run(["git", "rev-parse", "--verify", "HEAD"], check=True, capture_output=True)
                 self.assertFalse((copy / "ignored").exists())
                 self.assertFalse((copy / "deleted").exists())
+                self.assertTrue((copy / ".git/shallow").is_file())
+                self.assertTrue((copy / ".git").is_dir())
             finally:
                 os.chdir(previous)
 
@@ -171,7 +195,7 @@ else:
                     self.assertEqual(environment["CARGO_HOME"], "/immutable-cache")
                     self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
 
-    def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False):
+    def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False, outside_roots=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools, events = root / "bin", root / "events"
@@ -186,6 +210,10 @@ else:
                 (checkout / ".github/workflows" / name).write_text((ROOT / ".github/workflows" / name).read_text())
             subprocess.run(["git", "init", "-q", str(checkout)], check=True)
             subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+            commit_fixture(checkout)
+            home = root / "home"
+            allowed_root = home / "Work/Projects/CortexKit-scratch/synapse-gate"
+            allowed_root.mkdir(parents=True)
             nested_temp = checkout / "target/custom-tmp"
             nested_temp.mkdir(parents=True)
             ck = tools / "ck"
@@ -202,6 +230,10 @@ cwd = Path(args[args.index('--cwd') + 1]).resolve()
 checkout = Path(os.environ['FAKE_CHECKOUT']).resolve()
 if checkout in cwd.parents:
     print('lease_mismatch: --cwd overlaps the submitting checkout', flush=True)
+    sys.exit(200)
+allowed_roots = [Path(value).resolve() for value in json.loads(os.environ['FAKE_ALLOWED_ROOTS'])]
+if not any(cwd == allowed or allowed in cwd.parents for allowed in allowed_roots):
+    print('workspace_key_rejected: destination outside runner-owned roots: path=' + str(cwd), flush=True)
     sys.exit(200)
 def cancelled(signum, frame):
     (events / (name + '.cancelled')).touch()
@@ -230,12 +262,13 @@ sys.exit(status)
             phases = (first, second) if two_phases else (first,)
             evidence = root / "evidence"
             evidence.mkdir()
-            runner = GATE["Runner"]("tree", root / "snapshots", evidence)
+            runner = GATE["Runner"]("tree", root / "unowned" if outside_roots else allowed_root / "test-run", evidence)
             output = io.StringIO()
             status = 0
             with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                             FAKE_EVENTS=str(events), FAKE_STATUSES=json.dumps(statuses),
-                            FAKE_CHECKOUT=str(checkout), TMPDIR=str(nested_temp),
+                            FAKE_CHECKOUT=str(checkout), FAKE_ALLOWED_ROOTS=json.dumps([str(allowed_root)]),
+                            HOME=str(home), TMPDIR=str(nested_temp),
                             FAKE_HOLD="1" if interrupt or any(statuses.get(j.name, 0) for j in second) else "0"), \
                     redirect_stdout(output):
                 results = []
@@ -276,6 +309,8 @@ sys.exit(status)
                     cwd = Path(args[args.index("--cwd") + 1]).resolve()
                     self.assertNotIn(checkout.resolve(), cwd.parents,
                                      "MOTOR --cwd must not be beneath the checkout, including target/")
+                    self.assertIn(allowed_root.resolve(), cwd.parents,
+                                  "MOTOR --cwd must resolve under its runner-owned roots")
                     self.assertFalse(cwd.parent.exists(), "temporary snapshots must be removed after joining jobs")
             return status, results, recorded, completed, output.getvalue()
 
@@ -284,6 +319,12 @@ sys.exit(status)
         self.assertEqual(status, 0, output)
         self.assertEqual(len(recorded), 4)
         self.assertIn("Phase 2", output)
+
+    def test_fake_motor_rejects_destinations_outside_allowed_roots(self):
+        status, _, recorded, _, output = self.invoke({}, two_phases=False, outside_roots=True)
+        self.assertEqual(status, 200, output)
+        self.assertEqual(set(recorded), {"quick"})
+        self.assertIn("workspace_key_rejected: destination outside runner-owned roots", output)
 
     def test_snapshot_cleanup_after_job_failure(self):
         status, _, _, completed, output = self.invoke({"windows-suite": 7}, through_gate=True)
@@ -300,13 +341,55 @@ sys.exit(status)
     def test_snapshot_cleanup_when_evidence_setup_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory) / "snapshot"
-            scratch.mkdir()
+            mkdir = Path.mkdir
+
+            def setup(path, *args, **kwargs):
+                if path.parts[0] == ".cortexkit":
+                    raise PermissionError("evidence directory is not writable")
+                return mkdir(path, *args, **kwargs)
+
+            def prune(command, **kwargs):
+                self.assertEqual(command, ["git", "worktree", "prune"])
+                self.assertFalse(scratch.exists())
+                return subprocess.CompletedProcess(command, 0)
+
             with redirect_stdout(io.StringIO()), \
                     patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda: scratch), \
-                    patch.object(Path, "mkdir", side_effect=PermissionError("evidence directory is not writable")):
+                    patch.object(Path, "mkdir", setup), patch.object(subprocess, "run", side_effect=prune) as run:
                 with self.assertRaises(PermissionError):
                     GATE["run_gate"](([], []))
+                run.assert_called_once()
             self.assertFalse(scratch.exists())
+
+    def test_partial_clone_is_removed_and_pruned_before_any_job_starts(self):
+        phases = GATE["plan"]()
+        with tempfile.TemporaryDirectory() as directory:
+            source, scratch = Path(directory) / "source", Path(directory) / "run"
+            source.mkdir()
+            previous = Path.cwd()
+
+            def incomplete_clone(destination):
+                (destination / ".git").mkdir(parents=True)
+                raise subprocess.CalledProcessError(1, ["git", "clone"])
+
+            def prune(command, **kwargs):
+                self.assertEqual(command, ["git", "worktree", "prune"])
+                self.assertFalse(scratch.exists())
+                return subprocess.CompletedProcess(command, 0)
+
+            try:
+                os.chdir(source)
+                with redirect_stdout(io.StringIO()), \
+                        patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda: scratch,
+                                   snapshot=incomplete_clone), \
+                        patch.object(subprocess, "run", side_effect=prune) as run, \
+                        patch.object(GATE["Runner"], "run") as submit:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        GATE["run_gate"](phases)
+                    run.assert_called_once()
+                    submit.assert_not_called()
+            finally:
+                os.chdir(previous)
 
     def test_parallel_launch_platforms_resources_and_snapshot_isolation(self):
         status, results, recorded, completed, output = self.invoke({})
@@ -348,9 +431,9 @@ sys.exit(status)
             output = io.StringIO()
             with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), \
                     patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot=lambda _: None,
+                               snapshot_directory=lambda: Path(directory),
                                parallel=lambda runner, jobs: (status, {jobs[0].name: (status, .25)})), \
-                    patch.object(Path, "mkdir"), \
-                    patch.object(tempfile, "mkdtemp", return_value=directory):
+                    patch.object(Path, "mkdir"):
                 self.assertEqual(GATE["run_gate"]((first, second)), status)
             self.assertIn("PHASE TIMING | seconds | result", output.getvalue())
             self.assertIn("Phase 1", output.getvalue())
