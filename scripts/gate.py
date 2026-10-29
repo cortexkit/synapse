@@ -236,7 +236,7 @@ def worker(job, expected):
     return status
 
 
-def snapshot(destination):
+def snapshot(destination, allowed_roots):
     """Overlay current source inputs onto a detached worktree of this repository.
 
     MOTOR ships a checkout to the runner as a git bundle against history the
@@ -246,7 +246,7 @@ def snapshot(destination):
     `git worktree prune` cleans it up after `rmtree`.
     """
     names = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]).split(b"\0")
-    destination = validate_snapshot_path(destination, destination.name)
+    destination = validate_snapshot_path(destination, destination.name, allowed_roots)
     subprocess.run(["git", "worktree", "add", "--quiet", "--detach", "--no-checkout",
                     str(destination), "HEAD"], check=True)
     # Seed the index without checking out files, so deleted source inputs stay
@@ -271,8 +271,9 @@ def snapshot(destination):
 
 
 class Runner:
-    def __init__(self, expected, scratch, evidence):
+    def __init__(self, expected, scratch, evidence, allowed_roots):
         self.expected, self.scratch, self.evidence = expected, scratch, evidence
+        self.allowed_roots = tuple(allowed_roots)
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.active = {}
@@ -288,7 +289,7 @@ class Runner:
 
     def run(self, job):
         start = time.monotonic()
-        checkout = validate_snapshot_path(self.scratch / job.name, job.name)
+        checkout = validate_snapshot_path(self.scratch / job.name, job.name, self.allowed_roots)
         command = motor_command(
             ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected],
             cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=True,
@@ -348,30 +349,33 @@ def parallel(runner, jobs):
     return failure, results
 
 
-def validate_snapshot_path(path, label):
+def validate_snapshot_path(path, label, allowed_roots):
     """Refuse side checkouts outside the build runner's allowed roots or inside the source."""
     checkout = Path.cwd().resolve()
     path = Path(path).resolve()
     if path == checkout or checkout in path.parents:
         raise ValueError(f"{label}: snapshot_path_rejected: destination is under the checkout: {path}")
-    if sys.platform == "darwin" and Path("/Users") not in path.parents:
-        raise ValueError(f"{label}: workspace_key_rejected: destination outside runner-owned roots [/Users]: {path}")
+    roots = [Path(root).resolve() for root in allowed_roots]
+    if roots and not any(path == root or root in path.parents for root in roots):
+        names = ", ".join(str(root) for root in roots)
+        raise ValueError(f"{label}: workspace_key_rejected: destination outside runner-owned roots [{names}]: {path}")
     return path
 
 
-def snapshot_directory():
+def snapshot_directory(allowed_roots):
     """Use the side-checkout area under the user's home, never the system temp root."""
     base = Path.home() / "Work/Projects/CortexKit-scratch/synapse-gate"
-    return validate_snapshot_path(base / uuid.uuid4().hex, "snapshot root")
+    return validate_snapshot_path(base / uuid.uuid4().hex, "snapshot root", allowed_roots)
 
 
-def run_gate(phases):
+def run_gate(phases, allowed_roots):
     start = time.monotonic()
     expected = fingerprint()
     print(f"TREE requested {expected}", flush=True)
-    scratch = snapshot_directory()
+    allowed_roots = tuple(allowed_roots)
+    scratch = snapshot_directory(allowed_roots)
     evidence = Path(".cortexkit/internal-docs/investigations/gate") / scratch.name
-    runner = Runner(expected, scratch, evidence)
+    runner = Runner(expected, scratch, evidence, allowed_roots)
     timings, status = [], 1
     old_handlers = {}
 
@@ -382,7 +386,7 @@ def run_gate(phases):
     try:
         for jobs in phases:
             for job in jobs:
-                validate_snapshot_path(scratch / job.name, job.name)
+                validate_snapshot_path(scratch / job.name, job.name, allowed_roots)
         scratch.mkdir(parents=True)
         evidence.mkdir(parents=True, exist_ok=True)
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -390,7 +394,7 @@ def run_gate(phases):
         # Prepare independent identical checkouts before any compiler starts.
         for jobs in phases:
             for job in jobs:
-                snapshot(scratch / job.name)
+                snapshot(scratch / job.name, allowed_roots)
         if fingerprint() != expected:
             raise ValueError("source changed while preparing snapshots")
         status = 0
@@ -442,7 +446,8 @@ def main():
         if args.plan:
             print(json.dumps([[asdict(job) for job in jobs] for jobs in phases], indent=2))
             return 0
-        return run_gate(phases)
+        allowed_roots = (Path("/Users"),) if sys.platform == "darwin" else ()
+        return run_gate(phases, allowed_roots)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"gate: {error}", file=sys.stderr)
         return 1

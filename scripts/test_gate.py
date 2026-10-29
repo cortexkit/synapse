@@ -1,6 +1,7 @@
 """Push parity selection and fail-fast fan-out without submitting real builds."""
 
 from contextlib import redirect_stdout
+from dataclasses import asdict
 import io
 import json
 import os
@@ -29,24 +30,49 @@ class PlanTests(unittest.TestCase):
         home = Path("/Users/synapse-gate-test")
         with patch.object(sys, "platform", "darwin"), patch.object(Path, "home", return_value=home), \
                 patch.dict(os.environ, TMPDIR="/private/var/folders/not-a-workspace"):
-            directory = GATE["snapshot_directory"]()
+            directory = GATE["snapshot_directory"]((Path("/Users"),))
             self.assertEqual(directory.parent, home / "Work/Projects/CortexKit-scratch/synapse-gate")
             for jobs in GATE["plan"]():
                 for job in jobs:
-                    destination = GATE["validate_snapshot_path"](directory / job.name, job.name)
+                    destination = GATE["validate_snapshot_path"](directory / job.name, job.name, (Path("/Users"),))
                     self.assertIn(Path("/Users"), destination.parents)
                     self.assertNotIn(Path.cwd().resolve(), destination.parents)
 
     def test_invalid_macos_or_nested_destinations_refuse_up_front_by_name(self):
         with patch.object(sys, "platform", "darwin"), patch.object(Path, "mkdir") as mkdir:
             with self.assertRaisesRegex(ValueError, "quick: workspace_key_rejected.*outside runner-owned roots"):
-                GATE["validate_snapshot_path"](Path("/private/tmp/synapse-gate/quick"), "quick")
+                GATE["validate_snapshot_path"](Path("/private/tmp/synapse-gate/quick"), "quick", (Path("/Users"),))
             with self.assertRaisesRegex(ValueError, "quick: snapshot_path_rejected.*under the checkout"):
-                GATE["validate_snapshot_path"](Path.cwd() / "target/quick", "quick")
+                GATE["validate_snapshot_path"](Path.cwd() / "target/quick", "quick", (Path("/Users"),))
             with patch.object(Path, "home", return_value=Path("/private/tmp/home")):
                 with self.assertRaisesRegex(ValueError, "snapshot root: workspace_key_rejected"):
-                    GATE["snapshot_directory"]()
+                    GATE["snapshot_directory"]((Path("/Users"),))
             mkdir.assert_not_called()
+
+    def test_explicit_allowed_roots_are_independent_of_host_and_tmpdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "source"
+            source.mkdir()
+            previous = Path.cwd()
+            try:
+                os.chdir(source)
+                for host in ("darwin", "linux"):
+                    with patch.object(sys, "platform", host):
+                        destination = root / "run/quick"
+                        self.assertEqual(GATE["validate_snapshot_path"](destination, "quick", (root,)), destination)
+                        with self.assertRaisesRegex(ValueError, "quick: workspace_key_rejected"):
+                            GATE["validate_snapshot_path"](destination, "quick", (root / "other",))
+            finally:
+                os.chdir(previous)
+
+    def test_entry_point_selects_native_default_allowed_roots(self):
+        phases = ([], [])
+        for host, expected in (("darwin", (Path("/Users"),)), ("linux", ())):
+            with patch.object(sys, "platform", host), patch.object(sys, "argv", ["gate.py"]), \
+                    patch.dict(GATE["main"].__globals__, plan=lambda: phases), \
+                    patch.dict(GATE["main"].__globals__, run_gate=lambda actual, roots: (actual, roots)):
+                self.assertEqual(GATE["main"](), (phases, expected))
 
     def test_side_checkout_base_resolves_symlinks_before_accepting_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -60,7 +86,7 @@ class PlanTests(unittest.TestCase):
                 os.chdir(checkout)
                 with patch.object(Path, "home", return_value=alias):
                     with self.assertRaisesRegex(ValueError, "snapshot root: snapshot_path_rejected"):
-                        GATE["snapshot_directory"]()
+                        GATE["snapshot_directory"]((root,))
             finally:
                 os.chdir(previous)
 
@@ -84,14 +110,17 @@ class PlanTests(unittest.TestCase):
             try:
                 os.chdir(source)
                 before = GATE["fingerprint"]()
-                GATE["snapshot"](copy)
+                GATE["snapshot"](copy, (root,))
                 os.chdir(copy)
                 self.assertEqual(GATE["fingerprint"](), before)
                 subprocess.run(["git", "rev-parse", "--verify", "HEAD"], check=True, capture_output=True)
                 self.assertFalse((copy / "ignored").exists())
                 self.assertFalse((copy / "deleted").exists())
-                self.assertTrue((copy / ".git/shallow").is_file())
-                self.assertTrue((copy / ".git").is_dir())
+                self.assertTrue((copy / ".git").is_file())
+                common = subprocess.check_output(["git", "rev-parse", "--git-common-dir"], text=True).strip()
+                self.assertEqual((copy / common).resolve(), (source / ".git").resolve())
+                self.assertFalse((source / ".git/shallow").exists())
+                self.assertNotEqual(subprocess.run(["git", "symbolic-ref", "-q", "HEAD"]).returncode, 0)
             finally:
                 os.chdir(previous)
 
@@ -262,7 +291,7 @@ sys.exit(status)
             phases = (first, second) if two_phases else (first,)
             evidence = root / "evidence"
             evidence.mkdir()
-            runner = GATE["Runner"]("tree", root / "unowned" if outside_roots else allowed_root / "test-run", evidence)
+            runner = GATE["Runner"]("tree", root / "unowned" if outside_roots else allowed_root / "test-run", evidence, (root,))
             output = io.StringIO()
             status = 0
             with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
@@ -273,13 +302,24 @@ sys.exit(status)
                     redirect_stdout(output):
                 results = []
                 if interrupt:
-                    child = subprocess.Popen([sys.executable, str(ROOT / "scripts/gate.py")], cwd=checkout,
+                    # The fixture changes HOME. Pass the parent's plan so the
+                    # child does not need a YAML package installed in that home.
+                    child = subprocess.Popen([sys.executable, "-c",
+                                              "import json,runpy,sys; from pathlib import Path; gate=runpy.run_path(sys.argv[1]); "
+                                              "phases=[[gate['Job'](**job) for job in phase] for phase in json.loads(sys.argv[3])]; "
+                                              "raise SystemExit(gate['run_gate'](phases, (Path(sys.argv[2]),)))",
+                                              str(ROOT / "scripts/gate.py"), str(root),
+                                              json.dumps([[asdict(job) for job in jobs] for jobs in phases])], cwd=checkout,
                                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                     try:
-                        deadline = time.monotonic() + 10
+                        # Real Git worktree preparation can be slow on macOS.
+                        deadline = time.monotonic() + 60
                         while not all((events / (j.name + ".ready")).exists() for j in second):
                             if child.poll() is not None or time.monotonic() > deadline:
-                                self.fail("gate did not launch every parallel job before interrupt")
+                                if child.poll() is None:
+                                    child.terminate()
+                                text, _ = child.communicate(timeout=10)
+                                self.fail("gate did not launch every parallel job before interrupt:\n" + text)
                             time.sleep(.01)
                         child.send_signal(signal.SIGINT)
                         text, _ = child.communicate(timeout=10)
@@ -287,13 +327,17 @@ sys.exit(status)
                         status = child.returncode
                     finally:
                         if child.poll() is None:
-                            child.kill()
-                            child.communicate()
+                            child.terminate()
+                            try:
+                                child.communicate(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                child.kill()
+                                child.communicate()
                 elif through_gate:
                     previous = Path.cwd()
                     try:
                         os.chdir(checkout)
-                        status = GATE["run_gate"](phases)
+                        status = GATE["run_gate"](phases, (root,))
                     finally:
                         os.chdir(previous)
                 else:
@@ -354,40 +398,48 @@ sys.exit(status)
                 return subprocess.CompletedProcess(command, 0)
 
             with redirect_stdout(io.StringIO()), \
-                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda: scratch), \
+                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda roots: scratch), \
                     patch.object(Path, "mkdir", setup), patch.object(subprocess, "run", side_effect=prune) as run:
                 with self.assertRaises(PermissionError):
-                    GATE["run_gate"](([], []))
+                    GATE["run_gate"](([], []), (Path(directory),))
                 run.assert_called_once()
             self.assertFalse(scratch.exists())
 
-    def test_partial_clone_is_removed_and_pruned_before_any_job_starts(self):
+    def test_partial_worktree_is_removed_and_pruned_before_any_job_starts(self):
         phases = GATE["plan"]()
         with tempfile.TemporaryDirectory() as directory:
             source, scratch = Path(directory) / "source", Path(directory) / "run"
             source.mkdir()
+            (source / "input").write_text("fixture")
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            commit_fixture(source)
             previous = Path.cwd()
+            git = subprocess.run
 
-            def incomplete_clone(destination):
-                (destination / ".git").mkdir(parents=True)
-                raise subprocess.CalledProcessError(1, ["git", "clone"])
+            def incomplete_worktree(destination, allowed_roots):
+                command = ["git", "worktree", "add", "--quiet", "--detach", "--no-checkout", str(destination), "HEAD"]
+                git(command, check=True)
+                raise subprocess.CalledProcessError(1, command)
 
             def prune(command, **kwargs):
                 self.assertEqual(command, ["git", "worktree", "prune"])
                 self.assertFalse(scratch.exists())
-                return subprocess.CompletedProcess(command, 0)
+                return git(command, check=True)
 
             try:
                 os.chdir(source)
                 with redirect_stdout(io.StringIO()), \
-                        patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda: scratch,
-                                   snapshot=incomplete_clone), \
+                        patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot_directory=lambda roots: scratch,
+                                   snapshot=incomplete_worktree), \
                         patch.object(subprocess, "run", side_effect=prune) as run, \
                         patch.object(GATE["Runner"], "run") as submit:
                     with self.assertRaises(subprocess.CalledProcessError):
-                        GATE["run_gate"](phases)
+                        GATE["run_gate"](phases, (Path(directory),))
                     run.assert_called_once()
                     submit.assert_not_called()
+                listing = git(["git", "worktree", "list", "--porcelain"], capture_output=True, text=True, check=True).stdout
+                self.assertNotIn(str(scratch), listing)
             finally:
                 os.chdir(previous)
 
@@ -430,11 +482,12 @@ sys.exit(status)
         for status in (0, 200):
             output = io.StringIO()
             with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), \
-                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot=lambda _: None,
-                               snapshot_directory=lambda: Path(directory),
+                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot=lambda destination, roots: None,
+                               snapshot_directory=lambda roots: Path(directory),
                                parallel=lambda runner, jobs: (status, {jobs[0].name: (status, .25)})), \
-                    patch.object(Path, "mkdir"):
-                self.assertEqual(GATE["run_gate"]((first, second)), status)
+                    patch.object(Path, "mkdir"), \
+                    patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+                self.assertEqual(GATE["run_gate"]((first, second), (Path(directory),)), status)
             self.assertIn("PHASE TIMING | seconds | result", output.getvalue())
             self.assertIn("Phase 1", output.getvalue())
             self.assertIn("PASS" if status == 0 else "FAIL", output.getvalue())

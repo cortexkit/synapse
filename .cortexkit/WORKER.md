@@ -55,13 +55,15 @@ Clippy/Nextest/llama, and Linux llama/parity jobs concurrently. Linux uses one
 16-core nextest run over the union of CI's four shards. Every job prints its
 failing step and duration; the gate prints a phase timing table and preserves
 logs/build evidence under `.cortexkit/internal-docs/investigations/gate/`.
-Independent shallow local clones live under
+Independent detached Git worktrees live under
 `~/Work/Projects/CortexKit-scratch/synapse-gate/<run-id>/<job>/`, outside the
 checkout. The macOS MOTOR build runner requires workspace paths under `/Users`; system
 temporary directories are not admissible. The gate refuses invalid or nested
-destinations before creating clones or submitting jobs. Snapshots refuse
-mismatched fingerprints/source changes and are removed after all jobs join,
-including failure and interruption, followed by `git worktree prune`.
+destinations before creating worktrees or submitting jobs. Each worktree contains
+the submitted tracked and non-ignored untracked source inputs. Its source-content
+fingerprint must match the submitting tree and remain unchanged during checks.
+Worktrees are removed after all jobs join, including failure and interruption,
+followed by `git worktree prune`.
 A refused, cancelled, disconnected or timed-out job is never a pass or silently
 resubmitted. Runner prerequisites are stable Rust with Clippy/rustfmt, Nextest,
 and native MSVC/LLVM on Windows; Phase 1 bootstraps hash-pinned pure-Python
