@@ -269,10 +269,10 @@ class PlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unmapped CI expression"):
             GATE["render"]("echo ${{ inputs.unhandled }}", "linux")
 
-    def test_train_hook_defaults_to_full_with_explicit_fast_escape(self):
+    def test_train_hook_defaults_to_fast_with_explicit_full_opt_in(self):
         hook = (ROOT / "scripts/train-push.local.sh").read_text()
         self.assertIn("scripts/gate.sh", hook)
-        self.assertIn("TRAIN_GATE_FAST", hook)
+        self.assertIn("TRAIN_GATE_FULL", hook)
         self.assertNotIn("python3 scripts/train-preflight.py", hook)
         gate = (ROOT / "scripts/gate.sh").read_text()
         self.assertIn('"$job" != quick', gate)
@@ -286,14 +286,14 @@ class PlanTests(unittest.TestCase):
             tools.mkdir()
             (tools / "gh").write_text("#!/bin/sh\nexit 0\n")
             (tools / "gh").chmod(0o755)
-            for fast, status in (("0", "0"), ("1", "0"), ("0", "7"), ("1", "7")):
+            for full, status in (("0", "0"), ("1", "0"), ("0", "7"), ("1", "7")):
                 result = subprocess.run(["bash", "-uc", 'refuse() { echo "$*"; exit 1; }; say() { :; }; source "$1"',
                                          "hook-test", str(ROOT / "scripts/train-push.local.sh")], cwd=root,
                                         env=dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
-                                                 TRAIN_GATE_FAST=fast, GATE_STATUS=status, GATE_ARGS=str(root / "args")),
+                                                 TRAIN_GATE_FULL=full, GATE_STATUS=status, GATE_ARGS=str(root / "args")),
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0 if status == "0" else 1, result.stdout + result.stderr)
-                self.assertEqual((root / "args").read_text().strip(), "--fast" if fast == "1" else "")
+                self.assertEqual((root / "args").read_text().strip(), "" if full == "1" else "--fast")
 
 
 class FanoutTests(unittest.TestCase):

@@ -1,6 +1,9 @@
-# This repository-owned hook is sourced by the shared train driver. Full push-CI
-# parity is the default; doc-only landings may explicitly choose legacy preflight.
-if [ "${TRAIN_GATE_FAST:-0}" = 1 ]; then
+# This repository-owned hook is sourced by the shared train driver. The fast
+# preflight is the default until the build server's Windows images carry what
+# Synapse's Windows CI job needs (Python and LLVM's libclang); until then the
+# full gate's Windows job stops on a missing prerequisite, not on our code.
+# TRAIN_GATE_FULL=1 runs full push-CI parity.
+if [ "${TRAIN_GATE_FULL:-0}" != 1 ]; then
   bash scripts/gate.sh --fast || refuse "fast repository preflight failed"
   say "Fast repository preflight passed (not full push-CI parity)"
 else

@@ -93,9 +93,11 @@ job switches to a writable temporary `CARGO_HOME` with network fetches enabled;
 warm cached jobs keep their existing paths and outputs.
 
 `scripts/train-push.local.sh` invokes this gate before every train without
-changing the shared train driver. For an explicitly chosen small doc-only
-landing, `TRAIN_GATE_FAST=1` uses the previous preflight (`gate.sh --fast`), not
-full parity. The older `land-gates.sh` remains a changed-target iteration helper;
+changing the shared train driver. Trains run the fast preflight
+(`gate.sh --fast`) by default until the build server's Windows images carry
+Python and LLVM's libclang; `TRAIN_GATE_FULL=1` runs full push-CI parity.
+Workers run the full `scripts/gate.sh` from the head's shell, since worker
+sandboxes cannot reach the build-server connection. The older `land-gates.sh` remains a changed-target iteration helper;
 its `--full` means module coverage, not push-CI parity. Legacy helpers retain
 their Apple-only coverage but are not permission to compile portable code on
 the Mac. Their MOTOR exit-200 retry budget remains 3 minutes; the full gate
