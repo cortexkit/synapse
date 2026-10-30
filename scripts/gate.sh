@@ -52,4 +52,11 @@ PY
     export PATH="$gate_tools/cmake/data/bin:$PATH"
   fi
 fi
-exec python3 scripts/gate.py "$@"
+# Windows runners may provide Python only as `python` or the `py` launcher.
+for interpreter in python3 python "py -3"; do
+  if $interpreter -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    exec $interpreter scripts/gate.py "$@"
+  fi
+done
+echo "FAIL gate prerequisite: no Python 3.11+ found as python3, python or py -3" >&2
+exit 127
