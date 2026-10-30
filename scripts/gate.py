@@ -140,7 +140,10 @@ def plan():
                 else:
                     steps.append(converted)
         environment = dict(env, CARGO_NET_OFFLINE="true") if platform == "windows" else env
-        lanes[platform] = Job(platform + "-suite", platform, 12 if platform == "linux" else 2, steps, environment)
+        # Ask for the cores a full workspace build keeps busy, not more: a
+        # build-server job holds every requested slot (and memory per slot)
+        # for its whole run.
+        lanes[platform] = Job(platform + "-suite", platform, 8 if platform == "linux" else 2, steps, environment)
     phases = [Job("quick", "linux", 4, quick, env)], [
         lanes["linux"], lanes["windows"], Job("linux-llama-parity", "linux", 4, parity, env)]
     for jobs in phases:

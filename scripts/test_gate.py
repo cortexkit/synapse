@@ -46,7 +46,9 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "quick: workspace_key_rejected.*outside runner-owned roots"):
                 GATE["validate_snapshot_path"](Path("/private/tmp/synapse-gate/quick"), "quick", (Path("/Users"),))
             with self.assertRaisesRegex(ValueError, "quick: snapshot_path_rejected.*under the checkout"):
-                GATE["validate_snapshot_path"](Path.cwd() / "target/quick", "quick", (Path("/Users"),))
+                # A path that is not a symlink: a landing checkout's `target`
+                # can link outside /Users, which trips the roots check first.
+                GATE["validate_snapshot_path"](Path.cwd() / "scripts/quick", "quick", (Path("/Users"),))
             with patch.object(Path, "home", return_value=Path("/private/tmp/home")):
                 with self.assertRaisesRegex(ValueError, "snapshot root: workspace_key_rejected"):
                     GATE["snapshot_directory"]((Path("/Users"),))
@@ -155,7 +157,7 @@ class PlanTests(unittest.TestCase):
         first, second = GATE["plan"]()
         self.assertEqual([(j.name, j.platform, j.vcpus) for j in first], [("quick", "linux", 4)])
         self.assertEqual([(j.name, j.platform, j.vcpus) for j in second], [
-            ("linux-suite", "linux", 12), ("windows-suite", "windows", 2),
+            ("linux-suite", "linux", 8), ("windows-suite", "windows", 2),
             ("linux-llama-parity", "linux", 4)])
         for job in second[:2]:
             scripts = "\n".join(s.script for s in job.steps)
@@ -618,7 +620,7 @@ sys.exit(status)
             self.assertEqual(platform, "windows" if name == "windows-suite" else "linux")
             if platform == "linux":
                 self.assertIn("--net", args)
-                self.assertEqual(args[args.index("--vcpus") + 1], "12" if name == "linux-suite" else "4")
+                self.assertEqual(args[args.index("--vcpus") + 1], "8" if name == "linux-suite" else "4")
             else:
                 self.assertNotIn("--net", args)
                 self.assertNotIn("--vcpus", args)
