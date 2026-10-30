@@ -4010,6 +4010,7 @@ impl ModuleHandler for SynapseHandler {
                             .initialize(&ack)
                             .map_err(|error| error.to_string())?;
                         let _ = handler.inner.state.set(Arc::clone(&state));
+                        start_catalog_revalidation(Arc::clone(&state));
                         let _ = start_perf_sampler(state);
                         Ok(())
                     })
@@ -26995,6 +26996,61 @@ mod catalog_runtime_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// After an OS update the self-check key changes, so a lane that served
+    /// before reads `pending`. Startup must pick it up for revalidation (a
+    /// consumer gating on `certified` would never load it), but must not
+    /// auto-load a fresh install that never passed.
+    #[test]
+    fn startup_revalidates_only_lanes_that_passed_under_an_earlier_key() {
+        let (root, state) = isolated_catalog_state("revalidate-after-os-update", true);
+        let entry = state
+            .runtime
+            .release_catalog
+            .entry("gte-modernbert-base")
+            .unwrap()
+            .clone();
+        let backend = entry.backend("metal").unwrap().clone();
+        state
+            .store
+            .store
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO catalog_installs VALUES (?1,?2,?3)",
+                    rusqlite::params![entry.id, entry.manifest_digest(), backend.backend],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let selected = |state: &ModuleState| {
+            catalog_lanes_needing_revalidation(state)
+                .unwrap()
+                .into_iter()
+                .map(|(entry, backend)| catalog::lane_id(&entry.id, &backend.backend))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            selected(&state).is_empty(),
+            "a fresh install that never passed loads on first use, not at startup"
+        );
+        // The same lane passed before the OS update, under the old build.
+        let (id, key) = catalog_self_check_key(&state, &entry, &backend).unwrap();
+        let mut old_key = key.clone();
+        old_key["os_build"] = json!("previous-os-build");
+        let old_id = format!("{id}-previous-os-build");
+        let generation = catalog_check_generation(&state, &old_id, &old_key).unwrap();
+        assert!(catalog_complete_check(&state, &old_id, generation, "passed", None).unwrap());
+        assert_eq!(
+            selected(&state),
+            vec!["gte-modernbert-base-metal".to_string()]
+        );
+        // Once it passes under the current key, there is nothing left to do.
+        let generation = catalog_check_generation(&state, &id, &key).unwrap();
+        assert!(catalog_complete_check(&state, &id, generation, "passed", None).unwrap());
+        assert!(selected(&state).is_empty());
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn catalog_download_streams_pinned_files_commits_and_reuses_without_network() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28721,6 +28777,77 @@ fn sync_installed_catalog_slots(state: &ModuleState) -> Result<(), WireOperation
     }
     Ok(())
 }
+/// Installed catalog lanes that passed a self-check before, but have no result
+/// under their current key. The key includes the OS build, so an OS update
+/// leaves every lane in use here, and `models.list` reports it `certified:
+/// false` until something loads it. A consumer that gates on that flag never
+/// sends the request that would load it, so startup checks these lanes itself.
+/// Lanes that never passed (fresh installs) are left to load on first use.
+fn catalog_lanes_needing_revalidation(
+    state: &ModuleState,
+) -> Result<Vec<(catalog::CatalogEntry, catalog::CatalogBackend)>, WireOperationError> {
+    let mut lanes = Vec::new();
+    for entry in &state.runtime.release_catalog.models {
+        for backend in &entry.backends {
+            if !state.runtime.runnable_backends.contains(&backend.backend)
+                || current_catalog_install(state, entry, &backend.backend)?.is_none()
+                || catalog_self_check_projection(state, entry, backend)?["state"] != "pending"
+            {
+                continue;
+            }
+            let passed_before: bool = state
+                .store
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM catalog_self_checks \
+                         WHERE catalog_id=?1 AND backend=?2 AND state='passed')",
+                        [&entry.id, &backend.backend],
+                        |row| row.get(0),
+                    )
+                })
+                .map_err(catalog_store_error)?;
+            if passed_before {
+                lanes.push((entry.clone(), backend.clone()));
+            }
+        }
+    }
+    Ok(lanes)
+}
+
+/// Loads and self-checks, one at a time, every lane
+/// `catalog_lanes_needing_revalidation` names. It goes through the same
+/// single-flight path a request takes, so a request arriving meanwhile joins
+/// the check instead of starting a second one, and lanes on Apple's Neural
+/// Engine still go through the supervisor that caps how many compiled programs
+/// the chip holds and runs one compile at a time.
+fn start_catalog_revalidation(state: Arc<ModuleState>) {
+    // Detached: it ends once each named lane is checked, and a module stop
+    // drops it with the runtime.
+    tokio::spawn(async move {
+        let lanes = match catalog_lanes_needing_revalidation(&state) {
+            Ok(lanes) => lanes,
+            Err(error) => {
+                tracing::warn!(target: "synapse.catalog", error = %error.message,
+                    "catalog revalidation skipped: could not list lanes");
+                return;
+            }
+        };
+        for (entry, backend) in lanes {
+            let lane = catalog::lane_id(&entry.id, &backend.backend);
+            tracing::info!(target: "synapse.catalog", model_id = %lane,
+                "catalog self-check scheduled: no result for the current key");
+            match ensure_catalog_lane_ready(state.clone(), entry, backend, None).await {
+                Ok(_) => tracing::info!(target: "synapse.catalog", model_id = %lane,
+                    "catalog self-check passed at startup"),
+                Err(error) => tracing::warn!(target: "synapse.catalog", model_id = %lane,
+                    code = %error.code, error = %error.message,
+                    "catalog self-check at startup did not pass"),
+            }
+        }
+    });
+}
+
 pub(crate) fn catalog_self_check_id(
     catalog_id: &str,
     manifest_digest: &str,
