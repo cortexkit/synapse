@@ -128,11 +128,12 @@ class PlanTests(unittest.TestCase):
         first, second = GATE["plan"]()
         self.assertEqual([(j.name, j.platform, j.vcpus) for j in first], [("quick", "linux", 4)])
         self.assertEqual([(j.name, j.platform, j.vcpus) for j in second], [
-            ("linux-suite", "linux", 16), ("windows-suite", "windows", 2),
-            ("linux-llama-parity", "linux", 16)])
+            ("linux-suite", "linux", 12), ("windows-suite", "windows", 2),
+            ("linux-llama-parity", "linux", 4)])
         for job in second[:2]:
             scripts = "\n".join(s.script for s in job.steps)
-            self.assertIn("cargo clippy --locked $crates --all-targets -- -D warnings", scripts)
+            offline = " --offline" if job.platform == "windows" else ""
+            self.assertIn(f"cargo clippy --locked{offline} $crates --all-targets -- -D warnings", scripts)
             self.assertIn("--features synapse-module/test-support", scripts)
             self.assertIn("--partition 'count:1/1'", scripts)
             self.assertIn("not binary(skeleton_e2e)", scripts)
@@ -150,6 +151,27 @@ class PlanTests(unittest.TestCase):
             self.assertIn(command, guards)
         self.assertNotIn("synapse/scripts/", guards)
         self.assertNotIn("cd synapse", guards)
+
+    def test_phase_two_linux_vcpu_sum_stays_within_motor_budget(self):
+        phases = GATE["plan"]()
+        self.assertLessEqual(sum(job.vcpus for job in phases[1] if job.platform == "linux"), 16)
+        for jobs in phases:
+            self.assertLessEqual(sum(job.vcpus for job in jobs if job.platform == "linux"), 16)
+
+    def test_windows_cargo_uses_only_locked_prefetched_dependencies(self):
+        _, jobs = GATE["plan"]()
+        windows = next(job for job in jobs if job.platform == "windows")
+        self.assertEqual(windows.env["CARGO_NET_OFFLINE"], "true")
+        for name, expected in {
+            "fmt": "cargo tree --locked --offline --workspace",
+            "clippy": "cargo clippy --locked --offline $crates --all-targets -- -D warnings",
+            "nextest": "cargo nextest run --locked --offline $crates --features synapse-module/test-support",
+            "Windows llama CPU build gate": "cargo build --locked --offline -p synapse-worker-llama --no-default-features --features cpu --release",
+        }.items():
+            self.assertIn(expected, next(step.script for step in windows.steps if step.name == name))
+        llama = next(step.script for step in windows.steps if step.name == "Windows llama CPU build gate")
+        self.assertEqual(llama.count("cargo build --locked --offline -p synapse-worker-llama"), 2)
+        self.assertTrue(all("CARGO_NET_OFFLINE" not in job.env for job in jobs if job.platform == "linux"))
 
     def test_workflow_changes_flow_into_plan_and_unknown_expressions_refuse(self):
         import yaml
@@ -255,6 +277,9 @@ job = json.loads(args[-2])
 name = job['name']
 events = Path(os.environ['FAKE_EVENTS'])
 (events / (name + '.json')).write_text(json.dumps(args))
+if args[args.index('--platform') + 1] == 'windows' and '--net' in args:
+    print('network_unsupported: Windows job network is unsupported', flush=True)
+    sys.exit(200)
 cwd = Path(args[args.index('--cwd') + 1]).resolve()
 checkout = Path(os.environ['FAKE_CHECKOUT']).resolve()
 if checkout in cwd.parents:
@@ -450,12 +475,13 @@ sys.exit(status)
         roots = set()
         for name, args in recorded.items():
             roots.add(args[args.index("--cwd") + 1])
-            self.assertIn("--net", args)
             platform = args[args.index("--platform") + 1]
             self.assertEqual(platform, "windows" if name == "windows-suite" else "linux")
             if platform == "linux":
-                self.assertEqual(args[args.index("--vcpus") + 1], "4" if name == "quick" else "16")
+                self.assertIn("--net", args)
+                self.assertEqual(args[args.index("--vcpus") + 1], "12" if name == "linux-suite" else "4")
             else:
+                self.assertNotIn("--net", args)
                 self.assertNotIn("--vcpus", args)
                 self.assertNotIn("--return-path", args)
         self.assertEqual(len(roots), 4)

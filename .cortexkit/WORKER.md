@@ -51,8 +51,11 @@ still needs the hardware owner's arrangement and explicit opt-ins below.
 `scripts/gate.sh` reads executable push steps from the CI workflows. Phase 1
 runs the guard scripts, workflow/release/doc-contract self-tests and formatting
 on a small Linux job. Phase 2 runs full Linux Clippy/Nextest, native MSVC
-Clippy/Nextest/llama, and Linux llama/parity jobs concurrently. Linux uses one
-16-core nextest run over the union of CI's four shards. Every job prints its
+Clippy/Nextest/llama, and Linux llama/parity jobs concurrently. The Linux suite
+gets 12 cores and llama/parity gets 4, staying within the 16-core concurrent Linux
+budget; the 4-core quick phase completes before either starts. The suite covers
+the union of CI's four nextest shards. Windows jobs omit `--net` and run Cargo
+locked/offline against the runner's prefetched lockfile dependencies. Every job prints its
 failing step and duration; the gate prints a phase timing table and preserves
 logs/build evidence under `.cortexkit/internal-docs/investigations/gate/`.
 Independent detached Git worktrees live under

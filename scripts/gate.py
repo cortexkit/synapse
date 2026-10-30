@@ -69,6 +69,15 @@ def ci_step(step, platform, guards=False):
     else:
         script = script.replace("$binary = 'target/release/ck-synapse-worker-llama.exe'",
                                 "$binary = Join-Path $env:CARGO_TARGET_DIR 'release/ck-synapse-worker-llama.exe'")
+        # Windows MOTOR cannot enable job networking; it prefetches Cargo.lock
+        # dependencies before start. Keep execution locked to that offline cache.
+        for original, offline in (
+            ("cargo tree --workspace", "cargo tree --locked --offline --workspace"),
+            ("cargo clippy --locked", "cargo clippy --locked --offline"),
+            ("cargo nextest run --locked", "cargo nextest run --locked --offline"),
+            ("cargo build -p synapse-worker-llama", "cargo build --locked --offline -p synapse-worker-llama"),
+        ):
+            script = script.replace(original, offline)
     cwd = step.get("working-directory", ".")
     if guards:
         # The guard job starts outside its checkout; MOTOR starts at its root.
@@ -130,9 +139,10 @@ def plan():
                     parity.insert(0, converted)
                 else:
                     steps.append(converted)
-        lanes[platform] = Job(platform + "-suite", platform, 16 if platform == "linux" else 2, steps, env)
+        environment = dict(env, CARGO_NET_OFFLINE="true") if platform == "windows" else env
+        lanes[platform] = Job(platform + "-suite", platform, 12 if platform == "linux" else 2, steps, environment)
     phases = [Job("quick", "linux", 4, quick, env)], [
-        lanes["linux"], lanes["windows"], Job("linux-llama-parity", "linux", 16, parity, env)]
+        lanes["linux"], lanes["windows"], Job("linux-llama-parity", "linux", 4, parity, env)]
     for jobs in phases:
         for job in jobs:
             job.steps.insert(0, Step("runner toolchain prerequisites",
@@ -292,7 +302,7 @@ class Runner:
         checkout = validate_snapshot_path(self.scratch / job.name, job.name, self.allowed_roots)
         command = motor_command(
             ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected],
-            cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=True,
+            cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=job.platform != "windows",
             return_paths=[checkout / "target/gate-evidence.zip"] if job.platform == "linux" else [],
         )
         print(f"JOB {job.name}: {shlex.join(command[:command.index('--')])}", flush=True)
