@@ -58,17 +58,24 @@ the union of CI's four nextest shards. Windows jobs omit `--net` and run Cargo
 locked/offline against the runner's prefetched lockfile dependencies. Every job prints its
 failing step and duration; the gate prints a phase timing table and preserves
 logs/build evidence under `.cortexkit/internal-docs/investigations/gate/`.
+Windows commands are rendered on the submitting machine and run in Git Bash
+with PowerShell for native prerequisites and evidence; neither Python nor Git
+metadata is required on the Windows runner. Linux keeps its Python worker.
 Independent detached Git worktrees live under
 `~/Work/Projects/CortexKit-scratch/synapse-gate/<run-id>/<job>/`, outside the
 checkout. The macOS MOTOR build runner requires workspace paths under `/Users`; system
 temporary directories are not admissible. The gate refuses invalid or nested
 destinations before creating worktrees or submitting jobs. Each worktree contains
-the submitted tracked and non-ignored untracked source inputs. Its source-content
-fingerprint must match the submitting tree and remain unchanged during checks.
+the submitted tracked and non-ignored untracked source inputs. The submitting
+tree is fingerprinted before and after checks, and Linux workers also check their
+materialized inputs. Windows prints the submitted fingerprint and relies on
+MOTOR's source materialization, without a runner-side Git fingerprint check.
 Worktrees are removed after all jobs join, including failure and interruption,
 followed by `git worktree prune`.
 A refused, cancelled, disconnected or timed-out job is never a pass or silently
-resubmitted. Runner prerequisites are stable Rust with Clippy/rustfmt, Nextest,
+resubmitted. A `runner_full`/`hosted_capacity` admission refusal is reported as
+capacity, retry later, not as a failed check; the existing allocation budget and
+cancellation wait are unchanged. Runner prerequisites are stable Rust with Clippy/rustfmt, Nextest,
 and native MSVC/LLVM on Windows; Phase 1 bootstraps hash-pinned pure-Python
 PyYAML under the ignored target directory without modifying system Python.
 The Linux suite jobs provision hash-pinned CMake 3.31.6 under their temporary

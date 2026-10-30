@@ -2,11 +2,14 @@
 
 from contextlib import redirect_stdout
 from dataclasses import asdict
+import base64
 import io
 import json
 import os
 from pathlib import Path
 import runpy
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -173,6 +176,58 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(llama.count("cargo build --locked --offline -p synapse-worker-llama"), 2)
         self.assertTrue(all("CARGO_NET_OFFLINE" not in job.env for job in jobs if job.platform == "linux"))
 
+    def test_windows_shell_keeps_workflow_commands_without_runner_python_or_git(self):
+        job = next(job for job in GATE["plan"]()[1] if job.platform == "windows")
+        command = GATE["windows_command"](job, "submitted-tree")
+        self.assertEqual(command[:5], ["bash", "-e", "-o", "pipefail", "-c"])
+        script = command[-1]
+        tokens = shlex.split(script, comments=True)
+        sources = [tokens[i + 1] for i, token in enumerate(tokens[:-1]) if token == "-c"]
+        sources += [base64.b64decode(value).decode("utf-16le") for value in re.findall(r"\bgate_ps ([A-Za-z0-9+/=]+)", script)]
+        text = "\n".join(sources)
+        for expected in ("cargo clippy --locked --offline $crates --all-targets -- -D warnings",
+                         "cargo nextest run --locked --offline $crates --features synapse-module/test-support",
+                         "--cargo-profile ci-test --timings --cargo-verbose", "--retries 0", "count:1/1",
+                         "not binary(skeleton_e2e)", "--features cpu --release", "x86_64-pc-windows-msvc",
+                         "libclang.dll", "GATE_EVIDENCE", "CreateEntryFromFile"):
+            self.assertIn(expected, text)
+        self.assertNotIn("scripts/gate.sh", script)
+        self.assertNotIn("--worker", script)
+        self.assertNotRegex(text, r"(?m)^\s*(?:python(?:3)?|git)\s")
+        self.assertIn("powershell.exe", script)
+
+    def test_windows_shell_executes_in_a_gitless_directory_and_stops_by_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "bin"
+            tools.mkdir()
+            cargo = tools / "cargo"
+            cargo.write_text('#!/bin/sh\nprintf "%s|offline=%s\\n" "$*" "$CARGO_NET_OFFLINE" >> "$CALLS"\n'
+                             'if [ "$1" = tree ]; then printf "synapse-core\\nsynapse-module\\n"; fi\n')
+            cargo.chmod(0o755)
+            for name, body in (("rustc", 'echo "host: x86_64-pc-windows-msvc"'), ("pwsh", "exit 0"),
+                               ("git", "exit 99"), ("python", "exit 99"), ("python3", "exit 99"), ("py", "exit 99")):
+                tool = tools / name
+                tool.write_text("#!/bin/sh\n" + body + "\n")
+                tool.chmod(0o755)
+            job = next(job for job in GATE["plan"]()[1] if job.platform == "windows")
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                       CARGO_TARGET_DIR=str(root / "target"), CALLS=str(root / "calls"))
+            success = subprocess.run(GATE["windows_command"](job, "tree"), cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
+            calls = (root / "calls").read_text()
+            self.assertIn("clippy --locked --offline", calls)
+            self.assertIn("--cargo-profile ci-test --timings --cargo-verbose", calls)
+            self.assertIn("-E not binary(skeleton_e2e)|offline=true", calls)
+            self.assertIn("RESULT windows-suite exit=0", success.stdout)
+            self.assertFalse((root / ".git").exists())
+            job.steps = [Step("versions", "true"), Step("bad", "exit 7"), Step("unreached", "touch should-not-exist")]
+            failure = subprocess.run(GATE["windows_command"](job, "tree"), cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(failure.returncode, 7, failure.stdout + failure.stderr)
+            self.assertIn("FAIL windows-suite / bad: exit=7", failure.stdout)
+            self.assertIn("TIMING windows-suite / bad", failure.stdout)
+            self.assertFalse((root / "should-not-exist").exists())
+
     def test_workflow_changes_flow_into_plan_and_unknown_expressions_refuse(self):
         import yaml
         workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
@@ -246,7 +301,8 @@ else:
                     self.assertEqual(environment["CARGO_HOME"], "/immutable-cache")
                     self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
 
-    def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False, outside_roots=False):
+    def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False, outside_roots=False, capacity_jobs=(),
+               capacity_reason="runner_full: hosted_capacity"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools, events = root / "bin", root / "events"
@@ -269,16 +325,34 @@ else:
             nested_temp.mkdir(parents=True)
             ck = tools / "ck"
             ck.write_text(f"#!{sys.executable}\n" + r'''
-import json, os, signal, sys, time
+import base64, json, os, re, shlex, signal, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 assert args[:2] == ['motor', 'run']
-job = json.loads(args[-2])
-name = job['name']
+remote = args[args.index('--') + 1:]
+windows = args[args.index('--platform') + 1] == 'windows'
+unsupported = False
+if windows:
+    inline = len(remote) == 6 and remote[:5] == ['bash', '-e', '-o', 'pipefail', '-c']
+    script = remote[-1] if inline else ''
+    match = re.search(r'^gate_job=(.+)$', script, re.M)
+    name = shlex.split(match[1])[0] if match else 'windows-suite'
+    unsupported = not inline
+    scripts = [script]
+    scripts.extend(base64.b64decode(value).decode('utf-16le') for value in re.findall(r'\bgate_ps ([A-Za-z0-9+/=]+)', script))
+    for text in scripts:
+        tokens = shlex.split(text, comments=True)
+        if any(re.fullmatch(r'(?:git|python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?', token.replace('\\', '/').rsplit('/', 1)[-1], re.I) for token in tokens):
+            unsupported = True
+else:
+    name = json.loads(args[-2])['name']
 events = Path(os.environ['FAKE_EVENTS'])
 (events / (name + '.json')).write_text(json.dumps(args))
 if args[args.index('--platform') + 1] == 'windows' and '--net' in args:
     print('network_unsupported: Windows job network is unsupported', flush=True)
+    sys.exit(200)
+if unsupported:
+    print('runner_prerequisite_unsupported: Windows command invokes Python/git or a worker wrapper', flush=True)
     sys.exit(200)
 cwd = Path(args[args.index('--cwd') + 1]).resolve()
 checkout = Path(os.environ['FAKE_CHECKOUT']).resolve()
@@ -301,6 +375,10 @@ if name != 'quick':
             sys.exit(90)
         time.sleep(.01)
 status = json.loads(os.environ['FAKE_STATUSES']).get(name, 0)
+if name in json.loads(os.environ['FAKE_CAPACITY_JOBS']):
+    print(os.environ['FAKE_CAPACITY_REASON'], flush=True)
+    if status == 200:
+        sys.exit(status)
 if name == 'windows-suite':
     import base64
     print('GATE_EVIDENCE ' + base64.b64encode(b'evidence').decode(), flush=True)
@@ -321,6 +399,8 @@ sys.exit(status)
             status = 0
             with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                             FAKE_EVENTS=str(events), FAKE_STATUSES=json.dumps(statuses),
+                            FAKE_CAPACITY_JOBS=json.dumps(list(capacity_jobs)),
+                            FAKE_CAPACITY_REASON=capacity_reason,
                             FAKE_CHECKOUT=str(checkout), FAKE_ALLOWED_ROOTS=json.dumps([str(allowed_root)]),
                             HOME=str(home), TMPDIR=str(nested_temp),
                             FAKE_HOLD="1" if interrupt or any(statuses.get(j.name, 0) for j in second) else "0"), \
@@ -394,6 +474,32 @@ sys.exit(status)
         self.assertEqual(status, 200, output)
         self.assertEqual(set(recorded), {"quick"})
         self.assertIn("workspace_key_rejected: destination outside runner-owned roots", output)
+
+    def test_fake_motor_rejects_windows_python_and_git_commands(self):
+        for program in ("python3 --version", "git status"):
+            with patch.dict(GATE["Runner"].run.__globals__, windows_command=lambda job, expected: [
+                    "bash", "-e", "-o", "pipefail", "-c", "gate_job=" + job.name + "\n" + program]):
+                status, _, _, _, output = self.invoke({})
+            self.assertEqual(status, 200, output)
+            self.assertIn("runner_prerequisite_unsupported", output)
+
+    def test_capacity_refusal_is_retryable_not_a_check_failure(self):
+        for reason in ("runner_full: hosted_capacity", "queue_wait_exceeded: waiting_on=permits"):
+            status, _, _, _, output = self.invoke({"linux-suite": 200}, through_gate=True,
+                                                capacity_jobs=("linux-suite",), capacity_reason=reason)
+            self.assertEqual(status, 200, output)
+            self.assertIn("CAPACITY job linux-suite: capacity, retry later", output)
+            self.assertIn("Phase 2", output)
+            self.assertIn("CAPACITY, retry later", output)
+            self.assertNotIn("FAIL job linux-suite", output)
+            self.assertNotIn("FIRST FAILURE", output)
+            self.assertNotRegex(output, r"\bFAIL\b")
+
+    def test_capacity_words_in_a_failed_check_are_not_an_admission_refusal(self):
+        status, _, _, _, output = self.invoke({"linux-suite": 1}, capacity_jobs=("linux-suite",))
+        self.assertEqual(status, 1, output)
+        self.assertIn("FIRST FAILURE: linux-suite", output)
+        self.assertNotIn("CAPACITY job linux-suite", output)
 
     def test_snapshot_cleanup_after_job_failure(self):
         status, _, _, completed, output = self.invoke({"windows-suite": 7}, through_gate=True)
@@ -484,6 +590,10 @@ sys.exit(status)
                 self.assertNotIn("--net", args)
                 self.assertNotIn("--vcpus", args)
                 self.assertNotIn("--return-path", args)
+                remote = args[args.index("--") + 1:]
+                self.assertEqual(remote[:5], ["bash", "-e", "-o", "pipefail", "-c"])
+                self.assertNotIn("scripts/gate.sh", remote[-1])
+                self.assertNotIn("--worker", remote[-1])
         self.assertEqual(len(roots), 4)
         self.assertIn("Retained 8 bytes of Windows build evidence", output)
         self.assertNotIn("GATE_EVIDENCE", output)

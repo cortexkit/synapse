@@ -159,6 +159,75 @@ def shell_command(step):
     raise ValueError(f"unmapped CI shell: {step.shell}")
 
 
+def windows_command(job, expected):
+    """Render Windows work on the submitter; the runner needs neither Python nor Git."""
+    def powershell(script):
+        # Windows PowerShell 5 treats redirected native stderr as error records.
+        # Cargo's exit code, not its progress output, decides build success.
+        lines = []
+        for line in script.splitlines():
+            if line.lstrip().startswith("& cargo "):
+                lines.extend(["$ErrorActionPreference = 'Continue'", line, "$ErrorActionPreference = 'Stop'"])
+            else:
+                lines.append(line)
+        body = "$ErrorActionPreference = 'Stop'\n" + "\n".join(lines) + "\nif ($LASTEXITCODE) { exit $LASTEXITCODE }"
+        return "gate_ps " + base64.b64encode(body.encode("utf-16le")).decode("ascii")
+
+    evidence = powershell(r"""
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$memory = New-Object System.IO.MemoryStream
+$archive = [System.IO.Compression.ZipArchive]::new($memory, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+try {
+  foreach ($directory in @('target/gate-build-gates', (Join-Path $env:CARGO_TARGET_DIR 'cargo-timings'))) {
+    if (Test-Path -LiteralPath $directory -PathType Container) {
+      $root = Get-Item -LiteralPath $directory
+      foreach ($file in Get-ChildItem -LiteralPath $directory -Recurse -File) {
+        $relative = $file.FullName.Substring($root.FullName.Length + 1).Replace('\', '/')
+        $name = $root.Name + '/' + $relative
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $name) | Out-Null
+      }
+    }
+  }
+} finally { $archive.Dispose() }
+[Console]::WriteLine('GATE_EVIDENCE ' + [Convert]::ToBase64String($memory.ToArray()))
+$memory.Dispose()
+""")
+    lines = ["set -euo pipefail", "gate_job=" + shlex.quote(job.name), "gate_root=$PWD",
+             "gate_step='shell prerequisites'", "gate_powershell=",
+             "gate_ps() { \"$gate_powershell\" -NoLogo -NoProfile -NonInteractive -EncodedCommand \"$1\"; }",
+             "gate_finish() {", "  gate_status=$?", "  trap - EXIT", "  set +e",
+             "  if [ \"$gate_status\" -ne 0 ]; then printf 'FAIL %s / %s: exit=%s\\n' \"$gate_job\" \"$gate_step\" \"$gate_status\"; fi",
+             "  if [ -n \"$gate_powershell\" ]; then", "    " + evidence, "    evidence_status=$?",
+             "    if [ \"$gate_status\" -eq 0 ] && [ \"$evidence_status\" -ne 0 ]; then",
+             "      gate_status=$evidence_status; printf 'FAIL %s / evidence: exit=%s\\n' \"$gate_job\" \"$gate_status\"; fi",
+             "  fi", "  printf 'RESULT %s exit=%s\\n' \"$gate_job\" \"$gate_status\"", "  exit \"$gate_status\"", "}",
+             "trap gate_finish EXIT"]
+    lines += ["export " + key + "=" + shlex.quote(str(value)) for key, value in sorted(job.env.items())]
+    lines += ['export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(cygpath -m "$PWD/target")}"',
+              'if [ -z "${LIBCLANG_PATH:-}" ]; then export LIBCLANG_PATH=' + shlex.quote(r"C:\Program Files\LLVM\bin") + '; fi',
+              "if command -v pwsh >/dev/null 2>&1; then gate_powershell=pwsh;",
+              "elif command -v powershell.exe >/dev/null 2>&1; then gate_powershell=powershell.exe;",
+              "else echo 'FAIL Windows shell prerequisites: PowerShell is required'; exit 127; fi",
+              "printf '%s\\n' " + shlex.quote(f"TREE {job.name} submitted {expected}")]
+    native = Step("native MSVC and LLVM prerequisites", r"""
+$hostInfo = (& rustc -vV) -join "`n"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($hostInfo -notmatch 'host: x86_64-pc-windows-msvc') { throw 'native MSVC toolchain is required' }
+if (!(Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) { throw 'provision LIBCLANG_PATH on the runner' }
+""", "pwsh")
+    steps = [Step(**raw) if isinstance(raw, dict) else raw for raw in job.steps]
+    steps = [*steps[:1], native, *steps[1:]]
+    for step in steps:
+        command = powershell(step.script) if step.shell == "pwsh" else shlex.join(shell_command(step))
+        lines += ["gate_step=" + shlex.quote(step.name), "gate_started=$SECONDS",
+                  "printf 'STEP %s / %s\\n' \"$gate_job\" \"$gate_step\"", "gate_step_status=0",
+                  "(cd \"$gate_root\"/" + shlex.quote(step.cwd) + " && " + command + ") || gate_step_status=$?",
+                  "printf 'TIMING %s / %s: %ss exit=%s\\n' \"$gate_job\" \"$gate_step\" \"$((SECONDS - gate_started))\" \"$gate_step_status\"",
+                  '[ "$gate_step_status" -eq 0 ] || exit "$gate_step_status"']
+    lines.append("exit 0")
+    return ["bash", "-e", "-o", "pipefail", "-c", "\n".join(lines)]
+
+
 def python_dependencies():
     """Use pinned pure-Python PyYAML without pip or a system-package mutation."""
     directory = Path("target/gate-python").resolve()
@@ -190,7 +259,10 @@ def python_dependencies():
 
 
 def worker(job, expected):
-    """Execute only on MOTOR; never compile in the submitting shell."""
+    """Execute Linux work on the build runner; Windows uses submitter-rendered shell."""
+    if job.platform != "linux":
+        print(f"FAIL {job.name}: Windows requires inline shell mode", flush=True)
+        return 2
     root = Path.cwd()
     if fingerprint() != expected:
         print(f"FAIL {job.name}: snapshot differs from {expected}", flush=True)
@@ -203,13 +275,6 @@ def worker(job, expected):
         except (OSError, ValueError) as error:
             print(f"FAIL {job.name} / Python prerequisites: {error}", flush=True)
             return 1
-    if job.platform == "windows":
-        environment.setdefault("LIBCLANG_PATH", r"C:\Program Files\LLVM\bin")
-        job.steps.insert(1, Step("native MSVC and LLVM prerequisites",
-                                "python3 -c " + shlex.quote(
-                                    "import os,subprocess; from pathlib import Path; "
-                                    "assert 'host: x86_64-pc-windows-msvc' in subprocess.check_output(['rustc','-vV'],text=True); "
-                                    "assert (Path(os.environ['LIBCLANG_PATH'])/'libclang.dll').is_file(), 'provision LIBCLANG_PATH on the runner'")))
     print(f"TREE {job.name} {expected}", flush=True)
     status = 0
     try:
@@ -239,10 +304,6 @@ def worker(job, expected):
                     for path in directory.rglob("*"):
                         if path.is_file():
                             archive.write(path, Path(directory.name) / path.relative_to(directory))
-        if job.platform == "windows":
-            # Windows MOTOR has no return-path transport. Carry the same small
-            # evidence archive over stdout; the submitter removes it from logs.
-            print("GATE_EVIDENCE " + base64.b64encode(evidence.read_bytes()).decode("ascii"), flush=True)
     return status
 
 
@@ -287,6 +348,7 @@ class Runner:
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.active = {}
+        self.capacity_refusals = set()
 
     def cancel(self):
         self.stopped.set()
@@ -300,12 +362,15 @@ class Runner:
     def run(self, job):
         start = time.monotonic()
         checkout = validate_snapshot_path(self.scratch / job.name, job.name, self.allowed_roots)
+        remote = (windows_command(job, self.expected) if job.platform == "windows" else
+                  ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected])
         command = motor_command(
-            ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected],
+            remote,
             cwd=checkout, platform=job.platform, vcpus=job.vcpus, timeout=7200, net=job.platform != "windows",
             return_paths=[checkout / "target/gate-evidence.zip"] if job.platform == "linux" else [],
         )
         print(f"JOB {job.name}: {shlex.join(command[:command.index('--')])}", flush=True)
+        capacity = False
         try:
             with self.lock:
                 if self.stopped.is_set():
@@ -315,6 +380,8 @@ class Runner:
             assert child.stdout is not None
             with child.stdout, (self.evidence / (job.name + ".log")).open("w") as log:
                 for line in child.stdout:
+                    capacity = capacity or any(reason in line for reason in (
+                        "runner_full", "hosted_capacity", "queue_wait_exceeded"))
                     if line.startswith("GATE_EVIDENCE "):
                         content = base64.b64decode(line.split(" ", 1)[1].strip(), validate=True)
                         (self.evidence / (job.name + ".zip")).write_bytes(content)
@@ -332,8 +399,15 @@ class Runner:
             with self.lock:
                 self.active.pop(job.name, None)
         if status:
-            reason = "refused before start (no checks ran)" if status == 200 else f"exit={status}"
-            print(f"FAIL job {job.name}: {reason}", flush=True)
+            if status == 200 and capacity:
+                with self.lock:
+                    self.capacity_refusals.add(job.name)
+                print(f"CAPACITY job {job.name}: capacity, retry later (no checks ran)", flush=True)
+            elif status in (203, -signal.SIGTERM):
+                print(f"CANCELLED job {job.name}: exit={status}", flush=True)
+            else:
+                reason = "refused before start (no checks ran)" if status == 200 else f"exit={status}"
+                print(f"FAIL job {job.name}: {reason}", flush=True)
         return status, time.monotonic() - start
 
 
@@ -348,7 +422,8 @@ def parallel(runner, jobs):
                 results[name] = (status, duration)
                 if status and not failure:
                     failure = status
-                    print(f"FIRST FAILURE: {name}; cancelling other jobs", flush=True)
+                    reason = "CAPACITY, retry later" if name in runner.capacity_refusals else "FIRST FAILURE"
+                    print(f"{reason}: {name}; cancelling other jobs", flush=True)
                     runner.cancel()
         except BaseException:
             runner.cancel()
@@ -416,6 +491,9 @@ def run_gate(phases, allowed_roots):
                 break
     except KeyboardInterrupt:
         status = 130
+    except Exception:
+        status = 1
+        raise
     finally:
         runner.cancel()
         for signum, handler in old_handlers.items():
@@ -432,12 +510,29 @@ def run_gate(phases, allowed_roots):
             status = status or 1
         print("\nPHASE TIMING | seconds | result", flush=True)
         for number, duration, results in timings:
-            print(f"Phase {number} | {duration:.2f} | " + ("PASS" if all(s == 0 for s, _ in results.values()) else "FAIL"))
+            outcomes = [job_outcome(name, code, runner.capacity_refusals) for name, (code, _) in results.items()]
+            if "FAIL" in outcomes:
+                phase = "FAIL"
+            elif "CAPACITY, retry later" in outcomes:
+                phase = "CAPACITY, retry later"
+            else:
+                phase = "PASS" if all(s == 0 for s, _ in results.values()) else "CANCELLED"
+            print(f"Phase {number} | {duration:.2f} | {phase}")
             for name, (code, elapsed) in results.items():
-                print(f"  {name} | {elapsed:.2f} | exit={code}")
+                print(f"  {name} | {elapsed:.2f} | {job_outcome(name, code, runner.capacity_refusals)} exit={code}")
         print(f"Total (including snapshots) | {time.monotonic() - start:.2f} | exit={status}", flush=True)
         print(f"Evidence: {evidence}", flush=True)
     return status
+
+
+def job_outcome(name, status, capacity_refusals):
+    if name in capacity_refusals:
+        return "CAPACITY, retry later"
+    if status == 0:
+        return "PASS"
+    if status in (203, -signal.SIGTERM):
+        return "CANCELLED"
+    return "FAIL"
 
 
 def main():
