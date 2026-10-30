@@ -342,9 +342,10 @@ def snapshot(destination, allowed_roots, extra_files=None):
     for relative, text in (extra_files or {}).items():
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, newline="\n")
-    subprocess.run(["git", "-C", str(destination), "add", "--all", "--force"] +
-                   [str(relative) for relative in (extra_files or {})], check=True)
+        with target.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(text)
+    if extra_files:
+        subprocess.run(["git", "-C", str(destination), "add", "--force", "--", *extra_files], check=True)
     subprocess.run(["git", "-C", str(destination), "add", "--all"], check=True)
     # Commit even a clean source snapshot without changing the submitting branch
     # or inheriting signing/hooks configuration.

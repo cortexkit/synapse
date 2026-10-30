@@ -58,9 +58,14 @@ the union of CI's four nextest shards. Windows jobs omit `--net` and run Cargo
 locked/offline against the runner's prefetched lockfile dependencies. Every job prints its
 failing step and duration; the gate prints a phase timing table and preserves
 logs/build evidence under `.cortexkit/internal-docs/investigations/gate/`.
-Windows commands are rendered on the submitting machine and run in Git Bash
+Windows commands are rendered on the submitting machine into the committed
+snapshot file `.gate/windows-job.sh` and dispatched as `bash .gate/windows-job.sh`,
+so no multiline script or quote characters cross the Windows command argv.
+They run in Git Bash
 with PowerShell for native prerequisites and evidence; neither Python nor Git
 metadata is required on the Windows runner. Linux keeps its Python worker.
+Linux's worker JSON remains one argv element and relies on MOTOR's POSIX argv
+quoting; it is not safe for naive whitespace-only flattening.
 Independent detached Git worktrees live under
 `~/Work/Projects/CortexKit-scratch/synapse-gate/<run-id>/<job>/`, outside the
 checkout. The macOS MOTOR build runner requires workspace paths under `/Users`; system

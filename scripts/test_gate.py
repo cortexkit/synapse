@@ -127,6 +127,30 @@ class PlanTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_windows_script_is_committed_in_snapshot_not_in_submitting_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, copy = root / "source", root / "copy"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+            (source / ".gitignore").write_text(".gate/\n")
+            (source / "input").write_text("source")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            commit_fixture(source)
+            script = "#!/bin/bash\nprintf '%s\\n' \"a'b\"\n"
+            previous = Path.cwd()
+            try:
+                os.chdir(source)
+                expected = GATE["fingerprint"]()
+                GATE["snapshot"](copy, (root,), {GATE["WINDOWS_SCRIPT"]: script})
+                self.assertEqual((copy / GATE["WINDOWS_SCRIPT"]).read_bytes(), script.encode("utf-8"))
+                committed = subprocess.check_output(["git", "-C", str(copy), "show", "HEAD:" + GATE["WINDOWS_SCRIPT"]])
+                self.assertEqual(committed, script.encode("utf-8"))
+                self.assertFalse((source / GATE["WINDOWS_SCRIPT"]).exists())
+                self.assertEqual(GATE["fingerprint"](), expected)
+            finally:
+                os.chdir(previous)
+
     def test_ci_commands_are_read_not_reimplemented(self):
         first, second = GATE["plan"]()
         self.assertEqual([(j.name, j.platform, j.vcpus) for j in first], [("quick", "linux", 4)])
@@ -178,9 +202,7 @@ class PlanTests(unittest.TestCase):
 
     def test_windows_shell_keeps_workflow_commands_without_runner_python_or_git(self):
         job = next(job for job in GATE["plan"]()[1] if job.platform == "windows")
-        command = GATE["windows_command"](job, "submitted-tree")
-        self.assertEqual(command[:5], ["bash", "-e", "-o", "pipefail", "-c"])
-        script = command[-1]
+        script = GATE["windows_command"](job, "submitted-tree")[-1]
         tokens = shlex.split(script, comments=True)
         sources = [tokens[i + 1] for i, token in enumerate(tokens[:-1]) if token == "-c"]
         sources += [base64.b64decode(value).decode("utf-16le") for value in re.findall(r"\bgate_ps ([A-Za-z0-9+/=]+)", script)]
@@ -213,7 +235,12 @@ class PlanTests(unittest.TestCase):
             job = next(job for job in GATE["plan"]()[1] if job.platform == "windows")
             env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                        CARGO_TARGET_DIR=str(root / "target"), CALLS=str(root / "calls"))
-            success = subprocess.run(GATE["windows_command"](job, "tree"), cwd=root, env=env, text=True, capture_output=True)
+            script = root / GATE["WINDOWS_SCRIPT"]
+            script.parent.mkdir()
+            script.write_text(GATE["windows_command"](job, "tree")[-1])
+            command = ["bash", GATE["WINDOWS_SCRIPT"]]
+            subprocess.run(["bash", "-n", str(script)], check=True)
+            success = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
             self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
             calls = (root / "calls").read_text()
             self.assertIn("clippy --locked --offline", calls)
@@ -222,7 +249,8 @@ class PlanTests(unittest.TestCase):
             self.assertIn("RESULT windows-suite exit=0", success.stdout)
             self.assertFalse((root / ".git").exists())
             job.steps = [Step("versions", "true"), Step("bad", "exit 7"), Step("unreached", "touch should-not-exist")]
-            failure = subprocess.run(GATE["windows_command"](job, "tree"), cwd=root, env=env, text=True, capture_output=True)
+            script.write_text(GATE["windows_command"](job, "tree")[-1])
+            failure = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True)
             self.assertEqual(failure.returncode, 7, failure.stdout + failure.stderr)
             self.assertIn("FAIL windows-suite / bad: exit=7", failure.stdout)
             self.assertIn("TIMING windows-suite / bad", failure.stdout)
@@ -302,7 +330,7 @@ else:
                     self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
 
     def invoke(self, statuses, two_phases=True, through_gate=False, interrupt=False, outside_roots=False, capacity_jobs=(),
-               capacity_reason="runner_full: hosted_capacity"):
+               capacity_reason="runner_full: hosted_capacity", windows_script_override=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tools, events = root / "bin", root / "events"
@@ -330,14 +358,16 @@ from pathlib import Path
 args = sys.argv[1:]
 assert args[:2] == ['motor', 'run']
 remote = args[args.index('--') + 1:]
+cwd = Path(args[args.index('--cwd') + 1]).resolve()
 windows = args[args.index('--platform') + 1] == 'windows'
 unsupported = False
 if windows:
-    inline = len(remote) == 6 and remote[:5] == ['bash', '-e', '-o', 'pipefail', '-c']
-    script = remote[-1] if inline else ''
+    file_form = remote == ['bash', '.gate/windows-job.sh']
+    script_path = cwd / remote[1] if file_form else None
+    script = script_path.read_text() if script_path and script_path.is_file() else ''
     match = re.search(r'^gate_job=(.+)$', script, re.M)
     name = shlex.split(match[1])[0] if match else 'windows-suite'
-    unsupported = not inline
+    unsupported = not file_form or not script
     scripts = [script]
     scripts.extend(base64.b64decode(value).decode('utf-16le') for value in re.findall(r'\bgate_ps ([A-Za-z0-9+/=]+)', script))
     for text in scripts:
@@ -354,7 +384,6 @@ if args[args.index('--platform') + 1] == 'windows' and '--net' in args:
 if unsupported:
     print('runner_prerequisite_unsupported: Windows command invokes Python/git or a worker wrapper', flush=True)
     sys.exit(200)
-cwd = Path(args[args.index('--cwd') + 1]).resolve()
 checkout = Path(os.environ['FAKE_CHECKOUT']).resolve()
 if checkout in cwd.parents:
     print('lease_mismatch: --cwd overlaps the submitting checkout', flush=True)
@@ -395,6 +424,12 @@ sys.exit(status)
             evidence = root / "evidence"
             evidence.mkdir()
             runner = GATE["Runner"]("tree", root / "unowned" if outside_roots else allowed_root / "test-run", evidence, (root,))
+            if not through_gate and not interrupt:
+                windows = next(job for job in second if job.platform == "windows")
+                script = runner.scratch / windows.name / GATE["WINDOWS_SCRIPT"]
+                script.parent.mkdir(parents=True)
+                script.write_text(windows_script_override if windows_script_override is not None else
+                                  GATE["windows_command"](windows, "tree")[-1])
             output = io.StringIO()
             status = 0
             with patch.dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
@@ -477,9 +512,7 @@ sys.exit(status)
 
     def test_fake_motor_rejects_windows_python_and_git_commands(self):
         for program in ("python3 --version", "git status"):
-            with patch.dict(GATE["Runner"].run.__globals__, windows_command=lambda job, expected: [
-                    "bash", "-e", "-o", "pipefail", "-c", "gate_job=" + job.name + "\n" + program]):
-                status, _, _, _, output = self.invoke({})
+            status, _, _, _, output = self.invoke({}, windows_script_override="gate_job=windows-suite\n" + program)
             self.assertEqual(status, 200, output)
             self.assertIn("runner_prerequisite_unsupported", output)
 
@@ -548,7 +581,7 @@ sys.exit(status)
             previous = Path.cwd()
             git = subprocess.run
 
-            def incomplete_worktree(destination, allowed_roots):
+            def incomplete_worktree(destination, allowed_roots, extra_files=None):
                 command = ["git", "worktree", "add", "--quiet", "--detach", "--no-checkout", str(destination), "HEAD"]
                 git(command, check=True)
                 raise subprocess.CalledProcessError(1, command)
@@ -591,12 +624,35 @@ sys.exit(status)
                 self.assertNotIn("--vcpus", args)
                 self.assertNotIn("--return-path", args)
                 remote = args[args.index("--") + 1:]
-                self.assertEqual(remote[:5], ["bash", "-e", "-o", "pipefail", "-c"])
-                self.assertNotIn("scripts/gate.sh", remote[-1])
-                self.assertNotIn("--worker", remote[-1])
+                self.assertEqual(remote, ["bash", GATE["WINDOWS_SCRIPT"]])
         self.assertEqual(len(roots), 4)
         self.assertIn("Retained 8 bytes of Windows build evidence", output)
         self.assertNotIn("GATE_EVIDENCE", output)
+
+    def test_windows_remote_argv_is_flattening_safe(self):
+        status, _, recorded, _, output = self.invoke({})
+        args = recorded["windows-suite"]
+        remote = args[args.index("--") + 1:]
+        for argument in remote:
+            self.assertFalse(any(char in argument for char in ("\n", "\r", "'", '"')),
+                             "Windows remote argv must contain no newline or quote characters")
+        self.assertEqual(remote, ["bash", ".gate/windows-job.sh"])
+        self.assertEqual(status, 0, output)
+
+    def test_linux_worker_json_round_trips_through_posix_argv_quoting(self):
+        status, _, recorded, _, output = self.invoke({})
+        self.assertEqual(status, 0, output)
+        for name, args in recorded.items():
+            if args[args.index("--platform") + 1] != "linux":
+                continue
+            remote = args[args.index("--") + 1:]
+            self.assertEqual(remote[:3], ["bash", "scripts/gate.sh", "--worker"])
+            self.assertIn('"', remote[3])
+            self.assertNotIn("\n", remote[3])
+            probe = subprocess.run(["bash", "-c", "printf '%s\\0' " + shlex.join(remote)], capture_output=True, check=True)
+            received = probe.stdout.decode().split("\0")[:-1]
+            self.assertEqual(received, remote)
+            self.assertEqual(json.loads(received[3])["name"], name)
 
     def test_first_failure_names_job_and_step_cancels_and_joins_siblings(self):
         status, results, recorded, completed, output = self.invoke({"windows-suite": 7})
@@ -618,7 +674,7 @@ sys.exit(status)
         for status in (0, 200):
             output = io.StringIO()
             with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), \
-                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot=lambda destination, roots: None,
+                    patch.dict(GATE["run_gate"].__globals__, fingerprint=lambda: "tree", snapshot=lambda destination, roots, extra=None: None,
                                snapshot_directory=lambda roots: Path(directory),
                                parallel=lambda runner, jobs: (status, {jobs[0].name: (status, .25)})), \
                     patch.object(Path, "mkdir"), \
