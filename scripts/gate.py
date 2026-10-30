@@ -307,7 +307,13 @@ def worker(job, expected):
     return status
 
 
-def snapshot(destination, allowed_roots):
+# Windows MOTOR flattens argv into one command line, which mangles a multi-line
+# `bash -c` script's quoting ("unexpected EOF while looking for matching `''").
+# The Windows job therefore runs its script as a file committed into its snapshot.
+WINDOWS_SCRIPT = ".gate/windows-job.sh"
+
+
+def snapshot(destination, allowed_roots, extra_files=None):
     """Overlay current source inputs onto a detached worktree of this repository.
 
     MOTOR ships a checkout to the runner as a git bundle against history the
@@ -333,6 +339,12 @@ def snapshot(destination, allowed_roots):
             target.symlink_to(os.readlink(source))
         else:
             shutil.copy2(source, target)
+    for relative, text in (extra_files or {}).items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, newline="\n")
+    subprocess.run(["git", "-C", str(destination), "add", "--all", "--force"] +
+                   [str(relative) for relative in (extra_files or {})], check=True)
     subprocess.run(["git", "-C", str(destination), "add", "--all"], check=True)
     # Commit even a clean source snapshot without changing the submitting branch
     # or inheriting signing/hooks configuration.
@@ -362,7 +374,7 @@ class Runner:
     def run(self, job):
         start = time.monotonic()
         checkout = validate_snapshot_path(self.scratch / job.name, job.name, self.allowed_roots)
-        remote = (windows_command(job, self.expected) if job.platform == "windows" else
+        remote = (["bash", WINDOWS_SCRIPT] if job.platform == "windows" else
                   ["bash", "scripts/gate.sh", "--worker", json.dumps(asdict(job)), self.expected])
         command = motor_command(
             remote,
@@ -479,7 +491,9 @@ def run_gate(phases, allowed_roots):
         # Prepare independent identical checkouts before any compiler starts.
         for jobs in phases:
             for job in jobs:
-                snapshot(scratch / job.name, allowed_roots)
+                extra = ({WINDOWS_SCRIPT: windows_command(job, expected)[-1] + "\n"}
+                         if job.platform == "windows" else None)
+                snapshot(scratch / job.name, allowed_roots, extra)
         if fingerprint() != expected:
             raise ValueError("source changed while preparing snapshots")
         status = 0
