@@ -16,7 +16,8 @@
 # naming which ones ran.
 #
 # Why this is the default push path instead of scripts/gated-push.sh:
-# the local full Rust gate takes ~12 minutes on this box and only sees macOS.
+# the local full Rust gate takes ~12 minutes on a developer machine and only
+# sees that machine's operating system.
 # Measured over the last week, about half the red trains failed on Linux or
 # Windows only, so on those the local gate was paid for and could not have
 # caught the failure. It also runs in the one working tree, so trains serialize
@@ -28,7 +29,7 @@
 # on main, not of where the tests ran: nothing lands here except a sha whose CI
 # run concluded success, and it lands by fast-forward only - never a merge,
 # never a force. gated-push.sh stays for the work whose failures only reproduce
-# locally (watcher/fseventsd, macOS exec assessment).
+# on a developer machine (its native file watcher, or its executable assessment).
 #
 # EDIT THIS FILE BY WRITE-TEMP-THEN-RENAME, NEVER IN PLACE. A running bash holds
 # an open fd and reads on by byte offset, so an in-place write (same inode) makes
@@ -246,6 +247,10 @@ refuse() {
 # A failed GitHub query is not an empty result: empty run lists and unreadable
 # conclusions have different safety meanings. Retry transient service and
 # network errors a bounded number of times, then preserve the upstream error.
+# GitHub sometimes answers HTTP 200 with a truncated body, which gh reports as
+# "unexpected end of JSON input"; a well-formed reply never parses that way, so
+# it is transient too. A real failed check is a well-formed reply and is never
+# retried here.
 gh_query_or_refuse() {
   local context="$1"
   shift
@@ -265,7 +270,7 @@ gh_query_or_refuse() {
   [ "$total_delay" -le 600 ] ||
     refuse "TRAIN_PUSH_GH_RETRY_DELAYS must total no more than 600 seconds"
 
-  transient_error='rate.?limit|secondary[[:space:]]+rate|abuse[[:space:]]+detection|http[[:space:]]+(429|5[0-9][0-9])|status[[:space:]]+code:[[:space:]]*(429|5[0-9][0-9])|network[[:space:]]+(is[[:space:]]+)?unreachable|temporary[[:space:]]+failure|could[[:space:]]+not[[:space:]]+(resolve|connect)|no[[:space:]]+such[[:space:]]+host|connection[[:space:]]+(refused|reset|closed|aborted|timed[[:space:]]+out)|timed[[:space:]]+out|timeout|context[[:space:]]+deadline[[:space:]]+exceeded|dial[[:space:]]+(tcp|udp)|failed[[:space:]]+to[[:space:]]+connect|tls[[:space:]]+handshake|unexpected[[:space:]]+eof|i/o[[:space:]]+timeout|server[[:space:]]+misbehaving|remote[[:space:]]+end[[:space:]]+hung[[:space:]]+up|broken[[:space:]]+pipe|socket[[:space:]]+hang[[:space:]]+up|proxy.*(error|failed)'
+  transient_error='rate.?limit|secondary[[:space:]]+rate|abuse[[:space:]]+detection|http[[:space:]]+(429|5[0-9][0-9])|status[[:space:]]+code:[[:space:]]*(429|5[0-9][0-9])|network[[:space:]]+(is[[:space:]]+)?unreachable|temporary[[:space:]]+failure|could[[:space:]]+not[[:space:]]+(resolve|connect)|no[[:space:]]+such[[:space:]]+host|connection[[:space:]]+(refused|reset|closed|aborted|timed[[:space:]]+out)|timed[[:space:]]+out|timeout|context[[:space:]]+deadline[[:space:]]+exceeded|dial[[:space:]]+(tcp|udp)|failed[[:space:]]+to[[:space:]]+connect|tls[[:space:]]+handshake|unexpected[[:space:]]+eof|unexpected[[:space:]]+end[[:space:]]+of[[:space:]]+json[[:space:]]+input|i/o[[:space:]]+timeout|server[[:space:]]+misbehaving|remote[[:space:]]+end[[:space:]]+hung[[:space:]]+up|broken[[:space:]]+pipe|socket[[:space:]]+hang[[:space:]]+up|proxy.*(error|failed)'
   while :; do
     diagnostic_file="$(mktemp "${TMPDIR:-/tmp}/train-push-gh.XXXXXX")" || {
       printf 'train-push: could not query %s: could not create a diagnostic file\n' "$context" >&2
