@@ -15,11 +15,12 @@ server (`runon: "linux,4c"`). For a bug fix, add one ordinary test that fails
 without the fix, and show that once: revert only the fix, run that test, see it
 fail. Do not write mutation rows, break proofs or deliberate-break controls
 (edits that break production code on purpose to prove some test notices), and
-do not repeat runs to prove stability. Before delivering, run `scripts/gate.sh`:
-it is the single push-CI parity gate, with fast guards first and full Linux and
-native Windows suites on the build servers in parallel. CI confirms this result;
-do not wait for CI to discover failures. A filtered iteration check or
-`scripts/gate.sh --fast` is not a full delivery gate.
+do not repeat runs to prove stability. That filtered check is the whole worker
+gate: the head integrates deliveries, and CI runs the full suites before
+master. `scripts/gate.sh` runs every push-CI step on the build servers (fast
+guards, then the full Linux and native Windows suites in parallel), but it
+takes about 25 minutes, twice a warm CI run, so it is for the head to run on
+changes likely to break only on Windows or only in CI, not for every delivery.
 
 ## Standing pre-approvals
 
@@ -94,10 +95,10 @@ warm cached jobs keep their existing paths and outputs.
 
 `scripts/train-push.local.sh` invokes this gate before every train without
 changing the shared train driver. Trains run the fast preflight
-(`gate.sh --fast`) by default until the build server's Windows images carry
-Python and LLVM's libclang; `TRAIN_GATE_FULL=1` runs full push-CI parity.
-Workers run the full `scripts/gate.sh` from the head's shell, since worker
-sandboxes cannot reach the build-server connection. The older `land-gates.sh` remains a changed-target iteration helper;
+(`gate.sh --fast`) by default, because CI runs the full suites anyway and the
+full gate is slower than CI; `TRAIN_GATE_FULL=1` runs full push-CI parity.
+The full gate runs from the head's shell, since worker sandboxes cannot reach
+the build-server connection. The older `land-gates.sh` remains a changed-target iteration helper;
 its `--full` means module coverage, not push-CI parity. Legacy helpers retain
 their Apple-only coverage but are not permission to compile portable code on
 the Mac. Their MOTOR exit-200 retry budget remains 3 minutes; the full gate
@@ -158,6 +159,6 @@ certification executes extracted candidate assets through same-filesystem hard
 links under development names; never rebuild or copy the attested binaries.
 
 Before committing, inspect the diff and run the filtered tests and formatting for
-what you touched, followed by `scripts/gate.sh` before delivery. Use
+what you touched. Use
 [development verification](../docs/development.md) and
 [backend certification](../docs/backend-certification.md) for exact procedures.
