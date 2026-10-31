@@ -28,6 +28,9 @@ dunce = "1"
 
 [dev-dependencies]
 sha2.workspace = true
+# Deadline tests run on tokio's paused clock, so a busy test runner can't
+# spend the deadline before the first request is sent.
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 synapse-build-stamp = { path = "../synapse-build-stamp" }

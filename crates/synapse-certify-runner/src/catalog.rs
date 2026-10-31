@@ -269,7 +269,9 @@ mod tests {
             );
         }
     }
-    #[tokio::test]
+    // Paused clock: the 10 ms deadline starts counting only when the test
+    // waits, so it expires during the retry sleep, never before the first call.
+    #[tokio::test(start_paused = true)]
     async fn loading_deadline_refuses_without_completing_a_fixture() {
         let mut client = stub(vec![
             json!({"error":{"code":"model_loading","retry_after_ms":100}}),
@@ -296,7 +298,7 @@ mod tests {
         assert_eq!(client.calls.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unanswered_fixture_is_bounded_by_runner_deadline() {
         struct Silent;
         impl Client for Silent {
