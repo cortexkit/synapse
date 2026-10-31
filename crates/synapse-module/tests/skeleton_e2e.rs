@@ -354,13 +354,9 @@ async fn open_route_for_started_module(
 ) -> (TestDaemon, ModuleProcess, tokio::net::TcpStream, TestRoute) {
     wait_for_registration(&daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("synapse-e2e-project");
-    std::fs::create_dir_all(&project_root).unwrap();
-
     let mut consumer = connect_consumer(&daemon.connection_file_path).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    let route = route_open(&mut consumer, &project_root, 1).await;
-    let _ = std::fs::remove_dir_all(&project_root);
+    let route = route_open(&mut consumer, 1).await;
     (daemon, module, consumer, route)
 }
 
@@ -1615,15 +1611,11 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
 
     let mut second_consumer = connect_consumer(&daemon.connection_file_path).await;
     wait_for_catalog(&mut second_consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    let second_project = unique_temp_dir("synapse-admission-second");
-    std::fs::create_dir_all(&second_project).unwrap();
-    let second_route = route_open(&mut second_consumer, &second_project, 2).await;
+    let second_route = route_open(&mut second_consumer, 2).await;
 
     let mut status_consumer = connect_consumer(&daemon.connection_file_path).await;
     wait_for_catalog(&mut status_consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    let status_project = unique_temp_dir("synapse-admission-status");
-    std::fs::create_dir_all(&status_project).unwrap();
-    let status_route = route_open(&mut status_consumer, &status_project, 3).await;
+    let status_route = route_open(&mut status_consumer, 3).await;
 
     let text = "admission semaphore hold ".repeat(512);
     let make_items = || {

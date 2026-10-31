@@ -173,11 +173,7 @@ impl Candidate {
                 return Err(error.into());
             }
         };
-        let identity = BindIdentity::new(
-            checkout.to_path_buf(),
-            label,
-            format!("{label}-{}", std::process::id()),
-        );
+        let identity = BindIdentity::new(label, format!("{label}-{}", std::process::id()));
         let mut candidate = Self {
             consumer,
             identity,

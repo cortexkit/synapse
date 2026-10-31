@@ -16809,8 +16809,12 @@ fn manifest(module_id: &str) -> ModuleManifest {
             concurrency: Concurrency::ModuleManaged,
         }])
         // Unattended flows may read diagnoses, never infer or change serving state.
+        // Bind handling uses the principal and daemon-stamped scope, not project identity.
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-            provides: vec!["flow-scopes/v1".to_string()],
+            provides: vec![
+                "flow-scopes/v1".to_string(),
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
@@ -20242,7 +20246,7 @@ mod tests {
             subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "synapse".into(),
             },
-            subc_protocol::BindIdentity::new(PathBuf::from("/"), "synapse-test", "session-1"),
+            subc_protocol::BindIdentity::new("synapse-test", "session-1"),
         )
         .with_scope(stamp)
     }
@@ -20272,7 +20276,7 @@ mod tests {
         );
         assert_eq!(
             manifest.capabilities.as_ref().unwrap().provides,
-            vec!["flow-scopes/v1"]
+            vec!["flow-scopes/v1", "bind-no-project/v1"]
         );
         manifest.validate_flow_operations().unwrap();
         assert!(operations.iter().any(

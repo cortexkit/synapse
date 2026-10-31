@@ -54,7 +54,6 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
     let identity = BindIdentity::new(
-        env::current_dir().context("find exerciser project root")?,
         "inline-embed-throughput",
         format!("inline-embed-throughput-{}", std::process::id()),
     );

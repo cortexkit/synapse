@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
@@ -300,15 +300,10 @@ async fn run(cli: Cli) -> Result<()> {
     let subc = discover(cli.subc.as_deref())
         .context("discover subc daemon connection file")?
         .path;
-    let project_root = discover_repo_root()?;
     let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
-    let identity = BindIdentity::new(
-        project_root,
-        "opctl",
-        format!("opctl-{}", std::process::id()),
-    );
+    let identity = BindIdentity::new("opctl", format!("opctl-{}", std::process::id()));
 
     let result = execute(&consumer, &identity, &cli.command).await;
     consumer.close().await;
@@ -900,21 +895,6 @@ fn verify_content_echo(text: &str, echoed: &str) -> Result<String> {
     Ok(expected)
 }
 
-fn discover_repo_root() -> Result<PathBuf> {
-    let current = env::current_dir().context("read current directory")?;
-    for candidate in current.ancestors() {
-        if candidate.join(".git").exists() && candidate.join("Cargo.toml").is_file() {
-            return candidate
-                .canonicalize()
-                .with_context(|| format!("canonicalize repository root {}", candidate.display()));
-        }
-    }
-    bail!(
-        "current directory {} is not inside a Git Cargo workspace; run opctl from the Synapse repository",
-        current.display()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,7 +1048,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default();
-        let path = env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "synapse-opctl-manifest-{}-{nonce}.json",
             std::process::id(),
         ));

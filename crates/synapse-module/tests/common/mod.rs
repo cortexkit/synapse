@@ -279,7 +279,7 @@ pub async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
     .expect("timed out waiting for a frame")
 }
 
-pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) -> TestRoute {
+pub async fn route_open(stream: &mut TcpStream, corr: u64) -> TestRoute {
     let mut last_error = String::new();
     for attempt in 0..10 {
         let target = RouteTarget::ManagementSurface {
@@ -287,7 +287,6 @@ pub async fn route_open(stream: &mut TcpStream, project_root: &Path, corr: u64) 
         };
         let bind_id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let identity = BindIdentity::new(
-            project_root.to_path_buf(),
             format!("synapse-e2e-{}-{bind_id}", process::id()),
             format!("session-{}-{bind_id}", process::id()),
         );

@@ -270,21 +270,19 @@ jobs:
         run: |
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
-          # Synapse reads no project identity from routes and does not declare
-          # scope-workdir/v1. subc-protocol 0.33.5 adds the optional flow_operations
-          # allowlist; older daemons drop it and register Synapse as before.
-          # For 0.33.x the ck-subc floor stays at requires_core 0.20.53;
-          # Synapse also enforces its diagnostics-only flow guard locally.
+          # Synapse reads no project identity from routes and declares bind-no-project/v1.
+          # The requires_core floor 0.20.154 was confirmed with SUBC for
+          # subc-protocol 0.34.x. ck 0.20.154 ships daemon 0.39.0, required by client 0.33.
           # A new protocol minor needs that floor rechecked with SUBC.
           case "$protocol" in
-            0.33.*) ;;
+            0.34.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.33.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              echo "subc-protocol is $protocol, not 0.34.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
-          printf '{\n  "requires_core": "0.20.53"\n}\n' > dist/release-manifest.json
-          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.53',d"
+          printf '{\n  "requires_core": "0.20.154"\n}\n' > dist/release-manifest.json
+          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.154',d"
       - name: Upload assets to candidate draft
         env:
           GH_TOKEN: ${{ github.token }}

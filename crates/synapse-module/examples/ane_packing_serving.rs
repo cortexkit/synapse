@@ -419,7 +419,6 @@ impl Candidate {
         });
         let consumer = SubcConsumer::connect(&conn_path, ConsumerOptions::default()).await?;
         let identity = BindIdentity::new(
-            env::current_dir()?,
             "ane-packing-serving",
             format!("ane-packing-{}", std::process::id()),
         );

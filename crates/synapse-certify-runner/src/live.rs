@@ -261,11 +261,7 @@ fn candidate_command(
     command
 }
 
-async fn start(
-    options: &Options,
-    layout: &crate::assets::Layout,
-    endpoint: &str,
-) -> Result<Session> {
+async fn start(layout: &crate::assets::Layout, endpoint: &str) -> Result<Session> {
     let root = &layout.root;
     std::fs::create_dir_all(root.join("data")).map_err(err)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
@@ -326,7 +322,7 @@ async fn start(
     };
     for attempt in 0..600 {
         session.corr += 1;
-        let response = rpc(&mut session.stream, 0, 0, session.corr, json!({"op": "route.open", "target": RouteTarget::ManagementSurface { module_id: "synapse".into() }, "identity": BindIdentity::new(options.checkout.clone(), "certify".to_string(), "certify".to_string())})).await?;
+        let response = rpc(&mut session.stream, 0, 0, session.corr, json!({"op": "route.open", "target": RouteTarget::ManagementSurface { module_id: "synapse".into() }, "identity": BindIdentity::new("certify".to_string(), "certify".to_string())})).await?;
         if let (Some(channel), Some(epoch)) = (
             response["route_channel"].as_u64(),
             response["route_epoch"].as_u64(),
@@ -707,7 +703,7 @@ async fn observe(
         .as_array()
         .ok_or_else(|| refuse("fixture cases missing"))?;
     let mirror = crate::mirror::Mirror::start(&options.mirror).await?;
-    let mut candidate = start(options, layout, &mirror.endpoint).await?;
+    let mut candidate = start(layout, &mirror.endpoint).await?;
     let deadline = tokio::time::Instant::now() + crate::catalog::RUN_BUDGET;
     let pin = crate::catalog::install(&mut candidate, row, model, deadline).await?;
     let operation = pin.task.clone();
@@ -1104,7 +1100,7 @@ mod tests {
             .join(format!(".live/readout-probe-{}", std::process::id()));
         let layout = crate::assets::Layout::new(&options.assets, &root, "metal-m5").unwrap();
         let mirror = crate::mirror::Mirror::start(&options.mirror).await.unwrap();
-        let mut candidate = start(&options, &layout, &mirror.endpoint).await.unwrap();
+        let mut candidate = start(&layout, &mirror.endpoint).await.unwrap();
         let deadline = tokio::time::Instant::now() + crate::catalog::RUN_BUDGET;
         let pin = crate::catalog::install(
             &mut candidate,

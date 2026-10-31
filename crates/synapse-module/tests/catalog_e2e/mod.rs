@@ -896,7 +896,7 @@ async fn catalog_pre_commit_cancel_has_one_terminal_winner() {
     let verifying = h.wait_state(&job, &["verifying"]).await;
     assert_golden_status(&verifying);
     let mut canceller = connect_consumer(&h.daemon.connection_file_path).await;
-    let cancel_route = route_open(&mut canceller, &h.fixture_root, 1).await;
+    let cancel_route = route_open(&mut canceller, 1).await;
     let cancel_job = job.clone();
     let cancel_task = tokio::spawn(async move {
         route_request(
@@ -1023,7 +1023,7 @@ impl CatalogHarness {
         wait_for_registration(&self.daemon.registry, MODULE_ID, SETUP_TIMEOUT).await;
         self.consumer = connect_consumer(&self.daemon.connection_file_path).await;
         wait_for_catalog(&mut self.consumer, MODULE_ID, SETUP_TIMEOUT).await;
-        self.route = route_open(&mut self.consumer, &self.fixture_root, 1).await;
+        self.route = route_open(&mut self.consumer, 1).await;
     }
 }
 
@@ -2027,7 +2027,7 @@ async fn catalog_failed_load_after_inline_timeout_reaches_next_request_and_retry
     for index in 0..3 {
         let mut client = connect_consumer(&h.daemon.connection_file_path).await;
         wait_for_catalog(&mut client, MODULE_ID, SETUP_TIMEOUT).await;
-        let route = route_open(&mut client, &h.fixture_root, index + 1).await;
+        let route = route_open(&mut client, index + 1).await;
         clients.push((client, route));
     }
     let mut waiters = Vec::new();

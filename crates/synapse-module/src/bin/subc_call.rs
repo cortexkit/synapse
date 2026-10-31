@@ -79,11 +79,7 @@ async fn run(args: CliArgs) -> Result<()> {
     let consumer = SubcConsumer::connect(&subc, ConsumerOptions::default())
         .await
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
-    let identity = build_identity(
-        args.identity_override.clone(),
-        env::current_dir,
-        process::id,
-    )?;
+    let identity = build_identity(args.identity_override.clone(), process::id);
     let response = consumer
         .call(
             RouteTarget::ManagementSurface {
@@ -176,30 +172,19 @@ fn parse_identity_override(raw: &str) -> Result<(String, String)> {
 
 /// Build the bind identity. Override path uses exact harness/session bytes;
 /// default path matches the historical ambient `subc-call` / `subc-call-<pid>`.
-fn build_identity<Cwd, Pid>(
-    identity_override: Option<(String, String)>,
-    cwd: Cwd,
-    pid: Pid,
-) -> Result<BindIdentity>
+fn build_identity<Pid>(identity_override: Option<(String, String)>, pid: Pid) -> BindIdentity
 where
-    Cwd: FnOnce() -> std::io::Result<PathBuf>,
     Pid: FnOnce() -> u32,
 {
-    let project_root = cwd().context("resolve cwd")?;
     match identity_override {
-        Some((harness, session)) => Ok(BindIdentity::new(project_root, harness, session)),
-        None => Ok(BindIdentity::new(
-            project_root,
-            "subc-call",
-            format!("subc-call-{}", pid()),
-        )),
+        Some((harness, session)) => BindIdentity::new(harness, session),
+        None => BindIdentity::new("subc-call", format!("subc-call-{}", pid())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn unwrap_run(parsed: ParsedCli) -> CliArgs {
         match parsed {
@@ -288,8 +273,7 @@ mod tests {
 
     #[test]
     fn build_identity_default_matches_ambient() {
-        let id = build_identity(None, || Ok(PathBuf::from("/tmp/proj")), || 4242).unwrap();
-        assert_eq!(id.project_root, PathBuf::from("/tmp/proj"));
+        let id = build_identity(None, || 4242);
         assert_eq!(id.harness, "subc-call");
         assert_eq!(id.session, "subc-call-4242");
     }
@@ -298,11 +282,8 @@ mod tests {
     fn build_identity_override_passes_exact_bytes() {
         let id = build_identity(
             Some(("chair-harness".into(), "seat-session-01".into())),
-            || Ok(PathBuf::from("/work")),
             || 1,
-        )
-        .unwrap();
-        assert_eq!(id.project_root, PathBuf::from("/work"));
+        );
         assert_eq!(id.harness, "chair-harness");
         assert_eq!(id.session, "seat-session-01");
     }
