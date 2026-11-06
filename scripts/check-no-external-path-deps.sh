@@ -80,7 +80,21 @@ check_no_patch_tables() {
 
 if [ "${1:-}" = "--self-test" ]; then
   scratch="$(mktemp -d)"
-  trap 'rm -rf "$scratch"' EXIT
+  # macOS /bin/bash 3.2 exits 0 when an EXIT trap is set and an unbound
+  # variable aborts the script under set -eu, so a cleanup-only trap would let
+  # a broken self-test read as passed. The trap keeps a nonzero status and turns
+  # a 0 into a failure unless the self-test reached its own success exit.
+  self_test_finished=0
+  self_test_cleanup() {
+    local status=$?
+    rm -rf "$scratch"
+    if [ "$status" -eq 0 ] && [ "$self_test_finished" != 1 ]; then
+      echo "self-test FAILED: exited before finishing" >&2
+      status=1
+    fi
+    exit "$status"
+  }
+  trap self_test_cleanup EXIT
   make_crate() { # dir name [dependency line]
     mkdir -p "$1/src"
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n%s\n' \
@@ -114,6 +128,7 @@ if [ "${1:-}" = "--self-test" ]; then
   rc=0; check_no_patch_tables "$scratch/repo/app/Cargo.toml" >/dev/null || rc=$?
   [ "$rc" = 3 ] || { echo "self-test FAILED: an unused [patch] table was not refused (rc=$rc)" >&2; exit 1; }
   echo "path-dependency self-test: in-repo controls passed, 3 planted breaks refused"
+  self_test_finished=1
   exit 0
 fi
 

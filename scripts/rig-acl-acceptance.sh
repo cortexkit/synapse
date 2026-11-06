@@ -29,13 +29,23 @@ GRANT="$CONTROLLER allow read,readattr,readextattr,readsecurity,list,search,file
 
 as_candidate() { sudo -n -u "$CANDIDATE" "$@"; }
 
+# macOS /bin/bash 3.2 exits 0 when an EXIT trap is set and an unbound variable
+# aborts the script under set -eu. So cleanup keeps a nonzero status and turns a
+# 0 into a failure unless the script reached its PASSED line.
+finished=0
 cleanup() {
+  local status=$?
   # The candidate owns the three trees, so it clears their contents; the
   # controller owns the parent and removes the now-empty entries.
   as_candidate chmod -R u+rwx "$ROOT/workspace" "$ROOT/candidate-home" "$ROOT/candidate-tmp" 2>/dev/null || true
   as_candidate find "$ROOT/workspace" "$ROOT/candidate-home" "$ROOT/candidate-tmp" -mindepth 1 -delete 2>/dev/null || true
   rm -rf "$ROOT" 2>/dev/null || true
   if [ -e "$ROOT" ]; then echo "LEFTOVER: $ROOT" >&2; fi
+  if [ "$status" -eq 0 ] && [ "$finished" != 1 ]; then
+    echo "ACL ACCEPTANCE: FAILED (exited before finishing)" >&2
+    status=1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -110,3 +120,4 @@ expect REFUSED "file under a stripped dir" "$ROOT/workspace/probe/created.txt"
 rm -f "$PY_BODY"
 if [ "$fail" -ne 0 ]; then echo "ACL ACCEPTANCE: FAILED"; exit 1; fi
 echo "ACL ACCEPTANCE: PASSED"
+finished=1

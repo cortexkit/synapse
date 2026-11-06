@@ -33,7 +33,12 @@ SAFE="$RIG/hardlink-safe-$$"
 
 as_candidate() { sudo -n -u "$CANDIDATE" "$@"; }
 
+# macOS /bin/bash 3.2 exits 0 when an EXIT trap is set and an unbound variable
+# aborts the script under set -eu. So cleanup keeps a nonzero status and turns a
+# 0 into a failure unless the script reached its PASSED line.
+finished=0
 cleanup() {
+  local status=$?
   for root in "$HAZARD" "$SAFE"; do
     [ -d "$root" ] || continue
     as_candidate chmod -R u+rwx "$root/workspace" "$root/candidate-home" "$root/candidate-tmp" 2>/dev/null || true
@@ -49,7 +54,11 @@ cleanup() {
     rm -rf "$SRC"
   fi
   for p in "$HAZARD" "$SAFE" "$SRC"; do [ -e "$p" ] && echo "LEFTOVER: $p" >&2; done
-  return 0
+  if [ "$status" -eq 0 ] && [ "$finished" != 1 ]; then
+    echo "HARDLINK ACCEPTANCE: FAILED (exited before finishing)" >&2
+    status=1
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -104,3 +113,4 @@ fi
 
 if [ "$fail" -ne 0 ]; then echo "HARDLINK ACCEPTANCE: FAILED"; exit 1; fi
 echo "HARDLINK ACCEPTANCE: PASSED"
+finished=1
