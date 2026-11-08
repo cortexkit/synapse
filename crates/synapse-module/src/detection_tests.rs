@@ -38,17 +38,30 @@ fn stub_binary() -> PathBuf {
     if let Some(path) = env::var_os("SYNAPSE_PROBE_STUB_BINARY") {
         return path.into();
     }
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(if cfg!(windows) {
-            "synapse-probe-stub.exe"
-        } else {
-            "synapse-probe-stub"
-        })
+    let name = if cfg!(windows) {
+        "synapse-probe-stub.exe"
+    } else {
+        "synapse-probe-stub"
+    };
+    // This test executable sits in `<profile>/deps/`. Cargo puts built binaries
+    // in `<target>/<profile>/`, which is the deps folder's parent in the default
+    // layout. With `CARGO_BUILD_BUILD_DIR` set (the Linux build servers set it),
+    // test executables move under `<build-dir>/<profile>/deps/` inside the
+    // target folder while binaries stay in `<target>/<profile>/`. So look for
+    // `<profile>/<stub>` under each ancestor of the deps folder, nearest first.
+    let exe = std::env::current_exe().unwrap();
+    let profile_dir = exe.parent().unwrap().parent().unwrap();
+    let profile = profile_dir.file_name().unwrap();
+    let nearest = profile_dir.join(name);
+    if nearest.is_file() {
+        return nearest;
+    }
+    profile_dir
+        .ancestors()
+        .skip(1)
+        .map(|ancestor| ancestor.join(profile).join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(nearest)
 }
 
 /// The shared stub executable for `slot`. Each slot gets its own source file
