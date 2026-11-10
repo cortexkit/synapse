@@ -36,8 +36,12 @@ Routine verification repairs do not need a question or permission pause:
 - Feature-list corrections and test-only seam fixes are pre-approved. Keep them
   scoped and verify the affected feature/test configuration.
 - Submit build/test jobs to the build servers without asking. Never compile on
-  the Mac except macOS-only Metal/ANE type-checks, with
-  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+  the Mac except macOS-only Metal/ANE checks, with
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` and your
+  worktree's own `target/`. Those checks are pre-approved: `cargo check`,
+  Clippy, and filtered tests of the macOS-gated code you touched that don't run
+  on the GPU or Neural Engine. The macOS build servers have no Xcode, so don't
+  try them for these crates.
 
 ## Landing execution location
 
