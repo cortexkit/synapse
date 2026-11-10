@@ -94,6 +94,30 @@ pub struct GenerateOutput {
     pub generated_token_ids: Vec<u32>,
 }
 
+/// Normalized log-mel features in row-major order (128 bins per frame), before
+/// engine rung padding. Front-end padding may follow `valid_mel_frames`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscribeRequest {
+    pub mel: Vec<f32>,
+    pub mel_frames: usize,
+    pub valid_mel_frames: usize,
+    pub observe: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranscribeOutput {
+    pub valid_encoder_frames: usize,
+    pub triples: Vec<crate::TranscriptRecord>,
+    pub observation: Option<TranscribeObservation>,
+}
+
+/// Certification-only copies of engine results; observation must not change decoding.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TranscribeObservation {
+    pub encoder_output: Vec<f32>,
+    pub decode_trace: Vec<crate::DecodeTraceRecord>,
+}
+
 pub trait EmbedEngine {
     fn identity(&self) -> EngineIdentity;
     fn load(
@@ -133,5 +157,20 @@ pub trait GenerateEngine {
         model: &LoadedModel,
         request: GenerateRequest,
     ) -> Result<GenerateOutput, EngineError>;
+    fn unload(&mut self, model: &LoadedModel);
+}
+
+pub trait TranscribeEngine {
+    fn identity(&self) -> EngineIdentity;
+    fn load(
+        &mut self,
+        artifact: &ValidatedArtifact,
+        cfg: &RuntimeConfig,
+    ) -> Result<LoadedModel, EngineError>;
+    fn transcribe(
+        &self,
+        model: &LoadedModel,
+        request: TranscribeRequest,
+    ) -> Result<TranscribeOutput, EngineError>;
     fn unload(&mut self, model: &LoadedModel);
 }

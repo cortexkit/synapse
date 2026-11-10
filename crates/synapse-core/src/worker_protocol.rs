@@ -9,13 +9,13 @@ use crate::worker_engine_names::{
 use crate::EngineIdentity;
 
 /// Version every worker HELLO carries in `v`; the host accepts only an exact
-/// match. Version 3 adds completed-work progress frames. synapse-module and
-/// workers deploy together: an older worker is rejected at HELLO rather than
-/// run without progress reporting. Silence, not total elapsed time, detects hangs.
+/// match. Version 4 adds transcription requests and observation frames.
+/// synapse-module and workers deploy together: an older worker is rejected at
+/// HELLO before receiving a request whose raw frame it cannot recognize.
 ///
 /// The owned-decode envelope version (the separate top-level HELLO
 /// `protocol_version`) is independent of this constant.
-pub const WORKER_PROTOCOL_VERSION: u8 = 3;
+pub const WORKER_PROTOCOL_VERSION: u8 = 4;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 /// HELLO engine identities of the owned embed/rerank workers (CUDA, Vulkan and
@@ -433,6 +433,14 @@ pub enum WorkerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grammar: Option<String>,
     },
+    /// One raw little-endian f32 frame, row-major with 128 mel bins per frame.
+    Transcribe {
+        req_id: String,
+        model_ref: String,
+        mel_frames: usize,
+        valid_mel_frames: usize,
+        observe: bool,
+    },
     Unload {
         req_id: String,
         model_ref: String,
@@ -457,6 +465,7 @@ impl WorkerRequest {
             Self::AneAdmitShape { .. } => "ANE_ADMIT_SHAPE",
             Self::AneEvictShape { .. } => "ANE_EVICT_SHAPE",
             Self::Generate { .. } => "GENERATE",
+            Self::Transcribe { .. } => "TRANSCRIBE",
             Self::Unload { .. } => "UNLOAD",
             Self::Ping { .. } => "PING",
             Self::Shutdown {} => "SHUTDOWN",
@@ -475,6 +484,7 @@ impl WorkerRequest {
             | Self::AneAdmitShape { req_id, .. }
             | Self::AneEvictShape { req_id, .. }
             | Self::Generate { req_id, .. }
+            | Self::Transcribe { req_id, .. }
             | Self::Unload { req_id, .. }
             | Self::Ping { req_id } => Some(req_id),
             Self::Shutdown {} => None,
@@ -492,8 +502,23 @@ impl WorkerRequest {
                 | Self::Rerank { .. }
                 | Self::RerankSequences { .. }
                 | Self::Generate { .. }
+                | Self::Transcribe { .. }
         )
     }
+
+    /// Validate a transcription payload after the transport enforces `max_frame`.
+    pub fn validate_raw_frame(&self, bytes: &[u8]) -> Result<(), RawFrameError> {
+        if let Self::Transcribe { mel_frames, .. } = self {
+            validate_record_frame(bytes, *mel_frames, 128 * 4)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscribeRevision {
+    pub kernel_revision: String,
+    pub decode_rule: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +551,8 @@ pub enum WorkerResponse {
         /// unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ane_cached_shapes: Option<Vec<usize>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcribe_revision: Option<TranscribeRevision>,
     },
     Vectors {
         req_id: String,
@@ -534,6 +561,19 @@ pub enum WorkerResponse {
     },
     Scores {
         req_id: String,
+    },
+    EncoderOutput {
+        req_id: String,
+        frames: usize,
+    },
+    DecodeTrace {
+        req_id: String,
+        steps: usize,
+    },
+    Transcript {
+        req_id: String,
+        valid_encoder_frames: usize,
+        count: usize,
     },
     Text {
         req_id: String,
@@ -603,6 +643,7 @@ impl WorkerResponse {
             cold_load_ms,
             buckets,
             ane_cached_shapes,
+            transcribe_revision: None,
         }
     }
 
@@ -612,6 +653,9 @@ impl WorkerResponse {
             | Self::Loaded { req_id, .. }
             | Self::Vectors { req_id, .. }
             | Self::Scores { req_id }
+            | Self::EncoderOutput { req_id, .. }
+            | Self::DecodeTrace { req_id, .. }
+            | Self::Transcript { req_id, .. }
             | Self::Text { req_id, .. }
             | Self::Unloaded { req_id }
             | Self::Admitted { req_id, .. }
@@ -620,10 +664,30 @@ impl WorkerResponse {
             Self::Err { req_id, .. } => req_id.as_deref(),
         }
     }
-    /// Whether one raw frame follows this response's JSON frame: the f32
-    /// vectors after `VECTORS`, the f32 scores after `SCORES`.
+    /// Whether one raw frame follows this response's JSON frame.
     pub fn carries_raw_frame(&self) -> bool {
-        matches!(self, Self::Vectors { .. } | Self::Scores { .. })
+        matches!(
+            self,
+            Self::Vectors { .. }
+                | Self::Scores { .. }
+                | Self::EncoderOutput { .. }
+                | Self::DecodeTrace { .. }
+                | Self::Transcript { .. }
+        )
+    }
+
+    /// Reject mismatched transcription counts as a protocol fault, not a partial result.
+    pub fn validate_raw_frame(&self, bytes: &[u8]) -> Result<(), RawFrameError> {
+        match self {
+            Self::EncoderOutput { frames, .. } => validate_record_frame(bytes, *frames, 1024 * 4),
+            Self::DecodeTrace { steps, .. } => {
+                validate_record_frame(bytes, *steps, DECODE_TRACE_RECORD_BYTES)
+            }
+            Self::Transcript { count, .. } => {
+                validate_record_frame(bytes, *count, TRANSCRIPT_RECORD_BYTES)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The `ERR unsupported_request` answer to a request this worker does not
@@ -658,6 +722,135 @@ impl fmt::Display for RawFrameError {
 }
 
 impl std::error::Error for RawFrameError {}
+
+fn validate_record_frame(
+    bytes: &[u8],
+    count: usize,
+    record_size: usize,
+) -> Result<(), RawFrameError> {
+    let expected = count
+        .checked_mul(record_size)
+        .ok_or_else(|| RawFrameError::new("raw frame declared length overflows"))?;
+    if bytes.len() != expected {
+        return Err(RawFrameError::new(format!(
+            "raw frame length {} does not match {count} × {record_size} = {expected}",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+pub const DECODE_TRACE_RECORD_BYTES: usize = 40;
+pub const TRANSCRIPT_RECORD_BYTES: usize = 12;
+
+/// One decoder step combining encoder and predictor outputs to select a token
+/// and duration. Duration ids index [0, 1, 2, 3, 4]; flags use only
+/// bit 0 (emitted) and bit 1 (symbol cap hit).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodeTraceRecord {
+    pub frame_index: i32,
+    pub token_top1: i32,
+    pub token_top2: i32,
+    pub duration_top1: i32,
+    pub duration_top2: i32,
+    pub token_logit1: f32,
+    pub token_logit2: f32,
+    pub duration_logit1: f32,
+    pub duration_logit2: f32,
+    pub flags: u32,
+}
+
+pub fn encode_decode_trace_frame(records: &[DecodeTraceRecord]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(records.len() * DECODE_TRACE_RECORD_BYTES);
+    for record in records {
+        bytes.extend(encode_i32_frame(&[
+            record.frame_index,
+            record.token_top1,
+            record.token_top2,
+            record.duration_top1,
+            record.duration_top2,
+        ]));
+        bytes.extend(encode_f32_frame(&[
+            record.token_logit1,
+            record.token_logit2,
+            record.duration_logit1,
+            record.duration_logit2,
+        ]));
+        bytes.extend_from_slice(&record.flags.to_le_bytes());
+    }
+    bytes
+}
+
+pub fn decode_decode_trace_frame(
+    bytes: &[u8],
+    steps: usize,
+) -> Result<Vec<DecodeTraceRecord>, RawFrameError> {
+    validate_record_frame(bytes, steps, DECODE_TRACE_RECORD_BYTES)?;
+    bytes
+        .as_chunks::<DECODE_TRACE_RECORD_BYTES>()
+        .0
+        .iter()
+        .map(|record| {
+            let ints = decode_i32_frame(&record[..20])?;
+            let floats = decode_f32_frame(&record[20..36])?;
+            let flags = u32::from_le_bytes(record[36..40].try_into().unwrap());
+            if flags & !3 != 0 {
+                return Err(RawFrameError::new("decode trace has reserved flags set"));
+            }
+            Ok(DecodeTraceRecord {
+                frame_index: ints[0],
+                token_top1: ints[1],
+                token_top2: ints[2],
+                duration_top1: ints[3],
+                duration_top2: ints[4],
+                token_logit1: floats[0],
+                token_logit2: floats[1],
+                duration_logit1: floats[2],
+                duration_logit2: floats[3],
+                flags,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptRecord {
+    pub token_id: i32,
+    pub frame_index: i32,
+    pub duration: i32,
+}
+
+pub fn encode_transcript_frame(records: &[TranscriptRecord]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(records.len() * TRANSCRIPT_RECORD_BYTES);
+    for record in records {
+        bytes.extend(encode_i32_frame(&[
+            record.token_id,
+            record.frame_index,
+            record.duration,
+        ]));
+    }
+    bytes
+}
+
+pub fn decode_transcript_frame(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<TranscriptRecord>, RawFrameError> {
+    validate_record_frame(bytes, count, TRANSCRIPT_RECORD_BYTES)?;
+    bytes
+        .as_chunks::<TRANSCRIPT_RECORD_BYTES>()
+        .0
+        .iter()
+        .map(|record| {
+            let ints = decode_i32_frame(record)?;
+            Ok(TranscriptRecord {
+                token_id: ints[0],
+                frame_index: ints[1],
+                duration: ints[2],
+            })
+        })
+        .collect()
+}
 
 pub fn encode_i32_frame(values: &[i32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
@@ -700,6 +893,172 @@ pub fn decode_f32_frame(bytes: &[u8]) -> Result<Vec<f32>, RawFrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcribe_messages_round_trip_with_little_endian_raw_frames() {
+        let request = WorkerRequest::Transcribe {
+            req_id: "speech-1".into(),
+            model_ref: "speech:0".into(),
+            mel_frames: 2,
+            valid_mel_frames: 1,
+            observe: true,
+        };
+        let json = serde_json::to_vec(&request).unwrap();
+        assert_eq!(json, br#"{"type":"TRANSCRIBE","req_id":"speech-1","model_ref":"speech:0","mel_frames":2,"valid_mel_frames":1,"observe":true}"#);
+        assert_eq!(
+            serde_json::from_slice::<WorkerRequest>(&json).unwrap(),
+            request
+        );
+        assert_eq!(request.wire_type(), "TRANSCRIBE");
+        assert_eq!(request.req_id(), Some("speech-1"));
+        assert!(request.carries_raw_frame());
+        let mel = encode_f32_frame(&vec![1.0; 256]);
+        assert_eq!(&mel[..4], &[0, 0, 128, 63]);
+        assert_eq!(decode_f32_frame(&mel).unwrap(), vec![1.0; 256]);
+        request.validate_raw_frame(&mel).unwrap();
+        let unsupported = WorkerResponse::unsupported_request(&request);
+        assert!(
+            matches!(unsupported, WorkerResponse::Err { req_id: Some(id), code, msg }
+            if id == "speech-1" && code == ERR_UNSUPPORTED_REQUEST && msg.contains("TRANSCRIBE"))
+        );
+
+        let responses = [
+            (
+                WorkerResponse::EncoderOutput {
+                    req_id: "speech-1".into(),
+                    frames: 1,
+                },
+                r#"{"type":"ENCODER_OUTPUT","req_id":"speech-1","frames":1}"#,
+                vec![0; 4096],
+            ),
+            (
+                WorkerResponse::DecodeTrace {
+                    req_id: "speech-1".into(),
+                    steps: 1,
+                },
+                r#"{"type":"DECODE_TRACE","req_id":"speech-1","steps":1}"#,
+                vec![0; 40],
+            ),
+            (
+                WorkerResponse::Transcript {
+                    req_id: "speech-1".into(),
+                    valid_encoder_frames: 1,
+                    count: 1,
+                },
+                r#"{"type":"TRANSCRIPT","req_id":"speech-1","valid_encoder_frames":1,"count":1}"#,
+                vec![0; 12],
+            ),
+        ];
+        for (response, expected, raw) in responses {
+            let json = serde_json::to_vec(&response).unwrap();
+            assert_eq!(json, expected.as_bytes());
+            assert_eq!(
+                serde_json::from_slice::<WorkerResponse>(&json).unwrap(),
+                response
+            );
+            assert_eq!(response.req_id(), Some("speech-1"));
+            assert!(response.carries_raw_frame());
+            response.validate_raw_frame(&raw).unwrap();
+            assert!(response.validate_raw_frame(&raw[..raw.len() - 1]).is_err());
+            let mut extra = raw;
+            extra.push(0);
+            assert!(response.validate_raw_frame(&extra).is_err());
+        }
+        assert!(request.validate_raw_frame(&mel[..mel.len() - 4]).is_err());
+        let mut extra = mel;
+        extra.extend_from_slice(&[0; 4]);
+        assert!(request.validate_raw_frame(&extra).is_err());
+        let overflow = WorkerResponse::Transcript {
+            req_id: "overflow".into(),
+            valid_encoder_frames: 1,
+            count: usize::MAX,
+        };
+        assert!(overflow.validate_raw_frame(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_trace_record_codec_pins_all_forty_bytes() {
+        let record = DecodeTraceRecord {
+            frame_index: -1,
+            token_top1: 8192,
+            token_top2: 5,
+            duration_top1: 4,
+            duration_top2: 0,
+            token_logit1: 1.0,
+            token_logit2: -2.0,
+            duration_logit1: 0.5,
+            duration_logit2: 4.0,
+            flags: 3,
+        };
+        let expected = [
+            255, 255, 255, 255, 0, 32, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 0,
+            0, 0, 192, 0, 0, 0, 63, 0, 0, 128, 64, 3, 0, 0, 0,
+        ];
+        assert_eq!(
+            encode_decode_trace_frame(std::slice::from_ref(&record)),
+            expected
+        );
+        assert_eq!(
+            decode_decode_trace_frame(&expected, 1).unwrap(),
+            vec![record.clone()]
+        );
+        let two = encode_decode_trace_frame(&[record.clone(), record.clone()]);
+        assert_eq!(
+            decode_decode_trace_frame(&two, 2).unwrap(),
+            vec![record.clone(), record]
+        );
+        assert!(decode_decode_trace_frame(&expected[..39], 1).is_err());
+        assert!(decode_decode_trace_frame(&expected, 0).is_err());
+        assert!(decode_decode_trace_frame(&expected, 2).is_err());
+        let mut reserved_flag = expected;
+        reserved_flag[36] = 4;
+        assert!(decode_decode_trace_frame(&reserved_flag, 1).is_err());
+        assert!(decode_decode_trace_frame(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transcript_record_codec_pins_triple_order_and_little_endian_bytes() {
+        let records = vec![TranscriptRecord {
+            token_id: 258,
+            frame_index: 3,
+            duration: 4,
+        }];
+        let expected = [2, 1, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0];
+        assert_eq!(encode_transcript_frame(&records), expected);
+        assert_eq!(decode_transcript_frame(&expected, 1).unwrap(), records);
+        assert!(decode_transcript_frame(&expected[..8], 1).is_err());
+        assert!(decode_transcript_frame(&expected, 0).is_err());
+        assert!(decode_transcript_frame(&[], usize::MAX).is_err());
+        assert!(decode_transcript_frame(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn loaded_transcribe_revision_round_trips_and_is_omitted_when_absent() {
+        let mut loaded = WorkerResponse::loaded("load".into(), "speech:0".into(), 0, 1, None, None);
+        let legacy = br#"{"type":"LOADED","req_id":"load","model_ref":"speech:0","dims":0,"cold_load_ms":1}"#;
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), legacy);
+        assert_eq!(
+            serde_json::from_slice::<WorkerResponse>(legacy).unwrap(),
+            loaded
+        );
+        let WorkerResponse::Loaded {
+            transcribe_revision,
+            ..
+        } = &mut loaded
+        else {
+            unreachable!()
+        };
+        *transcribe_revision = Some(TranscribeRevision {
+            kernel_revision: "transcribe-v1".into(),
+            decode_rule: "tdt-v1".into(),
+        });
+        let expected = br#"{"type":"LOADED","req_id":"load","model_ref":"speech:0","dims":0,"cold_load_ms":1,"transcribe_revision":{"kernel_revision":"transcribe-v1","decode_rule":"tdt-v1"}}"#;
+        assert_eq!(serde_json::to_vec(&loaded).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_slice::<WorkerResponse>(expected).unwrap(),
+            loaded
+        );
+    }
 
     #[test]
     fn packed_planner_boundaries_ties_occurrences_and_order_restoration() {
@@ -820,7 +1179,7 @@ mod tests {
 
     #[test]
     fn v3_hello_without_packed_keeps_minimal_bytes_and_binding() {
-        let bytes = br#"{"v":3,"nonce":"legacy","engine":{"engine":"ane-direct-worker","version":"0.1.0"},"pid":42,"max_frame":16777216,"manifest_digest":"manifest","kernel_revision":"ane-direct-graph-v1"}"#;
+        let bytes = br#"{"v":4,"nonce":"legacy","engine":{"engine":"ane-direct-worker","version":"0.1.0"},"pid":42,"max_frame":16777216,"manifest_digest":"manifest","kernel_revision":"ane-direct-graph-v1"}"#;
         let mut hello: WorkerHello = serde_json::from_slice(bytes).unwrap();
         assert!(hello.packed.is_none());
         assert_eq!(serde_json::to_vec(&hello).unwrap(), bytes);
@@ -928,13 +1287,13 @@ mod tests {
 
     #[test]
     fn worker_protocol_is_version_three() {
-        assert_eq!(WORKER_PROTOCOL_VERSION, 3);
+        assert_eq!(WORKER_PROTOCOL_VERSION, 4);
     }
 
     #[test]
     fn hello_binding_fields_are_optional_on_the_wire() {
         let legacy = serde_json::json!({
-            "v": 3,
+            "v": 4,
             "nonce": "0123456789abcdef",
             "engine": {
                 "engine": "llama.cpp-worker",
@@ -1156,6 +1515,7 @@ mod tests {
             cold_load_ms: 5,
             buckets: Some(vec![128, 256]),
             ane_cached_shapes: Some(vec![128]),
+            transcribe_revision: None,
         };
         let admitted = WorkerResponse::Admitted {
             req_id: "admit-1".into(),
@@ -1215,6 +1575,7 @@ mod tests {
             decoded,
             WorkerResponse::Loaded {
                 ane_cached_shapes: None,
+                transcribe_revision: None,
                 ..
             }
         ));
@@ -1250,6 +1611,7 @@ mod tests {
                 cold_load_ms: 1,
                 buckets: Some(vec![128]),
                 ane_cached_shapes: Some(vec![128]),
+                transcribe_revision: None,
             }
         );
         let admitted = serde_json::json!({

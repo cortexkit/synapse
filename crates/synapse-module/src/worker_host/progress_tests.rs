@@ -54,6 +54,7 @@ async fn live_host_with_script(
                             cold_load_ms: 0,
                             buckets: None,
                             ane_cached_shapes: None,
+                            transcribe_revision: None,
                         },
                         DEFAULT_MAX_FRAME_BYTES,
                     )

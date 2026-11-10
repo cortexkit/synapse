@@ -3,7 +3,7 @@ import CryptoKit
 import Darwin
 import Foundation
 
-private let protocolVersion = 3
+private let protocolVersion = 4
 private let maxFrameBytes = 64 * 1024 * 1024
 private let engineVersion = "coreml-swift-v1"
 
@@ -108,6 +108,13 @@ private struct Main {
                     } catch {
                         try writeJSONFrame(fd: fd, value: err(reqId: reqId, code: "inference_failed", msg: String(describing: error)))
                     }
+                case "TRANSCRIBE":
+                    _ = try readFrame(fd: fd, maxFrame: acceptedFrame)
+                    try writeJSONFrame(fd: fd, value: err(
+                        reqId: request["req_id"] as? String,
+                        code: "unsupported_request",
+                        msg: "TRANSCRIBE is not supported by this worker"
+                    ))
                 case "RERANK", "GENERATE":
                     let reqId = request["req_id"] as? String
                     _ = try readFrame(fd: fd, maxFrame: acceptedFrame)

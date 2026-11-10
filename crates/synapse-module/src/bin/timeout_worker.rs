@@ -145,6 +145,7 @@ fn run_worker<S: Read + Write>(
                         cold_load_ms: load_sleep_ms,
                         buckets: buckets.clone(),
                         ane_cached_shapes: None,
+                        transcribe_revision: None,
                     },
                     max_frame,
                 )?;
@@ -234,6 +235,7 @@ fn run_worker<S: Read + Write>(
                 write_json_frame(stream, &WorkerResponse::Unloaded { req_id }, max_frame)?;
             }
             unsupported @ (WorkerRequest::RerankSequences { .. }
+            | WorkerRequest::Transcribe { .. }
             | WorkerRequest::EmbedPacked { .. }
             | WorkerRequest::AneAdmitPacked { .. }
             | WorkerRequest::AneEvictPacked { .. }
@@ -256,6 +258,7 @@ fn run_worker<S: Read + Write>(
                     | WorkerRequest::Unload { .. }
                     | WorkerRequest::Ping { .. }
                     | WorkerRequest::Generate { .. }
+                    | WorkerRequest::Transcribe { .. }
                     | WorkerRequest::RerankSequences { .. }
                     | WorkerRequest::EmbedPacked { .. }
                     | WorkerRequest::AneAdmitPacked { .. }

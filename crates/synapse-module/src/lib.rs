@@ -3617,6 +3617,8 @@ fn build_stored_model_config(
         rotation: None,
         converted_package_digest: None,
         manifest_profile_digest: None,
+        speech_frontend: None,
+        decode_rule: None,
     };
     if let Some(catalog) = &catalog {
         catalog.apply_numeric_profile(&mut numeric_profile);
@@ -23425,6 +23427,8 @@ mod tests {
                 rotation: None,
                 converted_package_digest: None,
                 manifest_profile_digest: None,
+                speech_frontend: None,
+                decode_rule: None,
             }
             .numeric_profile_id()
         );

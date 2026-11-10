@@ -90,6 +90,10 @@ pub struct NumericProfile {
     pub converted_package_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_profile_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_frontend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_rule: Option<String>,
 }
 
 impl NumericProfile {
@@ -286,6 +290,8 @@ mod tests {
             rotation: None,
             converted_package_digest: None,
             manifest_profile_digest: None,
+            speech_frontend: None,
+            decode_rule: None,
         }
     }
 
@@ -417,6 +423,12 @@ mod tests {
             }),
             ("manifest_profile_digest", |p| {
                 p.manifest_profile_digest = Some("manifest".into())
+            }),
+            ("speech_frontend", |p| {
+                p.speech_frontend = Some("speech-frontend-v1".into())
+            }),
+            ("decode_rule", |p| {
+                p.decode_rule = Some("tdt-greedy-v1".into())
             }),
         ];
         for (name, mutate) in fields {

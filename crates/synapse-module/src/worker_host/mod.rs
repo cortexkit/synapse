@@ -1194,6 +1194,7 @@ impl WorkerHost {
                     WorkerResponse::Vectors { .. }
                         | WorkerResponse::Scores { .. }
                         | WorkerResponse::Text { .. }
+                        | WorkerResponse::Transcript { .. }
                 ) && self
                     .connection
                     .as_ref()
@@ -1204,7 +1205,8 @@ impl WorkerHost {
                         | WorkerRequest::EmbedPacked { model_ref, .. }
                         | WorkerRequest::Rerank { model_ref, .. }
                         | WorkerRequest::RerankSequences { model_ref, .. }
-                        | WorkerRequest::Generate { model_ref, .. } => Some(model_ref),
+                        | WorkerRequest::Generate { model_ref, .. }
+                        | WorkerRequest::Transcribe { model_ref, .. } => Some(model_ref),
                         _ => None,
                     };
                     if let Some(model_ref) = model_ref {
@@ -2615,6 +2617,7 @@ fn request_stage(request: &WorkerRequest) -> &'static str {
         WorkerRequest::AneAdmitShape { .. } => "ane_admit_shape",
         WorkerRequest::AneEvictShape { .. } => "ane_evict_shape",
         WorkerRequest::Generate { .. } => "generate",
+        WorkerRequest::Transcribe { .. } => "transcribe",
         WorkerRequest::Unload { .. } => "unload",
         WorkerRequest::Ping { .. } => "ping",
         WorkerRequest::Shutdown {} => "shutdown",
@@ -3346,6 +3349,7 @@ mod tests {
                         cold_load_ms: 0,
                         buckets: None,
                         ane_cached_shapes: None,
+                        transcribe_revision: None,
                     },
                     None,
                 ),
@@ -9693,6 +9697,7 @@ pub mod ane_residency {
                                 cold_load_ms: 0,
                                 buckets: direct_profile.map(|_| ANE_SHAPE_LADDER.to_vec()),
                                 ane_cached_shapes: None,
+                                transcribe_revision: None,
                             },
                             None,
                         )
@@ -9979,7 +9984,7 @@ pub mod ane_residency {
         }
 
         const PACKED_MODEL: &str = "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:pinned";
-        const V3_WITHOUT_PACKED_HELLO: &[u8] = br#"{"v":3,"nonce":"frozen","engine":{"engine":"ane-direct-worker","version":"0.1.0","build_flags":{"kernel_revision":"ane-direct-graph-v1","precision":"f16"}},"pid":42,"max_frame":16777216,"manifest_digest":"frozen-manifest","kernel_revision":"ane-direct-graph-v1"}"#;
+        const V3_WITHOUT_PACKED_HELLO: &[u8] = br#"{"v":4,"nonce":"frozen","engine":{"engine":"ane-direct-worker","version":"0.1.0","build_flags":{"kernel_revision":"ane-direct-graph-v1","precision":"f16"}},"pid":42,"max_frame":16777216,"manifest_digest":"frozen-manifest","kernel_revision":"ane-direct-graph-v1"}"#;
 
         async fn packed_peer(
             legacy: bool,

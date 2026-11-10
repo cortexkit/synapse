@@ -29,6 +29,19 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     cuda: bool,
     test_idle: Option<(Duration, Duration)>,
 ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
+    if matches!(request, WorkerRequest::Transcribe { observe: true, .. }) {
+        return Err(WorkerHostError::WorkerErr {
+            code: "transcribe_observation_unsupported".into(),
+            msg: "transcription observation requires a multi-frame exchange".into(),
+        });
+    }
+    if matches!(request, WorkerRequest::Transcribe { .. }) {
+        request
+            .validate_raw_frame(raw.ok_or_else(|| {
+                WorkerHostError::Protocol("TRANSCRIBE requires a raw mel frame".into())
+            })?)
+            .map_err(|error| WorkerHostError::Protocol(error.to_string()))?;
+    }
     let inference = matches!(
         request,
         WorkerRequest::EmbedBatch { .. }
@@ -36,6 +49,7 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             | WorkerRequest::Rerank { .. }
             | WorkerRequest::RerankSequences { .. }
             | WorkerRequest::Generate { .. }
+            | WorkerRequest::Transcribe { .. }
     );
     let setup = matches!(
         request,
@@ -139,6 +153,10 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
                     WorkerResponse::Scores { .. }
                 )
                 | (WorkerRequest::Generate { .. }, WorkerResponse::Text { .. })
+                | (
+                    WorkerRequest::Transcribe { .. },
+                    WorkerResponse::Transcript { .. }
+                )
                 | (WorkerRequest::Ping { .. }, WorkerResponse::Pong { .. })
                 | (
                     WorkerRequest::Unload { .. },
@@ -180,6 +198,9 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             (WorkerRequest::RerankSequences { sequences, .. }, WorkerResponse::Scores { .. }) => {
                 sequences.len().checked_mul(4)
             }
+            (WorkerRequest::Transcribe { .. }, WorkerResponse::Transcript { count, .. }) => {
+                count.checked_mul(synapse_core::TRANSCRIPT_RECORD_BYTES)
+            }
             (_, WorkerResponse::Vectors { .. }) => {
                 return Err(WorkerHostError::Protocol(
                     "vector row count or dimensions mismatch".into(),
@@ -209,6 +230,122 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use synapse_core::{encode_f32_frame, encode_i32_frame, WorkerPooling, WorkerTokenItem};
+
+    fn transcribe(observe: bool) -> WorkerRequest {
+        WorkerRequest::Transcribe {
+            req_id: "speech".into(),
+            model_ref: "speech:0".into(),
+            mel_frames: 1,
+            valid_mel_frames: 1,
+            observe,
+        }
+    }
+
+    #[tokio::test]
+    async fn transcribe_observation_is_refused_by_name_before_sending() {
+        let (mut module, mut worker) = tokio::io::duplex(4096);
+        let result = exchange(
+            &mut module,
+            &transcribe(true),
+            Some(&[0; 512]),
+            4096,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(WorkerHostError::WorkerErr { code, .. })
+            if code == "transcribe_observation_unsupported")
+        );
+        drop(module);
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        worker.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "refused observation must not reach the worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribe_terminal_frame_is_length_checked_and_keeps_stream_aligned() {
+        for len in [8, 12, 16] {
+            let (mut module, mut worker) = tokio::io::duplex(4096);
+            let peer = tokio::spawn(async move {
+                let request: WorkerRequest = read_json(&mut worker, 4096).await.unwrap();
+                assert_eq!(request, transcribe(false));
+                assert_eq!(read_raw(&mut worker, 4096).await.unwrap().len(), 512);
+                write_json(
+                    &mut worker,
+                    &WorkerResponse::Transcript {
+                        req_id: "speech".into(),
+                        valid_encoder_frames: 1,
+                        count: 1,
+                    },
+                    4096,
+                )
+                .await
+                .unwrap();
+                write_raw(&mut worker, &vec![0; len], 4096).await.unwrap();
+                if len == 12 {
+                    let ping: WorkerRequest = read_json(&mut worker, 4096).await.unwrap();
+                    assert!(matches!(ping, WorkerRequest::Ping { .. }));
+                    write_json(
+                        &mut worker,
+                        &WorkerResponse::Pong {
+                            req_id: "ping".into(),
+                            rss_mb: 0,
+                            models_loaded: 1,
+                            placement_share: None,
+                            buckets: None,
+                            ane_resident_shapes: None,
+                        },
+                        4096,
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let result = exchange(
+                &mut module,
+                &transcribe(false),
+                Some(&[0; 512]),
+                4096,
+                false,
+                None,
+            )
+            .await;
+            if len == 12 {
+                let (response, raw) = result.unwrap();
+                assert!(matches!(
+                    response,
+                    WorkerResponse::Transcript {
+                        valid_encoder_frames: 1,
+                        count: 1,
+                        ..
+                    }
+                ));
+                assert_eq!(raw.unwrap(), vec![0; 12]);
+                let (pong, _) = exchange(
+                    &mut module,
+                    &WorkerRequest::Ping {
+                        req_id: "ping".into(),
+                    },
+                    None,
+                    4096,
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(pong, WorkerResponse::Pong { .. }));
+            } else {
+                assert!(matches!(result, Err(WorkerHostError::Protocol(_))));
+            }
+            drop(module);
+            peer.await.unwrap();
+        }
+    }
 
     fn request() -> WorkerRequest {
         WorkerRequest::EmbedBatch {

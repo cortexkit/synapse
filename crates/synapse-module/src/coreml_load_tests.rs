@@ -182,6 +182,7 @@ fn fixture(label: &str) -> CoreMlFixture {
                             cold_load_ms: 0,
                             buckets: Some(vec![8]),
                             ane_cached_shapes: None,
+transcribe_revision: None,
                         },
                         None,
                     )
