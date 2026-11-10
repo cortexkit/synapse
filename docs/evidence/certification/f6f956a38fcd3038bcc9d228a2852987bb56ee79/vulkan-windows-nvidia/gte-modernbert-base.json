@@ -1,0 +1,76 @@
+{
+  "schema": 3,
+  "row_id": "vulkan-windows-nvidia",
+  "source_commit": "f6f956a38fcd3038bcc9d228a2852987bb56ee79",
+  "machine": {
+    "driver": "NVIDIA 621.14",
+    "gpu": {
+      "device_id": "0x2206",
+      "name": "NVIDIA GeForce RTX 3080",
+      "uuid_sha256": "9f7ae5304c5bad083246a5ee22672f2b04e3bbd12c4882ea6b1acc5c17f157d7",
+      "vendor_id": "0x10de"
+    },
+    "os": "Microsoft Windows 11 Pro 10.0.22631",
+    "system_product_name": "MS-7C35"
+  },
+  "executed_artifacts": [
+    {
+      "role": "ck-synapse",
+      "file": "windows-x64/ck-synapse.exe",
+      "sha256": "a38b770066453584fe1869a540d1ceb4f05bc317045f2241811cd79c3a57eafe"
+    },
+    {
+      "role": "ck-synapse-worker-vulkan",
+      "file": "windows-x64/ck-synapse-worker-vulkan.exe",
+      "sha256": "6e0ce597b83af60e87d10c1df428dba43d5c1a52f3fe28a7f120ff80e1f45a06"
+    }
+  ],
+  "model": "gte-modernbert-base",
+  "operation": "embed",
+  "profile_id": "gte-modernbert-base.owned-vulkan",
+  "fingerprint": "9d281846adc39572fcc10bdd06ee43eefd17d45f4702a85a05e0ca285a922182",
+  "parity": {
+    "model": "gte-modernbert-base",
+    "operation": "embed",
+    "profile_id": "gte-modernbert-base.owned-vulkan",
+    "fingerprint": "9d281846adc39572fcc10bdd06ee43eefd17d45f4702a85a05e0ca285a922182",
+    "fixture_set_id": "gte-modernbert-base.ref-v1.transformers-5.16.1.seed-0",
+    "completed_fixtures": 17,
+    "expected_fixtures": 17,
+    "tolerance_class": "fp16",
+    "metrics": {
+      "max_absolute_error": null,
+      "max_norm_error": 7.350868148625622e-7,
+      "min_cosine": 0.9999989218215475,
+      "pools": {}
+    },
+    "gates": {
+      "complete": true,
+      "cosine": true,
+      "coverage": true,
+      "coverage_8192": true,
+      "dimension": true,
+      "finite": true,
+      "ranking": true,
+      "score": true,
+      "semantics": true,
+      "unit_norm": true
+    },
+    "failures": []
+  },
+  "admission": {
+    "tokens_8192": {
+      "outcome": "processed",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 1
+    },
+    "tokens_8193": {
+      "outcome": "sequence_too_long",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    }
+  },
+  "status": "passed"
+}

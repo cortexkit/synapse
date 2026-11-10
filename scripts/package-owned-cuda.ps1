@@ -39,7 +39,12 @@ try {
         worker_sha256 = (Get-FileHash (Join-Path $stage 'ck-synapse-worker-cuda.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
         runtime_files = $entries
         driver = 'System-installed NVIDIA driver; not bundled'
-    } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $stage 'manifest.json') -Encoding UTF8
+    } | ConvertTo-Json -Depth 5 | ForEach-Object {
+        # Write UTF-8 without a byte-order mark. Windows PowerShell 5.1's
+        # `Set-Content -Encoding UTF8` prepends one, and the certification
+        # runner's JSON parser refuses the manifest at column 1.
+        [IO.File]::WriteAllText((Join-Path $stage 'manifest.json'), $_, (New-Object Text.UTF8Encoding $false))
+    }
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $Output -Force
     Get-FileHash $Output -Algorithm SHA256
 } finally { Remove-Item $stage -Recurse -Force }

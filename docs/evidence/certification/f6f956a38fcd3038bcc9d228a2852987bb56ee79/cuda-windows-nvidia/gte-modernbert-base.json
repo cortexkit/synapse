@@ -1,0 +1,97 @@
+{
+  "schema": 3,
+  "row_id": "cuda-windows-nvidia",
+  "source_commit": "f6f956a38fcd3038bcc9d228a2852987bb56ee79",
+  "machine": {
+    "driver": "621.14",
+    "driver_api": 13050,
+    "gpu": {
+      "device_id": 8710,
+      "name": "NVIDIA GeForce RTX 3080",
+      "uuid_sha256": "8c4a018cd07d2b05f6613c6116b6ae1959b741390c670ee5b6eb3be529070ed1",
+      "vendor_id": 4318
+    },
+    "os": "Microsoft Windows 11 Pro 10.0.22631",
+    "system_product_name": "MS-7C35"
+  },
+  "executed_artifacts": [
+    {
+      "role": "ck-synapse",
+      "file": "windows-x64/ck-synapse.exe",
+      "sha256": "a38b770066453584fe1869a540d1ceb4f05bc317045f2241811cd79c3a57eafe"
+    },
+    {
+      "role": "ck-synapse-worker-cuda",
+      "file": "windows-x64/ck-synapse-worker-cuda.exe",
+      "sha256": "e3fc81a41b58306f0c6af1415eecc6c2ff72f0ad430d1b2f280a9c0ddfd5b860"
+    },
+    {
+      "role": "cuda-runtime:cudart64_13.dll",
+      "file": "windows-x64/cudart64_13.dll",
+      "sha256": "cac649f5d659f89713ebc5d426573ca7cf873d57af7e40767b068fe3606120db"
+    },
+    {
+      "role": "cuda-runtime:cublas64_13.dll",
+      "file": "windows-x64/cublas64_13.dll",
+      "sha256": "537d278122e2621d7202653cf873a9b8b872fac37122cb9d36246ded33c53e03"
+    },
+    {
+      "role": "cuda-runtime:cublasLt64_13.dll",
+      "file": "windows-x64/cublasLt64_13.dll",
+      "sha256": "b37233a1e3516a41d27dcea49595fd1cbaff979b65c80da69935cb59d0d23f5b"
+    },
+    {
+      "role": "cuda-runtime:nvblas64_13.dll",
+      "file": "windows-x64/nvblas64_13.dll",
+      "sha256": "a632170a5aeee26def3e1bb545948745a431de9489932af6e3e903336691a708"
+    }
+  ],
+  "model": "gte-modernbert-base",
+  "operation": "embed",
+  "profile_id": "gte-modernbert-base.owned-cuda",
+  "fingerprint": "5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010",
+  "parity": {
+    "model": "gte-modernbert-base",
+    "operation": "embed",
+    "profile_id": "gte-modernbert-base.owned-cuda",
+    "fingerprint": "5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010",
+    "fixture_set_id": "gte-modernbert-base.ref-v1.transformers-5.16.1.seed-0",
+    "completed_fixtures": 17,
+    "expected_fixtures": 17,
+    "tolerance_class": "fp16",
+    "metrics": {
+      "max_absolute_error": null,
+      "max_norm_error": 4.972826350702064e-8,
+      "min_cosine": 0.9999843460028781,
+      "pools": {}
+    },
+    "gates": {
+      "complete": true,
+      "cosine": true,
+      "coverage": true,
+      "coverage_8192": true,
+      "dimension": true,
+      "finite": true,
+      "ranking": true,
+      "score": true,
+      "semantics": true,
+      "unit_norm": true
+    },
+    "failures": []
+  },
+  "admission": {
+    "tokens_8192": {
+      "outcome": "processed",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 1
+    },
+    "tokens_8193": {
+      "outcome": "sequence_too_long",
+      "truncated": false,
+      "diverted": false,
+      "worker_requests": 0
+    }
+  },
+  "status": "passed"
+}
