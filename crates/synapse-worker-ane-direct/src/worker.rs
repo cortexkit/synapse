@@ -272,14 +272,14 @@ fn request_loop<S: Read + Write>(
                     );
                     models.insert(model_ref.clone(), model);
                     (
-                        WorkerResponse::Loaded {
+                        WorkerResponse::loaded(
                             req_id,
                             model_ref,
                             dims,
-                            cold_load_ms: start.elapsed().as_millis() as u64,
-                            buckets: Some(crate::backend::LADDER.to_vec()),
-                            ane_cached_shapes: Some(cached),
-                        },
+                            start.elapsed().as_millis() as u64,
+                            Some(crate::backend::LADDER.to_vec()),
+                            Some(cached),
+                        ),
                         None,
                     )
                 }

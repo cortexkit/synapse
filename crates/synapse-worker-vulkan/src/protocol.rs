@@ -168,14 +168,14 @@ pub fn request_loop<S: Read + Write>(
                 loaded = None;
                 match load(artifact_path, artifact_digest, runtime_config, &mut lookup) {
                     Ok(model) => {
-                        let response = WorkerResponse::Loaded {
-                            req_id: req_id.clone(),
-                            model_ref: model.model_ref.clone(),
-                            dims: model.dims,
-                            cold_load_ms: 0,
-                            buckets: None,
-                            ane_cached_shapes: None,
-                        };
+                        let response = WorkerResponse::loaded(
+                            req_id.clone(),
+                            model.model_ref.clone(),
+                            model.dims,
+                            0,
+                            None,
+                            None,
+                        );
                         loaded = Some(model);
                         response
                     }
