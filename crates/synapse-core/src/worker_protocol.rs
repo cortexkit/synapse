@@ -586,6 +586,26 @@ pub enum WorkerResponse {
 }
 
 impl WorkerResponse {
+    /// Build a `LOADED` response through one entry point so workers do not need
+    /// to name optional fields added by later protocol extensions.
+    pub fn loaded(
+        req_id: String,
+        model_ref: String,
+        dims: usize,
+        cold_load_ms: u64,
+        buckets: Option<Vec<usize>>,
+        ane_cached_shapes: Option<Vec<usize>>,
+    ) -> Self {
+        Self::Loaded {
+            req_id,
+            model_ref,
+            dims,
+            cold_load_ms,
+            buckets,
+            ane_cached_shapes,
+        }
+    }
+
     pub fn req_id(&self) -> Option<&str> {
         match self {
             Self::Progress { req_id, .. }
@@ -1324,6 +1344,27 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<WorkerResponse>(encoded).unwrap(),
             direct
+        );
+    }
+
+    #[test]
+    fn loaded_constructor_preserves_wire_bytes() {
+        let minimal = WorkerResponse::loaded("load-1".into(), "m".into(), 8, 5, None, None);
+        assert_eq!(
+            serde_json::to_string(&minimal).unwrap(),
+            r#"{"type":"LOADED","req_id":"load-1","model_ref":"m","dims":8,"cold_load_ms":5}"#
+        );
+        let with_shapes = WorkerResponse::loaded(
+            "load-1".into(),
+            "m".into(),
+            8,
+            5,
+            Some(vec![128, 256]),
+            Some(vec![128]),
+        );
+        assert_eq!(
+            serde_json::to_string(&with_shapes).unwrap(),
+            r#"{"type":"LOADED","req_id":"load-1","model_ref":"m","dims":8,"cold_load_ms":5,"buckets":[128,256],"ane_cached_shapes":[128]}"#
         );
     }
 

@@ -2598,14 +2598,14 @@ impl WorkerState {
             engine,
             ane_prefill,
         });
-        Ok(WorkerResponse::Loaded {
+        Ok(WorkerResponse::loaded(
             req_id,
             model_ref,
-            dims: 0,
-            cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            buckets: None,
-            ane_cached_shapes: None,
-        })
+            0,
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            None,
+            None,
+        ))
     }
 
     fn stream_for_start(
@@ -3846,15 +3846,14 @@ pub fn main() -> Result<()> {
                 let _ = stream.shutdown(Shutdown::Both);
                 break;
             }
-            other => {
-                let req_id = standard_req_id(&other);
+            unsupported => {
+                if unsupported.carries_raw_frame() {
+                    read_frame(&mut stream, max_frame)
+                        .context("discard the raw frame of an unsupported request")?;
+                }
                 write_json_frame(
                     &mut stream,
-                    &WorkerResponse::Err {
-                        req_id,
-                        code: "unknown_type".to_string(),
-                        msg: "decode worker supports LOAD, owned generation frames, PING, UNLOAD, and SHUTDOWN only".to_string(),
-                    },
+                    &WorkerResponse::unsupported_request(&unsupported),
                     max_frame,
                 )?;
             }
@@ -4371,15 +4370,6 @@ pub fn engine_identity(worker_generation: u64) -> EngineIdentity {
         engine: DECODE_WORKER_ENGINE.to_string(),
         version: ENGINE_VERSION.to_string(),
         build_flags,
-    }
-}
-
-fn standard_req_id(request: &WorkerRequest) -> Option<String> {
-    match request {
-        WorkerRequest::EmbedBatch { req_id, .. }
-        | WorkerRequest::Rerank { req_id, .. }
-        | WorkerRequest::Generate { req_id, .. } => Some(req_id.clone()),
-        _ => None,
     }
 }
 

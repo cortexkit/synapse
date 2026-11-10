@@ -340,11 +340,7 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                     ),
                 }
             }
-            unsupported @ (WorkerRequest::AneAdmitShape { .. }
-            | WorkerRequest::EmbedPacked { .. }
-            | WorkerRequest::AneAdmitPacked { .. }
-            | WorkerRequest::AneEvictPacked { .. }
-            | WorkerRequest::AneEvictShape { .. }) => {
+            unsupported => {
                 if unsupported.carries_raw_frame() {
                     read_frame(stream, max_frame)
                         .context("discard the raw frame of an unsupported request")?;
@@ -483,14 +479,14 @@ fn handle_load_with_probe(
             engine,
             engine_model,
         });
-        WorkerResponse::Loaded {
+        WorkerResponse::loaded(
             req_id,
             model_ref,
             dims,
-            cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            buckets: None,
-            ane_cached_shapes: None,
-        }
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            None,
+            None,
+        )
     }
 }
 

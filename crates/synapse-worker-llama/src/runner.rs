@@ -426,16 +426,9 @@ fn worker_request_loop<S: Read + Write>(
                 )?;
             }
             WorkerRequest::Shutdown {} => break,
-            // Composed-sequence rerank and direct-ANE shape residency are for
-            // the owned CUDA, Vulkan and direct-ANE workers. Read and discard
-            // the raw frame a refused request carries so the connection stays
-            // usable.
-            unsupported @ (WorkerRequest::RerankSequences { .. }
-            | WorkerRequest::EmbedPacked { .. }
-            | WorkerRequest::AneAdmitPacked { .. }
-            | WorkerRequest::AneEvictPacked { .. }
-            | WorkerRequest::AneAdmitShape { .. }
-            | WorkerRequest::AneEvictShape { .. }) => {
+            // Drain refused requests so their raw bytes cannot be mistaken for
+            // the next request, including kinds added by protocol extensions.
+            unsupported => {
                 if unsupported.carries_raw_frame() {
                     synapse_core::worker_framing_sync::read_frame(stream, max_frame)
                         .context("discard the raw frame of an unsupported request")?;
@@ -520,14 +513,14 @@ fn handle_load(
             dims,
         },
     );
-    Ok(WorkerResponse::Loaded {
+    Ok(WorkerResponse::loaded(
         req_id,
         model_ref,
         dims,
-        cold_load_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        buckets: None,
-        ane_cached_shapes: None,
-    })
+        started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        None,
+        None,
+    ))
 }
 
 fn handle_embed_batch(
