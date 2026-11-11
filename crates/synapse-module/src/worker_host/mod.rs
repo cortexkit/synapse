@@ -50,6 +50,7 @@ mod quarantine_tests;
 // A finite ten-minute cool-down lets a desktop lane recover without that step.
 pub(crate) const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
 mod liveness;
+mod transcribe;
 #[cfg(all(test, unix))]
 use synapse_core::{read_raw, write_raw};
 #[cfg(all(test, unix))]
@@ -993,11 +994,17 @@ impl WorkerHost {
                     dims,
                     cold_load_ms,
                     buckets,
+                    transcribe_revision,
                     ..
                 },
                 _,
             )) => {
                 ensure_req_id(&req_id, &got)?;
+                crate::transcribe_host::validate_worker_load(
+                    cfg,
+                    self.config.max_frame,
+                    transcribe_revision.as_ref(),
+                )?;
                 Ok((model_ref, dims, cold_load_ms, buckets))
             }
             Ok((WorkerResponse::Err { code, msg, .. }, _)) => {
@@ -1147,6 +1154,16 @@ impl WorkerHost {
         raw: Option<Vec<u8>>,
         _expect_raw_response: bool,
     ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
+        self.send_request_collect(request, raw, None).await
+    }
+
+    async fn send_request_collect(
+        &mut self,
+        request: WorkerRequest,
+        raw: Option<Vec<u8>>,
+        collection: Option<&mut liveness::TranscribeFrames>,
+    ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
+        let collecting_transcription = collection.is_some();
         self.ensure_worker().await?;
         let cuda = self
             .config
@@ -1172,13 +1189,14 @@ impl WorkerHost {
             unusable: &mut connection.unusable,
             completed: false,
         };
-        let result = liveness::exchange(
+        let result = liveness::exchange_collect(
             &mut connection.stream,
             &request,
             raw.as_deref(),
             self.config.max_frame,
             cuda,
             idle_override,
+            collection,
         )
         .await;
         exchange_guard.completed = result.is_ok();
@@ -1195,10 +1213,11 @@ impl WorkerHost {
                         | WorkerResponse::Scores { .. }
                         | WorkerResponse::Text { .. }
                         | WorkerResponse::Transcript { .. }
-                ) && self
-                    .connection
-                    .as_ref()
-                    .is_some_and(|c| c.worker_generation == generation)
+                ) && !collecting_transcription
+                    && self
+                        .connection
+                        .as_ref()
+                        .is_some_and(|c| c.worker_generation == generation)
                 {
                     let model_ref = match &request {
                         WorkerRequest::EmbedBatch { model_ref, .. }
@@ -3689,6 +3708,7 @@ pub mod ane_residency {
     #[cfg(test)]
     mod admission_trace;
     mod scheduler;
+    mod transcribe;
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
     /// A request is blocked on a shape compile: its deadline expired while it
@@ -6748,6 +6768,20 @@ pub mod ane_residency {
             generation: u64,
             idle_override: Option<std::time::Duration>,
         ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
+            self.exchange_locked_collect(guard, request, raw, generation, idle_override, None)
+                .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn exchange_locked_collect(
+            &self,
+            guard: &mut Option<AneWorkerSession<S>>,
+            request: &WorkerRequest,
+            raw: Option<&[u8]>,
+            generation: u64,
+            idle_override: Option<std::time::Duration>,
+            collection: Option<&mut super::liveness::TranscribeFrames>,
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError> {
             if let Some(retry_after_ms) = self.cooldown_remaining() {
                 return Err(AneResidencyError::Quarantined { retry_after_ms });
             }
@@ -6810,7 +6844,7 @@ pub mod ane_residency {
                         WorkerRequest::AneAdmitShape { .. } | WorkerRequest::AneAdmitPacked { .. }
                         | WorkerRequest::AneEvictShape { .. } | WorkerRequest::AneEvictPacked { .. })
                         .then_some(self.shape_rpc_timeout));
-                    super::liveness::exchange(stream, request, raw, max_frame, false, test_idle.map(|window| (window, window))).await
+                    super::liveness::exchange_collect(stream, request, raw, max_frame, false, test_idle.map(|window| (window, window)), collection).await
                         .map_err(|error| AneResidencyError::Channel(error.to_string()))
                 }=>result
             };
@@ -6820,6 +6854,7 @@ pub mod ane_residency {
             drop(rpc_clock);
             match result {
                 Ok((response, raw)) => {
+                    transcribe::validate_loaded_request(request, &response, self.max_frame)?;
                     exchange_guard.completed = true;
                     if matches!(
                         request,
@@ -7151,12 +7186,18 @@ pub mod ane_residency {
                         )
                         .await
                         .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
-                        match response {
+                        match &response {
                             WorkerResponse::Loaded {
                                 req_id: got,
                                 model_ref: got_ref,
                                 ..
-                            } if got == req_id && got_ref == model_ref => {}
+                            } if got == &req_id && got_ref == &model_ref => {
+                                transcribe::validate_loaded_request(
+                                    &request,
+                                    &response,
+                                    self.max_frame,
+                                )?;
+                            }
                             other => {
                                 return Err(AneResidencyError::Channel(format!(
                                     "model reload returned {other:?}"

@@ -68,6 +68,7 @@ pub use store::{
     RestoreImportReport, SynapseStore, SynapseStoreError, RECLAIM_FREELIST_MIN_BYTES,
     RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
 };
+pub mod transcribe_host;
 pub mod worker_host;
 
 /// Plain, compiled lane declarations and tasks for offline certification. The

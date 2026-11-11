@@ -29,12 +29,29 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     cuda: bool,
     test_idle: Option<(Duration, Duration)>,
 ) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
-    if matches!(request, WorkerRequest::Transcribe { observe: true, .. }) {
-        return Err(WorkerHostError::WorkerErr {
-            code: "transcribe_observation_unsupported".into(),
-            msg: "transcription observation requires a multi-frame exchange".into(),
-        });
-    }
+    exchange_collect(stream, request, raw, max_frame, cuda, test_idle, None).await
+}
+
+/// Each observation header stays paired with its raw frame until the transcript
+/// has drained. Ordinary exchanges retain their single-response interface.
+#[derive(Default, Debug)]
+pub(super) struct TranscribeFrames {
+    pub parts: Vec<(WorkerResponse, Vec<u8>)>,
+    pub progress: Vec<WorkerResponse>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exchange_collect<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    request: &WorkerRequest,
+    raw: Option<&[u8]>,
+    max_frame: u32,
+    cuda: bool,
+    test_idle: Option<(Duration, Duration)>,
+    mut collection: Option<&mut TranscribeFrames>,
+) -> Result<(WorkerResponse, Option<Vec<u8>>), WorkerHostError> {
+    let observe = matches!(request, WorkerRequest::Transcribe { observe: true, .. });
+    let mut observation_part = 0;
     if matches!(request, WorkerRequest::Transcribe { .. }) {
         request
             .validate_raw_frame(raw.ok_or_else(|| {
@@ -116,6 +133,11 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             ..
         } = response
         {
+            if observation_part != 0 {
+                return Err(WorkerHostError::Protocol(
+                    "PROGRESS after transcription observation started".into(),
+                ));
+            }
             if next <= completed
                 || !(next_phase == phase
                     || (cuda
@@ -135,10 +157,43 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
                 phase = ?phase, gap_ms = last.elapsed().as_secs_f64() * 1000.0,
                 completed = next, "completed work received");
             completed = next;
+            if let Some(collection) = collection.as_deref_mut() {
+                collection.progress.push(response);
+            }
             phase = next_phase;
             last = Instant::now();
             idle_until = last + window(phase);
             continue;
+        }
+        if matches!(request, WorkerRequest::Transcribe { .. }) {
+            match &response {
+                WorkerResponse::EncoderOutput { .. } if observe && observation_part == 0 => {}
+                WorkerResponse::DecodeTrace { .. } if observe && observation_part == 1 => {}
+                WorkerResponse::Transcript { .. }
+                    if observation_part == if observe { 2 } else { 0 } => {}
+                WorkerResponse::Err { .. } => {}
+                _ => {
+                    return Err(WorkerHostError::Protocol(
+                        "missing or out-of-order transcription response".into(),
+                    ))
+                }
+            }
+            if response.carries_raw_frame() {
+                let raw = timeout_at(idle_until, read_raw(stream, max_frame))
+                    .await
+                    .map_err(|_| fault(completed, phase))??;
+                response
+                    .validate_raw_frame(&raw)
+                    .map_err(|error| WorkerHostError::Protocol(error.to_string()))?;
+                if matches!(response, WorkerResponse::Transcript { .. }) {
+                    return Ok((response, Some(raw)));
+                }
+                observation_part += 1;
+                if let Some(collection) = collection.as_deref_mut() {
+                    collection.parts.push((response, raw));
+                }
+                continue;
+            }
         }
         let valid = matches!(
             (request, &response),
@@ -239,32 +294,6 @@ mod tests {
             valid_mel_frames: 1,
             observe,
         }
-    }
-
-    #[tokio::test]
-    async fn transcribe_observation_is_refused_by_name_before_sending() {
-        let (mut module, mut worker) = tokio::io::duplex(4096);
-        let result = exchange(
-            &mut module,
-            &transcribe(true),
-            Some(&[0; 512]),
-            4096,
-            false,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(result, Err(WorkerHostError::WorkerErr { code, .. })
-            if code == "transcribe_observation_unsupported")
-        );
-        drop(module);
-        use tokio::io::AsyncReadExt;
-        let mut bytes = Vec::new();
-        worker.read_to_end(&mut bytes).await.unwrap();
-        assert!(
-            bytes.is_empty(),
-            "refused observation must not reach the worker"
-        );
     }
 
     #[tokio::test]

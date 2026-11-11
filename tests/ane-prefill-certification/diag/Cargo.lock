@@ -2035,6 +2035,7 @@ dependencies = [
  "synapse-core",
  "synapse-engine-owned",
  "synapse-parity",
+ "synapse-speech",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

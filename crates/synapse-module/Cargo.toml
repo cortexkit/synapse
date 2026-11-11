@@ -45,6 +45,7 @@ e2e = ["test-support"]
 [dependencies]
 anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }
+synapse-speech = { path = "../synapse-speech" }
 synapse-certify = { path = "../synapse-certify" }
 synapse-parity = { path = "../../bench/parity" }
 synapse-engine-owned = { path = "../synapse-engine-owned" }

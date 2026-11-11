@@ -6749,6 +6749,7 @@ dependencies = [
  "synapse-engine-owned",
  "synapse-module",
  "synapse-parity",
+ "synapse-speech",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",
