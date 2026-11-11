@@ -23,6 +23,7 @@ mod catalog;
 mod runtime;
 #[cfg(all(feature = "test-support", target_os = "macos"))]
 mod token_capture_test_model;
+pub mod transcribe;
 
 /// Production-owned Metal decode engines for Qwen3-0.6B and LFM2-1.2B.
 /// Ported from `bench/spikes/unified-rt/` into production-owned code.
@@ -1390,8 +1391,11 @@ mod tests {
 
     #[test]
     fn identity_separates_family_dtype_graph_and_policy() {
-        assert_eq!(BUCKET_POLICY_VERSION, runtime::BUCKET_POLICY_VERSION);
-        assert_eq!(GRAPH_REVISION, runtime::GRAPH_REVISION);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(BUCKET_POLICY_VERSION, runtime::BUCKET_POLICY_VERSION);
+            assert_eq!(GRAPH_REVISION, runtime::GRAPH_REVISION);
+        }
         let minilm_f16 = engine_identity(ModelFamily::MiniLm, OwnedDType::F16);
         let minilm_f32 = engine_identity(ModelFamily::MiniLm, OwnedDType::F32);
         let qwen_f16 = engine_identity(ModelFamily::Qwen3, OwnedDType::F16);

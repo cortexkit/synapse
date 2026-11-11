@@ -6712,6 +6712,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "synapse-core",
+ "synapse-parity",
+ "synapse-speech",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
 ]

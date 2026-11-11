@@ -3,6 +3,7 @@ fn main() {
         "src/metal_mpsgraph.m",
         "src/qwen3_mpsgraph.m",
         "src/modernbert_mpsgraph.m",
+        "src/parakeet_mpsgraph.m",
         "src/mpsgraph_runtime.m",
         "src/mpsgraph_runtime.h",
         // Owned decode engine: Metal step kernels and their Objective-C drivers.
@@ -31,6 +32,12 @@ fn main() {
         .flag("-fobjc-exceptions")
         .compile("synapse_owned_mpsgraph");
 
+    cc::Build::new()
+        .file("src/parakeet_mpsgraph.m")
+        .flag("-fobjc-arc")
+        .flag("-fobjc-exceptions")
+        .compile("synapse_parakeet_mpsgraph");
+
     // Owned decode engine: compile the Metal step Objective-C drivers into a
     // separate static library so the FFI symbols are available to the
     // owned_decode_engine module. These drivers bind the Metal step kernels
@@ -44,6 +51,7 @@ fn main() {
 
     for framework in [
         "Foundation",
+        "Accelerate",
         "Metal",
         "MetalPerformanceShaders",
         "MetalPerformanceShadersGraph",
