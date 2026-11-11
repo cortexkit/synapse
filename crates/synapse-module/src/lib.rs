@@ -62,6 +62,8 @@ pub mod owned_decode_sidecar;
 mod rerank_readout_tests;
 mod rollback;
 mod store;
+#[cfg(test)]
+mod test_binaries;
 pub use store::{
     RestoreImportReport, SynapseStore, SynapseStoreError, RECLAIM_FREELIST_MIN_BYTES,
     RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
@@ -26211,7 +26213,6 @@ mod catalog_runtime_tests {
             std::process::id()
         ));
         let original = std::env::current_exe().unwrap();
-        let binaries = original.parent().unwrap().parent().unwrap();
         let executable = synapse_core::dev_binary::ckdev_binary(&original, &scratch).unwrap();
         let mut command =
             synapse_core::without_launch_nonce(std::process::Command::new(executable));
@@ -26235,10 +26236,7 @@ mod catalog_runtime_tests {
         for name in ["cuda", "vulkan"] {
             let key = format!("SYNAPSE_TEST_{}_WORKER", name.to_ascii_uppercase());
             let source = env::var_os(&key).map(PathBuf::from).unwrap_or_else(|| {
-                binaries.join(format!(
-                    "ck-synapse-worker-{name}{}",
-                    env::consts::EXE_SUFFIX
-                ))
+                test_binaries::built_binary(&format!("ck-synapse-worker-{name}"))
             });
             command.env(key, source);
         }
@@ -26507,7 +26505,7 @@ mod catalog_runtime_tests {
     fn startup_catalog_lane_load_executes_environment_hard_link_without_preload() {
         let original = env::current_exe().unwrap();
         let built_dir = original.parent().unwrap().parent().unwrap();
-        let source = built_dir.join("synapse-worker-timeout-mock");
+        let source = test_binaries::built_binary("synapse-worker-timeout-mock");
         assert!(
             source.is_file(),
             "build synapse-worker-timeout-mock before module lib tests"
