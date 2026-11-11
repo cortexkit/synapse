@@ -56,8 +56,19 @@ mod runner {
                 ..Default::default()
             },
         )?;
+        // transcribe.cpp reports the ggml device name ("MTL0", "CUDA0",
+        // "Vulkan0"), not the backend family; refuse anything else, such as a
+        // silent CPU fallback.
+        let device_prefix = match backend {
+            Backend::Metal => "mtl",
+            Backend::Cuda => "cuda",
+            _ => "vulkan",
+        };
         ensure!(
-            model.backend().eq_ignore_ascii_case(&args.backend),
+            model
+                .backend()
+                .to_ascii_lowercase()
+                .starts_with(device_prefix),
             "requested {} but model uses {}",
             args.backend,
             model.backend()
