@@ -79,6 +79,7 @@ def confirmations(reference_dir):
             "nemo_convolution_source": "nemo/collections/asr/parts/submodules/conformer_modules.py:320-345",
             "nemo_behavior": "finite -10000 sentinel, zero masked probabilities after softmax, zero padded frames after GLU before depthwise convolution",
             "convolution_patch_needed": False,
+            "unpadded_encoder_equality": "bit-identical patched and unpatched encoder output on every fixture without padding",
         },
         "decode_rule": {
             "revision": "synapse-parakeet-tdt-greedy-v1", "blank_token_id": 8192,
@@ -186,6 +187,7 @@ def main():
     tau_resample = math.ceil((max_resample + 0.001) * 1_000_000) / 1_000_000
     contract["self_check_sealed_bytes"] = subset_bytes
     contract["maximum_emissions_per_frame"] = max(c["max_emissions_per_frame"] for c in cases)
+    contract["upstream_nan_padded_input_fixtures"] = sum(bool(c.get("upstream_exception")) for c in cases)
     fixture_id = f"{SLUG}.ref-v1.transformers-5.16.1.seed-0"
     fixture_path = root / "fixtures" / SLUG / "reference.json"
     write(fixture_path, {"fixture_set_id": fixture_id, "model": SLUG, "cases": cases,

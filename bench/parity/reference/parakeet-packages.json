@@ -1,0 +1,24 @@
+{
+  "cargo_version": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "checkpoint_sha256": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+  "conversion_rule": "v1",
+  "profiles": {
+    "parakeet-tdt-0.6b-v3.ane-direct-worker": {
+      "bytes": 1289141384,
+      "integer_counters_verified": 24,
+      "sha256": "bbd41622921c3c3ad3a663aaf02799f29be33173569656d913738c16392fc192"
+    },
+    "parakeet-tdt-0.6b-v3.owned-cuda": {
+      "bytes": 1254196308,
+      "integer_counters_verified": 24,
+      "sha256": "55144098605bbd64592686c407a31b09f16bca33b02c3e3b04b46bbe705287a3"
+    },
+    "parakeet-tdt-0.6b-v3.owned-vulkan": {
+      "bytes": 1254196308,
+      "integer_counters_verified": 24,
+      "sha256": "1ce06d3fb25b7bf57c068da75588b937235b20427ebaf6eab8b9d0ad1cd2c597"
+    }
+  },
+  "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "seconds": 91
+}

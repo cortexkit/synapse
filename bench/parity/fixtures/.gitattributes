@@ -1,5 +1,5 @@
 # Tensor, trace and WAV seals cover raw bytes. The parent fixture rule forces
 # text checkout, which would otherwise strip incidental CRLF byte pairs.
-*.f32le -text
-*.trace -text
-*.wav -text
+*.f32le binary
+*.trace binary
+*.wav binary

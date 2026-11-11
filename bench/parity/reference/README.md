@@ -79,6 +79,13 @@ unpatched encoder. On padded inputs the generator first reproduces upstream NaN,
 then requires finite valid encoder frames and independent-loop equality against
 patched HF greedy output. The reference document lists every such exception id.
 
+The sealed 1,247-fixture set reaches at most 5 emissions at a frame, so only the
+stub tests exercise the cap of K=10 joint evaluations per encoder frame. Exactly
+279 fixtures are in the "upstream NaN on padded input" class: their independent
+loop matches the Hugging Face greedy decoder with the attention-mask fix above,
+not unmodified Transformers. Every fixture without padding has bit-identical
+encoder output between the patched and unpatched implementations.
+
 ## Artifact mirror and grading
 
 Committed f32 tensors are little-endian and row-major: mel `[mel_frames, 128]`,

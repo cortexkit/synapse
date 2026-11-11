@@ -33,10 +33,10 @@
       "gte-reranker-modernbert-base.owned-cuda": "a2a0abcbc79ba7758debc613e926ce95a34e97dc2eea0d57d1007f5182e95a72",
       "gte-reranker-modernbert-base.owned-metal": "96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
       "gte-reranker-modernbert-base.owned-vulkan": "1da21b3ab0d541caec40a65fd1cf2cec5c8f1ec590ebc5df360d6bf9471da783",
-      "parakeet-tdt-0.6b-v3.ane-direct-worker": "d37b07bbe7a2aeb96f577f4d75d6c30c359ef7907d45c637b075990acdfc3266",
-      "parakeet-tdt-0.6b-v3.owned-cuda": "741cf6ed17141fd02db3247898d0a4da604c6d4604fac254c7875930166afdb9",
-      "parakeet-tdt-0.6b-v3.owned-metal": "1c2ec87c7c4302b002ff8e8b37aa41b6c6c54e78ccd936111f3bbba190ec3399",
-      "parakeet-tdt-0.6b-v3.owned-vulkan": "653a7b7932a00ccd5cc1ac1a694ee851f043582e9695562bef90c3820439b99e",
+      "parakeet-tdt-0.6b-v3.ane-direct-worker": "eaf1c15fb6d358c9675c83c91a68ea099ad9008aef52b7284377b917857a4820",
+      "parakeet-tdt-0.6b-v3.owned-cuda": "5116448f7979c70a0031e3e0db00fcdf43ec3730350c312a188d2dd728bf12c3",
+      "parakeet-tdt-0.6b-v3.owned-metal": "b06d0c3967680bd9a8b8586fa234788fc525acf57781d8aee6426366481a3966",
+      "parakeet-tdt-0.6b-v3.owned-vulkan": "0ae0837a03fca46e34f6900dcbb9cb2d73f36dc2ed911a27a595937587bf28b2",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
       "qwen3-embedding-0.6b.owned-cuda": "a93eb2d4f132a60bf5fe0452fb9d9bb9bffe918c94523e88e868359c45dfe9e0",
       "qwen3-embedding-0.6b.owned-metal": "d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
@@ -841,7 +841,8 @@
             "patch_revision": "synapse-parakeet-mask-fix-v1",
             "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
             "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
-            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263",
+            "unpadded_encoder_equality": "bit-identical patched and unpatched encoder output on every fixture without padding"
           },
           "maximum_emissions_per_frame": 5,
           "measured_resample_max_abs_decimal": "1.5454903244972229",
@@ -850,6 +851,7 @@
           "torch_version": "2.14.0",
           "transformers_version": "5.16.1",
           "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "upstream_nan_padded_input_fixtures": 279,
           "wer_normalizer": "synapse-wer-norm-v1",
           "word_rule": {
             "boundary": "first emitted token, then each token piece beginning with U+2581",
@@ -1111,7 +1113,8 @@
             "patch_revision": "synapse-parakeet-mask-fix-v1",
             "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
             "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
-            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263",
+            "unpadded_encoder_equality": "bit-identical patched and unpatched encoder output on every fixture without padding"
           },
           "maximum_emissions_per_frame": 5,
           "measured_resample_max_abs_decimal": "1.5454903244972229",
@@ -1120,6 +1123,7 @@
           "torch_version": "2.14.0",
           "transformers_version": "5.16.1",
           "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "upstream_nan_padded_input_fixtures": 279,
           "wer_normalizer": "synapse-wer-norm-v1",
           "word_rule": {
             "boundary": "first emitted token, then each token piece beginning with U+2581",
@@ -1377,7 +1381,8 @@
             "patch_revision": "synapse-parakeet-mask-fix-v1",
             "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
             "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
-            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263",
+            "unpadded_encoder_equality": "bit-identical patched and unpatched encoder output on every fixture without padding"
           },
           "maximum_emissions_per_frame": 5,
           "measured_resample_max_abs_decimal": "1.5454903244972229",
@@ -1386,6 +1391,7 @@
           "torch_version": "2.14.0",
           "transformers_version": "5.16.1",
           "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "upstream_nan_padded_input_fixtures": 279,
           "wer_normalizer": "synapse-wer-norm-v1",
           "word_rule": {
             "boundary": "first emitted token, then each token piece beginning with U+2581",
@@ -1644,7 +1650,8 @@
             "patch_revision": "synapse-parakeet-mask-fix-v1",
             "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
             "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
-            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263",
+            "unpadded_encoder_equality": "bit-identical patched and unpatched encoder output on every fixture without padding"
           },
           "maximum_emissions_per_frame": 5,
           "measured_resample_max_abs_decimal": "1.5454903244972229",
@@ -1653,6 +1660,7 @@
           "torch_version": "2.14.0",
           "transformers_version": "5.16.1",
           "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "upstream_nan_padded_input_fixtures": 279,
           "wer_normalizer": "synapse-wer-norm-v1",
           "word_rule": {
             "boundary": "first emitted token, then each token piece beginning with U+2581",
