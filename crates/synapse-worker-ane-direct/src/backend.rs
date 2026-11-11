@@ -1,4 +1,4 @@
-use crate::{modernbert, qwen};
+use crate::{modernbert, parakeet, qwen};
 use ane::{Executable, Graph, NSQualityOfService, ProgramOrigin, TensorData};
 use anyhow::{ensure, Context, Result};
 use half::f16;
@@ -79,7 +79,7 @@ impl Profile {
         let identity = serde_json::json!({"model_digest":self.numeric["converted_package_digest"],
             "operation": self.operation(), "numeric_profile":self.numeric,
             "rotation":self.numeric["rotation"], "shape":shape, "layer":layer,
-            "graph_revision":REVISION, "worker_version":env!("CARGO_PKG_VERSION"), "os_build":os});
+            "graph_revision": if self.operation() == "transcribe" { synapse_core::ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION } else { REVISION }, "worker_version":env!("CARGO_PKG_VERSION"), "os_build":os});
         format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&identity).unwrap())
@@ -87,7 +87,7 @@ impl Profile {
     }
 }
 pub fn validate_inventory(inventory: &AnePlacementInventory, layers: usize) -> Result<()> {
-    const CPU: [&str; 8] = [
+    const CPU: [&str; 10] = [
         "token_embedding",
         "mask_position",
         "rotation_in",
@@ -96,6 +96,8 @@ pub fn validate_inventory(inventory: &AnePlacementInventory, layers: usize) -> R
         "pooling",
         "gte_classifier_head",
         "qwen_yes_no_readout",
+        "tdt_predictor",
+        "tdt_joint",
     ];
     ensure!(
         inventory
@@ -139,7 +141,52 @@ pub struct Resident {
     b: TensorData,
     residual: TensorData,
     mask: TensorData,
+    projection: Option<TensorData>,
 }
+#[cfg(test)]
+mod transcribe_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn transcription_reads_the_shape_resident_projection_on_every_request() {
+        let mut model = crate::parakeet::tests::synthetic_model(false);
+        model.tensors.get_mut("joint.head.weight").unwrap()[3 * parakeet::DECODER] = 1.0;
+        model.tensors.get_mut("joint.head.bias").unwrap()[synapse_speech::BLANK as usize] = 0.5;
+        model.tensors.get_mut("joint.head.bias").unwrap()[synapse_speech::VOCAB_SIZE + 4] = 10.0;
+        let shape = 128;
+        let encoder = TensorData::new(modernbert::shape(shape, parakeet::HIDDEN));
+        encoder.copy_from_f32(&vec![0.0; shape * parakeet::HIDDEN]);
+        let projection = TensorData::new(modernbert::shape(shape, parakeet::DECODER));
+        projection.copy_from_f32(&vec![1.0; shape * parakeet::DECODER]);
+        // Empty executables isolate host readback ownership without compiling
+        // or running an ANE program. The resident projection's sentinel selects
+        // token 3; reading a fresh request-local buffer would select blank.
+        model.resident.insert(
+            shape,
+            Resident {
+                inventory: model.profile.inventory(shape, "buffer-unit-test").unwrap(),
+                executables: Vec::new(),
+                a: encoder,
+                b: TensorData::new(modernbert::shape(shape, parakeet::HIDDEN)),
+                residual: TensorData::new(parakeet::mel_shape(shape)),
+                mask: TensorData::new(modernbert::shape(shape * 8, 1)),
+                projection: Some(projection),
+            },
+        );
+        for observe in [false, false, true] {
+            let output = model
+                .transcribe_progress(&vec![0.0; 9 * 128], 9, 8, observe, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(output.frames, 1);
+            assert_eq!(
+                output.decoded.triples,
+                [[3, 0, 4]],
+                "must decode the shape-resident projection, observe={observe}"
+            );
+        }
+    }
+}
+
 impl Drop for Model {
     fn drop(&mut self) {
         // Model unload, replacement, and connection close release all cached programs.
@@ -148,6 +195,108 @@ impl Drop for Model {
 }
 
 impl Model {
+    pub fn transcribe_progress(
+        &self,
+        mel: &[f32],
+        mel_frames: usize,
+        valid_mel_frames: usize,
+        observe: bool,
+        progress: &mut impl FnMut() -> Result<()>,
+    ) -> Result<parakeet::Output> {
+        ensure!(
+            self.profile.operation() == "transcribe",
+            "operation_mismatch"
+        );
+        let frames = parakeet::validate_input(&self.profile, mel, mel_frames, valid_mel_frames)?;
+        let shape = rung(frames)?;
+        let resident = self.resident.get(&shape).context("shape_not_admitted")?;
+        ane::autoreleasepool(|_| {
+            // The frontend's one invalid zero frame may lie just beyond a
+            // rung. Convolution's zero boundary is identical there; only valid
+            // mel frames are copied and all stage masks still use their counts.
+            let mut input = vec![0.0; shape * 8 * 128];
+            input[..valid_mel_frames * 128].copy_from_slice(&mel[..valid_mel_frames * 128]);
+            resident.residual.copy_from_f32(&input);
+            let mut mask = vec![0.0; shape * 8];
+            mask[..valid_mel_frames].fill(1.0);
+            resident.mask.copy_from_f32(&mask);
+            // Cached ANE requests retain their first IOSurfaces. This second
+            // output must live with the shape, just like the encoder buffers.
+            let projected = resident
+                .projection
+                .as_ref()
+                .context("missing_projection_surface")?;
+            for (layer, executable) in resident.executables.iter().enumerate() {
+                let (src, dst) = if layer % 2 == 0 {
+                    (&resident.a, &resident.b)
+                } else {
+                    (&resident.b, &resident.a)
+                };
+                let src = if layer == 0 { &resident.residual } else { src };
+                if layer == 23 {
+                    executable.run_cached(&[src, &resident.mask], &[dst, projected])?;
+                } else {
+                    executable.run_cached(&[src, &resident.mask], &[dst])?;
+                }
+                #[cfg(test)]
+                if observe {
+                    dump_transcribe_tensor(&format!("layer-{layer}"), shape, frames, dst)?;
+                }
+                progress()?;
+            }
+            let raw = resident.a.read_f32();
+            let projection = projected.read_f32();
+            let rows = |channels: usize, data: &[f32]| -> Vec<f32> {
+                (0..frames)
+                    .flat_map(|t| (0..channels).map(move |c| data[c * shape + t]))
+                    .collect()
+            };
+            let projection = rows(parakeet::DECODER, &projection);
+            let mut joint = parakeet::TdtJoint::new(self, &projection, frames);
+            let mut progress_failure = None;
+            let decoded = synapse_speech::greedy(&mut joint, frames, observe, |_| {
+                if progress_failure.is_none() {
+                    progress_failure = progress().err();
+                }
+            })?;
+            if let Some(error) = progress_failure {
+                return Err(error);
+            }
+            Ok(parakeet::Output {
+                frames,
+                encoder: if observe {
+                    rows(parakeet::HIDDEN, &raw)
+                } else {
+                    vec![]
+                },
+                decoded,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcribe_readbacks(&self, frames: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let shape = rung(frames)?;
+        let resident = self.resident.get(&shape).context("shape_not_admitted")?;
+        let rows = |data: Box<[f32]>, channels: usize| -> Vec<f32> {
+            (0..frames)
+                .flat_map(|t| (0..channels).map(move |c| c * shape + t))
+                .map(|index| data[index])
+                .collect()
+        };
+        Ok((
+            rows(resident.a.read_f32(), parakeet::HIDDEN),
+            rows(
+                resident
+                    .projection
+                    .as_ref()
+                    .context("missing_projection_surface")?
+                    .read_f32(),
+                parakeet::DECODER,
+            ),
+        ))
+    }
+
     pub fn load(profile: Profile, path: &Path, digest: &str) -> Result<Self> {
         ensure!(
             profile.numeric["converted_package_digest"] == digest,
@@ -193,6 +342,13 @@ impl Model {
         let fp32: Vec<String> = serde_json::from_value(profile.numeric["fp32_tensors"].clone())?;
         let mut tensors = BTreeMap::new();
         for (name, tensor) in st.tensors() {
+            if profile.operation() == "transcribe" && name.ends_with(".num_batches_tracked") {
+                ensure!(
+                    tensor.dtype() == Dtype::I64 && tensor.shape().is_empty(),
+                    "package_digest_mismatch"
+                );
+                continue;
+            }
             let expected = if fp32.contains(&name) {
                 Dtype::F32
             } else {
@@ -376,6 +532,9 @@ impl Model {
 
     /// Builds one hidden layer's Neural Engine graph at width `shape`.
     fn layer_graph(&self, shape: usize, layer: usize) -> Result<Graph> {
+        if self.profile.operation() == "transcribe" {
+            return parakeet::layer_graph(self, shape, layer);
+        }
         let hidden = self.profile.n("hidden_size");
         let mut graph = Graph::new();
         let input = graph.placeholder(modernbert::shape(shape, hidden));
@@ -456,8 +615,21 @@ impl Model {
                 executables,
                 a: TensorData::new(modernbert::shape(shape, hidden)),
                 b: TensorData::new(modernbert::shape(shape, hidden)),
-                residual: TensorData::new(modernbert::shape(shape, hidden)),
-                mask: TensorData::new(modernbert::shape(shape, 1)),
+                residual: TensorData::new(if self.profile.operation() == "transcribe" {
+                    parakeet::mel_shape(shape)
+                } else {
+                    modernbert::shape(shape, hidden)
+                }),
+                mask: TensorData::new(modernbert::shape(
+                    if self.profile.operation() == "transcribe" {
+                        shape * 8
+                    } else {
+                        shape
+                    },
+                    1,
+                )),
+                projection: (self.profile.operation() == "transcribe")
+                    .then(|| TensorData::new(modernbert::shape(shape, parakeet::DECODER))),
             },
         );
         Ok(inventory)
@@ -702,6 +874,40 @@ impl Model {
         profile.finish(serde_json::json!({"kind":"row", "tokens":tokens.len(), "shape":shape}));
         Ok(vec![score])
     }
+}
+
+#[cfg(test)]
+pub(crate) fn dump_transcribe_tensor(
+    name: &str,
+    shape: usize,
+    frames: usize,
+    tensor: &TensorData,
+) -> Result<()> {
+    let Some(root) = std::env::var_os("ANE_PARAKEET_LAYER_DUMP_DIR") else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root)?;
+    let raw = tensor.read_f32();
+    let rows: Vec<_> = (0..frames)
+        .flat_map(|t| (0..parakeet::HIDDEN).map(move |c| c * shape + t))
+        .map(|index| raw[index])
+        .collect();
+    std::fs::write(
+        root.join(format!("{name}-frames-{frames}.f32le")),
+        synapse_core::encode_f32_frame(&rows),
+    )?;
+    if ["layer-21", "layer-22"].contains(&name) {
+        let full: Vec<_> = (0..shape)
+            .flat_map(|t| (0..parakeet::HIDDEN).map(move |c| c * shape + t))
+            .map(|index| raw[index])
+            .collect();
+        std::fs::write(
+            root.join(format!("{name}-rung-{shape}.f32le")),
+            synapse_core::encode_f32_frame(&full),
+        )?;
+    }
+    Ok(())
 }
 fn padded_ids(tokens: &[u32], pad: u32, shape: usize) -> Vec<u32> {
     let mut ids = tokens.to_vec();
@@ -1002,6 +1208,7 @@ mod fresh_process_hardware {
                     b: TensorData::new(modernbert::shape(1, 1)),
                     residual: TensorData::new(modernbert::shape(1, 1)),
                     mask: TensorData::new(modernbert::shape(1, 1)),
+                    projection: None,
                 },
             );
         }

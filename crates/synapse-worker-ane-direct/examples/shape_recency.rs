@@ -42,6 +42,10 @@ mod modernbert;
 mod multirow;
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
+#[path = "../src/parakeet.rs"]
+mod parakeet;
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
 #[path = "../src/profile.rs"]
 mod profile;
 #[cfg(target_os = "macos")]
