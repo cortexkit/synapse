@@ -6937,11 +6937,13 @@ dependencies = [
  "anyhow",
  "ash",
  "clap",
+ "half",
  "serde",
  "serde_json",
  "sha2",
  "synapse-core",
  "synapse-parity",
+ "synapse-speech",
  "tempfile",
  "tokio",
 ]

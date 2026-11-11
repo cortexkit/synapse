@@ -1,0 +1,133 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { float x[]; };
+layout(set=0,binding=1,std430) readonly buffer Weight { float16_t w[]; };
+layout(set=0,binding=2,std430) writeonly buffer Output { float y[]; };
+layout(set=0,binding=3,std430) readonly buffer Other { uint z[]; };
+layout(set=0,binding=4,std430) readonly buffer Bias { uint b[]; };
+layout(set=0,binding=5,std430) readonly buffer Extra { uint c[]; };
+layout(set=0,binding=6,std430) readonly buffer Values { uint v[]; };
+layout(push_constant) uniform Params {
+    uint op; uint rows; uint cols; uint inner;
+    uint seq; uint heads; uint kv_heads; uint dim;
+    uint flags; uint offset; uint stride; uint window;
+    float eps; float theta; float scale; float unused;
+} p;
+float hb(uint i) { return unpackHalf2x16(b[i/2])[i%2]; }
+float hc(uint i) { return unpackHalf2x16(c[i/2])[i%2]; }
+float hz(uint i) { return unpackHalf2x16(z[i/2])[i%2]; }
+float fz(uint i) { return uintBitsToFloat(z[i]); }
+float fv(uint i) { return uintBitsToFloat(v[i]); }
+shared float tile_x[256];
+shared float tile_w[256];
+void linear() {
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    uint column_tiles=(p.cols+7)/8;
+    uint row0=group/column_tiles*8, col0=group%column_tiles*8;
+    if(row0>=p.rows) return;
+    uint lane=gl_LocalInvocationID.x, row=row0+lane/8, col=col0+lane%8;
+    float a=0.0;
+    for(uint start=0;start<p.inner;start+=32) {
+        for(uint j=lane;j<256;j+=64) {
+            uint r=j/32, k=start+j%32;
+            tile_x[j]=(row0+r<p.rows && k<p.inner)?x[(row0+r)*p.inner+k]:0.0;
+            tile_w[j]=(col0+r<p.cols && k<p.inner)?float(w[(col0+r)*p.inner+k]):0.0;
+        }
+        memoryBarrierShared(); barrier();
+        for(uint k=0;k<32;k++) a+=tile_x[(lane/8)*32+k]*tile_w[(lane%8)*32+k];
+        barrier();
+    }
+    if(row<p.rows && col<p.cols) y[(row+p.offset)*p.cols+col]=a+((p.flags!=0)?hb(col):0.0);
+}
+void main() {
+    if(p.op==100) { linear(); return; }
+    uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64+gl_LocalInvocationID.x;
+    if(p.op==101) { // LayerNorm, including its learned bias.
+        if(i>=p.rows) return;
+        float mean=0.0, variance=0.0;
+        for(uint k=0;k<p.cols;k++) mean+=x[i*p.cols+k];
+        mean/=float(p.cols);
+        for(uint k=0;k<p.cols;k++) { float a=x[i*p.cols+k]-mean; variance+=a*a; }
+        float inv=inversesqrt(variance/float(p.cols)+1e-5);
+        for(uint k=0;k<p.cols;k++) y[i*p.cols+k]=(x[i*p.cols+k]-mean)*inv*float(w[k])+hb(k);
+    } else if(p.op==102) {
+        if(i<p.rows*p.cols) y[i]=x[i]/(1.0+exp(-x[i]));
+    } else if(p.op==103) {
+        if(i<p.rows*p.cols) y[i]=x[i]+p.scale*fz(i);
+    } else if(p.op==104) { // Subsampling pointwise Conv2d, time/channel/frequency layout.
+        if(i>=p.rows*p.cols*256) return;
+        uint freq=i%p.cols, ch=(i/p.cols)%256, time=i/(p.cols*256);
+        float a=hb(ch);
+        for(uint k=0;k<256;k++) a+=x[(time*256+k)*p.cols+freq]*float(w[ch*256+k]);
+        int global_time=int(time)+int(p.offset);
+        y[i]=(global_time>=0 && global_time<int(p.window))?max(a,0.0):0.0;
+    } else if(p.op==105) { // Relative positions descend from T-1 to -(T-1).
+        if(i>=(2*p.rows-1)*1024) return;
+        uint d=i%1024;
+        float angle=float(int(p.rows)-1-int(i/1024))*pow(10000.0,-float(d/2)*2.0/1024.0);
+        y[i]=(d%2==0)?sin(angle):cos(angle);
+    } else if(p.op==106) { // Content and shifted relative-position attention scores.
+        if(i>=p.rows*8*p.seq) return;
+        uint key=i%p.seq, head=(i/p.seq)%8, query=i/(8*p.seq)+p.offset;
+        if(query>=p.window || key>=p.window) { y[i]=-10000.0; return; }
+        float ac=0.0, bd=0.0;
+        uint rel=p.seq-1-query+key;
+        for(uint d=0;d<128;d++) {
+            uint ch=head*128+d;
+            float q=x[query*1024+ch];
+            ac+=(q+hb(ch))*fz(key*1024+ch);
+            bd+=(q+hc(ch))*fv(rel*1024+ch);
+        }
+        y[i]=(ac+bd)*inversesqrt(128.0);
+    } else if(p.op==107) { // The reference uses finite masking, then zeros masked probabilities.
+        if(i>=p.rows*8) return;
+        uint query=i/8+p.offset;
+        float m=-3.402823466e+38, sum=0.0;
+        for(uint k=0;k<p.seq;k++) m=max(m,x[i*p.seq+k]);
+        for(uint k=0;k<p.seq;k++) sum+=exp(x[i*p.seq+k]-m);
+        for(uint k=0;k<p.seq;k++) y[i*p.seq+k]=(query<p.window && k<p.window)?exp(x[i*p.seq+k]-m)/sum:0.0;
+    } else if(p.op==108) {
+        if(i>=p.rows*1024) return;
+        uint row=i/1024, ch=i%1024, head=ch/128;
+        float a=0.0;
+        for(uint k=0;k<p.window;k++) a+=x[(row*8+head)*p.seq+k]*fv(k*1024+ch);
+        y[(row+p.offset)*1024+ch]=a;
+    } else if(p.op==109) { // GLU, masked immediately before depthwise convolution.
+        if(i>=p.rows*1024) return;
+        uint row=i/1024, ch=i%1024;
+        y[i]=(row<p.window)?x[row*2048+ch]/(1.0+exp(-x[row*2048+1024+ch])):0.0;
+    } else if(p.op==110) {
+        if(i>=p.rows*1024) return;
+        uint row=i/1024, ch=i%1024;
+        float a=0.0;
+        for(int k=0;k<9;k++) {
+            int t=int(row)+k-4;
+            if(t>=0 && t<int(p.rows)) a+=x[uint(t)*1024+ch]*float(w[ch*9+uint(k)]);
+        }
+        y[i]=a;
+    } else if(p.op==111) { // Inference BatchNorm followed by SiLU.
+        if(i>=p.rows*1024) return;
+        uint ch=i%1024;
+        float a=(x[i]-hc(ch))*inversesqrt(hz(ch)+1e-5)*float(w[ch])+hb(ch);
+        y[i]=a/(1.0+exp(-a));
+    } else if(p.op==112) {
+        if(i<p.rows) y[i]=x[i];
+    } else if(p.op==113) { // Strided 3x3 Conv2d (first dense, subsequent depthwise).
+        if(i>=p.rows*p.cols*256) return;
+        uint freq=i%p.cols, ch=(i/p.cols)%256, time=i/(p.cols*256);
+        int global_time=int(time)+int(p.offset);
+        if(global_time<0 || global_time>=int(p.window)) { y[i]=0.0; return; }
+        float a=hb(ch);
+        for(int kt=0;kt<3;kt++) for(int kf=0;kf<3;kf++) {
+            int t=global_time*2+kt-1-int(p.stride), f=int(freq*2)+kf-1;
+            if(t>=0 && t<int(p.seq) && f>=0 && f<int(p.heads)) {
+                uint channel=(p.flags!=0)?0:ch;
+                a+=x[(uint(t)*p.inner+channel)*p.heads+uint(f)]*float(w[ch*9+uint(kt*3+kf)]);
+            }
+        }
+        if(p.flags!=0) a=max(a,0.0);
+        y[i]=a;
+    }
+}

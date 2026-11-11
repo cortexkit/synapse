@@ -3,6 +3,9 @@ pub mod allocation;
 pub mod protocol;
 #[cfg(feature = "vulkan")]
 pub mod runtime;
+pub mod transcribe;
+#[cfg(all(test, feature = "vulkan"))]
+mod transcribe_layers;
 
 use synapse_parity::manifest::Manifest;
 
@@ -80,8 +83,10 @@ mod tests {
             )
         );
         let mut hash = Sha256::new();
-        for (_, bytes) in SHADERS {
-            hash.update(bytes);
+        for (name, bytes) in SHADERS {
+            if !name.starts_with("transcribe") {
+                hash.update(bytes);
+            }
         }
         assert_eq!(KERNEL_REVISION, format!("{:x}", hash.finalize()));
         let original = Sha256::digest(b"shader-set-a");

@@ -3,10 +3,12 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 // Attention has its own pipeline because its shared-memory tiles would
 // otherwise be reserved by every other kernel and lower their occupancy.
-const SHADERS: [(&str, &str); 3] = [
+const SHADERS: [(&str, &str); 5] = [
     ("plain", "vulkan1.2"),
     ("cooperative", "vulkan1.3"),
     ("attention", "vulkan1.2"),
+    ("transcribe", "vulkan1.2"),
+    ("transcribe_f32", "vulkan1.2"),
 ];
 
 fn verify_spirv(bytes: &[u8]) {
@@ -72,7 +74,17 @@ fn main() {
     let mut hash = Sha256::new();
     let mut declarations = String::from("pub static SHADERS: &[(&str, &[u8])] = &[\n");
     for (name, target) in SHADERS {
-        let source = format!("shaders/{name}.comp");
+        if name == "transcribe_f32"
+            && env::var_os("CARGO_FEATURE_TRANSCRIBE_F32_MEASUREMENT").is_none()
+        {
+            continue;
+        }
+        let source_name = if name == "transcribe_f32" {
+            "transcribe"
+        } else {
+            name
+        };
+        let source = format!("shaders/{source_name}.comp");
         println!("cargo:rerun-if-changed={source}");
         let binary = out.join(format!("{name}.spv"));
         if let Some(sdk) = &sdk {
@@ -93,6 +105,34 @@ fn main() {
                     && version_text.contains("spirv-tools v2026.3"),
                 "glslc does not match SDK 1.4.357.0: {version_text}"
             );
+            // Generate only the measurement shader. The original fp16 source
+            // and compiler arguments remain unchanged, preserving its SPIR-V.
+            let input = if name == "transcribe_f32" {
+                let mut text = fs::read_to_string(&source).expect("read speech shader");
+                for (from, to) in [
+                    ("#extension GL_EXT_shader_16bit_storage : require\n", ""),
+                    (
+                        "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n",
+                        "",
+                    ),
+                    ("float16_t w[]", "float w[]"),
+                    ("unpackHalf2x16(b[i/2])[i%2]", "uintBitsToFloat(b[i])"),
+                    ("unpackHalf2x16(c[i/2])[i%2]", "uintBitsToFloat(c[i])"),
+                    ("unpackHalf2x16(z[i/2])[i%2]", "uintBitsToFloat(z[i])"),
+                    ("p.op", "(p.op-100u)"),
+                ] {
+                    assert!(
+                        text.contains(from),
+                        "speech shader transformation anchor disappeared: {from}"
+                    );
+                    text = text.replace(from, to);
+                }
+                let path = out.join("transcribe_f32.comp");
+                fs::write(&path, text).expect("write measurement shader");
+                path
+            } else {
+                PathBuf::from(format!("{name}.comp"))
+            };
             let output = Command::new(compiler)
                 .current_dir("shaders")
                 .args([
@@ -100,7 +140,7 @@ fn main() {
                     "-fshader-stage=compute",
                     &format!("--target-env={target}"),
                 ])
-                .arg(format!("{name}.comp"))
+                .arg(input)
                 .arg("-o")
                 .arg(&binary)
                 .output()
@@ -112,7 +152,11 @@ fn main() {
             );
             let bytes = fs::read(&binary).expect("read compiled shader");
             verify_spirv(&bytes);
-            hash.update(&bytes);
+            // Speech kernels have their own load-time revision. Excluding them
+            // preserves the embedding/reranking shader-set identity.
+            if !name.starts_with("transcribe") {
+                hash.update(&bytes);
+            }
             declarations.push_str(&format!("({name:?}, include_bytes!({:?})),\n", binary));
         }
     }

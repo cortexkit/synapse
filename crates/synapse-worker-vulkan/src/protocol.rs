@@ -20,6 +20,10 @@ use crate::{
     KERNEL_REVISION, MANIFEST_DIGEST,
 };
 
+#[cfg(all(test, feature = "vulkan"))]
+#[path = "transcribe_hardware.rs"]
+mod transcribe_hardware;
+
 pub fn hello(nonce: &str) -> WorkerHello {
     WorkerHello {
         v: WORKER_PROTOCOL_VERSION,
@@ -52,6 +56,25 @@ fn digest(value: &str) -> &str {
     value.strip_prefix("sha256:").unwrap_or(value)
 }
 
+fn loaded_response(req_id: String, model: &Loaded) -> WorkerResponse {
+    let mut response =
+        WorkerResponse::loaded(req_id, model.model_ref.clone(), model.dims, 0, None, None);
+    if model.operation == Operation::Transcribe {
+        if let WorkerResponse::Loaded {
+            transcribe_revision,
+            ..
+        } = &mut response
+        {
+            *transcribe_revision = Some(synapse_core::TranscribeRevision {
+                kernel_revision:
+                    synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION.into(),
+                decode_rule: synapse_speech::DECODE_RULE_REVISION.into(),
+            });
+        }
+    }
+    response
+}
+
 pub fn preflight(
     config: &BTreeMap<String, String>,
     artifact_digest: &str,
@@ -69,12 +92,10 @@ pub fn preflight(
         .model(&profile.model)
         .map_err(|_| "model_unsupported")?
         .clone();
-    // This worker has no transcription engine yet, so it refuses a transcribe
-    // profile the same way as any other model it can't serve.
     let operation = match model.operation {
         Operation::Embed => "embed",
         Operation::Rerank => "rerank",
-        Operation::Transcribe => return Err("model_unsupported".into()),
+        Operation::Transcribe => "transcribe",
     };
     if config.get("operation").map(String::as_str) != Some(operation) {
         return Err("operation_mismatch".into());
@@ -109,7 +130,13 @@ struct Loaded {
     operation: Operation,
     dims: usize,
     #[cfg(feature = "vulkan")]
-    engine: crate::runtime::Engine,
+    engine: LoadedEngine,
+}
+
+#[cfg(feature = "vulkan")]
+enum LoadedEngine {
+    Tokens(Box<crate::runtime::Engine>),
+    Speech(Box<crate::runtime::transcribe::Engine>),
 }
 
 pub fn session<S: Read + Write>(
@@ -149,6 +176,11 @@ pub fn request_loop<S: Read + Write>(
         } else {
             None
         };
+        if let Some(raw) = &raw {
+            request
+                .validate_raw_frame(raw)
+                .context("invalid raw frame")?;
+        }
         let response = match &request {
             WorkerRequest::Shutdown {} => break,
             WorkerRequest::Ping { req_id } => WorkerResponse::Pong {
@@ -169,16 +201,15 @@ pub fn request_loop<S: Read + Write>(
                 // A worker retains one model arena. Release it before constructing a
                 // replacement so repeated LOAD cannot double device-local residency.
                 loaded = None;
-                match load(artifact_path, artifact_digest, runtime_config, &mut lookup) {
+                match load(
+                    artifact_path,
+                    artifact_digest,
+                    runtime_config,
+                    max_frame,
+                    &mut lookup,
+                ) {
                     Ok(model) => {
-                        let response = WorkerResponse::loaded(
-                            req_id.clone(),
-                            model.model_ref.clone(),
-                            model.dims,
-                            0,
-                            None,
-                            None,
-                        );
+                        let response = loaded_response(req_id.clone(), &model);
                         loaded = Some(model);
                         response
                     }
@@ -198,6 +229,26 @@ pub fn request_loop<S: Read + Write>(
                         "model reference is not loaded",
                     )
                 }
+            }
+            WorkerRequest::Transcribe {
+                req_id,
+                model_ref,
+                mel_frames,
+                valid_mel_frames,
+                observe,
+            } => {
+                serve_transcribe(
+                    stream,
+                    max_frame,
+                    loaded.as_mut(),
+                    req_id,
+                    model_ref,
+                    *mel_frames,
+                    *valid_mel_frames,
+                    raw.as_deref().unwrap(),
+                    *observe,
+                )?;
+                continue;
             }
             WorkerRequest::EmbedBatch {
                 req_id,
@@ -286,12 +337,65 @@ pub fn request_loop<S: Read + Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn serve_transcribe(
+    stream: &mut impl Write,
+    max_frame: u32,
+    loaded: Option<&mut Loaded>,
+    req_id: &str,
+    model_ref: &str,
+    mel_frames: usize,
+    valid: usize,
+    raw: &[u8],
+    observe: bool,
+) -> Result<()> {
+    let mut writer =
+        synapse_core::worker_framing_sync::ProgressWriter::new(stream, req_id, max_frame);
+    let result = transcribe_progress(
+        loaded,
+        model_ref,
+        mel_frames,
+        valid,
+        raw,
+        observe,
+        &mut || {
+            writer
+                .completed(WorkerProgressPhase::Inference)
+                .map_err(Into::into)
+        },
+    );
+    if writer.failed() {
+        return Err(anyhow::anyhow!("progress stream write failed"));
+    }
+    match result {
+        Ok(output) => crate::transcribe::write_output(stream, req_id, &output, observe, max_frame)?,
+        Err(code) => write_json_frame(stream, &err(Some(req_id.into()), &code, &code), max_frame)?,
+    }
+    Ok(())
+}
+
 fn load(
     path: &str,
     artifact_digest: &str,
     config: &BTreeMap<String, String>,
+    max_frame: u32,
     lookup: impl FnOnce() -> std::result::Result<Vec<Adapter>, String>,
 ) -> std::result::Result<Loaded, String> {
+    if let Some(profile) = config
+        .get("profile")
+        .and_then(|id| crate::manifest().profiles.get(id).cloned())
+        .filter(|p| p.transcribe.is_some())
+    {
+        let maximum = crate::transcribe::maximum(&profile).map_err(|e| e.to_string())?;
+        crate::transcribe::validate_frame_envelope(maximum, max_frame)
+            .map_err(|e| e.to_string())?;
+        if config
+            .get("max_encoder_frames")
+            .is_some_and(|m| m.parse::<usize>().ok() != Some(maximum))
+        {
+            return Err("invalid_runtime_config".into());
+        }
+    }
     let mut package_path = Path::new(path).to_path_buf();
     #[cfg(feature = "vulkan")]
     let mut prepared = None;
@@ -337,7 +441,13 @@ fn load(
         if header.tensors.len() != expected.len()
             || expected.iter().any(|(name, shape)| {
                 header.tensors.get(name).is_none_or(|t| {
-                    &t.shape != shape || t.dtype != synapse_parity::safetensors::StDType::F16
+                    &t.shape != shape
+                        || t.dtype
+                            != if name.ends_with("num_batches_tracked") {
+                                synapse_parity::safetensors::StDType::I64
+                            } else {
+                                synapse_parity::safetensors::StDType::F16
+                            }
                 })
             })
         {
@@ -350,18 +460,38 @@ fn load(
         {
             return Err("artifact_invalid".into());
         }
-        let dims = model.output().map_err(|_| "model_unsupported")?.dimension as usize;
+        let dims = if model.operation == Operation::Transcribe {
+            0
+        } else {
+            model.output().map_err(|_| "model_unsupported")?.dimension as usize
+        };
         let operation = model.operation;
         let required = requirements(&crate::manifest(), Some(&profile.model))?;
-        let engine = crate::runtime::Engine::load(
-            model,
-            profile,
-            prepared.take().expect("device prepared before header"),
-            required,
-            &header,
-            data,
-        )
-        .map_err(runtime_error_code)?;
+        let engine = if operation == Operation::Transcribe {
+            LoadedEngine::Speech(Box::new(
+                crate::runtime::transcribe::Engine::load(
+                    &model,
+                    &profile,
+                    prepared.take().expect("device prepared before header"),
+                    required,
+                    &header,
+                    data,
+                )
+                .map_err(runtime_error_code)?,
+            ))
+        } else {
+            LoadedEngine::Tokens(Box::new(
+                crate::runtime::Engine::load(
+                    model,
+                    profile,
+                    prepared.take().expect("device prepared before header"),
+                    required,
+                    &header,
+                    data,
+                )
+                .map_err(runtime_error_code)?,
+            ))
+        };
         Ok(Loaded {
             model_ref: digest(artifact_digest).into(),
             operation,
@@ -430,8 +560,10 @@ fn infer_progress(
         .collect();
     #[cfg(feature = "vulkan")]
     {
-        model
-            .engine
+        let LoadedEngine::Tokens(engine) = &model.engine else {
+            return Err("operation_mismatch".into());
+        };
+        engine
             .infer_progress(&sequences, progress)
             .map_err(|e| e.to_string())
     }
@@ -442,9 +574,177 @@ fn infer_progress(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn transcribe_progress(
+    loaded: Option<&mut Loaded>,
+    model_ref: &str,
+    mel_frames: usize,
+    valid: usize,
+    raw: &[u8],
+    observe: bool,
+    progress: &mut impl FnMut() -> Result<()>,
+) -> std::result::Result<crate::transcribe::Output, String> {
+    let model = loaded
+        .filter(|m| m.model_ref == model_ref)
+        .ok_or("model_not_loaded")?;
+    if model.operation != Operation::Transcribe {
+        return Err("operation_mismatch".into());
+    }
+    let mel = synapse_core::decode_f32_frame(raw).map_err(|_| "invalid_mel_frames".to_owned())?;
+    #[cfg(feature = "vulkan")]
+    {
+        let LoadedEngine::Speech(engine) = &mut model.engine else {
+            return Err("operation_mismatch".into());
+        };
+        engine
+            .transcribe(&mel, mel_frames, valid, observe, progress)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "vulkan"))]
+    {
+        let _ = (mel, mel_frames, valid, observe, progress);
+        Err("vulkan_no_device".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcribe_profile_is_admitted_before_weights_are_opened() {
+        let manifest = crate::manifest();
+        let profile = &manifest.profiles["parakeet-tdt-0.6b-v3.owned-vulkan"];
+        let config = BTreeMap::from([
+            ("profile".into(), "parakeet-tdt-0.6b-v3.owned-vulkan".into()),
+            ("operation".into(), "transcribe".into()),
+        ]);
+        let mut opened = false;
+        let (model, _, _, _) = preflight(
+            &config,
+            profile.converted_package_digest.as_ref().unwrap(),
+            || Ok(vec![eligible()]),
+            || {
+                opened = true;
+                parse_header_json(b"{}").map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        assert!(opened);
+        assert_eq!(model.operation, Operation::Transcribe);
+        let mut too_small = eligible();
+        too_small.device_local_heaps = vec![profile.vulkan_min_device_local_bytes.unwrap() - 1];
+        assert_eq!(
+            preflight(
+                &config,
+                profile.converted_package_digest.as_ref().unwrap(),
+                || Ok(vec![too_small]),
+                || panic!("floor refusal must precede artifact access")
+            )
+            .unwrap_err(),
+            "vulkan_insufficient_memory"
+        );
+    }
+
+    #[test]
+    fn transcribe_raw_count_and_negotiated_limit_are_protocol_faults() {
+        for (raw, limit) in [
+            (vec![0; 511], 4096),
+            (vec![0; 513], 4096),
+            (vec![0; 512], 256),
+        ] {
+            let mut input = Vec::new();
+            write_json_frame(
+                &mut input,
+                &WorkerRequest::Transcribe {
+                    req_id: "speech".into(),
+                    model_ref: "missing".into(),
+                    mel_frames: 1,
+                    valid_mel_frames: 0,
+                    observe: false,
+                },
+                4096,
+            )
+            .unwrap();
+            write_frame(&mut input, &raw, 4096).unwrap();
+            let mut script = Script {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+            };
+            assert!(request_loop(&mut script, limit, || panic!(
+                "no device access for invalid frame"
+            ))
+            .is_err());
+            assert!(script.output.is_empty());
+        }
+    }
+
+    #[test]
+    fn transcribe_refusal_consumes_raw_frame_before_ping() {
+        let mut input = Vec::new();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Transcribe {
+                req_id: "speech".into(),
+                model_ref: "missing".into(),
+                mel_frames: 2,
+                valid_mel_frames: 1,
+                observe: true,
+            },
+            4096,
+        )
+        .unwrap();
+        write_frame(&mut input, &[0; 1024], 4096).unwrap();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Ping {
+                req_id: "alive".into(),
+            },
+            4096,
+        )
+        .unwrap();
+        let mut script = Script {
+            input: std::io::Cursor::new(input),
+            output: Vec::new(),
+        };
+        request_loop(&mut script, 4096, || panic!("no device access before LOAD")).unwrap();
+        let mut responses = std::io::Cursor::new(script.output);
+        assert!(
+            matches!(read_json_frame::<_,WorkerResponse>(&mut responses,4096).unwrap(), WorkerResponse::Err {code,..} if code=="model_not_loaded")
+        );
+        assert!(
+            matches!(read_json_frame::<_,WorkerResponse>(&mut responses,4096).unwrap(), WorkerResponse::Pong {req_id,..} if req_id=="alive")
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "vulkan"))]
+    fn transcribe_load_revision_is_separate_from_legacy_loaded_bytes() {
+        let mut model = Loaded {
+            model_ref: "speech".into(),
+            operation: Operation::Transcribe,
+            dims: 0,
+        };
+        let response = loaded_response("load".into(), &model);
+        let WorkerResponse::Loaded {
+            transcribe_revision: Some(revision),
+            ..
+        } = response
+        else {
+            panic!("missing revision");
+        };
+        assert_eq!(
+            revision.kernel_revision,
+            synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION
+        );
+        assert_eq!(revision.decode_rule, synapse_speech::DECODE_RULE_REVISION);
+        model.operation = Operation::Embed;
+        model.dims = 768;
+        assert_eq!(
+            serde_json::to_string(&loaded_response("load".into(), &model)).unwrap(),
+            r#"{"type":"LOADED","req_id":"load","model_ref":"speech","dims":768,"cold_load_ms":0}"#
+        );
+    }
     use std::{cell::Cell, io::Cursor};
     struct Script {
         input: Cursor<Vec<u8>>,

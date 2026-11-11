@@ -1431,6 +1431,8 @@
       "model": "parakeet-tdt-0.6b-v3",
       "rerank_tolerance_class": "fp16",
       "storage_dtype": "f16",
+      "vulkan_min_device_local_bytes": 2021900544,
+      "vulkan_min_storage_buffer_range": 134217728,
       "transcribe": {
         "confirmations": {
           "decode_rule": {
