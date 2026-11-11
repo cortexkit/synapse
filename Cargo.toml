@@ -31,6 +31,8 @@ members = [
     "bench/lanes/burn",
     "bench/spikes/unified-rt",
     "bench/lanes/candle-embed",
+    "bench/lanes/stt-common",
+    "bench/lanes/stt-transcribe-cpp",
     "crates/synapse-core",
     "crates/synapse-build-stamp",
     "crates/synapse-native-probe",

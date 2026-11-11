@@ -6426,6 +6426,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "stt-common"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-bench",
+ "synapse-parity",
+]
+
+[[package]]
+name = "stt-transcribe-cpp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde_json",
+ "stt-common",
+ "transcribe-cpp",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "subc-cgroup"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7542,6 +7568,25 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transcribe-cpp"
+version = "0.4.1"
+source = "git+https://github.com/anomalyco/transcribe.cpp?rev=bcb639faa4c74a2300ba19e30360cb2355b1663a#bcb639faa4c74a2300ba19e30360cb2355b1663a"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
+ "transcribe-cpp-sys",
+]
+
+[[package]]
+name = "transcribe-cpp-sys"
+version = "0.4.1"
+source = "git+https://github.com/anomalyco/transcribe.cpp?rev=bcb639faa4c74a2300ba19e30360cb2355b1663a#bcb639faa4c74a2300ba19e30360cb2355b1663a"
+dependencies = [
+ "cmake",
+ "serde_json",
 ]
 
 [[package]]
