@@ -75,9 +75,10 @@ mod runner {
         );
         let mut session = model.session()?;
         let options = RunOptions::default();
+        let memory_probe = stt_common::memory::loaded_barrier()?;
         let first = read_pcm(&request.utterances[0].path)?;
         session.run(&first, &options)?;
-        let cold = start.elapsed().as_secs_f64();
+        let cold = start.elapsed().saturating_sub(memory_probe).as_secs_f64();
         let warm = Instant::now();
         let mut transcripts = Vec::new();
         for utterance in &request.utterances {

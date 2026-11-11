@@ -29,3 +29,29 @@ Cold start means a new process and unloaded model, not a flushed operating-syste
 file cache. Record wall time includes worker launch and shutdown but excludes
 corpus verification and scoring. Warm wall time excludes model loading and warmup;
 per-utterance percentiles and real-time factor use measured warm transcriptions.
+
+The coordinator adds (without changing worker-required fields) `model_size_bytes`,
+`weight_precision`, `process_peak_bytes`/`process_peak_method`, NVIDIA sampling
+method/baseline/cadence/sample-count fields, and nullable `ane_peak_bytes`.
+The process comparison column is macOS lifetime maximum **phys_footprint**,
+sampled from the parent, or Linux RSS / Windows peak working set. The original
+`peak_rss_bytes` remains available with its original units and meaning. NVIDIA
+memory is per PID (pre-spawn baseline zero), preferably NVML compute+graphics,
+otherwise `nvidia-smi` compute-apps, with 100 ms target interval and observed
+maximum gap. Missing counters, including Neural Engine memory, stay null.
+Live parent counters are not reconstructed during transcript replay.
+
+Optional loaded-memory probe: when `STT_MEMORY_READY` is set to a path, workers
+create that file after load, before warmup, and wait (at most 30 seconds) for the
+same path with extension `memory-resume`. The parent snapshots
+`gpu_after_load_idle_bytes` then creates the resume file. Workers subtract the
+barrier's elapsed duration from `cold_start_seconds`; process wall still includes
+it. Workers without the extension remain compatible and have a null idle value.
+Current NVIDIA-capable lanes implement it; Mac-only Swift GPU counters stay null.
+
+Synapse backends are named `synapse-metal`, `synapse-ane`,
+`synapse-cuda-f16`, `synapse-cuda-f32`, `synapse-vulkan-f16` and
+`synapse-vulkan-f32`; the prefix distinguishes their package validation from
+competitors' GGUF/CoreML inputs. All use WAV input, one discarded first-utterance
+warmup, and observation disabled. CUDA/Vulkan F32 packages are measurement-only,
+not new production profiles. The lane never invokes certification harnesses.

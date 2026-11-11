@@ -1,6 +1,8 @@
 pub mod artifact;
 pub mod input;
 pub mod measurement;
+pub mod memory;
+mod nvml;
 
 #[cfg(test)]
 mod tests;

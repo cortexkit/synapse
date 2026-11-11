@@ -33,6 +33,7 @@ members = [
     "bench/lanes/candle-embed",
     "bench/lanes/stt-common",
     "bench/lanes/stt-transcribe-cpp",
+    "bench/lanes/stt-synapse",
     "crates/synapse-core",
     "crates/synapse-build-stamp",
     "crates/synapse-native-probe",

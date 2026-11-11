@@ -1,0 +1,52 @@
+[package]
+name = "stt-synapse"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# ANE source modules belong to a binary-only worker. Compile them unchanged in
+# this library, excluding certification test functions and intermediate-tensor
+# dumping that are compiled only in the worker's test harness.
+[lib]
+test = false
+doctest = false
+
+[features]
+default = []
+metal = ["dep:synapse-engine-owned"]
+ane = ["dep:ane", "dep:half", "dep:safetensors", "dep:libm"]
+cuda = ["dep:synapse-engine-cuda", "synapse-engine-cuda/cuda"]
+vulkan = ["dep:synapse-worker-vulkan", "synapse-worker-vulkan/transcribe-f32-measurement"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+stt-common = { path = "../stt-common" }
+synapse-core = { path = "../../../crates/synapse-core" }
+synapse-speech = { path = "../../../crates/synapse-speech" }
+synapse-parity = { path = "../../parity", default-features = false }
+synapse-engine-cuda = { path = "../../../crates/synapse-engine-cuda", optional = true }
+synapse-worker-vulkan = { path = "../../../crates/synapse-worker-vulkan", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+synapse-engine-owned = { path = "../../../crates/synapse-engine-owned", optional = true }
+ane = { path = "../../../crates/synapse-worker-ane-direct/vendor/ane", optional = true }
+half = { version = "2.7", optional = true }
+safetensors = { version = "0.7", optional = true }
+libm = { version = "0.2", optional = true }
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[build-dependencies]
+synapse-build-stamp = { path = "../../../crates/synapse-build-stamp" }
+
+[[bin]]
+name = "stt-synapse"
+path = "src/main.rs"

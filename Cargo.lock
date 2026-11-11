@@ -6430,12 +6430,39 @@ name = "stt-common"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
+ "libloading 0.8.9",
  "serde",
  "serde_json",
  "sha2",
  "synapse-bench",
  "synapse-parity",
+]
+
+[[package]]
+name = "stt-synapse"
+version = "0.1.0"
+dependencies = [
+ "ane",
+ "anyhow",
+ "clap",
+ "half",
+ "libc",
+ "libm",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "stt-common",
+ "synapse-build-stamp",
+ "synapse-core",
+ "synapse-engine-cuda",
+ "synapse-engine-owned",
+ "synapse-parity",
+ "synapse-speech",
+ "synapse-worker-vulkan",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

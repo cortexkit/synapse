@@ -6,9 +6,9 @@ out=${2:?supply a new result directory}
 [[ ! -e "$out" ]] || { echo "result directory already exists: $out" >&2; exit 2; }
 mkdir -p "$out"
 case "$(uname -s)" in
-  Darwin) lanes=${STT_LANES:-"transcribe fluid apple"}; backends=${STT_BACKENDS:-metal}; suffix= ;;
-  MINGW*|MSYS*|CYGWIN*) lanes=${STT_LANES:-transcribe}; backends=${STT_BACKENDS:-"cuda vulkan"}; suffix=.exe ;;
-  Linux) lanes=${STT_LANES:-transcribe}; backends=${STT_BACKENDS:-"cuda vulkan"}; suffix= ;;
+  Darwin) lanes=${STT_LANES:-"transcribe fluid apple synapse"}; backends=${STT_BACKENDS:-metal}; synapse_backends=${STT_SYNAPSE_BACKENDS:-"metal ane"}; suffix= ;;
+  MINGW*|MSYS*|CYGWIN*) lanes=${STT_LANES:-"transcribe synapse"}; backends=${STT_BACKENDS:-"cuda vulkan"}; synapse_backends=${STT_SYNAPSE_BACKENDS:-"cuda-f16 cuda-f32 vulkan-f16 vulkan-f32"}; suffix=.exe ;;
+  Linux) lanes=${STT_LANES:-"transcribe synapse"}; backends=${STT_BACKENDS:-"cuda vulkan"}; synapse_backends=${STT_SYNAPSE_BACKENDS:-"cuda-f16 cuda-f32 vulkan-f16 vulkan-f32"}; suffix= ;;
   *) echo "unsupported OS" >&2; exit 2 ;;
 esac
 bench=${STT_BENCH:-target/release/stt-bench$suffix}
@@ -40,8 +40,23 @@ for lane in $lanes; do
     apple)
       run apple-speech target/stt-apple-speech/release/stt-apple-speech system OS-managed apple-speech
       ;;
+    synapse)
+      for backend in $synapse_backends; do
+        case "$backend" in
+          metal) model=${STT_SYNAPSE_METAL_MODEL:?set STT_SYNAPSE_METAL_MODEL to pinned HF snapshot}; build=metal ;;
+          ane) model=${STT_SYNAPSE_ANE_MODEL:?set STT_SYNAPSE_ANE_MODEL to converted ANE package}; build=ane ;;
+          cuda-f16) model=${STT_SYNAPSE_CUDA_F16_MODEL:?set STT_SYNAPSE_CUDA_F16_MODEL}; build=cuda ;;
+          cuda-f32) model=${STT_SYNAPSE_CUDA_F32_MODEL:?set STT_SYNAPSE_CUDA_F32_MODEL}; build=cuda ;;
+          vulkan-f16) model=${STT_SYNAPSE_VULKAN_F16_MODEL:?set STT_SYNAPSE_VULKAN_F16_MODEL}; build=vulkan ;;
+          vulkan-f32) model=${STT_SYNAPSE_VULKAN_F32_MODEL:?set STT_SYNAPSE_VULKAN_F32_MODEL}; build=vulkan ;;
+          *) echo "unknown Synapse backend: $backend" >&2; exit 2 ;;
+        esac
+        run "synapse-$backend" "target/stt-synapse-$build/release/stt-synapse$suffix" "$model" 541d1f99c6b0c3cd0b11a95167540bb8edefd82b "synapse-$backend"
+      done
+      ;;
     *) echo "unknown lane: $lane" >&2; exit 2 ;;
   esac
 done
 "$table" "${results[@]}" > "$out/matrix.tsv"
-printf 'Table: %s/matrix.tsv\n' "$out"
+"$table" --wide "${results[@]}" > "$out/comparison.tsv"
+printf 'Tables: %s/matrix.tsv (per split), %s/comparison.tsv (per engine)\n' "$out" "$out"

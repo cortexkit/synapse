@@ -10,9 +10,12 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+libloading = "0.8"
 synapse-parity = { path = "../../parity", default-features = false }
 synapse-bench = { path = "../../harness" }
 
 [[bin]]
 name = "stt-bench"
 path = "src/main.rs"
+[build-dependencies]
+cc = "1"
