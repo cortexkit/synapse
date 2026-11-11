@@ -224,9 +224,11 @@ def main():
         raise RuntimeError("converted-package receipt has the wrong checkpoint or converter rule")
     for lane in ("owned-metal", "owned-cuda", "owned-vulkan", "ane-direct-worker"):
         profile_id = SLUG + "." + lane
-        profile = {"model": SLUG, "lane": lane, "storage_dtype": "f16", "compute_dtype": "f16",
+        dtype = "f32" if lane == "owned-metal" else "f16"
+        profile = {"model": SLUG, "lane": lane, "storage_dtype": dtype, "compute_dtype": dtype,
                    "conversion_rule": "none" if lane == "owned-metal" else "v1",
-                   "rerank_tolerance_class": "fp16", "fp32_tensors": [],
+                   "rerank_tolerance_class": "fp32" if dtype == "f32" else "fp16",
+                   "fp32_tensors": "all" if dtype == "f32" else [],
                    "transcribe": {"max_duration_ms": 600000, "encoder_rungs": list(ref.RUNGS),
                                   "tau_feat": 0.001, "tau_resample": tau_resample,
                                   "tau_margin": subset["tau_margin"], "confirmations": contract,

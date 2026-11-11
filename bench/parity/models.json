@@ -35,7 +35,7 @@
       "gte-reranker-modernbert-base.owned-vulkan": "1da21b3ab0d541caec40a65fd1cf2cec5c8f1ec590ebc5df360d6bf9471da783",
       "parakeet-tdt-0.6b-v3.ane-direct-worker": "eaf1c15fb6d358c9675c83c91a68ea099ad9008aef52b7284377b917857a4820",
       "parakeet-tdt-0.6b-v3.owned-cuda": "5116448f7979c70a0031e3e0db00fcdf43ec3730350c312a188d2dd728bf12c3",
-      "parakeet-tdt-0.6b-v3.owned-metal": "b06d0c3967680bd9a8b8586fa234788fc525acf57781d8aee6426366481a3966",
+      "parakeet-tdt-0.6b-v3.owned-metal": "641ec0b90dc3f34cffecf88e39dc357932b8444da9c18324f6572a57d4bcfec7",
       "parakeet-tdt-0.6b-v3.owned-vulkan": "0ae0837a03fca46e34f6900dcbb9cb2d73f36dc2ed911a27a595937587bf28b2",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
       "qwen3-embedding-0.6b.owned-cuda": "a93eb2d4f132a60bf5fe0452fb9d9bb9bffe918c94523e88e868359c45dfe9e0",
@@ -1155,13 +1155,13 @@
       }
     },
     "parakeet-tdt-0.6b-v3.owned-metal": {
-      "compute_dtype": "f16",
+      "compute_dtype": "f32",
       "conversion_rule": "none",
-      "fp32_tensors": [],
+      "fp32_tensors": "all",
       "lane": "owned-metal",
       "model": "parakeet-tdt-0.6b-v3",
-      "rerank_tolerance_class": "fp16",
-      "storage_dtype": "f16",
+      "rerank_tolerance_class": "fp32",
+      "storage_dtype": "f32",
       "transcribe": {
         "confirmations": {
           "decode_rule": {

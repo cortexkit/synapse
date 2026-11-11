@@ -10,9 +10,15 @@ Load a `safetensors-package` artifact with these `RuntimeConfig` values:
 | --- | --- |
 | `model_path` | Hugging Face package directory containing `config.json` and `model.safetensors` |
 | `max_encoder_frames` | Required positive certified lane maximum, at most 7500 |
+| `profile` | Optional; defaults to `parakeet-tdt-0.6b-v3.owned-metal` |
 | `family` | Optional; if present, `parakeet-tdt` |
 | `dtype` | Optional; if present, `f32` |
 | `execution` | Optional; if present, `explicit` |
+
+Load validates the embedded profile before reading weights or creating GPU
+state. Both `compute_dtype` and `storage_dtype` must explicitly declare `f32`;
+missing or lower-precision declarations are refused rather than fingerprinted
+as arithmetic the engine does not run.
 
 Input is normalized, un-rung-padded f32 mel features, 128 bins per frame, with
 the shared front end's invalid tail zeroed. The engine admits the valid encoder

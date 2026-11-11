@@ -51,6 +51,30 @@ fn error(stage: EngineErrorStage, message: impl ToString) -> EngineError {
     }
 }
 
+fn validate_profile(cfg: &RuntimeConfig, manifest: &serde_json::Value) -> Result<(), EngineError> {
+    let profile = cfg
+        .values
+        .get("profile")
+        .map(String::as_str)
+        .unwrap_or("parakeet-tdt-0.6b-v3.owned-metal");
+    let entry = &manifest["profiles"][profile];
+    if entry["lane"] != "owned-metal" || entry["model"] != "parakeet-tdt-0.6b-v3" {
+        return Err(error(
+            EngineErrorStage::Load,
+            "model_unsupported: Metal transcribe profile",
+        ));
+    }
+    // The unconverted checkpoint and all Metal graph arithmetic are f32. A
+    // fingerprint must not advertise a different storage or compute precision.
+    if entry["compute_dtype"] != "f32" || entry["storage_dtype"] != "f32" {
+        return Err(error(
+            EngineErrorStage::Load,
+            "Metal transcribe requires profile compute_dtype=f32 and storage_dtype=f32",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate before touching the accelerator. An encoder rung is a preallocated
 /// frame capacity. The front end's one trailing frame is zero; dropping that zero
 /// at an exact capacity boundary preserves zero convolution padding. Like the
@@ -192,6 +216,9 @@ impl TranscribeEngine for OwnedMetalTranscribeEngine {
                 "Metal transcribe requires safetensors-package",
             ));
         }
+        let manifest = serde_json::from_slice(include_bytes!("../../../bench/parity/models.json"))
+            .map_err(|e| error(EngineErrorStage::Load, e))?;
+        validate_profile(cfg, &manifest)?;
         #[cfg(target_os = "macos")]
         {
             let model = metal::Model::load(cfg).map_err(|e| error(EngineErrorStage::Load, e))?;
@@ -268,6 +295,28 @@ mod tests {
         );
         assert!(!id.build_flags.contains_key("graph_revision"));
         assert_eq!(id.build_flags["family"], "parakeet-tdt");
+    }
+
+    #[test]
+    fn transcribe_load_refuses_profile_precision_it_does_not_compute() {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
+        let profile = "parakeet-tdt-0.6b-v3.owned-metal";
+        let cfg = RuntimeConfig {
+            values: [("profile".into(), profile.into())].into(),
+        };
+        validate_profile(&cfg, &manifest).unwrap();
+        for field in ["compute_dtype", "storage_dtype"] {
+            for invalid in [serde_json::json!("f16"), serde_json::Value::Null] {
+                let mut wrong = manifest.clone();
+                wrong["profiles"][profile][field] = invalid;
+                let error = validate_profile(&cfg, &wrong).unwrap_err();
+                assert_eq!(error.stage, EngineErrorStage::Load);
+                assert!(error
+                    .message
+                    .contains("compute_dtype=f32 and storage_dtype=f32"));
+            }
+        }
     }
 
     struct Stub {

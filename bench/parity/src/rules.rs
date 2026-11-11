@@ -1,15 +1,17 @@
 //! The numeric-profile rule, written once so `models.json` can be checked
 //! against it rather than trusted.
 //!
-//! - Storage dtype: f16 on every lane, except the Metal gte-reranker profile,
-//!   which stores and computes in f32. Compute dtype follows storage.
-//! - fp32-kept tensors: none on CUDA and Vulkan; every tensor on the f32 Metal
-//!   profile and none on the f16 Metal profiles; on direct ANE exactly the
+//! - Storage dtype: f16 except the Metal gte-reranker and Parakeet profiles,
+//!   which store and compute in f32. Compute dtype follows storage. Parakeet's
+//!   unconverted Metal lane reads the checkpoint's native f32 tensors.
+//! - fp32-kept tensors: none on CUDA and Vulkan; every floating-point tensor on
+//!   the f32 Metal profiles and none on the f16 Metal profiles; on direct ANE exactly the
 //!   tensors read only by the profile's CPU stages (every transformer layer
 //!   runs on the ANE in fp16).
-//! - `rerank_tolerance_class` is `fp32` only when every transformer layer
-//!   stores and computes in fp32, which leaves the Metal gte-reranker profile
-//!   as the only `fp32` profile.
+//! - `rerank_tolerance_class` is `fp32` only when every floating-point tensor stores
+//!   and computes in fp32, including the Metal gte-reranker and Parakeet profiles. Speech
+//!   grading uses its own encoder, trace and word error rate gates, not this
+//!   rerank class.
 //! - Direct ANE: ModernBERT profiles use the committed Hadamard rotation and
 //!   the tanh GELU; Qwen3 profiles pin rotation `none` and have no GELU.
 
@@ -40,7 +42,12 @@ pub const ANE_CPU_STAGES: [&str; 8] = [
 ];
 
 pub fn storage_dtype(model_slug: &str, lane: Lane) -> DType {
-    if lane == Lane::OwnedMetal && model_slug == "gte-reranker-modernbert-base" {
+    if lane == Lane::OwnedMetal
+        && matches!(
+            model_slug,
+            "gte-reranker-modernbert-base" | "parakeet-tdt-0.6b-v3"
+        )
+    {
         DType::F32
     } else {
         DType::F16
