@@ -9,6 +9,10 @@ evidence/** text eol=lf
 bench/parity/models.json text eol=lf
 bench/parity/fixtures/** text eol=lf
 crates/synapse-certify/src/self_check/*.json text eol=lf
+# Sealed byte-for-byte copies of pinned model files (the speech crate embeds the
+# tokenizer and checks its SHA-256 at load). Never convert line endings.
+crates/synapse-speech/assets/** -text
+bench/parity/checkpoints/** -text
 
 # Parsed by structure at compile time (include_str!): the drift-guard tests
 # find the operation inventory by its blank-line paragraph break, which a CRLF

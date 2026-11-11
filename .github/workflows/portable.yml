@@ -19,11 +19,11 @@ env:
   LLAMA_BUILD_EVIDENCE_CONTRACT: nonmac-build-gates-v1
   # Explicit portable production crates: Metal/CUDA-only engines and heavy
   # benchmark workspaces cannot build on hosted CPU runners.
-  SYNAPSE_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
+  SYNAPSE_CRATES: -p synapse-core -p synapse-speech -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-worker-decode -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
   # Clippy still covers synapse-worker-decode, but nextest leaves it out: its
   # runner and integration tests are all cfg(target_os = "macos"), so off macOS
   # it compiles and runs nothing.
-  SYNAPSE_TEST_CRATES: -p synapse-core -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
+  SYNAPSE_TEST_CRATES: -p synapse-core -p synapse-speech -p synapse-native-probe -p synapse-module -p synapse-certify -p synapse-certify-runner -p synapse-worker-llama -p owned-decode-worker -p synapse-opctl -p synapse-engine-cuda -p synapse-worker-cuda -p synapse-worker-vulkan
 
 jobs:
   clippy:
