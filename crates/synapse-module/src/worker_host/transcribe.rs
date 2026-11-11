@@ -177,7 +177,9 @@ impl WorkerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synapse_core::{write_raw, DecodeTraceRecord, TranscribeRevision, WorkerProgressPhase};
+    #[cfg(unix)]
+    use synapse_core::TranscribeRevision;
+    use synapse_core::{write_raw, DecodeTraceRecord, WorkerProgressPhase};
 
     fn request(observe: bool) -> WorkerRequest {
         WorkerRequest::Transcribe {

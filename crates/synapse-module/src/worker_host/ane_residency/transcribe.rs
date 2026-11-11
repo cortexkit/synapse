@@ -1,9 +1,12 @@
 use super::*;
+#[cfg(unix)]
 use crate::worker_host::{
     liveness::TranscribeFrames,
     transcribe::{decode_transcription, WorkerTranscription},
 };
-use synapse_core::{encode_f32_frame, RuntimeConfig, TranscribeRequest};
+use synapse_core::RuntimeConfig;
+#[cfg(unix)]
+use synapse_core::{encode_f32_frame, TranscribeRequest};
 
 pub(super) fn validate_loaded_request(
     request: &WorkerRequest,
@@ -35,6 +38,9 @@ pub(super) fn validate_loaded_request(
     Ok(())
 }
 
+// Transcription on the direct Neural Engine is reached only through
+// `DirectAneEngine`, which exists on Unix; elsewhere these paths are unused.
+#[cfg(unix)]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneWorkerChannel<S> {
     async fn exchange_transcription(
         &self,
@@ -92,6 +98,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneWorkerChannel<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
     pub(crate) async fn transcribe_with_frames(
         self: &Arc<Self>,
@@ -279,6 +286,8 @@ mod tests {
         (channel, admitted)
     }
 
+    // Runs a real transcription through `AneServing`, which is Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn transcribe_parakeet_encoder_ladder_four_shapes_fit_an_otherwise_empty_budget() {
         let (channel, admitted) = mock_channel("speech-only").await;
