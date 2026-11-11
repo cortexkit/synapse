@@ -34,6 +34,8 @@ __global__ void norm(const float *x, float *y, const float *w, const float *b, i
     sums[tid] = sum; __syncthreads();
     for (int s = 128; s; s >>= 1) { if (tid < s) sums[tid] += sums[tid+s]; __syncthreads(); }
     float mean = sums[0] / H, var = 0.f;
+    // Every warp must capture the mean before any warp reuses sums for variance.
+    __syncthreads();
     for (int j = tid; j < H; j += blockDim.x) { float d = x[row * H+j]-mean; var += d*d; }
     sums[tid] = var; __syncthreads();
     for (int s = 128; s; s >>= 1) { if (tid < s) sums[tid] += sums[tid+s]; __syncthreads(); }
@@ -99,6 +101,8 @@ __global__ void attention_softmax(float *ac, const float *bd, int rows, int t, i
     sums[tid]=m; __syncthreads();
     for (int s=128;s;s>>=1) { if(tid<s) sums[tid]=fmaxf(sums[tid],sums[tid+s]); __syncthreads(); }
     m=sums[0]; float sum=0.f;
+    // Every warp must capture the maximum before any warp reuses sums for totals.
+    __syncthreads();
     for (int j=tid;j<t;j+=256) { float v=expf(ac[row*t+j]-m); ac[row*t+j]=v; sum+=v; }
     sums[tid]=sum; __syncthreads();
     for(int s=128;s;s>>=1) { if(tid<s) sums[tid]+=sums[tid+s]; __syncthreads(); }
@@ -142,6 +146,7 @@ struct Context {
         FAMILY_CUDA_CHECK(cudaGetDevice(&device));
         FAMILY_CUBLAS_CHECK(cublasCreate(&blas));
         FAMILY_CUBLAS_CHECK(cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH));
+        FAMILY_CUBLAS_CHECK(cublasSetAtomicsMode(blas,CUBLAS_ATOMICS_NOT_ALLOWED));
     }
     ~Context(){ if(blas) cublasDestroy(blas); }
     void bind(){ FAMILY_CUDA_CHECK(cudaSetDevice(device)); }

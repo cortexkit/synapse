@@ -162,6 +162,150 @@ fn read_wav_input(root: &Path, id: &str, index: &Value) -> Vec<u8> {
     bytes
 }
 
+fn assert_same_decode(
+    id: &str,
+    check: &str,
+    first: &SpeechObservation,
+    second: &SpeechObservation,
+) {
+    assert_eq!(
+        first.valid_encoder_frames, second.valid_encoder_frames,
+        "{id}: {check}: valid encoder-frame counts differ"
+    );
+    let differing = first
+        .triples
+        .iter()
+        .zip(&second.triples)
+        .position(|(a, b)| a != b)
+        .unwrap_or(first.triples.len().min(second.triples.len()));
+    assert!(
+        first.triples == second.triples,
+        "{id}: {check}: first differing triple {differing}: {:?} vs {:?}",
+        first.triples.get(differing),
+        second.triples.get(differing)
+    );
+}
+
+fn repeat_plain(
+    state: &WorkerState,
+    id: &str,
+    mel: &[f32],
+    frames: usize,
+    valid: usize,
+) -> (SpeechObservation, usize, f64) {
+    let (first, progress, gap) = exchange(state, id, mel, frames, valid, false);
+    let (second, second_progress, second_gap) = exchange(state, id, mel, frames, valid, false);
+    assert!(first.refusal.is_none(), "{id}: repeatability input refused");
+    assert!(second.refusal.is_none(), "{id}: repeated input refused");
+    assert_same_decode(
+        id,
+        "nondeterminism with observe=false twice",
+        &first,
+        &second,
+    );
+    assert_eq!(progress, second_progress, "{id}: repeated progress differs");
+    (first, progress, gap.max(second_gap))
+}
+
+fn load_state(manifest: &Value, profile_id: &str, maximum: u64) -> WorkerState {
+    let mut state = WorkerState::default();
+    let started = Instant::now();
+    let loaded = load_transcribe(
+        &mut state,
+        "load-speech".into(),
+        require_path("SYNAPSE_CUDA_SPEECH_PACKAGE")
+            .to_string_lossy()
+            .into_owned(),
+        manifest["profiles"][profile_id]["converted_package_digest"]
+            .as_str()
+            .unwrap()
+            .into(),
+        "safetensors-package".into(),
+        BTreeMap::from([
+            ("profile".into(), profile_id.into()),
+            ("operation".into(), "transcribe".into()),
+            ("max_encoder_frames".into(), maximum.to_string()),
+        ]),
+        DEFAULT_MAX_FRAME_BYTES,
+    );
+    assert!(started.elapsed().as_secs() < 600);
+    let WorkerResponse::Loaded {
+        transcribe_revision: Some(revision),
+        ..
+    } = loaded
+    else {
+        panic!("{loaded:?}")
+    };
+    assert_eq!(revision.kernel_revision, CUDA_TRANSCRIBE_KERNEL_REVISION);
+    assert_eq!(revision.decode_rule, synapse_speech::DECODE_RULE_REVISION);
+    state
+}
+
+#[test]
+#[ignore = "requires real NVIDIA hardware, pinned package and external tensor mirror; diagnostic only, not certification"]
+fn cuda_transcribe_ladder_1023_is_repeatable_and_observation_read_only() {
+    let parity = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/parity");
+    let mirror = require_path("SYNAPSE_CUDA_SPEECH_MIRROR");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(parity.join("models.json")).unwrap()).unwrap();
+    let document: Value = serde_json::from_slice(
+        &std::fs::read(parity.join("fixtures/parakeet-tdt-0.6b-v3/reference.json")).unwrap(),
+    )
+    .unwrap();
+    let id = "ladder-1023";
+    let row = document["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str() == Some(id))
+        .unwrap();
+    let artifact: Artifact = serde_json::from_value(row["log_mel"].clone()).unwrap();
+    let mel = f32le(&artifact.read(&parity, &mirror).unwrap());
+    let frames = row["mel_frames"].as_u64().unwrap() as usize;
+    let valid = row["valid_mel_frames"].as_u64().unwrap() as usize;
+    let state = load_state(&manifest, "parakeet-tdt-0.6b-v3.owned-cuda", 1023);
+    let (plain, _, _) = repeat_plain(&state, id, &mel, frames, valid);
+    let (observed, _, _) = exchange(&state, id, &mel, frames, valid, true);
+    let (observed_again, _, _) = exchange(&state, id, &mel, frames, valid, true);
+    assert_same_decode(id, "observation invariance", &plain, &observed);
+    assert_same_decode(
+        id,
+        "nondeterminism with observe=true twice",
+        &observed,
+        &observed_again,
+    );
+    let encoder = observed.encoder_output.as_ref().unwrap();
+    let encoder_again = observed_again.encoder_output.as_ref().unwrap();
+    assert_eq!(encoder.len(), encoder_again.len());
+    let differing = encoder
+        .iter()
+        .zip(encoder_again)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(
+        differing.is_none(),
+        "{id}: repeated encoder outputs differ at float index {differing:?}"
+    );
+    assert_eq!(observed.trace.len(), observed_again.trace.len());
+    let logits = |step: &speech::TraceStep| {
+        [
+            step.token_logit1.to_bits(),
+            step.token_logit2.to_bits(),
+            step.duration_logit1.to_bits(),
+            step.duration_logit2.to_bits(),
+        ]
+    };
+    let differing = observed
+        .trace
+        .iter()
+        .zip(&observed_again.trace)
+        .position(|(a, b)| a != b || logits(a) != logits(b));
+    assert!(
+        differing.is_none(),
+        "{id}: repeated joint traces differ at step {differing:?}"
+    );
+    println!("{id}: two plain and two observed executions are identical");
+}
+
 #[test]
 #[ignore = "requires real NVIDIA hardware, pinned package, all prepared audio and external tensor mirror; see scripts/transcribe-certify.md"]
 fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
@@ -190,36 +334,8 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     );
     let index: Value =
         serde_json::from_slice(&std::fs::read(audio.join("inputs.json")).unwrap()).unwrap();
-    let mut state = WorkerState::default();
     let started = Instant::now();
-    let loaded = load_transcribe(
-        &mut state,
-        "load-speech".into(),
-        require_path("SYNAPSE_CUDA_SPEECH_PACKAGE")
-            .to_string_lossy()
-            .into_owned(),
-        manifest_json["profiles"][profile_id]["converted_package_digest"]
-            .as_str()
-            .unwrap()
-            .into(),
-        "safetensors-package".into(),
-        BTreeMap::from([
-            ("profile".into(), profile_id.into()),
-            ("operation".into(), "transcribe".into()),
-            ("max_encoder_frames".into(), maximum.to_string()),
-        ]),
-        DEFAULT_MAX_FRAME_BYTES,
-    );
-    assert!(started.elapsed().as_secs() < 600);
-    let WorkerResponse::Loaded {
-        transcribe_revision: Some(revision),
-        ..
-    } = loaded
-    else {
-        panic!("{loaded:?}")
-    };
-    assert_eq!(revision.kernel_revision, CUDA_TRANSCRIBE_KERNEL_REVISION);
-    assert_eq!(revision.decode_rule, synapse_speech::DECODE_RULE_REVISION);
+    let state = load_state(&manifest_json, profile_id, maximum);
     let tokenizer = synapse_speech::Tokenizer::pinned();
     let frontend = synapse_speech::Frontend::new();
     let document: Value = serde_json::from_slice(
@@ -285,11 +401,11 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
                 .unwrap()
                 .text;
             if fixture.encoder.is_some() {
-                let (plain, plain_progress, _) =
-                    exchange(&state, &fixture.id, &mel, frames, valid, false);
-                assert_eq!(observed.valid_encoder_frames, plain.valid_encoder_frames);
-                assert_eq!(observed.triples, plain.triples);
+                let (plain, plain_progress, plain_gap) =
+                    repeat_plain(&state, &fixture.id, &mel, frames, valid);
+                assert_same_decode(&fixture.id, "observation invariance", &observed, &plain);
                 assert_eq!(progress, plain_progress);
+                longest = longest.max(plain_gap);
                 invariant += 1;
             }
             if fixture.id.starts_with("ladder-") {
@@ -320,7 +436,7 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     .unwrap();
     let summary = json!({"profile":profile_id,"kernel_revision":CUDA_TRANSCRIBE_KERNEL_REVISION,"decode_rule":synapse_speech::DECODE_RULE_REVISION,
         "graded":report.graded.len(),"expected_refusals":report.expected_refusals,"margin_exempt":report.margin_exempt,"split_wer":report.split_wer,
-        "tensor_observation_invariance":invariant,"max_duration_ms":profile.max_duration_ms,"largest_certified_ladder_ms":largest_ladder,
+        "tensor_observation_invariance":invariant,"tensor_repeatability":invariant,"max_duration_ms":profile.max_duration_ms,"largest_certified_ladder_ms":largest_ladder,
         "peak_device_used_bytes":max_peak,"longest_progress_gap_s":longest,"elapsed_s":started.elapsed().as_secs_f64()});
     std::fs::write(
         evidence.join("cuda-transcribe-summary.json"),

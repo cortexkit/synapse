@@ -457,6 +457,39 @@ pub use enabled::OwnedCudaTranscribeEngine;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcribe_reductions_capture_scalars_before_reusing_shared_scratch() {
+        // The portable guard protects the synchronization boundary; the opt-in
+        // NVIDIA test separately checks repeatability of the actual kernels.
+        let source = include_str!("port/cuda_parakeet.cu");
+        for (kernel, capture, overwrite) in [
+            (
+                "norm",
+                "float mean = sums[0] / H, var = 0.f;",
+                "sums[tid] = var;",
+            ),
+            (
+                "attention_softmax",
+                "m=sums[0]; float sum=0.f;",
+                "sums[tid]=sum;",
+            ),
+        ] {
+            let after_capture = source
+                .split_once(capture)
+                .unwrap_or_else(|| panic!("{kernel}: missing reduced-scalar capture"))
+                .1;
+            let before_overwrite = after_capture
+                .split_once(overwrite)
+                .unwrap_or_else(|| panic!("{kernel}: missing scratch reuse"))
+                .0;
+            assert!(
+                before_overwrite.contains("__syncthreads();"),
+                "{kernel}: all threads must capture the reduced scalar before shared scratch is overwritten"
+            );
+        }
+    }
+
     #[test]
     fn transcribe_shape_admission_is_checked_before_cuda() {
         let mut r = TranscribeRequest {

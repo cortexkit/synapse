@@ -67,7 +67,9 @@ triples must always agree with the engine's own trace. The test permits at most 
 0.5 percentage-point word error rate increase in each corpus split. On every tensor
 fixture within the selected duration and encoder-frame limits, it also requires bit-identical
 `(token_id, frame_index, duration)` triples and valid encoder-frame counts with the
-request's certification-only `observe` flag on and off. It checks exact
+request's certification-only `observe` flag on and off. Each such fixture also runs
+twice with `observe` off to detect run-to-run nondeterminism separately from an
+observation mismatch. It checks exact
 completed-work progress counts and <120 s progress gaps, printing completed work
 rather than timer heartbeats. It records the selected maximum, largest certified
 duration-ladder clip, peak device-used bytes and longest progress gap in
@@ -85,3 +87,17 @@ seals to pass.
 
 Keep the two machines' logs and JSON summaries outside `target/`, and return them
 to the change reviewer for inspection before landing.
+
+## Narrow repeatability diagnostic
+
+With the same package and tensor-mirror environment variables, the following test
+runs only `ladder-1023`, the sealed concatenated-corpus clip with 1023 valid encoder
+frames: two requests with `observe` off, followed by two with it on. It compares
+emitted triples and valid-frame counts across the requests and checks that the two
+copied encoder tensors and joint traces (including top-two logits) are bit-identical.
+It needs no prepared WAVs or evidence output directory, and it is not a substitute
+for full certification.
+
+```sh
+cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda cuda_transcribe_ladder_1023_is_repeatable_and_observation_read_only -- --ignored --nocapture
+```
