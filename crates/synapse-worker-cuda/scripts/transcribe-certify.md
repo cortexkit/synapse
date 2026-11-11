@@ -109,6 +109,68 @@ records `largest_executed_ladder_ms`, but leaves `largest_certified_ladder_ms` n
 The canonical parity evaluator still determines success using the unchanged
 profile thresholds. A diagnostic report does not turn a failed gate into a pass.
 
+## Measurement-only all-F32 comparison
+
+The sealed CUDA profile, package digest and frozen encoder, trace and WER gates
+are unchanged. The hardware tests alone accept `SYNAPSE_CUDA_SPEECH_PRECISION=f32`.
+That switch calls a separate, explicitly unpinned engine load method: it verifies
+the measured package's full SHA-256, original profile metadata, tensor shapes and
+homogeneous F32 storage, but does not claim that its digest is production-approved.
+Ordinary worker LOAD always uses the sealed F16 package and cannot select this
+override through its runtime config or environment.
+
+Create a scratch converter input, then run the existing v1 converter against the
+same pinned HF cache used for the F16 package. `HF_CACHE` below is the directory
+containing the pinned model's `models--nvidia--parakeet-tdt-0.6b-v3/snapshots/` tree.
+The Python helper changes only `fp32_tensors` in an ignored manifest copy. The
+copy retains the original approved F16 package digest as conversion input, not
+as approval for the F32 output. The converter prints the new digest; the harness
+records it and independently verifies the package bytes.
+
+```sh
+python3 crates/synapse-worker-cuda/scripts/prepare-f32-measurement.py
+cargo run --locked --release --manifest-path bench/parity/Cargo.toml --no-default-features --bin parity-manifest -- convert --dir target/scratch/cuda-speech-f32 --profile parakeet-tdt-0.6b-v3.owned-cuda --hf-cache "$HF_CACHE" --out target/scratch/cuda-speech-f32/model.safetensors
+```
+
+Retain the existing mirror/audio/maximum/toolchain environment from the normal
+kit. Set a different evidence directory for each variant so the second cannot
+overwrite the first. Run the same tests back to back; the shell syntax below is
+for Bash (including Git Bash on Windows):
+
+```sh
+export SYNAPSE_CUDA_SPEECH_PRECISION=f16
+export SYNAPSE_CUDA_SPEECH_PACKAGE="$F16_PACKAGE"
+export SYNAPSE_CUDA_SPEECH_EVIDENCE="$F16_EVIDENCE"
+cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda cuda_transcribe_ladder_1023_is_repeatable_and_observation_read_only -- --ignored --nocapture
+cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance -- --ignored --nocapture
+
+export SYNAPSE_CUDA_SPEECH_PRECISION=f32
+export SYNAPSE_CUDA_SPEECH_PACKAGE="$PWD/target/scratch/cuda-speech-f32/model.safetensors"
+export SYNAPSE_CUDA_SPEECH_EVIDENCE="$F32_EVIDENCE"
+cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda cuda_transcribe_ladder_1023_is_repeatable_and_observation_read_only -- --ignored --nocapture
+cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-synapse-worker-cuda cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance -- --ignored --nocapture
+```
+
+Both reports include `measurements`: precision, the measurement-only flag, actual
+package digest/size, pedantic math/no-TF32 declaration, model load time, total
+fixture time and `fixture_groups`. Groups separate `ladders` (fixture IDs starting
+with `ladder-`, including rung-boundary and maximum-duration cases) from
+`short_clips` (all other fixtures, including silence, resample and hop cases). Each group
+records fixture/refusal counts, wall time including frontend/fixture reads and
+the repeated plain checks, and `observed_request_s` for one observed request per
+fixture, including expected refusals but excluding frontend and repeat work.
+Use the latter for the closest engine-side comparison; neither timer is a
+GPU-event-only measurement. SHA-256 verification and grading are outside group
+times. Peak device usage has the same sampling semantics as the normal kit.
+
+The F32 context keeps only float weight views and consumes float operands for
+linear, query/key score, relative-position and probability/value GEMMs, with explicit
+`CUBLAS_COMPUTE_32F_PEDANTIC`, pedantic math and atomics disabled. It does not
+round activations or weights through half and does not enable TF32. The F16
+context retains its existing half operands and arithmetic. Every frozen gate
+and the repeatability/observation checks still run; a new variant is a measurement,
+not a production profile approval or hardware certification until its gates pass.
+
 ## Narrow repeatability diagnostic
 
 With the same package and tensor-mirror environment variables, the following test

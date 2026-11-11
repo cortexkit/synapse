@@ -1,5 +1,6 @@
 //! Opt-in hardware certification exercises the production LOAD and TRANSCRIBE
 //! handlers on both Windows and Linux, including their multi-frame wire output.
+//! The explicit F32 measurement switch substitutes only the unpinned model load.
 use super::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -210,6 +211,40 @@ fn repeat_plain(
 fn load_state(manifest: &Value, profile_id: &str, maximum: u64) -> WorkerState {
     let mut state = WorkerState::default();
     let started = Instant::now();
+    if measurement_precision() == super::measurement::Precision::F32 {
+        use synapse_core::{RuntimeConfig, ValidatedArtifact};
+        let path = require_path("SYNAPSE_CUDA_SPEECH_PACKAGE");
+        let mut engine = synapse_engine_cuda::transcribe::OwnedCudaTranscribeEngine::default();
+        synapse_engine_cuda::transcribe::validate_frame_envelope(
+            maximum.try_into().unwrap(),
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let model = engine
+            .load_f32_measurement(
+                &ValidatedArtifact {
+                    digest: package_digest(),
+                    format: "safetensors-package".into(),
+                },
+                &RuntimeConfig {
+                    values: BTreeMap::from([
+                        ("profile".into(), profile_id.into()),
+                        ("model_path".into(), path.to_string_lossy().into_owned()),
+                        ("max_encoder_frames".into(), maximum.to_string()),
+                    ]),
+                },
+            )
+            .unwrap();
+        state.loaded = Some(super::super::LoadedModel {
+            model_ref: model.model_id.clone(),
+            engine: super::super::LoadedEngine::Transcribe {
+                engine,
+                engine_model: model,
+            },
+        });
+        assert!(started.elapsed().as_secs() < 600);
+        return state;
+    }
     let loaded = load_transcribe(
         &mut state,
         "load-speech".into(),
@@ -239,6 +274,18 @@ fn load_state(manifest: &Value, profile_id: &str, maximum: u64) -> WorkerState {
     assert_eq!(revision.kernel_revision, CUDA_TRANSCRIBE_KERNEL_REVISION);
     assert_eq!(revision.decode_rule, synapse_speech::DECODE_RULE_REVISION);
     state
+}
+
+fn measurement_precision() -> super::measurement::Precision {
+    let value = std::env::var("SYNAPSE_CUDA_SPEECH_PRECISION").ok();
+    super::measurement::Precision::parse(value.as_deref()).unwrap()
+}
+
+fn package_digest() -> String {
+    let mut file = std::fs::File::open(require_path("SYNAPSE_CUDA_SPEECH_PACKAGE")).unwrap();
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).unwrap();
+    format!("sha256:{:x}", hash.finalize())
 }
 
 #[test]
@@ -336,6 +383,7 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         serde_json::from_slice(&std::fs::read(audio.join("inputs.json")).unwrap()).unwrap();
     let started = Instant::now();
     let state = load_state(&manifest_json, profile_id, maximum);
+    let load_elapsed_s = started.elapsed().as_secs_f64();
     let tokenizer = synapse_speech::Tokenizer::pinned();
     let frontend = synapse_speech::Frontend::new();
     let document: Value = serde_json::from_slice(
@@ -353,7 +401,9 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let mut longest = 0f64;
     let mut max_peak = 0;
     let mut largest_ladder = 0;
+    let mut timings = super::measurement::Timings::default();
     for fixture in &fixtures {
+        let fixture_started = Instant::now();
         let row = rows[fixture.id.as_str()];
         let valid = row["valid_mel_frames"].as_u64().unwrap() as usize;
         let frames = row["mel_frames"].as_u64().unwrap() as usize;
@@ -371,8 +421,10 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             assert_eq!(features.valid_mel_frames, valid);
             features.values
         };
+        let request_started = Instant::now();
         let (mut observed, progress, gap) =
             exchange(&state, &fixture.id, &mel, frames, valid, true);
+        let observed_request_s = request_started.elapsed().as_secs_f64();
         longest = longest.max(gap);
         if over {
             let refusal = observed
@@ -424,8 +476,25 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             fixture.id, fixture.valid_encoder_frames, progress
         );
         observations.insert(fixture.id.clone(), observed);
+        timings.record(
+            &fixture.id,
+            over,
+            fixture_started.elapsed().as_secs_f64(),
+            observed_request_s,
+        );
     }
-    let diagnostics = super::grading::collect(&profile, &fixtures, &observations, &parity, &mirror);
+    let fixture_elapsed_s = started.elapsed().as_secs_f64() - load_elapsed_s;
+    let precision = measurement_precision();
+    let measurements = json!({"precision": precision.label(),
+        "measurement_only": precision == super::measurement::Precision::F32,
+        "package_digest": package_digest(),
+        "package_bytes": std::fs::metadata(require_path("SYNAPSE_CUDA_SPEECH_PACKAGE")).unwrap().len(),
+        "math_mode": "pedantic", "tf32": false,
+        "load_elapsed_s": load_elapsed_s, "fixture_elapsed_s": fixture_elapsed_s,
+        "fixture_groups": timings.report()});
+    let mut diagnostics =
+        super::grading::collect(&profile, &fixtures, &observations, &parity, &mirror);
+    diagnostics["measurements"] = measurements.clone();
     std::fs::write(
         evidence.join("cuda-transcribe-grading.json"),
         serde_json::to_vec_pretty(&diagnostics).unwrap(),
@@ -445,7 +514,7 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         "duration_limit",
     );
     let report = evaluation.as_ref().ok();
-    let summary = json!({"profile":profile_id,"kernel_revision":CUDA_TRANSCRIBE_KERNEL_REVISION,"decode_rule":synapse_speech::DECODE_RULE_REVISION,
+    let summary = json!({"profile":profile_id,"measurements":measurements,"kernel_revision":CUDA_TRANSCRIBE_KERNEL_REVISION,"decode_rule":synapse_speech::DECODE_RULE_REVISION,
         "grading_passed":evaluation.is_ok(),"grading_error":evaluation.as_ref().err().map(ToString::to_string),
         "fixtures_executed":observations.len(),"graded":report.map(|r| r.graded.len()),
         "expected_refusals":diagnostics["expected_refusals"],"margin_exempt":diagnostics["margin_exempt"],

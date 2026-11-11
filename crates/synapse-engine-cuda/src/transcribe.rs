@@ -50,6 +50,37 @@ pub fn validate_frame_envelope(maximum: usize, max_frame: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, all(feature = "cuda", not(target_os = "macos"))))]
+fn load_profile(id: &str, measurement_digest: Option<&str>) -> Result<crate::manifest::Profile> {
+    let mut profile = crate::manifest::Profile::select(id, Some("transcribe"))?;
+    if let Some(digest) = measurement_digest {
+        ensure!(
+            digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            }),
+            "package_digest_mismatch"
+        );
+        profile.package_digest = digest.into();
+    }
+    Ok(profile)
+}
+
+#[cfg(any(test, all(feature = "cuda", not(target_os = "macos"))))]
+fn decode_weights(raw: &[u8], fp32: bool) -> Result<Vec<f32>> {
+    ensure!(raw.len() % if fp32 { 4 } else { 2 } == 0, "partial weight");
+    let values: Vec<f32> = if fp32 {
+        raw.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    } else {
+        raw.chunks_exact(2)
+            .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+            .collect()
+    };
+    ensure!(values.iter().all(|v| v.is_finite()), "non-finite tensor");
+    Ok(values)
+}
+
 #[cfg(all(feature = "cuda", not(target_os = "macos")))]
 mod enabled {
     use super::*;
@@ -72,6 +103,7 @@ mod enabled {
     unsafe extern "C" {
         fn synapse_parakeet_error() -> *const c_char;
         fn synapse_parakeet_create() -> *mut c_void;
+        fn synapse_parakeet_create_f32() -> *mut c_void;
         fn synapse_parakeet_destroy(p: *mut c_void);
         fn synapse_parakeet_weight(
             p: *mut c_void,
@@ -120,6 +152,7 @@ mod enabled {
     #[derive(Default)]
     pub struct OwnedCudaTranscribeEngine {
         loaded: Option<(String, usize, Mutex<ContextHandle>)>,
+        strict_f32: bool,
     }
     impl OwnedCudaTranscribeEngine {
         pub fn maximum(&self) -> Option<usize> {
@@ -266,23 +299,29 @@ mod enabled {
         }
     }
 
-    impl TranscribeEngine for OwnedCudaTranscribeEngine {
-        fn identity(&self) -> EngineIdentity {
-            synapse_core::owned_cuda_engine_identity(
-                "parakeet-tdt",
-                "f16",
-                CUDA_TRANSCRIBE_KERNEL_REVISION,
-            )
-        }
-        fn load(
+    impl OwnedCudaTranscribeEngine {
+        /// Load an unpinned all-F32 package for an explicitly arranged measurement.
+        /// Production LOAD never calls this method or accepts its digest override.
+        /// The artifact digest is still checked against the complete package bytes;
+        /// model metadata, tensor shapes and homogeneous F32 storage are required.
+        pub fn load_f32_measurement(
             &mut self,
             artifact: &ValidatedArtifact,
             cfg: &RuntimeConfig,
         ) -> std::result::Result<LoadedModel, EngineError> {
+            self.load_package(artifact, cfg, true)
+        }
+
+        fn load_package(
+            &mut self,
+            artifact: &ValidatedArtifact,
+            cfg: &RuntimeConfig,
+            strict_f32: bool,
+        ) -> std::result::Result<LoadedModel, EngineError> {
             let result = (|| {
-                let profile = crate::manifest::Profile::select(
+                let profile = super::load_profile(
                     cfg.values.get("profile").map(String::as_str).unwrap_or(""),
-                    Some("transcribe"),
+                    strict_f32.then_some(artifact.digest.as_str()),
                 )?;
                 ensure!(
                     profile.model["architecture"]["family"] == "parakeet_tdt",
@@ -321,22 +360,23 @@ mod enabled {
                         .tensor(name)
                         .with_context(|| format!("missing tensor {name}"))?;
                     ensure!(view.shape() == shape, "wrong shape for {name}");
-                    ensure!(view.dtype() == Dtype::F16, "wrong storage dtype for {name}");
+                    let dtype = if strict_f32 { Dtype::F32 } else { Dtype::F16 };
+                    ensure!(view.dtype() == dtype, "wrong storage dtype for {name}");
                 }
                 let context = ContextHandle(
-                    NonNull::new(unsafe { synapse_parakeet_create() }).ok_or_else(native_error)?,
+                    NonNull::new(unsafe {
+                        if strict_f32 {
+                            synapse_parakeet_create_f32()
+                        } else {
+                            synapse_parakeet_create()
+                        }
+                    })
+                    .ok_or_else(native_error)?,
                 );
                 for name in expected.keys() {
                     let view = tensors.tensor(name)?;
-                    let data: Vec<f32> = view
-                        .data()
-                        .chunks_exact(2)
-                        .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
-                        .collect();
-                    ensure!(
-                        data.iter().all(|v| v.is_finite()),
-                        "non-finite tensor {name}"
-                    );
+                    let data = super::decode_weights(view.data(), strict_f32)
+                        .with_context(|| format!("invalid tensor {name}"))?;
                     let name = CString::new(name.as_str())?;
                     checked(unsafe {
                         synapse_parakeet_weight(
@@ -348,12 +388,37 @@ mod enabled {
                     })?;
                 }
                 let model = LoadedModel {
-                    model_id: format!("cuda-transcribe-{}", artifact.digest),
+                    model_id: if strict_f32 {
+                        format!("cuda-transcribe-measurement-f32-{}", artifact.digest)
+                    } else {
+                        format!("cuda-transcribe-{}", artifact.digest)
+                    },
                 };
                 self.loaded = Some((model.model_id.clone(), maximum, Mutex::new(context)));
+                self.strict_f32 = strict_f32;
                 Ok(model)
             })();
             result.map_err(|e| engine_error(EngineErrorStage::Load, e))
+        }
+    }
+    impl TranscribeEngine for OwnedCudaTranscribeEngine {
+        fn identity(&self) -> EngineIdentity {
+            synapse_core::owned_cuda_engine_identity(
+                "parakeet-tdt",
+                if self.strict_f32 {
+                    "f32-measurement"
+                } else {
+                    "f16"
+                },
+                CUDA_TRANSCRIBE_KERNEL_REVISION,
+            )
+        }
+        fn load(
+            &mut self,
+            artifact: &ValidatedArtifact,
+            cfg: &RuntimeConfig,
+        ) -> std::result::Result<LoadedModel, EngineError> {
+            self.load_package(artifact, cfg, false)
         }
         fn transcribe(
             &self,
@@ -370,6 +435,7 @@ mod enabled {
                 .is_some_and(|(id, _, _)| *id == model.model_id)
             {
                 self.loaded = None;
+                self.strict_f32 = false;
             }
         }
     }
@@ -456,6 +522,65 @@ pub use enabled::OwnedCudaTranscribeEngine;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcribe_f32_measurement_preserves_weight_bits_instead_of_rounding_to_half() {
+        let values = [1.0001234f32, -0.0000001234, 65505., -0.];
+        let raw: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let decoded = super::decode_weights(&raw, true).unwrap();
+        assert_eq!(
+            decoded.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let raw_half: Vec<_> = values
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let decoded_half = super::decode_weights(&raw_half, false).unwrap();
+        assert_ne!(decoded[0].to_bits(), decoded_half[0].to_bits());
+        assert_eq!(decoded_half[0], 1.);
+        assert!(super::decode_weights(&[0, 0, 0], true).is_err());
+        assert!(super::decode_weights(&f32::NAN.to_le_bytes(), true).is_err());
+        assert!(
+            super::decode_weights(&half::f16::INFINITY.to_bits().to_le_bytes(), false).is_err()
+        );
+    }
+
+    #[test]
+    fn transcribe_measurement_digest_override_never_changes_production_pin() {
+        let id = "parakeet-tdt-0.6b-v3.owned-cuda";
+        let sealed = super::load_profile(id, None).unwrap();
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let measured = super::load_profile(id, Some(&digest)).unwrap();
+        assert_eq!(measured.package_digest, digest);
+        assert_eq!(measured.id, sealed.id);
+        assert_eq!(measured.model, sealed.model);
+        assert_ne!(measured.package_digest, sealed.package_digest);
+        assert_eq!(
+            super::load_profile(id, None).unwrap().package_digest,
+            sealed.package_digest
+        );
+        assert_eq!(
+            crate::manifest::MANIFEST["profiles"][id]["converted_package_digest"],
+            sealed.package_digest
+        );
+        assert!(super::load_profile(id, Some("unhashed")).is_err());
+    }
+
+    #[test]
+    fn transcribe_f32_measurement_uses_pedantic_gemm_without_half_weight_copies() {
+        let native = include_str!("port/cuda_parakeet.cu");
+        assert_eq!(native.matches("CUBLAS_COMPUTE_32F_PEDANTIC").count(), 4);
+        assert_eq!(
+            native
+                .matches("CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT")
+                .count(),
+            4
+        );
+        assert!(native.contains("if(!c.strict_f32) {\n            HalfBuffer hb(n);"));
+        assert!(native.contains("HalfBuffer kh(c.strict_f32?0:t*H)"));
+        assert!(!native.contains("FAST_TF32"));
+        assert!(!native.contains("CUBLAS_TF32_TENSOR_OP_MATH"));
+    }
     use super::*;
 
     #[test]

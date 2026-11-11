@@ -137,12 +137,13 @@ __global__ void joint_input(const float *enc,const float *pred,float *out,int fr
 
 struct Context {
     cublasHandle_t blas=nullptr;
+    bool strict_f32=false;
     int device=0, frames=0, valid=0, next_layer=0;
     size_t peak=0;
     std::unordered_map<std::string,Buffer> weights;
     std::unordered_map<std::string,HalfBuffer> half_weights;
     Buffer hidden, pos, projected, h, cell, predictor;
-    Context() {
+    explicit Context(bool fp32=false):strict_f32(fp32) {
         FAMILY_CUDA_CHECK(cudaGetDevice(&device));
         FAMILY_CUBLAS_CHECK(cublasCreate(&blas));
         FAMILY_CUBLAS_CHECK(cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH));
@@ -155,6 +156,12 @@ struct Context {
     void memory(){ size_t free,total; FAMILY_CUDA_CHECK(cudaMemGetInfo(&free,&total)); peak=std::max(peak,total-free); }
     void multiply(const float *x,float *y,const std::string &name,int rows,int in,int out) {
         float one=1.f,zero=0.f;
+        if(strict_f32) {
+            FAMILY_CUBLAS_CHECK(cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,&one,
+                w(name),CUDA_R_32F,in,x,CUDA_R_32F,in,&zero,y,CUDA_R_32F,out,
+                CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT));
+            return;
+        }
         HalfBuffer input(rows*in);
         to_half<<<(rows*in+255)/256,256>>>(x,input.pointer,rows*in);
         FAMILY_CUBLAS_CHECK(cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,&one,
@@ -190,14 +197,19 @@ extern "C" const char *synapse_parakeet_error(){ return error.c_str(); }
 extern "C" void *synapse_parakeet_create(){
     try { return new Context(); } catch(const std::exception &e){error=e.what();return nullptr;}
 }
+extern "C" void *synapse_parakeet_create_f32(){
+    try { return new Context(true); } catch(const std::exception &e){error=e.what();return nullptr;}
+}
 extern "C" void synapse_parakeet_destroy(void *p){ if(p){auto *c=static_cast<Context*>(p); cudaSetDevice(c->device); delete c;} }
 extern "C" int synapse_parakeet_weight(void *p,const char *name,const float *data,size_t n){
     return guard([&]{ auto &c=*static_cast<Context*>(p);c.bind(); Buffer b(n);
         FAMILY_CUDA_CHECK(cudaMemcpy(b.pointer,data,n*sizeof(float),cudaMemcpyHostToDevice));
-        // Matrix operands are stored in half as the profile specifies. Keep the
-        // float view for biases, norms and the small direct convolution kernels.
-        HalfBuffer hb(n);to_half<<<(n+255)/256,256>>>(b.pointer,hb.pointer,static_cast<int>(n));
-        c.half_weights.emplace(name,std::move(hb));
+        // The f16 path retains a float view for scalar/direct-convolution consumers.
+        // Strict f32 keeps only the float view and never rounds weights through half.
+        if(!c.strict_f32) {
+            HalfBuffer hb(n);to_half<<<(n+255)/256,256>>>(b.pointer,hb.pointer,static_cast<int>(n));
+            c.half_weights.emplace(name,std::move(hb));
+        }
         c.weights.emplace(name,std::move(b));c.memory(); });
 }
 
@@ -244,21 +256,37 @@ extern "C" int synapse_parakeet_layer(void *p,int layer){
         {
             Buffer n(t*H),q(t*H),k(t*H),v(t*H),r((2*t-1)*H),att(t*H),out(t*H);
             Buffer qu(TILE*HD),qv(TILE*HD),ac(TILE*t),bd(TILE*(2*t-1));
-            HalfBuffer kh(t*H),vh(t*H),rh((2*t-1)*H),quh(TILE*HD),qvh(TILE*HD),prob(TILE*t);
+            HalfBuffer kh(c.strict_f32?0:t*H),vh(c.strict_f32?0:t*H),rh(c.strict_f32?0:(2*t-1)*H),
+                quh(c.strict_f32?0:TILE*HD),qvh(c.strict_f32?0:TILE*HD),prob(c.strict_f32?0:TILE*t);
             c.ln(c.hidden.pointer,n.pointer,l+".norm_self_att");
             std::string a=l+".self_attn";
             c.linear(n.pointer,q.pointer,a+".q_proj",t,H,H);
             c.linear(n.pointer,k.pointer,a+".k_proj",t,H,H);
             c.linear(n.pointer,v.pointer,a+".v_proj",t,H,H);
             c.linear(c.pos.pointer,r.pointer,a+".relative_k_proj",2*t-1,H,H);
-            to_half<<<(t*H+255)/256,256>>>(k.pointer,kh.pointer,t*H);
-            to_half<<<(t*H+255)/256,256>>>(v.pointer,vh.pointer,t*H);
-            to_half<<<((2*t-1)*H+255)/256,256>>>(r.pointer,rh.pointer,(2*t-1)*H);
+            if(!c.strict_f32) {
+                to_half<<<(t*H+255)/256,256>>>(k.pointer,kh.pointer,t*H);
+                to_half<<<(t*H+255)/256,256>>>(v.pointer,vh.pointer,t*H);
+                to_half<<<((2*t-1)*H+255)/256,256>>>(r.pointer,rh.pointer,(2*t-1)*H);
+            }
             float one=1.f,zero=0.f;
             for(int head=0;head<HEADS;++head) for(int start=0;start<t;start+=TILE){
                 int rows=std::min(TILE,t-start);
                 query_bias<<<(rows*HD+255)/256,256>>>(q.pointer,c.w(a+".bias_u"),qu.pointer,rows,head,start);
                 query_bias<<<(rows*HD+255)/256,256>>>(q.pointer,c.w(a+".bias_v"),qv.pointer,rows,head,start);
+                if(c.strict_f32) {
+                    FAMILY_CUBLAS_CHECK(cublasGemmEx(c.blas,CUBLAS_OP_T,CUBLAS_OP_N,t,rows,HD,&one,
+                        k.pointer+head*HD,CUDA_R_32F,H,qu.pointer,CUDA_R_32F,HD,&zero,ac.pointer,CUDA_R_32F,t,
+                        CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT));
+                    FAMILY_CUBLAS_CHECK(cublasGemmEx(c.blas,CUBLAS_OP_T,CUBLAS_OP_N,2*t-1,rows,HD,&one,
+                        r.pointer+head*HD,CUDA_R_32F,H,qv.pointer,CUDA_R_32F,HD,&zero,bd.pointer,CUDA_R_32F,2*t-1,
+                        CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT));
+                    attention_softmax<<<rows,256>>>(ac.pointer,bd.pointer,rows,t,start,c.valid);
+                    FAMILY_CUBLAS_CHECK(cublasGemmEx(c.blas,CUBLAS_OP_N,CUBLAS_OP_N,HD,rows,t,&one,
+                        v.pointer+head*HD,CUDA_R_32F,H,ac.pointer,CUDA_R_32F,t,&zero,att.pointer+start*H+head*HD,CUDA_R_32F,H,
+                        CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT));
+                    continue;
+                }
                 to_half<<<(rows*HD+255)/256,256>>>(qu.pointer,quh.pointer,rows*HD);
                 to_half<<<(rows*HD+255)/256,256>>>(qv.pointer,qvh.pointer,rows*HD);
                 // Row-major scores: Q K^T and Q R^T. Relative shift selects
