@@ -58,17 +58,30 @@ cargo test --locked --release -p synapse-worker-cuda --features cuda --bin ck-sy
 
 The single opt-in test runs the production LOAD and TRANSCRIBE handlers and parses
 their real framed responses on either OS. It checks the load revision, response
-order, record lengths, all C6 encoder/trace/split-WER gates, bit-identical observation
-on/off triples and frame counts on every in-envelope tensor fixture, exact
-completed-work progress counts and <120 s progress gaps. It prints completed work,
-not timer heartbeats. It records the maximum, largest certified ladder duration,
-peak device-used bytes and longest progress gap in `cuda-transcribe-summary.json`.
+order and record lengths. Against the sealed fp32 reference, it requires a minimum
+per-frame encoder cosine of 0.999 and checks the greedy trace. A first differing
+trace step is exempt only if its frame index matches and each differing argmax
+has a reference top-1 minus top-2 margin below `tau_margin` from the
+`parakeet-tdt-0.6b-v3.owned-cuda` profile. Trace-length differences fail, and emitted
+triples must always agree with the engine's own trace. The test permits at most a
+0.5 percentage-point word error rate increase in each corpus split. On every tensor
+fixture within the selected duration and encoder-frame limits, it also requires bit-identical
+`(token_id, frame_index, duration)` triples and valid encoder-frame counts with the
+request's certification-only `observe` flag on and off. It checks exact
+completed-work progress counts and <120 s progress gaps, printing completed work
+rather than timer heartbeats. It records the selected maximum, largest certified
+duration-ladder clip, peak device-used bytes and longest progress gap in
+`cuda-transcribe-summary.json`.
 
 Default maximum is the sealed 600000 ms target. If hardware cannot reach it, select
 an exact sealed ladder duration using `SYNAPSE_CUDA_SPEECH_MAX_MS`; it must still
-cover every non-ladder fixture. Above-limit ladders must be refused before encoder
-work and are recorded separately from graded fixtures. Do not call a smaller run
-a 600-second certification, relax tolerances, or change reference seals to pass.
+cover every non-ladder fixture. The ladder consists of deterministic concatenated
+corpus clips whose sample counts test one frame below, at, and above the encoder
+input-shape boundaries of 128, 256, 512, 1024, 2048, 4096 and 8192 frames, plus the
+600-second target. Above-limit ladder clips must be refused before encoder work and
+are recorded separately from graded fixtures. Do not call
+a smaller run a 600-second certification, relax tolerances, or change reference
+seals to pass.
 
 Keep the two machines' logs and JSON summaries outside `target/`, and return them
-to the implementation worker for inspection before landing.
+to the change reviewer for inspection before landing.
