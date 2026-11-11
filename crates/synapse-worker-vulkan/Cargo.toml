@@ -22,6 +22,8 @@ serde_json.workspace = true
 clap.workspace = true
 sha2.workspace = true
 synapse-core = { path = "../synapse-core" }
+synapse-speech = { path = "../synapse-speech" }
+half = "2"
 synapse-parity = { path = "../../bench/parity", default-features = false }
 ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "std"] }
 

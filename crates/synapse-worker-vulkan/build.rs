@@ -3,10 +3,11 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 // Attention has its own pipeline because its shared-memory tiles would
 // otherwise be reserved by every other kernel and lower their occupancy.
-const SHADERS: [(&str, &str); 3] = [
+const SHADERS: [(&str, &str); 4] = [
     ("plain", "vulkan1.2"),
     ("cooperative", "vulkan1.3"),
     ("attention", "vulkan1.2"),
+    ("transcribe", "vulkan1.2"),
 ];
 
 fn verify_spirv(bytes: &[u8]) {
@@ -112,7 +113,11 @@ fn main() {
             );
             let bytes = fs::read(&binary).expect("read compiled shader");
             verify_spirv(&bytes);
-            hash.update(&bytes);
+            // Speech kernels have their own load-time revision. Excluding them
+            // preserves the embedding/reranking shader-set identity.
+            if name != "transcribe" {
+                hash.update(&bytes);
+            }
             declarations.push_str(&format!("({name:?}, include_bytes!({:?})),\n", binary));
         }
     }
