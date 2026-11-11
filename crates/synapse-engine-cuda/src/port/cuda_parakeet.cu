@@ -6,8 +6,13 @@
 namespace {
 using synapse_cuda_family::DeviceAllocation;
 using Buffer = DeviceAllocation<float>;
+using HalfBuffer = DeviceAllocation<half>;
 thread_local std::string error;
 constexpr int H = 1024, D = 640, HEADS = 8, HD = 128, TILE = 128;
+
+__global__ void to_half(const float *x,half *y,int n) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)y[i]=__float2half_rn(x[i]);
+}
 
 __global__ void bias(float *x, const float *b, int n, int width, bool relu) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,6 +136,7 @@ struct Context {
     int device=0, frames=0, valid=0, next_layer=0;
     size_t live=0, peak=0;
     std::unordered_map<std::string,Buffer> weights;
+    std::unordered_map<std::string,HalfBuffer> half_weights;
     Buffer hidden, pos, projected, h, cell, predictor;
     Context() {
         FAMILY_CUDA_CHECK(cudaGetDevice(&device));
@@ -142,10 +148,16 @@ struct Context {
     float *w(const std::string &name){ return weights.at(name).pointer; }
     void sync(){ FAMILY_CUDA_CHECK(cudaGetLastError()); FAMILY_CUDA_CHECK(cudaDeviceSynchronize()); }
     void memory(){ size_t free,total; FAMILY_CUDA_CHECK(cudaMemGetInfo(&free,&total)); peak=std::max(peak,total-free); }
-    void linear(const float *x,float *y,const std::string &name,int rows,int in,int out,bool has_bias=false) {
+    void multiply(const float *x,float *y,const std::string &name,int rows,int in,int out) {
         float one=1.f,zero=0.f;
-        FAMILY_CUBLAS_CHECK(cublasSgemm(blas,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,&one,
-            w(name+".weight"),in,x,in,&zero,y,out));
+        HalfBuffer input(rows*in);
+        to_half<<<(rows*in+255)/256,256>>>(x,input.pointer,rows*in);
+        FAMILY_CUBLAS_CHECK(cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,out,rows,in,&one,
+            half_weights.at(name).pointer,CUDA_R_16F,in,input.pointer,CUDA_R_16F,in,&zero,y,CUDA_R_32F,out,
+            CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));
+    }
+    void linear(const float *x,float *y,const std::string &name,int rows,int in,int out,bool has_bias=false) {
+        multiply(x,y,name+".weight",rows,in,out);
         if(has_bias) bias<<<(rows*out+255)/256,256>>>(y,w(name+".bias"),rows*out,out,false);
     }
     void ln(const float *x,float *y,const std::string &name) {
@@ -177,6 +189,10 @@ extern "C" void synapse_parakeet_destroy(void *p){ if(p){auto *c=static_cast<Con
 extern "C" int synapse_parakeet_weight(void *p,const char *name,const float *data,size_t n){
     return guard([&]{ auto &c=*static_cast<Context*>(p);c.bind(); Buffer b(n);
         FAMILY_CUDA_CHECK(cudaMemcpy(b.pointer,data,n*sizeof(float),cudaMemcpyHostToDevice));
+        // Matrix operands are stored in half as the profile specifies. Keep the
+        // float view for biases, norms and the small direct convolution kernels.
+        HalfBuffer hb(n);to_half<<<(n+255)/256,256>>>(b.pointer,hb.pointer,static_cast<int>(n));
+        c.half_weights.emplace(name,std::move(hb));
         c.weights.emplace(name,std::move(b));c.memory(); });
 }
 
@@ -277,13 +293,10 @@ extern "C" int synapse_parakeet_finish(void *p,float *encoder){
 static void predict(Context &c,int token){
     Buffer a(4*D),b(4*D);
     const float *input=c.w("decoder.embedding.weight")+token*D;
-    float one=1.f,zero=0.f;
     for(int layer=0;layer<2;++layer){
         std::string base="decoder.lstm.",suffix="_l"+std::to_string(layer);
-        FAMILY_CUBLAS_CHECK(cublasSgemm(c.blas,CUBLAS_OP_T,CUBLAS_OP_N,4*D,1,D,&one,
-            c.w(base+"weight_ih"+suffix),D,input,D,&zero,a.pointer,4*D));
-        FAMILY_CUBLAS_CHECK(cublasSgemm(c.blas,CUBLAS_OP_T,CUBLAS_OP_N,4*D,1,D,&one,
-            c.w(base+"weight_hh"+suffix),D,c.h.pointer+layer*D,D,&zero,b.pointer,4*D));
+        c.multiply(input,a.pointer,base+"weight_ih"+suffix,1,D,4*D);
+        c.multiply(c.h.pointer+layer*D,b.pointer,base+"weight_hh"+suffix,1,D,4*D);
         lstm_update<<<(D+255)/256,256>>>(c.h.pointer+layer*D,c.cell.pointer+layer*D,a.pointer,b.pointer,
             c.w(base+"bias_ih"+suffix),c.w(base+"bias_hh"+suffix));
         input=c.h.pointer+layer*D;

@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod transcribe;
+#[cfg(feature = "cuda")]
+use transcribe::load_transcribe;
+use transcribe::serve_transcribe;
+
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -44,16 +49,29 @@ struct WorkerState {
     loaded: Option<LoadedModel>,
 }
 
+struct LoadEnvironment {
+    probe: fn() -> Result<synapse_engine_cuda::HardwareFloorProbe>,
+    max_frame: u32,
+}
+
 struct LoadedModel {
     model_ref: String,
     #[cfg(feature = "cuda")]
-    dims: usize,
-    #[cfg(feature = "cuda")]
-    operation: String,
-    #[cfg(feature = "cuda")]
-    engine: OwnedCudaEmbedEngine,
-    #[cfg(feature = "cuda")]
-    engine_model: synapse_core::LoadedModel,
+    engine: LoadedEngine,
+}
+
+#[cfg(feature = "cuda")]
+enum LoadedEngine {
+    Tokens {
+        dims: usize,
+        operation: String,
+        engine: OwnedCudaEmbedEngine,
+        engine_model: synapse_core::LoadedModel,
+    },
+    Transcribe {
+        engine: synapse_engine_cuda::transcribe::OwnedCudaTranscribeEngine,
+        engine_model: synapse_core::LoadedModel,
+    },
 }
 
 fn version_probe() -> bool {
@@ -180,7 +198,7 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                     artifact_digest,
                     format,
                     runtime_config,
-                    probe,
+                    LoadEnvironment { probe, max_frame },
                 ),
                 None,
             ),
@@ -235,6 +253,10 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                     ),
                 }
             }
+            request @ WorkerRequest::Transcribe { .. } => {
+                serve_transcribe(stream, max_frame, &state, request)?;
+                continue;
+            }
             unsupported @ WorkerRequest::Rerank { .. } => {
                 read_frame(stream, max_frame).context("discard unsupported rerank frame")?;
                 (WorkerResponse::unsupported_request(&unsupported), None)
@@ -255,7 +277,17 @@ fn worker_request_loop_with_probe<S: Read + Write>(
                 {
                     #[cfg(feature = "cuda")]
                     if let Some(mut model) = state.loaded.take() {
-                        model.engine.unload(&model.engine_model);
+                        match &mut model.engine {
+                            LoadedEngine::Tokens {
+                                engine,
+                                engine_model,
+                                ..
+                            } => engine.unload(engine_model),
+                            LoadedEngine::Transcribe {
+                                engine,
+                                engine_model,
+                            } => synapse_core::TranscribeEngine::unload(engine, engine_model),
+                        }
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
@@ -363,8 +395,9 @@ fn handle_load_with_probe(
     artifact_digest: String,
     format: String,
     runtime_config: BTreeMap<String, String>,
-    probe: fn() -> Result<synapse_engine_cuda::HardwareFloorProbe>,
+    environment: LoadEnvironment,
 ) -> WorkerResponse {
+    let LoadEnvironment { probe, max_frame } = environment;
     if artifact_path.trim().is_empty() || format.trim().is_empty() {
         return error_response(
             Some(req_id),
@@ -389,6 +422,7 @@ fn handle_load_with_probe(
             format,
             runtime_config,
             probe,
+            max_frame,
         );
         error_response(
             Some(req_id),
@@ -420,6 +454,17 @@ fn handle_load_with_probe(
                 Some(req_id),
                 envelope["code"].as_str().unwrap(),
                 "CUDA floor refused load",
+            );
+        }
+        if profile.operation() == "transcribe" {
+            return load_transcribe(
+                state,
+                req_id,
+                artifact_path,
+                artifact_digest,
+                format,
+                runtime_config,
+                max_frame,
             );
         }
         let family = match profile.model["architecture"]["family"].as_str() {
@@ -474,10 +519,12 @@ fn handle_load_with_probe(
         let model_ref = engine_model.model_id.clone();
         state.loaded = Some(LoadedModel {
             model_ref: model_ref.clone(),
-            dims,
-            operation: profile.operation().into(),
-            engine,
-            engine_model,
+            engine: LoadedEngine::Tokens {
+                dims,
+                operation: profile.operation().into(),
+                engine,
+                engine_model,
+            },
         });
         WorkerResponse::loaded(
             req_id,
@@ -564,7 +611,23 @@ fn handle_sequences(
 
     #[cfg(feature = "cuda")]
     {
-        if (model.operation == "rerank") != rerank {
+        let LoadedEngine::Tokens {
+            dims,
+            operation,
+            engine,
+            engine_model,
+        } = &model.engine
+        else {
+            return (
+                error_response(
+                    Some(req_id),
+                    "operation_mismatch",
+                    "transcribe model cannot serve token requests",
+                ),
+                None,
+            );
+        };
+        if (operation == "rerank") != rerank {
             return (
                 error_response(
                     Some(req_id),
@@ -600,14 +663,13 @@ fn handle_sequences(
                 .collect(),
         };
         match forward_with_progress(progress, || {
-            model
-                .engine
-                .embed_batch(&model.engine_model, batch)
+            engine
+                .embed_batch(engine_model, batch)
                 .map_err(|error| error.message)
         }) {
             Ok(vectors)
                 if vectors.len() == items.len()
-                    && vectors.iter().all(|vector| vector.len() == model.dims) =>
+                    && vectors.iter().all(|vector| vector.len() == *dims) =>
             {
                 let values = vectors.into_iter().flatten().collect();
                 (
@@ -616,7 +678,7 @@ fn handle_sequences(
                     } else {
                         WorkerResponse::Vectors {
                             req_id,
-                            dims: model.dims,
+                            dims: *dims,
                             n: items.len(),
                         }
                     },
@@ -740,7 +802,7 @@ mod tests {
             "sha256:abc".to_string(),
             "safetensors".to_string(),
             BTreeMap::new(),
-            synapse_engine_cuda::probe_hardware_floor,
+            LoadEnvironment { probe: synapse_engine_cuda::probe_hardware_floor, max_frame: DEFAULT_MAX_FRAME_BYTES },
         );
         assert!(
             matches!(response, WorkerResponse::Err { ref code, .. } if code == "backend_missing")
@@ -842,7 +904,7 @@ mod load_floor_tests {
                 ("profile".into(), p.id),
                 ("operation".into(), "embed".into()),
             ]),
-            no_driver,
+            LoadEnvironment { probe: no_driver, max_frame: DEFAULT_MAX_FRAME_BYTES },
         );
         assert!(matches!(response,WorkerResponse::Err{code,..} if code=="cuda_no_driver"));
     }
