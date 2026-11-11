@@ -53,6 +53,29 @@ fn encoder_cosines(reference: &[f32], actual: &[f32], frames: usize) -> Result<V
     Ok(cosines)
 }
 
+fn failing_encoder_frames(reference: &[f32], actual: &[f32], cosines: &[f64]) -> Vec<Value> {
+    let norm = |row: &[f32]| {
+        row.iter()
+            .map(|&v| f64::from(v).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    cosines
+        .iter()
+        .enumerate()
+        .filter(|(_, cosine)| **cosine < 0.999)
+        .map(|(index, &cosine)| {
+            let row = index * 1024..(index + 1) * 1024;
+            let reference_norm = norm(&reference[row.clone()]);
+            let engine_norm = norm(&actual[row]);
+            json!({"frame_index": index, "valid_encoder_frames": cosines.len(),
+                "frames_from_end": cosines.len() - index - 1, "cosine": cosine,
+                "reference_l2_norm": reference_norm, "engine_l2_norm": engine_norm,
+                "engine_to_reference_norm_ratio": engine_norm / reference_norm})
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct WerCounts {
     words: usize,
@@ -161,7 +184,9 @@ pub(super) fn collect(
                         actual,
                         fixture.valid_encoder_frames as usize,
                     );
-                    let row = json!({"fixture": id, "distribution": distribution(cosines.clone()),
+                    let row = json!({"fixture": id, "valid_encoder_frames": fixture.valid_encoder_frames,
+                    "below_threshold_frames": failing_encoder_frames(&reference, actual, &cosines),
+                    "distribution": distribution(cosines.clone()),
                     "passed": gate.is_ok(), "error": gate.err().map(|e| e.to_string())});
                     all_cosines.extend(cosines);
                     Ok(row)
@@ -339,6 +364,27 @@ mod tests {
     }
 
     #[test]
+    fn transcribe_encoder_diagnostic_names_last_valid_frame_and_both_norms() {
+        let mut reference = vec![0.; 3 * 1024];
+        reference[0] = 1.;
+        reference[1024] = 2.;
+        reference[2048] = 3.;
+        let mut engine = reference.clone();
+        engine[2048] = 0.;
+        engine[2049] = 6.;
+        let cosines = encoder_cosines(&reference, &engine, 3).unwrap();
+        let failed = failing_encoder_frames(&reference, &engine, &cosines);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["frame_index"], 2);
+        assert_eq!(failed[0]["valid_encoder_frames"], 3);
+        assert_eq!(failed[0]["frames_from_end"], 0);
+        assert_eq!(failed[0]["cosine"], 0.);
+        assert_eq!(failed[0]["reference_l2_norm"], 3.);
+        assert_eq!(failed[0]["engine_l2_norm"], 6.);
+        assert_eq!(failed[0]["engine_to_reference_norm_ratio"], 2.);
+    }
+
+    #[test]
     fn transcribe_diagnostics_retain_all_failures_wer_and_encoder_distribution() {
         use sha2::{Digest, Sha256};
         use synapse_core::{encode_decode_trace_frame, encode_f32_frame, DecodeTraceRecord};
@@ -447,6 +493,11 @@ mod tests {
         assert_eq!(report["encoder"]["distribution"]["p50"], 0.5);
         assert_eq!(report["encoder"]["distribution"]["below_0_999"], 1);
         assert_eq!(report["encoder"]["fixtures"][1]["passed"], false);
+        let bad_frame = &report["encoder"]["fixtures"][1]["below_threshold_frames"][0];
+        assert_eq!(bad_frame["frame_index"], 0);
+        assert_eq!(bad_frame["valid_encoder_frames"], 1);
+        assert_eq!(bad_frame["reference_l2_norm"], 1.);
+        assert_eq!(bad_frame["engine_l2_norm"], 1.);
         assert!(report["errors"].as_array().unwrap().is_empty());
         // Diagnostic collection must not turn a canonical failure into a pass.
         assert!(speech::evaluate_transcribe(

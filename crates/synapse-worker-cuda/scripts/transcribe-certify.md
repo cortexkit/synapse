@@ -97,6 +97,11 @@ per-split reference and engine word edits, total ground-truth words, WER and the
 delta in percentage points, regardless of trace failures. Encoder statistics cover
 all valid frames with a stored reference tensor: per-fixture and overall minimum,
 mean, maximum, linearly interpolated percentiles and count below cosine 0.999.
+Each encoder fixture also lists every frame below 0.999, with its zero-based
+index, valid encoder length, distance from the last valid frame, cosine, reference
+and engine L2 norms, and the engine/reference norm ratio. These rows distinguish
+padding-boundary errors from discrepancies throughout a clip or ill-conditioned
+cosines caused by near-zero encoder rows.
 
 `cuda-transcribe-summary.json` is preserved even when final grading fails. Its
 `grading_passed` and `grading_error` fields identify that outcome; a failed run
