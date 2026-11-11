@@ -7,7 +7,7 @@ use synapse_parity::inventory::{
     check_machine_registry, check_release_assets, check_row_fixture, load_json, module_defaults,
     Binding, MachineRegistry, ReleaseAssets, ROW_IDS,
 };
-use synapse_parity::manifest::{Manifest, MANIFEST_FILE, MODEL_SLUGS};
+use synapse_parity::manifest::{Manifest, ALL_MODEL_SLUGS, MANIFEST_FILE, MODEL_SLUGS};
 use synapse_parity::preload::{check_preload, PreloadInputs, PRELOAD_MODEL_IDS};
 use synapse_parity::validate::validate_inventory;
 use synapse_parity::{parity_dir, repo_root};
@@ -221,7 +221,10 @@ fn reference_fixtures_cover_every_model_with_digests() {
     let manifest = Manifest::load(&parity_dir().join(MANIFEST_FILE)).unwrap();
     let index: Value = load_json(&parity_dir().join("fixtures/index.json")).unwrap();
     let index = index.as_object().unwrap();
-    assert_eq!(index.len(), MODEL_SLUGS.len());
+    // The index holds one entry per model. The token-model documents are
+    // checked here; the speech model's document has its own shape and is
+    // checked in tests/speech.rs.
+    assert_eq!(index.len(), ALL_MODEL_SLUGS.len());
     for slug in MODEL_SLUGS {
         let id = format!(
             "{slug}.ref-v1.transformers-{}.seed-{}",

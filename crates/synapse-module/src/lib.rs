@@ -3256,9 +3256,14 @@ impl CatalogProfile {
                 .typed
                 .model(&self.slug)
                 .map_err(|error| ModuleError::Config(error.to_string()))?;
-            let template = model.grammar.template.as_ref().ok_or_else(|| {
-                ModuleError::Config("qwen_template_mismatch: missing template".into())
-            })?;
+            let template = model
+                .grammar()
+                .map_err(|error| ModuleError::Config(error.to_string()))?
+                .template
+                .as_ref()
+                .ok_or_else(|| {
+                    ModuleError::Config("qwen_template_mismatch: missing template".into())
+                })?;
             synapse_parity::oracle::check_template(
                 template,
                 include_str!("../../../bench/parity/oracles/qwen3-reranker-0.6b-README.md"),
@@ -23568,6 +23573,11 @@ mod tests {
         assert_eq!(stream.generation_id, "generation-9");
     }
 
+    fn is_transcribe_profile(manifest: &Value, profile: &Value) -> bool {
+        let model = profile["model"].as_str().unwrap();
+        manifest["models"][model]["operation"] == "transcribe"
+    }
+
     fn catalog_fixture_config(id: &str) -> StoredModelConfig {
         let catalog = CatalogProfile::load(id).unwrap();
         let preload: PreloadModelConfig = serde_json::from_value(json!({
@@ -23759,7 +23769,14 @@ mod tests {
     fn catalog_profiles_bind_identity_and_worker_package() {
         let manifest: Value =
             serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
-        for (id, profile) in manifest["profiles"].as_object().unwrap() {
+        // Token-model (embed and rerank) profiles only; transcription
+        // profiles have no token grammar and no preload lane.
+        for (id, profile) in manifest["profiles"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, profile)| !is_transcribe_profile(&manifest, profile))
+        {
             let spec = catalog_fixture_config(id);
             let catalog = CatalogProfile::load(id).unwrap();
             let mut numeric: NumericProfile = serde_json::from_value(json!({
@@ -23861,8 +23878,9 @@ mod tests {
             let index = manifest["profiles"]
                 .as_object()
                 .unwrap()
-                .keys()
-                .position(|key| key == id)
+                .iter()
+                .filter(|(_, profile)| !is_transcribe_profile(&manifest, profile))
+                .position(|(key, _)| key == id)
                 .unwrap();
             assert_eq!(spec.fingerprint.0, expected[index], "{id}");
         }
@@ -24122,7 +24140,12 @@ mod tests {
         let (dir, _) = test_storage_descriptor("catalog-preload");
         let manifest: Value =
             serde_json::from_slice(include_bytes!("../../../bench/parity/models.json")).unwrap();
-        for id in manifest["profiles"].as_object().unwrap().keys() {
+        for (id, _) in manifest["profiles"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, profile)| !is_transcribe_profile(&manifest, profile))
+        {
             let fixture = catalog_fixture_config(id);
             let model = catalog_test_model(&dir, &fixture);
             let preload: PreloadModelConfig = serde_json::from_value(json!({
@@ -24972,6 +24995,8 @@ mod tests {
             .get_mut(&catalog.slug)
             .unwrap()
             .grammar
+            .as_mut()
+            .unwrap()
             .template
             .as_mut()
             .unwrap()
@@ -29382,24 +29407,17 @@ async fn numerical_profile_preload_check(
                 scores.scores.into_iter().next().ok_or_else(|| {
                     profile_preload_check_error(profile, "missing self-check score")
                 })?;
-            let readout = references
+            let readout = &references
                 .manifest
                 .model(&references.manifest.profiles[profile].model)
                 .expect("sealed model")
-                .grammar
-                .readout
+                .grammar()
+                .expect("a rerank model has a token grammar")
+                .readout;
+            let readout = readout
                 .yes
                 .as_ref()
-                .zip(
-                    references
-                        .manifest
-                        .model(&references.manifest.profiles[profile].model)
-                        .expect("sealed model")
-                        .grammar
-                        .readout
-                        .no
-                        .as_ref(),
-                )
+                .zip(readout.no.as_ref())
                 .map(|(yes, no)| (yes.id, no.id));
             (Output::Score(f64::from(score)), input_ids, readout)
         };

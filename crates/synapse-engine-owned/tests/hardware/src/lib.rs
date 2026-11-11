@@ -169,12 +169,12 @@ mod tests {
                         .collect(),
                 };
                 assert_eq!(outputs.len(), chunk.len());
-                let readout = model
-                    .grammar
+                let grammar = model.grammar().unwrap();
+                let readout = grammar
                     .readout
                     .yes
                     .as_ref()
-                    .zip(model.grammar.readout.no.as_ref())
+                    .zip(grammar.readout.no.as_ref())
                     .map(|(y, n)| (y.id, n.id));
                 for (case, output) in chunk.iter().zip(outputs) {
                     observed.insert(

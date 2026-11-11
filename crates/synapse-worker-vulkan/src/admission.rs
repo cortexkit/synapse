@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use synapse_parity::manifest::{Lane, Manifest};
+use synapse_parity::manifest::{Lane, Manifest, Operation};
 use synapse_parity::vulkan::{vulkan_floors, FLOOR_SEQUENCES};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,7 +17,15 @@ pub fn requirements(manifest: &Manifest, slug: Option<&str>) -> Result<Required,
     for profile in manifest
         .profiles
         .values()
-        .filter(|p| p.lane == Lane::OwnedVulkan && slug.is_none_or(|s| p.model == s))
+        // Device floors cover the token (embed and rerank) models this worker
+        // serves. A transcription profile carries no floors until the Vulkan
+        // transcription engine measures them, so it must not enter the
+        // machine-wide probe.
+        .filter(|p| {
+            p.lane == Lane::OwnedVulkan
+                && slug.is_none_or(|s| p.model == s)
+                && manifest.models[&p.model].operation != Operation::Transcribe
+        })
     {
         let model = &manifest.models[&profile.model];
         let floors = vulkan_floors(

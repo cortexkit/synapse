@@ -7,8 +7,9 @@ fn manifest() -> serde_json::Value {
 }
 
 #[test]
-fn all_four_cuda_profiles_agree_with_public_floor_constants() {
+fn every_cuda_profile_agrees_with_public_floor_constants() {
     let manifest = manifest();
+    // One CUDA profile per model: four token models and Parakeet.
     assert_eq!(
         manifest["profiles"]
             .as_object()
@@ -16,7 +17,7 @@ fn all_four_cuda_profiles_agree_with_public_floor_constants() {
             .values()
             .filter(|p| p["lane"] == "owned-cuda")
             .count(),
-        4
+        5
     );
     let floor = floor_build::collect_cuda_floor(&manifest).unwrap();
     assert_eq!(floor, [13020, 7, 5]);

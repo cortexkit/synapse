@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
             max_tokens: usize::MAX,
         },
     )?;
-    let chunks = code_chunks(&tokenizer, pinned.grammar.terminal_tokens[0].id)?;
+    let chunks = code_chunks(&tokenizer, pinned.grammar()?.terminal_tokens[0].id)?;
     let candidate = Candidate::start(
         &checkout,
         &assets,

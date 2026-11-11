@@ -155,7 +155,7 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
         let actual = engine.infer(&sequences).unwrap();
         assert!(actual.iter().all(|v| v.is_finite()));
         if model.operation == Operation::Embed {
-            let dim = model.output.dimension as usize;
+            let dim = model.output().unwrap().dimension as usize;
             assert_eq!(actual.len(), selected.len() * dim);
             let mut min_cosine = 1.0f64;
             for (row, case) in selected.iter().enumerate() {

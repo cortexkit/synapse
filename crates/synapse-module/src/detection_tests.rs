@@ -549,7 +549,8 @@ fn parity_manifest_pins_equal_cuda_floors() {
         .iter()
         .filter(|(id, _)| id.ends_with(".owned-cuda"))
         .collect();
-    assert_eq!(cuda.len(), 4);
+    // One CUDA profile per model: four token models and Parakeet.
+    assert_eq!(cuda.len(), 5);
     assert_eq!(baseline, [13020, 7, 5]);
     for (id, profile) in cuda {
         assert_eq!(floor(profile), baseline, "{id}");

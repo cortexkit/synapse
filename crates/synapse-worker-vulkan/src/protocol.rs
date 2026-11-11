@@ -69,9 +69,12 @@ pub fn preflight(
         .model(&profile.model)
         .map_err(|_| "model_unsupported")?
         .clone();
+    // This worker has no transcription engine yet, so it refuses a transcribe
+    // profile the same way as any other model it can't serve.
     let operation = match model.operation {
         Operation::Embed => "embed",
         Operation::Rerank => "rerank",
+        Operation::Transcribe => return Err("model_unsupported".into()),
     };
     if config.get("operation").map(String::as_str) != Some(operation) {
         return Err("operation_mismatch".into());
@@ -347,7 +350,7 @@ fn load(
         {
             return Err("artifact_invalid".into());
         }
-        let dims = model.output.dimension as usize;
+        let dims = model.output().map_err(|_| "model_unsupported")?.dimension as usize;
         let operation = model.operation;
         let required = requirements(&crate::manifest(), Some(&profile.model))?;
         let engine = crate::runtime::Engine::load(

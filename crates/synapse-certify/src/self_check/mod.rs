@@ -129,8 +129,19 @@ mod tests {
     #[test]
     fn all_sixteen_profiles_have_sealed_model_specific_subsets() {
         let manifest = Manifest::from_slice(MANIFEST).unwrap();
-        assert_eq!(manifest.profiles.len(), 16);
-        for profile in manifest.profiles.keys() {
+        // The sixteen token-model (embed and rerank) profiles. Transcription
+        // profiles get their own speech self-check subset, not these.
+        let token_profiles: Vec<_> = manifest
+            .profiles
+            .iter()
+            .filter(|(_, profile)| {
+                manifest.models[&profile.model].operation
+                    != synapse_parity::manifest::Operation::Transcribe
+            })
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(token_profiles.len(), 16);
+        for profile in token_profiles {
             assert!(load(profile).is_ok(), "{profile}");
         }
     }

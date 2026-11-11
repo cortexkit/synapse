@@ -1007,7 +1007,7 @@ impl Engine {
             "sequence_too_long"
         );
         let padded =
-            crate::pad(sequences, self.model.grammar.pad.id as i32).map_err(|e| anyhow!(e))?;
+            crate::pad(sequences, self.model.grammar()?.pad.id as i32).map_err(|e| anyhow!(e))?;
         let mut result = Vec::new();
         // The arena is sized for one maximum-context sequence. Reuse it without
         // changing the request's batch-longest padding or splitting a sequence.
@@ -1418,7 +1418,8 @@ impl Engine {
             !modern,
             eps,
         )?;
-        let pooling = match self.model.grammar.pooling {
+        let grammar = self.model.grammar()?;
+        let pooling = match grammar.pooling {
             Pooling::Cls => 0,
             Pooling::MaskedMean => 1,
             Pooling::LastNonPad => 2,
@@ -1439,8 +1440,8 @@ impl Engine {
             "activation:hidden",
             batch * h,
         )?;
-        let output_dim = self.model.output.dimension;
-        match self.model.grammar.readout.kind {
+        let output_dim = self.model.output()?.dimension;
+        match grammar.readout.kind {
             synapse_parity::manifest::ReadoutKind::PooledHiddenState => self.run(
                 Params {
                     op: 10,
@@ -1456,7 +1457,7 @@ impl Engine {
                 batch,
             )?,
             synapse_parity::manifest::ReadoutKind::YesNoTwoWaySoftmax => {
-                let readout = &self.model.grammar.readout;
+                let readout = &grammar.readout;
                 let weight = format!(
                     "weight:{}",
                     readout.weight.as_ref().context("missing readout")?

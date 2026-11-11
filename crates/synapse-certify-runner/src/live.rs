@@ -764,15 +764,18 @@ async fn observe(
         evaluate(&manifest, &profile_id, &fingerprint, &fixtures, &outputs).map_err(err)?;
     let parity: Parity =
         serde_json::from_value(serde_json::to_value(&evaluation).map_err(err)?).map_err(err)?;
-    let expected_readout = manifest.models.get(model).and_then(|model| {
-        model
-            .grammar
-            .readout
-            .yes
-            .as_ref()
-            .zip(model.grammar.readout.no.as_ref())
-            .map(|(yes, no)| (yes.id, no.id))
-    });
+    let expected_readout = manifest
+        .models
+        .get(model)
+        .and_then(|model| model.grammar.as_ref())
+        .and_then(|grammar| {
+            grammar
+                .readout
+                .yes
+                .as_ref()
+                .zip(grammar.readout.no.as_ref())
+                .map(|(yes, no)| (yes.id, no.id))
+        });
     let parity_failure = (!parity.passed())
         .then(|| parity_failure_message(&evaluation, fixtures.cases(), &outputs, expected_readout));
     let long_case = cases
@@ -1373,7 +1376,24 @@ mod tests {
         let index: Value =
             serde_json::from_slice(&std::fs::read(parity.join("fixtures/index.json")).unwrap())
                 .unwrap();
-        for entry in index.as_object().unwrap().values() {
+        // Token-model fixture sets only; the speech model's reference has its
+        // own shape and no batched token requests.
+        let token_entries: Vec<_> = index
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| {
+                synapse_parity::manifest::MODEL_SLUGS
+                    .iter()
+                    .any(|slug| id.starts_with(&format!("{slug}.")))
+            })
+            .map(|(_, entry)| entry)
+            .collect();
+        assert_eq!(
+            token_entries.len(),
+            synapse_parity::manifest::MODEL_SLUGS.len()
+        );
+        for entry in token_entries {
             let bytes = std::fs::read(parity.join(entry["path"].as_str().unwrap())).unwrap();
             assert_eq!(
                 synapse_parity::canonical::sha256_hex(&bytes),

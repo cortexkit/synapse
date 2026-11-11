@@ -34,17 +34,16 @@ impl Layout {
 mod tests {
     use super::*;
     use synapse_parity::{
-        manifest::Lane,
+        manifest::{Lane, Operation},
         vulkan::{buffer_plan, BUFFER_ALIGNMENT, FLOOR_SEQUENCES},
     };
     #[test]
     fn allocator_reuses_one_arena_for_256_max_context_sequences() {
         let manifest = crate::manifest();
-        for profile in manifest
-            .profiles
-            .values()
-            .filter(|p| p.lane == Lane::OwnedVulkan)
-        {
+        for profile in manifest.profiles.values().filter(|p| {
+            p.lane == Lane::OwnedVulkan
+                && manifest.models[&p.model].operation != Operation::Transcribe
+        }) {
             let plan = buffer_plan(
                 &manifest.models[&profile.model],
                 profile.storage_dtype,
