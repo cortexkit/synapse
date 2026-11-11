@@ -1,0 +1,27 @@
+{
+  "transcribe_ultra_q8": {
+    "repo": "handy-computer/parakeet-ultra-gguf",
+    "revision": "a1539be1b849ea7463b88343e5277b373d0c4ea9",
+    "file": "parakeet-ultra-Q8_0.gguf",
+    "sha256": "007a59761e9258779f189df396b50d12b83bb5b79e66df4b955c230d2f2a0a59"
+  },
+  "transcribe_v3_q8": {
+    "repo": "handy-computer/parakeet-tdt-0.6b-v3-gguf",
+    "revision": "85ac09ea12fc4b1112fa76810059364bc6adc9de",
+    "file": "parakeet-tdt-0.6b-v3-Q8_0.gguf",
+    "sha256": "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7"
+  },
+  "transcribe_v3_f16": {
+    "repo": "handy-computer/parakeet-tdt-0.6b-v3-gguf",
+    "revision": "85ac09ea12fc4b1112fa76810059364bc6adc9de",
+    "file": "parakeet-tdt-0.6b-v3-F16.gguf",
+    "sha256": "d9ec7e2c39da7b4fec3e01e71e82c7f7bbe97741e08c0c054091bf3d520a41d3"
+  },
+  "fluidaudio_v3": {
+    "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+    "revision": "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe",
+    "directories": ["Preprocessor.mlmodelc", "Encoder.mlmodelc", "Encoder_v2.mlmodelc", "Decoder.mlmodelc", "JointDecisionv3.mlmodelc"],
+    "files": ["parakeet_vocab.json"],
+    "encoder_variants": {"ane-pal6": "Encoder.mlmodelc", "ane-int8": "Encoder_v2.mlmodelc"}
+  }
+}

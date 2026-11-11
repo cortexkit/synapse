@@ -1,0 +1,25 @@
+[package]
+name = "stt-transcribe-cpp"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+native = ["dep:transcribe-cpp"]
+metal = ["native", "transcribe-cpp/metal"]
+cuda = ["native", "transcribe-cpp/cuda"]
+vulkan = ["native", "transcribe-cpp/vulkan"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+stt-common = { path = "../stt-common" }
+transcribe-cpp = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "bcb639faa4c74a2300ba19e30360cb2355b1663a", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_Threading"] }
