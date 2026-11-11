@@ -91,6 +91,9 @@ Local compatibility changes:
   method delegates with strides `[1, 1]`, preserving its emitted MIL bytes.
   SAME padding remains `same_lower`, with the leading pad on odd totals.
 
+- `Graph::diagnostic_shapes` reports operation count and input/output shapes
+  without calling the private framework, for compile-probe reports.
+
 `.cargo-checksum.json` records SHA-256 for every copied source, build script,
 manifest and this provenance document (excluding the checksum manifest itself).
 The `vendored_binding_checksums_match` test recomputes the hashes and checks the

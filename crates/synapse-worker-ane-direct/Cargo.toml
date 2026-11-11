@@ -33,6 +33,7 @@ synapse-core = { path = "../synapse-core" }
 # a Neural Engine test that only builds and runs on macOS.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 tokenizers.workspace = true
+synapse-parity = { path = "../../bench/parity", default-features = false }
 
 [build-dependencies]
 serde_json.workspace = true

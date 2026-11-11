@@ -127,3 +127,97 @@ Reranker pools at128/512/2048 must be finite with byte-identical repeats. The
 Metal ordering comparison is explicitly skipped when that lane/package is not
 available; a2048-rung parity fixture remains a parity-crate follow-up, not a new
 worker-authored model reference generator.
+
+## Parakeet transcription hardware gate
+
+The opt-in `parakeet::hardware::certify_parakeet` test runs the real 24-program
+FastConformer encoder, accelerated encoder projection, and shared-core token-and-
+duration transducer (TDT) loop.
+The hardware owner must arrange exclusive Neural Engine access. The test takes
+the production `~/Library/Caches/ck-synapse/ane-direct.lock` nonblocking and
+refuses while any cooperating ANE client holds it; it never uses a private lock.
+Do not stop another client or bypass the lock to run the gate.
+
+Build before opening the exclusive hardware window (full Xcode is required):
+
+```sh
+bash crates/synapse-worker-ane-direct/tests/run_parakeet.sh build
+```
+
+The `probe` mode compiles and releases independent subsampling stages, complete
+subsampling, conformer components and one complete block, the encoder projection,
+and the complete first encoder layer. It never submits an inference request. Each candidate prints its
+operation count (excluding constants), NCHW input/output shapes, and pass/fail;
+failed candidates do not stop the remaining probes. Probe mode takes the same
+machine-wide lock as inference and needs only `ANE_PARAKEET_SNAPSHOT` and
+`ANE_PARAKEET_REPORT` below. After building, run it during the owner's window:
+
+```sh
+unset TMPDIR
+bash crates/synapse-worker-ane-direct/tests/run_parakeet.sh probe
+```
+
+Independent stages whose frequency width is below the binding's 64-column
+input minimum also get explicitly labeled padded-width probes. The padded
+variants test operator support, not the exact production shape. The complete
+subsampling and first-layer probes retain their original shapes.
+
+`probe-attention` narrows the compile-only run to the complete attention graph
+and seven independent attention pieces: QKV projections; content scores with
+softmax and values; dynamic and constant position projections; position-score
+matmul; relative shift; and the query/key mask with the -10000 sentinel. The
+constant position-projection probe adds a dynamic input only at its output to
+test that constant branch inside a valid, input-bearing ANE program.
+
+`probe-corrected` compiles the static relative-score gather, corrected attention,
+one complete corrected conformer block, and corrected layer 0. The gather uses
+per-query compile-time slice bounds and small, bounded-fan-in concatenations.
+It stores no dense selection matrix and retains the shared relative-position
+table, so selection metadata grows linearly with encoder frames rather than
+quadratically. The encoder still uses exactly 24 executables per shape. This
+changes internal graph operations, not the number of worker dispatches; latency
+at the maximum duration must still be measured on hardware. The original
+pad/reshape/slice shift remains available for diagnostic comparison in `probe-attention`,
+not in serving or in the corrected probe group.
+
+Set the asset roots and a retained report path, then run smoke first:
+
+```sh
+export ANE_PARAKEET_SNAPSHOT="$HOME/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v3/snapshots/541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+export ANE_PARAKEET_MIRROR="$PWD/bench/parity/.cache-out"
+export ANE_PARAKEET_WAVS="$PWD/target/scratch/parakeet-wavs"
+export ANE_PARAKEET_REPORT="$PWD/.cortexkit/internal-docs/investigations/ane-parakeet-smoke.json"
+unset TMPDIR
+bash crates/synapse-worker-ane-direct/tests/run_parakeet.sh smoke
+export ANE_PARAKEET_REPORT="$PWD/.cortexkit/internal-docs/investigations/ane-parakeet-full.json"
+bash crates/synapse-worker-ane-direct/tests/run_parakeet.sh full
+```
+
+The kit converts the pinned checkpoint to a checksum-verified ANE package on
+first use, retaining it under `target/scratch/ane-parakeet-kit/`. Alternatively
+set `ANE_PARAKEET_PACKAGE` to an existing converted package; loading still checks
+its manifest digest. Tensor artifacts and prepared WAVs are checksum-checked.
+
+Full mode grades the encoder's minimum per-frame cosine, all ten word error rate
+(WER) splits, and the reference trace rule: frame indices and token/duration
+argmax decisions must match, except a changed argmax at the first differing step
+is exempted only when the frame index agrees and each differing head's reference
+top-1 minus top-2 logit margin is below the profile's `tau_margin`. Frame-only
+or trace-length differences fail. Emitted triples
+(token id, encoder frame index, duration) must also match the decisions implied
+by the engine's entire trace. Every stored-tensor fixture
+also checks bit-identical triples and valid frame counts with observation on
+and off, in the order off/off/on. Each pair records frame and triple counts,
+the first differing triple index with both triples, and encoder/projection
+readback bit equality and maximum absolute differences. These are read-only
+copies after inference. Encoder and trace gate outcomes are recorded even if
+the repeat comparison fails. Reports include 24-executable inventories, peak live executables
+(at most four shapes / 96 programs), completed-work progress gaps including the
+terminal interval, and the largest passing full-attention ladder duration.
+Smoke runs only three short fixtures and is not certification. To try a smaller
+envelope, set `ANE_PARAKEET_MAX_DURATION_MS` to a ladder duration present in the
+fixture set; full mode
+still requires coverage of every non-ladder fixture. No maximum is certified
+unless the entire full run succeeds. These are engine development measurements,
+not a substitute for the release runner's end-to-end module-path certification
+(see [backend certification](../../docs/backend-certification.md)).

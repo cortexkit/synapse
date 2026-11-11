@@ -141,7 +141,52 @@ pub struct Resident {
     b: TensorData,
     residual: TensorData,
     mask: TensorData,
+    projection: Option<TensorData>,
 }
+#[cfg(test)]
+mod transcribe_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn transcription_reads_the_shape_resident_projection_on_every_request() {
+        let mut model = crate::parakeet::tests::synthetic_model(false);
+        model.tensors.get_mut("joint.head.weight").unwrap()[3 * parakeet::DECODER] = 1.0;
+        model.tensors.get_mut("joint.head.bias").unwrap()[synapse_speech::BLANK as usize] = 0.5;
+        model.tensors.get_mut("joint.head.bias").unwrap()[synapse_speech::VOCAB_SIZE + 4] = 10.0;
+        let shape = 128;
+        let encoder = TensorData::new(modernbert::shape(shape, parakeet::HIDDEN));
+        encoder.copy_from_f32(&vec![0.0; shape * parakeet::HIDDEN]);
+        let projection = TensorData::new(modernbert::shape(shape, parakeet::DECODER));
+        projection.copy_from_f32(&vec![1.0; shape * parakeet::DECODER]);
+        // Empty executables isolate host readback ownership without compiling
+        // or running an ANE program. The resident projection's sentinel selects
+        // token 3; reading a fresh request-local buffer would select blank.
+        model.resident.insert(
+            shape,
+            Resident {
+                inventory: model.profile.inventory(shape, "buffer-unit-test").unwrap(),
+                executables: Vec::new(),
+                a: encoder,
+                b: TensorData::new(modernbert::shape(shape, parakeet::HIDDEN)),
+                residual: TensorData::new(parakeet::mel_shape(shape)),
+                mask: TensorData::new(modernbert::shape(shape * 8, 1)),
+                projection: Some(projection),
+            },
+        );
+        for observe in [false, false, true] {
+            let output = model
+                .transcribe_progress(&vec![0.0; 9 * 128], 9, 8, observe, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(output.frames, 1);
+            assert_eq!(
+                output.decoded.triples,
+                [[3, 0, 4]],
+                "must decode the shape-resident projection, observe={observe}"
+            );
+        }
+    }
+}
+
 impl Drop for Model {
     fn drop(&mut self) {
         // Model unload, replacement, and connection close release all cached programs.
@@ -175,7 +220,12 @@ impl Model {
             let mut mask = vec![0.0; shape * 8];
             mask[..valid_mel_frames].fill(1.0);
             resident.mask.copy_from_f32(&mask);
-            let projected = TensorData::new(modernbert::shape(shape, parakeet::DECODER));
+            // Cached ANE requests retain their first IOSurfaces. This second
+            // output must live with the shape, just like the encoder buffers.
+            let projected = resident
+                .projection
+                .as_ref()
+                .context("missing_projection_surface")?;
             for (layer, executable) in resident.executables.iter().enumerate() {
                 let (src, dst) = if layer % 2 == 0 {
                     (&resident.a, &resident.b)
@@ -184,7 +234,7 @@ impl Model {
                 };
                 let src = if layer == 0 { &resident.residual } else { src };
                 if layer == 23 {
-                    executable.run_cached(&[src, &resident.mask], &[dst, &projected])?;
+                    executable.run_cached(&[src, &resident.mask], &[dst, projected])?;
                 } else {
                     executable.run_cached(&[src, &resident.mask], &[dst])?;
                 }
@@ -218,6 +268,29 @@ impl Model {
                 decoded,
             })
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcribe_readbacks(&self, frames: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let shape = rung(frames)?;
+        let resident = self.resident.get(&shape).context("shape_not_admitted")?;
+        let rows = |data: Box<[f32]>, channels: usize| -> Vec<f32> {
+            (0..frames)
+                .flat_map(|t| (0..channels).map(move |c| c * shape + t))
+                .map(|index| data[index])
+                .collect()
+        };
+        Ok((
+            rows(resident.a.read_f32(), parakeet::HIDDEN),
+            rows(
+                resident
+                    .projection
+                    .as_ref()
+                    .context("missing_projection_surface")?
+                    .read_f32(),
+                parakeet::DECODER,
+            ),
+        ))
     }
 
     pub fn load(profile: Profile, path: &Path, digest: &str) -> Result<Self> {
@@ -551,6 +624,8 @@ impl Model {
                     },
                     1,
                 )),
+                projection: (self.profile.operation() == "transcribe")
+                    .then(|| TensorData::new(modernbert::shape(shape, parakeet::DECODER))),
             },
         );
         Ok(inventory)
@@ -1095,6 +1170,7 @@ mod fresh_process_hardware {
                     b: TensorData::new(modernbert::shape(1, 1)),
                     residual: TensorData::new(modernbert::shape(1, 1)),
                     mask: TensorData::new(modernbert::shape(1, 1)),
+                    projection: None,
                 },
             );
         }

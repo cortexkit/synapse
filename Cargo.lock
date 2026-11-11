@@ -6843,6 +6843,7 @@ dependencies = [
  "subc-protocol",
  "synapse-build-stamp",
  "synapse-core",
+ "synapse-parity",
  "synapse-speech",
  "tokenizers 0.21.4",
 ]

@@ -2,9 +2,15 @@
 //! full attention and encoder projection belong to the 24 admitted ANE programs.
 use crate::backend::{Model, Profile};
 use crate::modernbert::shape;
-use ane::{Convolution2dDescriptor, Graph, PadFillMode, PadMode, Shape, Tensor};
+#[cfg(test)]
+use ane::PadFillMode;
+use ane::{Convolution2dDescriptor, Graph, PadMode, Shape, Tensor};
 use anyhow::{ensure, Result};
 use synapse_speech::{Joint, JointLogits};
+
+#[cfg(test)]
+#[path = "parakeet_hardware.rs"]
+mod hardware;
 
 pub const HIDDEN: usize = 1024;
 pub const DECODER: usize = 640;
@@ -195,6 +201,40 @@ fn head_view(g: &mut Graph, x: Tensor, length: usize) -> Tensor {
     g.transpose(x, [0, 1, 3, 2])
 }
 
+fn relative_row_offset(queries: usize, row: usize) -> usize {
+    queries - 1 - row
+}
+
+fn relative_gather(g: &mut Graph, scores: Tensor, length: usize, queries: usize) -> Tensor {
+    // The relative-position table is shared across queries. Gather each score
+    // row using compile-time slice bounds instead of padding and reshaping an
+    // odd-width score tensor, which the ANE compiler cannot lower. Only O(T)
+    // slice metadata is added; no dense T-by-T selection constants are stored.
+    let mut rows: Vec<_> = (0..queries)
+        .map(|row| {
+            g.slice(
+                scores,
+                [0, 0, row, relative_row_offset(queries, row)],
+                [1, HEADS, 1, length],
+            )
+        })
+        .collect();
+    // Bounded fan-in keeps concatenations small even for a full query tile.
+    while rows.len() > 1 {
+        rows = rows
+            .chunks(8)
+            .map(|chunk| {
+                if chunk.len() == 1 {
+                    chunk[0]
+                } else {
+                    g.concat(chunk, 2)
+                }
+            })
+            .collect();
+    }
+    rows[0]
+}
+
 fn attention(
     g: &mut Graph,
     x: Tensor,
@@ -269,27 +309,7 @@ fn attention(
             [1, HEADS, relative_length, HEAD],
         );
         let bd = g.matrix_multiplication(qv, p, false, true);
-        let bd = g.pad(bd, 0, 0, 1, 0, PadFillMode::Constant, 0.0);
-        let bd = g.reshape(
-            bd,
-            Shape {
-                batch: 1,
-                channels: HEADS,
-                height: relative_length + 1,
-                width: queries,
-            },
-        );
-        let bd = g.slice(bd, [0, 0, 1, 0], [1, HEADS, relative_length, queries]);
-        let bd = g.reshape(
-            bd,
-            Shape {
-                batch: 1,
-                channels: HEADS,
-                height: queries,
-                width: relative_length,
-            },
-        );
-        let bd = g.slice(bd, [0, 0, 0, 0], [1, HEADS, queries, length]);
+        let bd = relative_gather(g, bd, length, queries);
         let ac = g.matrix_multiplication(qu, k, false, true);
         let scores = g.addition(ac, bd);
         let scores = g.multiplication(scores, scale);
@@ -386,6 +406,58 @@ fn convolution(
     Ok(g.addition(x, y))
 }
 
+const SUBSAMPLING: [(usize, usize, usize, usize); 5] = [
+    (0, 3, 2, 1),
+    (2, 3, 2, 256),
+    (3, 1, 1, 1),
+    (5, 3, 2, 256),
+    (6, 1, 1, 1),
+];
+
+fn subsampling_stage(
+    g: &mut Graph,
+    x: Tensor,
+    mut valid: Tensor,
+    model: &Model,
+    stage: (usize, usize, usize, usize),
+) -> Result<(Tensor, Tensor)> {
+    let (index, kernel, stride, groups) = stage;
+    let base = format!("encoder.subsampling.layers.{index}");
+    let w = g.constant(
+        model.tensor(&format!("{base}.weight"))?,
+        Shape {
+            batch: x.shape.channels / groups,
+            channels: 256,
+            height: kernel,
+            width: kernel,
+        },
+    );
+    let b = g.constant(model.tensor(&format!("{base}.bias"))?, Shape::channels(256));
+    let mut x = g.convolution_2d_strided(
+        x,
+        w,
+        Some(b),
+        &Convolution2dDescriptor {
+            groups,
+            pad_mode: if kernel == 1 {
+                PadMode::Valid
+            } else {
+                PadMode::Same
+            },
+        },
+        [stride, stride],
+    );
+    if stride == 2 {
+        valid = g.max_pool(valid, 1, 1, 1, 2, PadMode::Valid);
+    }
+    let time_mask = g.transpose(valid, [0, 1, 3, 2]);
+    x = g.multiplication(x, time_mask);
+    if [0, 3, 6].contains(&index) {
+        x = g.relu(x);
+    }
+    Ok((x, valid))
+}
+
 fn subsampling(
     g: &mut Graph,
     input: Tensor,
@@ -394,50 +466,198 @@ fn subsampling(
     length: usize,
 ) -> Result<Tensor> {
     let mut x = input;
-    for (index, kernel, stride, groups) in [
-        (0, 3, 2, 1),
-        (2, 3, 2, 256),
-        (3, 1, 1, 1),
-        (5, 3, 2, 256),
-        (6, 1, 1, 1),
-    ] {
-        let base = format!("encoder.subsampling.layers.{index}");
-        let w = g.constant(
-            model.tensor(&format!("{base}.weight"))?,
-            Shape {
-                batch: x.shape.channels / groups,
-                channels: 256,
-                height: kernel,
-                width: kernel,
-            },
-        );
-        let b = g.constant(model.tensor(&format!("{base}.bias"))?, Shape::channels(256));
-        x = g.convolution_2d_strided(
-            x,
-            w,
-            Some(b),
-            &Convolution2dDescriptor {
-                groups,
-                pad_mode: if kernel == 1 {
-                    PadMode::Valid
-                } else {
-                    PadMode::Same
-                },
-            },
-            [stride, stride],
-        );
-        if stride == 2 {
-            valid = g.max_pool(valid, 1, 1, 1, 2, PadMode::Valid);
-        }
-        let time_mask = g.transpose(valid, [0, 1, 3, 2]);
-        x = g.multiplication(x, time_mask);
-        if [0, 3, 6].contains(&index) {
-            x = g.relu(x);
-        }
+    for stage in SUBSAMPLING {
+        (x, valid) = subsampling_stage(g, x, valid, model, stage)?;
     }
     let x = g.transpose(x, [0, 1, 3, 2]);
     let x = g.reshape(x, shape(length, 256 * 16));
     linear(g, x, model, "encoder.subsampling.linear", HIDDEN, true)
+}
+
+#[cfg(test)]
+fn probe_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for (index, _, _, _) in SUBSAMPLING {
+        names.push(format!("subsampling-stage-{index}"));
+        if index >= 3 {
+            names.push(format!("subsampling-stage-{index}-padded-width"));
+        }
+    }
+    names.extend(
+        [
+            "subsampling-complete",
+            "normalization",
+            "feed-forward",
+            "attention",
+            "attention-qkv",
+            "attention-content",
+            "attention-position-projection",
+            "attention-position-projection-constant",
+            "attention-position-scores",
+            "attention-relative-shift",
+            "attention-static-gather",
+            "attention-mask",
+            "convolution",
+            "conformer-block",
+            "encoder-projection",
+            "full-layer-0",
+        ]
+        .map(str::to_owned),
+    );
+    names
+}
+
+#[cfg(test)]
+fn probe_graph(model: &Model, length: usize, name: &str) -> Result<Graph> {
+    if name.starts_with("attention-") {
+        return attention_probe(model, length, name);
+    }
+    if name == "full-layer-0" {
+        return layer_graph(model, length, 0);
+    }
+    if name == "conformer-block" {
+        return layer_graph(model, length, 1);
+    }
+    let mut g = Graph::new();
+    if name == "encoder-projection" {
+        let x = g.placeholder(shape(length, HIDDEN));
+        linear(&mut g, x, model, "encoder_projector", DECODER, true)?;
+    } else if name == "subsampling-complete" {
+        let x = g.placeholder(mel_shape(length));
+        let mask = g.placeholder(shape(length * 8, 1));
+        subsampling(&mut g, x, mask, model, length)?;
+    } else if ["normalization", "feed-forward", "attention", "convolution"].contains(&name) {
+        let x = g.placeholder(shape(length, HIDDEN));
+        let base = "encoder.layers.0";
+        match name {
+            "normalization" => {
+                norm(&mut g, x, model, &format!("{base}.norm_self_att"))?;
+            }
+            "feed-forward" => {
+                feed_forward(&mut g, x, model, base, 1)?;
+            }
+            _ => {
+                let valid = g.placeholder(shape(length, 1));
+                if name == "attention" {
+                    attention(&mut g, x, valid, model, base, length)?;
+                } else {
+                    convolution(&mut g, x, valid, model, base)?;
+                }
+            }
+        }
+    } else {
+        let mut input_shape = mel_shape(length);
+        let mut found = false;
+        for stage in SUBSAMPLING {
+            if name.strip_suffix("-padded-width").unwrap_or(name)
+                == format!("subsampling-stage-{}", stage.0)
+            {
+                if name.ends_with("-padded-width") {
+                    input_shape.width = input_shape.width.max(64);
+                }
+                let x = g.placeholder(input_shape);
+                let valid = g.placeholder(shape(input_shape.height, 1));
+                subsampling_stage(&mut g, x, valid, model, stage)?;
+                found = true;
+                break;
+            }
+            input_shape.channels = 256;
+            input_shape.height = input_shape.height.div_ceil(stage.2);
+            input_shape.width = input_shape.width.div_ceil(stage.2);
+        }
+        ensure!(found, "unknown probe candidate: {name}");
+    }
+    Ok(g)
+}
+
+#[cfg(test)]
+fn attention_probe(model: &Model, length: usize, name: &str) -> Result<Graph> {
+    let mut g = Graph::new();
+    let heads = |height, width| Shape {
+        batch: 1,
+        channels: HEADS,
+        height,
+        width,
+    };
+    let base = "encoder.layers.0.self_attn";
+    match name {
+        "attention-position-projection" | "attention-position-projection-constant" => {
+            let constant = name.ends_with("-constant");
+            let pos = if constant {
+                g.constant(&positions(length), shape(length * 2 - 1, HIDDEN))
+            } else {
+                g.placeholder(shape(length * 2 - 1, HIDDEN))
+            };
+            let projected = linear(
+                &mut g,
+                pos,
+                model,
+                &format!("{base}.relative_k_proj"),
+                HIDDEN,
+                false,
+            )?;
+            let projected = head_view(&mut g, projected, length * 2 - 1);
+            if constant {
+                // Keep a dynamic input at the output, so the probe tests the
+                // real constant projection branch inside an otherwise dynamic
+                // program rather than submitting an input-free ANE program.
+                let anchor = g.placeholder(projected.shape);
+                g.addition(projected, anchor);
+            }
+        }
+        "attention-position-scores" => {
+            let qv = g.placeholder(heads(length, HEAD));
+            let pos = g.placeholder(heads(length * 2 - 1, HEAD));
+            g.matrix_multiplication(qv, pos, false, true);
+        }
+        "attention-relative-shift" | "attention-static-gather" => {
+            let relative_length = length * 2 - 1;
+            let bd = g.placeholder(heads(length, relative_length));
+            if name == "attention-static-gather" {
+                relative_gather(&mut g, bd, length, length);
+                return Ok(g);
+            }
+            let bd = g.pad(bd, 0, 0, 1, 0, PadFillMode::Constant, 0.0);
+            let bd = g.reshape(bd, heads(relative_length + 1, length));
+            let bd = g.slice(bd, [0, 0, 1, 0], [1, HEADS, relative_length, length]);
+            let bd = g.reshape(bd, heads(length, relative_length));
+            g.slice(bd, [0, 0, 0, 0], [1, HEADS, length, length]);
+        }
+        "attention-mask" => {
+            let scores = g.placeholder(heads(length, length));
+            let valid = g.placeholder(shape(length, 1));
+            let query = g.transpose(valid, [0, 1, 3, 2]);
+            let pair_valid = g.multiplication(valid, query);
+            let scores = g.multiplication(scores, pair_valid);
+            let one = scalar(&mut g, 1.0);
+            let invalid = g.subtraction(one, pair_valid);
+            let sentinel = scalar(&mut g, -10000.0);
+            let masked = g.multiplication(invalid, sentinel);
+            g.addition(scores, masked);
+        }
+        "attention-qkv" | "attention-content" => {
+            let x = g.placeholder(shape(length, HIDDEN));
+            let q = linear(&mut g, x, model, &format!("{base}.q_proj"), HIDDEN, false)?;
+            let k = linear(&mut g, x, model, &format!("{base}.k_proj"), HIDDEN, false)?;
+            let v = linear(&mut g, x, model, &format!("{base}.v_proj"), HIDDEN, false)?;
+            let q = head_view(&mut g, q, length);
+            let k = head_view(&mut g, k, length);
+            let v = head_view(&mut g, v, length);
+            if name == "attention-content" {
+                let u = g.constant(model.tensor(&format!("{base}.bias_u"))?, heads(1, HEAD));
+                let q = g.addition(q, u);
+                let scores = g.matrix_multiplication(q, k, false, true);
+                let scale = scalar(&mut g, 1.0 / (HEAD as f32).sqrt());
+                let scores = g.multiplication(scores, scale);
+                let scores = g.transpose(scores, [0, 3, 1, 2]);
+                let probabilities = g.soft_max(scores, 1);
+                let probabilities = g.transpose(probabilities, [0, 2, 3, 1]);
+                g.matrix_multiplication(probabilities, v, false, false);
+            }
+        }
+        _ => anyhow::bail!("unknown attention probe: {name}"),
+    }
+    Ok(g)
 }
 
 pub fn layer_graph(model: &Model, length: usize, layer: usize) -> Result<Graph> {
@@ -466,8 +686,8 @@ pub fn layer_graph(model: &Model, length: usize, layer: usize) -> Result<Graph> 
     x = norm(&mut g, x, model, &format!("{base}.norm_out"))?;
     if layer == 23 {
         // Always expose the unprojected encoder as the first leaf output.
-        // Certification may copy it, but requests with observe=false still
-        // execute exactly the same graph as requests with observe=true.
+        // Both leaf outputs are computed even when observe=false, so copying an
+        // observation never changes the graph or its arithmetic.
         let one = scalar(&mut g, 1.0);
         let _encoder_output = g.multiplication(x, one);
         let _projected = linear(&mut g, x, model, "encoder_projector", DECODER, true)?;
@@ -600,7 +820,7 @@ impl Joint for TdtJoint<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
@@ -608,7 +828,7 @@ mod tests {
         Profile::select("parakeet-tdt-0.6b-v3.ane-direct-worker", "transcribe").unwrap()
     }
 
-    fn synthetic_model(graphs: bool) -> Model {
+    pub(crate) fn synthetic_model(graphs: bool) -> Model {
         let index: serde_json::Value = serde_json::from_str(include_str!(
             "../../../bench/parity/checkpoints/parakeet-tdt-0.6b-v3/tensor-index.json"
         ))
@@ -622,6 +842,7 @@ mod tests {
                 && (!graphs
                     || (name.starts_with("encoder.layers.")
                         && !name.starts_with("encoder.layers.0.")
+                        && !name.starts_with("encoder.layers.1.")
                         && !name.starts_with("encoder.layers.23.")))
             {
                 continue;
@@ -722,6 +943,82 @@ mod tests {
         assert!(off.trace.is_empty());
         assert!(completions.is_empty());
         assert!(joint.evaluate(5).is_err());
+    }
+
+    #[test]
+    fn static_relative_gather_matches_pad_shift_and_avoids_unsupported_kernel() {
+        let mut random = 7u32;
+        for (length, queries) in [(128, 128), (256, 128), (512, 128), (8192, 128), (137, 9)] {
+            let relative = length + queries - 1;
+            for _head in 0..3 {
+                let scores: Vec<_> = (0..queries * relative)
+                    .map(|_| {
+                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (random >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                    })
+                    .collect();
+                // Independent replay of the reference's leading pad, reshape,
+                // skipped first row, reshape back, and final key-width slice.
+                let padded: Vec<_> = scores
+                    .chunks_exact(relative)
+                    .flat_map(|row| std::iter::once(0.0).chain(row.iter().copied()))
+                    .collect();
+                let shifted = &padded[queries..];
+                for row in 0..queries {
+                    let reference = &shifted[row * relative..row * relative + length];
+                    let offset = row * relative + relative_row_offset(queries, row);
+                    let gathered = &scores[offset..offset + length];
+                    assert!(reference
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .eq(gathered.iter().map(|x| x.to_bits())));
+                }
+            }
+            let mut g = Graph::new();
+            let scores = g.placeholder(Shape {
+                batch: 1,
+                channels: HEADS,
+                height: queries,
+                width: relative,
+            });
+            let output = relative_gather(&mut g, scores, length, queries);
+            assert_eq!(
+                output.shape,
+                Shape {
+                    batch: 1,
+                    channels: HEADS,
+                    height: queries,
+                    width: length
+                }
+            );
+            let (mil, weights) = g.source_payload();
+            assert!(
+                weights.is_empty(),
+                "static gathers need no dense selection constants"
+            );
+            assert!(!mil.contains(" = pad("));
+        }
+        let model = synthetic_model(true);
+        let (attention, _) = probe_graph(&model, 128, "attention")
+            .unwrap()
+            .source_payload();
+        assert!(
+            !attention.contains(" = pad("),
+            "production attention still uses the unsupported padding/reshape shift"
+        );
+    }
+
+    #[test]
+    fn compiler_probe_metadata_is_available_without_private_api() {
+        let model = synthetic_model(true);
+        for name in probe_names() {
+            let graph = probe_graph(&model, 128, &name).unwrap();
+            let (count, inputs, outputs) = graph.diagnostic_shapes();
+            println!(
+                "PROBE_SOURCE {name}: operations={count} inputs={inputs:?} outputs={outputs:?}"
+            );
+            assert!(count > 0 && !inputs.is_empty() && !outputs.is_empty());
+        }
     }
 
     #[test]

@@ -545,7 +545,7 @@ fn loaded_response(
     response
 }
 
-fn transcribe_responses(
+pub(crate) fn transcribe_responses(
     req_id: &str,
     output: crate::parakeet::Output,
     observe: bool,
