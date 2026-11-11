@@ -12,6 +12,9 @@ use super::{error_response, WorkerState};
 #[cfg(all(test, feature = "cuda"))]
 mod hardware;
 
+#[cfg(test)]
+mod grading;
+
 #[cfg(feature = "cuda")]
 pub(super) fn load_transcribe(
     state: &mut WorkerState,

@@ -64,7 +64,7 @@ trace step is exempt only if its frame index matches and each differing argmax
 has a reference top-1 minus top-2 margin below `tau_margin` from the
 `parakeet-tdt-0.6b-v3.owned-cuda` profile. Trace-length differences fail, and emitted
 triples must always agree with the engine's own trace. The test permits at most a
-0.5 percentage-point word error rate increase in each corpus split. On every tensor
+0.5 percentage-point word error rate (WER) increase in each corpus split. On every tensor
 fixture within the selected duration and encoder-frame limits, it also requires bit-identical
 `(token_id, frame_index, duration)` triples and valid encoder-frame counts with the
 request's certification-only `observe` flag on and off. Each such fixture also runs
@@ -87,6 +87,22 @@ seals to pass.
 
 Keep the two machines' logs and JSON summaries outside `target/`, and return them
 to the change reviewer for inspection before landing.
+
+The test writes `cuda-transcribe-grading.json` before the final pass/fail check.
+It grades every fixture independently for diagnostics, retaining all failures
+rather than stopping at the first bad trace. For each trace failure or exemption,
+it records the fixture, first differing step, frame index, affected head, reference
+top-two ids/logits and margin, and engine top-two ids/logits. It also records
+per-split reference and engine word edits, total ground-truth words, WER and the
+delta in percentage points, regardless of trace failures. Encoder statistics cover
+all valid frames with a stored reference tensor: per-fixture and overall minimum,
+mean, maximum, linearly interpolated percentiles and count below cosine 0.999.
+
+`cuda-transcribe-summary.json` is preserved even when final grading fails. Its
+`grading_passed` and `grading_error` fields identify that outcome; a failed run
+records `largest_executed_ladder_ms`, but leaves `largest_certified_ladder_ms` null.
+The canonical parity evaluator still determines success using the unchanged
+profile thresholds. A diagnostic report does not turn a failed gate into a pass.
 
 ## Narrow repeatability diagnostic
 

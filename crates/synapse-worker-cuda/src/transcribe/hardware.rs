@@ -425,18 +425,34 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         );
         observations.insert(fixture.id.clone(), observed);
     }
-    let report = speech::evaluate_transcribe(
+    let diagnostics = super::grading::collect(&profile, &fixtures, &observations, &parity, &mirror);
+    std::fs::write(
+        evidence.join("cuda-transcribe-grading.json"),
+        serde_json::to_vec_pretty(&diagnostics).unwrap(),
+    )
+    .unwrap();
+    for failure in diagnostics["trace_failures"].as_array().unwrap() {
+        println!("trace_failure {failure}");
+    }
+    println!("split_wer {}", diagnostics["split_wer"]);
+    println!("encoder_cosine {}", diagnostics["encoder"]["distribution"]);
+    let evaluation = speech::evaluate_transcribe(
         &profile,
         &fixtures,
         &observations,
         &parity,
         &mirror,
         "duration_limit",
-    )
-    .unwrap();
+    );
+    let report = evaluation.as_ref().ok();
     let summary = json!({"profile":profile_id,"kernel_revision":CUDA_TRANSCRIBE_KERNEL_REVISION,"decode_rule":synapse_speech::DECODE_RULE_REVISION,
-        "graded":report.graded.len(),"expected_refusals":report.expected_refusals,"margin_exempt":report.margin_exempt,"split_wer":report.split_wer,
-        "tensor_observation_invariance":invariant,"tensor_repeatability":invariant,"max_duration_ms":profile.max_duration_ms,"largest_certified_ladder_ms":largest_ladder,
+        "grading_passed":evaluation.is_ok(),"grading_error":evaluation.as_ref().err().map(ToString::to_string),
+        "fixtures_executed":observations.len(),"graded":report.map(|r| r.graded.len()),
+        "expected_refusals":diagnostics["expected_refusals"],"margin_exempt":diagnostics["margin_exempt"],
+        "split_wer":diagnostics["split_wer"],"trace_failure_count":diagnostics["trace_failures"].as_array().unwrap().len(),
+        "encoder_cosine_distribution":diagnostics["encoder"]["distribution"],
+        "tensor_observation_invariance":invariant,"tensor_repeatability":invariant,"max_duration_ms":profile.max_duration_ms,
+        "largest_executed_ladder_ms":largest_ladder,"largest_certified_ladder_ms":report.map(|_| largest_ladder),
         "peak_device_used_bytes":max_peak,"longest_progress_gap_s":longest,"elapsed_s":started.elapsed().as_secs_f64()});
     std::fs::write(
         evidence.join("cuda-transcribe-summary.json"),
@@ -444,4 +460,7 @@ fn cuda_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     )
     .unwrap();
     println!("{summary}");
+    evaluation.expect(
+        "canonical grading failed; see cuda-transcribe-grading.json for all fixture diagnostics",
+    );
 }
