@@ -4,6 +4,8 @@ pub mod protocol;
 #[cfg(feature = "vulkan")]
 pub mod runtime;
 pub mod transcribe;
+#[cfg(all(test, feature = "vulkan"))]
+mod transcribe_layers;
 
 use synapse_parity::manifest::Manifest;
 

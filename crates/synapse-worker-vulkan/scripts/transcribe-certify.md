@@ -136,5 +136,58 @@ those diagnostic projections. A regenerated reference may have small
 cross-architecture differences; record that provenance separately. These CPU
 calculations exist only in the test harness and do not alter production inference.
 
+## Separating weight storage from GPU arithmetic
+
+The speech shader widens fp16 weights at each load and uses fp32 activations,
+shared tiles, dot products, LayerNorm reductions, attention scores, softmax and
+score-times-value accumulation. The arena upload itself retains fp16 bytes.
+Do not infer half-precision accumulation from an encoder mismatch alone.
+
+In the pinned reference Python environment, generate diagnostic CPU controls:
+
+```sh
+HF_HUB_OFFLINE=1 "$REFERENCE_PYTHON" \
+  crates/synapse-worker-vulkan/scripts/diagnose-transcribe-storage.py \
+  --hf-cache "$HF_CACHE" --mirror bench/parity/.cache-out \
+  --audio target/scratch/parakeet-wavs \
+  --vulkan-summary "$PREVIOUS_EVIDENCE/vulkan-transcribe-summary.json" \
+  --out target/scratch/storage-reference --mixed
+```
+
+The script reads the immutable sealed mel/encoder/trace artifacts and verifies
+all hashes; corpus cases without stored mel use hash-checked prepared WAVs.
+It first captures fp32 CPU outputs for `ladder-1025`, `ladder-4096`,
+`silence-30s` and the shortest stored-tensor LibriSpeech case. It then rounds
+only persistent floating checkpoint tensors through fp16, leaving computed
+position frequencies and all arithmetic fp32. It captures final encoders for
+all in-envelope tensor fixtures and every trace-failed fixture listed in the
+`--vulkan-summary` report. Every selected encoder is replayed through the
+fp16-storage joint; the report's trace-failed cases are also replayed through
+the original fp32 joint. Full-shadow traces are saved for comparison, not made
+into new seals.
+
+With `--mixed`, three additional diagnostic modes keep original fp32 tensors
+for layers 21–23, all attention projection weights, or all feed-forward weights.
+They run on the union of `trace_failures` and `encoder_failures` in the
+`--vulkan-summary` report, not the complete corpus; their results cannot certify
+a new profile. `--reuse-captures` reuses
+existing SHA-checked encoder files when only additional replays are needed.
+CPU per-layer/final metrics and trace findings are in `storage-summary.json`.
+
+Copy the `fp32/` and `f16-storage/` children of `storage-reference` to the GPU host
+(selective-mode directories are not needed), then set
+`SYNAPSE_VULKAN_SPEECH_LAYER_REFERENCE` to its root before the normal opt-in test.
+For each matching fixture the test compares subsampling and layer outputs
+against available fp32/shadow captures. It writes `<fixture>-layer-errors.jsonl`
+with max-abs error, cosine quantiles, every final encoder frame's cosine and
+norms, and failing frame indices measured both from the start and valid end.
+`silence-30s` includes per-frame norms at every layer. The final summary adds
+whole-trace agreement with the CPU storage-shadow pipeline: frame index, token
+argmax and duration argmax at every evaluation, plus each emitted token's
+`[token_id, frame_index, duration]` triple.
+This instrumented run includes extra GPU downloads and CPU comparisons; report
+it as a diagnostic, not a clean performance measurement. No reference, numerical
+gate, kernel revision or production computation changes when captures are enabled.
+
 Keep logs/JSON outside `target/` and attach all three hardware results to the
 change review before landing. Do not relax tolerances or reference seals.

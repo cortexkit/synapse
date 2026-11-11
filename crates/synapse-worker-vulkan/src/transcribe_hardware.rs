@@ -521,10 +521,15 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let mut trace_findings = Vec::new();
     let mut encoder_failures = Vec::new();
     let mut diagnosed = false;
+    let mut shadow_trace_agreement = Vec::new();
     let mut findings_log =
         std::fs::File::create(evidence.join("vulkan-fixture-findings.jsonl")).unwrap();
     let (mut invariant, mut longest, mut largest_ladder) = (0, 0f64, 0);
     for fixture in &fixtures {
+        let LoadedEngine::Speech(engine) = &mut loaded.engine else {
+            panic!("wrong engine");
+        };
+        crate::transcribe_layers::attach(engine, &fixture.id, &evidence).unwrap();
         let row = rows[fixture.id.as_str()];
         let frames = row["mel_frames"].as_u64().unwrap() as usize;
         let valid = row["valid_mel_frames"].as_u64().unwrap() as usize;
@@ -549,6 +554,10 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         };
         let (mut output, progress, gap) =
             exchange(&mut loaded, &fixture.id, &mel, frames, valid, true);
+        let LoadedEngine::Speech(engine) = &mut loaded.engine else {
+            panic!("wrong engine");
+        };
+        engine.debug_clear_capture();
         longest = longest.max(gap);
         if over {
             output
@@ -565,6 +574,12 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             expected_refusals.push(fixture.id.clone());
         } else {
             graded.push(fixture.id.clone());
+            if let Some(agreement) =
+                crate::transcribe_layers::trace_agreement(&fixture.id, &output).unwrap()
+            {
+                println!("shadow trace agreement: {agreement}");
+                shadow_trace_agreement.push(agreement);
+            }
             assert_eq!(progress, 24 + fixture.valid_encoder_frames as usize / 125);
             assert_eq!(
                 output.valid_encoder_frames,
@@ -710,6 +725,8 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         "decode_rule":synapse_speech::DECODE_RULE_REVISION,"graded":graded.len(),"expected_refusals":expected_refusals,
         "margin_exempt":margin_exempt,"trace_findings":trace_findings,"trace_failures":trace_failures,"encoder_failures":encoder_failures,
         "split_wer":split_wer,"wer_failures":wer_failures,"evaluation_error":report.err().map(|e|e.to_string()),"tensor_observation_invariance":invariant,
+        "shadow_trace_agreement":shadow_trace_agreement,
+        "layer_reference":std::env::var_os("SYNAPSE_VULKAN_SPEECH_LAYER_REFERENCE").map(|p|PathBuf::from(p).display().to_string()),
         "max_duration_ms":profile.max_duration_ms,"largest_passed_ladder_ms":largest_ladder,"largest_certified_ladder_ms":if passed && filter.is_none() {Some(largest_ladder)} else {None},
         "arena_driver_allocation_bytes":peak,"longest_progress_gap_s":longest,"elapsed_s":started.elapsed().as_secs_f64()});
     std::fs::write(

@@ -7,10 +7,21 @@ use synapse_parity::{manifest::Profile, safetensors::Header};
 
 use crate::transcribe::Output;
 
+#[cfg(test)]
+type LayerObserver = Box<dyn Fn(&str, &[f32]) -> Result<()>>;
+
+#[cfg(test)]
+struct LayerCapture {
+    names: std::collections::BTreeSet<String>,
+    observe: LayerObserver,
+}
+
 pub struct Engine {
     arena: Arena,
     maximum: usize,
     joint: HostJoint,
+    #[cfg(test)]
+    layer_capture: Option<LayerCapture>,
 }
 
 impl Engine {
@@ -47,11 +58,42 @@ impl Engine {
             arena,
             maximum,
             joint: HostJoint::load(header, data),
+            #[cfg(test)]
+            layer_capture: None,
         })
     }
 
     pub fn device_bytes(&self) -> u64 {
         self.arena.driver_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_capture_layers(
+        &mut self,
+        names: std::collections::BTreeSet<String>,
+        observe: impl Fn(&str, &[f32]) -> Result<()> + 'static,
+    ) {
+        self.layer_capture = Some(LayerCapture {
+            names,
+            observe: Box::new(observe),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_clear_capture(&mut self) {
+        self.layer_capture = None;
+    }
+
+    #[cfg(test)]
+    fn capture_layer(&self, name: &str, valid: usize) -> Result<()> {
+        if let Some(capture) = self
+            .layer_capture
+            .as_ref()
+            .filter(|capture| capture.names.contains(name))
+        {
+            (capture.observe)(name, &self.download("hidden", valid * 1024)?)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -324,6 +366,8 @@ impl Engine {
                 n * 1024,
             )?;
         }
+        #[cfg(test)]
+        self.capture_layer("subsampling", valid_encoder)?;
         self.run(
             Params {
                 op: 105,
@@ -471,6 +515,8 @@ impl Engine {
             self.ff(&layer, 2, rows)?;
             self.norm("hidden", "norm", &format!("{layer}.norm_out"), rows)?;
             self.simple(112, "norm", "hidden", rows * 1024, 1)?;
+            #[cfg(test)]
+            self.capture_layer(&format!("layer-{i:02}"), valid_encoder)?;
             progress()?;
         }
         self.linear(
