@@ -277,6 +277,66 @@ pub(crate) mod joint {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn transcribe_host_joint_initial_blank_recurrence_and_reset() {
+            let mut weights = BTreeMap::new();
+            weights.insert("decoder.embedding.weight".into(), vec![0.; 8193 * 640]);
+            for layer in 0..2 {
+                for name in ["weight_ih", "weight_hh"] {
+                    weights.insert(
+                        format!("decoder.lstm.{name}_l{layer}"),
+                        vec![0.; 2560 * 640],
+                    );
+                }
+                let mut bias = vec![0.; 2560];
+                bias[1280] = 1.;
+                weights.insert(format!("decoder.lstm.bias_ih_l{layer}"), bias);
+                weights.insert(format!("decoder.lstm.bias_hh_l{layer}"), vec![0.; 2560]);
+            }
+            let mut projector = vec![0.; 640 * 640];
+            projector[0] = 1.;
+            weights.insert("decoder.decoder_projector.weight".into(), projector);
+            weights.insert("decoder.decoder_projector.bias".into(), vec![0.; 640]);
+            let mut head = vec![0.; 8198 * 640];
+            head[7 * 640] = 1.;
+            weights.insert("joint.head.weight".into(), head);
+            weights.insert("joint.head.bias".into(), vec![0.; 8198]);
+            let mut projected = vec![0.; 640];
+            projected[0] = 0.25;
+            let mut joint = HostJoint {
+                weights,
+                projected,
+                h: [vec![9.; 640], vec![9.; 640]],
+                cell: [vec![9.; 640], vec![9.; 640]],
+                predictor: vec![0.; 640],
+                logits: vec![0.; 8198],
+            };
+            joint.reset().unwrap();
+            // With zero matrices every sigmoid gate is 1/2 and the candidate
+            // cell is tanh(1). The initial blank must run the LSTM once.
+            let candidate = 1.0f32.tanh();
+            let first = 0.25 + 0.5 * (0.5 * candidate).tanh();
+            assert_eq!(joint.evaluate(0).unwrap().tokens[7], first);
+            assert_eq!(joint.evaluate(0).unwrap().tokens[7], first);
+            joint.accept(7).unwrap();
+            assert_eq!(
+                joint.evaluate(0).unwrap().tokens[7],
+                0.25 + 0.5 * (0.75 * candidate).tanh()
+            );
+            assert!(joint.evaluate(1).is_err());
+            assert!(joint.accept(synapse_speech::BLANK).is_err());
+            joint.reset().unwrap();
+            assert_eq!(
+                joint.evaluate(0).unwrap().tokens[7].to_bits(),
+                first.to_bits()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

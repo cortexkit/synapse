@@ -286,6 +286,39 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             assert_eq!(progress, 0);
         } else {
             assert_eq!(progress, 24 + fixture.valid_encoder_frames as usize / 125);
+            assert_eq!(
+                output.valid_encoder_frames,
+                Some(fixture.valid_encoder_frames)
+            );
+            let encoder = output
+                .encoder_output
+                .as_ref()
+                .expect("missing encoder observation");
+            assert_eq!(encoder.len(), fixture.valid_encoder_frames as usize * 1024);
+            assert!(encoder.iter().all(|v| v.is_finite()));
+            // Fail numerical gates before running another utterance. Word-error
+            // rates are still aggregated over entire splits after the loop.
+            let cosine = fixture.encoder.as_ref().map(|artifact| {
+                let reference =
+                    synapse_core::decode_f32_frame(&artifact.read(&parity, &mirror).unwrap())
+                        .unwrap();
+                speech::grade_encoder(&reference, encoder, fixture.valid_encoder_frames as usize)
+                    .unwrap_or_else(|e| panic!("{}: {e}", fixture.id))
+            });
+            let reference_trace =
+                speech::decode_trace(&fixture.trace.read(&parity, &mirror).unwrap()).unwrap();
+            let exempt = speech::grade_trace(
+                &reference_trace,
+                &output.trace,
+                &output.triples,
+                fixture.valid_encoder_frames,
+                profile.tau_margin.unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", fixture.id));
+            println!(
+                "{} encoder_min_cosine={cosine:?} margin_exempt={exempt}",
+                fixture.id
+            );
             output.text = tokenizer
                 .transcript(
                     &output

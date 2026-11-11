@@ -88,6 +88,8 @@ divergence is exempt only for the reference profile's small argmax margins at
 the same frame; a shifted frame or trace-length difference always fails.
 Each corpus split's word-error rate may exceed the reference by at most 0.5
 absolute percentage points, using the shared evaluator's pinned normalizer.
+Encoder/trace checks run after each utterance so a numerical failure stops the
+run immediately; word-error rates are graded after the complete corpus.
 Completed work produces exactly 24 encoder progress units plus one per 125
 decoded frames. Progress gaps must remain below 120 s; no timer heartbeats exist.
 
