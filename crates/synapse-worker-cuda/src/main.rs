@@ -802,7 +802,10 @@ mod tests {
             "sha256:abc".to_string(),
             "safetensors".to_string(),
             BTreeMap::new(),
-            LoadEnvironment { probe: synapse_engine_cuda::probe_hardware_floor, max_frame: DEFAULT_MAX_FRAME_BYTES },
+            LoadEnvironment {
+                probe: synapse_engine_cuda::probe_hardware_floor,
+                max_frame: DEFAULT_MAX_FRAME_BYTES,
+            },
         );
         assert!(
             matches!(response, WorkerResponse::Err { ref code, .. } if code == "backend_missing")
@@ -847,6 +850,58 @@ mod lifecycle_tests {
     }
     fn missing_driver() -> Result<synapse_engine_cuda::HardwareFloorProbe> {
         anyhow::bail!("cuda_no_driver")
+    }
+    #[test]
+    fn transcribe_unknown_model_drains_mel_before_next_ping() {
+        let mut input = Vec::new();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Transcribe {
+                req_id: "speech".into(),
+                model_ref: "missing".into(),
+                mel_frames: 1,
+                valid_mel_frames: 1,
+                observe: true,
+            },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        write_frame(
+            &mut input,
+            &encode_f32_frame(&[0.; 128]),
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Ping {
+                req_id: "after-speech".into(),
+            },
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Shutdown {},
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let mut stream = Duplex {
+            input: std::io::Cursor::new(input),
+            output: Vec::new(),
+        };
+        worker_request_loop_with_probe(&mut stream, DEFAULT_MAX_FRAME_BYTES, missing_driver)
+            .unwrap();
+        let mut output = std::io::Cursor::new(stream.output);
+        assert!(
+            matches!(synapse_core::worker_framing_sync::read_json_frame::<_, WorkerResponse>(&mut output, DEFAULT_MAX_FRAME_BYTES).unwrap(),
+            WorkerResponse::Err { req_id: Some(id), code, .. } if id == "speech" && code == "model_not_loaded")
+        );
+        assert!(
+            matches!(synapse_core::worker_framing_sync::read_json_frame::<_, WorkerResponse>(&mut output, DEFAULT_MAX_FRAME_BYTES).unwrap(),
+            WorkerResponse::Pong { req_id, .. } if req_id == "after-speech")
+        );
+        assert_eq!(output.position(), output.get_ref().len() as u64);
     }
     #[test]
     fn hello_and_ping_succeed_with_injected_missing_driver() {
@@ -904,7 +959,10 @@ mod load_floor_tests {
                 ("profile".into(), p.id),
                 ("operation".into(), "embed".into()),
             ]),
-            LoadEnvironment { probe: no_driver, max_frame: DEFAULT_MAX_FRAME_BYTES },
+            LoadEnvironment {
+                probe: no_driver,
+                max_frame: DEFAULT_MAX_FRAME_BYTES,
+            },
         );
         assert!(matches!(response,WorkerResponse::Err{code,..} if code=="cuda_no_driver"));
     }

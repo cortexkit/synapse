@@ -6855,8 +6855,10 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "synapse-core",
  "synapse-engine-cuda",
+ "synapse-parity",
  "synapse-speech",
 ]
 

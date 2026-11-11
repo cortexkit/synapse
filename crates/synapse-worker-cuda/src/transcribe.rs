@@ -9,6 +9,9 @@ use synapse_core::{
 
 use super::{error_response, WorkerState};
 
+#[cfg(all(test, feature = "cuda"))]
+mod hardware;
+
 #[cfg(feature = "cuda")]
 pub(super) fn load_transcribe(
     state: &mut WorkerState,
@@ -304,5 +307,78 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(write_transcription(&mut bytes, 100, "t", output(true)).is_err());
         assert!(bytes.is_empty());
+    }
+
+    struct Duplex {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(b)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn transcribe_mel_length_fault_closes_before_any_response() {
+        for (frames, raw, maximum) in [
+            (1, vec![0; 511], DEFAULT_MAX_FRAME_BYTES),
+            (usize::MAX, vec![], DEFAULT_MAX_FRAME_BYTES),
+            (1, vec![0; 512], 64),
+        ] {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &raw, DEFAULT_MAX_FRAME_BYTES).unwrap();
+            let mut stream = Duplex {
+                input: Cursor::new(bytes),
+                output: Vec::new(),
+            };
+            let request = WorkerRequest::Transcribe {
+                req_id: "bad".into(),
+                model_ref: "m".into(),
+                mel_frames: frames,
+                valid_mel_frames: 1,
+                observe: false,
+            };
+            assert!(
+                serve_transcribe(&mut stream, maximum, &WorkerState::default(), request).is_err()
+            );
+            assert!(stream.output.is_empty());
+        }
+    }
+    #[test]
+    fn transcribe_nonfinite_input_is_refused_before_model_lookup() {
+        let mut raw = vec![0.; 128];
+        raw[3] = f32::NAN;
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &encode_f32_frame(&raw), DEFAULT_MAX_FRAME_BYTES).unwrap();
+        let mut stream = Duplex {
+            input: Cursor::new(bytes),
+            output: Vec::new(),
+        };
+        let request = WorkerRequest::Transcribe {
+            req_id: "nan".into(),
+            model_ref: "m".into(),
+            mel_frames: 1,
+            valid_mel_frames: 1,
+            observe: false,
+        };
+        serve_transcribe(
+            &mut stream,
+            DEFAULT_MAX_FRAME_BYTES,
+            &WorkerState::default(),
+            request,
+        )
+        .unwrap();
+        let response: WorkerResponse =
+            read_json_frame(&mut Cursor::new(stream.output), DEFAULT_MAX_FRAME_BYTES).unwrap();
+        assert!(matches!(response, WorkerResponse::Err { code, .. } if code == "invalid_request"));
     }
 }
