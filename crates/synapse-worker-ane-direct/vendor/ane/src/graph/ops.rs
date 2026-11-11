@@ -95,16 +95,30 @@ impl Graph {
         bias: Option<Tensor>,
         descriptor: &Convolution2dDescriptor,
     ) -> Tensor {
+        self.convolution_2d_strided(source, weights, bias, descriptor, [1, 1])
+    }
+
+    /// Convolution with explicit spatial strides. SAME uses leading padding
+    /// when padding is odd, matching a symmetrically padded strided kernel.
+    pub fn convolution_2d_strided(
+        &mut self,
+        source: Tensor,
+        weights: Tensor,
+        bias: Option<Tensor>,
+        descriptor: &Convolution2dDescriptor,
+        strides: [usize; 2],
+    ) -> Tensor {
+        assert!(strides.into_iter().all(|s| s > 0));
         let out_channels = weights.shape.channels;
         let kernel_h = weights.shape.height;
         let kernel_w = weights.shape.width;
         let out_h = match descriptor.pad_mode {
-            PadMode::Valid => source.shape.height.saturating_sub(kernel_h) + 1,
-            PadMode::Same => source.shape.height,
+            PadMode::Valid => source.shape.height.saturating_sub(kernel_h) / strides[0] + 1,
+            PadMode::Same => source.shape.height.div_ceil(strides[0]),
         };
         let out_w = match descriptor.pad_mode {
-            PadMode::Valid => source.shape.width.saturating_sub(kernel_w) + 1,
-            PadMode::Same => source.shape.width,
+            PadMode::Valid => source.shape.width.saturating_sub(kernel_w) / strides[1] + 1,
+            PadMode::Same => source.shape.width.div_ceil(strides[1]),
         };
         let output = self.alloc(Shape {
             channels: out_channels,
@@ -122,6 +136,8 @@ impl Graph {
                 kernel_height: kernel_h,
                 kernel_width: kernel_w,
                 groups: descriptor.groups,
+                stride_height: strides[0],
+                stride_width: strides[1],
                 pad_mode: descriptor.pad_mode,
                 pad_top: 0,
                 pad_bottom: 0,

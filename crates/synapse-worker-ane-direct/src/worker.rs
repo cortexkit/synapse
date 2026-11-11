@@ -233,8 +233,8 @@ fn request_loop<S: Read + Write>(
                 .map_err(anyhow::Error::from)
         };
         let profile = crate::profile::LaneProfile::new();
-        let result: Result<(WorkerResponse, Option<Vec<f32>>)> = (|| {
-            Ok(match request {
+        let result: Result<Vec<(WorkerResponse, Option<Vec<u8>>)>> = (|| {
+            let response = match request {
                 WorkerRequest::Load {
                     req_id,
                     artifact_path,
@@ -254,12 +254,19 @@ fn request_loop<S: Read + Write>(
                         .get("operation")
                         .context("operation_mismatch")?;
                     let profile = Profile::select(id, operation)?;
+                    if operation == "transcribe" {
+                        crate::parakeet::validate_load(&profile, max)?;
+                    }
                     let model_ref = format!("ane-direct:{id}:{artifact_digest}");
                     let start = Instant::now();
                     let model = Model::load(profile, Path::new(&artifact_path), &artifact_digest)?;
-                    let dims = model.profile.model["output"]["dimension"]
-                        .as_u64()
-                        .context("model_unsupported")? as usize;
+                    let dims = if operation == "transcribe" {
+                        0
+                    } else {
+                        model.profile.model["output"]["dimension"]
+                            .as_u64()
+                            .context("model_unsupported")? as usize
+                    };
                     // Which rungs aned already holds compiled, so the module
                     // predicts a fast load for them instead of a compile.
                     let check_started = Instant::now();
@@ -272,13 +279,14 @@ fn request_loop<S: Read + Write>(
                     );
                     models.insert(model_ref.clone(), model);
                     (
-                        WorkerResponse::loaded(
+                        loaded_response(
                             req_id,
                             model_ref,
                             dims,
                             start.elapsed().as_millis() as u64,
                             Some(crate::backend::LADDER.to_vec()),
                             Some(cached),
+                            operation == "transcribe",
                         ),
                         None,
                     )
@@ -407,6 +415,26 @@ fn request_loop<S: Read + Write>(
                     )?;
                     (WorkerResponse::Scores { req_id }, Some(scores))
                 }
+                WorkerRequest::Transcribe {
+                    req_id,
+                    model_ref,
+                    mel_frames,
+                    valid_mel_frames,
+                    observe,
+                } => {
+                    let raw = raw.as_deref().context("invalid_mel_frame_length")?;
+                    validate_transcribe_frame(raw, mel_frames, max)?;
+                    let model = models.get(&model_ref).context("model_not_loaded")?;
+                    let mel = synapse_core::decode_f32_frame(raw)?;
+                    let output = model.transcribe_progress(
+                        &mel,
+                        mel_frames,
+                        valid_mel_frames,
+                        observe,
+                        &mut || progress(WorkerProgressPhase::Inference),
+                    )?;
+                    return transcribe_responses(&req_id, output, observe, max);
+                }
                 WorkerRequest::EmbedPacked {
                     req_id,
                     model_ref,
@@ -460,27 +488,258 @@ fn request_loop<S: Read + Write>(
                     models.remove(&model_ref).context("model_not_loaded")?;
                     (WorkerResponse::Unloaded { req_id }, None)
                 }
-                WorkerRequest::Shutdown {} => {
-                    return Ok((
-                        WorkerResponse::Unloaded {
-                            req_id: String::new(),
-                        },
-                        None,
-                    ))
-                }
+                WorkerRequest::Shutdown {} => unreachable!("handled before dispatch"),
                 ref other => (WorkerResponse::unsupported_request(other), None),
-            })
+            };
+            Ok(vec![(
+                response.0,
+                response.1.map(|values| encode_f32_frame(&values)),
+            )])
         })();
         if progress_writer.failed() {
             anyhow::bail!("progress stream write failed");
         }
-        let (response, output) =
-            result.unwrap_or_else(|e| (request_error(req_id.clone(), &e), None));
-        write_json_frame(stream, &response, max)?;
-        if let Some(output) = output {
-            write_frame(stream, &encode_f32_frame(&output), max)?;
+        let responses = result.unwrap_or_else(|e| vec![(request_error(req_id.clone(), &e), None)]);
+        for (response, output) in responses {
+            write_json_frame(stream, &response, max)?;
+            if let Some(output) = output {
+                write_frame(stream, &output, max)?;
+            }
         }
         profile.finish(serde_json::json!({"kind":"request", "req_id":req_id}));
+    }
+}
+
+fn validate_transcribe_frame(raw: &[u8], mel_frames: usize, max: u32) -> Result<()> {
+    anyhow::ensure!(
+        mel_frames.checked_mul(512) == Some(raw.len()),
+        "invalid_mel_frame_length"
+    );
+    anyhow::ensure!(raw.len() <= max as usize, "transcribe_max_frame_exceeded");
+    Ok(())
+}
+
+fn loaded_response(
+    req_id: String,
+    model_ref: String,
+    dims: usize,
+    cold_load_ms: u64,
+    buckets: Option<Vec<usize>>,
+    cached: Option<Vec<usize>>,
+    transcribe: bool,
+) -> WorkerResponse {
+    let mut response =
+        WorkerResponse::loaded(req_id, model_ref, dims, cold_load_ms, buckets, cached);
+    if transcribe {
+        if let WorkerResponse::Loaded {
+            transcribe_revision,
+            ..
+        } = &mut response
+        {
+            *transcribe_revision = Some(synapse_core::TranscribeRevision {
+                kernel_revision: synapse_core::ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION.into(),
+                decode_rule: synapse_speech::DECODE_RULE_REVISION.into(),
+            });
+        }
+    }
+    response
+}
+
+fn transcribe_responses(
+    req_id: &str,
+    output: crate::parakeet::Output,
+    observe: bool,
+    max: u32,
+) -> Result<Vec<(WorkerResponse, Option<Vec<u8>>)>> {
+    let mut frames = Vec::new();
+    if observe {
+        frames.push((
+            WorkerResponse::EncoderOutput {
+                req_id: req_id.into(),
+                frames: output.frames,
+            },
+            Some(encode_f32_frame(&output.encoder)),
+        ));
+        let trace: Vec<_> = output
+            .decoded
+            .trace
+            .iter()
+            .map(|s| synapse_core::DecodeTraceRecord {
+                frame_index: s.frame_index as i32,
+                token_top1: s.token_top1 as i32,
+                token_top2: s.token_top2 as i32,
+                duration_top1: s.duration_top1 as i32,
+                duration_top2: s.duration_top2 as i32,
+                token_logit1: s.token_logit1,
+                token_logit2: s.token_logit2,
+                duration_logit1: s.duration_logit1,
+                duration_logit2: s.duration_logit2,
+                flags: u32::from(s.emitted) | (u32::from(s.cap_hit) << 1),
+            })
+            .collect();
+        frames.push((
+            WorkerResponse::DecodeTrace {
+                req_id: req_id.into(),
+                steps: trace.len(),
+            },
+            Some(synapse_core::encode_decode_trace_frame(&trace)),
+        ));
+    }
+    let triples: Vec<_> = output
+        .decoded
+        .triples
+        .iter()
+        .map(|s| synapse_core::TranscriptRecord {
+            token_id: s[0] as i32,
+            frame_index: s[1] as i32,
+            duration: s[2] as i32,
+        })
+        .collect();
+    frames.push((
+        WorkerResponse::Transcript {
+            req_id: req_id.into(),
+            valid_encoder_frames: output.frames,
+            count: triples.len(),
+        },
+        Some(synapse_core::encode_transcript_frame(&triples)),
+    ));
+    // Refuse before writing any observation header, so a frame-size failure
+    // never leaves the connection halfway through a multi-frame response.
+    for (response, raw) in &frames {
+        let raw = raw.as_deref().unwrap();
+        anyhow::ensure!(raw.len() <= max as usize, "transcribe_max_frame_exceeded");
+        response.validate_raw_frame(raw)?;
+    }
+    Ok(frames)
+}
+
+#[cfg(test)]
+mod transcribe_tests {
+    use super::*;
+    struct Stream {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Stream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transcribe_frame_length_is_exact_and_bounded() {
+        assert!(validate_transcribe_frame(&vec![0; 1024], 2, 1024).is_ok());
+        for bytes in [1023, 1025] {
+            assert!(validate_transcribe_frame(&vec![0; bytes], 2, 2048).is_err());
+        }
+        assert!(validate_transcribe_frame(&vec![0; 1024], 2, 1023).is_err());
+        assert!(validate_transcribe_frame(&[], usize::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn only_transcribe_loaded_reports_both_compiled_revisions() {
+        let loaded = |speech| loaded_response("r".into(), "m".into(), 0, 1, None, None, speech);
+        let legacy = serde_json::to_value(loaded(false)).unwrap();
+        assert!(legacy.get("transcribe_revision").is_none());
+        let speech = serde_json::to_value(loaded(true)).unwrap();
+        assert_eq!(
+            speech["transcribe_revision"]["kernel_revision"],
+            synapse_core::ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION
+        );
+        assert_eq!(
+            speech["transcribe_revision"]["decode_rule"],
+            synapse_speech::DECODE_RULE_REVISION
+        );
+    }
+
+    fn output() -> crate::parakeet::Output {
+        crate::parakeet::Output {
+            frames: 1,
+            encoder: vec![0.25; 1024],
+            decoded: synapse_speech::DecodeOutput {
+                triples: vec![[7, 0, 2]],
+                trace: vec![synapse_speech::TraceStep {
+                    frame_index: 0,
+                    token_top1: 7,
+                    token_top2: 8192,
+                    duration_top1: 2,
+                    duration_top2: 1,
+                    token_logit1: 4.0,
+                    token_logit2: 3.0,
+                    duration_logit1: 2.0,
+                    duration_logit2: 1.0,
+                    emitted: true,
+                    cap_hit: false,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn transcribe_observation_order_codecs_and_terminal_bytes() {
+        let observed = transcribe_responses("r", output(), true, 8192).unwrap();
+        let quiet = transcribe_responses("r", output(), false, 8192).unwrap();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(quiet.len(), 1);
+        assert!(matches!(
+            observed[0].0,
+            WorkerResponse::EncoderOutput { frames: 1, .. }
+        ));
+        assert!(matches!(
+            observed[1].0,
+            WorkerResponse::DecodeTrace { steps: 1, .. }
+        ));
+        assert_eq!(observed[2], quiet[0]);
+        assert_eq!(observed[0].1.as_ref().unwrap().len(), 4096);
+        assert_eq!(observed[1].1.as_ref().unwrap().len(), 40);
+        assert_eq!(
+            quiet[0].1.as_ref().unwrap(),
+            &synapse_core::encode_i32_frame(&[7, 0, 2])
+        );
+        assert!(transcribe_responses("r", output(), true, 4095).is_err());
+    }
+
+    #[test]
+    fn malformed_transcribe_then_ping_keeps_framing() {
+        let mut input = std::io::Cursor::new(Vec::new());
+        let request = WorkerRequest::Transcribe {
+            req_id: "bad".into(),
+            model_ref: "absent".into(),
+            mel_frames: 2,
+            valid_mel_frames: 1,
+            observe: false,
+        };
+        write_json_frame(&mut input, &request, 8192).unwrap();
+        write_frame(&mut input, &[0; 512], 8192).unwrap();
+        write_json_frame(
+            &mut input,
+            &WorkerRequest::Ping {
+                req_id: "ping".into(),
+            },
+            8192,
+        )
+        .unwrap();
+        let mut stream = Stream {
+            input: std::io::Cursor::new(input.into_inner()),
+            output: vec![],
+        };
+        request_loop(&mut stream, 8192, || Ok(())).unwrap();
+        let mut output = std::io::Cursor::new(stream.output);
+        let error: WorkerResponse = read_json_frame(&mut output, 8192).unwrap();
+        assert!(
+            matches!(error, WorkerResponse::Err { code, .. } if code == "invalid_mel_frame_length")
+        );
+        let pong: WorkerResponse = read_json_frame(&mut output, 8192).unwrap();
+        assert!(matches!(pong, WorkerResponse::Pong { req_id, .. } if req_id == "ping"));
     }
 }
 #[cfg(test)]

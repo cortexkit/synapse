@@ -17,6 +17,7 @@ ane = { path = "vendor/ane" }
 anyhow.workspace = true
 clap.workspace = true
 synapse-core = { path = "../synapse-core" }
+synapse-speech = { path = "../synapse-speech" }
 serde.workspace = true
 sha2.workspace = true
 half = "2.7"
