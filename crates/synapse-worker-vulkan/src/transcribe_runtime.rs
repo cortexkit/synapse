@@ -20,6 +20,7 @@ pub struct Engine {
     arena: Arena,
     maximum: usize,
     joint: HostJoint,
+    precision: transcribe::WeightPrecision,
     #[cfg(test)]
     layer_capture: Option<LayerCapture>,
 }
@@ -34,7 +35,13 @@ impl Engine {
         data: &[u8],
     ) -> Result<Self> {
         let maximum = transcribe::maximum(profile)?;
-        let plan = transcribe::buffer_plan(model, maximum)?;
+        let precision = transcribe::WeightPrecision::from_header(header)?;
+        ensure!(
+            precision == transcribe::WeightPrecision::F16
+                || cfg!(feature = "transcribe-f32-measurement"),
+            "f32 speech weights require the measurement feature"
+        );
+        let plan = transcribe::buffer_plan_for_precision(model, maximum, precision)?;
         ensure!(
             synapse_parity::vulkan::arena_bytes(&plan) == required.min_device_local_bytes,
             "manifest_mismatch"
@@ -52,12 +59,14 @@ impl Engine {
                 "maximum_encoder_frames": maximum,
                 "min_storage_buffer_range": required.min_storage_buffer_range,
                 "allocations": 1
+                ,"weight_precision":format!("{precision:?}")
             }})
         );
         Ok(Self {
             arena,
             maximum,
             joint: HostJoint::load(header, data),
+            precision,
             #[cfg(test)]
             layer_capture: None,
         })
@@ -65,6 +74,29 @@ impl Engine {
 
     pub fn device_bytes(&self) -> u64 {
         self.arena.driver_bytes
+    }
+
+    #[cfg(all(test, feature = "transcribe-f32-measurement"))]
+    pub(crate) fn debug_device_heap_usage(&self) -> Option<u64> {
+        let device = &self.arena.device;
+        let extensions = unsafe {
+            device
+                .instance
+                .raw
+                .enumerate_device_extension_properties(device.physical)
+        }
+        .ok()?;
+        if !extensions.iter().any(|e|unsafe {std::ffi::CStr::from_ptr(e.extension_name.as_ptr())}==c"VK_EXT_memory_budget") {return None;}
+        let mut budget = ash::vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties =
+            ash::vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        unsafe {
+            device
+                .instance
+                .raw
+                .get_physical_device_memory_properties2(device.physical, &mut properties)
+        };
+        Some(budget.heap_usage[device.heap_index as usize])
     }
 
     #[cfg(test)]
@@ -107,19 +139,28 @@ impl Engine {
             encoder.len().is_multiple_of(1024),
             "malformed debug encoder"
         );
-        let mut weights = vec![0; 640 * 1024 * 2];
-        let mut bias = vec![0; 640 * 2];
+        let mut weights = vec![0; 640 * 1024 * self.precision.width() as usize];
+        let mut bias = vec![0; 640 * self.precision.width() as usize];
         self.arena
             .transfer("weight:encoder_projector.weight", &mut weights, false)?;
         self.arena
             .transfer("weight:encoder_projector.bias", &mut bias, false)?;
         let widen = |bytes: &[u8]| {
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|v| f64::from(half::f16::from_le_bytes(*v).to_f32()))
-                .collect::<Vec<_>>()
+            if self.precision == transcribe::WeightPrecision::F32 {
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| f64::from(f32::from_le_bytes(*v)))
+                    .collect::<Vec<_>>()
+            } else {
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|v| f64::from(half::f16::from_le_bytes(*v).to_f32()))
+                    .collect::<Vec<_>>()
+            }
         };
         let weights = widen(&weights);
         let bias = widen(&bias);
@@ -156,7 +197,10 @@ impl Engine {
         Ok(result?)
     }
 
-    fn run(&self, p: Params, buffers: [&str; 7], count: usize) -> Result<()> {
+    fn run(&self, mut p: Params, buffers: [&str; 7], count: usize) -> Result<()> {
+        if self.precision == transcribe::WeightPrecision::F32 {
+            p.op += 100;
+        }
         self.arena.dispatch(p, buffers, u32::try_from(count)?)
     }
     fn simple(&self, op: u32, input: &str, output: &str, rows: usize, cols: usize) -> Result<()> {

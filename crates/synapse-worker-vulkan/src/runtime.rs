@@ -177,6 +177,8 @@ struct Device {
     cooperative: Option<vk::Pipeline>,
     attention: vk::Pipeline,
     speech: vk::Pipeline,
+    #[cfg(feature = "transcribe-f32-measurement")]
+    speech_f32: vk::Pipeline,
     heap_index: u32,
 }
 impl Drop for Device {
@@ -189,6 +191,8 @@ impl Drop for Device {
             self.raw.destroy_pipeline(self.plain, None);
             self.raw.destroy_pipeline(self.attention, None);
             self.raw.destroy_pipeline(self.speech, None);
+            #[cfg(feature = "transcribe-f32-measurement")]
+            self.raw.destroy_pipeline(self.speech_f32, None);
             self.raw.destroy_pipeline_layout(self.pipeline_layout, None);
             self.raw.destroy_descriptor_pool(self.descriptor_pool, None);
             self.raw
@@ -341,6 +345,8 @@ impl Device {
             cooperative: None,
             attention: vk::Pipeline::null(),
             speech: vk::Pipeline::null(),
+            #[cfg(feature = "transcribe-f32-measurement")]
+            speech_f32: vk::Pipeline::null(),
         };
         let raw = &device.raw;
         let pool = unsafe {
@@ -426,6 +432,10 @@ impl Device {
         device.plain = make_pipeline("plain")?;
         device.attention = make_pipeline("attention")?;
         device.speech = make_pipeline("transcribe")?;
+        #[cfg(feature = "transcribe-f32-measurement")]
+        {
+            device.speech_f32 = make_pipeline("transcribe_f32")?;
+        }
         device.cooperative = if coop_enabled {
             Some(make_pipeline("cooperative")?)
         } else {
@@ -688,6 +698,28 @@ impl Arena {
 
     fn dispatch(&self, params: Params, buffers: [&str; 7], count: u32) -> Result<()> {
         let device = &self.device;
+        let cooperative = params.op == 1
+            && params.inner.is_multiple_of(16)
+            && params.cols.is_multiple_of(16)
+            && device.cooperative.is_some();
+        let pipeline = if params.op >= 200 {
+            #[cfg(feature = "transcribe-f32-measurement")]
+            {
+                device.speech_f32
+            }
+            #[cfg(not(feature = "transcribe-f32-measurement"))]
+            {
+                anyhow::bail!("f32 speech pipeline is unavailable")
+            }
+        } else if params.op >= 100 {
+            device.speech
+        } else if params.op == ATTENTION_OP {
+            device.attention
+        } else if cooperative {
+            device.cooperative.unwrap()
+        } else {
+            device.plain
+        };
         let descriptors: Vec<_> = buffers
             .iter()
             .map(|name| self.descriptor(name))
@@ -720,11 +752,7 @@ impl Arena {
         unsafe {
             device.raw.update_descriptor_sets(&writes, &[]);
         }
-        let cooperative = params.op == 1
-            && params.inner.is_multiple_of(16)
-            && params.cols.is_multiple_of(16)
-            && device.cooperative.is_some();
-        let groups = if params.op == 100 {
+        let groups = if params.op == 100 || params.op == 200 {
             params.rows.div_ceil(8) * params.cols.div_ceil(8)
         } else if cooperative {
             params.rows.div_ceil(16) * params.cols.div_ceil(16)
@@ -746,19 +774,9 @@ impl Arena {
                 &[],
                 &[],
             );
-            device.raw.cmd_bind_pipeline(
-                command,
-                vk::PipelineBindPoint::COMPUTE,
-                if params.op >= 100 {
-                    device.speech
-                } else if params.op == ATTENTION_OP {
-                    device.attention
-                } else if cooperative {
-                    device.cooperative.unwrap()
-                } else {
-                    device.plain
-                },
-            );
+            device
+                .raw
+                .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.raw.cmd_bind_descriptor_sets(
                 command,
                 vk::PipelineBindPoint::COMPUTE,

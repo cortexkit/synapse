@@ -1,5 +1,7 @@
 //! Opt-in runs use the production encoder, joint and framed response writer.
 use super::*;
+#[path = "transcribe_measurement.rs"]
+mod measurement;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -372,7 +374,7 @@ fn diagnose_trace_failure(
         let LoadedEngine::Speech(engine) = &mut loaded.engine else {
             panic!("wrong engine");
         };
-        // These CPU diagnostics use the package's exact fp16 projector weights
+        // These CPU diagnostics use the package's stored projector weights
         // with f64 dot products. They do not change production computations.
         let exact_actual = engine.debug_project_f64(encoder)?;
         let exact_reference = engine.debug_project_f64(reference_encoder)?;
@@ -495,12 +497,35 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let index: Value =
         serde_json::from_slice(&std::fs::read(audio.join("inputs.json")).unwrap()).unwrap();
     let started = Instant::now();
-    let mut loaded = load_hardware();
+    let f32_measurement = measurement::f32_enabled();
+    let (mut loaded, precision_report) = if f32_measurement {
+        #[cfg(feature = "transcribe-f32-measurement")]
+        {
+            measurement::load_f32().unwrap()
+        }
+        #[cfg(not(feature = "transcribe-f32-measurement"))]
+        {
+            unreachable!("checked measurement feature")
+        }
+    } else {
+        let load_started = Instant::now();
+        let loaded = load_hardware();
+        let bytes = std::fs::metadata(env_path("SYNAPSE_VULKAN_SPEECH_PACKAGE"))
+            .unwrap()
+            .len();
+        let metadata = json!({"measurement_only":false,"weight_precision":"f16","profile":profile_id,
+            "package_bytes":bytes,"package_sha256":loaded.model_ref,"load_s":load_started.elapsed().as_secs_f64(),"conversion_s":0.,"production_load_binding_checked":true});
+        (loaded, metadata)
+    };
     assert!(started.elapsed().as_secs() < 600);
-    let revision = loaded_response("load".into(), &loaded);
-    assert!(
-        matches!(revision,WorkerResponse::Loaded {transcribe_revision:Some(r),..} if r.kernel_revision==synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION && r.decode_rule==synapse_speech::DECODE_RULE_REVISION)
-    );
+    // The unregistered f32 profile uses a direct test constructor and cannot
+    // claim a production LOAD binding.
+    if !f32_measurement {
+        let revision = loaded_response("load".into(), &loaded);
+        assert!(
+            matches!(revision,WorkerResponse::Loaded {transcribe_revision:Some(r),..} if r.kernel_revision==synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION && r.decode_rule==synapse_speech::DECODE_RULE_REVISION)
+        );
+    }
     let tokenizer = synapse_speech::Tokenizer::pinned();
     let frontend = synapse_speech::Frontend::new();
     let reference: Value = serde_json::from_slice(
@@ -522,6 +547,10 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let mut encoder_failures = Vec::new();
     let mut diagnosed = false;
     let mut shadow_trace_agreement = Vec::new();
+    let mut encoder_cosine_distribution = Vec::new();
+    let mut group_timings: BTreeMap<String, measurement::GroupTiming> = BTreeMap::new();
+    let mut fixture_timings = Vec::new();
+    let mut heap_usage_peak = measurement::heap_usage(&loaded);
     let mut findings_log =
         std::fs::File::create(evidence.join("vulkan-fixture-findings.jsonl")).unwrap();
     let (mut invariant, mut longest, mut largest_ladder) = (0, 0f64, 0);
@@ -535,6 +564,7 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         let valid = row["valid_mel_frames"].as_u64().unwrap() as usize;
         let over =
             fixture.duration_ms > profile.max_duration_ms || fixture.valid_encoder_frames > maximum;
+        let prepare_started = Instant::now();
         let mel = if over {
             vec![0.; frames * 128]
         } else if !row["log_mel"].is_null() {
@@ -552,8 +582,12 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             assert_eq!(features.valid_mel_frames, valid);
             features.values
         };
+        let prepare_s = prepare_started.elapsed().as_secs_f64();
+        let inference_started = Instant::now();
         let (mut output, progress, gap) =
             exchange(&mut loaded, &fixture.id, &mel, frames, valid, true);
+        let observe_s = inference_started.elapsed().as_secs_f64();
+        let mut plain_s = 0.;
         let LoadedEngine::Speech(engine) = &mut loaded.engine else {
             panic!("wrong engine");
         };
@@ -596,6 +630,9 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             let reference_encoder = fixture.encoder.as_ref().map(|artifact| {
                 synapse_core::decode_f32_frame(&artifact.read(&parity, &mirror).unwrap()).unwrap()
             });
+            if let Some(reference) = &reference_encoder {
+                encoder_cosine_distribution.push(json!({"fixture":fixture.id,"metrics":crate::transcribe_layers::compare(reference,encoder,true).unwrap()}));
+            }
             let mut encoder_ok = true;
             let cosine =
                 reference_encoder.as_ref().and_then(|reference| {
@@ -681,8 +718,10 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
                 .unwrap()
                 .text;
             if fixture.encoder.is_some() {
+                let plain_started = Instant::now();
                 let (plain, plain_progress, plain_gap) =
                     exchange(&mut loaded, &fixture.id, &mel, frames, valid, false);
+                plain_s = plain_started.elapsed().as_secs_f64();
                 assert_eq!(output.valid_encoder_frames, plain.valid_encoder_frames);
                 assert_eq!(output.triples, plain.triples);
                 assert_eq!(progress, plain_progress);
@@ -697,6 +736,17 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             "{} frames={} progress={progress} gap={gap:.3}s",
             fixture.id, fixture.valid_encoder_frames
         );
+        let group = measurement::group(&fixture.id, fixture.duration_ms, over);
+        let timing = group_timings.entry(group.into()).or_default();
+        timing.cases += 1;
+        timing.feature_preparation_s += prepare_s;
+        timing.observe_inference_s += observe_s;
+        timing.unobserved_inference_s += plain_s;
+        fixture_timings.push(json!({"fixture":fixture.id,"group":group,"feature_preparation_s":prepare_s,"observe_inference_s":observe_s,"unobserved_inference_s":plain_s}));
+        heap_usage_peak = heap_usage_peak
+            .into_iter()
+            .chain(measurement::heap_usage(&loaded))
+            .max();
         observations.insert(fixture.id.clone(), output);
     }
     let report = speech::evaluate_transcribe(
@@ -714,20 +764,30 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         panic!("wrong engine");
     };
     let peak = engine.device_bytes();
-    assert!(
-        peak <= manifest.profiles[profile_id]
-            .vulkan_min_device_local_bytes
-            .unwrap()
-    );
-    let summary = json!({"profile":profile_id,"complete":filter.is_none(),"passed":passed,"filter":filter,
+    let required = crate::transcribe::floors_for_precision(
+        &manifest.models[&manifest.profiles[profile_id].model],
+        maximum as usize,
+        if f32_measurement {
+            crate::transcribe::WeightPrecision::F32
+        } else {
+            crate::transcribe::WeightPrecision::F16
+        },
+    )
+    .unwrap();
+    assert!(peak <= required.min_device_local_bytes);
+    let summary = json!({"profile":if f32_measurement {measurement::F32_PROFILE} else {profile_id},"complete":filter.is_none(),"passed":passed,"filter":filter,
+        "precision":precision_report,"group_timings":group_timings,"fixture_timings":fixture_timings,
+        "encoder_cosine_distribution":encoder_cosine_distribution,
+        "sampled_peak_device_heap_usage_bytes":heap_usage_peak,
+        "memory_scope":"VK_EXT_memory_budget device-local heap sampled after load/requests, including other allocations; arena size is exact and excludes driver/pipeline overhead",
         "diagnostic_moltenvk":cfg!(all(target_os="macos",feature="moltenvk-diagnostic")),
-        "kernel_revision":synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
+        "kernel_revision":if f32_measurement {measurement::F32_REVISION} else {synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION},
         "decode_rule":synapse_speech::DECODE_RULE_REVISION,"graded":graded.len(),"expected_refusals":expected_refusals,
         "margin_exempt":margin_exempt,"trace_findings":trace_findings,"trace_failures":trace_failures,"encoder_failures":encoder_failures,
         "split_wer":split_wer,"wer_failures":wer_failures,"evaluation_error":report.err().map(|e|e.to_string()),"tensor_observation_invariance":invariant,
         "shadow_trace_agreement":shadow_trace_agreement,
         "layer_reference":std::env::var_os("SYNAPSE_VULKAN_SPEECH_LAYER_REFERENCE").map(|p|PathBuf::from(p).display().to_string()),
-        "max_duration_ms":profile.max_duration_ms,"largest_passed_ladder_ms":largest_ladder,"largest_certified_ladder_ms":if passed && filter.is_none() {Some(largest_ladder)} else {None},
+        "max_duration_ms":profile.max_duration_ms,"largest_passed_ladder_ms":largest_ladder,"largest_certified_ladder_ms":if passed && filter.is_none() && !f32_measurement {Some(largest_ladder)} else {None},
         "arena_driver_allocation_bytes":peak,"longest_progress_gap_s":longest,"elapsed_s":started.elapsed().as_secs_f64()});
     std::fs::write(
         evidence.join("vulkan-transcribe-summary.json"),

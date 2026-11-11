@@ -112,6 +112,48 @@ pub fn validate_frame_envelope(maximum: usize, max_frame: u32) -> Result<()> {
 }
 
 pub fn buffer_plan(model: &Model, maximum: usize) -> Result<Vec<Buffer>> {
+    buffer_plan_for_precision(model, maximum, WeightPrecision::F16)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightPrecision {
+    F16,
+    F32,
+}
+
+impl WeightPrecision {
+    pub fn width(self) -> u64 {
+        match self {
+            Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn from_header(header: &synapse_parity::safetensors::Header) -> Result<Self> {
+        use synapse_parity::safetensors::StDType;
+        let mut precision = None;
+        for tensor in header.tensors.values().filter(|t| t.dtype != StDType::I64) {
+            let next = match tensor.dtype {
+                StDType::F16 => Self::F16,
+                StDType::F32 => Self::F32,
+                _ => anyhow::bail!("unsupported speech weight dtype"),
+            };
+            anyhow::ensure!(
+                precision.is_none_or(|p| p == next),
+                "mixed speech weight dtypes are not supported"
+            );
+            precision = Some(next);
+        }
+        precision.ok_or_else(|| anyhow::anyhow!("no speech weights"))
+    }
+}
+
+pub fn buffer_plan_for_precision(
+    model: &Model,
+    maximum: usize,
+    precision: WeightPrecision,
+) -> Result<Vec<Buffer>> {
     let (_, rung) = input_shape(maximum * 8 + 1, maximum * 8, maximum)?;
     let t = rung as u64;
     let mut plan = Vec::new();
@@ -119,7 +161,7 @@ pub fn buffer_plan(model: &Model, maximum: usize) -> Result<Vec<Buffer>> {
         let width = if name.ends_with("num_batches_tracked") {
             8
         } else {
-            2
+            precision.width()
         };
         plan.push(Buffer {
             name: format!("weight:{name}"),
@@ -159,7 +201,15 @@ pub fn buffer_plan(model: &Model, maximum: usize) -> Result<Vec<Buffer>> {
 }
 
 pub fn floors(model: &Model, maximum: usize) -> Result<crate::admission::Required> {
-    let plan = buffer_plan(model, maximum)?;
+    floors_for_precision(model, maximum, WeightPrecision::F16)
+}
+
+pub fn floors_for_precision(
+    model: &Model,
+    maximum: usize,
+    precision: WeightPrecision,
+) -> Result<crate::admission::Required> {
+    let plan = buffer_plan_for_precision(model, maximum, precision)?;
     Ok(crate::admission::Required {
         min_device_local_bytes: synapse_parity::vulkan::arena_bytes(&plan),
         min_storage_buffer_range: plan.iter().map(|b| b.bytes).max().unwrap_or(0),
@@ -186,12 +236,20 @@ pub(crate) mod joint {
                 .iter()
                 .filter(|(n, _)| n.starts_with("decoder.") || n.starts_with("joint."))
                 .map(|(n, t)| {
-                    let values = data[t.data_offsets.0..t.data_offsets.1]
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|v| half::f16::from_le_bytes(*v).to_f32())
-                        .collect();
+                    let raw = &data[t.data_offsets.0..t.data_offsets.1];
+                    let values = if t.dtype == synapse_parity::safetensors::StDType::F32 {
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|v| f32::from_le_bytes(*v))
+                            .collect()
+                    } else {
+                        raw.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|v| half::f16::from_le_bytes(*v).to_f32())
+                            .collect()
+                    };
                     (n.clone(), values)
                 })
                 .collect();
@@ -336,12 +394,160 @@ pub(crate) mod joint {
                 first.to_bits()
             );
         }
+
+        #[test]
+        fn transcribe_host_joint_reads_declared_f32_without_rounding_to_half() {
+            use synapse_parity::safetensors::{
+                parse_header_json, split_file, write_package, PackageTensor, StDType,
+            };
+            let value = 1.0001f32;
+            for dtype in [StDType::F16, StDType::F32] {
+                let bytes = if dtype == StDType::F32 {
+                    value.to_le_bytes().to_vec()
+                } else {
+                    half::f16::from_f32(value).to_le_bytes().to_vec()
+                };
+                let package = write_package(
+                    "measurement",
+                    &BTreeMap::from([(
+                        "decoder.embedding.weight".into(),
+                        PackageTensor {
+                            dtype,
+                            shape: vec![1],
+                            bytes,
+                        },
+                    )]),
+                );
+                let (header, data) = split_file(&package).unwrap();
+                let joint = HostJoint::load(&parse_header_json(header).unwrap(), data);
+                let expected = if dtype == StDType::F32 { value } else { 1. };
+                assert_eq!(
+                    joint.weights["decoder.embedding.weight"][0].to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcribe_f32_inventory_preserves_activations_and_integer_counters() {
+        let manifest = crate::manifest();
+        let model = &manifest.models["parakeet-tdt-0.6b-v3"];
+        let f16 = buffer_plan(model, 7500).unwrap();
+        let f32 = buffer_plan_for_precision(model, 7500, WeightPrecision::F32).unwrap();
+        for (a, b) in f16.iter().zip(&f32) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(
+                b.bytes,
+                if a.name.starts_with("weight:") && !a.name.ends_with("num_batches_tracked") {
+                    a.bytes * 2
+                } else {
+                    a.bytes
+                }
+            );
+        }
+        assert_eq!(
+            floors(model, 7500).unwrap().min_device_local_bytes,
+            2_021_900_544
+        );
+        let required = floors_for_precision(model, 7500, WeightPrecision::F32).unwrap();
+        assert_eq!(required.min_device_local_bytes, 3_276_015_104);
+        assert_eq!(required.min_storage_buffer_range, 134_217_728);
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn transcribe_dtype_requires_uniform_declared_float_storage() {
+        use synapse_parity::safetensors::{
+            parse_header_json, split_file, write_package, PackageTensor, StDType,
+        };
+        let mut tensors = std::collections::BTreeMap::new();
+        tensors.insert(
+            "counter".into(),
+            PackageTensor {
+                dtype: StDType::I64,
+                shape: vec![],
+                bytes: vec![0; 8],
+            },
+        );
+        tensors.insert(
+            "weight".into(),
+            PackageTensor {
+                dtype: StDType::F32,
+                shape: vec![1],
+                bytes: vec![0; 4],
+            },
+        );
+        let parse = |t: &std::collections::BTreeMap<String, PackageTensor>| {
+            let bytes = write_package("measurement", t);
+            parse_header_json(split_file(&bytes).unwrap().0).unwrap()
+        };
+        assert_eq!(
+            WeightPrecision::from_header(&parse(&tensors)).unwrap(),
+            WeightPrecision::F32
+        );
+        tensors.insert(
+            "other".into(),
+            PackageTensor {
+                dtype: StDType::F16,
+                shape: vec![1],
+                bytes: vec![0; 2],
+            },
+        );
+        assert!(WeightPrecision::from_header(&parse(&tensors)).is_err());
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn transcribe_f16_shader_matches_the_v1_byte_identity() {
+        use sha2::{Digest, Sha256};
+        let bytes = crate::SHADERS
+            .iter()
+            .find(|(name, _)| *name == "transcribe")
+            .unwrap()
+            .1;
+        // SDK 1.4.357.0 compiling the unchanged v1 source (SHA-256
+        // 16db12050106cbe059a857e34cc6c90e0b45d5cdc435363750621be66028601f).
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            "6f84be1c14096b066e7bbf1b6b47aa7e97b9e243e8672a54bff102408421d1ad"
+        );
+        assert_eq!(
+            synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
+            "owned-vulkan-transcribe-v1"
+        );
+    }
+
+    #[cfg(feature = "transcribe-f32-measurement")]
+    #[test]
+    fn transcribe_measurement_shader_has_no_half_precision_float_type() {
+        let bytes = crate::SHADERS
+            .iter()
+            .find(|(name, _)| *name == "transcribe_f32")
+            .unwrap()
+            .1;
+        let words: Vec<_> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        let (mut offset, mut floats) = (5, Vec::new());
+        while offset < words.len() {
+            let instruction = words[offset];
+            if instruction & 0xffff == 22 {
+                floats.push(words[offset + 2]);
+            }
+            offset += (instruction >> 16) as usize;
+        }
+        assert!(floats.contains(&32));
+        assert!(!floats.contains(&16));
+    }
     use std::io::Cursor;
     use synapse_core::{
         worker_framing_sync::{read_frame, read_json_frame},

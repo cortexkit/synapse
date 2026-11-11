@@ -131,7 +131,7 @@ this debug tensor) repeats observed/plain inference and writes
 `vulkan-trace-failure.json`, the engine encoder and its projected output. The JSON
 includes both heads' top-2 logits/margins, repeated encoder/triple equality,
 reference encoder max-abs at the differing frame, GPU projection error against
-CPU f64 dot products using the package's fp16 weights, and joint replay with
+CPU f64 dot products using the package's declared stored weights, and joint replay with
 those diagnostic projections. A regenerated reference may have small
 cross-architecture differences; record that provenance separately. These CPU
 calculations exist only in the test harness and do not alter production inference.
@@ -188,6 +188,67 @@ argmax and duration argmax at every evaluation, plus each emitted token's
 This instrumented run includes extra GPU downloads and CPU comparisons; report
 it as a diagnostic, not a clean performance measurement. No reference, numerical
 gate, kernel revision or production computation changes when captures are enabled.
+
+## Unpinned 32-bit-weight benchmark
+
+The `transcribe-f32-measurement` feature adds a separate fp32-weight speech
+pipeline. It does not edit the production profile, package pin, fp16 shader
+source or `owned-vulkan-transcribe-v1`. Normal worker LOAD still accepts only
+the sealed fp16 package. The fp32 option exists solely in this ignored native
+test, has a `measurement-only-vulkan-transcribe-f32-v1` report identity, and
+never produces a certified production maximum for the synthetic duration-ladder
+fixtures described above.
+
+Keep the usual package/mirror/audio variables from the native commands above.
+Also point `SYNAPSE_VULKAN_SPEECH_CHECKPOINT` at the pinned original
+`model.safetensors`, not a converted fp16 package. The test checks its committed
+SHA-256, clones the profile in memory with `fp32_tensors: "all"`, converts it
+deterministically, and records the resulting package digest and byte length.
+The converted bytes need not be written to disk. Integer BatchNorm counters
+remain I64. The new pipeline reads F32 directly; activations, accumulation,
+masking, frame limits and the shared greedy loop are otherwise the same.
+
+For a fair timing comparison, use the same feature build for both runs, with
+separate evidence directories. Unset `SYNAPSE_VULKAN_SPEECH_FILTER`,
+`SYNAPSE_VULKAN_SPEECH_LAYER_REFERENCE` and `SYNAPSE_VULKAN_SPEECH_DEBUG_ENCODER`
+so capture/replay instrumentation cannot alter the measured work:
+
+```sh
+export SYNAPSE_VULKAN_SPEECH_PRECISION=f16
+export SYNAPSE_VULKAN_SPEECH_EVIDENCE="$F16_EVIDENCE"
+cargo test --locked --release -p synapse-worker-vulkan \
+  --features transcribe-f32-measurement --lib \
+  vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance \
+  -- --ignored --nocapture
+
+export SYNAPSE_VULKAN_SPEECH_PRECISION=f32
+export SYNAPSE_VULKAN_SPEECH_EVIDENCE="$F32_EVIDENCE"
+cargo test --locked --release -p synapse-worker-vulkan \
+  --features transcribe-f32-measurement --lib \
+  vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance \
+  -- --ignored --nocapture
+```
+
+On Windows set the same variables with `$env:NAME = 'value'` in PowerShell;
+the Cargo command is identical. On Linux use the SDK wrapper described above.
+Run the two commands separately: the existing fp16 numerical failures cause its
+test to exit nonzero after writing the report, and must not prevent the fp32 run.
+
+Both summaries retain the numerical findings and per-split word-error rates, and add
+per-frame encoder cosine/norm distributions, per-fixture timings, and timing
+groups for clips <=30 seconds, longer non-ladder clips, ladders and expected
+refusals. The ladder group consists of fixture IDs starting with `ladder-`,
+the synthetic encoder-frame-boundary and 600-second cases. Above-limit cases
+are counted only in expected refusals. `observe_inference_s` times the entire observed TRANSCRIBE exchange;
+the unobserved timing covers only the tensor-fixture repeat. Feature preparation,
+package conversion and model load are reported separately from those inference
+groups. The fp32 arena requirement is 3,276,015,104 bytes at 7500 valid frames;
+the fp16 requirement remains 2,021,900,544 bytes. Driver allocation size is
+recorded exactly. If `VK_EXT_memory_budget` is available, the test also reports
+the maximum device-local heap usage sampled after load and each request. This
+sample includes other allocations on the device and is not an exact
+process-private transient peak; a missing extension yields null, not a zero.
+Use an otherwise idle GPU and retain that memory-measurement scope with results.
 
 Keep logs/JSON outside `target/` and attach all three hardware results to the
 change review before landing. Do not relax tolerances or reference seals.

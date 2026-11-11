@@ -8,7 +8,7 @@ use std::{
 };
 use synapse_parity::speech::Artifact;
 
-fn compare(reference: &[f32], actual: &[f32], per_frame: bool) -> Result<Value> {
+pub(crate) fn compare(reference: &[f32], actual: &[f32], per_frame: bool) -> Result<Value> {
     ensure!(
         !reference.is_empty()
             && reference.len() == actual.len()

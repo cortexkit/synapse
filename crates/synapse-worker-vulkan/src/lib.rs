@@ -84,7 +84,7 @@ mod tests {
         );
         let mut hash = Sha256::new();
         for (name, bytes) in SHADERS {
-            if *name != "transcribe" {
+            if !name.starts_with("transcribe") {
                 hash.update(bytes);
             }
         }
