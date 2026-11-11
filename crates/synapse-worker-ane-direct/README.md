@@ -221,3 +221,72 @@ still requires coverage of every non-ladder fixture. No maximum is certified
 unless the entire full run succeeds. These are engine development measurements,
 not a substitute for the release runner's end-to-end module-path certification
 (see [backend certification](../../docs/backend-certification.md)).
+
+For numerical diagnosis, every stored-encoder case reports all per-frame cosines,
+their minimum/mean/quantiles/maximum, and counts below 0.999 and 0.9999. Optional
+`ANE_PARAKEET_LAYER_DUMP_DIR` captures completed encoder layers as raw row-major
+f32 tensors without changing the graph. `ANE_PARAKEET_LAYER_REFERENCE_INDEX` can
+name a checksum-indexed, pinned upstream CPU layer reference for one fixture;
+the kit compares every layer and reports the first stage below 0.9999. It also
+runs an isolated subsampling diagnostic, releasing that extra executable before
+the 24-program encoder runs. The peak count of simultaneously live diagnostic
+and encoder executables is reported separately and must remain within the
+100-executable budget. Unset these variables for duration/performance measurements.
+The small padded-attention unit fixture comes from the actual transformers
+5.16.1 positional-encoding and attention classes with deterministic diagonal
+projections, both position biases, and the pinned mask fix (a finite sentinel
+before softmax and zeroed masked probabilities afterwards). Its scalar row-major replay
+checks the lowered position table and gather against an independent upstream
+output rather than only comparing two versions of the worker's shift formula.
+
+`component-probe` diagnoses late-layer arithmetic and masking using a
+checksum-indexed bundle of CPU reference input/output tensors at component
+boundaries, named by
+`ANE_PARAKEET_COMPONENT_REFERENCE_INDEX`. It first runs the normal encoder and
+captures full layer-21/22 outputs, including padded positions, under
+`ANE_PARAKEET_LAYER_DUMP_DIR`. Each isolated layer-22/23 normalization,
+feed-forward, attention, convolution, and full-block program then runs on the
+same CPU seam input. Masked components additionally replace only the padded
+rows with the actual ANE predecessor's padded rows, or with zeros. The valid
+rows are identical across these controls. Reports include pairwise output
+differences and each frame's index and zero-based distance from the valid end.
+A separate readback checks the three-stage downsampled mask against the exact
+valid encoder prefix. Only one temporary program is live beside the normal
+24-program shape, so the peak is 25 executables, within the budget of 100.
+This is an owner-run diagnostic, not a certification result; the machine-wide
+Neural Engine lock and explicit opt-in are still mandatory.
+
+The opt-in runner is collect-all: a numeric mismatch is recorded and the next
+fixture still runs. Every available transcript contributes to its split's WER,
+including cases whose encoder or trace gate fails. `wer_details` includes raw
+word/edit counts, both WERs, their percentage-point delta, expected/observed case
+counts, and explicit incomplete status. Trace findings retain the first differing
+step and margins, total differing steps, and up to 16 differing-step examples.
+They also check that emitted (token id, frame index, duration) triples exactly
+match the non-blank decisions in the engine's entire trace. Encoder distributions are available wherever a
+sealed reference encoder tensor exists; other cases still require finite output
+and the exact valid-frame count. Encoder, trace, WER, progress, inventory and
+observation-parity gates are unchanged, and any failure keeps the final test red.
+No maximum duration is certified by a run containing failures.
+
+Each completed case is appended immediately to a `.cases.jsonl` receipt beside
+`ANE_PARAKEET_REPORT`. The complete JSON is checkpointed every 25 cases and at
+shape admissions, so repeated serialization does not dominate inference. Case
+records include admission, preparation, encoder and host-decoder timing, as well
+as every measured progress gap. Per-rung summaries retain cache-hit/cold-compile
+counts and estimate the full run using measured encoder time and sealed joint/
+predictor work. Missing rung measurements are reported as unknown, not zero.
+
+Run `timing` before sizing an owner window. It selects the largest in-envelope
+ladder fixture per encoder rung plus one non-tensor corpus fixture for each
+populated corpus rung. The latter measures actual frontend work rather than only
+reading sealed mel tensors. `ANE_PARAKEET_TIMING_MAX_RUNG=512` limits an initial
+pilot to smaller rungs; 1024 covers every corpus shape class, including two
+utterances above 40 seconds. Omitted large-rung costs remain unknown. Full and
+timing modes unset layer-dump diagnostic variables to avoid contaminating latency
+measurements. With the configured 600000 ms envelope (not a certification claim), full mode processes 1244
+in-envelope cases and checks three above-limit ladder refusals. The 76 in-envelope
+stored-tensor cases run twice with observation disabled, then once with it
+enabled, giving 1396 engine calls in total. A timing
+pilot is not certification, and it still returns failure for unchanged gates
+that do not pass.

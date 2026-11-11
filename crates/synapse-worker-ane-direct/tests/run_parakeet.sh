@@ -26,7 +26,7 @@ PY
     executable="$(< "$kit_dir/executable")"
     codesign --force --sign - --identifier ckdev-synapse-ane-parakeet "$executable"
     ;;
-  smoke|full|probe|probe-attention|probe-corrected)
+  smoke|full|timing|probe|probe-attention|probe-corrected|component-probe)
     : "${ANE_PARAKEET_SNAPSHOT:?set to the pinned HF snapshot directory}"
     if [[ "$1" != probe* ]]; then
       : "${ANE_PARAKEET_MIRROR:?set to the content-addressed tensor mirror root}"
@@ -41,13 +41,20 @@ PY
     export ANE_PARAKEET_PACKAGE="${ANE_PARAKEET_PACKAGE:-$kit_dir/parakeet.safetensors}"
     export ANE_PARAKEET_SMOKE=0
     export ANE_PARAKEET_PROBE=0
+    export ANE_PARAKEET_COMPONENT_PROBE=0
+    export ANE_PARAKEET_TIMING=0
     export ANE_PARAKEET_PROBE_GROUP=all
     [[ "$1" != smoke ]] || export ANE_PARAKEET_SMOKE=1
     [[ "$1" != probe* ]] || export ANE_PARAKEET_PROBE=1
     [[ "$1" != probe-attention ]] || export ANE_PARAKEET_PROBE_GROUP=attention
     [[ "$1" != probe-corrected ]] || export ANE_PARAKEET_PROBE_GROUP=corrected
+    [[ "$1" != component-probe ]] || export ANE_PARAKEET_COMPONENT_PROBE=1
+    [[ "$1" != timing ]] || export ANE_PARAKEET_TIMING=1
+    if [[ "$1" == full || "$1" == timing ]]; then
+      unset ANE_PARAKEET_LAYER_DUMP_DIR ANE_PARAKEET_LAYER_REFERENCE_INDEX ANE_PARAKEET_COMPONENT_REFERENCE_INDEX
+    fi
     executable="$(< "$kit_dir/executable")"
     exec "$executable" --exact parakeet::hardware::certify_parakeet --ignored --nocapture --test-threads=1
     ;;
-  *) echo "usage: bash $0 {build|probe|probe-attention|probe-corrected|smoke|full}" >&2; exit 2 ;;
+  *) echo "usage: bash $0 {build|probe|probe-attention|probe-corrected|component-probe|timing|smoke|full}" >&2; exit 2 ;;
 esac

@@ -238,6 +238,10 @@ impl Model {
                 } else {
                     executable.run_cached(&[src, &resident.mask], &[dst])?;
                 }
+                #[cfg(test)]
+                if observe {
+                    dump_transcribe_tensor(&format!("layer-{layer}"), shape, frames, dst)?;
+                }
                 progress()?;
             }
             let raw = resident.a.read_f32();
@@ -870,6 +874,40 @@ impl Model {
         profile.finish(serde_json::json!({"kind":"row", "tokens":tokens.len(), "shape":shape}));
         Ok(vec![score])
     }
+}
+
+#[cfg(test)]
+pub(crate) fn dump_transcribe_tensor(
+    name: &str,
+    shape: usize,
+    frames: usize,
+    tensor: &TensorData,
+) -> Result<()> {
+    let Some(root) = std::env::var_os("ANE_PARAKEET_LAYER_DUMP_DIR") else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    std::fs::create_dir_all(&root)?;
+    let raw = tensor.read_f32();
+    let rows: Vec<_> = (0..frames)
+        .flat_map(|t| (0..parakeet::HIDDEN).map(move |c| c * shape + t))
+        .map(|index| raw[index])
+        .collect();
+    std::fs::write(
+        root.join(format!("{name}-frames-{frames}.f32le")),
+        synapse_core::encode_f32_frame(&rows),
+    )?;
+    if ["layer-21", "layer-22"].contains(&name) {
+        let full: Vec<_> = (0..shape)
+            .flat_map(|t| (0..parakeet::HIDDEN).map(move |c| c * shape + t))
+            .map(|index| raw[index])
+            .collect();
+        std::fs::write(
+            root.join(format!("{name}-rung-{shape}.f32le")),
+            synapse_core::encode_f32_frame(&full),
+        )?;
+    }
+    Ok(())
 }
 fn padded_ids(tokens: &[u32], pad: u32, shape: usize) -> Vec<u32> {
     let mut ids = tokens.to_vec();

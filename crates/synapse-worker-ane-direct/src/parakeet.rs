@@ -9,6 +9,9 @@ use anyhow::{ensure, Result};
 use synapse_speech::{Joint, JointLogits};
 
 #[cfg(test)]
+#[path = "parakeet_attention_oracle.rs"]
+mod attention_oracle;
+#[cfg(test)]
 #[path = "parakeet_hardware.rs"]
 mod hardware;
 
@@ -175,10 +178,14 @@ fn feed_forward(
 
 /// Descending relative positions, interleaved sine and cosine, in NCHW order.
 fn positions(length: usize) -> Vec<f32> {
+    relative_positions(length, HIDDEN)
+}
+
+fn relative_positions(length: usize, hidden: usize) -> Vec<f32> {
     let width = length * 2 - 1;
-    let mut values = vec![0.0; HIDDEN * width];
-    for pair in 0..HIDDEN / 2 {
-        let freq = 1.0 / 10000f32.powf((2 * pair) as f32 / HIDDEN as f32);
+    let mut values = vec![0.0; hidden * width];
+    for pair in 0..hidden / 2 {
+        let freq = 1.0 / 10000f32.powf((2 * pair) as f32 / hidden as f32);
         for i in 0..width {
             let (sin, cos) = ((length as f32 - 1.0 - i as f32) * freq).sin_cos();
             values[(pair * 2) * width + i] = sin;
