@@ -3,6 +3,8 @@ use crate::{refuse, Result};
 use serde_json::Value;
 use synapse_parity::{canonical::sha256_hex, evaluator::FixtureSet, manifest::Manifest};
 
+pub mod speech;
+
 // These cases exercise short input and both sides of the 128-token shape boundary
 // without running the costly 8192 case on load. Rerank also checks a three-item
 // pool so the evaluator's existing ranking gate has real observations to grade.

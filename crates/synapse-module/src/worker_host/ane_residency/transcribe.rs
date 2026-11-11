@@ -100,6 +100,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneWorkerChannel<S> {
 
 #[cfg(unix)]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
+    async fn admit_self_check(&self, frames: usize) -> Result<AneShapeLease, AneResidencyError> {
+        if self.channel.retired.load(Ordering::Acquire) {
+            return Err(AneResidencyError::Channel("worker is retired".into()));
+        }
+        let worker: Arc<dyn AneShapeWorker> = self.channel.clone();
+        if let Some(retry_after_ms) = self.channel.cooldown_remaining() {
+            return Err(AneResidencyError::Quarantined { retry_after_ms });
+        }
+        if self.channel.faulted.load(Ordering::Acquire) {
+            self.supervisor.recover(&worker).await?;
+        }
+        let rung = self
+            .metadata
+            .buckets
+            .iter()
+            .copied()
+            .find(|r| *r >= frames)
+            .ok_or(AneResidencyError::SequenceTooLong {
+                n_tokens: frames,
+                max: self.metadata.buckets.last().copied().unwrap_or_default(),
+            })?;
+        self.supervisor
+            .lease(&worker, &self.metadata.model_ref, rung)
+            .await
+    }
+
     pub(crate) async fn transcribe_with_frames(
         self: &Arc<Self>,
         request: TranscribeRequest,
@@ -163,6 +189,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
 
 #[cfg(unix)]
 impl DirectAneEngine {
+    pub(crate) fn admit_self_check(
+        &self,
+        frames: usize,
+    ) -> Result<AneShapeLease, AneResidencyError> {
+        self.runtime
+            .as_ref()
+            .expect("live ANE runtime")
+            .block_on(self.serving.admit_self_check(frames))
+    }
+
+    // The caller holds the ordinary scheduler lease across this exchange, so
+    // no compile or second scheduler wait belongs to the timed self-check.
+    pub(crate) fn transcribe_self_check_admitted(
+        &self,
+        request: TranscribeRequest,
+        expected_frames: usize,
+    ) -> Result<WorkerTranscription, AneResidencyError> {
+        self.runtime.as_ref().expect("live ANE runtime").block_on(
+            self.serving.channel.exchange_transcription(
+                &self.serving.metadata.model_ref,
+                request,
+                expected_frames,
+            ),
+        )
+    }
+
     pub(crate) fn transcribe_with_frames(
         &self,
         request: TranscribeRequest,
@@ -338,6 +390,73 @@ mod tests {
         assert_eq!(
             *admitted.lock().unwrap(),
             [(true, 128), (true, 256), (true, 512), (true, 1024)]
+        );
+        serving.retire().await.unwrap();
+        assert_eq!(supervisor.inner.lock().reserved_executables(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn speech_self_check_admission_holds_only_an_ordinary_temporary_lease() {
+        let (channel, events) = mock_channel("speech-self-check").await;
+        let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        let serving = Arc::new(
+            AneServing::new(
+                channel.clone(),
+                supervisor.clone(),
+                AneServingMetadata {
+                    model_ref: "ane-direct:parakeet-tdt-0.6b-v3.ane-direct-worker:0".into(),
+                    dims: 1024,
+                    buckets: ANE_SHAPE_LADDER.to_vec(),
+                    pooling: synapse_core::WorkerPooling::Mean,
+                    normalize: false,
+                    timeout: std::time::Duration::from_secs(30),
+                },
+            )
+            .unwrap(),
+        );
+        let lease = serving.admit_self_check(129).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), [(true, 256)]);
+        assert_eq!(supervisor.inner.lock().reserved_executables(), 24);
+        assert_eq!(
+            supervisor
+                .inner
+                .lock()
+                .slots
+                .values()
+                .map(|s| s.leases)
+                .sum::<u32>(),
+            1
+        );
+        let result = channel
+            .exchange_transcription(
+                &serving.metadata.model_ref,
+                TranscribeRequest {
+                    mel: vec![0.0; 1033 * 128],
+                    mel_frames: 1033,
+                    valid_mel_frames: 1032,
+                    observe: false,
+                },
+                129,
+            )
+            .await
+            .unwrap();
+        assert!(result.output.triples.is_empty());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(true, 256)],
+            "timed exchange never readmits"
+        );
+        drop(lease);
+        assert_eq!(
+            supervisor
+                .inner
+                .lock()
+                .slots
+                .values()
+                .map(|s| s.leases)
+                .sum::<u32>(),
+            0
         );
         serving.retire().await.unwrap();
         assert_eq!(supervisor.inner.lock().reserved_executables(), 0);

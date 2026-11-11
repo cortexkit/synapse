@@ -28901,6 +28901,642 @@ pub(crate) fn catalog_self_check_id(
     Ok(sha256_hex(catalog::jcs(&key)?.as_bytes()))
 }
 
+// Catalog/media integration supplies lane identity and a host-loading closure.
+// Keep speech checking separate from embedding's token-count admission runtime.
+#[allow(dead_code)]
+mod transcribe_self_check {
+    use super::*;
+    use transcribe_host::{TranscribeHost, TranscribeHostError};
+
+    #[derive(Clone)]
+    pub(crate) struct Lane {
+        pub catalog_id: String,
+        pub backend: String,
+        pub profile: String,
+        pub fingerprint: String,
+        pub manifest_digest: String,
+        pub engine_identity: Value,
+    }
+
+    fn key(state: &ModuleState, lane: &Lane) -> Result<(String, Value), WireOperationError> {
+        let revision = format!(
+            "{}:{}",
+            lane.profile,
+            synapse_certify::self_check::speech::revision()
+        );
+        let id = catalog_self_check_id(
+            &lane.catalog_id,
+            &lane.manifest_digest,
+            &lane.backend,
+            &lane.fingerprint,
+            &lane.engine_identity,
+            &state.machine_profile.os_build,
+            &revision,
+        )
+        .map_err(catalog_store_error)?;
+        Ok((
+            id,
+            json!({"catalog_id": lane.catalog_id, "manifest_digest": lane.manifest_digest,
+            "backend": lane.backend, "fingerprint": lane.fingerprint,
+            "engine_identity": lane.engine_identity, "os_build": state.machine_profile.os_build,
+            "fixture_revision": revision}),
+        ))
+    }
+
+    fn failed(lane: &Lane, id: &str, reason: &str) -> WireOperationError {
+        catalog_wire_error(
+            "self_check_failed",
+            json!({
+                "model_id": catalog::lane_id(&lane.catalog_id, &lane.backend),
+                "backend": lane.backend, "check_id": id, "reason": reason,
+            }),
+            "speech numerical self-check failed",
+        )
+    }
+
+    fn crashed(reason: impl Into<String>) -> WireOperationError {
+        WireOperationError::from_stable(StableError::engine_crashed(Some(1000)), reason)
+    }
+
+    pub(crate) fn projection(
+        state: &ModuleState,
+        lane: &Lane,
+    ) -> Result<Value, WireOperationError> {
+        use rusqlite::OptionalExtension;
+        let (id, _) = key(state, lane)?;
+        let row = state.store.store.with_conn(|conn| {
+            conn.query_row("SELECT state, checked_at_ms, reason FROM catalog_self_checks WHERE check_id=?1", [&id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<u64>>(1)?, r.get::<_, Option<String>>(2)?))).optional()
+        }).map_err(catalog_store_error)?;
+        let (status, checked, reason) = row.unwrap_or(("pending".into(), None, None));
+        Ok(json!({"check_id": id, "state": status, "checked_at_ms": checked, "reason": reason}))
+    }
+
+    /// Run in a blocking task that owns the engine, not in the request future.
+    /// The lane lock, host and shape lease live until inference drains, even past the ceiling.
+    /// Catalog removal/download clears the existing persisted rows; key rotation
+    /// naturally makes a previous decision inapplicable.
+    pub(crate) fn ensure(
+        state: &ModuleState,
+        lane: &Lane,
+        load: impl FnOnce() -> Result<TranscribeHost, TranscribeHostError>,
+        phase: impl FnMut(&'static str),
+    ) -> Result<TranscribeHost, WireOperationError> {
+        ensure_using(
+            state,
+            lane,
+            load,
+            phase,
+            synapse_certify::self_check::speech::load,
+        )
+    }
+
+    fn ensure_using(
+        state: &ModuleState,
+        lane: &Lane,
+        load: impl FnOnce() -> Result<TranscribeHost, TranscribeHostError>,
+        mut phase: impl FnMut(&'static str),
+        references: impl FnOnce(
+            &str,
+        ) -> synapse_certify::Result<
+            Vec<synapse_certify::self_check::speech::Case>,
+        >,
+    ) -> Result<TranscribeHost, WireOperationError> {
+        let model_id = catalog::lane_id(&lane.catalog_id, &lane.backend);
+        let _guard = catalog_lane_lock(&state.runtime, &model_id).blocking_lock_owned();
+        let (id, key) = key(state, lane)?;
+        let saved = projection(state, lane)?;
+        if saved["state"] == "failed" {
+            return Err(failed(
+                lane,
+                &id,
+                saved["reason"].as_str().unwrap_or("reference mismatch"),
+            ));
+        }
+        let generation = if saved["state"] == "passed" {
+            None
+        } else {
+            Some(catalog_check_generation(state, &id, &key)?)
+        };
+        let references = match references(&lane.profile) {
+            Ok(references) => references,
+            Err(error) => {
+                let reason = error.to_string();
+                let generation = match generation {
+                    Some(generation) => generation,
+                    None => catalog_check_generation(state, &id, &key)?,
+                };
+                if !catalog_complete_check(state, &id, generation, "failed", Some(&reason))? {
+                    return Err(crashed("speech self-check generation changed"));
+                }
+                return Err(failed(lane, &id, &reason));
+            }
+        };
+        let execution = (|| {
+            phase("loading");
+            // Loading a worker host validates its reported transcription revisions.
+            let host = load().map_err(|e| crashed(e.to_string()))?;
+            if host.profile().id != lane.profile {
+                return Err(crashed("self-check host profile differs from lane"));
+            }
+            if saved["state"] == "passed" {
+                return Ok((host, None));
+            }
+            let mismatch = {
+                let frames = references
+                    .iter()
+                    .map(|c| c.valid_encoder_frames)
+                    .max()
+                    .expect("sealed cases");
+                if host.profile().lane == "ane-direct-worker" {
+                    phase("shape_compiling");
+                }
+                let admission = host.admit_self_check(frames).map_err(|e| {
+                    #[cfg(unix)]
+                    if let TranscribeHostError::Ane(error) = e {
+                        let wire = ane_residency_error_to_wire(error);
+                        if wire.code == "shape_compiling" {
+                            return wire;
+                        }
+                        return crashed(wire.message);
+                    }
+                    crashed(e.to_string())
+                })?;
+                phase("self_check");
+                let start = Instant::now();
+                let mut mismatch = None;
+                for case in &references {
+                    let result = admission.transcribe(&case.wav);
+                    // The ceiling includes WAV decode, frontend, engine and words,
+                    // but starts only after load/revision and shape admission.
+                    if start.elapsed() > Duration::from_millis(2000) {
+                        return Err(crashed("speech self-check exceeded 2000 ms"));
+                    }
+                    let result = result.map_err(|e| crashed(e.to_string()))?;
+                    let triples = result
+                        .output
+                        .triples
+                        .iter()
+                        .map(|t| [t.token_id, t.frame_index, t.duration])
+                        .collect::<Vec<_>>();
+                    if let Err(error) = synapse_certify::self_check::speech::compare(
+                        case,
+                        &triples,
+                        &result.transcript.text,
+                    ) {
+                        mismatch = Some(error.to_string());
+                        break;
+                    }
+                }
+                mismatch
+            };
+            Ok((host, mismatch))
+        })();
+        match execution {
+            Ok((host, mismatch)) => {
+                let status = if mismatch.is_some() {
+                    "failed"
+                } else {
+                    "passed"
+                };
+                if let Some(generation) = generation {
+                    if !catalog_complete_check(state, &id, generation, status, mismatch.as_deref())?
+                    {
+                        return Err(crashed("speech self-check generation changed"));
+                    }
+                }
+                if let Some(reason) = mismatch {
+                    return Err(failed(lane, &id, &reason));
+                }
+                phase("ready");
+                Ok(host)
+            }
+            Err(error) => {
+                if let Some(generation) = generation {
+                    catalog_complete_check(state, &id, generation, "pending", None)?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use transcribe_host::TranscribeProfile;
+
+        fn fixture(label: &str, backend: &str) -> (PathBuf, Arc<ModuleState>, Lane) {
+            let (root, descriptor) = crate::tests::test_storage_descriptor(label);
+            let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+            let profile = crate::tests::test_machine_profile("speech-check-os");
+            store.activate_profile(&profile, 1, 1000).unwrap();
+            let state = crate::tests::test_module_state(store, profile);
+            let engine = if backend == "metal" {
+                "owned-metal"
+            } else {
+                "owned-cuda"
+            };
+            let lane = Lane {
+                catalog_id: "parakeet-tdt-0.6b-v3".into(),
+                backend: backend.into(),
+                profile: format!("parakeet-tdt-0.6b-v3.{engine}"),
+                fingerprint: "test-pin".into(),
+                manifest_digest: "test-manifest".into(),
+                engine_identity: json!({"engine":engine}),
+            };
+            (root, state, lane)
+        }
+
+        #[derive(Clone, Copy)]
+        enum Behavior {
+            Pass,
+            Mismatch,
+            Runtime,
+            Slow,
+        }
+
+        fn output(
+            request: &synapse_core::TranscribeRequest,
+            behavior: Behavior,
+            index: usize,
+        ) -> Result<synapse_core::TranscribeOutput, EngineError> {
+            assert!(
+                !request.observe,
+                "certification mode must not leak into a self-check"
+            );
+            assert_eq!(request.mel.len(), request.mel_frames * 128);
+            assert!(request.mel.iter().all(|n| n.is_finite()));
+            if matches!(behavior, Behavior::Runtime) {
+                return Err(EngineError {
+                    stage: EngineErrorStage::Inference,
+                    risk_class: synapse_core::EngineRiskClass::AbortSafe,
+                    message: "runtime fixture".into(),
+                    retry_after_ms: None,
+                    safe_to_retry_same_request: false,
+                });
+            }
+            if matches!(behavior, Behavior::Slow) {
+                std::thread::sleep(Duration::from_millis(2001));
+            }
+            let cases =
+                synapse_certify::self_check::speech::load("parakeet-tdt-0.6b-v3.owned-metal")
+                    .unwrap();
+            let case = &cases[index];
+            assert_eq!(
+                request.valid_mel_frames.div_ceil(8),
+                case.valid_encoder_frames
+            );
+            let mut triples = case
+                .triples
+                .iter()
+                .map(|t| synapse_core::TranscriptRecord {
+                    token_id: t[0],
+                    frame_index: t[1],
+                    duration: t[2],
+                })
+                .collect::<Vec<_>>();
+            if matches!(behavior, Behavior::Mismatch) {
+                triples.push(synapse_core::TranscriptRecord {
+                    token_id: 380,
+                    frame_index: 0,
+                    duration: 1,
+                });
+            }
+            Ok(synapse_core::TranscribeOutput {
+                valid_encoder_frames: case.valid_encoder_frames,
+                triples,
+                observation: None,
+            })
+        }
+
+        fn host(lane: &Lane, behavior: Behavior, calls: Arc<AtomicUsize>) -> TranscribeHost {
+            let profile = TranscribeProfile::pinned(&lane.profile).unwrap();
+            #[cfg(unix)]
+            if lane.backend == "cuda" {
+                let engine = worker_host::WorkerEngine::new(worker_host::WorkerHostConfig::new(
+                    "/bin/false",
+                    "unused",
+                ))
+                .unwrap();
+                let model =
+                    engine.insert_loaded_model_for_test("speech-check".into(), 1024, 0, None);
+                engine.attach_mock_worker_for_test(move |request, raw| {
+                    let synapse_core::WorkerRequest::Transcribe {
+                        req_id,
+                        mel_frames,
+                        valid_mel_frames,
+                        observe,
+                        ..
+                    } = request
+                    else {
+                        panic!("expected TRANSCRIBE")
+                    };
+                    let request = synapse_core::TranscribeRequest {
+                        mel: synapse_core::decode_f32_frame(raw.unwrap()).unwrap(),
+                        mel_frames: *mel_frames,
+                        valid_mel_frames: *valid_mel_frames,
+                        observe: *observe,
+                    };
+                    let index = calls.fetch_add(1, Ordering::SeqCst);
+                    match output(&request, behavior, index) {
+                        Ok(out) => (
+                            synapse_core::WorkerResponse::Transcript {
+                                req_id: req_id.clone(),
+                                valid_encoder_frames: out.valid_encoder_frames,
+                                count: out.triples.len(),
+                            },
+                            Some(synapse_core::encode_transcript_frame(&out.triples)),
+                        ),
+                        Err(_) => (
+                            synapse_core::WorkerResponse::Err {
+                                req_id: Some(req_id.clone()),
+                                code: "engine_crashed".into(),
+                                msg: "runtime fixture".into(),
+                            },
+                            None,
+                        ),
+                    }
+                });
+                return TranscribeHost::worker_for_test(profile, engine, model);
+            }
+            TranscribeHost::in_process_for_test(profile, move |request| {
+                output(&request, behavior, calls.fetch_add(1, Ordering::SeqCst))
+            })
+        }
+
+        fn outcomes(backend: &str) {
+            for (name, behavior, code) in [
+                ("pass", Behavior::Pass, None),
+                ("mismatch", Behavior::Mismatch, Some("self_check_failed")),
+                ("runtime", Behavior::Runtime, Some("engine_crashed")),
+                ("slow", Behavior::Slow, Some("engine_crashed")),
+            ] {
+                let (root, state, lane) = fixture(&format!("speech-{backend}-{name}"), backend);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut phases = Vec::new();
+                let result = ensure(
+                    &state,
+                    &lane,
+                    || Ok(host(&lane, behavior, calls.clone())),
+                    |p| phases.push(p),
+                );
+                if let Some(code) = code {
+                    let error = result.err().unwrap();
+                    assert_eq!(error.code, code);
+                    if code == "self_check_failed" {
+                        assert_eq!(error.class, ErrorClass::Permanent);
+                        assert!(error.retry_after_ms.is_none());
+                        let details = error.details.unwrap();
+                        assert_eq!(details["backend"], backend);
+                        assert_eq!(
+                            details["model_id"],
+                            catalog::lane_id(&lane.catalog_id, backend)
+                        );
+                        assert_eq!(
+                            details["check_id"],
+                            projection(&state, &lane).unwrap()["check_id"]
+                        );
+                        assert!(details["reason"].as_str().unwrap().contains("silence-1s"));
+                        assert_eq!(projection(&state, &lane).unwrap()["state"], "failed");
+                        assert_eq!(
+                            ensure(
+                                &state,
+                                &lane,
+                                || panic!("permanent failures never load again"),
+                                |_| {}
+                            )
+                            .err()
+                            .unwrap()
+                            .code,
+                            code
+                        );
+                    } else {
+                        assert_eq!(error.class, ErrorClass::Transient);
+                        assert!(error.retry_after_ms.is_some());
+                        assert_eq!(projection(&state, &lane).unwrap()["state"], "pending");
+                    }
+                } else {
+                    drop(result.unwrap());
+                    assert_eq!(calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(phases, ["loading", "self_check", "ready"]);
+                    assert_eq!(projection(&state, &lane).unwrap()["state"], "passed");
+                    let (check_id, _) = key(&state, &lane).unwrap();
+                    let generation = || {
+                        state
+                            .store
+                            .store
+                            .with_conn(|conn| {
+                                conn.query_row(
+                                    "SELECT generation FROM catalog_self_checks WHERE check_id=?1",
+                                    [&check_id],
+                                    |row| row.get::<_, u64>(0),
+                                )
+                            })
+                            .unwrap()
+                    };
+                    let checked_generation = generation();
+                    let checked_at = projection(&state, &lane).unwrap()["checked_at_ms"].clone();
+                    drop(
+                        ensure(
+                            &state,
+                            &lane,
+                            || Ok(host(&lane, Behavior::Runtime, calls.clone())),
+                            |_| {},
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        3,
+                        "cached pass runs no inference"
+                    );
+                    assert_eq!(
+                        generation(),
+                        checked_generation,
+                        "reusing evidence starts no new check"
+                    );
+                    assert_eq!(
+                        projection(&state, &lane).unwrap()["checked_at_ms"],
+                        checked_at
+                    );
+                }
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+
+        #[test]
+        fn speech_self_check_in_process_outcomes() {
+            outcomes("metal");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn speech_self_check_mock_worker_outcomes() {
+            outcomes("cuda");
+        }
+
+        #[test]
+        fn speech_self_check_reference_failure_persists_until_key_change_or_download() {
+            reference_failures("metal");
+            #[cfg(unix)]
+            reference_failures("cuda");
+        }
+
+        fn reference_failures(backend: &str) {
+            for invalid in [false, true] {
+                let (root, state, mut lane) = fixture(
+                    if invalid {
+                        "speech-seal"
+                    } else {
+                        "speech-absent"
+                    },
+                    backend,
+                );
+                let error = ensure_using(
+                    &state,
+                    &lane,
+                    || panic!("bad references never infer"),
+                    |_| {},
+                    |_| {
+                        if invalid {
+                            Err(synapse_certify::Error("invalid seal".into()))
+                        } else {
+                            synapse_certify::self_check::speech::load("absent")
+                        }
+                    },
+                )
+                .err()
+                .unwrap();
+                assert_eq!(error.code, "self_check_failed");
+                assert!(error.retry_after_ms.is_none());
+                assert_eq!(
+                    ensure(
+                        &state,
+                        &lane,
+                        || panic!("failed reference stays failed"),
+                        |_| {}
+                    )
+                    .err()
+                    .unwrap(),
+                    error
+                );
+                let old = projection(&state, &lane).unwrap()["check_id"].clone();
+                lane.fingerprint = "rotated".into();
+                assert_ne!(projection(&state, &lane).unwrap()["check_id"], old);
+                drop(
+                    ensure(
+                        &state,
+                        &lane,
+                        || Ok(host(&lane, Behavior::Pass, Arc::new(AtomicUsize::new(0)))),
+                        |_| {},
+                    )
+                    .unwrap(),
+                );
+                lane.fingerprint = "test-pin".into();
+                // This is the same catalog-id reset used by model removal/download.
+                state
+                    .store
+                    .store
+                    .with_conn_fenced(|tx| {
+                        tx.execute(
+                            "DELETE FROM catalog_self_checks WHERE catalog_id=?1",
+                            [&lane.catalog_id],
+                        )
+                    })
+                    .unwrap();
+                drop(
+                    ensure(
+                        &state,
+                        &lane,
+                        || Ok(host(&lane, Behavior::Pass, Arc::new(AtomicUsize::new(0)))),
+                        |_| {},
+                    )
+                    .unwrap(),
+                );
+                drop(state);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+
+        #[test]
+        fn speech_self_check_load_failure_is_retryable_and_precedes_execution() {
+            load_failure("metal");
+            #[cfg(unix)]
+            load_failure("cuda");
+        }
+
+        fn load_failure(backend: &str) {
+            let (root, state, lane) = fixture("speech-load", backend);
+            let error = ensure(
+                &state,
+                &lane,
+                || Err(TranscribeHostError::Profile("load fixture".into())),
+                |_| {},
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.code, "engine_crashed");
+            assert!(error.retry_after_ms.is_some());
+            assert_eq!(projection(&state, &lane).unwrap()["state"], "pending");
+            drop(
+                ensure(
+                    &state,
+                    &lane,
+                    || {
+                        if backend == "metal" {
+                            std::thread::sleep(Duration::from_millis(2001));
+                        }
+                        Ok(host(&lane, Behavior::Pass, Arc::new(AtomicUsize::new(0))))
+                    },
+                    |_| {},
+                )
+                .unwrap(),
+            );
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        /// Uses the actual Metal engine rather than a test callback.
+        #[cfg(target_os = "macos")]
+        #[test]
+        #[ignore = "requires pinned model and SYNAPSE_METAL_SPEECH_GPU=1 hardware opt-in"]
+        fn speech_self_check_real_metal() {
+            assert_eq!(env::var("SYNAPSE_METAL_SPEECH_GPU").as_deref(), Ok("1"));
+            let (root, state, lane) = fixture("speech-real-metal", "metal");
+            let cfg = RuntimeConfig {
+                values: [(
+                    "model_path".into(),
+                    env::var("SYNAPSE_METAL_SPEECH_MODEL").unwrap(),
+                )]
+                .into(),
+            };
+            drop(
+                ensure(
+                    &state,
+                    &lane,
+                    || {
+                        TranscribeHost::load_metal(
+                            TranscribeProfile::pinned(&lane.profile).unwrap(),
+                            &synapse_core::ValidatedArtifact {
+                                format: "safetensors-package".into(),
+                                digest: "test".into(),
+                            },
+                            &cfg,
+                            transcribe_host::ObservationMode::Certification,
+                        )
+                    },
+                    |_| {},
+                )
+                .unwrap(),
+            );
+            drop(state);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
 fn catalog_self_check_key(
     state: &ModuleState,
     entry: &catalog::CatalogEntry,

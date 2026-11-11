@@ -248,6 +248,49 @@ enum Backend {
     Worker(WorkerEngine, LoadedModel),
     #[cfg(unix)]
     Ane(crate::worker_host::ane_residency::DirectAneEngine),
+    #[cfg(test)]
+    InProcessTest(Box<dyn Fn(TranscribeRequest) -> Result<TranscribeOutput, EngineError> + Send>),
+}
+
+/// A normal, temporary shape lease. It is released after checking, never pinned
+/// for the model's lifetime. Keeping it alive keeps compilation out of the timed check.
+pub struct SelfCheckAdmission<'a> {
+    host: &'a TranscribeHost,
+    frames: usize,
+    #[cfg(unix)]
+    _lease: Option<crate::worker_host::ane_residency::AneShapeLease>,
+}
+
+impl SelfCheckAdmission<'_> {
+    pub fn transcribe(&self, wav: &[u8]) -> Result<TranscribeResult, TranscribeHostError> {
+        let prepared = prepare_wav(&self.host.profile, wav, ObservationMode::Serving)?;
+        if prepared.valid_encoder_frames > self.frames {
+            return Err(TranscribeHostError::Profile(
+                "self-check exceeds admitted shape".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if let Backend::Ane(engine) = &self.host.backend {
+            if crate::worker_host::ane_residency::ladder_rung(prepared.valid_encoder_frames)
+                != crate::worker_host::ane_residency::ladder_rung(self.frames)
+            {
+                return Err(TranscribeHostError::Profile(
+                    "self-check input requires a different admitted rung".into(),
+                ));
+            }
+            let result = engine
+                .transcribe_self_check_admitted(prepared.request, prepared.valid_encoder_frames)?;
+            return finish(
+                result.output,
+                Some(result.transcript_frame),
+                result.observation,
+                result.progress,
+                prepared.valid_encoder_frames,
+                prepared.audio_duration_ms,
+            );
+        }
+        self.host.transcribe_prepared(prepared, |_| {})
+    }
 }
 
 /// One loaded transcription lane. A worker backend is constructed here, never
@@ -259,6 +302,56 @@ pub struct TranscribeHost {
 }
 
 impl TranscribeHost {
+    /// Call from the lane's blocking task after load and revision validation.
+    /// Direct ANE uses the shared compile scheduler and its usual leased LRU budget.
+    pub fn admit_self_check(
+        &self,
+        frames: usize,
+    ) -> Result<SelfCheckAdmission<'_>, TranscribeHostError> {
+        if frames == 0 || frames > self.profile.max_encoder_frames {
+            return Err(TranscribeHostError::Profile(
+                "invalid self-check frame envelope".into(),
+            ));
+        }
+        #[cfg(unix)]
+        let lease = if let Backend::Ane(engine) = &self.backend {
+            Some(engine.admit_self_check(frames)?)
+        } else {
+            None
+        };
+        Ok(SelfCheckAdmission {
+            host: self,
+            frames,
+            #[cfg(unix)]
+            _lease: lease,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_process_for_test(
+        profile: TranscribeProfile,
+        run: impl Fn(TranscribeRequest) -> Result<TranscribeOutput, EngineError> + Send + 'static,
+    ) -> Self {
+        Self {
+            profile,
+            mode: ObservationMode::Certification,
+            backend: Backend::InProcessTest(Box::new(run)),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn worker_for_test(
+        profile: TranscribeProfile,
+        engine: WorkerEngine,
+        model: LoadedModel,
+    ) -> Self {
+        Self {
+            profile,
+            mode: ObservationMode::Certification,
+            backend: Backend::Worker(engine, model),
+        }
+    }
+
     pub fn load_metal(
         profile: TranscribeProfile,
         artifact: &ValidatedArtifact,
@@ -376,10 +469,25 @@ impl TranscribeHost {
         &self,
         wav: &[u8],
         mode: ObservationMode,
-        mut metal_progress: impl FnMut(Progress),
+        metal_progress: impl FnMut(Progress),
     ) -> Result<TranscribeResult, TranscribeHostError> {
         let prepared = prepare_wav(&self.profile, wav, mode)?;
+        self.transcribe_prepared(prepared, metal_progress)
+    }
+
+    fn transcribe_prepared(
+        &self,
+        prepared: PreparedTranscription,
+        mut metal_progress: impl FnMut(Progress),
+    ) -> Result<TranscribeResult, TranscribeHostError> {
         let (output, transcript_frame, observation, progress) = match &self.backend {
+            #[cfg(test)]
+            Backend::InProcessTest(run) => (
+                run(prepared.request).map_err(TranscribeHostError::Engine)?,
+                None,
+                None,
+                Vec::new(),
+            ),
             Backend::Metal(engine, model) => {
                 let output = engine
                     .transcribe_with_progress(model, prepared.request, &mut metal_progress)
