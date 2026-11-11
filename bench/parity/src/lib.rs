@@ -22,6 +22,7 @@ pub mod oracle;
 pub mod preload;
 pub mod rules;
 pub mod safetensors;
+pub mod speech;
 pub mod validate;
 pub mod vulkan;
 

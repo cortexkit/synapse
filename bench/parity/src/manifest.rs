@@ -17,13 +17,20 @@ use crate::{perr, Result};
 pub const SCHEMA: &str = "synapse-parity-models-v1";
 pub const MANIFEST_FILE: &str = "models.json";
 
-/// The four model slugs this manifest covers. Order does not matter; every
-/// check compares them as a set.
+/// Embed/rerank slugs using the token-input reference fixture format.
 pub const MODEL_SLUGS: [&str; 4] = [
     "gte-modernbert-base",
     "gte-reranker-modernbert-base",
     "qwen3-embedding-0.6b",
     "qwen3-reranker-0.6b",
+];
+
+pub const ALL_MODEL_SLUGS: [&str; 5] = [
+    MODEL_SLUGS[0],
+    MODEL_SLUGS[1],
+    MODEL_SLUGS[2],
+    MODEL_SLUGS[3],
+    "parakeet-tdt-0.6b-v3",
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -84,6 +91,7 @@ pub struct Rotation {
 pub enum Operation {
     Embed,
     Rerank,
+    Transcribe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -91,6 +99,7 @@ pub enum Operation {
 pub enum Family {
     Modernbert,
     Qwen3,
+    ParakeetTdt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,8 +187,10 @@ pub struct Model {
     pub checkpoint_digest: String,
     pub tokenizer_digest: String,
     pub architecture: Architecture,
-    pub grammar: Grammar,
-    pub output: Output,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<Grammar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Output>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<Head>,
 }
@@ -193,6 +204,20 @@ pub struct Architecture {
     /// Parameter name to value. The allowed names, their JSON types and the
     /// checkpoint field each comes from are fixed per family in `arch`.
     pub params: BTreeMap<String, Value>,
+}
+
+impl Model {
+    pub fn grammar(&self) -> Result<&Grammar> {
+        self.grammar
+            .as_ref()
+            .ok_or_else(|| perr!("model has no token-input grammar"))
+    }
+
+    pub fn output(&self) -> Result<&Output> {
+        self.output
+            .as_ref()
+            .ok_or_else(|| perr!("model has no embed/rerank output"))
+    }
 }
 
 impl Architecture {
@@ -381,6 +406,8 @@ pub struct Profile {
     pub cuda_min_compute_major: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_min_compute_minor: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe: Option<crate::speech::SpeechProfile>,
 }
 
 /// Digests recorded in the manifest. They are outside every hashed entry, so
@@ -430,7 +457,7 @@ impl Manifest {
     /// Canonical grammar entry for one model; its SHA-256 is the grammar digest.
     pub fn grammar_entry(&self, slug: &str) -> Result<Value> {
         let model = self.model(slug)?;
-        Ok(json!({"model": slug, "grammar": model.grammar}))
+        Ok(json!({"model": slug, "grammar": model.grammar()?}))
     }
 
     pub fn grammar_digest(&self, slug: &str) -> Result<String> {
@@ -477,8 +504,10 @@ impl Manifest {
     /// Recompute every grammar and profile digest.
     pub fn computed_digests(&self) -> Result<Digests> {
         let mut grammar = BTreeMap::new();
-        for slug in self.models.keys() {
-            grammar.insert(slug.clone(), self.grammar_digest(slug)?);
+        for (slug, model) in &self.models {
+            if model.grammar.is_some() {
+                grammar.insert(slug.clone(), self.grammar_digest(slug)?);
+            }
         }
         let mut profiles = BTreeMap::new();
         for id in self.profiles.keys() {

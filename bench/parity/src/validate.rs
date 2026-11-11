@@ -17,7 +17,7 @@ use crate::canonical::{is_sha256_hex, sha256_hex};
 use crate::hadamard;
 use crate::manifest::{
     profile_id, Family, Grammar, GrammarKind, Head, Lane, Manifest, Model, Normalization,
-    Operation, Pooling, ReadoutKind, MANIFEST_FILE, MODEL_SLUGS, SCHEMA,
+    Operation, Pooling, ReadoutKind, ALL_MODEL_SLUGS as MODEL_SLUGS, MANIFEST_FILE, SCHEMA,
 };
 use crate::oracle::check_template;
 use crate::rules::{check_profile, MODERNBERT_ROTATION};
@@ -215,6 +215,22 @@ fn check_model(slug: &str, model: &Model, parity_dir: &Path) -> Result<()> {
         .map(|(name, info)| (name, info.shape))
         .collect();
     check_tensor_index(model, &index)?;
+    if model.operation == Operation::Transcribe {
+        if model.architecture.family != Family::ParakeetTdt
+            || model.grammar.is_some()
+            || model.output.is_some()
+            || model.head.is_some()
+        {
+            return Err(perr!(
+                "Parakeet transcribe must have no grammar, output or rerank head"
+            ));
+        }
+        for name in ["processor_config.json", "generation_config.json"] {
+            let bytes = std::fs::read(dir.join(name)).map_err(|e| perr!("read {name}: {e}"))?;
+            check_pinned_copy(model, name, &bytes)?;
+        }
+        return Ok(());
+    }
     check_output(slug, model)?;
     check_grammar(model, &config, parity_dir)?;
     check_head(model, &config, &index)?;
@@ -266,9 +282,9 @@ fn check_output(slug: &str, model: &Model) -> Result<()> {
             ))
         }
     };
-    if model.grammar.pooling != pooling
-        || model.output.dimension != dimension
-        || model.output.normalization != normalization
+    if model.grammar()?.pooling != pooling
+        || model.output()?.dimension != dimension
+        || model.output()?.normalization != normalization
     {
         return Err(perr!(
             "output must be pooling {pooling:?}, dimension {dimension}, normalization {normalization:?}"
@@ -285,7 +301,7 @@ fn config_u64(config: &Value, key: &str) -> Result<u64> {
 }
 
 fn check_grammar(model: &Model, config: &Value, parity_dir: &Path) -> Result<()> {
-    let grammar: &Grammar = &model.grammar;
+    let grammar: &Grammar = model.grammar()?;
     let arch = &model.architecture;
     if u64::from(grammar.pad.id) != arch.int("pad_token_id")? {
         return Err(perr!(
@@ -404,6 +420,7 @@ fn check_grammar(model: &Model, config: &Value, parity_dir: &Path) -> Result<()>
                 ));
             }
         }
+        _ => return Err(perr!("model family/operation has no embed/rerank grammar")),
     }
     if model.operation == Operation::Embed
         && (grammar.readout.yes.is_some() || grammar.readout.weight.is_some())
@@ -422,6 +439,7 @@ pub fn check_head(model: &Model, config: &Value, index: &BTreeMap<String, Vec<u6
         (Operation::Embed, Some(_)) => return Err(perr!("embed models have no rerank head")),
         (Operation::Rerank, None) => return Err(perr!("rerank model without a head")),
         (Operation::Rerank, Some(head)) => head,
+        (Operation::Transcribe, _) => return Err(perr!("transcribe has no rerank head")),
     };
     let arch = &model.architecture;
     let hidden = arch.int("hidden_size")?;
@@ -496,7 +514,7 @@ pub fn check_head(model: &Model, config: &Value, index: &BTreeMap<String, Vec<u6
             } else {
                 ("lm_head.weight".to_string(), vec![])
             };
-            if model.grammar.readout.weight.as_deref() != Some(key.as_str()) {
+            if model.grammar()?.readout.weight.as_deref() != Some(key.as_str()) {
                 return Err(perr!(
                     "qwen_readout_mismatch: readout weight must be `{key}`"
                 ));
@@ -511,6 +529,7 @@ pub fn check_head(model: &Model, config: &Value, index: &BTreeMap<String, Vec<u6
                 None,
             )
         }
+        Family::ParakeetTdt => return Err(perr!("transcribe has no rerank head")),
     };
     let required: Vec<String> = {
         let mut keys: Vec<String> = tensors.values().map(|t| t.key.clone()).collect();
@@ -532,7 +551,7 @@ pub fn check_head(model: &Model, config: &Value, index: &BTreeMap<String, Vec<u6
             serde_json::to_string(&expected).expect("head serializes")
         ));
     }
-    if head.pooling != model.grammar.pooling {
+    if head.pooling != model.grammar()?.pooling {
         return Err(perr!("head pooling differs from the grammar pooling"));
     }
     for tensor in head.tensors.values() {
@@ -666,6 +685,14 @@ fn check_profiles(manifest: &Manifest) -> Result<()> {
             _ => return Err(perr!("non-CUDA profile `{id}` carries CUDA floor keys")),
         }
         check_profile(id, &profile.model, model, profile)?;
+        // Speech backends establish allocation floors when their kernels are
+        // certified; token batching is not a speech shape.
+        if model.operation == Operation::Transcribe {
+            if profile.vulkan_sub_batch_max_tokens.is_some() {
+                return Err(perr!("transcribe must not carry a token sub-batch limit"));
+            }
+            continue;
+        }
         let vulkan = (
             profile.vulkan_sub_batch_max_tokens,
             profile.vulkan_min_storage_buffer_range,

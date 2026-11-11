@@ -15,6 +15,7 @@ pub enum StDType {
     F16,
     Bf16,
     F32,
+    I64,
 }
 
 impl StDType {
@@ -23,6 +24,7 @@ impl StDType {
             "F16" => Ok(Self::F16),
             "BF16" => Ok(Self::Bf16),
             "F32" => Ok(Self::F32),
+            "I64" => Ok(Self::I64),
             other => Err(perr!("unsupported safetensors dtype `{other}`")),
         }
     }
@@ -32,6 +34,7 @@ impl StDType {
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
             Self::F32 => "F32",
+            Self::I64 => "I64",
         }
     }
 
@@ -39,6 +42,7 @@ impl StDType {
         match self {
             Self::F16 | Self::Bf16 => 2,
             Self::F32 => 4,
+            Self::I64 => 8,
         }
     }
 }
@@ -234,6 +238,11 @@ impl Checkpoint {
     pub fn values_f32(&self, name: &str) -> Result<Vec<f32>> {
         let (info, raw) = self.raw(name)?;
         Ok(match info.dtype {
+            StDType::I64 => {
+                return Err(perr!(
+                    "integer tensor `{name}` is not a floating-point weight"
+                ))
+            }
             StDType::F32 => raw
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

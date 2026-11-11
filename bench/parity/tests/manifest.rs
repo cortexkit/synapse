@@ -76,7 +76,7 @@ fn every_model_pins_revision_tokenizer_operation_output_and_parameters() {
         let model = m.model(slug).unwrap();
         assert_eq!(model.hf_revision.len(), 40, "{slug}");
         assert!(model.tokenizer_digest.starts_with("sha256:"), "{slug}");
-        assert!(model.output.dimension > 0, "{slug}");
+        assert!(model.output.as_ref().unwrap().dimension > 0, "{slug}");
         check_schema(slug, &model.architecture).unwrap();
     }
     assert_eq!(
@@ -178,6 +178,8 @@ fn template_literals_equal_the_oracle_and_any_difference_fails() {
         .model("qwen3-reranker-0.6b")
         .unwrap()
         .grammar
+        .as_ref()
+        .unwrap()
         .template
         .clone()
         .unwrap();
@@ -213,15 +215,22 @@ fn template_literals_equal_the_oracle_and_any_difference_fails() {
 #[test]
 fn yes_and_no_ids_are_recorded_and_checked() {
     let m = manifest();
-    let readout = &m.model("qwen3-reranker-0.6b").unwrap().grammar.readout;
+    let readout = &m
+        .model("qwen3-reranker-0.6b")
+        .unwrap()
+        .grammar
+        .as_ref()
+        .unwrap()
+        .readout;
     assert_eq!(readout.yes.as_ref().unwrap().id, 9693);
     assert_eq!(readout.no.as_ref().unwrap().id, 2152);
 
     let mut swapped = m.clone();
     let model = swapped.models.get_mut("qwen3-reranker-0.6b").unwrap();
-    let yes = model.grammar.readout.yes.clone();
-    model.grammar.readout.yes = model.grammar.readout.no.clone();
-    model.grammar.readout.no = yes;
+    let grammar = model.grammar.as_mut().unwrap();
+    let yes = grammar.readout.yes.clone();
+    grammar.readout.yes = grammar.readout.no.clone();
+    grammar.readout.no = yes;
     expect_err(
         validate_manifest(&swapped, &parity_dir()),
         "qwen_readout_mismatch",
@@ -267,7 +276,7 @@ fn rerank_heads_are_checked_against_the_tensor_index() {
     let qwen_index = tensor_index("qwen3-reranker-0.6b");
     check_head(qwen, &qwen_config, &qwen_index).unwrap();
     assert_eq!(
-        qwen.grammar.readout.weight.as_deref(),
+        qwen.grammar.as_ref().unwrap().readout.weight.as_deref(),
         Some("model.embed_tokens.weight")
     );
     // Untied, the readout must be lm_head.weight.
@@ -280,7 +289,7 @@ fn rerank_heads_are_checked_against_the_tensor_index() {
         check_head(&untied, &qwen_config, &qwen_index),
         "readout weight must be `lm_head.weight`",
     );
-    untied.grammar.readout.weight = Some("lm_head.weight".into());
+    untied.grammar.as_mut().unwrap().readout.weight = Some("lm_head.weight".into());
     expect_err(
         check_head(&untied, &qwen_config, &qwen_index),
         "rerank head disagrees",
@@ -454,7 +463,7 @@ fn vulkan_floors_equal_the_sizing_function() {
         for n in 1..=512 {
             assert!(floor_at(n) <= floor_at(n + 1), "{id} at {n}");
         }
-        let result_bytes = u64::from(m.model(slug).unwrap().output.dimension) * 4;
+        let result_bytes = u64::from(m.model(slug).unwrap().output.as_ref().unwrap().dimension) * 4;
         let quantum = BUFFER_ALIGNMENT.div_ceil(result_bytes);
         for n in [1, 63, 128, 255, 256, 512] {
             assert!(
@@ -495,7 +504,7 @@ fn vulkan_floors_equal_the_sizing_function() {
 fn digests_cover_every_grammar_and_profile_entry() {
     let m = manifest();
     assert_eq!(m.digests.grammar.len(), 4);
-    assert_eq!(m.digests.profiles.len(), 16);
+    assert_eq!(m.digests.profiles.len(), 20);
     let mut all: Vec<&String> = m
         .digests
         .grammar
@@ -504,7 +513,7 @@ fn digests_cover_every_grammar_and_profile_entry() {
         .collect();
     all.sort();
     all.dedup();
-    assert_eq!(all.len(), 20, "every entry hashes differently");
+    assert_eq!(all.len(), 24, "every entry hashes differently");
     assert_eq!(m.computed_digests().unwrap(), m.digests);
 
     // Changing a per-profile key changes that profile's digest only.
@@ -530,6 +539,8 @@ fn digests_cover_every_grammar_and_profile_entry() {
                 .get_mut("qwen3-reranker-0.6b")
                 .unwrap()
                 .grammar
+                .as_mut()
+                .unwrap()
                 .template
                 .as_mut()
                 .unwrap()
@@ -541,6 +552,8 @@ fn digests_cover_every_grammar_and_profile_entry() {
                 .get_mut("qwen3-reranker-0.6b")
                 .unwrap()
                 .grammar
+                .as_mut()
+                .unwrap()
                 .readout
                 .yes
                 .as_mut()

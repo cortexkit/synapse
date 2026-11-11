@@ -220,7 +220,21 @@ pub(crate) fn convert_with(
             }
             None => {
                 let (info, raw) = checkpoint.raw(&name)?;
-                if fp32 && info.dtype == StDType::F32 {
+                if info.dtype == StDType::I64 {
+                    if model.architecture.family != Family::ParakeetTdt
+                        || !name.ends_with(".conv.norm.num_batches_tracked")
+                        || !info.shape.is_empty()
+                    {
+                        return Err(perr!("unexpected integer tensor `{name}`"));
+                    }
+                    // BatchNorm's inference-unused scalar counter is retained
+                    // losslessly, rather than rounded as a floating-point weight.
+                    PackageTensor {
+                        dtype: StDType::I64,
+                        shape: vec![],
+                        bytes: raw.to_vec(),
+                    }
+                } else if fp32 && info.dtype == StDType::F32 {
                     PackageTensor {
                         dtype: StDType::F32,
                         shape: info.shape.clone(),
@@ -506,6 +520,7 @@ mod tests {
 
     fn encode_values(values: &[f32], dtype: StDType) -> Vec<u8> {
         match dtype {
+            StDType::I64 => panic!("floating-point fixture cannot contain integer tensors"),
             StDType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
             StDType::F16 => values
                 .iter()

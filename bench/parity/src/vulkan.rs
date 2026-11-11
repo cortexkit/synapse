@@ -74,6 +74,11 @@ pub fn buffer_plan(
     let intermediate = arch.int("intermediate_size")?;
     let (q_dim, kv_dim) = match arch.family {
         Family::Modernbert => (hidden, hidden),
+        Family::ParakeetTdt => {
+            return Err(perr!(
+                "speech allocation floors require the transcribe kernel's buffer inventory"
+            ))
+        }
         Family::Qwen3 => {
             let head_dim = arch.int("head_dim")?;
             (
@@ -127,7 +132,7 @@ pub fn buffer_plan(
     }
     plan.push(Buffer {
         name: "result".to_string(),
-        bytes: sequences * u64::from(model.output.dimension) * F32,
+        bytes: sequences * u64::from(model.output()?.dimension) * F32,
         per_sub_batch: false,
     });
     Ok(plan)

@@ -16,7 +16,7 @@ fn reference_outputs(
     model: &str,
     fixtures: &FixtureSet,
 ) -> BTreeMap<String, ObservedCase> {
-    let readout = &manifest.models[model].grammar.readout;
+    let readout = &manifest.models[model].grammar.as_ref().unwrap().readout;
     let readout = readout
         .yes
         .as_ref()
@@ -42,6 +42,9 @@ fn reference_outputs(
 fn committed_references_pass_every_profile_and_report_identity() {
     let manifest = manifest();
     for (id, profile) in &manifest.profiles {
+        if manifest.models[&profile.model].operation == Operation::Transcribe {
+            continue;
+        }
         let fixtures = FixtureSet::load(&parity_dir(), &manifest, &profile.model).unwrap();
         let outputs = reference_outputs(&manifest, &profile.model, &fixtures);
         let report = evaluate(&manifest, id, "runtime-fingerprint", &fixtures, &outputs).unwrap();
@@ -65,6 +68,7 @@ fn committed_references_pass_every_profile_and_report_identity() {
                 assert_eq!(report.tolerance_class, profile.rerank_tolerance_class);
                 assert_eq!(report.metrics.pools.len(), 2);
             }
+            Operation::Transcribe => unreachable!("speech fixtures have their own evaluator"),
         }
         assert_eq!(report.completed_fixtures, fixtures.cases().len());
         let json = serde_json::to_value(report).unwrap();
@@ -82,6 +86,9 @@ fn committed_references_pass_every_profile_and_report_identity() {
 fn no_output_fails_every_gate_with_zero_completed_fixtures() {
     let manifest = manifest();
     for (id, profile) in &manifest.profiles {
+        if manifest.models[&profile.model].operation == Operation::Transcribe {
+            continue;
+        }
         let fixtures = FixtureSet::load(&parity_dir(), &manifest, &profile.model).unwrap();
         let report = evaluate(&manifest, id, "missing", &fixtures, &BTreeMap::new()).unwrap();
         assert_eq!(report.completed_fixtures, 0);

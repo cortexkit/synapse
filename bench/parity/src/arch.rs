@@ -35,6 +35,7 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Config(&'static str),
+    EncoderConfig(&'static str),
     PadTokenFromTokenizerConfig,
     Class,
 }
@@ -175,10 +176,100 @@ pub const QWEN3_PARAMS: &[ParamSpec] = &[
     ),
 ];
 
+pub const PARAKEET_PARAMS: &[ParamSpec] = &[
+    spec(
+        "num_hidden_layers",
+        Kind::Int,
+        Source::EncoderConfig("num_hidden_layers"),
+    ),
+    spec(
+        "hidden_size",
+        Kind::Int,
+        Source::EncoderConfig("hidden_size"),
+    ),
+    spec(
+        "num_attention_heads",
+        Kind::Int,
+        Source::EncoderConfig("num_attention_heads"),
+    ),
+    spec(
+        "intermediate_size",
+        Kind::Int,
+        Source::EncoderConfig("intermediate_size"),
+    ),
+    spec(
+        "num_mel_bins",
+        Kind::Int,
+        Source::EncoderConfig("num_mel_bins"),
+    ),
+    spec(
+        "subsampling_conv_channels",
+        Kind::Int,
+        Source::EncoderConfig("subsampling_conv_channels"),
+    ),
+    spec(
+        "subsampling_conv_kernel_size",
+        Kind::Int,
+        Source::EncoderConfig("subsampling_conv_kernel_size"),
+    ),
+    spec(
+        "subsampling_conv_stride",
+        Kind::Int,
+        Source::EncoderConfig("subsampling_conv_stride"),
+    ),
+    spec(
+        "subsampling_factor",
+        Kind::Int,
+        Source::EncoderConfig("subsampling_factor"),
+    ),
+    spec(
+        "conv_kernel_size",
+        Kind::Int,
+        Source::EncoderConfig("conv_kernel_size"),
+    ),
+    spec(
+        "scale_input",
+        Kind::Bool,
+        Source::EncoderConfig("scale_input"),
+    ),
+    spec(
+        "attention_bias",
+        Kind::Bool,
+        Source::EncoderConfig("attention_bias"),
+    ),
+    spec(
+        "convolution_bias",
+        Kind::Bool,
+        Source::EncoderConfig("convolution_bias"),
+    ),
+    spec("vocab_size", Kind::Int, Source::Config("vocab_size")),
+    spec(
+        "blank_token_id",
+        Kind::Int,
+        Source::Config("blank_token_id"),
+    ),
+    spec(
+        "decoder_hidden_size",
+        Kind::Int,
+        Source::Config("decoder_hidden_size"),
+    ),
+    spec(
+        "num_decoder_layers",
+        Kind::Int,
+        Source::Config("num_decoder_layers"),
+    ),
+    spec(
+        "max_symbols_per_step",
+        Kind::Int,
+        Source::Config("max_symbols_per_step"),
+    ),
+];
+
 pub fn params_for(family: Family) -> &'static [ParamSpec] {
     match family {
         Family::Modernbert => MODERNBERT_PARAMS,
         Family::Qwen3 => QWEN3_PARAMS,
+        Family::ParakeetTdt => PARAKEET_PARAMS,
     }
 }
 
@@ -220,6 +311,11 @@ pub fn class_table(class: &str) -> Result<ClassInfo> {
                 ("mlp_kind", json!("swiglu")),
                 ("qk_norm", json!(true)),
             ]),
+            has_classification_head: false,
+        }),
+        "ParakeetForTDT" => Ok(ClassInfo {
+            family: Family::ParakeetTdt,
+            values: BTreeMap::new(),
             has_classification_head: false,
         }),
         other => Err(perr!(
@@ -336,6 +432,11 @@ pub fn check_against_config(
         let manifest_value = &arch.params[spec.name];
         let source_value = match spec.source {
             Source::Class => continue,
+            Source::EncoderConfig(key) => config
+                .get("encoder_config")
+                .and_then(|encoder| encoder.get(key))
+                .cloned()
+                .ok_or_else(|| perr!("{slug}: missing encoder_config.{key}"))?,
             Source::Config(key) => config.get(key).cloned().ok_or_else(|| {
                 perr!(
                     "{slug}: architecture parameter `{}` has no `{key}` in the pinned config.json",
@@ -406,6 +507,7 @@ pub fn expected_tensors(model: &Model) -> Result<BTreeMap<String, Vec<u64>>> {
         out.insert(name, shape);
     };
     match arch.family {
+        Family::ParakeetTdt => return crate::speech::expected_tensors(arch),
         Family::Modernbert => {
             for flag in ["norm_bias", "attention_bias", "mlp_bias"] {
                 if arch.boolean(flag)? {
@@ -501,6 +603,7 @@ pub fn embedding_key(model: &Model) -> String {
     match model.architecture.family {
         Family::Modernbert => format!("{}embeddings.tok_embeddings.weight", model.tensor_prefix),
         Family::Qwen3 => format!("{}embed_tokens.weight", model.tensor_prefix),
+        Family::ParakeetTdt => "decoder.embedding.weight".to_string(),
     }
 }
 
@@ -509,5 +612,6 @@ pub fn final_norm_key(model: &Model) -> String {
     match model.architecture.family {
         Family::Modernbert => format!("{}final_norm.weight", model.tensor_prefix),
         Family::Qwen3 => format!("{}norm.weight", model.tensor_prefix),
+        Family::ParakeetTdt => "encoder.layers.23.norm_out.weight".to_string(),
     }
 }

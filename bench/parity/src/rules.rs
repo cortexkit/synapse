@@ -51,6 +51,9 @@ pub fn storage_dtype(model_slug: &str, lane: Lane) -> DType {
 /// setup, the fp32 final norm and pooling always; the two rotation
 /// projections on ModernBERT; and the operation's head.
 pub fn ane_cpu_stages(model: &Model) -> Vec<String> {
+    if model.operation == Operation::Transcribe {
+        return vec!["tdt_predictor".into(), "tdt_joint".into()];
+    }
     let mut stages = vec!["token_embedding", "mask_position"];
     if model.architecture.family == Family::Modernbert {
         stages.extend(["rotation_in", "rotation_out"]);
@@ -60,6 +63,7 @@ pub fn ane_cpu_stages(model: &Model) -> Vec<String> {
         (Family::Modernbert, Operation::Rerank) => stages.push("gte_classifier_head"),
         (Family::Qwen3, Operation::Rerank) => stages.push("qwen_yes_no_readout"),
         (_, Operation::Embed) => {}
+        _ => {}
     }
     stages.into_iter().map(str::to_string).collect()
 }
@@ -76,6 +80,7 @@ pub fn stage_tensors(model: &Model, stage: &str) -> Result<Vec<String>> {
         "final_norm" => match model.architecture.family {
             Family::Modernbert => vec![],
             Family::Qwen3 => vec![final_norm_key(model)],
+            Family::ParakeetTdt => return Err(perr!("transcribe has no standalone final norm")),
         },
         "gte_classifier_head" => {
             let head = model
@@ -88,11 +93,21 @@ pub fn stage_tensors(model: &Model, stage: &str) -> Result<Vec<String>> {
                 .collect()
         }
         "qwen_yes_no_readout" => vec![model
-            .grammar
+            .grammar()?
             .readout
             .weight
             .clone()
             .ok_or_else(|| perr!("qwen_yes_no_readout on a model without a readout weight"))?],
+        "tdt_predictor" | "tdt_joint" => crate::arch::expected_tensors(model)?
+            .into_keys()
+            .filter(|key| {
+                key.starts_with(if stage == "tdt_predictor" {
+                    "decoder."
+                } else {
+                    "joint."
+                })
+            })
+            .collect(),
         other => return Err(perr!("`{other}` is not an allowed direct-ANE CPU stage")),
     })
 }
@@ -137,6 +152,7 @@ pub fn derived_profile(model_slug: &str, model: &Model, lane: Lane) -> Result<Pr
         fp32_tensors: fp32,
         conversion_rule: if lane.is_worker() { "v1" } else { "none" }.to_string(),
         converted_package_digest: None,
+        transcribe: None,
         cpu_stages: (lane == Lane::AneDirect).then(|| ane_cpu_stages(model)),
         rotation: (lane == Lane::AneDirect).then(|| {
             if modernbert {
@@ -194,6 +210,16 @@ pub fn check_profile(
     expected.vulkan_sub_batch_max_tokens = profile.vulkan_sub_batch_max_tokens;
     expected.vulkan_min_storage_buffer_range = profile.vulkan_min_storage_buffer_range;
     expected.vulkan_min_device_local_bytes = profile.vulkan_min_device_local_bytes;
+    if model.operation == Operation::Transcribe {
+        let speech = profile
+            .transcribe
+            .as_ref()
+            .ok_or_else(|| perr!("transcribe profile is missing"))?;
+        speech.validate()?;
+        expected.transcribe = profile.transcribe.clone();
+    } else if profile.transcribe.is_some() {
+        return Err(perr!("non-transcribe profile carries speech fields"));
+    }
     if &expected != profile {
         return Err(perr!(
             "profile `{profile_id}` disagrees with the numeric-profile rule:\n  committed: {}\n  rule:      {}",

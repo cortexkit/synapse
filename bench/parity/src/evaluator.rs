@@ -125,6 +125,7 @@ impl FixtureSet {
             return Err(perr!("fixture_set_mismatch: {model}"));
         }
         let mut ids = BTreeSet::new();
+        let output_dimension = pinned.output()?.dimension as usize;
         if document.cases.is_empty()
             || document.cases.iter().any(|c| {
                 !ids.insert(&c.id)
@@ -133,7 +134,7 @@ impl FixtureSet {
                     || match (&c.output, pinned.operation) {
                         (Output::Score(s), Operation::Rerank) => !s.is_finite(),
                         (Output::Embedding(v), Operation::Embed) => {
-                            v.len() != pinned.output.dimension as usize
+                            v.len() != output_dimension
                                 || v.iter().any(|x| !x.is_finite())
                                 || norm(v) == 0.0
                         }
@@ -346,7 +347,7 @@ pub fn evaluate(
                 gates.semantics = false;
                 result.failures.push("qwen_template_mismatch".into());
             }
-            let readout = &model.grammar.readout;
+            let readout = &model.grammar()?.readout;
             let expected = readout
                 .yes
                 .as_ref()
@@ -360,7 +361,7 @@ pub fn evaluate(
         match (&case.output, &observed.output) {
             (Output::Embedding(reference), Output::Embedding(actual)) => {
                 let finite = actual.iter().all(|x| x.is_finite());
-                gates.dimension &= actual.len() == model.output.dimension as usize;
+                gates.dimension &= actual.len() == model.output()?.dimension as usize;
                 gates.finite &= finite;
                 if !finite || actual.len() != reference.len() || norm(actual) == 0.0 {
                     gates.unit_norm = false;

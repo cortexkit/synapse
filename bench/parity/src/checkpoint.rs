@@ -86,7 +86,7 @@ pub fn check_checkpoint(
         .map_err(|error| at(perr!("disable truncation: {error}")))?;
     check_tokenizer(model, &tokenizer).map_err(at)?;
 
-    if let Some(template) = &model.grammar.template {
+    if let Some(template) = model.grammar.as_ref().and_then(|g| g.template.as_ref()) {
         let upstream = std::fs::read(dir.join("README.md"))
             .map_err(|error| at(perr!("read README.md: {error}")))?;
         let oracle = std::fs::read(parity_dir.join(&template.oracle.path))
@@ -153,7 +153,13 @@ fn check_token_id(tokenizer: &Tokenizer, token: &TokenRef) -> Result<()> {
 }
 
 pub fn check_tokenizer(model: &Model, tokenizer: &Tokenizer) -> Result<()> {
-    let grammar: &Grammar = &model.grammar;
+    if model.operation == Operation::Transcribe {
+        if tokenizer.get_vocab_size(true) as u64 != model.architecture.int("vocab_size")? {
+            return Err(perr!("Parakeet tokenizer vocabulary differs from config"));
+        }
+        return Ok(());
+    }
+    let grammar: &Grammar = model.grammar()?;
     for token in grammar
         .special_tokens
         .values()
@@ -237,6 +243,11 @@ pub fn check_tokenizer(model: &Model, tokenizer: &Tokenizer) -> Result<()> {
                     ));
                 }
             }
+        }
+        _ => {
+            return Err(perr!(
+                "family/operation has no embed/rerank tokenizer grammar"
+            ))
         }
     }
     Ok(())

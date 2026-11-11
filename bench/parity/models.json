@@ -33,6 +33,10 @@
       "gte-reranker-modernbert-base.owned-cuda": "a2a0abcbc79ba7758debc613e926ce95a34e97dc2eea0d57d1007f5182e95a72",
       "gte-reranker-modernbert-base.owned-metal": "96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
       "gte-reranker-modernbert-base.owned-vulkan": "1da21b3ab0d541caec40a65fd1cf2cec5c8f1ec590ebc5df360d6bf9471da783",
+      "parakeet-tdt-0.6b-v3.ane-direct-worker": "d37b07bbe7a2aeb96f577f4d75d6c30c359ef7907d45c637b075990acdfc3266",
+      "parakeet-tdt-0.6b-v3.owned-cuda": "741cf6ed17141fd02db3247898d0a4da604c6d4604fac254c7875930166afdb9",
+      "parakeet-tdt-0.6b-v3.owned-metal": "1c2ec87c7c4302b002ff8e8b37aa41b6c6c54e78ccd936111f3bbba190ec3399",
+      "parakeet-tdt-0.6b-v3.owned-vulkan": "653a7b7932a00ccd5cc1ac1a694ee851f043582e9695562bef90c3820439b99e",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
       "qwen3-embedding-0.6b.owned-cuda": "a93eb2d4f132a60bf5fe0452fb9d9bb9bffe918c94523e88e868359c45dfe9e0",
       "qwen3-embedding-0.6b.owned-metal": "d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
@@ -236,6 +240,47 @@
       "tensor_index_sha256": "1d47a632a2facd6cbbf3f0db5b0fe5e2263a6881d83e1b6380d81ed0ff9cb219",
       "tensor_prefix": "model.",
       "tokenizer_digest": "sha256:2aea6ff4701d063e7e029b6be695a1659f2caaa2ae4fb0e8b18285818271becd"
+    },
+    "parakeet-tdt-0.6b-v3": {
+      "architecture": {
+        "class": "ParakeetForTDT",
+        "family": "parakeet_tdt",
+        "params": {
+          "attention_bias": false,
+          "blank_token_id": 8192,
+          "conv_kernel_size": 9,
+          "convolution_bias": false,
+          "decoder_hidden_size": 640,
+          "hidden_size": 1024,
+          "intermediate_size": 4096,
+          "max_symbols_per_step": 10,
+          "num_attention_heads": 8,
+          "num_decoder_layers": 2,
+          "num_hidden_layers": 24,
+          "num_mel_bins": 128,
+          "scale_input": false,
+          "subsampling_conv_channels": 256,
+          "subsampling_conv_kernel_size": 3,
+          "subsampling_conv_stride": 2,
+          "subsampling_factor": 8,
+          "vocab_size": 8193
+        }
+      },
+      "checkpoint_digest": "sha256:3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+      "files": {
+        "config.json": "e747b85e1bdfd300c8b8ac63bac8dd5221f8fe9bc275b48d06c735fcd6971b6e",
+        "generation_config.json": "b141de6ec6d7f982ece13f98f604e3fe1807ea9c0e839185d0ab7064604209d0",
+        "model.safetensors": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+        "processor_config.json": "8346a93a3b987fa1dec57a78f045cd0817d21786589a5a096b41a57a446fd1d7",
+        "tokenizer.json": "bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91",
+        "tokenizer_config.json": "0b2fe0037599ee335f0b972fa682bf0ece74e4ccfec755cb7daa3405d3d3e874"
+      },
+      "hf_repo": "nvidia/parakeet-tdt-0.6b-v3",
+      "hf_revision": "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+      "operation": "transcribe",
+      "tensor_index_sha256": "8e09446adb800a8de25737d973ac276b574e962a2f7d110f9a77b76a8cd46fe2",
+      "tensor_prefix": "",
+      "tokenizer_digest": "sha256:bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91"
     },
     "qwen3-embedding-0.6b": {
       "architecture": {
@@ -547,6 +592,1096 @@
       "vulkan_min_device_local_bytes": 564312064,
       "vulkan_min_storage_buffer_range": 77365248,
       "vulkan_sub_batch_max_tokens": 8192
+    },
+    "parakeet-tdt-0.6b-v3.ane-direct-worker": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:bbd41622921c3c3ad3a663aaf02799f29be33173569656d913738c16392fc192",
+      "cpu_stages": [
+        "tdt_predictor",
+        "tdt_joint"
+      ],
+      "fp32_tensors": [
+        "decoder.decoder_projector.bias",
+        "decoder.decoder_projector.weight",
+        "decoder.embedding.weight",
+        "decoder.lstm.bias_hh_l0",
+        "decoder.lstm.bias_hh_l1",
+        "decoder.lstm.bias_ih_l0",
+        "decoder.lstm.bias_ih_l1",
+        "decoder.lstm.weight_hh_l0",
+        "decoder.lstm.weight_hh_l1",
+        "decoder.lstm.weight_ih_l0",
+        "decoder.lstm.weight_ih_l1",
+        "joint.head.bias",
+        "joint.head.weight"
+      ],
+      "gelu_lowering": "none",
+      "lane": "ane-direct-worker",
+      "model": "parakeet-tdt-0.6b-v3",
+      "rerank_tolerance_class": "fp16",
+      "rotation": "none",
+      "storage_dtype": "f16",
+      "transcribe": {
+        "confirmations": {
+          "decode_rule": {
+            "K": 10,
+            "a": "zero LSTM state, initial predictor input blank; blank preserves predictor state and output",
+            "argmax_ties": "lowest index",
+            "b": "count every joint evaluation at a frame; a blank always advances by max(duration, 1)",
+            "blank_token_id": 8192,
+            "c": "force +1 only when the K-th evaluation otherwise advances by zero; no extra +1 after positive duration",
+            "d": "K=10 is a bounded adaptation, not the upstream TDT per-frame rule",
+            "durations": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "hf_equality": "tokens and durations must equal HF generate on every fixture with finite unpatched encoder output",
+            "hf_exception_class": "upstream NaN on padded input; compare independent loop against patched HF generate instead",
+            "maximum_evaluations": "valid_encoder_frames * K",
+            "natural_fixture_guard": "fail if any fixture reaches K emissions at a single frame",
+            "nemo_deviation": "v2.4.0 tdt greedy counts per-frame symbols but adds +1 even after a positive duration at the cap; this bounded rule matches neither upstream exactly",
+            "revision": "synapse-parakeet-tdt-greedy-v1",
+            "transformers_deviation": "5.16.1 generation_parakeet.py:280-299 bypasses the RNNT frame counter; max_symbols_per_step=10 sizes only the global output buffer"
+          },
+          "duration_ladder": [
+            {
+              "duration_ms": 10090,
+              "encoder_frames": 127,
+              "id": "ladder-127",
+              "sample_count": 161440
+            },
+            {
+              "duration_ms": 10170,
+              "encoder_frames": 128,
+              "id": "ladder-128",
+              "sample_count": 162720
+            },
+            {
+              "duration_ms": 10250,
+              "encoder_frames": 129,
+              "id": "ladder-129",
+              "sample_count": 164000
+            },
+            {
+              "duration_ms": 20330,
+              "encoder_frames": 255,
+              "id": "ladder-255",
+              "sample_count": 325280
+            },
+            {
+              "duration_ms": 20410,
+              "encoder_frames": 256,
+              "id": "ladder-256",
+              "sample_count": 326560
+            },
+            {
+              "duration_ms": 20490,
+              "encoder_frames": 257,
+              "id": "ladder-257",
+              "sample_count": 327840
+            },
+            {
+              "duration_ms": 40810,
+              "encoder_frames": 511,
+              "id": "ladder-511",
+              "sample_count": 652960
+            },
+            {
+              "duration_ms": 40890,
+              "encoder_frames": 512,
+              "id": "ladder-512",
+              "sample_count": 654240
+            },
+            {
+              "duration_ms": 40970,
+              "encoder_frames": 513,
+              "id": "ladder-513",
+              "sample_count": 655520
+            },
+            {
+              "duration_ms": 81770,
+              "encoder_frames": 1023,
+              "id": "ladder-1023",
+              "sample_count": 1308320
+            },
+            {
+              "duration_ms": 81850,
+              "encoder_frames": 1024,
+              "id": "ladder-1024",
+              "sample_count": 1309600
+            },
+            {
+              "duration_ms": 81930,
+              "encoder_frames": 1025,
+              "id": "ladder-1025",
+              "sample_count": 1310880
+            },
+            {
+              "duration_ms": 163690,
+              "encoder_frames": 2047,
+              "id": "ladder-2047",
+              "sample_count": 2619040
+            },
+            {
+              "duration_ms": 163770,
+              "encoder_frames": 2048,
+              "id": "ladder-2048",
+              "sample_count": 2620320
+            },
+            {
+              "duration_ms": 163850,
+              "encoder_frames": 2049,
+              "id": "ladder-2049",
+              "sample_count": 2621600
+            },
+            {
+              "duration_ms": 327530,
+              "encoder_frames": 4095,
+              "id": "ladder-4095",
+              "sample_count": 5240480
+            },
+            {
+              "duration_ms": 327610,
+              "encoder_frames": 4096,
+              "id": "ladder-4096",
+              "sample_count": 5241760
+            },
+            {
+              "duration_ms": 327690,
+              "encoder_frames": 4097,
+              "id": "ladder-4097",
+              "sample_count": 5243040
+            },
+            {
+              "duration_ms": 655210,
+              "encoder_frames": 8191,
+              "id": "ladder-8191",
+              "sample_count": 10483360
+            },
+            {
+              "duration_ms": 655290,
+              "encoder_frames": 8192,
+              "id": "ladder-8192",
+              "sample_count": 10484640
+            },
+            {
+              "duration_ms": 655370,
+              "encoder_frames": 8193,
+              "id": "ladder-8193",
+              "sample_count": 10485920
+            },
+            {
+              "duration_ms": 600000,
+              "encoder_frames": 7500,
+              "id": "ladder-600000ms",
+              "sample_count": 9600000
+            }
+          ],
+          "environment": {
+            "attention_implementation": "eager",
+            "deterministic_algorithms": true,
+            "device": "cpu",
+            "dtype": "fp32",
+            "interop_threads": 1,
+            "intraop_threads": 1,
+            "seed": 0
+          },
+          "frame_counts": {
+            "actual_mel_frames": "floor(samples / 160) + 1",
+            "samples": "mono 16 kHz sample frames after reference resampling",
+            "source": "feature_extraction_parakeet.py:191-245; modeling_parakeet.py:365-431,515-541",
+            "stride2": "floor((L - 1) / 2) + 1 = ceil(L / 2)",
+            "valid_encoder_frames": "ceil(ceil(ceil(valid_mel_frames / 2) / 2) / 2)",
+            "valid_mel_frames": "floor(samples / 160)"
+          },
+          "frontend": {
+            "dither": 0,
+            "frequency_range_hz": [
+              0,
+              8000
+            ],
+            "hop_samples": 160,
+            "log": "natural",
+            "log_guard": "2^-24 (5.9604644775390625e-8)",
+            "mean_divisor": "valid_mel_frames",
+            "mel_bins": 128,
+            "mel_filter_dtype": "fp32",
+            "mel_norm": "slaney",
+            "mel_scale": "Slaney (librosa htk=False)",
+            "n_fft": 512,
+            "normalization": "per feature, mean and sample standard deviation over valid frames only",
+            "normalization_denominator": "std + 1e-5",
+            "padding_after_normalization": "invalid mel frames set to 0.0",
+            "preemphasis": 0.97,
+            "preemphasis_first_sample": "unchanged",
+            "sample_rate": 16000,
+            "source": "transformers 5.16.1 feature_extraction_parakeet.py:30-31,96-125,214-245",
+            "spectrum": "sqrt(re^2+im^2), then square, fp32",
+            "std_divisor": "valid_mel_frames - 1",
+            "stft_center": true,
+            "stft_pad_mode": "constant (zero)",
+            "window": "Hann, periodic=False",
+            "window_samples": 400
+          },
+          "integer_tensors": "retain BatchNorm num_batches_tracked scalar I64 counters losslessly in v1 packages",
+          "masking": {
+            "attention": "pairwise valid query AND valid key; finite -10000 mask before softmax, then zero masked probabilities",
+            "before_first_subsampling_convolution": "no extra mask beyond frontend zero padding",
+            "between_subsampling_stages": "zero invalid time positions after every Conv2d, including pointwise stages",
+            "conformer_convolution": "zero invalid positions after GLU, immediately before depthwise convolution",
+            "convolution_patch_needed": false,
+            "nemo_attention_source": "nemo/collections/asr/parts/submodules/multi_head_attention.py:125-146",
+            "nemo_behavior": "finite -10000 sentinel, zero masked probabilities after softmax, zero padded frames after GLU before depthwise convolution",
+            "nemo_convolution_source": "nemo/collections/asr/parts/submodules/conformer_modules.py:320-345",
+            "nemo_revision": "2381f42f6979449b5b99538f8f80135831009b51",
+            "patch_revision": "synapse-parakeet-mask-fix-v1",
+            "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
+            "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+          },
+          "maximum_emissions_per_frame": 5,
+          "measured_resample_max_abs_decimal": "1.5454903244972229",
+          "self_check_sealed_bytes": 111894,
+          "synthetic_wav_metadata": "libsndfile FLOAT WAV PEAK timestamp is zeroed; encoded samples and peak values are unchanged",
+          "torch_version": "2.14.0",
+          "transformers_version": "5.16.1",
+          "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "wer_normalizer": "synapse-wer-norm-v1",
+          "word_rule": {
+            "boundary": "first emitted token, then each token piece beginning with U+2581",
+            "end_ms": "80 * (last token frame_index + max(last token duration, 1)), clamped to audio duration",
+            "no_speech": "true exactly when no token was emitted; text empty and words empty",
+            "start_ms": "80 * first token frame_index, clamped to audio duration",
+            "text": "tokenizer decode of all emitted token ids",
+            "word": "tokenizer decode of word token ids, leading/trailing whitespace stripped"
+          }
+        },
+        "encoder_rungs": [
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192
+        ],
+        "max_duration_ms": 600000,
+        "self_check": {
+          "bytes": 4366,
+          "path": "fixtures/parakeet-tdt-0.6b-v3/self-check.json",
+          "sha256": "5f6161617119fa54ca90e792880465f3f17d1bf1766597908ffdd98f2af8c075"
+        },
+        "tau_feat": 0.001,
+        "tau_margin": 0.001,
+        "tau_resample": 1.546491
+      }
+    },
+    "parakeet-tdt-0.6b-v3.owned-cuda": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:55144098605bbd64592686c407a31b09f16bca33b02c3e3b04b46bbe705287a3",
+      "cuda_min_compute_major": 7,
+      "cuda_min_compute_minor": 5,
+      "cuda_min_driver_api": 13020,
+      "fp32_tensors": [],
+      "lane": "owned-cuda",
+      "model": "parakeet-tdt-0.6b-v3",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "transcribe": {
+        "confirmations": {
+          "decode_rule": {
+            "K": 10,
+            "a": "zero LSTM state, initial predictor input blank; blank preserves predictor state and output",
+            "argmax_ties": "lowest index",
+            "b": "count every joint evaluation at a frame; a blank always advances by max(duration, 1)",
+            "blank_token_id": 8192,
+            "c": "force +1 only when the K-th evaluation otherwise advances by zero; no extra +1 after positive duration",
+            "d": "K=10 is a bounded adaptation, not the upstream TDT per-frame rule",
+            "durations": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "hf_equality": "tokens and durations must equal HF generate on every fixture with finite unpatched encoder output",
+            "hf_exception_class": "upstream NaN on padded input; compare independent loop against patched HF generate instead",
+            "maximum_evaluations": "valid_encoder_frames * K",
+            "natural_fixture_guard": "fail if any fixture reaches K emissions at a single frame",
+            "nemo_deviation": "v2.4.0 tdt greedy counts per-frame symbols but adds +1 even after a positive duration at the cap; this bounded rule matches neither upstream exactly",
+            "revision": "synapse-parakeet-tdt-greedy-v1",
+            "transformers_deviation": "5.16.1 generation_parakeet.py:280-299 bypasses the RNNT frame counter; max_symbols_per_step=10 sizes only the global output buffer"
+          },
+          "duration_ladder": [
+            {
+              "duration_ms": 10090,
+              "encoder_frames": 127,
+              "id": "ladder-127",
+              "sample_count": 161440
+            },
+            {
+              "duration_ms": 10170,
+              "encoder_frames": 128,
+              "id": "ladder-128",
+              "sample_count": 162720
+            },
+            {
+              "duration_ms": 10250,
+              "encoder_frames": 129,
+              "id": "ladder-129",
+              "sample_count": 164000
+            },
+            {
+              "duration_ms": 20330,
+              "encoder_frames": 255,
+              "id": "ladder-255",
+              "sample_count": 325280
+            },
+            {
+              "duration_ms": 20410,
+              "encoder_frames": 256,
+              "id": "ladder-256",
+              "sample_count": 326560
+            },
+            {
+              "duration_ms": 20490,
+              "encoder_frames": 257,
+              "id": "ladder-257",
+              "sample_count": 327840
+            },
+            {
+              "duration_ms": 40810,
+              "encoder_frames": 511,
+              "id": "ladder-511",
+              "sample_count": 652960
+            },
+            {
+              "duration_ms": 40890,
+              "encoder_frames": 512,
+              "id": "ladder-512",
+              "sample_count": 654240
+            },
+            {
+              "duration_ms": 40970,
+              "encoder_frames": 513,
+              "id": "ladder-513",
+              "sample_count": 655520
+            },
+            {
+              "duration_ms": 81770,
+              "encoder_frames": 1023,
+              "id": "ladder-1023",
+              "sample_count": 1308320
+            },
+            {
+              "duration_ms": 81850,
+              "encoder_frames": 1024,
+              "id": "ladder-1024",
+              "sample_count": 1309600
+            },
+            {
+              "duration_ms": 81930,
+              "encoder_frames": 1025,
+              "id": "ladder-1025",
+              "sample_count": 1310880
+            },
+            {
+              "duration_ms": 163690,
+              "encoder_frames": 2047,
+              "id": "ladder-2047",
+              "sample_count": 2619040
+            },
+            {
+              "duration_ms": 163770,
+              "encoder_frames": 2048,
+              "id": "ladder-2048",
+              "sample_count": 2620320
+            },
+            {
+              "duration_ms": 163850,
+              "encoder_frames": 2049,
+              "id": "ladder-2049",
+              "sample_count": 2621600
+            },
+            {
+              "duration_ms": 327530,
+              "encoder_frames": 4095,
+              "id": "ladder-4095",
+              "sample_count": 5240480
+            },
+            {
+              "duration_ms": 327610,
+              "encoder_frames": 4096,
+              "id": "ladder-4096",
+              "sample_count": 5241760
+            },
+            {
+              "duration_ms": 327690,
+              "encoder_frames": 4097,
+              "id": "ladder-4097",
+              "sample_count": 5243040
+            },
+            {
+              "duration_ms": 655210,
+              "encoder_frames": 8191,
+              "id": "ladder-8191",
+              "sample_count": 10483360
+            },
+            {
+              "duration_ms": 655290,
+              "encoder_frames": 8192,
+              "id": "ladder-8192",
+              "sample_count": 10484640
+            },
+            {
+              "duration_ms": 655370,
+              "encoder_frames": 8193,
+              "id": "ladder-8193",
+              "sample_count": 10485920
+            },
+            {
+              "duration_ms": 600000,
+              "encoder_frames": 7500,
+              "id": "ladder-600000ms",
+              "sample_count": 9600000
+            }
+          ],
+          "environment": {
+            "attention_implementation": "eager",
+            "deterministic_algorithms": true,
+            "device": "cpu",
+            "dtype": "fp32",
+            "interop_threads": 1,
+            "intraop_threads": 1,
+            "seed": 0
+          },
+          "frame_counts": {
+            "actual_mel_frames": "floor(samples / 160) + 1",
+            "samples": "mono 16 kHz sample frames after reference resampling",
+            "source": "feature_extraction_parakeet.py:191-245; modeling_parakeet.py:365-431,515-541",
+            "stride2": "floor((L - 1) / 2) + 1 = ceil(L / 2)",
+            "valid_encoder_frames": "ceil(ceil(ceil(valid_mel_frames / 2) / 2) / 2)",
+            "valid_mel_frames": "floor(samples / 160)"
+          },
+          "frontend": {
+            "dither": 0,
+            "frequency_range_hz": [
+              0,
+              8000
+            ],
+            "hop_samples": 160,
+            "log": "natural",
+            "log_guard": "2^-24 (5.9604644775390625e-8)",
+            "mean_divisor": "valid_mel_frames",
+            "mel_bins": 128,
+            "mel_filter_dtype": "fp32",
+            "mel_norm": "slaney",
+            "mel_scale": "Slaney (librosa htk=False)",
+            "n_fft": 512,
+            "normalization": "per feature, mean and sample standard deviation over valid frames only",
+            "normalization_denominator": "std + 1e-5",
+            "padding_after_normalization": "invalid mel frames set to 0.0",
+            "preemphasis": 0.97,
+            "preemphasis_first_sample": "unchanged",
+            "sample_rate": 16000,
+            "source": "transformers 5.16.1 feature_extraction_parakeet.py:30-31,96-125,214-245",
+            "spectrum": "sqrt(re^2+im^2), then square, fp32",
+            "std_divisor": "valid_mel_frames - 1",
+            "stft_center": true,
+            "stft_pad_mode": "constant (zero)",
+            "window": "Hann, periodic=False",
+            "window_samples": 400
+          },
+          "integer_tensors": "retain BatchNorm num_batches_tracked scalar I64 counters losslessly in v1 packages",
+          "masking": {
+            "attention": "pairwise valid query AND valid key; finite -10000 mask before softmax, then zero masked probabilities",
+            "before_first_subsampling_convolution": "no extra mask beyond frontend zero padding",
+            "between_subsampling_stages": "zero invalid time positions after every Conv2d, including pointwise stages",
+            "conformer_convolution": "zero invalid positions after GLU, immediately before depthwise convolution",
+            "convolution_patch_needed": false,
+            "nemo_attention_source": "nemo/collections/asr/parts/submodules/multi_head_attention.py:125-146",
+            "nemo_behavior": "finite -10000 sentinel, zero masked probabilities after softmax, zero padded frames after GLU before depthwise convolution",
+            "nemo_convolution_source": "nemo/collections/asr/parts/submodules/conformer_modules.py:320-345",
+            "nemo_revision": "2381f42f6979449b5b99538f8f80135831009b51",
+            "patch_revision": "synapse-parakeet-mask-fix-v1",
+            "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
+            "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+          },
+          "maximum_emissions_per_frame": 5,
+          "measured_resample_max_abs_decimal": "1.5454903244972229",
+          "self_check_sealed_bytes": 111894,
+          "synthetic_wav_metadata": "libsndfile FLOAT WAV PEAK timestamp is zeroed; encoded samples and peak values are unchanged",
+          "torch_version": "2.14.0",
+          "transformers_version": "5.16.1",
+          "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "wer_normalizer": "synapse-wer-norm-v1",
+          "word_rule": {
+            "boundary": "first emitted token, then each token piece beginning with U+2581",
+            "end_ms": "80 * (last token frame_index + max(last token duration, 1)), clamped to audio duration",
+            "no_speech": "true exactly when no token was emitted; text empty and words empty",
+            "start_ms": "80 * first token frame_index, clamped to audio duration",
+            "text": "tokenizer decode of all emitted token ids",
+            "word": "tokenizer decode of word token ids, leading/trailing whitespace stripped"
+          }
+        },
+        "encoder_rungs": [
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192
+        ],
+        "max_duration_ms": 600000,
+        "self_check": {
+          "bytes": 4366,
+          "path": "fixtures/parakeet-tdt-0.6b-v3/self-check.json",
+          "sha256": "5f6161617119fa54ca90e792880465f3f17d1bf1766597908ffdd98f2af8c075"
+        },
+        "tau_feat": 0.001,
+        "tau_margin": 0.001,
+        "tau_resample": 1.546491
+      }
+    },
+    "parakeet-tdt-0.6b-v3.owned-metal": {
+      "compute_dtype": "f16",
+      "conversion_rule": "none",
+      "fp32_tensors": [],
+      "lane": "owned-metal",
+      "model": "parakeet-tdt-0.6b-v3",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "transcribe": {
+        "confirmations": {
+          "decode_rule": {
+            "K": 10,
+            "a": "zero LSTM state, initial predictor input blank; blank preserves predictor state and output",
+            "argmax_ties": "lowest index",
+            "b": "count every joint evaluation at a frame; a blank always advances by max(duration, 1)",
+            "blank_token_id": 8192,
+            "c": "force +1 only when the K-th evaluation otherwise advances by zero; no extra +1 after positive duration",
+            "d": "K=10 is a bounded adaptation, not the upstream TDT per-frame rule",
+            "durations": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "hf_equality": "tokens and durations must equal HF generate on every fixture with finite unpatched encoder output",
+            "hf_exception_class": "upstream NaN on padded input; compare independent loop against patched HF generate instead",
+            "maximum_evaluations": "valid_encoder_frames * K",
+            "natural_fixture_guard": "fail if any fixture reaches K emissions at a single frame",
+            "nemo_deviation": "v2.4.0 tdt greedy counts per-frame symbols but adds +1 even after a positive duration at the cap; this bounded rule matches neither upstream exactly",
+            "revision": "synapse-parakeet-tdt-greedy-v1",
+            "transformers_deviation": "5.16.1 generation_parakeet.py:280-299 bypasses the RNNT frame counter; max_symbols_per_step=10 sizes only the global output buffer"
+          },
+          "duration_ladder": [
+            {
+              "duration_ms": 10090,
+              "encoder_frames": 127,
+              "id": "ladder-127",
+              "sample_count": 161440
+            },
+            {
+              "duration_ms": 10170,
+              "encoder_frames": 128,
+              "id": "ladder-128",
+              "sample_count": 162720
+            },
+            {
+              "duration_ms": 10250,
+              "encoder_frames": 129,
+              "id": "ladder-129",
+              "sample_count": 164000
+            },
+            {
+              "duration_ms": 20330,
+              "encoder_frames": 255,
+              "id": "ladder-255",
+              "sample_count": 325280
+            },
+            {
+              "duration_ms": 20410,
+              "encoder_frames": 256,
+              "id": "ladder-256",
+              "sample_count": 326560
+            },
+            {
+              "duration_ms": 20490,
+              "encoder_frames": 257,
+              "id": "ladder-257",
+              "sample_count": 327840
+            },
+            {
+              "duration_ms": 40810,
+              "encoder_frames": 511,
+              "id": "ladder-511",
+              "sample_count": 652960
+            },
+            {
+              "duration_ms": 40890,
+              "encoder_frames": 512,
+              "id": "ladder-512",
+              "sample_count": 654240
+            },
+            {
+              "duration_ms": 40970,
+              "encoder_frames": 513,
+              "id": "ladder-513",
+              "sample_count": 655520
+            },
+            {
+              "duration_ms": 81770,
+              "encoder_frames": 1023,
+              "id": "ladder-1023",
+              "sample_count": 1308320
+            },
+            {
+              "duration_ms": 81850,
+              "encoder_frames": 1024,
+              "id": "ladder-1024",
+              "sample_count": 1309600
+            },
+            {
+              "duration_ms": 81930,
+              "encoder_frames": 1025,
+              "id": "ladder-1025",
+              "sample_count": 1310880
+            },
+            {
+              "duration_ms": 163690,
+              "encoder_frames": 2047,
+              "id": "ladder-2047",
+              "sample_count": 2619040
+            },
+            {
+              "duration_ms": 163770,
+              "encoder_frames": 2048,
+              "id": "ladder-2048",
+              "sample_count": 2620320
+            },
+            {
+              "duration_ms": 163850,
+              "encoder_frames": 2049,
+              "id": "ladder-2049",
+              "sample_count": 2621600
+            },
+            {
+              "duration_ms": 327530,
+              "encoder_frames": 4095,
+              "id": "ladder-4095",
+              "sample_count": 5240480
+            },
+            {
+              "duration_ms": 327610,
+              "encoder_frames": 4096,
+              "id": "ladder-4096",
+              "sample_count": 5241760
+            },
+            {
+              "duration_ms": 327690,
+              "encoder_frames": 4097,
+              "id": "ladder-4097",
+              "sample_count": 5243040
+            },
+            {
+              "duration_ms": 655210,
+              "encoder_frames": 8191,
+              "id": "ladder-8191",
+              "sample_count": 10483360
+            },
+            {
+              "duration_ms": 655290,
+              "encoder_frames": 8192,
+              "id": "ladder-8192",
+              "sample_count": 10484640
+            },
+            {
+              "duration_ms": 655370,
+              "encoder_frames": 8193,
+              "id": "ladder-8193",
+              "sample_count": 10485920
+            },
+            {
+              "duration_ms": 600000,
+              "encoder_frames": 7500,
+              "id": "ladder-600000ms",
+              "sample_count": 9600000
+            }
+          ],
+          "environment": {
+            "attention_implementation": "eager",
+            "deterministic_algorithms": true,
+            "device": "cpu",
+            "dtype": "fp32",
+            "interop_threads": 1,
+            "intraop_threads": 1,
+            "seed": 0
+          },
+          "frame_counts": {
+            "actual_mel_frames": "floor(samples / 160) + 1",
+            "samples": "mono 16 kHz sample frames after reference resampling",
+            "source": "feature_extraction_parakeet.py:191-245; modeling_parakeet.py:365-431,515-541",
+            "stride2": "floor((L - 1) / 2) + 1 = ceil(L / 2)",
+            "valid_encoder_frames": "ceil(ceil(ceil(valid_mel_frames / 2) / 2) / 2)",
+            "valid_mel_frames": "floor(samples / 160)"
+          },
+          "frontend": {
+            "dither": 0,
+            "frequency_range_hz": [
+              0,
+              8000
+            ],
+            "hop_samples": 160,
+            "log": "natural",
+            "log_guard": "2^-24 (5.9604644775390625e-8)",
+            "mean_divisor": "valid_mel_frames",
+            "mel_bins": 128,
+            "mel_filter_dtype": "fp32",
+            "mel_norm": "slaney",
+            "mel_scale": "Slaney (librosa htk=False)",
+            "n_fft": 512,
+            "normalization": "per feature, mean and sample standard deviation over valid frames only",
+            "normalization_denominator": "std + 1e-5",
+            "padding_after_normalization": "invalid mel frames set to 0.0",
+            "preemphasis": 0.97,
+            "preemphasis_first_sample": "unchanged",
+            "sample_rate": 16000,
+            "source": "transformers 5.16.1 feature_extraction_parakeet.py:30-31,96-125,214-245",
+            "spectrum": "sqrt(re^2+im^2), then square, fp32",
+            "std_divisor": "valid_mel_frames - 1",
+            "stft_center": true,
+            "stft_pad_mode": "constant (zero)",
+            "window": "Hann, periodic=False",
+            "window_samples": 400
+          },
+          "integer_tensors": "retain BatchNorm num_batches_tracked scalar I64 counters losslessly in v1 packages",
+          "masking": {
+            "attention": "pairwise valid query AND valid key; finite -10000 mask before softmax, then zero masked probabilities",
+            "before_first_subsampling_convolution": "no extra mask beyond frontend zero padding",
+            "between_subsampling_stages": "zero invalid time positions after every Conv2d, including pointwise stages",
+            "conformer_convolution": "zero invalid positions after GLU, immediately before depthwise convolution",
+            "convolution_patch_needed": false,
+            "nemo_attention_source": "nemo/collections/asr/parts/submodules/multi_head_attention.py:125-146",
+            "nemo_behavior": "finite -10000 sentinel, zero masked probabilities after softmax, zero padded frames after GLU before depthwise convolution",
+            "nemo_convolution_source": "nemo/collections/asr/parts/submodules/conformer_modules.py:320-345",
+            "nemo_revision": "2381f42f6979449b5b99538f8f80135831009b51",
+            "patch_revision": "synapse-parakeet-mask-fix-v1",
+            "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
+            "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+          },
+          "maximum_emissions_per_frame": 5,
+          "measured_resample_max_abs_decimal": "1.5454903244972229",
+          "self_check_sealed_bytes": 111894,
+          "synthetic_wav_metadata": "libsndfile FLOAT WAV PEAK timestamp is zeroed; encoded samples and peak values are unchanged",
+          "torch_version": "2.14.0",
+          "transformers_version": "5.16.1",
+          "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "wer_normalizer": "synapse-wer-norm-v1",
+          "word_rule": {
+            "boundary": "first emitted token, then each token piece beginning with U+2581",
+            "end_ms": "80 * (last token frame_index + max(last token duration, 1)), clamped to audio duration",
+            "no_speech": "true exactly when no token was emitted; text empty and words empty",
+            "start_ms": "80 * first token frame_index, clamped to audio duration",
+            "text": "tokenizer decode of all emitted token ids",
+            "word": "tokenizer decode of word token ids, leading/trailing whitespace stripped"
+          }
+        },
+        "encoder_rungs": [
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192
+        ],
+        "max_duration_ms": 600000,
+        "self_check": {
+          "bytes": 4366,
+          "path": "fixtures/parakeet-tdt-0.6b-v3/self-check.json",
+          "sha256": "5f6161617119fa54ca90e792880465f3f17d1bf1766597908ffdd98f2af8c075"
+        },
+        "tau_feat": 0.001,
+        "tau_margin": 0.001,
+        "tau_resample": 1.546491
+      }
+    },
+    "parakeet-tdt-0.6b-v3.owned-vulkan": {
+      "compute_dtype": "f16",
+      "conversion_rule": "v1",
+      "converted_package_digest": "sha256:1ce06d3fb25b7bf57c068da75588b937235b20427ebaf6eab8b9d0ad1cd2c597",
+      "fp32_tensors": [],
+      "lane": "owned-vulkan",
+      "model": "parakeet-tdt-0.6b-v3",
+      "rerank_tolerance_class": "fp16",
+      "storage_dtype": "f16",
+      "transcribe": {
+        "confirmations": {
+          "decode_rule": {
+            "K": 10,
+            "a": "zero LSTM state, initial predictor input blank; blank preserves predictor state and output",
+            "argmax_ties": "lowest index",
+            "b": "count every joint evaluation at a frame; a blank always advances by max(duration, 1)",
+            "blank_token_id": 8192,
+            "c": "force +1 only when the K-th evaluation otherwise advances by zero; no extra +1 after positive duration",
+            "d": "K=10 is a bounded adaptation, not the upstream TDT per-frame rule",
+            "durations": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "hf_equality": "tokens and durations must equal HF generate on every fixture with finite unpatched encoder output",
+            "hf_exception_class": "upstream NaN on padded input; compare independent loop against patched HF generate instead",
+            "maximum_evaluations": "valid_encoder_frames * K",
+            "natural_fixture_guard": "fail if any fixture reaches K emissions at a single frame",
+            "nemo_deviation": "v2.4.0 tdt greedy counts per-frame symbols but adds +1 even after a positive duration at the cap; this bounded rule matches neither upstream exactly",
+            "revision": "synapse-parakeet-tdt-greedy-v1",
+            "transformers_deviation": "5.16.1 generation_parakeet.py:280-299 bypasses the RNNT frame counter; max_symbols_per_step=10 sizes only the global output buffer"
+          },
+          "duration_ladder": [
+            {
+              "duration_ms": 10090,
+              "encoder_frames": 127,
+              "id": "ladder-127",
+              "sample_count": 161440
+            },
+            {
+              "duration_ms": 10170,
+              "encoder_frames": 128,
+              "id": "ladder-128",
+              "sample_count": 162720
+            },
+            {
+              "duration_ms": 10250,
+              "encoder_frames": 129,
+              "id": "ladder-129",
+              "sample_count": 164000
+            },
+            {
+              "duration_ms": 20330,
+              "encoder_frames": 255,
+              "id": "ladder-255",
+              "sample_count": 325280
+            },
+            {
+              "duration_ms": 20410,
+              "encoder_frames": 256,
+              "id": "ladder-256",
+              "sample_count": 326560
+            },
+            {
+              "duration_ms": 20490,
+              "encoder_frames": 257,
+              "id": "ladder-257",
+              "sample_count": 327840
+            },
+            {
+              "duration_ms": 40810,
+              "encoder_frames": 511,
+              "id": "ladder-511",
+              "sample_count": 652960
+            },
+            {
+              "duration_ms": 40890,
+              "encoder_frames": 512,
+              "id": "ladder-512",
+              "sample_count": 654240
+            },
+            {
+              "duration_ms": 40970,
+              "encoder_frames": 513,
+              "id": "ladder-513",
+              "sample_count": 655520
+            },
+            {
+              "duration_ms": 81770,
+              "encoder_frames": 1023,
+              "id": "ladder-1023",
+              "sample_count": 1308320
+            },
+            {
+              "duration_ms": 81850,
+              "encoder_frames": 1024,
+              "id": "ladder-1024",
+              "sample_count": 1309600
+            },
+            {
+              "duration_ms": 81930,
+              "encoder_frames": 1025,
+              "id": "ladder-1025",
+              "sample_count": 1310880
+            },
+            {
+              "duration_ms": 163690,
+              "encoder_frames": 2047,
+              "id": "ladder-2047",
+              "sample_count": 2619040
+            },
+            {
+              "duration_ms": 163770,
+              "encoder_frames": 2048,
+              "id": "ladder-2048",
+              "sample_count": 2620320
+            },
+            {
+              "duration_ms": 163850,
+              "encoder_frames": 2049,
+              "id": "ladder-2049",
+              "sample_count": 2621600
+            },
+            {
+              "duration_ms": 327530,
+              "encoder_frames": 4095,
+              "id": "ladder-4095",
+              "sample_count": 5240480
+            },
+            {
+              "duration_ms": 327610,
+              "encoder_frames": 4096,
+              "id": "ladder-4096",
+              "sample_count": 5241760
+            },
+            {
+              "duration_ms": 327690,
+              "encoder_frames": 4097,
+              "id": "ladder-4097",
+              "sample_count": 5243040
+            },
+            {
+              "duration_ms": 655210,
+              "encoder_frames": 8191,
+              "id": "ladder-8191",
+              "sample_count": 10483360
+            },
+            {
+              "duration_ms": 655290,
+              "encoder_frames": 8192,
+              "id": "ladder-8192",
+              "sample_count": 10484640
+            },
+            {
+              "duration_ms": 655370,
+              "encoder_frames": 8193,
+              "id": "ladder-8193",
+              "sample_count": 10485920
+            },
+            {
+              "duration_ms": 600000,
+              "encoder_frames": 7500,
+              "id": "ladder-600000ms",
+              "sample_count": 9600000
+            }
+          ],
+          "environment": {
+            "attention_implementation": "eager",
+            "deterministic_algorithms": true,
+            "device": "cpu",
+            "dtype": "fp32",
+            "interop_threads": 1,
+            "intraop_threads": 1,
+            "seed": 0
+          },
+          "frame_counts": {
+            "actual_mel_frames": "floor(samples / 160) + 1",
+            "samples": "mono 16 kHz sample frames after reference resampling",
+            "source": "feature_extraction_parakeet.py:191-245; modeling_parakeet.py:365-431,515-541",
+            "stride2": "floor((L - 1) / 2) + 1 = ceil(L / 2)",
+            "valid_encoder_frames": "ceil(ceil(ceil(valid_mel_frames / 2) / 2) / 2)",
+            "valid_mel_frames": "floor(samples / 160)"
+          },
+          "frontend": {
+            "dither": 0,
+            "frequency_range_hz": [
+              0,
+              8000
+            ],
+            "hop_samples": 160,
+            "log": "natural",
+            "log_guard": "2^-24 (5.9604644775390625e-8)",
+            "mean_divisor": "valid_mel_frames",
+            "mel_bins": 128,
+            "mel_filter_dtype": "fp32",
+            "mel_norm": "slaney",
+            "mel_scale": "Slaney (librosa htk=False)",
+            "n_fft": 512,
+            "normalization": "per feature, mean and sample standard deviation over valid frames only",
+            "normalization_denominator": "std + 1e-5",
+            "padding_after_normalization": "invalid mel frames set to 0.0",
+            "preemphasis": 0.97,
+            "preemphasis_first_sample": "unchanged",
+            "sample_rate": 16000,
+            "source": "transformers 5.16.1 feature_extraction_parakeet.py:30-31,96-125,214-245",
+            "spectrum": "sqrt(re^2+im^2), then square, fp32",
+            "std_divisor": "valid_mel_frames - 1",
+            "stft_center": true,
+            "stft_pad_mode": "constant (zero)",
+            "window": "Hann, periodic=False",
+            "window_samples": 400
+          },
+          "integer_tensors": "retain BatchNorm num_batches_tracked scalar I64 counters losslessly in v1 packages",
+          "masking": {
+            "attention": "pairwise valid query AND valid key; finite -10000 mask before softmax, then zero masked probabilities",
+            "before_first_subsampling_convolution": "no extra mask beyond frontend zero padding",
+            "between_subsampling_stages": "zero invalid time positions after every Conv2d, including pointwise stages",
+            "conformer_convolution": "zero invalid positions after GLU, immediately before depthwise convolution",
+            "convolution_patch_needed": false,
+            "nemo_attention_source": "nemo/collections/asr/parts/submodules/multi_head_attention.py:125-146",
+            "nemo_behavior": "finite -10000 sentinel, zero masked probabilities after softmax, zero padded frames after GLU before depthwise convolution",
+            "nemo_convolution_source": "nemo/collections/asr/parts/submodules/conformer_modules.py:320-345",
+            "nemo_revision": "2381f42f6979449b5b99538f8f80135831009b51",
+            "patch_revision": "synapse-parakeet-mask-fix-v1",
+            "patch_sha256": "bf2ce94d4113539fb39b39e69ad6004926d36714a4a44b8f7f9723c840524c7e",
+            "reason": "upstream all-masked padded query rows produce NaN under eager softmax; padded convolution neighbours contaminate valid frames",
+            "replaced_function": "transformers.models.parakeet.modeling_parakeet.eager_attention_forward:241-263"
+          },
+          "maximum_emissions_per_frame": 5,
+          "measured_resample_max_abs_decimal": "1.5454903244972229",
+          "self_check_sealed_bytes": 111894,
+          "synthetic_wav_metadata": "libsndfile FLOAT WAV PEAK timestamp is zeroed; encoded samples and peak values are unchanged",
+          "torch_version": "2.14.0",
+          "transformers_version": "5.16.1",
+          "transformers_wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+          "wer_normalizer": "synapse-wer-norm-v1",
+          "word_rule": {
+            "boundary": "first emitted token, then each token piece beginning with U+2581",
+            "end_ms": "80 * (last token frame_index + max(last token duration, 1)), clamped to audio duration",
+            "no_speech": "true exactly when no token was emitted; text empty and words empty",
+            "start_ms": "80 * first token frame_index, clamped to audio duration",
+            "text": "tokenizer decode of all emitted token ids",
+            "word": "tokenizer decode of word token ids, leading/trailing whitespace stripped"
+          }
+        },
+        "encoder_rungs": [
+          128,
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192
+        ],
+        "max_duration_ms": 600000,
+        "self_check": {
+          "bytes": 4366,
+          "path": "fixtures/parakeet-tdt-0.6b-v3/self-check.json",
+          "sha256": "5f6161617119fa54ca90e792880465f3f17d1bf1766597908ffdd98f2af8c075"
+        },
+        "tau_feat": 0.001,
+        "tau_margin": 0.001,
+        "tau_resample": 1.546491
+      }
     },
     "qwen3-embedding-0.6b.ane-direct-worker": {
       "compute_dtype": "f16",

@@ -1,0 +1,36 @@
+{
+  "nemo": {
+    "revision": "2381f42f6979449b5b99538f8f80135831009b51",
+    "tag": "v2.4.0",
+    "sources": [
+      {
+        "path": "nemo/collections/asr/parts/submodules/multi_head_attention.py",
+        "url": "https://raw.githubusercontent.com/NVIDIA-NeMo/NeMo/2381f42f6979449b5b99538f8f80135831009b51/nemo/collections/asr/parts/submodules/multi_head_attention.py",
+        "sha256": "5891e68f35ff21ce869c796ce883bcdcee5460ea229c81b8a1755665c7f14929",
+        "bytes": 50958
+      },
+      {
+        "path": "nemo/collections/asr/parts/submodules/conformer_modules.py",
+        "url": "https://raw.githubusercontent.com/NVIDIA-NeMo/NeMo/2381f42f6979449b5b99538f8f80135831009b51/nemo/collections/asr/parts/submodules/conformer_modules.py",
+        "sha256": "eb6fa21ff503817577c0b8c90dc85f9e6ed5df1d3a8dfd3b1fd32bc85142738d",
+        "bytes": 15809
+      },
+      {
+        "path": "nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py",
+        "url": "https://raw.githubusercontent.com/NVIDIA-NeMo/NeMo/2381f42f6979449b5b99538f8f80135831009b51/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py",
+        "sha256": "c5ca98a36c2dadf74ee4a82e00b017a6417e1c9915d5de0dddec386c57ef4277",
+        "bytes": 143562
+      }
+    ]
+  },
+  "transformers": {
+    "version": "5.16.1",
+    "wheel_sha256": "2f2d5b98a5ad3718713653734298fa620754ed683702a635ebb587df3ed29c7e",
+    "sources": [
+      {"path": "transformers/models/parakeet/configuration_parakeet.py", "sha256": "74f52c7ccf887da1bf840c9c75a511b4940385ef7be4cdc93e64c7caf3c6540e", "bytes": 9073},
+      {"path": "transformers/models/parakeet/feature_extraction_parakeet.py", "sha256": "5ec8a9664456edfc0b56c64083bdcdd74dd78364504d35207ab917d1c3b9f575", "bytes": 13110},
+      {"path": "transformers/models/parakeet/generation_parakeet.py", "sha256": "ee5ac5310d699f7d48d9c04e525bebae6b905e663f74fb418470ce514703d0ba", "bytes": 13257},
+      {"path": "transformers/models/parakeet/modeling_parakeet.py", "sha256": "457f93a49db264cb4b7266ba81f45066232119adcc5fae2d96861e16e05eda07", "bytes": 49389}
+    ]
+  }
+}

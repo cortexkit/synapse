@@ -6787,6 +6787,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokenizers 0.21.4",
+ "unicode-casefold",
+ "unicode-general-category",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -7613,6 +7616,18 @@ dependencies = [
  "thiserror 1.0.69",
  "ug",
 ]
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
+name = "unicode-general-category"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2281c8c1d221438e373249e065ca4989c4c36952c211ff21a0ee91c44a3869e7"
 
 [[package]]
 name = "unicode-ident"
