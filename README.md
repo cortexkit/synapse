@@ -17,6 +17,7 @@ matrix determine supported backends and published assets.
 |---|---|
 | `synapse-build-stamp` | Shared clean/dirty Git build provenance. |
 | `synapse-core` | Protocol, errors, fingerprints, tokenizer, cache and scheduler types. |
+| `synapse-speech` | Portable WAV validation, resampling, Parakeet log-mel frontend, TDT greedy decoding and word timing. |
 | `synapse-native-probe` | Safe native platform-profile probes. |
 | `synapse-certify` | Schema-3 certification records, self-checks and offline validation. |
 | `synapse-certify-runner` | Non-shipped hardware evidence producer with isolated run state. |

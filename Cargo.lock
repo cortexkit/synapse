@@ -6808,6 +6808,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-speech"
+version = "0.1.0"
+dependencies = [
+ "rustfft",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "synapse-worker-ane"
 version = "0.1.0-alpha.2"
 dependencies = [

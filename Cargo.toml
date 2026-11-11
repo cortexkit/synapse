@@ -4,6 +4,7 @@ exclude = ["bench/parity"]
 # Ordinary root builds should compile shipped components, not experimental
 # benchmark engines. Benchmarks remain available through -p and --workspace.
 default-members = [
+    "crates/synapse-speech",
     "crates/synapse-core",
     "crates/synapse-native-probe",
     "crates/synapse-certify",
@@ -20,6 +21,7 @@ default-members = [
     "crates/synapse-worker-vulkan",
 ]
 members = [
+    "crates/synapse-speech",
     "bench/harness",
     "bench/rig",
     "bench/lanes/ort-embed",
