@@ -6722,6 +6722,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "synapse-core",
+ "synapse-speech",
  "thiserror 1.0.69",
 ]
 
@@ -6885,8 +6886,11 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "synapse-core",
  "synapse-engine-cuda",
+ "synapse-parity",
+ "synapse-speech",
 ]
 
 [[package]]

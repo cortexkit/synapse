@@ -11,6 +11,7 @@ fn main() {
         "src/port/cuda_minilm.cu",
         "src/port/cuda_modernbert.cu",
         "src/port/cuda_qwen3.cu",
+        "src/port/cuda_parakeet.cu",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
@@ -62,6 +63,7 @@ fn main() {
         .file("src/port/cuda_minilm.cu")
         .file("src/port/cuda_modernbert.cu")
         .file("src/port/cuda_qwen3.cu");
+    build.file("src/port/cuda_parakeet.cu");
     // Position-independent host code is an ELF concern. Forwarded to MSVC it is
     // an unknown-option error out of cl, which nvcc surfaces as a build failure,
     // so the flag is applied only where the host toolchain accepts it.
