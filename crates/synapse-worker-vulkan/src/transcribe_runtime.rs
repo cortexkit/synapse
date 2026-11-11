@@ -54,6 +54,66 @@ impl Engine {
         self.arena.driver_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn debug_projection(&self) -> &[f32] {
+        &self.joint.projected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_project_f64(&self, encoder: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            encoder.len().is_multiple_of(1024),
+            "malformed debug encoder"
+        );
+        let mut weights = vec![0; 640 * 1024 * 2];
+        let mut bias = vec![0; 640 * 2];
+        self.arena
+            .transfer("weight:encoder_projector.weight", &mut weights, false)?;
+        self.arena
+            .transfer("weight:encoder_projector.bias", &mut bias, false)?;
+        let widen = |bytes: &[u8]| {
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| f64::from(half::f16::from_le_bytes(*v).to_f32()))
+                .collect::<Vec<_>>()
+        };
+        let weights = widen(&weights);
+        let bias = widen(&bias);
+        Ok(encoder
+            .as_chunks::<1024>()
+            .0
+            .iter()
+            .flat_map(|input| {
+                weights
+                    .as_chunks::<1024>()
+                    .0
+                    .iter()
+                    .zip(&bias)
+                    .map(move |(row, b)| {
+                        (row.iter()
+                            .zip(input)
+                            .map(|(w, x)| w * f64::from(*x))
+                            .sum::<f64>()
+                            + b) as f32
+                    })
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_replay_projection(
+        &mut self,
+        projected: Vec<f32>,
+        frames: usize,
+    ) -> Result<synapse_speech::DecodeOutput> {
+        let saved = std::mem::replace(&mut self.joint.projected, projected);
+        let result = synapse_speech::greedy(&mut self.joint, frames, true, |_| {});
+        self.joint.projected = saved;
+        Ok(result?)
+    }
+
     fn run(&self, p: Params, buffers: [&str; 7], count: usize) -> Result<()> {
         self.arena.dispatch(p, buffers, u32::try_from(count)?)
     }

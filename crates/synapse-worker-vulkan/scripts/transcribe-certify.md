@@ -88,8 +88,14 @@ divergence is exempt only for the reference profile's small argmax margins at
 the same frame; a shifted frame or trace-length difference always fails.
 Each corpus split's word-error rate may exceed the reference by at most 0.5
 absolute percentage points, using the shared evaluator's pinned normalizer.
-Encoder/trace checks run after each utterance so a numerical failure stops the
-run immediately; word-error rates are graded after the complete corpus.
+Encoder/trace checks run after each utterance and preserve every fixture's
+finding, including failures, in `vulkan-fixture-findings.jsonl`. Each trace
+finding reports the first differing decision (the decision used by the grading
+rule), the affected head, reference margin, and both reference/engine top-2
+pairs and logits. Later divergence after that first decision is not counted as
+another independent margin failure. Word-error rates are aggregated over entire
+splits. The final JSON is written even if numerical grading fails, and the test
+still fails unless the shared evaluator accepts the run.
 Completed work produces exactly 24 encoder progress units plus one per 125
 decoded frames. Progress gaps must remain below 120 s; no timer heartbeats exist.
 
@@ -107,12 +113,28 @@ encoder-frame rung boundaries and the 600-second target; other fixtures test
 the corpus, silence, resampling and hop boundaries.
 The summary `vulkan-transcribe-summary.json` records graded/refused counts,
 split WER, margin exemptions, observation comparisons, longest progress gap,
-arena bytes, maximum duration, and the largest **actually passed** ladder.
+arena bytes, maximum duration, all encoder/trace/WER failures, and the largest
+**actually passed** ladder. `largest_certified_ladder_ms` is null unless the
+complete run passes; `largest_passed_ladder_ms` records individual ladder results.
 Do not describe the target maximum as certified until this complete run passes.
 `SYNAPSE_VULKAN_SPEECH_FILTER=<fixture-id-prefix>` is available for a quick
 numerical investigation; such summaries have `complete: false` and do not
 certify a lane. A smaller production maximum requires updating the profile and
 its inventory floors, still covering every non-ladder fixture, then rerunning.
+
+For a targeted numerical investigation, optionally set
+`SYNAPSE_VULKAN_SPEECH_DEBUG_ENCODER` to a scratch fp32 encoder file whose basename
+starts with its full SHA-256 and whose frame count matches the filtered fixture.
+It is hash-checked and used only for diagnostics, never to replace the sealed
+trace or change a gate. On the first failing trace, a filtered run (or one with
+this debug tensor) repeats observed/plain inference and writes
+`vulkan-trace-failure.json`, the engine encoder and its projected output. The JSON
+includes both heads' top-2 logits/margins, repeated encoder/triple equality,
+reference encoder max-abs at the differing frame, GPU projection error against
+CPU f64 dot products using the package's fp16 weights, and joint replay with
+those diagnostic projections. A regenerated reference may have small
+cross-architecture differences; record that provenance separately. These CPU
+calculations exist only in the test harness and do not alter production inference.
 
 Keep logs/JSON outside `target/` and attach all three hardware results to the
 change review before landing. Do not relax tolerances or reference seals.
