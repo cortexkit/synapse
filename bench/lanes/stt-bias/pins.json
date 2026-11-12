@@ -1,0 +1,38 @@
+{
+  "transcribe_cpp": {
+    "repo": "https://github.com/anomalyco/transcribe.cpp",
+    "revision": "bcb639faa4c74a2300ba19e30360cb2355b1663a",
+    "version": "0.4.1",
+    "model_repo": "handy-computer/parakeet-tdt-0.6b-v3-gguf",
+    "model_revision": "85ac09ea12fc4b1112fa76810059364bc6adc9de",
+    "file": "parakeet-tdt-0.6b-v3-F16.gguf",
+    "sha256": "d9ec7e2c39da7b4fec3e01e71e82c7f7bbe97741e08c0c054091bf3d520a41d3",
+    "boosts": [2.5, 4.0]
+  },
+  "qwen_1_7b": {
+    "repo": "Qwen/Qwen3-ASR-1.7B",
+    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5"
+  },
+  "qwen_0_6b": {
+    "repo": "Qwen/Qwen3-ASR-0.6B",
+    "revision": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+  },
+  "granite_2b": {
+    "repo": "ibm-granite/granite-speech-5.0-2b",
+    "revision": "ec49ca6b1a5e7e9176127e09cb303ab78cbacdf7"
+  },
+  "earnings22": {
+    "repo": "argmaxinc/contextual-earnings22",
+    "revision": "59d7f94771cc197984d8038e494c83abeff87282",
+    "file": "data/test-00000-of-00001.parquet",
+    "subset_size": 200,
+    "seed": 20261119
+  },
+  "fluidaudio": {
+    "repo": "https://github.com/FluidInference/FluidAudio.git",
+    "revision": "66a239a32609d3f90b50a9634e4b2820ab977011",
+    "model_repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+    "model_revision": "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe",
+    "execution": "requires separately scheduled ANE window"
+  }
+}
