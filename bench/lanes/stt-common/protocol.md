@@ -38,7 +38,17 @@ sampled from the parent, or Linux RSS / Windows peak working set. The original
 `peak_rss_bytes` remains available with its original units and meaning. NVIDIA
 memory is per PID (pre-spawn baseline zero), preferably NVML compute+graphics,
 otherwise `nvidia-smi` compute-apps, with 100 ms target interval and observed
-maximum gap. Missing counters, including Neural Engine memory, stay null.
+maximum gap. When per-PID memory is unavailable (including `N/A` under the Windows
+Display Driver Model, WDDM), use device
+`memory.used` minus a baseline captured **before worker spawn**, via NVML
+`nvmlDeviceGetMemoryInfo` or `nvidia-smi --query-gpu=uuid,memory.used`.
+Device snapshots sum the same NVIDIA GPU UUIDs as the baseline; a changed or
+missing set is unavailable. Deltas clamp to zero if other users release memory.
+`gpu_peak_method` labels `device-delta` and warns that other GPU users are included.
+A valid per-PID peak takes priority; it is never combined with device deltas.
+`gpu_idle_baseline_bytes` records the chosen peak's baseline, while
+`gpu_device_baseline_bytes` separately preserves the pre-spawn device total.
+Missing counters/baselines, including Neural Engine memory, stay null.
 Live parent counters are not reconstructed during transcript replay.
 
 Optional loaded-memory probe: when `STT_MEMORY_READY` is set to a path, workers
@@ -48,6 +58,9 @@ same path with extension `memory-resume`. The parent snapshots
 barrier's elapsed duration from `cold_start_seconds`; process wall still includes
 it. Workers without the extension remain compatible and have a null idle value.
 Current NVIDIA-capable lanes implement it; Mac-only Swift GPU counters stay null.
+The idle snapshot also uses per-PID memory first, otherwise device used minus
+the pre-spawn device baseline. `gpu_after_load_idle_method` records that snapshot's
+scope independently of the peak, including the other-GPU-users caveat.
 
 Synapse backends are named `synapse-metal`, `synapse-ane`,
 `synapse-cuda-f16`, `synapse-cuda-f32`, `synapse-vulkan-f16` and

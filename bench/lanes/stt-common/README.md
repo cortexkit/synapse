@@ -68,21 +68,39 @@ Memory covers loading and warmup as well as inference:
   RSS. It is still worker-only, excluding CoreML, Speech and `aned` service
   processes. On Linux/Windows it uses the worker's high-water RSS/working set.
   The final instant before worker exit can fall between footprint polls.
-- **`gpu_peak_bytes`** is sampled NVIDIA memory for the worker PID, summed over
-  devices, above its pre-spawn idle baseline of **zero** (not whole-device memory
-  minus other users). NVML v2 compute **and graphics** process lists are preferred,
+- **`gpu_peak_bytes`** prefers sampled NVIDIA memory for the worker PID, summed
+  over devices, above its pre-spawn idle baseline of **zero**. NVML v2 compute
+  **and graphics** process lists are preferred,
   deduplicated per device, so Vulkan is covered when the driver exposes it. The
   fallback is `nvidia-smi --query-compute-apps=pid,used_gpu_memory`; MiB are
   converted to bytes. The target interval is 100 ms (faster than 200 ms);
   `gpu_peak_method`, `gpu_sample_interval_ms`, `gpu_max_sample_gap_ms` and
   `gpu_samples` record method/cadence/valid samples. Inspect actual gaps: a slow
   command/driver can miss the requested cadence. Peaks shorter than an interval
-  can be missed. Missing PID rows, absent drivers and WDDM `N/A` are **null**, not
-  zero. The fallback may not expose Vulkan graphics memory on some drivers.
+  can be missed.
+- When per-process memory is unavailable, including `N/A` under the Windows
+  Display Driver Model (**WDDM**), the runner falls back to **device memory used
+  minus its pre-spawn baseline**.
+  Device readings use NVML `nvmlDeviceGetMemoryInfo`, or
+  `nvidia-smi --query-gpu=uuid,memory.used` if NVML is unavailable. The same GPU
+  UUIDs must be present in baseline and run samples; values sum all NVIDIA GPUs.
+  `gpu_peak_method` explicitly labels `device-delta` and its API. **This includes
+  allocations/releases by any other GPU user during the run**, not just the
+  worker; releases can mask the worker's usage. Negative deltas clamp to zero.
+  Arrange an otherwise idle GPU for comparable device-delta rows. A valid
+  per-PID peak always takes priority over device samples collected during startup,
+  so peaks from different scopes are never mixed. If neither the PID reading nor
+  a matching device baseline/reading exists, memory remains **null**, not zero.
+  `gpu_idle_baseline_bytes` is zero for a per-PID peak or the captured device
+  baseline for a device-delta peak; `gpu_device_baseline_bytes` preserves the
+  device baseline separately, even when the peak ultimately uses per-PID data.
 - **`gpu_after_load_idle_bytes`** is a separate resident-memory snapshot after
   model loading, before the first warmup utterance. Synapse and transcribe.cpp
-  pause at an optional parent probe barrier; the parent samples the same PID
-  counter, then resumes them. The barrier wait is subtracted from worker cold
+  pause at an optional parent probe barrier; the parent samples per-PID memory,
+  or device memory minus the same pre-spawn baseline when unavailable, then
+  resumes them. `gpu_after_load_idle_method` labels that snapshot's scope/API
+  separately, because a PID counter unavailable at load may become available
+  during later inference. The barrier wait is subtracted from worker cold
   time, but remains in parent-observed total wall time. We do **not** subtract
   resident weights from `gpu_peak_bytes`. Mac-only Swift lanes have no NVIDIA
   counter, so their GPU resident-idle value is null, as are old workers/replays

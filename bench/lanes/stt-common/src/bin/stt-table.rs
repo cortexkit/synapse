@@ -35,7 +35,7 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    println!("engine\tversion\tcommit\tmodel\tbackend\tsplit\tcompleted\trequested\twer_truth\twer_nvidia\trtf\tp50_s\tp95_s\tcold_s\ttotal_wall_s\twarm_wall_s\tpeak_rss_bytes\tgpu_peak_bytes\tenergy_joules\tmodel_size_bytes\tprocess_peak_bytes\tprocess_peak_method\tgpu_peak_method\tgpu_idle_baseline_bytes\tgpu_sample_interval_ms\tgpu_max_sample_gap_ms\tane_peak_bytes\tweight_precision\tmachine\tos\tgpu_after_load_idle_bytes");
+    println!("engine\tversion\tcommit\tmodel\tbackend\tsplit\tcompleted\trequested\twer_truth\twer_nvidia\trtf\tp50_s\tp95_s\tcold_s\ttotal_wall_s\twarm_wall_s\tpeak_rss_bytes\tgpu_peak_bytes\tenergy_joules\tmodel_size_bytes\tprocess_peak_bytes\tprocess_peak_method\tgpu_peak_method\tgpu_idle_baseline_bytes\tgpu_sample_interval_ms\tgpu_max_sample_gap_ms\tane_peak_bytes\tweight_precision\tmachine\tos\tgpu_after_load_idle_bytes\tgpu_device_baseline_bytes\tgpu_after_load_idle_method");
     for path in args.results {
         let result: Value = serde_json::from_slice(&fs::read(path)?)?;
         ensure!(
@@ -84,6 +84,8 @@ fn main() -> Result<()> {
                     "machine",
                     "os",
                     "gpu_after_load_idle_bytes",
+                    "gpu_device_baseline_bytes",
+                    "gpu_after_load_idle_method",
                 ]
                 .iter()
                 .map(|k| cell(&result[k])),
@@ -110,6 +112,8 @@ fn wide_rows(results: &[Value]) -> Result<Vec<Vec<String>>> {
         "peak_rss_bytes",
         "gpu_peak_bytes",
         "gpu_after_load_idle_bytes",
+        "gpu_device_baseline_bytes",
+        "gpu_after_load_idle_method",
         "gpu_peak_method",
         "gpu_idle_baseline_bytes",
         "gpu_sample_interval_ms",
@@ -174,7 +178,7 @@ fn stt_table_distinguishes_unavailable_from_zero_and_escapes_cells() {
 #[test]
 fn stt_table_wide_keeps_one_row_per_result_and_old_schema_nulls() {
     let old = serde_json::json!({"schema":"synapse-stt-benchmark-v1", "engine":"old", "splits":{"english":{"ground_truth_wer":0.25,"nvidia_fp32_wer":0.5}}});
-    let new = serde_json::json!({"schema":"synapse-stt-benchmark-v1", "engine":"new", "model_size_bytes":123, "process_peak_bytes":456, "gpu_peak_bytes":0,"gpu_after_load_idle_bytes":111,"splits":{"other":{"ground_truth_wer":0.75}}});
+    let new = serde_json::json!({"schema":"synapse-stt-benchmark-v1", "engine":"new", "model_size_bytes":123, "process_peak_bytes":456, "gpu_peak_bytes":0,"gpu_after_load_idle_bytes":111,"gpu_device_baseline_bytes":200,"gpu_after_load_idle_method":"device-delta","splits":{"other":{"ground_truth_wer":0.75}}});
     let rows = wide_rows(&[old, new]).unwrap();
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|r| r.len() == rows[0].len()));
@@ -184,6 +188,12 @@ fn stt_table_wide_keeps_one_row_per_result_and_old_schema_nulls() {
     assert_eq!(rows[2][column("process_peak_bytes")], "456");
     assert_eq!(rows[2][column("gpu_peak_bytes")], "0");
     assert_eq!(rows[2][column("gpu_after_load_idle_bytes")], "111");
+    assert_eq!(rows[2][column("gpu_device_baseline_bytes")], "200");
+    assert_eq!(
+        rows[2][column("gpu_after_load_idle_method")],
+        "device-delta"
+    );
+    assert_eq!(rows[1][column("gpu_device_baseline_bytes")], "NA");
     assert_eq!(rows[1][column("english.ground_truth_wer")], "0.25");
     assert_eq!(rows[1][column("english.nvidia_fp32_wer")], "0.5");
     assert_eq!(rows[2][column("english.ground_truth_wer")], "NA");

@@ -1,4 +1,5 @@
 pub mod artifact;
+mod gpu;
 pub mod input;
 pub mod measurement;
 pub mod memory;

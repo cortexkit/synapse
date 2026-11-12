@@ -11,7 +11,7 @@ use stt_common::{
     input::sha256,
     load_corpus,
     measurement::{percentile, WorkerResult},
-    memory::{Memory, Monitor},
+    memory::{GpuProbe, Memory, Monitor},
     score,
 };
 
@@ -152,6 +152,7 @@ fn main() -> Result<()> {
     let mut memory;
     if let Some(worker) = &args.worker {
         worker_artifacts = artifacts(worker)?;
+        let gpu = GpuProbe::before_spawn();
         let start = Instant::now();
         let mut child = Command::new(worker)
             .env("STT_MEMORY_READY", &memory_ready)
@@ -165,7 +166,7 @@ fn main() -> Result<()> {
             .arg(&args.backend)
             .spawn()
             .with_context(|| format!("launch {}", worker.display()))?;
-        let monitor = Monitor::start(child.id(), memory_ready.clone());
+        let monitor = Monitor::start(child.id(), memory_ready.clone(), gpu);
         let status = child.wait();
         wall = Some(start.elapsed().as_secs_f64());
         memory = monitor.finish();
@@ -237,7 +238,7 @@ fn main() -> Result<()> {
         "model_size_bytes": model_size_bytes,
         "weight_precision": weight_precision(&args.model, &args.backend),
         "measurement_only": args.backend.ends_with("-f32") && args.backend != "synapse-metal",
-        "memory_notes": "Process counter covers worker only, not CoreML/Speech/aned services. macOS uses lifetime maximum phys_footprint (includes charged Metal allocations); RSS is retained separately. NVIDIA counters are process-scoped above pre-spawn zero baseline, sampled, not an allocation trace. WDDM N/A and absent graphics/compute PID rows are unavailable. No public per-process Neural Engine counter exists.",
+        "memory_notes": "Process counter covers worker only, not CoreML/Speech/aned services. macOS uses lifetime maximum phys_footprint (includes charged Metal allocations); RSS is retained separately. NVIDIA counters prefer per-PID above pre-spawn zero baseline. When unavailable (including WDDM N/A), device-delta subtracts a pre-spawn baseline across the same NVIDIA GPU UUIDs and includes allocations/releases by other GPU users. Negative deltas clamp to zero. Check peak/idle method labels and actual max sample gap; sampled peaks are not an allocation trace. No public per-process Neural Engine counter exists.",
         "corpus_manifest_sha256": sha256(&fs::read(args.parity.join("reference/parakeet-corpus.json"))?),
         "fixture_index_sha256": sha256(&fs::read(args.parity.join("fixtures/index.json"))?),
         "total_wall_seconds": wall, "cold_start_seconds": result.cold_start_seconds,

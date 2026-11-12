@@ -1,11 +1,22 @@
 //! Dynamically loaded so hosts without NVIDIA drivers need no NVML installation.
 use libloading::Library;
-use std::ffi::{c_uint, c_void};
+use std::collections::BTreeMap;
+use std::ffi::{c_char, c_uint, c_void, CStr};
 
 type Device = *mut c_void;
 type Count = unsafe extern "C" fn(*mut c_uint) -> c_uint;
 type Handle = unsafe extern "C" fn(c_uint, *mut Device) -> c_uint;
 type Processes = unsafe extern "C" fn(Device, *mut c_uint, *mut Process) -> c_uint;
+type GetMemory = unsafe extern "C" fn(Device, *mut DeviceMemory) -> c_uint;
+type GetUuid = unsafe extern "C" fn(Device, *mut c_char, c_uint) -> c_uint;
+
+#[repr(C)]
+#[derive(Default)]
+struct DeviceMemory {
+    total: u64,
+    free: u64,
+    used: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -22,6 +33,8 @@ pub struct Nvml {
     handle: Handle,
     compute: Processes,
     graphics: Processes,
+    memory: GetMemory,
+    uuid: GetUuid,
 }
 
 impl Nvml {
@@ -46,6 +59,10 @@ impl Nvml {
             let graphics = *library
                 .get::<Processes>(b"nvmlDeviceGetGraphicsRunningProcesses_v2\0")
                 .ok()?;
+            let memory = *library
+                .get::<GetMemory>(b"nvmlDeviceGetMemoryInfo\0")
+                .ok()?;
+            let uuid = *library.get::<GetUuid>(b"nvmlDeviceGetUUID\0").ok()?;
             if init() != 0 {
                 return None;
             }
@@ -55,6 +72,8 @@ impl Nvml {
                 handle,
                 compute,
                 graphics,
+                memory,
+                uuid,
             })
         }
     }
@@ -83,6 +102,37 @@ impl Nvml {
                 }
             }
             total
+        }
+    }
+
+    pub fn device_bytes(&self) -> Option<BTreeMap<String, u64>> {
+        unsafe {
+            let mut count = 0;
+            if (self.count)(&mut count) != 0 || count == 0 {
+                return None;
+            }
+            let mut devices = BTreeMap::new();
+            for index in 0..count {
+                let mut device = std::ptr::null_mut();
+                if (self.handle)(index, &mut device) != 0 {
+                    return None;
+                }
+                let mut memory = DeviceMemory::default();
+                let mut uuid = [0 as c_char; 96];
+                if (self.memory)(device, &mut memory) != 0
+                    || (self.uuid)(device, uuid.as_mut_ptr(), uuid.len() as u32) != 0
+                    || memory.used > memory.total
+                    || memory.used == u64::MAX
+                    || uuid.last() != Some(&0)
+                {
+                    return None;
+                }
+                let id = CStr::from_ptr(uuid.as_ptr()).to_str().ok()?.to_owned();
+                if id.is_empty() || devices.insert(id, memory.used).is_some() {
+                    return None;
+                }
+            }
+            Some(devices)
         }
     }
 }
