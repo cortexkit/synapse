@@ -81,7 +81,10 @@ class ScoringTests(unittest.TestCase):
             aggregate([fixture()], [{**prediction, "text": None}])
 
     def test_private_outputs_cannot_escape_target(self):
-        self.assertEqual(private_path(TARGET / "tests" / "safe.jsonl"), TARGET / "tests" / "safe.jsonl")
+        # private_path resolves symlinks, and a checkout's target/ may itself be
+        # a symlink to another volume, so compare against the resolved path.
+        safe = TARGET / "tests" / "safe.jsonl"
+        self.assertEqual(private_path(safe), safe.resolve())
         with self.assertRaises(ValueError):
             private_path(Path(__file__).parent / "transcripts.jsonl")
 
