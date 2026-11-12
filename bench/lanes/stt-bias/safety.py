@@ -37,9 +37,24 @@ def sample():
     if pageout_match is None or free_match is None:
         raise RuntimeError("cannot read pageouts or memory pressure")
     pageouts, free = int(pageout_match[1]), int(free_match[1])
+    process = psutil.Process()
+    rss = process.memory_info().rss
+    for child in process.children(recursive=True):
+        try:
+            rss += child.memory_info().rss
+        except psutil.NoSuchProcess:
+            pass
     return {"time": time.time(), "swap_bytes": swap_bytes, "pageouts": pageouts,
-            "free_percent": free, "rss_bytes": psutil.Process().memory_info().rss,
+            "free_percent": free, "rss_bytes": rss,
             "load": list(os.getloadavg())}
+
+
+def limits_exceeded(first, recent):
+    value = recent[-1]
+    return (value["rss_bytes"] > 20 * 2**30 or
+            value["swap_bytes"] - first["swap_bytes"] > 2**30 or
+            value["free_percent"] < 25 or
+            value["pageouts"] - recent[0]["pageouts"] > 25000)
 
 
 class Watchdog:
@@ -69,16 +84,23 @@ class Watchdog:
                 value = sample()
                 self.record(value)
                 recent = self.history[-5:]
-                pageout_growth = value["pageouts"] - recent[0]["pageouts"]
-                if (value["rss_bytes"] > 20 * 2**30 or
-                        value["swap_bytes"] - self.first["swap_bytes"] > 2**30 or
-                        value["free_percent"] < 25 or pageout_growth > 25000):
+                if limits_exceeded(self.first, recent):
                     print("Resource watchdog stopped inference; inspect target telemetry", file=sys.stderr)
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    self.terminate()
                     return
             except Exception:
-                os.kill(os.getpid(), signal.SIGTERM)
+                self.terminate()
                 return
+
+    @staticmethod
+    def terminate():
+        import psutil
+        for child in psutil.Process().children(recursive=True):
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def close(self):
         self.stopped.set()

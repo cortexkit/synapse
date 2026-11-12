@@ -3,7 +3,7 @@
 import unittest
 from pathlib import Path
 
-from safety import TARGET, private_path
+from safety import TARGET, limits_exceeded, private_path
 from score import aggregate, alignment, norm, score_clip, spans
 
 
@@ -84,6 +84,21 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(private_path(TARGET / "tests" / "safe.jsonl"), TARGET / "tests" / "safe.jsonl")
         with self.assertRaises(ValueError):
             private_path(Path(__file__).parent / "transcripts.jsonl")
+
+    def test_watchdog_gates_growth_not_standing_swap(self):
+        first = {"rss_bytes": 2**30, "swap_bytes": 12 * 2**30, "pageouts": 100000, "free_percent": 60}
+        self.assertFalse(limits_exceeded(first, [first, {**first, "pageouts": 100066}]))
+        self.assertFalse(limits_exceeded(first, [first, {**first, "pageouts": 125000}]))
+        for field, value in [("rss_bytes", 20 * 2**30 + 1),
+                             ("swap_bytes", 13 * 2**30 + 1),
+                             ("free_percent", 24), ("pageouts", 125001)]:
+            with self.subTest(field=field):
+                self.assertTrue(limits_exceeded(first, [first, {**first, field: value}]))
+
+    def test_pageout_window_does_not_accumulate_entire_run(self):
+        first = {"rss_bytes": 2**30, "swap_bytes": 12 * 2**30, "pageouts": 100000, "free_percent": 60}
+        self.assertFalse(limits_exceeded(first, [{**first, "pageouts": 200000},
+                                                 {**first, "pageouts": 201000}]))
 
 
 if __name__ == "__main__":

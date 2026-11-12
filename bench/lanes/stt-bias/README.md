@@ -176,5 +176,46 @@ python3 -m unittest discover -s bench/lanes/stt-bias -p test_score.py -v
 The scorer writes aggregate counts/rates/latency only. A fresh run may use
 `qwen06.jsonl` instead of the resumed filename. Keep aggregate evidence copied
 into the ignored investigation write-up, not solely in the disposable target
-directory. No Rust files or package dependencies are changed, so Rust fmt,
+directory. No Rust files or Cargo package dependencies are changed, so Rust fmt,
 Clippy, and Cargo tests are not applicable to this Python lane.
+
+## FluidAudio CTC reference (separate ANE appointment)
+
+The pinned FluidAudio supports TDT v3 plus its separate 110M CTC spotter.
+The new adapter leaves the existing `stt-fluidaudio` lane untouched. It uses
+the default size-aware thresholds, per-term weight 10 (the runtime's text-list
+loader setting), `.cpuAndNeuralEngine` for encoders and CPU-only preprocessing.
+This permits CPU fallback; it is not exclusive-ANE hardware certification.
+Native warning logs invalidate the affected benchmark result set if the runtime silently absorbs a CTC
+failure, and a dropped vocabulary term or missing token timings fails the run.
+
+Prepare without touching the ANE:
+
+```sh
+for asset in fluidaudio_tdt fluidaudio_ctc; do
+  "$PY" bench/lanes/stt-bias/fetch.py "$asset"
+done
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build \
+  --disable-sandbox -c release --package-path bench/lanes/stt-bias/fluid \
+  --scratch-path target/stt-bias/fluid-build
+```
+
+Only after the hardware owner explicitly authorizes a Neural Engine appointment, run:
+
+```sh
+env -u TMPDIR STT_BIAS_ANE=1 "$PY" bench/lanes/stt-bias/run_fluid.py \
+  --lane-lock "$HOME/Library/Caches/ck-synapse/ane-direct.lock" \
+  --output target/stt-bias/fluid.jsonl > target/stt-bias/fluid-supervisor.log 2>&1
+```
+
+The supervisor takes the existing shared lock non-blocking and read-only,
+never replacing its inode. If it is held, stop and reschedule; never stop
+another process. It holds the lock through model destruction and watches resident set size (RSS)
+of itself **and its native child**. A resource stop terminates the child too.
+The supervisor preconverts the same audio to raw 16 kHz float32 PCM in target,
+so FluidAudio's timed section includes native PCM read, a fresh TDT decode,
+vocabulary tokenization/setup, CTC inference and rescoring, **but not Python's
+earlier resampling**. This is a timing boundary difference from the GPU arms.
+One biased warmup is excluded to warm both models. The FluidAudio run's 1,760 predictions can
+be added to `score.py --predictions` with the same manifest. No ANE inference
+is implied merely by building this adapter.

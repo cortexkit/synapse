@@ -24,10 +24,14 @@ def fetch(key):
         raise RuntimeError("revision did not resolve to exact pin")
     if info.siblings is None:
         raise RuntimeError("missing HF file inventory")
-    names = [s.rfilename for s in info.siblings if
-             s.rfilename == pin.get("file") or
-             (kind == "model" and s.rfilename.endswith((".json", ".safetensors", ".txt", ".model"))
-              and s.rfilename != "out_llm.safetensors")]
+    if key.startswith("fluidaudio_"):
+        names = [s.rfilename for s in info.siblings if s.rfilename in pin["files"] or
+                 any(s.rfilename.startswith(folder + "/") for folder in pin["directories"])]
+    else:
+        names = [s.rfilename for s in info.siblings if
+                 s.rfilename == pin.get("file") or
+                 (kind == "model" and s.rfilename.endswith((".json", ".safetensors", ".txt", ".model"))
+                  and s.rfilename != "out_llm.safetensors")]
     size = sum(s.size or 0 for s in info.siblings if s.rfilename in names)
     ledger_path = TARGET / "downloads.json"
     ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
@@ -48,5 +52,6 @@ def fetch(key):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("asset", choices=["qwen_0_6b", "qwen_1_7b", "granite_2b", "earnings22"])
+    parser.add_argument("asset", choices=["qwen_0_6b", "qwen_1_7b", "granite_2b", "earnings22",
+                                         "fluidaudio_tdt", "fluidaudio_ctc"])
     fetch(parser.parse_args().asset)

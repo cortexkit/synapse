@@ -31,8 +31,18 @@
   "fluidaudio": {
     "repo": "https://github.com/FluidInference/FluidAudio.git",
     "revision": "66a239a32609d3f90b50a9634e4b2820ab977011",
-    "model_repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
-    "model_revision": "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe",
     "execution": "requires separately scheduled ANE window"
+  },
+  "fluidaudio_tdt": {
+    "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+    "revision": "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe",
+    "directories": ["Preprocessor.mlmodelc", "Encoder.mlmodelc", "Decoder.mlmodelc", "JointDecisionv3.mlmodelc"],
+    "files": ["parakeet_vocab.json"]
+  },
+  "fluidaudio_ctc": {
+    "repo": "FluidInference/parakeet-ctc-110m-coreml",
+    "revision": "accdafd8cf8a2ff1cabe3c11e54416b405d409aa",
+    "directories": ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc"],
+    "files": ["vocab.json", "tokenizer.json"]
   }
 }
