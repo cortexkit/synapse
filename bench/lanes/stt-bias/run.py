@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from prepare import sha256
-from safety import TARGET, Watchdog, private_path
+from safety import TARGET, Watchdog, footprint, private_path
 from score import load_jsonl
 
 
@@ -33,7 +33,8 @@ def pcm(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", required=True,
-                        choices=["transcribe", "qwen_0_6b", "qwen_1_7b", "granite_2b"])
+                        choices=["transcribe", "qwen_0_6b", "qwen_1_7b", "qwen_1_7b_8bit", "granite_2b"])
+    parser.add_argument("--language", choices=["English", "auto"], default="English")
     parser.add_argument("--boost", type=float, choices=[2.5, 4.0], default=2.5)
     parser.add_argument("--manifest", type=Path, default=TARGET / "manifest.jsonl")
     parser.add_argument("--datasets", nargs="+")
@@ -68,6 +69,7 @@ def main():
             raise ValueError("resume inputs do not match selected run")
         finished.add(key)
     provenance = {"system": system_name, "host": platform.machine(), "os": platform.platform(),
+                  "language": args.language,
                   "python": platform.python_version(), "manifest_sha256": sha256(args.manifest),
                   "pins": pins, "started": time.time(), "packages": {}}
     provenance["resume_source_sha256"] = sha256(args.resume_from) if args.resume_from else None
@@ -96,7 +98,17 @@ def main():
             provenance["model_artifacts"] = {
                 name: sha256(Path(ledger[args.system]["snapshot"]) / name)
                 for name in ledger[args.system]["files"]}
-            model = MLX(Path(ledger[args.system]["snapshot"]), args.system)
+            for name, expected_hash in pins[args.system].get("sha256", {}).items():
+                if provenance["model_artifacts"].get(name) != expected_hash:
+                    raise ValueError("model artifact hash differs from lane pin")
+            snapshot = Path(ledger[args.system]["snapshot"])
+            provenance["model_bytes"] = sum((snapshot / name).stat().st_size
+                                            for name in ledger[args.system]["files"])
+            if "quantization" in pins[args.system]:
+                config = json.loads((snapshot / "config.json").read_text())
+                if config.get("quantization") != pins[args.system]["quantization"]:
+                    raise ValueError("quantization configuration differs from lane pin")
+            model = MLX(snapshot, args.system, None if args.language == "auto" else args.language)
         model.generate(pcm(rows[0]["path"]), [])
         provenance["load_and_warmup_seconds"] = time.perf_counter() - before
         with output_path.open("x") as output:
@@ -117,6 +129,8 @@ def main():
                         raise RuntimeError("20 GiB resident-memory high-water limit exceeded")
                     result = {"id": row["id"], "system": system_name, "list": list_name,
                               "text": text, "seconds": seconds}
+                    if args.system != "transcribe":
+                        result["detected_languages"] = getattr(model, "detected_languages", [])
                     output.write(json.dumps(result) + "\n")
                     output.flush()
                     completed += 1
@@ -131,7 +145,8 @@ def main():
             model.close()
         watchdog.close()
         provenance.update(completed=completed, finished=time.time(),
-                          peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                          peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                          **footprint())
         output_path.with_suffix(".provenance.json").write_text(json.dumps(provenance, indent=2))
     print(f"{system_name}: complete ({completed} predictions)")
 

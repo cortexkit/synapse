@@ -136,7 +136,8 @@ def aggregate(manifest, predictions):
                            "colli_recall": ratio("colli_hits", "colli_expected"),
                            "wer": ratio("word_edits", "reference_words"),
                            "nonlist_wer": ratio("nonlist_edits", "nonlist_words"),
-                           "median_seconds": statistics.median(time for _, time in rows)})
+                           "median_seconds": statistics.median(time for _, time in rows),
+                           "p95_seconds": sorted(time for _, time in rows)[math.ceil(0.95 * len(rows)) - 1]})
     return output
 
 

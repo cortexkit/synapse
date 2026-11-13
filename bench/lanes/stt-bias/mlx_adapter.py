@@ -1,8 +1,10 @@
-"""Unquantized reference weights on MLX; no model or decoder modifications."""
+"""Pinned reference weights on MLX; no decoder modifications."""
+
+from typing import Optional
 
 
 class MLX:
-    def __init__(self, snapshot, system):
+    def __init__(self, snapshot, system, language: Optional[str] = "English"):
         import mlx.core as mx
         from mlx_audio.stt import load
         mx.set_memory_limit(16 * 2**30)
@@ -10,6 +12,8 @@ class MLX:
         mx.random.seed(0)
         self.mx = mx
         self.system = system
+        self.language = language
+        self.detected_languages = []
         self.model = load(snapshot, strict=True)
 
     def generate(self, pcm, terms):
@@ -18,7 +22,7 @@ class MLX:
         options = {"max_tokens": 1024, "temperature": 0.0,
                    "verbose": False, "stream": False}
         if self.system.startswith("qwen"):
-            options.update(language="English", system_prompt=", ".join(terms) if terms else None)
+            options.update(language=self.language, system_prompt=", ".join(terms) if terms else None)
         else:
             prompt = "transcribe the speech to text."
             if terms:
@@ -28,6 +32,8 @@ class MLX:
         self.mx.synchronize()
         if result.generation_tokens >= options["max_tokens"]:
             raise RuntimeError("generation reached token limit; refusing a truncated transcript")
+        languages = getattr(result, "language", None)
+        self.detected_languages = languages if isinstance(languages, list) else [languages]
         return result.text
 
     def close(self):

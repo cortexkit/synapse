@@ -1,0 +1,12 @@
+[package]
+name = "stt-bias-parity-score"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+stt-common = { path = "../../stt-common" }

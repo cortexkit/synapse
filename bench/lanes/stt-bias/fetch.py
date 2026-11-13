@@ -10,7 +10,7 @@ from pathlib import Path
 from safety import TARGET
 
 
-def fetch(key):
+def fetch(key, budget_gb=15):
     from huggingface_hub import HfApi, snapshot_download
     pins = json.loads(Path(__file__).with_name("pins.json").read_text())
     pin = pins[key]
@@ -37,8 +37,8 @@ def fetch(key):
     ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
     # Reserve 1 GB for Python wheels, source trees, and metadata outside HF.
     projected = sum(v["bytes"] for k, v in ledger.items() if k != key) + size + 10**9
-    if projected > 15 * 10**9:
-        raise RuntimeError("15 GB cumulative download budget exceeded; ask owner")
+    if projected > budget_gb * 10**9:
+        raise RuntimeError(f"{budget_gb:g} GB cumulative download budget exceeded; ask owner")
     if shutil.disk_usage(TARGET).free < 20 * 2**30:
         raise RuntimeError("less than 20 GiB free before download")
     ledger[key] = {"bytes": size, "revision": info.sha, "files": names, "status": "reserved"}
@@ -52,6 +52,8 @@ def fetch(key):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("asset", choices=["qwen_0_6b", "qwen_1_7b", "granite_2b", "earnings22",
+    parser.add_argument("asset", choices=["qwen_0_6b", "qwen_1_7b", "qwen_1_7b_8bit", "granite_2b", "earnings22",
                                          "fluidaudio_tdt", "fluidaudio_ctc"])
-    fetch(parser.parse_args().asset)
+    parser.add_argument("--budget-gb", type=float, default=15)
+    args = parser.parse_args()
+    fetch(args.asset, args.budget_gb)

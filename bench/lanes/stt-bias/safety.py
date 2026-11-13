@@ -1,9 +1,11 @@
 """Local-only output boundaries and shared-Mac resource admission/watchdog."""
 
+import ctypes
 import json
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -21,6 +23,28 @@ def private_path(path):
         raise ValueError("per-clip inputs/outputs must stay under target/stt-bias")
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def footprint():
+    """Read current and lifetime-peak phys_footprint, not the RSS counter.
+
+    macOS rusage_info_v4 has a 16-byte UUID followed by uint64 counters;
+    phys_footprint and lifetime_max_phys_footprint are at offsets 72 and 240.
+    The kernel high-water mark includes peaks between watchdog samples.
+    """
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    function = libproc.proc_pid_rusage
+    function.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+    function.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(512)
+    if function(os.getpid(), 4, buffer) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    current = struct.unpack_from("=Q", buffer, 72)[0]
+    peak = struct.unpack_from("=Q", buffer, 240)[0]
+    if not current or peak < current:
+        raise RuntimeError("invalid macOS footprint counters")
+    return {"phys_footprint_bytes": current, "peak_phys_footprint_bytes": peak}
 
 
 def sample():
@@ -46,7 +70,7 @@ def sample():
             pass
     return {"time": time.time(), "swap_bytes": swap_bytes, "pageouts": pageouts,
             "free_percent": free, "rss_bytes": rss,
-            "load": list(os.getloadavg())}
+            "load": list(os.getloadavg()), **footprint()}
 
 
 def limits_exceeded(first, recent):

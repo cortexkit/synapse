@@ -11,7 +11,19 @@
   },
   "qwen_1_7b": {
     "repo": "Qwen/Qwen3-ASR-1.7B",
-    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5"
+    "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "sha256": {
+      "model-00001-of-00002.safetensors": "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
+      "model-00002-of-00002.safetensors": "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc"
+    }
+  },
+  "qwen_1_7b_8bit": {
+    "repo": "mlx-community/Qwen3-ASR-1.7B-8bit",
+    "revision": "a8379a2e2f9e313c9292cdf1af4055ab56d50d55",
+    "quantization": {"bits": 8, "group_size": 64, "mode": "affine"},
+    "sha256": {
+      "model.safetensors": "bf304b009cc7eca79283056f787b44c952d24ac22cec787b39732bba3c23c13c"
+    }
   },
   "qwen_0_6b": {
     "repo": "Qwen/Qwen3-ASR-0.6B",

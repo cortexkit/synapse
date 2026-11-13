@@ -21,7 +21,10 @@ may go to the portable test runner.
 
 Run one GPU model process at a time. The watchdog samples `sysctl vm.swapusage`,
 `vm_stat`, `memory_pressure -Q`, process RSS, and host load before model load and
-every 30 seconds. It refuses admission below 25% free; it stops at RSS >20 GiB,
+every 30 seconds. MLX provenance also records the kernel's lifetime maximum
+`phys_footprint` via `proc_pid_rusage(RUSAGE_INFO_V4)`, which includes peaks
+between samples; this is the process-memory comparison, not RSS.
+It refuses admission below 25% free; it stops at RSS >20 GiB,
 swap growth >1 GiB since admission, free memory <25%, or >25,000 pageouts within
 the last two minutes. These are owner-approved shared-host limits, not claims
 that all host memory traffic came from the benchmark. MLX additionally caps its
@@ -161,6 +164,99 @@ predicted term spans. Thus exact listed-name insertions are excluded from
 non-list WER but visible in false insertions and full WER. Baseline and biased
 arms use the same masks/vocabulary. Zero denominators are `null`, never 0%.
 Partial, duplicate, missing, or invalid measurements fail closed.
+
+## Qwen 1.7B 16-bit versus 8-bit
+
+`qwen_1_7b_8bit` selects the pinned **mlx-community** conversion, not a new
+training run. Its model card names mlx-audio 0.3.1 as the converter; its config
+specifies standard affine 8-bit quantization, group size 64. The pinned runtime
+above loads both models with the same decoder. `run.py` verifies weight SHA256s
+and the quantization config, and records all runtime-file hashes and logical
+model bytes (excluding environment/cache duplication). Not every tensor is
+quantized: convolutions and other unselected tensors retain their stored dtype.
+Aggregate findings are in the ignored operational record
+`.cortexkit/internal-docs/investigations/stt-qwen-8bit.md`; that private/local
+measurement report is not part of the public harness distribution.
+
+Use a fresh target directory for each experiment. Set up Python as above, then:
+
+```sh
+for asset in qwen_1_7b qwen_1_7b_8bit earnings22; do
+  "$PY" bench/lanes/stt-bias/fetch.py "$asset" --budget-gb 10 || break
+done
+# Prepare the ordinary 720-clip manifest first with prepare.py, as above.
+# Retain all COLLI/control arms and only Earnings global; no clip filtering.
+"$PY" - <<'PY'
+import json
+from pathlib import Path
+source = Path('target/stt-bias/manifest.jsonl')
+output = Path('target/stt-bias/compare-manifest.jsonl')
+with output.open('x') as stream:
+    output.chmod(0o600)
+    for line in source.read_text().splitlines():
+        row = json.loads(line)
+        if row['dataset'] == 'earnings22-test-200':
+            row['lists'] = {'global': row['lists']['global']}
+        stream.write(json.dumps(row) + '\n')
+PY
+for system in qwen_1_7b qwen_1_7b_8bit; do
+  "$PY" bench/lanes/stt-bias/run.py --system "$system" \
+    --manifest target/stt-bias/compare-manifest.jsonl \
+    --output "target/stt-bias/$system-bias.jsonl" || break
+done
+"$PY" bench/lanes/stt-bias/score.py --manifest target/stt-bias/compare-manifest.jsonl \
+  --predictions target/stt-bias/qwen_1_7b-bias.jsonl target/stt-bias/qwen_1_7b_8bit-bias.jsonl \
+  --output target/stt-bias/bias-aggregates.json
+```
+
+This is **1,360 predictions per model**. Run long measurement loops as
+background shell tasks and wait for completion. Use one GPU process at a time;
+neither MLX arm uses the ANE. The tighter 10 GB budget includes a 1 GB reserve
+for dependencies, in addition to the disk/resource checks above.
+
+For the multilingual matrix comparison, `parity.py` prepares all 1,200 verified
+WAVs without exposing ground truth to the decoder. Use **automatic language
+detection**, no vocabulary/name list, and no ground-truth language hint. The English bias study
+retains its existing forced-English setting. The aggregate language counters
+mark a clip as mismatched if any chunk reports the wrong language; absent/empty
+labels have a separate unknown count. Unknown and mismatch can overlap if a
+multi-chunk clip has both kinds of label.
+
+```sh
+"$PY" bench/lanes/stt-bias/parity.py prepare --wavs "$WAVS"
+for system in qwen_1_7b qwen_1_7b_8bit; do
+  "$PY" bench/lanes/stt-bias/run.py --system "$system" --language auto \
+    --manifest target/stt-bias/parity-manifest.jsonl --lists none \
+    --output "target/stt-bias/$system-parity.jsonl" || break
+done
+```
+
+The tiny Rust bridge calls **`stt_common::load_corpus` and `stt_common::score`**,
+including `synapse_parity::speech::grade_wer`, rather than approximating Unicode
+normalization in Python. It verifies the sealed corpus/WAVs again and emits only
+aggregate split scores. Build on the build server normally; a Mac-native scorer
+build for local-only transcript grading needs the Mac hardware owner's explicit
+exception to the normal build-server policy:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build --locked \
+  --manifest-path bench/lanes/stt-bias/parity-score/Cargo.toml \
+  --target-dir target/stt-bias/scorer-build
+for system in qwen_1_7b qwen_1_7b_8bit; do
+  "$PY" bench/lanes/stt-bias/parity.py score --wavs "$WAVS" \
+    --predictions "target/stt-bias/$system-parity.jsonl" \
+    --scorer target/stt-bias/scorer-build/debug/stt-bias-parity-score \
+    --output "target/stt-bias/$system-parity-aggregate.json" || break
+done
+```
+
+Bias WER still uses COLLI normalization; full-corpus WER uses parity's NFKC,
+Unicode case-fold and punctuation-deletion normalization. Do not compare those
+two WER columns directly. Median latency is the conventional middle value (or
+mean of the middle pair); p95 uses nearest rank `ceil(0.95 * n)`. Model load and
+one warmup are excluded, WAV loading/resampling and synchronous GPU inference
+included. A single ordered pair on a shared Mac does not isolate quantization's
+speed effect from host-load changes.
 
 ## Aggregate and check
 
