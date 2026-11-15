@@ -429,6 +429,7 @@ mod tests {
         basis[0] = 1.;
         let encoder = artifact("encoder.bin", encode_f32_frame(&basis));
         let profile = SpeechProfile {
+            precision_class: synapse_parity::manifest::ToleranceClass::Fp32,
             max_duration_ms: 600000,
             encoder_rungs: vec![128, 256, 512, 1024, 2048, 4096, 8192],
             tau_feat: Some(0.001),

@@ -10,7 +10,7 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_general_category::{get_general_category, GeneralCategory};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::manifest::Architecture;
+use crate::manifest::{Architecture, ToleranceClass};
 use crate::{perr, Result};
 
 pub const MODEL: &str = "parakeet-tdt-0.6b-v3";
@@ -22,6 +22,9 @@ pub const CAP: usize = 10;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeechProfile {
+    /// Only the declared lane profile selects word-error-rate-only precision grading.
+    #[serde(default = "fp32", skip_serializing_if = "is_fp32")]
+    pub precision_class: ToleranceClass,
     pub max_duration_ms: u64,
     pub encoder_rungs: Vec<u32>,
     pub tau_feat: Option<f64>,
@@ -29,6 +32,14 @@ pub struct SpeechProfile {
     pub tau_margin: Option<f64>,
     pub confirmations: Value,
     pub self_check: Artifact,
+}
+
+fn fp32() -> ToleranceClass {
+    ToleranceClass::Fp32
+}
+
+fn is_fp32(class: &ToleranceClass) -> bool {
+    *class == ToleranceClass::Fp32
 }
 
 impl SpeechProfile {
@@ -560,15 +571,24 @@ pub struct SpeechObservation {
 }
 
 #[derive(Clone, Debug)]
+pub struct SpeechDiagnostics {
+    pub encoder_min_cosine: Option<f64>,
+    pub encoder_error: Option<String>,
+    pub trace_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct SpeechReport {
     pub graded: Vec<String>,
     pub expected_refusals: Vec<String>,
     pub margin_exempt: Vec<String>,
     pub split_wer: BTreeMap<String, [f64; 2]>,
+    pub diagnostics: BTreeMap<String, SpeechDiagnostics>,
 }
 
 /// Grade all in-envelope fixtures and record out-of-envelope refusals separately.
-/// Even margin-exempt traces must pass the encoder gate and whole-trace triples.
+/// Fp16 profiles retain numerical findings as diagnostics; finite tensors,
+/// complete traces, consistent triples and split WER remain mandatory.
 pub fn evaluate_transcribe(
     profile: &SpeechProfile,
     fixtures: &[SpeechFixture],
@@ -586,6 +606,7 @@ pub fn evaluate_transcribe(
         expected_refusals: vec![],
         margin_exempt: vec![],
         split_wer: BTreeMap::new(),
+        diagnostics: BTreeMap::new(),
     };
     let mut wer = Vec::new();
     let mut ids = std::collections::BTreeSet::new();
@@ -637,6 +658,11 @@ pub fn evaluate_transcribe(
                 fixture.id
             ));
         }
+        let mut diagnostics = SpeechDiagnostics {
+            encoder_min_cosine: None,
+            encoder_error: None,
+            trace_error: None,
+        };
         if let Some(encoder) = &fixture.encoder {
             let raw = encoder.read(parity_dir, mirror)?;
             if raw.len() % 4 != 0 {
@@ -646,22 +672,44 @@ pub fn evaluate_transcribe(
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect();
-            grade_encoder(
+            if reference.len() != actual_encoder.len() || reference.iter().any(|x| !x.is_finite()) {
+                return Err(perr!("malformed reference encoder: {}", fixture.id));
+            }
+            match grade_encoder(
                 &reference,
                 actual_encoder,
                 fixture.valid_encoder_frames as usize,
-            )?;
+            ) {
+                Ok(minimum) => diagnostics.encoder_min_cosine = Some(minimum),
+                Err(error) if profile.precision_class == ToleranceClass::Fp16 => {
+                    diagnostics.encoder_error = Some(error.to_string());
+                }
+                Err(error) => return Err(error),
+            }
         }
         let reference = decode_trace(&fixture.trace.read(parity_dir, mirror)?)?;
-        if grade_trace(
+        // The precision class never excuses invalid engine output or bad references.
+        if implied_triples(&actual.trace, fixture.valid_encoder_frames)? != actual.triples {
+            return Err(perr!(
+                "emitted triples are inconsistent with the whole engine trace"
+            ));
+        }
+        implied_triples(&reference, fixture.valid_encoder_frames)?;
+        match grade_trace(
             &reference,
             &actual.trace,
             &actual.triples,
             fixture.valid_encoder_frames,
             profile.tau_margin.unwrap(),
-        )? {
-            report.margin_exempt.push(fixture.id.clone());
+        ) {
+            Ok(true) => report.margin_exempt.push(fixture.id.clone()),
+            Ok(false) => {}
+            Err(error) if profile.precision_class == ToleranceClass::Fp16 => {
+                diagnostics.trace_error = Some(error.to_string());
+            }
+            Err(error) => return Err(error),
         }
+        report.diagnostics.insert(fixture.id.clone(), diagnostics);
         if let (Some(split), Some(truth)) = (&fixture.split, &fixture.ground_truth) {
             wer.push((
                 split.as_str(),

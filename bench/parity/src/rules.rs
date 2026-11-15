@@ -225,6 +225,11 @@ pub fn check_profile(
             .as_ref()
             .ok_or_else(|| perr!("transcribe profile is missing"))?;
         speech.validate()?;
+        if profile.compute_dtype == DType::F32 && speech.precision_class != ToleranceClass::Fp32 {
+            return Err(perr!(
+                "fp32 transcription profiles require strict fp32 precision grading"
+            ));
+        }
         expected.transcribe = profile.transcribe.clone();
     } else if profile.transcribe.is_some() {
         return Err(perr!("non-transcribe profile carries speech fields"));

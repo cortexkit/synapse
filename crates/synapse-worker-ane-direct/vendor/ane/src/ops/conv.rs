@@ -12,6 +12,8 @@ pub struct ConvOp {
     pub kernel_width: usize,
     pub kernel_height: usize,
     pub groups: usize,
+    pub stride_height: usize,
+    pub stride_width: usize,
     pub pad_mode: PadMode,
     pub pad_top: usize,
     pub pad_bottom: usize,

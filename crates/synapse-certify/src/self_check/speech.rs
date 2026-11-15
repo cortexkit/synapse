@@ -1,8 +1,9 @@
-//! Exact speech references for the first-load check.
+//! Profile-bound speech references for the first-load check.
 use crate::{refuse, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use synapse_parity::canonical::sha256_hex;
+use synapse_parity::manifest::ToleranceClass;
 
 pub const CASE_IDS: [&str; 3] = [
     "silence-1s",
@@ -30,6 +31,8 @@ pub struct Case {
     pub duration_ms: u64,
     #[serde(skip)]
     pub wav: Vec<u8>,
+    #[serde(skip)]
+    precision_class: Option<ToleranceClass>,
 }
 
 /// Hash the actual compiled subset even if its seal is invalid or absent. A bad
@@ -56,6 +59,8 @@ fn load_bytes(
     };
     let lane = &manifest["profiles"][profile];
     let speech = &lane["transcribe"];
+    let speech_profile: synapse_parity::speech::SpeechProfile =
+        serde_json::from_value(speech.clone()).map_err(|_| invalid())?;
     let seal = &speech["self_check"];
     if lane["model"] != "parakeet-tdt-0.6b-v3"
         || seal["path"] != format!("{ROOT}self-check.json")
@@ -84,6 +89,7 @@ fn load_bytes(
     let mut result = Vec::new();
     for (index, (value, id)) in cases.iter().zip(CASE_IDS).enumerate() {
         let mut case: Case = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+        case.precision_class = Some(speech_profile.precision_class);
         if case.id != id
             || value["minimum_margin"]
                 .as_f64()
@@ -134,10 +140,12 @@ fn silence_wav() -> Vec<u8> {
     wav
 }
 
-/// Both emitted triples and detokenized text must match exactly during the
-/// load-time check, even when the reference's top two logits are close together.
+/// Text must match exactly for every precision class. The fp16 class tolerates
+/// different word timings; fp32 classes also require identical emitted triples.
 pub fn compare(case: &Case, triples: &[[i32; 3]], text: &str) -> Result<()> {
-    if triples != case.triples || text != case.text {
+    if text != case.text
+        || (case.precision_class != Some(ToleranceClass::Fp16) && triples != case.triples)
+    {
         Err(refuse(format!("speech self-check mismatch: {}", case.id)))
     } else {
         Ok(())
@@ -168,7 +176,10 @@ mod tests {
                 assert!(compare(&case, &case.triples, "wrong text").is_err());
                 let mut triples = case.triples.clone();
                 triples.push([0, 0, 0]);
-                assert!(compare(&case, &triples, &case.text).is_err());
+                assert_eq!(
+                    compare(&case, &triples, &case.text).is_ok(),
+                    lane == "ane-direct-worker"
+                );
             }
         }
     }
@@ -190,5 +201,38 @@ mod tests {
             .unwrap()
             .remove("self_check");
         assert!(load_bytes(profile, &missing, SUBSET, [CLEAN, DE]).is_err());
+        let mut unknown = manifest;
+        unknown["profiles"][profile]["transcribe"]["precision_class"] = "unknown".into();
+        assert!(load_bytes(profile, &unknown, SUBSET, [CLEAN, DE]).is_err());
+    }
+
+    #[test]
+    fn speech_self_check_fp16_ignores_triples_but_all_classes_require_exact_text() {
+        for lane in [
+            "ane-direct-worker",
+            "owned-metal",
+            "owned-cuda",
+            "owned-vulkan",
+        ] {
+            let cases = load(&format!("parakeet-tdt-0.6b-v3.{lane}")).unwrap();
+            for case in cases {
+                compare(&case, &case.triples, &case.text).unwrap();
+                let mut changed = case.triples.clone();
+                changed.push([1, 0, 1]);
+                assert_eq!(
+                    compare(&case, &changed, &case.text).is_ok(),
+                    lane == "ane-direct-worker",
+                    "{} {lane}",
+                    case.id
+                );
+                assert!(compare(&case, &changed, &(case.text.clone() + " ")).is_err());
+                let unbound: Case = serde_json::from_value(serde_json::json!({
+                    "id": case.id, "triples": case.triples, "text": case.text,
+                    "valid_encoder_frames": case.valid_encoder_frames, "duration_ms": case.duration_ms,
+                    "precision_class": "fp16"
+                })).unwrap();
+                assert!(compare(&unbound, &changed, &unbound.text).is_err());
+            }
+        }
     }
 }

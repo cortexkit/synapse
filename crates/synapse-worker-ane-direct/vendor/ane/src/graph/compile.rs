@@ -64,6 +64,28 @@ impl Graph {
         (all_ops.into_boxed_slice(), shapes.into_boxed_slice())
     }
 
+    /// Operation count (excluding constants), placeholder shapes, and terminal
+    /// output shapes, in graph order. This inspects sources without touching ANE.
+    #[doc(hidden)]
+    pub fn diagnostic_shapes(&self) -> (usize, Vec<Shape>, Vec<Shape>) {
+        let bottoms: HashSet<&str> = self
+            .ops
+            .iter()
+            .flat_map(|op| op.op.bottom_names())
+            .collect();
+        let outputs = self
+            .ops
+            .iter()
+            .filter(|op| !bottoms.contains(Self::tensor_name(op.output).as_str()))
+            .map(|op| op.output.shape)
+            .collect();
+        (
+            self.ops.len(),
+            self.inputs.iter().map(|input| input.shape).collect(),
+            outputs,
+        )
+    }
+
     /// Return the exact MIL text and packed weights submitted to the private
     /// compiler. This measures source payloads, not opaque compiled programs.
     #[doc(hidden)]

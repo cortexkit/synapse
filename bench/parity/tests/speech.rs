@@ -353,6 +353,181 @@ fn speech_profile_requires_all_three_tolerances() {
 }
 
 #[test]
+fn speech_precision_is_profile_bound_defaults_strict_and_rejects_unknown_values() {
+    use synapse_parity::manifest::{Manifest, ToleranceClass};
+    let manifest = Manifest::load(&synapse_parity::parity_dir().join("models.json")).unwrap();
+    let ane = "parakeet-tdt-0.6b-v3.ane-direct-worker";
+    for (id, profile) in &manifest.profiles {
+        if let Some(speech) = &profile.transcribe {
+            assert_eq!(speech.precision_class == ToleranceClass::Fp16, id == ane);
+            let serialized = serde_json::to_value(speech).unwrap();
+            assert_eq!(serialized.get("precision_class").is_some(), id == ane);
+        }
+    }
+    let mut invalid = serde_json::to_value(&manifest).unwrap();
+    invalid["profiles"][ane]["transcribe"]["precision_class"] = "unknown".into();
+    assert!(Manifest::from_slice(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    invalid["profiles"][ane]["transcribe"]["precision_class"] = serde_json::Value::Null;
+    assert!(Manifest::from_slice(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    let mut strict = manifest.clone();
+    strict
+        .profiles
+        .get_mut(ane)
+        .unwrap()
+        .transcribe
+        .as_mut()
+        .unwrap()
+        .precision_class = ToleranceClass::Fp32;
+    for id in manifest.profiles.keys() {
+        assert_eq!(
+            manifest.profile_digest(id).unwrap() != strict.profile_digest(id).unwrap(),
+            id == ane,
+            "{id}"
+        );
+    }
+    for lane in ["owned-metal", "owned-cuda"] {
+        let id = format!("parakeet-tdt-0.6b-v3.{lane}");
+        let mut invalid = manifest.profiles[&id].clone();
+        invalid.transcribe.as_mut().unwrap().precision_class = ToleranceClass::Fp16;
+        assert!(synapse_parity::rules::check_profile(
+            &id,
+            MODEL,
+            manifest.model(MODEL).unwrap(),
+            &invalid
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn speech_fp16_reports_trace_and_encoder_differences_but_keeps_output_and_wer_gates() {
+    use std::collections::BTreeMap;
+    use synapse_parity::{canonical::sha256_hex, manifest::Manifest};
+    let root = synapse_parity::parity_dir();
+    let manifest = Manifest::load(&root.join("models.json")).unwrap();
+    let scratch = root
+        .join("target")
+        .join(format!("speech-precision-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let artifact = |name: &str, bytes: &[u8]| {
+        std::fs::write(scratch.join(name), bytes).unwrap();
+        Artifact {
+            path: Some(name.into()),
+            cache_path: None,
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+        }
+    };
+    let reference = step(0, 1, 1);
+    let mut raw = Vec::new();
+    for value in [
+        reference.frame_index,
+        reference.token_top1,
+        reference.token_top2,
+        reference.duration_top1,
+        reference.duration_top2,
+    ] {
+        raw.extend(value.to_le_bytes());
+    }
+    for value in [
+        reference.token_logit1,
+        reference.token_logit2,
+        reference.duration_logit1,
+        reference.duration_logit2,
+    ] {
+        raw.extend(value.to_le_bytes());
+    }
+    raw.extend(1u32.to_le_bytes());
+    let fixture = SpeechFixture {
+        id: "precision-comparison".into(),
+        sample_count: 1280,
+        duration_ms: 80,
+        valid_encoder_frames: 1,
+        trace: artifact("reference.trace", &raw),
+        encoder: Some(artifact(
+            "encoder.f32le",
+            &1.0f32.to_le_bytes().repeat(1024),
+        )),
+        text: "hello".into(),
+        split: Some("test".into()),
+        ground_truth: Some("hello".into()),
+    };
+    let mut changed = reference;
+    changed.token_top1 = 3;
+    let mut observations = BTreeMap::from([(
+        fixture.id.clone(),
+        SpeechObservation {
+            valid_encoder_frames: Some(1),
+            engine_started: true,
+            encoder_output: Some(vec![1.0; 1024]),
+            trace: vec![changed],
+            triples: vec![[3, 0, 1]],
+            text: "hello".into(),
+            ..Default::default()
+        },
+    )]);
+    let evaluate = |lane: &str, observations: &BTreeMap<String, SpeechObservation>| {
+        evaluate_transcribe(
+            manifest.profiles[&format!("parakeet-tdt-0.6b-v3.{lane}")]
+                .transcribe
+                .as_ref()
+                .unwrap(),
+            std::slice::from_ref(&fixture),
+            observations,
+            &scratch,
+            &scratch,
+            "invalid_params",
+        )
+    };
+    for lane in ["owned-metal", "owned-cuda", "owned-vulkan"] {
+        assert!(evaluate(lane, &observations)
+            .unwrap_err()
+            .to_string()
+            .contains("trace argmax"));
+    }
+    let report = evaluate("ane-direct-worker", &observations).unwrap();
+    assert!(report.diagnostics[&fixture.id]
+        .trace_error
+        .as_ref()
+        .unwrap()
+        .contains("trace argmax"));
+    observations.get_mut(&fixture.id).unwrap().encoder_output = Some(vec![-1.0; 1024]);
+    let report = evaluate("ane-direct-worker", &observations).unwrap();
+    assert!(report.diagnostics[&fixture.id]
+        .encoder_error
+        .as_ref()
+        .unwrap()
+        .contains("cosine"));
+    assert!(evaluate("owned-metal", &observations)
+        .unwrap_err()
+        .to_string()
+        .contains("cosine"));
+    observations.get_mut(&fixture.id).unwrap().text = "wrong".into();
+    assert!(evaluate("ane-direct-worker", &observations)
+        .unwrap_err()
+        .to_string()
+        .contains("WER"));
+    observations.get_mut(&fixture.id).unwrap().text = "hello".into();
+    observations.get_mut(&fixture.id).unwrap().triples = vec![[4, 0, 1]];
+    assert!(evaluate("ane-direct-worker", &observations)
+        .unwrap_err()
+        .to_string()
+        .contains("inconsistent"));
+    observations.get_mut(&fixture.id).unwrap().triples = vec![[3, 0, 1]];
+    observations.get_mut(&fixture.id).unwrap().trace.clear();
+    assert!(evaluate("ane-direct-worker", &observations)
+        .unwrap_err()
+        .to_string()
+        .contains("truncated"));
+    observations.get_mut(&fixture.id).unwrap().encoder_output = Some(vec![f32::NAN; 1024]);
+    assert!(evaluate("ane-direct-worker", &observations)
+        .unwrap_err()
+        .to_string()
+        .contains("nonfinite"));
+    std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[test]
 fn speech_applicability_requires_exact_pre_engine_refusal() {
     let manifest =
         synapse_parity::manifest::Manifest::load(&synapse_parity::parity_dir().join("models.json"))

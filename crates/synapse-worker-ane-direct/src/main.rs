@@ -2,6 +2,8 @@
 mod backend;
 #[cfg(target_os = "macos")]
 mod modernbert;
+#[cfg(target_os = "macos")]
+mod parakeet;
 // Fixed-slot multi-row layouts remain experimental. Serving compiles the kernel
 // that packs rows into 256 columns separately from single-row kernels, charging
 // its 28 layer executables to the same 100-executable ANE residency budget.

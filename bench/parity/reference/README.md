@@ -126,6 +126,13 @@ non-blank step in its whole trace, even after an exemption. The evaluator also
 computes word-weighted per-split WER using `synapse-wer-norm-v1`: NFKC,
 Unicode case folding, deletion of Unicode punctuation-category characters,
 whitespace collapsing, and whitespace splitting.
+Those cosine and reference-trace requirements are acceptance gates for the
+default `fp32` precision class. A declared `transcribe.precision_class: "fp16"`
+retains both comparisons in `SpeechReport.diagnostics` without gating them;
+per-split WER, finite correctly shaped encoder output, complete valid traces,
+trace/triple consistency and over-limit refusals remain mandatory. The class
+comes from the lane profile, never from an inference request. Unknown classes
+are rejected, and fp32-compute profiles cannot declare fp16 grading.
 Profiles without any of the three positive finite tolerances are refused.
 The 600000-ms envelope is the reference target, not hardware certification;
 each backend must certify its own declared maximum before it is runnable.
