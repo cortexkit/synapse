@@ -121,7 +121,7 @@ class ProducerTests(unittest.TestCase):
 
     def write_reports(self, root, output):
         digest = hashlib.sha256((root / 'bench/parity/models.json').read_bytes()).hexdigest()
-        expected = matrix.release_checks(root).catalog_cells(root)
+        expected = matrix.release_checks(root).benchmark_cells(root)
         for row in dict.fromkeys(row for row, _ in expected):
             cells = []
             for cell_row, model in expected:
@@ -153,7 +153,7 @@ class ProducerTests(unittest.TestCase):
         self.assertTrue(removed <= before_cells)
         self.assertEqual({(cell['row_id'], cell['model']) for cell in result['cells']}, before_cells - removed)
         checks = matrix.release_checks(root)
-        cells = checks.catalog_cells(root)
+        cells = checks.benchmark_cells(root)
         checks.benchmark(result, cells)
         self.assertEqual(set(result['competitors']), set(matrix.COMPETITORS))
         for runtime, competitor_cells in result['competitors'].items():
@@ -198,6 +198,14 @@ class ProducerTests(unittest.TestCase):
                     matrix.run_row({'row_id': 'metal-m5', 'source_commit': 'source', 'manifest_digest': 'wrong',
                                     'machine': {'memory_kind': 'footprint'}}, matrix.ROOT, Path(directory))
 
+    def test_speech_lanes_are_certified_but_not_raced_against_competitors(self):
+        checks = matrix.release_checks(matrix.ROOT)
+        certified = {model for _, model in checks.catalog_cells(matrix.ROOT)}
+        raced = {model for _, model in checks.benchmark_cells(matrix.ROOT)}
+        self.assertIn('parakeet-tdt-0.6b-v3', certified)
+        self.assertNotIn('parakeet-tdt-0.6b-v3', raced)
+        self.assertEqual(certified - raced, {'parakeet-tdt-0.6b-v3'})
+
     def test_full_row_shared_files_and_precision_label(self):
         manifest = matrix.load(matrix.ROOT / 'bench/parity/models.json')
         digest = hashlib.sha256((matrix.ROOT / 'bench/parity/models.json').read_bytes()).hexdigest()
@@ -208,7 +216,7 @@ class ProducerTests(unittest.TestCase):
             file_digest = hashlib.sha256(model_file.read_bytes()).hexdigest()
             cfg = {'row_id': 'metal-m5', 'source_commit': 'source', 'manifest_digest': digest,
                    'machine': {'id': 'test-machine', 'memory_kind': 'footprint'}, 'models': {}}
-            models = [model for row, model in matrix.release_checks(matrix.ROOT).catalog_cells(matrix.ROOT)
+            models = [model for row, model in matrix.release_checks(matrix.ROOT).benchmark_cells(matrix.ROOT)
                       if row == 'metal-m5']
             for model in models:
                 definition = manifest['models'][model]

@@ -38,6 +38,15 @@ def catalog_cells(root):
             if any(lane['backend'] == backend for lane in model['backends'])]
 
 
+def benchmark_cells(root):
+    # The release benchmark races embedding and reranking against llama.cpp,
+    # LM Studio, Ollama and TEI, none of which serves speech. Speech lanes are
+    # still certified per row (catalog_cells) but are benchmarked separately.
+    models = {model['id']: model for model in
+              load(root / 'crates/synapse-module/src/catalog/models.json')['models']}
+    return [(row, model) for row, model in catalog_cells(root) if models[model].get('task') != 'transcribe']
+
+
 def cuda_models(cells):
     return {model for row, model in cells if ROW_BACKENDS[row] == 'cuda'}
 
@@ -205,7 +214,7 @@ def evidence(root, s, assets, entries):
         stress_evidence(stress)
     require((cert / 'RELEASE-NOTES.md').is_file(), 'missing release notes')
     report_dir = root / 'docs/evidence/benchmark' / s
-    benchmark(load(report_dir / 'report.json'), cells)
+    benchmark(load(report_dir / 'report.json'), benchmark_cells(root))
     if any(r['row_id'] == 'ane-m5' and r['model'] == 'gte-modernbert-base' and r['status'] == 'passed' for r in records):
         t = load(report_dir / 'ane-transition.json')
         core, direct = median(t['coreml']), median(t['direct'])

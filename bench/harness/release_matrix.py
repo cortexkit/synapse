@@ -235,7 +235,7 @@ def run_row(config, root, output):
     require(memory_kind in ('footprint', 'rss_plus_device'), 'missing memory architecture')
     if row in ('metal-m5', 'ane-m5'):
         require(memory_kind == 'footprint', 'Apple rows use unified memory')
-    expected_cells = checks.catalog_cells(root)
+    expected_cells = checks.benchmark_cells(root)
     lane = LANES[checks.ROW_BACKENDS[row]]
     for cell_row, model in expected_cells:
         if cell_row != row:
@@ -272,7 +272,7 @@ def run_row(config, root, output):
 
 def assemble(root, source, output):
     checks = release_checks(root)
-    cells = checks.catalog_cells(root)
+    cells = checks.benchmark_cells(root)
     rows = tuple(dict.fromkeys(row for row, _ in cells))
     reports = [load(output / f'{row}.json') for row in rows]
     digest = hashlib.sha256((root / 'bench/parity/models.json').read_bytes()).hexdigest()
