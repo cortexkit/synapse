@@ -414,7 +414,7 @@ mod tests {
         for (id, digest) in [
             (
                 "parakeet-tdt-0.6b-v3.ane-direct-worker",
-                "eaf1c15fb6d358c9675c83c91a68ea099ad9008aef52b7284377b917857a4820",
+                "d35570d39da3bf1cdf63a72d61af066907cf40ec9f3f4bebefad6e75f0a3536e",
             ),
             (
                 "parakeet-tdt-0.6b-v3.owned-cuda",
