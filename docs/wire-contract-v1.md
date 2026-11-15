@@ -251,16 +251,25 @@ all of these operations with `flow_scope_refused`.
 - **role.describe** {} — query; declares group `jobs`,
   `jobs_survive_restart: false`, and engines `{kind: "transcribe", provider:
   "local", model, local: true, formats: ["audio/wav"], latency_class: "batch",
-  max_input_bytes: 268435456, max_duration_ms}`. The same engine facts appear in
+  max_input_bytes: 268435456, max_duration_ms, languages}`. The same engine facts appear in
   `role_declarations["media-provider/v1"]`. No `bias_limit` is declared.
+  Every Parakeet engine declares the catalog's 25 languages: bg, cs, da, de, el,
+  en, es, et, fi, fr, hr, hu, it, lt, lv, mt, nl, pl, pt, ro, ru, sk, sl, sv, uk.
 - **media.submit** {client_job_id, kind: "transcribe", model, input: {audio,
   language?, bias?}, decision_id?, deadline_ms?} — mutate; returns `{job_id}`.
   `client_job_id` is 1–128 Unicode scalar values and is scoped to the principal.
   Replaying equal decoded JSON returns the original id, including after failure
   or restart, without new work. A changed `kind`, `input`, `model`, `decision_id`
   or `deadline_ms` refuses with `client_job_id_reuse {field}`, in that order.
-  Refused submissions remember nothing. `language` is accepted and ignored;
-  non-empty bias refuses with `invalid_params {field: "bias"}`.
+  Refused submissions remember nothing. An undeclared audio MIME refuses permanent
+  `unsupported {field: "input.audio.mime"}`. Language matching ignores case and
+  accepts a hint extending a declared tag at a subtag boundary (`en-GB` matches
+  `en`); other hints refuse `unsupported {field: "input.language"}`. A matching
+  hint is accepted but does not steer decoding: Parakeet detects language itself
+  and the result omits `language`. Any supplied bias, including empty terms,
+  refuses `unsupported {field: "input.bias"}` because no bias limit is declared.
+  Malformed input instead refuses `invalid_params`: for example a wrong field
+  type, invalid base64, or bytes declared as WAV which cannot be decoded as WAV.
 - **media.status** {job_id} — query; returns `{status, failure?}` where status is
   `queued`, `running`, `done`, `failed` or `cancelled`. Exactly failed jobs carry
   `{code, class, message, retry_after_ms?, detail?}`. Deadlines include queue time.
@@ -270,6 +279,14 @@ all of these operations with `flow_scope_refused`.
   object_id}}`, readable with `media.read`. Certification mode adds the
   observation descriptor below. Other statuses refuse with `job_not_done
   {status}`. Unknown/foreign jobs refuse with `unknown_job`.
+  Words begin with the first emitted token and at every tokenizer piece starting
+  with `▁`; other pieces join the current word. Each word is the trimmed tokenizer
+  decode of its token ids. Start is 80 ms times the first token's encoder-frame
+  index; end is 80 ms times `(last token's frame index + max(duration, 1))`,
+  including duration-zero emissions. Both times clamp to
+  the original audio duration, then truncate to the contract's integer
+  milliseconds. Text decodes all emitted tokens. `no_speech` is true exactly
+  when no tokens were emitted, in which case text is empty and words is `[]`.
 - **media.cancel** {job_id} — mutate; returns `{status}`. Cancellation is terminal
   immediately; the first terminal status wins. In-flight work drains on its lane
   owner and its output is discarded. Cancellation does not count as a worker
@@ -294,14 +311,18 @@ all of these operations with `flow_scope_refused`.
   base64 of at most 512 KiB raw bytes. The result's `observation` contains
   `{lane_id, fingerprint, valid_encoder_frames, triples, encoder_output,
   decode_trace}`, where triples is base64 and each large part is
-  `{bytes, sha256, pages}`. Pages expire with their job result.
+  `{bytes, sha256, pages}`. Descriptors count raw bytes, use their lowercase
+  SHA-256, and count zero-based pages of at most 524,288 raw bytes (an empty
+  part has zero pages). Pages are principal-scoped, reject an invalid part or
+  page with `invalid_params {field}`, and expire with their job result.
 
 The catalog engine id `parakeet-tdt-0.6b-v3` selects the first runnable backend
 in catalog order (Metal, ANE, CUDA, Vulkan). Lane ids append `-metal`, `-ane`,
 `-cuda` or `-vulkan` and pin that backend. Neither form switches to another
 backend when the selected one is not installed, failed its self-check, or is
 paused or quarantined. Non-runnable engines are not declared
-and submit refuses `backend_unavailable`. Runnable uninstalled engines remain
+and submit naming an undeclared model (unknown or non-runnable) refuses permanent
+`unsupported {field: "model"}` without storing or starting work. Runnable uninstalled engines remain
 declared and refuse `model_not_installed {download_op: "models.download"}`.
 Persisted numerical failures remain declared and refuse permanent
 `self_check_failed`. Transient load/self-check faults and worker quarantine

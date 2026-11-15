@@ -1659,6 +1659,18 @@ impl WorkerEngine {
         });
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn attach_mock_worker_frames_for_test<F>(&self, respond: F)
+    where
+        F: Fn(&WorkerRequest, Option<&[u8]>) -> Vec<(WorkerResponse, Option<Vec<u8>>)>
+            + Send
+            + 'static,
+    {
+        self.runtime().block_on(async {
+            tests::attach_mock_worker_frames(&mut self.lock_host().unwrap(), respond);
+        });
+    }
+
     pub(crate) fn embed_batch_with_job(
         &self,
         model: &LoadedModel,
@@ -3262,6 +3274,19 @@ mod tests {
     where
         F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
     {
+        attach_mock_worker_frames(host, move |request, raw| vec![respond(request, raw)])
+    }
+
+    #[cfg(unix)]
+    pub(super) fn attach_mock_worker_frames<F>(
+        host: &mut WorkerHost,
+        respond: F,
+    ) -> tokio::task::JoinHandle<SeenRequests>
+    where
+        F: Fn(&WorkerRequest, Option<&[u8]>) -> Vec<(WorkerResponse, Option<Vec<u8>>)>
+            + Send
+            + 'static,
+    {
         let (module, mut worker) = tokio::net::UnixStream::pair().unwrap();
         // The mock below speaks the protocol in-process; the host still owns a
         // child process per connection, so give it a harmless one.
@@ -3292,14 +3317,15 @@ mod tests {
                 } else {
                     None
                 };
-                let (response, raw_out) = respond(&request, raw.as_deref());
-                write_json(&mut worker, &response, DEFAULT_MAX_FRAME_BYTES)
-                    .await
-                    .unwrap();
-                if let Some(raw_out) = raw_out {
-                    write_raw(&mut worker, &raw_out, DEFAULT_MAX_FRAME_BYTES)
+                for (response, raw_out) in respond(&request, raw.as_deref()) {
+                    write_json(&mut worker, &response, DEFAULT_MAX_FRAME_BYTES)
                         .await
                         .unwrap();
+                    if let Some(raw_out) = raw_out {
+                        write_raw(&mut worker, &raw_out, DEFAULT_MAX_FRAME_BYTES)
+                            .await
+                            .unwrap();
+                    }
                 }
                 seen.push((request, raw));
             }

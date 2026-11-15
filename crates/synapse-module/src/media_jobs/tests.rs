@@ -1,4 +1,22 @@
 use super::*;
+
+mod conformance;
+mod results;
+
+async fn cleanup(root: PathBuf, state: Arc<ModuleState>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // The inference task can hold the SQLite connection briefly after publishing
+    // a terminal result. Wait for it before deleting files, including on Windows.
+    while Arc::strong_count(&state) > 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "media owner did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(state);
+    fs::remove_dir_all(root).unwrap();
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 const MODEL: &str = "parakeet-tdt-0.6b-v3";
 
@@ -95,6 +113,15 @@ async fn media_declaration_selection_and_five_states() {
     let described: cortexkit_role_media::describe::Describe =
         serde_json::from_value(described).unwrap();
     cortexkit_role_media::describe::check_describe(&described).unwrap();
+    let languages: Vec<String> =
+        "bg cs da de el en es et fi fr hr hu it lt lv mt nl pl pt ro ru sk sl sv uk"
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+    assert!(described
+        .engines
+        .iter()
+        .all(|e| e.languages.as_ref() == Some(&languages)));
     assert!(described.engines.iter().all(|e| e.local
         && e.provider == "local"
         && e.formats == ["audio/wav"]
@@ -195,10 +222,101 @@ async fn media_declaration_selection_and_five_states() {
             .await
             .unwrap_err()
             .0["code"],
-        "backend_unavailable"
+        "unsupported"
     );
     drop(state);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn media_undeclared_model_refuses_before_storing_or_starting_work() {
+    let (root, state) = fixture("media-undeclared-model", true);
+    let undeclared_lane = catalog::lane_id(
+        MODEL,
+        if cfg!(target_os = "macos") {
+            "cuda"
+        } else {
+            "ane"
+        },
+    );
+    let declared = call(&state, "alice", "role.describe", json!({}))
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    *state.runtime.media.runner.lock().unwrap() = Some(Arc::new(move |_, _| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        panic!("an undeclared engine must never start");
+    }));
+    for model in ["unknown-model", undeclared_lane.as_str()] {
+        assert!(!declared["engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["model"] == model));
+        let mut p = request(model);
+        p["model"] = json!(model);
+        let error = call(&state, "alice", "media.submit", p).await.unwrap_err();
+        assert_eq!(error.0["code"], "unsupported", "{model}");
+        assert_eq!(error.0["detail"]["field"], "model", "{model}");
+        assert_eq!(error.0["detail"]["class"], "permanent", "{model}");
+        let rows: (u64, u64) = state.store.store.with_conn(|c| {
+            c.query_row("SELECT (SELECT count(*) FROM media_jobs), (SELECT count(*) FROM media_objects)", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        }).unwrap();
+        assert_eq!(rows, (0, 0), "{model}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{model}");
+    }
+    cleanup(root, state).await;
+}
+
+#[tokio::test]
+async fn media_undeclared_facts_refuse_before_storing_work() {
+    let (root, state) = fixture("media-undeclared-facts", true);
+    for (name, field, value) in [
+        ("mime", "input.audio.mime", json!("audio/unknown")),
+        ("language", "input.language", json!("ja")),
+        ("bias", "input.bias", json!({"terms":[]})),
+    ] {
+        let mut p = request(name);
+        if name == "mime" {
+            p["input"]["audio"]["mime"] = value;
+        } else {
+            p["input"][name] = value;
+        }
+        let error = call(&state, "alice", "media.submit", p).await.unwrap_err();
+        assert_eq!(error.0["code"], "unsupported", "{name}");
+        assert_eq!(error.0["detail"]["field"], field, "{name}");
+        assert_eq!(error.0["detail"]["class"], "permanent", "{name}");
+        let jobs: u64 = state
+            .store
+            .store
+            .with_conn(|c| c.query_row("SELECT count(*) FROM media_jobs", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(jobs, 0, "{name}");
+    }
+    cleanup(root, state).await;
+}
+
+#[tokio::test]
+async fn media_declared_mime_with_malformed_audio_is_invalid_params() {
+    let (root, state) = fixture("media-malformed-audio", true);
+    for name in ["undecodable", "base64", "field-type"] {
+        let mut p = request(name);
+        match name {
+            "undecodable" => p["input"]["audio"] = media(b"not a WAV"),
+            "base64" => p["input"]["audio"]["data"] = json!("***"),
+            _ => p["input"]["audio"]["mime"] = json!(7),
+        }
+        let error = call(&state, "alice", "media.submit", p).await.unwrap_err();
+        assert_eq!(error.0["code"], "invalid_params", "{name}");
+    }
+    let jobs: u64 = state
+        .store
+        .store
+        .with_conn(|c| c.query_row("SELECT count(*) FROM media_jobs", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(jobs, 0);
+    cleanup(root, state).await;
 }
 
 #[tokio::test]
@@ -352,8 +470,8 @@ async fn media_audio_options_upload_capacity_permissions_retention_and_restart()
     let mut p = request("bias");
     p["input"]["bias"] = json!({"terms":[{"text":"word","weight":1.0}]});
     let e = call(&state, "alice", "media.submit", p).await.unwrap_err();
-    assert_eq!(e.0["code"], "invalid_params");
-    assert_eq!(e.0["detail"]["field"], "bias");
+    assert_eq!(e.0["code"], "unsupported");
+    assert_eq!(e.0["detail"]["field"], "input.bias");
     let mut bad = request("bad");
     bad["input"]["audio"] = media(b"not a WAV");
     let e = call(&state, "alice", "media.submit", bad)
@@ -417,7 +535,7 @@ async fn media_audio_options_upload_capacity_permissions_retention_and_restart()
     p["input"]["audio"] = facts.clone();
     p["input"]["audio"].as_object_mut().unwrap().remove("data");
     p["input"]["audio"]["object_id"] = object.clone();
-    p["input"]["language"] = json!("ignored");
+    p["input"]["language"] = json!("en-GB");
     let id = call(&state, "alice", "media.submit", p.clone())
         .await
         .unwrap()["job_id"]
@@ -578,115 +696,6 @@ async fn media_observation_pages_reassemble_and_unload_releases_cached_host() {
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     drop(state);
     fs::remove_dir_all(root).unwrap();
-}
-
-// cortexkit-role-media-conformance 0.2.8's generic job cases configure remote
-// engines and demand billing records, so only its local-compatible upload and
-// input-bound cases run here.
-// The tests above cover local job replay, terminality and cancellation directly.
-struct LocalSubject(Arc<ModuleState>);
-#[async_trait]
-impl cortexkit_role_media_conformance::MediaSubject for LocalSubject {
-    async fn configure_engines(
-        &self,
-        _: Vec<Engine>,
-    ) -> cortexkit_role_media_conformance::subject::SubjectResult<()> {
-        Ok(())
-    }
-    async fn configure_peers(
-        &self,
-        _: cortexkit_role_media_conformance::peers::RecordingRoutingPeer,
-        _: cortexkit_role_media_conformance::peers::RecordingVendor,
-    ) -> cortexkit_role_media_conformance::subject::SubjectResult<()> {
-        Ok(())
-    }
-    async fn configure_principals(
-        &self,
-        _: cortexkit_role_media_conformance::subject::Principals,
-    ) -> cortexkit_role_media_conformance::subject::SubjectResult<()> {
-        Ok(())
-    }
-    async fn call_as(
-        &self,
-        principal: &str,
-        request: cortexkit_role_media_conformance::subject::Request,
-    ) -> cortexkit_role_media_conformance::subject::SubjectResult<Value> {
-        use cortexkit_role_media_conformance::subject::SubjectError;
-        let mut params = request.params;
-        if request.method == "media.submit" && params["model"] == "transcribe" {
-            params["model"] = json!(MODEL);
-        }
-        match handle(self.0.clone(), Some(principal), &request.method, params).await {
-            HandlerOutcome::Response(body) => {
-                serde_json::from_slice(&body).map_err(|e| SubjectError::new(e.to_string()))
-            }
-            HandlerOutcome::ErrorWithDetail {
-                code,
-                message,
-                detail,
-            } => Err(SubjectError::refused(
-                json!({"code":code,"message":message,"detail":detail}),
-            )),
-            other => Err(SubjectError::new(format!("unexpected {other:?}"))),
-        }
-    }
-    async fn restart(&self) -> cortexkit_role_media_conformance::subject::SubjectResult<()> {
-        startup(&self.0).map_err(|e| {
-            cortexkit_role_media_conformance::subject::SubjectError::new(e.to_string())
-        })
-    }
-    async fn script_engine(
-        &self,
-        _: &str,
-        script: cortexkit_role_media_conformance::subject::Script,
-    ) -> cortexkit_role_media_conformance::subject::SubjectResult<()> {
-        let output = script
-            .steps
-            .into_iter()
-            .find_map(|s| match s {
-                cortexkit_role_media_conformance::subject::ScriptStep::Output(v) => Some(v),
-                _ => None,
-            })
-            .unwrap();
-        *self.0.runtime.media.runner.lock().unwrap() =
-            Some(Arc::new(move |_, _| Ok(output.clone())));
-        Ok(())
-    }
-}
-#[tokio::test]
-async fn media_published_local_compatible_conformance() {
-    for name in [
-        "reply_envelope",
-        "oversize_output_is_object",
-        "client_job_id_bounds",
-        "upload_resumes_at_received",
-        "upload_gone_after_restart",
-        "committed_upload_is_object",
-    ] {
-        let (root, state) = fixture(name, true);
-        let outcome =
-            cortexkit_role_media_conformance::run_case(&LocalSubject(state.clone()), name).await;
-        assert_eq!(
-            outcome,
-            cortexkit_role_media_conformance::Outcome::Passed,
-            "{name}"
-        );
-        // A job's drain task still holds a state clone, and with it the store
-        // connection, for a moment after its result is readable. Windows
-        // refuses to delete a directory with an open file, so wait until this
-        // test holds the only reference before removing it.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while Arc::strong_count(&state) > 1 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{name}: {} module-state references still held",
-                Arc::strong_count(&state)
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        drop(state);
-        fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[tokio::test]

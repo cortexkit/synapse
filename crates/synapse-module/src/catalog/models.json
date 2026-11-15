@@ -382,6 +382,7 @@
       "task": "transcribe",
       "name": "Parakeet TDT 0.6B v3",
       "description": "Batch speech transcription in 25 European languages with word timestamps.",
+      "languages": ["bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk"],
       "default_for_task": true,
       "upstream": {
         "hf_repo": "nvidia/parakeet-tdt-0.6b-v3",

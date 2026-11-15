@@ -30,9 +30,20 @@ pub(super) struct Runtime {
     lanes: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Lane>>>>,
     #[cfg(test)]
     runner: Mutex<Option<Arc<TestRunner>>>,
+    #[cfg(test)]
+    clock: Mutex<Option<u64>>,
 }
 #[cfg(test)]
 type TestRunner = dyn Fn(&str, &[u8]) -> Result<Value, Fault> + Send + Sync;
+
+fn clock_ms(state: &ModuleState) -> u64 {
+    #[cfg(test)]
+    if let Some(now) = *state.runtime.media.clock.lock().unwrap() {
+        return now;
+    }
+    let _ = state;
+    now_ms()
+}
 
 #[derive(Default)]
 struct Lane {
@@ -70,6 +81,21 @@ fn input_limit(limit: &str) -> Fault {
 }
 fn invalid(field: &str) -> Fault {
     fault("invalid_params", Some(field))
+}
+fn unsupported(field: &str) -> Fault {
+    use cortexkit_role_media::errors::{Refusal, RefusalClass, RefusalDetail};
+    let detail = RefusalDetail::new(RefusalClass::Permanent).with_members(BTreeMap::from([(
+        "field".into(),
+        Value::String(field.into()),
+    )]));
+    Fault(
+        serde_json::to_value(Refusal::new(
+            "unsupported".into(),
+            "unsupported".into(),
+            detail,
+        ))
+        .expect("media refusal serializes"),
+    )
 }
 fn internal(error: impl std::fmt::Display) -> Fault {
     let mut e = fault("store_failure", None);
@@ -111,8 +137,8 @@ fn string<'a>(v: &'a Value, field: &str) -> Answer<&'a str> {
     v[field].as_str().ok_or_else(|| invalid(field))
 }
 
-fn engine(model: &str, duration: u64) -> Engine {
-    Engine::new(
+fn engine(model: &str, duration: u64, entry: &catalog::CatalogEntry) -> Engine {
+    let mut engine = Engine::new(
         Kind::Transcribe,
         "local".into(),
         model.into(),
@@ -121,7 +147,11 @@ fn engine(model: &str, duration: u64) -> Engine {
         LatencyClass::Batch,
     )
     .with_max_input_bytes(UPLOAD_MAX)
-    .with_max_duration_ms(duration)
+    .with_max_duration_ms(duration);
+    if let Some(languages) = &entry.languages {
+        engine = engine.with_languages(languages.clone());
+    }
+    engine
 }
 fn engines(runtime: &RuntimeState) -> Vec<Engine> {
     let mut engines = Vec::new();
@@ -140,12 +170,13 @@ fn engines(runtime: &RuntimeState) -> Vec<Engine> {
             })
             .collect();
         if let Some(first) = runnable.first() {
-            engines.push(engine(&entry.id, first.max_duration_ms.unwrap_or(0)));
+            engines.push(engine(&entry.id, first.max_duration_ms.unwrap_or(0), entry));
         }
         for backend in runnable {
             engines.push(engine(
                 &catalog::lane_id(&entry.id, &backend.backend),
                 backend.max_duration_ms.unwrap_or(0),
+                entry,
             ));
         }
     }
@@ -164,7 +195,7 @@ pub(super) fn start_maintenance(state: &Arc<ModuleState>) {
             };
             let _ = tokio::task::spawn_blocking(move || {
                 let _gate = state.runtime.media.gate.lock().expect("media gate");
-                if let Err(error) = persistence::sweep(&state, now_ms()) {
+                if let Err(error) = persistence::sweep(&state, clock_ms(&state)) {
                     tracing::warn!(error=%error.0,"media retention sweep failed");
                 }
             })
@@ -193,7 +224,7 @@ pub(super) async fn handle(
         submit(state.clone(), owner, params).await
     } else {
         let _gate = state.runtime.media.gate.lock().expect("media gate");
-        persistence::sweep(&state, now_ms()).and_then(|_| match method {
+        persistence::sweep(&state, clock_ms(&state)).and_then(|_| match method {
             "media.upload_begin" => persistence::upload_begin(&state, owner, params),
             "media.upload_append" => persistence::upload_append(&state, owner, params),
             "media.upload_status" => persistence::upload_status(&state, owner, params),
@@ -217,9 +248,9 @@ fn select(
         .runtime
         .release_catalog
         .resolve_reserved(model)
-        .ok_or_else(|| fault("backend_unavailable", None))?;
+        .ok_or_else(|| unsupported("model"))?;
     if entry.task != "transcribe" {
-        return Err(fault("unsupported", Some("model")));
+        return Err(unsupported("model"));
     }
     let backend = if let Some(pinned) = pinned {
         entry.backend(pinned)
@@ -229,7 +260,7 @@ fn select(
                 .is_none()
         })
     }
-    .ok_or_else(|| fault("backend_unavailable", None))?;
+    .ok_or_else(|| unsupported("model"))?;
     if catalog_lane_backend_reason(
         &state.runtime,
         entry,
@@ -238,7 +269,7 @@ fn select(
     )
     .is_some()
     {
-        return Err(fault("backend_unavailable", None));
+        return Err(unsupported("model"));
     }
     Ok((entry.clone(), backend.clone()))
 }
@@ -254,26 +285,17 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
     let binding = persistence::binding(&params);
     let admitted = {
         let _gate = state.runtime.media.gate.lock().expect("media gate");
-        persistence::sweep(&state, now_ms())?;
+        persistence::sweep(&state, clock_ms(&state))?;
         if let Some(id) = persistence::replay(&state, owner, client, &binding)? {
             return Ok(json!({"job_id":id}));
         }
-        let input = &params["input"];
-        if input.get("bias").is_some_and(|bias| {
-            !bias.is_null()
-                && (bias["terms"]
-                    .as_array()
-                    .is_none_or(|terms| !terms.is_empty())
-                    || bias["prompt"]
-                        .as_str()
-                        .is_some_and(|prompt| !prompt.is_empty()))
-        }) {
-            return Err(invalid("bias"));
-        }
         let request: SubmitRequest = parse(params.clone(), "params")?;
         if request.kind != Kind::Transcribe {
-            return Err(fault("unsupported", Some("kind")));
+            return Err(unsupported("kind"));
         }
+        let cortexkit_role_media::jobs::JobInput::Transcribe(input) = &request.input else {
+            return Err(invalid("input"));
+        };
         if request.model.chars().count() > 256 {
             return Err(invalid("model"));
         }
@@ -326,15 +348,27 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
                 return Err(quarantined(&lane, retry));
             }
         }
-        let audio: objects::MediaValue = parse(input["audio"].clone(), "audio")?;
+        let audio = input.audio.clone();
         objects::check_media(&audio).map_err(|e| Fault(serde_json::json!({"code":e.code,"message":e.code,"detail":{"class":"permanent","field":"audio"}})))?;
         if audio.bytes > UPLOAD_MAX {
             return Err(input_limit("max_input_bytes"));
         }
         persistence::check_lane_capacity(&state, &lane)?;
         let bytes = persistence::audio_bytes(&state, owner, &audio)?;
-        if !audio.mime.eq_ignore_ascii_case("audio/wav") {
-            return Err(invalid("audio"));
+        if !cortexkit_role_media::describe::mime_matches("audio/wav", &audio.mime) {
+            return Err(unsupported("input.audio.mime"));
+        }
+        if input.language.as_ref().is_some_and(|hint| {
+            entry.languages.as_ref().is_none_or(|languages| {
+                !languages.iter().any(|language| {
+                    cortexkit_role_media::describe::language_matches(language, hint)
+                })
+            })
+        }) {
+            return Err(unsupported("input.language"));
+        }
+        if input.bias.is_some() {
+            return Err(unsupported("input.bias"));
         }
         let decoded = synapse_speech::decode_wav(&bytes).map_err(|_| invalid("audio"))?;
         let profile =
@@ -402,7 +436,7 @@ fn run(
     {
         let run = state.runtime.media.runner.lock().unwrap().clone();
         if let Some(run) = run {
-            return run(&catalog::lane_id(&entry.id, &backend.backend), audio);
+            return checked_output(run(&catalog::lane_id(&entry.id, &backend.backend), audio)?);
         }
     }
     let lane = catalog_transcribe_lane(entry, backend).map_err(wire)?;
@@ -447,9 +481,7 @@ fn run(
         .map(|w| json!({"text":w.word,"start_ms":w.start_ms as u64,"end_ms":w.end_ms as u64}))
         .collect::<Vec<_>>();
     let mut output = json!({"text":result.transcript.text,"words":words,"no_speech":result.transcript.no_speech});
-    let typed: cortexkit_role_media::jobs::TranscribeOutput = parse(output.clone(), "output")?;
-    cortexkit_role_media::jobs::check_transcribe_output(&typed)
-        .map_err(|_| fault("engine_empty_result", None))?;
+    output = checked_output(output)?;
     if state.runtime.certify_observation {
         if let Some(frames) = result.observation {
             // Raw observation bytes are internal until completion atomically
@@ -457,6 +489,13 @@ fn run(
             output["_observation"] = json!({"lane_id":catalog::lane_id(&entry.id,&backend.backend),"fingerprint":backend.fingerprint,"valid_encoder_frames":result.output.valid_encoder_frames,"triples":base64_encode(&result.transcript_frame),"encoder_output":base64_encode(&frames.encoder_output),"decode_trace":base64_encode(&frames.decode_trace)});
         }
     }
+    Ok(output)
+}
+
+fn checked_output(output: Value) -> Answer<Value> {
+    let typed: cortexkit_role_media::jobs::TranscribeOutput = parse(output.clone(), "output")?;
+    cortexkit_role_media::jobs::check_transcribe_output(&typed)
+        .map_err(|_| fault("engine_empty_result", None))?;
     Ok(output)
 }
 

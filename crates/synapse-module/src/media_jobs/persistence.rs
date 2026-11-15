@@ -109,7 +109,7 @@ pub(super) fn upload_begin(state: &ModuleState, owner: &str, p: Value) -> Answer
     let id = new_id(state)?;
     create(state, &id, &[])?;
     let result = mutate(state, |t| {
-        t.execute("INSERT INTO media_objects(id,owner,mime,bytes,sha256,state,retained_ms) VALUES(?1,?2,?3,?4,?5,'open',?6)",params![id,owner,p.mime,p.bytes,p.sha256,now_ms()+RETENTION_MS])?;
+        t.execute("INSERT INTO media_objects(id,owner,mime,bytes,sha256,state,retained_ms) VALUES(?1,?2,?3,?4,?5,'open',?6)",params![id,owner,p.mime,p.bytes,p.sha256,clock_ms(state)+RETENTION_MS])?;
         Ok(())
     });
     if result.is_err() {
@@ -150,7 +150,7 @@ pub(super) fn upload_append(state: &ModuleState, owner: &str, p: Value) -> Answe
     mutate(state, |t| {
         t.execute(
             "UPDATE media_objects SET received=?2,retained_ms=?3 WHERE id=?1",
-            params![o.id, received, now_ms() + RETENTION_MS],
+            params![o.id, received, clock_ms(state) + RETENTION_MS],
         )?;
         Ok(())
     })?;
@@ -173,7 +173,7 @@ pub(super) fn upload_commit(state: &ModuleState, owner: &str, p: Value) -> Answe
         mutate(state, |t| {
             t.execute(
                 "UPDATE media_objects SET state='committed',retained_ms=?2 WHERE id=?1",
-                params![o.id, now_ms() + RETENTION_MS],
+                params![o.id, clock_ms(state) + RETENTION_MS],
             )?;
             Ok(())
         })?;
@@ -203,9 +203,9 @@ pub(super) fn read(state: &ModuleState, owner: &str, p: Value) -> Answer<Value> 
         f.take(p.length).read_to_end(&mut bytes).map_err(internal)?;
         bytes
     };
-    extend(state, &o.id, now_ms())?;
+    extend(state, &o.id, clock_ms(state))?;
     mutate(state, |t| {
-        t.execute("UPDATE media_jobs SET retained_ms=max(retained_ms,?2) WHERE object_id=?1 OR json_extract(result,'$.output_object.object_id')=?1",params![o.id,now_ms()+RETENTION_MS])?;
+        t.execute("UPDATE media_jobs SET retained_ms=max(retained_ms,?2) WHERE object_id=?1 OR json_extract(result,'$.output_object.object_id')=?1",params![o.id,clock_ms(state)+RETENTION_MS])?;
         Ok(())
     })?;
     Ok(json!({"data":base64_encode(&bytes)}))
@@ -311,7 +311,7 @@ pub(super) fn admit(
     if new_object {
         create(state, &object_id, bytes)?;
     }
-    let now = now_ms();
+    let now = clock_ms(state);
     let result = mutate(state, |t| {
         if new_object {
             t.execute("INSERT INTO media_objects(id,owner,mime,bytes,sha256,state,received,retained_ms) VALUES(?1,?2,?3,?4,?5,'committed',?4,?6)",params![object_id,owner,audio.mime,audio.bytes,audio.sha256,now+RETENTION_MS])?;
@@ -349,7 +349,7 @@ fn failure(e: Fault) -> Value {
 }
 pub(super) fn start(state: &ModuleState, id: &str) -> Answer<bool> {
     let _gate = state.runtime.media.gate.lock().expect("media gate");
-    expire_deadlines(state, now_ms())?;
+    expire_deadlines(state, clock_ms(state))?;
     mutate(state, |t| {
         Ok(t.execute(
             "UPDATE media_jobs SET state='running' WHERE id=?1 AND state='queued'",
@@ -358,7 +358,7 @@ pub(super) fn start(state: &ModuleState, id: &str) -> Answer<bool> {
     })
 }
 pub(super) fn finish(state: &ModuleState, id: &str, result: Answer<Value>) -> Answer<()> {
-    expire_deadlines(state, now_ms())?;
+    expire_deadlines(state, clock_ms(state))?;
     let (mut status, mut output, mut error) = match result {
         Ok(v) => ("done", Some(v), None),
         Err(e) => ("failed", None, Some(failure(e))),
@@ -387,9 +387,9 @@ pub(super) fn finish(state: &ModuleState, id: &str, result: Answer<Value>) -> An
                 }
                 metadata[part] = json!({"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes)),"pages":bytes.len().div_ceil(PAGE)});
             }
-            output.as_mut().expect("output")["observation"] = metadata;
+            attach_certify_observation(output.as_mut().expect("output"), Some(metadata));
         }
-        let now = now_ms();
+        let now = clock_ms(state);
         if let Some(value) = &output {
             let bytes = serde_json::to_vec(value).expect("JSON output");
             if bytes.len() > cortexkit_role_media::MESSAGE_MAX {
@@ -447,7 +447,7 @@ pub(super) fn job_answer(
     p: Value,
 ) -> Answer<Value> {
     let id = string(&p, "job_id")?;
-    expire_deadlines(state, now_ms())?;
+    expire_deadlines(state, clock_ms(state))?;
     let row: Option<(String, Option<String>, Option<String>, String)> = db(state, |c| {
         c.query_row("SELECT state,result,failure,object_id FROM media_jobs WHERE owner=?1 AND id=?2 AND expired=0",params![owner,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
     })?;
@@ -457,10 +457,10 @@ pub(super) fn job_answer(
     if method == "media.cancel" {
         if status == "queued" || status == "running" {
             mutate(state, |t| {
-                t.execute("UPDATE media_jobs SET state='cancelled',retained_ms=?2 WHERE id=?1 AND state IN ('queued','running')",params![id,now_ms()+RETENTION_MS])?;
+                t.execute("UPDATE media_jobs SET state='cancelled',retained_ms=?2 WHERE id=?1 AND state IN ('queued','running')",params![id,clock_ms(state)+RETENTION_MS])?;
                 Ok(())
             })?;
-            extend(state, &object, now_ms())?;
+            extend(state, &object, clock_ms(state))?;
             return Ok(json!({"status":"cancelled"}));
         }
         return Ok(json!({"status":status}));
@@ -485,14 +485,14 @@ pub(super) fn job_answer(
     mutate(state, |t| {
         t.execute(
             "UPDATE media_jobs SET retained_ms=?2 WHERE id=?1",
-            params![id, now_ms() + RETENTION_MS],
+            params![id, clock_ms(state) + RETENTION_MS],
         )?;
         Ok(())
     })?;
-    extend(state, &object, now_ms())?;
+    extend(state, &object, clock_ms(state))?;
     let result: Value = serde_json::from_str(&result.unwrap_or_default()).map_err(internal)?;
     if let Some(id) = result["output_object"]["object_id"].as_str() {
-        extend(state, id, now_ms())?;
+        extend(state, id, clock_ms(state))?;
     }
     Ok(result)
 }
@@ -558,7 +558,7 @@ pub(super) fn sweep(state: &ModuleState, now: u64) -> Answer<()> {
 }
 pub(super) fn recover(state: &ModuleState) -> Answer<()> {
     let root = directory(state)?;
-    let now = now_ms();
+    let now = clock_ms(state);
     let error = failure(fault("module_restarted", None)).to_string();
     mutate(state, |t| {
         t.execute("UPDATE media_objects SET retained_ms=max(retained_ms,?1) WHERE id IN (SELECT object_id FROM media_jobs WHERE state IN ('queued','running'))",[now+RETENTION_MS])?;

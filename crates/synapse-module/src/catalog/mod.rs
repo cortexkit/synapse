@@ -67,6 +67,8 @@ pub(crate) struct CatalogEntry {
     pub task: String,
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
     pub default_for_task: bool,
     pub upstream: Upstream,
     pub files: Vec<CatalogFile>,
