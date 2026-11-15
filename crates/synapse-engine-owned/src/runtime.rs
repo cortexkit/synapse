@@ -1913,15 +1913,27 @@ pub(crate) fn load_safetensor_map(
     model_root: &Path,
     original_path: &Path,
 ) -> Result<HashMap<String, Tensor>> {
+    let mut merged = HashMap::new();
+    for path in safetensor_files(model_root, original_path)? {
+        let bytes =
+            fs::read(&path).with_context(|| format!("read safetensors {}", path.display()))?;
+        merged.extend(tensors_from_safetensors_bytes(&path, &bytes)?);
+    }
+    Ok(merged)
+}
+
+/// The safetensors files holding a model: the file itself when `original_path`
+/// names one, else `model.safetensors`, else every shard the index lists.
+pub(crate) fn safetensor_files(model_root: &Path, original_path: &Path) -> Result<Vec<PathBuf>> {
     if original_path.is_file()
         && original_path.extension().and_then(|value| value.to_str()) == Some("safetensors")
     {
-        return load_single_safetensors_file(original_path);
+        return Ok(vec![original_path.to_path_buf()]);
     }
 
     let single_file = model_root.join("model.safetensors");
     if single_file.is_file() {
-        return load_single_safetensors_file(&single_file);
+        return Ok(vec![single_file]);
     }
 
     let index_file = model_root.join("model.safetensors.index.json");
@@ -1935,13 +1947,11 @@ pub(crate) fn load_safetensor_map(
                 .with_context(|| format!("read safetensors index {}", index_file.display()))?,
         )
         .with_context(|| format!("parse safetensors index {}", index_file.display()))?;
-        let mut merged = HashMap::new();
         let unique_files: HashSet<_> = index.weight_map.into_values().collect();
-        for shard in unique_files {
-            let shard_path = model_root.join(&shard);
-            merged.extend(load_single_safetensors_file(&shard_path)?);
-        }
-        return Ok(merged);
+        return Ok(unique_files
+            .into_iter()
+            .map(|shard| model_root.join(shard))
+            .collect());
     }
 
     bail!(
@@ -1950,9 +1960,14 @@ pub(crate) fn load_safetensor_map(
     )
 }
 
-fn load_single_safetensors_file(path: &Path) -> Result<HashMap<String, Tensor>> {
-    let bytes = fs::read(path).with_context(|| format!("read safetensors {}", path.display()))?;
-    let safetensors = SafeTensors::deserialize(&bytes)
+/// Converts every f32, f16 and bf16 tensor in one safetensors file's bytes.
+/// Other dtypes are skipped. The bytes may be a read buffer or a file mapping;
+/// the returned tensors own copies, so the caller may release `bytes` after.
+pub(crate) fn tensors_from_safetensors_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<HashMap<String, Tensor>> {
+    let safetensors = SafeTensors::deserialize(bytes)
         .map_err(|error| anyhow::anyhow!("load safetensors {}: {error}", path.display()))?;
     let mut tensors = HashMap::new();
     for name in safetensors.names() {

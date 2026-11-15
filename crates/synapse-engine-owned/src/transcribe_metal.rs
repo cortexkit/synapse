@@ -1,5 +1,5 @@
 use super::Progress;
-use crate::runtime::Tensor;
+use crate::runtime::{safetensor_files, tensors_from_safetensors_bytes, Tensor};
 use anyhow::{bail, ensure, Context as _, Result};
 use std::{
     collections::HashMap,
@@ -179,74 +179,21 @@ impl Drop for MappedWeights {
     }
 }
 
+/// Reads the checkpoint through a read-only file mapping instead of a read
+/// buffer. A 2.5 GB read buffer, the converted host tensors and the GPU copies
+/// used to be alive at once. A read-only mapping is backed by the file itself,
+/// so the OS can drop its pages instead of holding a second private copy, and
+/// each mapping is released once its tensors are converted.
 fn load_weights(root: &Path, original: &Path) -> Result<HashMap<String, Tensor>> {
-    use safetensors::{Dtype, SafeTensors};
-    let single = root.join("model.safetensors");
-    let files = if original.is_file()
-        && original.extension().and_then(|s| s.to_str()) == Some("safetensors")
-    {
-        vec![original.to_path_buf()]
-    } else if single.is_file() {
-        vec![single]
-    } else {
-        #[derive(serde::Deserialize)]
-        struct Index {
-            weight_map: HashMap<String, String>,
-        }
-        let index: Index = serde_json::from_slice(
-            &std::fs::read(root.join("model.safetensors.index.json"))
-                .context("read safetensors index")?,
-        )?;
-        let unique: std::collections::HashSet<_> = index.weight_map.into_values().collect();
-        unique.into_iter().map(|file| root.join(file)).collect()
-    };
     let mut host = HashMap::new();
-    for file in files {
+    for file in safetensor_files(root, original)? {
         let mapping = MappedWeights::open(&file)?;
-        // Deserialize validates the complete header, shapes, offsets and file
-        // length before constructing tensors. The mapping is released before
-        // GPU upload; unlike a read buffer, its clean pages need no private copy.
-        let tensors = SafeTensors::deserialize(mapping.bytes())
-            .with_context(|| format!("load safetensors {}", file.display()))?;
-        for name in tensors.names() {
-            let view = tensors.tensor(name)?;
-            let dtype = view.dtype();
-            if !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
-                continue;
-            }
-            let values: Vec<f32> = {
-                match dtype {
-                    Dtype::F32 => view
-                        .data()
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|&b| f32::from_le_bytes(b))
-                        .collect(),
-                    Dtype::F16 => view
-                        .data()
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|&b| half::f16::from_bits(u16::from_le_bytes(b)).to_f32())
-                        .collect(),
-                    Dtype::BF16 => view
-                        .data()
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|&b| half::bf16::from_bits(u16::from_le_bytes(b)).to_f32())
-                        .collect(),
-                    _ => unreachable!(),
-                }
-            };
-            ensure!(
-                values.iter().all(|x| x.is_finite()),
-                "non-finite model weight"
-            );
-            host.insert(name.to_owned(), Tensor::new(view.shape().to_vec(), values)?);
-        }
+        host.extend(tensors_from_safetensors_bytes(&file, mapping.bytes())?);
     }
+    ensure!(
+        host.values().all(|t| t.data.iter().all(|x| x.is_finite())),
+        "non-finite model weight"
+    );
     Ok(host)
 }
 
