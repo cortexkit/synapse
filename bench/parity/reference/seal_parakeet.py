@@ -21,6 +21,10 @@ import parakeet_reference as ref
 SLUG = "parakeet-tdt-0.6b-v3"
 
 
+def profile_dtype(lane):
+    return "f32" if lane in ("owned-metal", "owned-cuda", "owned-vulkan") else "f16"
+
+
 def digest(path):
     return ref.sha256_file(path)
 
@@ -224,7 +228,7 @@ def main():
         raise RuntimeError("converted-package receipt has the wrong checkpoint or converter rule")
     for lane in ("owned-metal", "owned-cuda", "owned-vulkan", "ane-direct-worker"):
         profile_id = SLUG + "." + lane
-        dtype = "f32" if lane in ("owned-metal", "owned-cuda") else "f16"
+        dtype = profile_dtype(lane)
         profile = {"model": SLUG, "lane": lane, "storage_dtype": dtype, "compute_dtype": dtype,
                    "conversion_rule": "none" if lane == "owned-metal" else "v1",
                    "rerank_tolerance_class": "fp32" if dtype == "f32" else "fp16",
@@ -235,6 +239,8 @@ def main():
                                   "self_check": artifact(subset_path, root)}}
         if lane == "owned-cuda":
             profile.update(cuda_min_compute_major=7, cuda_min_compute_minor=5, cuda_min_driver_api=13020)
+        if lane == "owned-vulkan":
+            profile.update(vulkan_min_device_local_bytes=3276015104, vulkan_min_storage_buffer_range=134217728)
         if lane == "ane-direct-worker":
             profile.update(cpu_stages=["tdt_predictor", "tdt_joint"], rotation="none", gelu_lowering="none")
             profile["fp32_tensors"] = sorted(k for k in tensor_names if k.startswith(("decoder.", "joint.")))

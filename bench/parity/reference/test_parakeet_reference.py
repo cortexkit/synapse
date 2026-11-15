@@ -3,6 +3,15 @@ import unittest
 import parakeet_reference as ref
 
 
+class ProfileTests(unittest.TestCase):
+    def test_generated_vulkan_profile_uses_f32_without_changing_other_lanes(self):
+        from seal_parakeet import profile_dtype
+        self.assertEqual(profile_dtype("owned-vulkan"), "f32")
+        self.assertEqual(profile_dtype("owned-cuda"), "f32")
+        self.assertEqual(profile_dtype("owned-metal"), "f32")
+        self.assertEqual(profile_dtype("ane-direct-worker"), "f16")
+
+
 class GreedyTests(unittest.TestCase):
     def test_always_nonblank_zero_duration_has_exact_frame_cap(self):
         trace, triples = ref.greedy(lambda t, previous: ([3., 0., -1.], [4., 0.]),

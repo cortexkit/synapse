@@ -17,30 +17,34 @@ pub fn requirements(manifest: &Manifest, slug: Option<&str>) -> Result<Required,
     for profile in manifest
         .profiles
         .values()
-        // Device floors cover the token (embed and rerank) models this worker
-        // serves. A transcription profile carries no floors until the Vulkan
-        // transcription engine measures them, so it must not enter the
-        // machine-wide probe.
-        .filter(|p| {
-            p.lane == Lane::OwnedVulkan
-                && slug.is_none_or(|s| p.model == s)
-                && manifest.models[&p.model].operation != Operation::Transcribe
-        })
+        .filter(|p| p.lane == Lane::OwnedVulkan && slug.is_none_or(|s| p.model == s))
     {
         let model = &manifest.models[&profile.model];
-        let floors = vulkan_floors(
-            model,
-            profile.storage_dtype,
-            &profile.fp32_tensors,
-            u64::from(manifest.admission.max_context_tokens),
-            FLOOR_SEQUENCES,
-            u64::from(
-                profile
-                    .vulkan_sub_batch_max_tokens
-                    .ok_or("model_unsupported")?,
-            ),
-        )
-        .map_err(|e| e.to_string())?;
+        let floors = if model.operation == Operation::Transcribe {
+            crate::transcribe::floors(
+                model,
+                crate::transcribe::maximum(profile).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            let floors = vulkan_floors(
+                model,
+                profile.storage_dtype,
+                &profile.fp32_tensors,
+                u64::from(manifest.admission.max_context_tokens),
+                FLOOR_SEQUENCES,
+                u64::from(
+                    profile
+                        .vulkan_sub_batch_max_tokens
+                        .ok_or("model_unsupported")?,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            Required {
+                min_storage_buffer_range: floors.min_storage_buffer_range,
+                min_device_local_bytes: floors.min_device_local_bytes,
+            }
+        };
         if Some(floors.min_storage_buffer_range) != profile.vulkan_min_storage_buffer_range
             || Some(floors.min_device_local_bytes) != profile.vulkan_min_device_local_bytes
         {

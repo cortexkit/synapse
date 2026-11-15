@@ -13,6 +13,8 @@ crates/synapse-certify/src/self_check/*.json text eol=lf
 # tokenizer and checks its SHA-256 at load). Never convert line endings.
 crates/synapse-speech/assets/** -text
 bench/parity/checkpoints/** -text
+# Compile shader sources identically on Windows; the build does not patch text.
+crates/synapse-worker-vulkan/shaders/** text eol=lf
 
 # Parsed by structure at compile time (include_str!): the drift-guard tests
 # find the operation inventory by its blank-line paragraph break, which a CRLF

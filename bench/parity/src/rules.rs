@@ -47,7 +47,8 @@ pub fn storage_dtype(model_slug: &str, lane: Lane) -> DType {
             model_slug,
             "gte-reranker-modernbert-base" | "parakeet-tdt-0.6b-v3"
         ))
-        || (lane == Lane::OwnedCuda && model_slug == "parakeet-tdt-0.6b-v3")
+        || (matches!(lane, Lane::OwnedCuda | Lane::OwnedVulkan)
+            && model_slug == "parakeet-tdt-0.6b-v3")
     {
         DType::F32
     } else {

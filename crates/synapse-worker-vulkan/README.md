@@ -1,8 +1,17 @@
 # Owned Vulkan worker
 
-`ck-synapse-worker-vulkan` serves the four `owned-vulkan` manifest profiles over
-worker protocol v3. The default build needs neither a Vulkan SDK nor a loader;
+`ck-synapse-worker-vulkan` serves the embedding, reranking and Parakeet transcription profiles over
+worker protocol v4. The default build needs neither a Vulkan SDK nor a loader;
 HELLO and PING do not attempt loader discovery.
+
+Transcription uses GPU subsampling, the full Conformer encoder and encoder
+projection, then the shared speech crate's greedy loop over a worker-local
+host predictor/joint. Parakeet uses only F32 weights and fp32 arithmetic; the
+strict reference gates are unchanged. Its LOAD revision is separate from the existing kernel
+binding. See [the transcription hardware kit](scripts/transcribe-certify.md)
+for required numerical/observation/progress checks and the explicit MoltenVK
+diagnostic. The profile's 600-second target and allocation floors are not
+hardware certification until the complete native runs pass.
 
 Enable the GPU build with Vulkan SDK **1.4.357.0**, setting `VULKAN_SDK` to its
 platform directory (containing `bin/glslc`, or `Bin/glslc.exe` on Windows):
@@ -14,9 +23,9 @@ ck-synapse-worker-vulkan --probe-floor
 ck-synapse-worker-vulkan --probe-floor --model qwen3-embedding-0.6b
 ```
 
-The build checks the SDK path and compiler version. All three owned shaders use
+The build checks the SDK path and compiler version. All owned shaders use
 `-O` and a fixed target environment: Vulkan 1.2 for plain and attention kernels,
-Vulkan 1.3 for cooperative matrices. Embedded SPIR-V is checked for source/debug
+Vulkan 1.3 for cooperative matrices; speech uses Vulkan 1.2. Embedded SPIR-V is checked for source/debug
 instructions. The kernel revision hashes the plain, cooperative and attention
 binaries in that order;
 the feature-disabled worker hashes an empty shader set. The manifest binding

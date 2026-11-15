@@ -36,7 +36,7 @@
       "parakeet-tdt-0.6b-v3.ane-direct-worker": "d35570d39da3bf1cdf63a72d61af066907cf40ec9f3f4bebefad6e75f0a3536e",
       "parakeet-tdt-0.6b-v3.owned-cuda": "e41be8497607e06c51552af7a1d12d6108c227e50a43ecc2a7d4a6bb0177c67c",
       "parakeet-tdt-0.6b-v3.owned-metal": "641ec0b90dc3f34cffecf88e39dc357932b8444da9c18324f6572a57d4bcfec7",
-      "parakeet-tdt-0.6b-v3.owned-vulkan": "0ae0837a03fca46e34f6900dcbb9cb2d73f36dc2ed911a27a595937587bf28b2",
+      "parakeet-tdt-0.6b-v3.owned-vulkan": "231a720634eb87a696d43ea22a21372ebaa11fb104ce3f55adeb311e154d4b5e",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
       "qwen3-embedding-0.6b.owned-cuda": "a93eb2d4f132a60bf5fe0452fb9d9bb9bffe918c94523e88e868359c45dfe9e0",
       "qwen3-embedding-0.6b.owned-metal": "d3f98359d9b76aa1576eb96bec880868e3b35963d8dfdcee21f8cc9a82b45b52",
@@ -1424,14 +1424,14 @@
       }
     },
     "parakeet-tdt-0.6b-v3.owned-vulkan": {
-      "compute_dtype": "f16",
+      "compute_dtype": "f32",
       "conversion_rule": "v1",
-      "converted_package_digest": "sha256:1ce06d3fb25b7bf57c068da75588b937235b20427ebaf6eab8b9d0ad1cd2c597",
-      "fp32_tensors": [],
+      "converted_package_digest": "sha256:77db3da80dd474fe7481cf263d107c0401e866934018a5b8ad3247c179731175",
+      "fp32_tensors": "all",
       "lane": "owned-vulkan",
       "model": "parakeet-tdt-0.6b-v3",
-      "rerank_tolerance_class": "fp16",
-      "storage_dtype": "f16",
+      "rerank_tolerance_class": "fp32",
+      "storage_dtype": "f32",
       "transcribe": {
         "confirmations": {
           "decode_rule": {
@@ -1690,7 +1690,9 @@
         "tau_feat": 0.001,
         "tau_margin": 0.001,
         "tau_resample": 1.546491
-      }
+      },
+      "vulkan_min_device_local_bytes": 3276015104,
+      "vulkan_min_storage_buffer_range": 134217728
     },
     "qwen3-embedding-0.6b.ane-direct-worker": {
       "compute_dtype": "f16",

@@ -14,9 +14,9 @@
       "sha256": "1f89f0a76ef7f1bc738eaaac4befd6bc2dd94cf5c3bad2ae2b98885657ecddec"
     },
     "parakeet-tdt-0.6b-v3.owned-vulkan": {
-      "bytes": 1254196308,
+      "bytes": 2508311520,
       "integer_counters_verified": 24,
-      "sha256": "1ce06d3fb25b7bf57c068da75588b937235b20427ebaf6eab8b9d0ad1cd2c597"
+      "sha256": "77db3da80dd474fe7481cf263d107c0401e866934018a5b8ad3247c179731175"
     }
   },
   "rustc_version": "rustc 1.99.0 (b940084d7 2026-09-28)",
