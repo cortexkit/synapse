@@ -110,6 +110,8 @@ fn input(case: &Value, audio: Option<(&Path, &Value)>) -> TranscribeRequest {
 unsafe extern "C" {
     fn synapse_parakeet_resident_bytes() -> u64;
     fn synapse_parakeet_peak_resident_bytes() -> u64;
+    fn synapse_parakeet_footprint_bytes() -> u64;
+    fn synapse_parakeet_peak_footprint_bytes() -> u64;
 }
 fn resident() -> u64 {
     unsafe { synapse_parakeet_resident_bytes() }
@@ -188,6 +190,12 @@ fn transcribe_metal_c6_parity() {
     let evidence =
         std::env::var_os("SYNAPSE_METAL_SPEECH_EVIDENCE").map(|p| fs::File::create(p).unwrap());
     let mut evidence = evidence;
+    let encoder_save = std::env::var_os("SYNAPSE_METAL_SPEECH_ENCODER_SAVE").map(PathBuf::from);
+    let encoder_compare =
+        std::env::var_os("SYNAPSE_METAL_SPEECH_ENCODER_COMPARE").map(PathBuf::from);
+    if let Some(path) = &encoder_save {
+        fs::create_dir_all(path).unwrap();
+    }
     // A previous run supplies bit-exact engine outputs in addition to the
     // reference's tolerance-based numerical gates.
     let baseline: Option<std::collections::HashMap<String, String>> =
@@ -250,6 +258,7 @@ fn transcribe_metal_c6_parity() {
             }
             continue;
         }
+        let engine_start = Instant::now();
         let output = engine
             .transcribe_with_progress(&model, request.clone(), |p| {
                 gap = gap.max(previous.elapsed().as_millis() as u64);
@@ -258,6 +267,7 @@ fn transcribe_metal_c6_parity() {
                 progress.push(p);
             })
             .unwrap();
+        let engine_seconds = engine_start.elapsed().as_secs_f64();
         gap = gap.max(previous.elapsed().as_millis() as u64);
         longest_gap = longest_gap.max(gap);
         peak = peak.max(resident());
@@ -268,6 +278,25 @@ fn transcribe_metal_c6_parity() {
         let obs = output.observation.as_ref().unwrap();
         assert_eq!(obs.encoder_output.len(), output.valid_encoder_frames * 1024);
         assert!(obs.encoder_output.iter().all(|x| x.is_finite()));
+        let encoder_file = format!("{}.f32", case["id"].as_str().unwrap());
+        if let Some(path) = &encoder_save {
+            let bytes: Vec<u8> = obs
+                .encoder_output
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            fs::write(path.join(&encoder_file), bytes).unwrap();
+        }
+        let max_encoder_difference = encoder_compare.as_ref().map(|path| {
+            let before = floats(&fs::read(path.join(&encoder_file)).unwrap());
+            assert_eq!(before.len(), obs.encoder_output.len());
+            assert!(before.iter().all(|x| x.is_finite()));
+            before
+                .iter()
+                .zip(&obs.encoder_output)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max)
+        });
         let cosine = case["encoder"].is_object().then(|| {
             grade_encoder(
                 &floats(&sealed(&case["encoder"])),
@@ -292,15 +321,18 @@ fn transcribe_metal_c6_parity() {
         )
         .unwrap_or_else(|e| panic!("{}: {e}", case["id"]));
         exempt += usize::from(margin_exempt);
+        let mut plain_seconds = None;
         if case["encoder"].is_object() {
             tensors += 1;
             let mut plain_request = request;
             plain_request.observe = false;
+            let plain_start = Instant::now();
             let plain = engine
                 .transcribe_with_progress(&model, plain_request, |_| {
                     completed.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 })
                 .unwrap();
+            plain_seconds = Some(plain_start.elapsed().as_secs_f64());
             assert_eq!(output.triples, plain.triples);
             assert_eq!(output.valid_encoder_frames, plain.valid_encoder_frames);
             assert!(plain.observation.is_none());
@@ -337,7 +369,7 @@ fn transcribe_metal_c6_parity() {
                 case["id"]
             );
         }
-        let row = serde_json::json!({"id":case["id"],"valid_encoder_frames":output.valid_encoder_frames,"min_cosine":cosine,"margin_exempt":margin_exempt,"seconds":case_start.elapsed().as_secs_f64(),"progress_gap_ms":gap,"resident_bytes":resident(),"output_sha256":output_sha256});
+        let row = serde_json::json!({"id":case["id"],"valid_encoder_frames":output.valid_encoder_frames,"min_cosine":cosine,"margin_exempt":margin_exempt,"seconds":case_start.elapsed().as_secs_f64(),"engine_seconds":engine_seconds,"plain_seconds":plain_seconds,"progress_gap_ms":gap,"resident_bytes":resident(),"phys_footprint_bytes":unsafe {synapse_parakeet_footprint_bytes()},"peak_phys_footprint_bytes":unsafe {synapse_parakeet_peak_footprint_bytes()},"max_encoder_difference":max_encoder_difference,"output_sha256":output_sha256});
         eprintln!("{row}");
         if let Some(f) = evidence.as_mut() {
             writeln!(f, "{row}").unwrap();
@@ -358,7 +390,12 @@ fn transcribe_metal_c6_parity() {
         assert_eq!(maximum, 600000);
     }
     peak = peak.max(unsafe { synapse_parakeet_peak_resident_bytes() });
-    let summary = serde_json::json!({"graded":count,"expected_refusals":refused,"tensor_observe_pairs":tensors,"margin_exempt":exempt,"split_wer":split_wer,"largest_ladder_ms":maximum,"maximum_encoder_frames":7500,"peak_resident_bytes":peak,"longest_progress_gap_ms":longest_gap,"seconds":start.elapsed().as_secs_f64(),"kernel_revision":synapse_core::METAL_TRANSCRIBE_KERNEL_REVISION});
+    let peak_footprint = unsafe { synapse_parakeet_peak_footprint_bytes() };
+    assert!(
+        peak_footprint <= 10_000_000_000,
+        "GPU-inclusive peak phys_footprint {peak_footprint} exceeds 10 GB"
+    );
+    let summary = serde_json::json!({"graded":count,"expected_refusals":refused,"tensor_observe_pairs":tensors,"margin_exempt":exempt,"split_wer":split_wer,"largest_ladder_ms":maximum,"maximum_encoder_frames":7500,"peak_resident_bytes":peak,"peak_phys_footprint_bytes":peak_footprint,"longest_progress_gap_ms":longest_gap,"seconds":start.elapsed().as_secs_f64(),"kernel_revision":synapse_core::METAL_TRANSCRIBE_KERNEL_REVISION});
     eprintln!("SUMMARY {summary}");
     if let Some(f) = evidence.as_mut() {
         writeln!(f, "{summary}").unwrap();

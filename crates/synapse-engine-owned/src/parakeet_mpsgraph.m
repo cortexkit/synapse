@@ -20,6 +20,16 @@ uint64_t synapse_parakeet_peak_resident_bytes(void) {
     struct rusage info;
     return getrusage(RUSAGE_SELF, &info) == 0 ? (uint64_t)info.ru_maxrss : UINT64_MAX;
 }
+uint64_t synapse_parakeet_footprint_bytes(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS ? info.phys_footprint : UINT64_MAX;
+}
+uint64_t synapse_parakeet_peak_footprint_bytes(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS && count >= TASK_VM_INFO_REV4_COUNT ? info.ledger_phys_footprint_peak : UINT64_MAX;
+}
 
 // This bridge uses ARC; each model owns its weights, plans and in-flight tensors.
 @interface PKPlan : NSObject
@@ -249,10 +259,13 @@ int32_t synapse_parakeet_begin(void *raw, const float *mel, uint64_t rung, uint6
         NSMutableData *row = [NSMutableData dataWithLength:t*sizeof(float)];
         float *rv = row.mutableBytes; for (NSUInteger i=0;i<n;i++) rv[i]=1;
         c.rowMask = data(c,rv,@[@(t),@1]);
-        NSMutableData *pair = [NSMutableData dataWithLength:t*t*sizeof(float)];
-        float *pv = pair.mutableBytes;
-        for (NSUInteger i=0;i<n;i++) for (NSUInteger j=0;j<n;j++) pv[i*t+j]=1;
-        c.pairMask = data(c,pv,@[@1,@(t),@(t)]);
+        c.pairMask = nil;
+        if (t <= 1024) {
+            NSMutableData *pair = [NSMutableData dataWithLength:t*t*sizeof(float)];
+            float *pv = pair.mutableBytes;
+            for (NSUInteger i=0;i<n;i++) for (NSUInteger j=0;j<n;j++) pv[i*t+j]=1;
+            c.pairMask = data(c,pv,@[@1,@(t),@(t)]);
+        }
         NSMutableData *positions = [NSMutableData dataWithLength:(2*t-1)*1024*sizeof(float)];
         float *pos = positions.mutableBytes;
         for (NSUInteger i=0;i<2*t-1;i++) for (NSUInteger j=0;j<512;j++) {
@@ -271,6 +284,30 @@ static MPSGraphTensor *heads(MPSGraph *g, MPSGraphTensor *x, NSUInteger t) {
 static MPSGraphTensor *ff(PKContext *c, PKPlan *p, MPSGraphTensor *x, NSString *prefix) {
     x = linear(c,p,x,[prefix stringByAppendingString:@".linear1"],1024,4096,NO);
     return linear(c,p,silu(p.graph,x),[prefix stringByAppendingString:@".linear2"],4096,1024,NO);
+}
+static MPSGraphTensor *layerTail(PKContext *c, PKPlan *p, MPSGraphTensor *x, MPSGraphTensor *attention, MPSGraphTensor *row, NSUInteger t) {
+    MPSGraph *g = p.graph;
+    x = add(g,x,linear(c,p,attention,@"layer.self_attn.o_proj",1024,1024,NO));
+    MPSGraphTensor *normalized = norm(c,p,x,@"layer.norm_conv");
+    // Conv1d pointwise weights have a singleton kernel dimension.
+    MPSGraphTensor *pw = reshape(g,w(c,p,@"layer.conv.pointwise_conv1.weight",@[@2048,@1024,@1]),@[@2048,@1024]);
+    MPSGraphTensor *glu = mm(g,normalized,[g transposeTensor:pw dimension:0 withDimension:1 name:nil]);
+    MPSGraphTensor *a = [g sliceTensor:glu dimension:1 start:0 length:1024 name:nil];
+    MPSGraphTensor *b = [g sliceTensor:glu dimension:1 start:1024 length:1024 name:nil];
+    glu = mul(g,mul(g,a,[g sigmoidWithTensor:b name:nil]),row);
+    MPSGraphTensor *dw = reshape(g,w(c,p,@"layer.conv.depthwise_conv.weight",@[@1024,@1,@9]),@[@1024,@1,@9,@1]);
+    MPSGraphConvolution2DOpDescriptor *d = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:1 strideInY:1 dilationRateInX:1 dilationRateInY:1 groups:1024 paddingLeft:0 paddingRight:0 paddingTop:4 paddingBottom:4 paddingStyle:MPSGraphPaddingStyleExplicit dataLayout:MPSGraphTensorNamedDataLayoutNCHW weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+    glu = reshape(g,[g transposeTensor:glu dimension:0 withDimension:1 name:nil],@[@1,@1024,@(t),@1]);
+    glu = [g convolution2DWithSourceTensor:glu weightsTensor:dw descriptor:d name:nil];
+    glu = [g transposeTensor:reshape(g,glu,@[@1024,@(t)]) dimension:0 withDimension:1 name:nil];
+    MPSGraphTensor *mean = w(c,p,@"layer.conv.norm.running_mean",@[@1024]);
+    MPSGraphTensor *variance = w(c,p,@"layer.conv.norm.running_var",@[@1024]);
+    glu = [g normalizationWithTensor:glu meanTensor:mean varianceTensor:variance gammaTensor:w(c,p,@"layer.conv.norm.weight",@[@1024]) betaTensor:w(c,p,@"layer.conv.norm.bias",@[@1024]) epsilon:1e-5 name:nil];
+    glu = silu(g,glu);
+    pw = reshape(g,w(c,p,@"layer.conv.pointwise_conv2.weight",@[@1024,@1024,@1]),@[@1024,@1024]);
+    x = add(g,x,mm(g,glu,[g transposeTensor:pw dimension:0 withDimension:1 name:nil]));
+    x = add(g,x,scale(g,ff(c,p,norm(c,p,x,@"layer.norm_feed_forward2"),@"layer.feed_forward2"),0.5));
+    return norm(c,p,x,@"layer.norm_out");
 }
 static PKPlan *layerPlan(PKContext *c) {
     PKPlan *p = plan(); MPSGraph *g = p.graph; NSUInteger t = c.rung;
@@ -302,32 +339,95 @@ static PKPlan *layerPlan(PKContext *c) {
     MPSGraphTensor *probs = mul(g,[g softMaxWithTensor:scores axis:2 name:nil],pair);
     MPSGraphTensor *attention = mm(g,probs,v);
     attention = reshape(g,[g transposeTensor:attention permutation:@[@1,@0,@2] name:nil],@[@(t),@1024]);
-    x = add(g,x,linear(c,p,attention,@"layer.self_attn.o_proj",1024,1024,NO));
-    normalized = norm(c,p,x,@"layer.norm_conv");
-    // Conv1d pointwise weights have a singleton kernel dimension.
-    MPSGraphTensor *pw = reshape(g,w(c,p,@"layer.conv.pointwise_conv1.weight",@[@2048,@1024,@1]),@[@2048,@1024]);
-    MPSGraphTensor *glu = mm(g,normalized,[g transposeTensor:pw dimension:0 withDimension:1 name:nil]);
-    MPSGraphTensor *a = [g sliceTensor:glu dimension:1 start:0 length:1024 name:nil];
-    MPSGraphTensor *b = [g sliceTensor:glu dimension:1 start:1024 length:1024 name:nil];
-    glu = mul(g,mul(g,a,[g sigmoidWithTensor:b name:nil]),row);
-    MPSGraphTensor *dw = reshape(g,w(c,p,@"layer.conv.depthwise_conv.weight",@[@1024,@1,@9]),@[@1024,@1,@9,@1]);
-    MPSGraphConvolution2DOpDescriptor *d = [MPSGraphConvolution2DOpDescriptor descriptorWithStrideInX:1 strideInY:1 dilationRateInX:1 dilationRateInY:1 groups:1024 paddingLeft:0 paddingRight:0 paddingTop:4 paddingBottom:4 paddingStyle:MPSGraphPaddingStyleExplicit dataLayout:MPSGraphTensorNamedDataLayoutNCHW weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-    glu = reshape(g,[g transposeTensor:glu dimension:0 withDimension:1 name:nil],@[@1,@1024,@(t),@1]);
-    glu = [g convolution2DWithSourceTensor:glu weightsTensor:dw descriptor:d name:nil];
-    glu = [g transposeTensor:reshape(g,glu,@[@1024,@(t)]) dimension:0 withDimension:1 name:nil];
-    MPSGraphTensor *mean = w(c,p,@"layer.conv.norm.running_mean",@[@1024]);
-    MPSGraphTensor *variance = w(c,p,@"layer.conv.norm.running_var",@[@1024]);
-    glu = [g normalizationWithTensor:glu meanTensor:mean varianceTensor:variance gammaTensor:w(c,p,@"layer.conv.norm.weight",@[@1024]) betaTensor:w(c,p,@"layer.conv.norm.bias",@[@1024]) epsilon:1e-5 name:nil];
-    glu = silu(g,glu);
-    pw = reshape(g,w(c,p,@"layer.conv.pointwise_conv2.weight",@[@1024,@1024,@1]),@[@1024,@1024]);
-    x = add(g,x,mm(g,glu,[g transposeTensor:pw dimension:0 withDimension:1 name:nil]));
-    x = add(g,x,scale(g,ff(c,p,norm(c,p,x,@"layer.norm_feed_forward2"),@"layer.feed_forward2"),0.5));
-    p.output = norm(c,p,x,@"layer.norm_out");
+    p.output = layerTail(c,p,x,attention,row,t);
     return p;
+}
+// Short rungs retain the original graph. Long rungs bound attention scratch by
+// this query count; every tile still sees every key, in all eight fp32 heads.
+static const NSUInteger PKAttentionQueryTile = 1024;
+
+static PKPlan *attentionInputsPlan(PKContext *c) {
+    PKPlan *p = plan(); MPSGraph *g = p.graph; NSUInteger t = c.rung;
+    MPSGraphTensor *x = ph(p,@"hidden",@[@(t),@1024]);
+    x = add(g,x,scale(g,ff(c,p,norm(c,p,x,@"layer.norm_feed_forward1"),@"layer.feed_forward1"),0.5));
+    MPSGraphTensor *normalized = norm(c,p,x,@"layer.norm_self_att");
+    MPSGraphTensor *q = linear(c,p,normalized,@"layer.self_attn.q_proj",1024,1024,NO);
+    MPSGraphTensor *k = linear(c,p,normalized,@"layer.self_attn.k_proj",1024,1024,NO);
+    MPSGraphTensor *v = linear(c,p,normalized,@"layer.self_attn.v_proj",1024,1024,NO);
+    MPSGraphTensor *relative = linear(c,p,ph(p,@"positions",@[@(2*t-1),@1024]),@"layer.self_attn.relative_k_proj",1024,1024,NO);
+    // One linear-size result keeps the residual and projections live across
+    // sequential tiles without recomputing them or copying them to the CPU.
+    p.output = [g concatTensors:@[x,q,k,v,relative] dimension:0 name:nil];
+    return p;
+}
+static MPSGraphTensor *tileIndices(MPSGraph *g, NSUInteger count, MPSGraphTensor *start) {
+    NSMutableData *bytes = [NSMutableData dataWithLength:count*sizeof(int32_t)];
+    int32_t *v = bytes.mutableBytes;
+    for (NSUInteger i=0;i<count;i++) v[i]=(int32_t)i;
+    return add(g,[g constantWithData:bytes shape:@[@(count)] dataType:MPSDataTypeInt32],start);
+}
+static PKPlan *attentionTilePlan(PKContext *c) {
+    PKPlan *p = plan(); MPSGraph *g = p.graph;
+    NSUInteger t = c.rung, b = PKAttentionQueryTile, r = t+b-1;
+    MPSGraphTensor *packed = ph(p,@"packed",@[@(6*t-1),@1024]);
+    MPSGraphTensor *start = [g castTensor:ph(p,@"start",@[@1]) toType:MPSDataTypeInt32 name:nil];
+    MPSGraphTensor *qi = tileIndices(g,b,start);
+    MPSGraphTensor *q = [g sliceTensor:packed dimension:0 start:t length:t name:nil];
+    q = heads(g,[g gatherWithUpdatesTensor:q indicesTensor:qi axis:0 batchDimensions:0 name:nil],b);
+    MPSGraphTensor *k = heads(g,[g sliceTensor:packed dimension:0 start:2*t length:t name:nil],t);
+    MPSGraphTensor *v = heads(g,[g sliceTensor:packed dimension:0 start:3*t length:t name:nil],t);
+    MPSGraphTensor *relative = [g sliceTensor:packed dimension:0 start:4*t length:2*t-1 name:nil];
+    MPSGraphTensor *relativeStart = [g subtractionWithPrimaryTensor:[g constantWithScalar:t-b dataType:MPSDataTypeInt32] secondaryTensor:start name:nil];
+    relative = heads(g,[g gatherWithUpdatesTensor:relative indicesTensor:tileIndices(g,r,relativeStart) axis:0 batchDimensions:0 name:nil],r);
+    MPSGraphTensor *u = reshape(g,w(c,p,@"layer.self_attn.bias_u",@[@8,@128]),@[@8,@1,@128]);
+    MPSGraphTensor *vb = reshape(g,w(c,p,@"layer.self_attn.bias_v",@[@8,@128]),@[@8,@1,@128]);
+    MPSGraphTensor *bd = mm(g,add(g,q,vb),[g transposeTensor:relative dimension:1 withDimension:2 name:nil]);
+    // The full relative shift selects position t-1-query+key. Cropping the
+    // positions at t-b-start makes that b-1-localQuery+key within this tile.
+    MPSGraphTensor *zero = [g constantWithScalar:0 shape:@[@8,@(b),@1] dataType:MPSDataTypeFloat32];
+    bd = [g concatTensors:@[zero,bd] dimension:2 name:nil];
+    bd = reshape(g,bd,@[@8,@(t+b),@(b)]);
+    bd = [g sliceTensor:bd dimension:1 start:1 length:r name:nil];
+    bd = reshape(g,bd,@[@8,@(b),@(r)]);
+    bd = [g sliceTensor:bd dimension:2 start:0 length:t name:nil];
+    MPSGraphTensor *scores = add(g,scale(g,mm(g,add(g,q,u),[g transposeTensor:k dimension:1 withDimension:2 name:nil]),1.0/sqrt(128.0)),scale(g,bd,1.0/sqrt(128.0)));
+    MPSGraphTensor *row = ph(p,@"row",@[@(t),@1]);
+    MPSGraphTensor *queryRow = [g gatherWithUpdatesTensor:row indicesTensor:qi axis:0 batchDimensions:0 name:nil];
+    MPSGraphTensor *pair = mul(g,reshape(g,queryRow,@[@1,@(b),@1]),reshape(g,row,@[@1,@1,@(t)]));
+    MPSGraphTensor *condition = [g castTensor:pair toType:MPSDataTypeBool name:nil];
+    scores = [g selectWithPredicateTensor:condition truePredicateTensor:scores falsePredicateTensor:[g constantWithScalar:-10000 dataType:MPSDataTypeFloat32] name:nil];
+    MPSGraphTensor *probs = mul(g,[g softMaxWithTensor:scores axis:2 name:nil],pair);
+    MPSGraphTensor *attention = mm(g,probs,v);
+    attention = reshape(g,[g transposeTensor:attention permutation:@[@1,@0,@2] name:nil],@[@(b),@1024]);
+    p.output = [g scatterWithDataTensor:ph(p,@"attention",@[@(t),@1024]) updatesTensor:attention indicesTensor:qi axis:0 mode:MPSGraphScatterModeSet name:nil];
+    return p;
+}
+static MPSGraphTensorData *tiledLayer(PKContext *c, NSUInteger layer) {
+    NSUInteger t = c.rung, b = PKAttentionQueryTile;
+    PKPlan *pre = c.plans[@"attention_inputs"], *tile = c.plans[@"attention_tile"], *post = c.plans[@"layer_tail"];
+    if (!pre) {
+        pre = attentionInputsPlan(c); tile = attentionTilePlan(c); post = plan();
+        MPSGraphTensor *packed = ph(post,@"packed",@[@(6*t-1),@1024]);
+        post.output = layerTail(c,post,[post.graph sliceTensor:packed dimension:0 start:0 length:t name:nil],ph(post,@"attention",@[@(t),@1024]),ph(post,@"row",@[@(t),@1]),t);
+        c.plans[@"attention_inputs"] = pre; c.plans[@"attention_tile"] = tile; c.plans[@"layer_tail"] = post;
+    }
+    MPSGraphTensorData *packed = run(c,pre,@{@"hidden":c.hidden,@"positions":c.positions},layer);
+    // Scatter overwrites disjoint query rows on the GPU. Starting with hidden
+    // avoids a zero-fill allocation; every row is replaced before layerTail.
+    MPSGraphTensorData *attention = c.hidden;
+    for (NSUInteger start=0;start<t;start+=b) { @autoreleasepool {
+        float offset = (float)start;
+        attention = run(c,tile,@{@"packed":packed,@"row":c.rowMask,@"start":data(c,&offset,@[@1]),@"attention":attention},layer);
+    } }
+    return run(c,post,@{@"packed":packed,@"attention":attention,@"row":c.rowMask},layer);
 }
 int32_t synapse_parakeet_layer(void *raw, uint64_t layer) {
     @autoreleasepool { @try {
         PKContext *c = (__bridge PKContext *)raw;
+        if (c.rung > 1024) {
+            c.hidden = tiledLayer(c,layer);
+            return 0;
+        }
         PKPlan *p = c.plans[@"layer"];
         if (!p) { p = layerPlan(c); c.plans[@"layer"] = p; }
         c.hidden = run(c,p,@{@"hidden":c.hidden,@"row":c.rowMask,@"pair":c.pairMask,@"positions":c.positions},layer);

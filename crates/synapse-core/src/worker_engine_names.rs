@@ -48,7 +48,7 @@ pub const ANE_DIRECT_KERNEL_REVISION: &str = "ane-direct-graph-v1";
 pub const METAL_KERNEL_REVISION: &str = "owned-metal-graph-4-bucket-2";
 
 /// Transcription kernels rotate independently of existing embed and rerank lanes.
-pub const METAL_TRANSCRIBE_KERNEL_REVISION: &str = "owned-metal-transcribe-v1";
+pub const METAL_TRANSCRIBE_KERNEL_REVISION: &str = "owned-metal-transcribe-v2";
 pub const ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION: &str = "ane-direct-transcribe-v1";
 pub const CUDA_TRANSCRIBE_KERNEL_REVISION: &str = "owned-cuda-transcribe-v1";
 pub const VULKAN_TRANSCRIBE_KERNEL_REVISION: &str = "owned-vulkan-transcribe-v1";

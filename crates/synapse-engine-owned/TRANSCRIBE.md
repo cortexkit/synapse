@@ -28,8 +28,15 @@ admission, audio processing and detokenization.
 
 Subsampling, all 24 encoder layers with full relative-position attention, and
 the encoder's 1024-to-640 joint projection execute as explicit MPSGraph GPU
-executables. One reusable layer graph binds each layer's own weights. Only one
-rung's plans stay resident; weights remain resident across requests. Masks match
+executables. Padded encoder lengths (rungs) through 1024 frames use one reusable
+layer graph. Larger rungs use reusable plans for the first feed-forward block
+and Q/K/V/relative projections, attention tiles, and the remaining residual,
+convolution and feed-forward operations. Each 1024-query tile
+attends to every key in all eight heads, with a full-key fp32 softmax and exact
+relative-position bias. Attention scratch is linear in the rung for this fixed
+tile size; the audio is not chunked and the attention is not windowed. Plans
+bind each layer's own weights. Only one rung's plans stay resident; weights
+remain resident across requests. Masks match
 transformers 5.16.1 with `synapse-parakeet-mask-fix-v1`: after every subsampling
 convolution, before the encoder's depthwise convolution, and on both query and
 key attention rows. Fully masked attention probabilities are zeroed after the
@@ -46,7 +53,7 @@ It copies the same results and never selects a different graph or decoder path.
 
 ## Certified envelope
 
-`METAL_TRANSCRIBE_KERNEL_REVISION = owned-metal-transcribe-v1` was graded with
+`METAL_TRANSCRIBE_KERNEL_REVISION = owned-metal-transcribe-v2` was graded with
 the fp32 reference pinned by SHA256 in
 [`bench/parity/fixtures/index.json`](../../bench/parity/fixtures/index.json)
 through **600,000 ms**, **7500 valid encoder frames**,
@@ -85,3 +92,8 @@ are not engine progress events. Per-fixture JSONL and the final summary record
 timing, cosine, WER, memory and the certified ladder maximum. The trace-exemption
 field records whether the first differing head decision qualified for the
 reference's low-logit-margin exception; it does not exempt the encoder gate.
+The gate also enforces a 10 GB GPU-inclusive lifetime `phys_footprint` budget.
+`SYNAPSE_METAL_SPEECH_ENCODER_SAVE` saves raw little-endian fp32 encoder outputs
+per fixture to a directory; `SYNAPSE_METAL_SPEECH_ENCODER_COMPARE` reads such a
+directory from a previous engine run and records each fixture's maximum absolute
+encoder difference without changing the frozen reference gates.
