@@ -210,14 +210,14 @@ fn certify(summary: &mut Value) -> Result<()> {
     summary["kernel_revision"] = json!(synapse_core::ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION);
     summary["decode_rule"] = json!(synapse_speech::DECODE_RULE_REVISION);
     summary["os_build"] = json!(String::from_utf8(
-        std::process::Command::new("sw_vers")
+        synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
             .arg("-buildVersion")
             .output()?
             .stdout
     )?
     .trim());
     summary["machine"] = json!(String::from_utf8(
-        std::process::Command::new("sysctl")
+        synapse_core::without_launch_nonce(std::process::Command::new("sysctl"))
             .args(["-n", "machdep.cpu.brand_string"])
             .output()?
             .stdout

@@ -142,7 +142,7 @@ pub(super) fn run(
     let mut model = load_model(manifest, profile, snapshot, package)?;
     super::super::validate_load(&model.profile, synapse_core::DEFAULT_MAX_FRAME_BYTES)?;
     let os = String::from_utf8(
-        std::process::Command::new("sw_vers")
+        synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
             .arg("-buildVersion")
             .output()?
             .stdout,

@@ -24,7 +24,7 @@ pub(super) fn run(
     let frontend = synapse_speech::Frontend::new();
     let mut model = load_model(manifest, profile, snapshot, package)?;
     let os = String::from_utf8(
-        std::process::Command::new("sw_vers")
+        synapse_core::without_launch_nonce(std::process::Command::new("sw_vers"))
             .arg("-buildVersion")
             .output()?
             .stdout,
