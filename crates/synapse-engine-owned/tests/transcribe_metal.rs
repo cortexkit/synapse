@@ -115,6 +115,18 @@ fn resident() -> u64 {
     unsafe { synapse_parakeet_resident_bytes() }
 }
 
+fn output_digest(output: &synapse_core::TranscribeOutput) -> String {
+    let observation = output.observation.as_ref().unwrap();
+    let mut digest = Sha256::new();
+    digest.update((output.valid_encoder_frames as u64).to_le_bytes());
+    digest.update(synapse_core::encode_transcript_frame(&output.triples));
+    digest.update(synapse_core::encode_f32_frame(&observation.encoder_output));
+    digest.update(synapse_core::encode_decode_trace_frame(
+        &observation.decode_trace,
+    ));
+    format!("{:x}", digest.finalize())
+}
+
 struct Monitor {
     done: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -176,6 +188,22 @@ fn transcribe_metal_c6_parity() {
     let evidence =
         std::env::var_os("SYNAPSE_METAL_SPEECH_EVIDENCE").map(|p| fs::File::create(p).unwrap());
     let mut evidence = evidence;
+    // A previous run supplies bit-exact engine outputs in addition to the
+    // reference's tolerance-based numerical gates.
+    let baseline: Option<std::collections::HashMap<String, String>> =
+        std::env::var_os("SYNAPSE_METAL_SPEECH_BASELINE").map(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|row| {
+                    Some((
+                        row["id"].as_str()?.to_owned(),
+                        row["output_sha256"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        });
     let (mut engine, model) = load(7500);
     let mut all = cases();
     all.sort_by_key(|c| {
@@ -300,7 +328,16 @@ fn transcribe_metal_c6_parity() {
         if case["id"].as_str().unwrap().starts_with("ladder-") {
             maximum = maximum.max(case["duration_ms"].as_u64().unwrap());
         }
-        let row = serde_json::json!({"id":case["id"],"valid_encoder_frames":output.valid_encoder_frames,"min_cosine":cosine,"margin_exempt":margin_exempt,"seconds":case_start.elapsed().as_secs_f64(),"progress_gap_ms":gap,"resident_bytes":resident()});
+        let output_sha256 = output_digest(&output);
+        if let Some(baseline) = &baseline {
+            assert_eq!(
+                baseline.get(case["id"].as_str().unwrap()),
+                Some(&output_sha256),
+                "bit-exact output changed for {}",
+                case["id"]
+            );
+        }
+        let row = serde_json::json!({"id":case["id"],"valid_encoder_frames":output.valid_encoder_frames,"min_cosine":cosine,"margin_exempt":margin_exempt,"seconds":case_start.elapsed().as_secs_f64(),"progress_gap_ms":gap,"resident_bytes":resident(),"output_sha256":output_sha256});
         eprintln!("{row}");
         if let Some(f) = evidence.as_mut() {
             writeln!(f, "{row}").unwrap();

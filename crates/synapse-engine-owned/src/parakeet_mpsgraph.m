@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <mach/mach.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 uint64_t synapse_parakeet_resident_bytes(void) {
     mach_task_basic_info_data_t info;
@@ -43,6 +48,51 @@ uint64_t synapse_parakeet_peak_resident_bytes(void) {
 
 static _Thread_local char pkError[1024];
 const char *synapse_parakeet_error(void) { return pkError; }
+typedef struct {
+    void *bytes;
+    size_t length;
+} PKMappedWeights;
+void *synapse_parakeet_map_weights(const char *path) {
+    int fd = open(path, O_RDONLY);
+    struct stat info;
+    if (fd < 0) {
+        snprintf(pkError, sizeof(pkError), "open %s: %s", path, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &info) != 0 || info.st_size <= 0) {
+        snprintf(pkError, sizeof(pkError), "invalid safetensors file %s", path);
+        close(fd);
+        return NULL;
+    }
+    void *bytes = mmap(NULL, (size_t)info.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int mapError = errno;
+    close(fd);
+    if (bytes == MAP_FAILED) {
+        snprintf(pkError, sizeof(pkError), "map %s: %s", path, strerror(mapError));
+        return NULL;
+    }
+    PKMappedWeights *mapping = malloc(sizeof(*mapping));
+    if (!mapping) {
+        munmap(bytes, (size_t)info.st_size);
+        snprintf(pkError, sizeof(pkError), "allocate weight mapping failed");
+        return NULL;
+    }
+    mapping->bytes = bytes;
+    mapping->length = (size_t)info.st_size;
+    return mapping;
+}
+const uint8_t *synapse_parakeet_mapped_bytes(void *raw, NSUInteger *length) {
+    PKMappedWeights *mapping = raw;
+    *length = mapping->length;
+    return mapping->bytes;
+}
+void synapse_parakeet_unmap_weights(void *raw) {
+    if (raw) {
+        PKMappedWeights *mapping = raw;
+        munmap(mapping->bytes, mapping->length);
+        free(mapping);
+    }
+}
 static int failure(NSException *e) {
     snprintf(pkError, sizeof(pkError), "%s", e.reason.UTF8String ?: "Parakeet graph failed");
     return -1;

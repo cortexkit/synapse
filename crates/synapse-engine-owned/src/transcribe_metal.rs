@@ -1,5 +1,5 @@
 use super::Progress;
-use crate::runtime::{load_safetensor_map, Tensor};
+use crate::runtime::Tensor;
 use anyhow::{bail, ensure, Context as _, Result};
 use std::{
     collections::HashMap,
@@ -52,32 +52,21 @@ impl Model {
                 && config["decoder_hidden_size"] == 640,
             "unsupported Parakeet architecture"
         );
-        let mut weights = load_safetensor_map(root, path)?;
-        ensure!(
-            weights
-                .values()
-                .all(|t| t.data.iter().all(|x| x.is_finite())),
-            "non-finite model weight"
-        );
+        let loaded = load_weights(root, path)?;
         let gpu = Gpu::new()?;
-        for (name, tensor) in &weights {
-            if name.starts_with("encoder.") || name.starts_with("encoder_projector.") {
-                let c_name = CString::new(name.as_str())?;
-                let dims: Vec<u64> = tensor.shape.iter().map(|&n| n as u64).collect();
-                gpu.check(unsafe {
-                    synapse_parakeet_weight(
-                        gpu.0.as_ptr(),
-                        c_name.as_ptr(),
-                        tensor.data.as_ptr(),
-                        dims.as_ptr(),
-                        dims.len() as u64,
-                    )
-                })?;
-            }
-        }
-        weights.retain(|name, _| {
-            !name.starts_with("encoder.") && !name.starts_with("encoder_projector.")
-        });
+        let weights = upload_weights(loaded, |name, tensor| {
+            let c_name = CString::new(name)?;
+            let dims: Vec<u64> = tensor.shape.iter().map(|&n| n as u64).collect();
+            gpu.check(unsafe {
+                synapse_parakeet_weight(
+                    gpu.0.as_ptr(),
+                    c_name.as_ptr(),
+                    tensor.data.as_ptr(),
+                    dims.as_ptr(),
+                    dims.len() as u64,
+                )
+            })
+        })?;
         // Validate every host matvec before passing its dimensions to BLAS.
         for (name, shape) in [
             ("decoder.embedding.weight", vec![8193, 640]),
@@ -156,6 +145,126 @@ impl Model {
             progress,
         )?)
     }
+}
+
+struct MappedWeights(NonNull<c_void>);
+
+impl MappedWeights {
+    fn open(path: &Path) -> Result<Self> {
+        let path = CString::new(path.as_os_str().as_encoded_bytes())?;
+        NonNull::new(unsafe { synapse_parakeet_map_weights(path.as_ptr()) })
+            .map(Self)
+            .with_context(|| {
+                format!(
+                    "map safetensors: {}",
+                    unsafe { CStr::from_ptr(synapse_parakeet_error()) }.to_string_lossy()
+                )
+            })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let mut len = 0;
+        // This owner keeps the read-only mapping alive until Drop. Tensor
+        // conversion copies bytes before the mapping is released.
+        unsafe {
+            let bytes = synapse_parakeet_mapped_bytes(self.0.as_ptr(), &mut len);
+            std::slice::from_raw_parts(bytes, len)
+        }
+    }
+}
+
+impl Drop for MappedWeights {
+    fn drop(&mut self) {
+        unsafe { synapse_parakeet_unmap_weights(self.0.as_ptr()) }
+    }
+}
+
+fn load_weights(root: &Path, original: &Path) -> Result<HashMap<String, Tensor>> {
+    use safetensors::{Dtype, SafeTensors};
+    let single = root.join("model.safetensors");
+    let files = if original.is_file()
+        && original.extension().and_then(|s| s.to_str()) == Some("safetensors")
+    {
+        vec![original.to_path_buf()]
+    } else if single.is_file() {
+        vec![single]
+    } else {
+        #[derive(serde::Deserialize)]
+        struct Index {
+            weight_map: HashMap<String, String>,
+        }
+        let index: Index = serde_json::from_slice(
+            &std::fs::read(root.join("model.safetensors.index.json"))
+                .context("read safetensors index")?,
+        )?;
+        let unique: std::collections::HashSet<_> = index.weight_map.into_values().collect();
+        unique.into_iter().map(|file| root.join(file)).collect()
+    };
+    let mut host = HashMap::new();
+    for file in files {
+        let mapping = MappedWeights::open(&file)?;
+        // Deserialize validates the complete header, shapes, offsets and file
+        // length before constructing tensors. The mapping is released before
+        // GPU upload; unlike a read buffer, its clean pages need no private copy.
+        let tensors = SafeTensors::deserialize(mapping.bytes())
+            .with_context(|| format!("load safetensors {}", file.display()))?;
+        for name in tensors.names() {
+            let view = tensors.tensor(name)?;
+            let dtype = view.dtype();
+            if !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+                continue;
+            }
+            let values: Vec<f32> = {
+                match dtype {
+                    Dtype::F32 => view
+                        .data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|&b| f32::from_le_bytes(b))
+                        .collect(),
+                    Dtype::F16 => view
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&b| half::f16::from_bits(u16::from_le_bytes(b)).to_f32())
+                        .collect(),
+                    Dtype::BF16 => view
+                        .data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&b| half::bf16::from_bits(u16::from_le_bytes(b)).to_f32())
+                        .collect(),
+                    _ => unreachable!(),
+                }
+            };
+            ensure!(
+                values.iter().all(|x| x.is_finite()),
+                "non-finite model weight"
+            );
+            host.insert(name.to_owned(), Tensor::new(view.shape().to_vec(), values)?);
+        }
+    }
+    Ok(host)
+}
+
+fn upload_weights(
+    loaded: HashMap<String, Tensor>,
+    mut upload: impl FnMut(&str, &Tensor) -> Result<()>,
+) -> Result<HashMap<String, Tensor>> {
+    let mut host = HashMap::new();
+    // Preserve host conversion before Metal allocation, but release each
+    // encoder tensor as soon as its synchronous upload has copied its bytes.
+    for (name, tensor) in loaded {
+        if name.starts_with("encoder.") || name.starts_with("encoder_projector.") {
+            upload(&name, &tensor)?;
+        } else {
+            host.insert(name, tensor);
+        }
+    }
+    Ok(host)
 }
 
 struct Gpu(NonNull<c_void>);
@@ -301,6 +410,9 @@ fn matvec(weight: &[f32], input: &[f32], output: &mut [f32]) {
     }
 }
 unsafe extern "C" {
+    fn synapse_parakeet_map_weights(path: *const c_char) -> *mut c_void;
+    fn synapse_parakeet_mapped_bytes(raw: *mut c_void, len: *mut usize) -> *const u8;
+    fn synapse_parakeet_unmap_weights(raw: *mut c_void);
     fn cblas_sgemv(
         order: i32,
         trans: i32,
@@ -328,4 +440,132 @@ unsafe extern "C" {
     fn synapse_parakeet_begin(raw: *mut c_void, mel: *const f32, rung: u64, valid: u64) -> i32;
     fn synapse_parakeet_layer(raw: *mut c_void, layer: u64) -> i32;
     fn synapse_parakeet_finish(raw: *mut c_void, encoder: *mut f32, projected: *mut f32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(std::path::PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/scratch")
+                .join(format!(
+                    "parakeet-weights-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, file: &str, name: &str, dtype: Dtype, bytes: &[u8], count: usize) {
+            let view = TensorView::new(dtype, vec![count], bytes).unwrap();
+            serialize_to_file([(name, view)], None, &self.0.join(file)).unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn mapped_weights_keep_f32_bits_and_only_retain_host_tensors() {
+        let fixture = Fixture::new();
+        let bits = [0x8000_0000_u32, 1, 0x7f7f_ffff, 0xbf80_0000];
+        let bytes: Vec<_> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        fixture.write(
+            "encoder.safetensors",
+            "encoder.weight",
+            Dtype::F32,
+            &bytes,
+            4,
+        );
+        fixture.write("host.safetensors", "decoder.weight", Dtype::F32, &bytes, 4);
+        std::fs::write(fixture.0.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"encoder.weight":"encoder.safetensors","decoder.weight":"host.safetensors"}}"#).unwrap();
+        let mut uploads = 0;
+        let loaded = load_weights(&fixture.0, &fixture.0).unwrap();
+        let host = upload_weights(loaded, |name, tensor| {
+            assert_eq!(name, "encoder.weight");
+            assert_eq!(tensor.shape, [4]);
+            assert_eq!(
+                tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                bits
+            );
+            uploads += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(uploads, 1);
+        assert_eq!(host.len(), 1);
+        assert_eq!(
+            host["decoder.weight"]
+                .data
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            bits
+        );
+    }
+
+    #[test]
+    fn mapped_weights_validate_file_length_before_upload() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "model.safetensors",
+            "encoder.weight",
+            Dtype::F32,
+            &1_f32.to_le_bytes(),
+            1,
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.0.join("model.safetensors"))
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        let error = load_weights(&fixture.0, &fixture.0).unwrap_err();
+        assert!(format!("{error:#}").contains("load safetensors"));
+    }
+
+    #[test]
+    fn mapped_weights_preserve_half_conversion_and_reject_nonfinite() {
+        let fixture = Fixture::new();
+        for (dtype, bits) in [(Dtype::F16, 0x3c00_u16), (Dtype::BF16, 0x3f80)] {
+            fixture.write(
+                "model.safetensors",
+                "encoder.weight",
+                dtype,
+                &bits.to_le_bytes(),
+                1,
+            );
+            let loaded = load_weights(&fixture.0, &fixture.0).unwrap();
+            assert_eq!(loaded["encoder.weight"].data[0].to_bits(), 1_f32.to_bits());
+        }
+        fixture.write(
+            "model.safetensors",
+            "encoder.weight",
+            Dtype::F32,
+            &f32::NAN.to_le_bytes(),
+            1,
+        );
+        let error = load_weights(&fixture.0, &fixture.0).unwrap_err();
+        assert!(error.to_string().contains("non-finite model weight"));
+    }
+
+    #[test]
+    fn mapped_weights_report_mapping_errors() {
+        let fixture = Fixture::new();
+        let error = MappedWeights::open(&fixture.0.join("missing.safetensors"))
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("map safetensors: open"));
+    }
 }
