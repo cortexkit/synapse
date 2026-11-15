@@ -1,4 +1,4 @@
-//! The release-versioned model catalog: the curated embed and rerank models a
+//! The release-versioned model catalog: curated embed, rerank and transcribe models a
 //! user can browse, download and serve by catalog id.
 //!
 //! The catalog is one JSON document, `models.json`, compiled into the module.
@@ -117,6 +117,8 @@ pub(crate) struct CatalogBackend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pooling: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normalize: Option<bool>,
@@ -178,7 +180,7 @@ pub(crate) enum CatalogError {
     InvalidEntryId(String),
     #[error("catalog entry id '{id}' collides with a lane id derived from entry '{owner}'")]
     ReservedIdCollision { id: String, owner: String },
-    #[error("catalog entry '{id}' has task '{task}', expected embed or rerank")]
+    #[error("catalog entry '{id}' has task '{task}', expected embed, rerank or transcribe")]
     UnknownTask { id: String, task: String },
     #[error("catalog entry '{id}' has hf_repo '{hf_repo}', expected <owner>/<name>")]
     InvalidRepo { id: String, hf_repo: String },
@@ -204,6 +206,13 @@ pub(crate) enum CatalogError {
     MissingBackendField {
         id: String,
         backend: String,
+        field: &'static str,
+    },
+    #[error("catalog entry '{id}' backend '{backend}' forbids {field} for task '{task}'")]
+    ForbiddenBackendField {
+        id: String,
+        backend: String,
+        task: String,
         field: &'static str,
     },
     #[error("catalog entry '{id}' backend '{backend}' has invalid {field}: {value}")]
@@ -507,7 +516,7 @@ pub(crate) fn validate_schema(catalog: &Catalog) -> Result<(), CatalogError> {
     for entry in &catalog.models {
         validate_entry(entry)?;
     }
-    for task in ["embed", "rerank"] {
+    for task in ["embed", "rerank", "transcribe"] {
         let count = catalog
             .models
             .iter()
@@ -527,7 +536,7 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
     let id = entry.id.clone();
     let embed = match entry.task.as_str() {
         "embed" => true,
-        "rerank" => false,
+        "rerank" | "transcribe" => false,
         _ => {
             return Err(CatalogError::UnknownTask {
                 id,
@@ -574,7 +583,7 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
                 backend: backend.backend.clone(),
             });
         }
-        validate_backend(&entry.id, embed, backend)?;
+        validate_backend(&entry.id, &entry.task, backend)?;
     }
 
     let mut paths = BTreeSet::new();
@@ -635,6 +644,9 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
         }
     }
 
+    if entry.task == "transcribe" && entry.self_check.is_some() {
+        return Err(CatalogError::SelfCheckUnexpected { id });
+    }
     match (&entry.self_check, entry.backends.is_empty()) {
         (None, false)
             if entry
@@ -652,19 +664,39 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
     }
 }
 
+fn profile_manifest(
+    profile: &str,
+    task: &str,
+) -> Result<synapse_parity::manifest::Manifest, String> {
+    if task == "transcribe" {
+        synapse_certify::self_check::speech::load(profile).map_err(|error| error.to_string())?;
+        let manifest = synapse_parity::manifest::Manifest::from_slice(include_bytes!(
+            "../../../../bench/parity/models.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        manifest
+            .profile_entry(profile)
+            .map_err(|error| error.to_string())?;
+        Ok(manifest)
+    } else {
+        synapse_certify::self_check::load(profile)
+            .map(|references| references.manifest)
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn validate_profile_files(entry: &CatalogEntry) -> Result<(), CatalogError> {
     for backend in &entry.backends {
         let Some(profile) = backend.profile.as_deref() else {
             continue;
         };
-        let references = synapse_certify::self_check::load(profile).map_err(|error| {
+        let manifest = profile_manifest(profile, &entry.task).map_err(|error| {
             CatalogError::SelfCheckShape {
                 id: entry.id.clone(),
                 reason: error.to_string(),
             }
         })?;
-        let model = references
-            .manifest
+        let model = manifest
             .model(&entry.id)
             .expect("profile model was validated");
         for file in entry.backend_files(&backend.backend).values() {
@@ -685,7 +717,7 @@ fn validate_profile_files(entry: &CatalogEntry) -> Result<(), CatalogError> {
     Ok(())
 }
 
-fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), CatalogError> {
+fn validate_backend(id: &str, task: &str, row: &CatalogBackend) -> Result<(), CatalogError> {
     let backend = row.backend.clone();
     if !ALLOWED_ENGINES.contains(&row.engine.as_str()) {
         return Err(CatalogError::UnknownEngine {
@@ -705,7 +737,19 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
         field,
         value,
     };
+    for (field, value) in [
+        ("family", &row.family),
+        ("dtype", &row.dtype),
+        ("execution", &row.execution),
+    ] {
+        match value {
+            None => return Err(missing(field)),
+            Some(text) if text.trim().is_empty() => return Err(invalid(field, text.clone())),
+            Some(_) => {}
+        }
+    }
     let profile_backend = match row.engine.as_str() {
+        "owned-metal" if task == "transcribe" => Some("metal"),
         "ane-direct-worker" => Some("ane"),
         "owned-cuda" => Some("cuda"),
         "owned-vulkan" => Some("vulkan"),
@@ -713,9 +757,9 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
     };
     if let Some(expected_backend) = profile_backend {
         let profile = row.profile.as_deref().ok_or_else(|| missing("profile"))?;
-        let references = synapse_certify::self_check::load(profile)
-            .map_err(|error| invalid("profile", error.to_string()))?;
-        let declared = &references.manifest.profiles[profile];
+        let manifest =
+            profile_manifest(profile, task).map_err(|error| invalid("profile", error))?;
+        let declared = &manifest.profiles[profile];
         if row.backend != expected_backend
             || declared.model != id
             || declared.lane.as_str() != row.engine
@@ -730,55 +774,92 @@ fn validate_backend(id: &str, embed: bool, row: &CatalogBackend) -> Result<(), C
             "legacy lanes do not use a manifest profile".into(),
         ));
     }
-    for (field, value) in [
-        ("family", &row.family),
-        ("dtype", &row.dtype),
-        ("execution", &row.execution),
-    ] {
-        match value {
-            None => return Err(missing(field)),
-            Some(text) if text.trim().is_empty() => return Err(invalid(field, text.clone())),
-            Some(_) => {}
+    if task == "transcribe" {
+        let duration = row
+            .max_duration_ms
+            .ok_or_else(|| missing("max_duration_ms"))?;
+        let profile = crate::transcribe_host::TranscribeProfile::pinned(
+            row.profile.as_deref().ok_or_else(|| missing("profile"))?,
+        )
+        .map_err(|error| invalid("profile", error.to_string()))?;
+        if duration != profile.max_duration_ms
+            || row.family.as_deref() != Some("parakeet-tdt")
+            || row.execution.as_deref()
+                != Some(if row.engine == "owned-metal" {
+                    "explicit"
+                } else {
+                    "supervised"
+                })
+        {
+            return Err(invalid(
+                "max_duration_ms/family/execution",
+                duration.to_string(),
+            ));
         }
-    }
-    let attention_units = row
-        .attention_units
-        .ok_or_else(|| missing("attention_units"))?;
-    let max_tokens = row.max_tokens.ok_or_else(|| missing("max_tokens"))?;
-    if max_tokens == 0 {
-        return Err(invalid("max_tokens", "0".to_string()));
-    }
-    if u128::from(attention_units) < u128::from(max_tokens) * u128::from(max_tokens) {
-        return Err(CatalogError::AttentionUnitsBelowContext {
-            id: id.to_string(),
-            backend,
-            attention_units,
-            max_tokens,
-        });
-    }
-    if embed {
-        let pooling = row.pooling.as_ref().ok_or_else(|| missing("pooling"))?;
-        if !ALLOWED_POOLING.contains(&pooling.as_str()) {
-            return Err(invalid("pooling", pooling.clone()));
-        }
-        row.normalize.ok_or_else(|| missing("normalize"))?;
-        match row.dims {
-            None => return Err(missing("dims")),
-            Some(0) => return Err(invalid("dims", "0".to_string())),
-            Some(_) => {}
-        }
-    } else {
         for (field, present) in [
+            ("max_tokens", row.max_tokens.is_some()),
+            ("attention_units", row.attention_units.is_some()),
             ("pooling", row.pooling.is_some()),
             ("normalize", row.normalize.is_some()),
             ("dims", row.dims.is_some()),
         ] {
             if present {
-                return Err(CatalogError::EmbedFieldOnRerank {
-                    id: id.to_string(),
+                return Err(CatalogError::ForbiddenBackendField {
+                    id: id.into(),
                     backend,
+                    task: task.into(),
                     field,
                 });
+            }
+        }
+    } else {
+        if row.max_duration_ms.is_some() {
+            return Err(CatalogError::ForbiddenBackendField {
+                id: id.into(),
+                backend,
+                task: task.into(),
+                field: "max_duration_ms",
+            });
+        }
+        let attention_units = row
+            .attention_units
+            .ok_or_else(|| missing("attention_units"))?;
+        let max_tokens = row.max_tokens.ok_or_else(|| missing("max_tokens"))?;
+        if max_tokens == 0 {
+            return Err(invalid("max_tokens", "0".to_string()));
+        }
+        if u128::from(attention_units) < u128::from(max_tokens) * u128::from(max_tokens) {
+            return Err(CatalogError::AttentionUnitsBelowContext {
+                id: id.to_string(),
+                backend,
+                attention_units,
+                max_tokens,
+            });
+        }
+        if task == "embed" {
+            let pooling = row.pooling.as_ref().ok_or_else(|| missing("pooling"))?;
+            if !ALLOWED_POOLING.contains(&pooling.as_str()) {
+                return Err(invalid("pooling", pooling.clone()));
+            }
+            row.normalize.ok_or_else(|| missing("normalize"))?;
+            match row.dims {
+                None => return Err(missing("dims")),
+                Some(0) => return Err(invalid("dims", "0".to_string())),
+                Some(_) => {}
+            }
+        } else {
+            for (field, present) in [
+                ("pooling", row.pooling.is_some()),
+                ("normalize", row.normalize.is_some()),
+                ("dims", row.dims.is_some()),
+            ] {
+                if present {
+                    return Err(CatalogError::EmbedFieldOnRerank {
+                        id: id.to_string(),
+                        backend,
+                        field,
+                    });
+                }
             }
         }
     }
@@ -911,8 +992,9 @@ struct FrozenBackend {
     family: &'static str,
     dtype: &'static str,
     execution: &'static str,
-    attention_units: u64,
-    max_tokens: u64,
+    attention_units: Option<u64>,
+    max_tokens: Option<u64>,
+    max_duration_ms: Option<u64>,
     pooling: Option<&'static str>,
     normalize: Option<bool>,
     dims: Option<u64>,
@@ -933,7 +1015,7 @@ const FROZEN_MAX_TOKENS: u64 = 8192;
 
 /// What this release ships. Changing any value here is a release decision
 /// that needs new evidence records for the affected backends.
-const FROZEN_ENTRIES: [FrozenEntry; 4] = [
+const FROZEN_ENTRIES: [FrozenEntry; 5] = [
     FrozenEntry {
         id: "gte-modernbert-base",
         hf_repo: "Alibaba-NLP/gte-modernbert-base",
@@ -947,8 +1029,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
@@ -960,8 +1043,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
@@ -973,8 +1057,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
@@ -986,8 +1071,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("cls"),
                 normalize: Some(true),
                 dims: Some(768),
@@ -1007,8 +1093,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f32",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1020,8 +1107,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1033,8 +1121,73 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "gte-modernbert",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
+                pooling: None,
+                normalize: None,
+                dims: None,
+            },
+        ],
+    },
+    FrozenEntry {
+        id: "parakeet-tdt-0.6b-v3",
+        hf_repo: "nvidia/parakeet-tdt-0.6b-v3",
+        revision: "541d1f99c6b0c3cd0b11a95167540bb8edefd82b",
+        default_for_task: true,
+        backends: &[
+            FrozenBackend {
+                backend: "metal",
+                engine: "owned-metal",
+                profile: Some("parakeet-tdt-0.6b-v3.owned-metal"),
+                family: "parakeet-tdt",
+                dtype: "f32",
+                execution: "explicit",
+                attention_units: None,
+                max_tokens: None,
+                max_duration_ms: Some(600_000),
+                pooling: None,
+                normalize: None,
+                dims: None,
+            },
+            FrozenBackend {
+                backend: "ane",
+                engine: "ane-direct-worker",
+                profile: Some("parakeet-tdt-0.6b-v3.ane-direct-worker"),
+                family: "parakeet-tdt",
+                dtype: "f16",
+                execution: "supervised",
+                attention_units: None,
+                max_tokens: None,
+                max_duration_ms: Some(600_000),
+                pooling: None,
+                normalize: None,
+                dims: None,
+            },
+            FrozenBackend {
+                backend: "cuda",
+                engine: "owned-cuda",
+                profile: Some("parakeet-tdt-0.6b-v3.owned-cuda"),
+                family: "parakeet-tdt",
+                dtype: "f32",
+                execution: "supervised",
+                attention_units: None,
+                max_tokens: None,
+                max_duration_ms: Some(600_000),
+                pooling: None,
+                normalize: None,
+                dims: None,
+            },
+            FrozenBackend {
+                backend: "vulkan",
+                engine: "owned-vulkan",
+                profile: Some("parakeet-tdt-0.6b-v3.owned-vulkan"),
+                family: "parakeet-tdt",
+                dtype: "f32",
+                execution: "supervised",
+                attention_units: None,
+                max_tokens: None,
+                max_duration_ms: Some(600_000),
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1054,8 +1207,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
@@ -1067,8 +1221,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
@@ -1080,8 +1235,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
@@ -1093,8 +1249,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: Some("last"),
                 normalize: Some(true),
                 dims: Some(1024),
@@ -1114,8 +1271,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1127,8 +1285,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1140,8 +1299,9 @@ const FROZEN_ENTRIES: [FrozenEntry; 4] = [
                 family: "qwen3-0.6b",
                 dtype: "f16",
                 execution: "explicit",
-                attention_units: FROZEN_ATTENTION_UNITS,
-                max_tokens: FROZEN_MAX_TOKENS,
+                attention_units: Some(FROZEN_ATTENTION_UNITS),
+                max_tokens: Some(FROZEN_MAX_TOKENS),
+                max_duration_ms: None,
                 pooling: None,
                 normalize: None,
                 dims: None,
@@ -1214,7 +1374,7 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
             );
         }
         for (row, frozen_row) in entry.backends.iter().zip(frozen.backends) {
-            let literals: [(&str, String, String); 10] = [
+            let literals: [(&str, String, String); 11] = [
                 ("engine", frozen_row.engine.into(), row.engine.clone()),
                 (
                     "profile",
@@ -1238,12 +1398,12 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
                 ),
                 (
                     "attention_units",
-                    show(Some(frozen_row.attention_units)),
+                    show(frozen_row.attention_units),
                     show(row.attention_units),
                 ),
                 (
                     "max_tokens",
-                    show(Some(frozen_row.max_tokens)),
+                    show(frozen_row.max_tokens),
                     show(row.max_tokens),
                 ),
                 (
@@ -1253,6 +1413,11 @@ pub(crate) fn validate_release(catalog: &Catalog) -> Result<(), CatalogError> {
                 ),
                 ("normalize", show(frozen_row.normalize), show(row.normalize)),
                 ("dims", show(frozen_row.dims), show(row.dims)),
+                (
+                    "max_duration_ms",
+                    show(frozen_row.max_duration_ms),
+                    show(row.max_duration_ms),
+                ),
             ];
             for (field, expected, actual) in literals {
                 if expected != actual {
@@ -1399,11 +1564,11 @@ mod tests {
         seed.to_string().repeat(64)
     }
 
-    /// A schema-valid fixture catalog with ids outside the frozen set: one
-    /// embed entry and one rerank entry that both ship a `tokenizer.json`.
+    /// Schema fixtures share a tokenizer path across embed and rerank entries.
+    /// The compiled speech entry supplies the third task's default and profile.
     fn fixture() -> Value {
         let vector = json!([0.5, 0.5, 0.5, 0.5]);
-        json!({
+        let mut doc = json!({
             "catalog_revision": 3,
             "models": [
                 {
@@ -1455,7 +1620,17 @@ mod tests {
                     }
                 }
             ]
-        })
+        });
+        doc["models"].as_array_mut().unwrap().push(
+            compiled_value()["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["task"] == "transcribe")
+                .unwrap()
+                .clone(),
+        );
+        doc
     }
 
     fn schema(document: &Value) -> Result<Catalog, CatalogError> {
@@ -1506,7 +1681,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.files.iter().any(|file| file.path == "tokenizer.json"))
             .count();
-        assert_eq!(with_tokenizer, 2);
+        assert_eq!(with_tokenizer, 3);
     }
 
     #[test]
@@ -1605,11 +1780,11 @@ mod tests {
         let catalog = compiled_catalog().unwrap();
         for entry in &catalog.models {
             for backend in entry.backends.iter().filter(|row| row.profile.is_some()) {
-                validate_backend(&entry.id, entry.task == "embed", backend).unwrap();
+                validate_backend(&entry.id, &entry.task, backend).unwrap();
                 let mut missing = backend.clone();
                 missing.profile = None;
                 assert!(matches!(
-                    validate_backend(&entry.id, entry.task == "embed", &missing),
+                    validate_backend(&entry.id, &entry.task, &missing),
                     Err(CatalogError::MissingBackendField {
                         field: "profile",
                         ..
@@ -1619,7 +1794,14 @@ mod tests {
                     let mut row = backend.clone();
                     let mut id = entry.id.as_str();
                     match field {
-                        "backend" => row.backend = "metal".into(),
+                        "backend" => {
+                            row.backend = if row.backend == "metal" {
+                                "cuda"
+                            } else {
+                                "metal"
+                            }
+                            .into()
+                        }
                         "model" => id = "another-model",
                         "lane" => {
                             row.profile = Some(format!(
@@ -1632,12 +1814,21 @@ mod tests {
                                 }
                             ))
                         }
-                        "dtype" => row.dtype = Some("f32".into()),
+                        "dtype" => {
+                            row.dtype = Some(
+                                if row.dtype.as_deref() == Some("f32") {
+                                    "f16"
+                                } else {
+                                    "f32"
+                                }
+                                .into(),
+                            )
+                        }
                         _ => unreachable!(),
                     }
                     assert!(
                         matches!(
-                            validate_backend(id, entry.task == "embed", &row),
+                            validate_backend(id, &entry.task, &row),
                             Err(CatalogError::InvalidBackendField {
                                 field: "profile",
                                 ..
@@ -1948,11 +2139,72 @@ mod tests {
     #[test]
     fn compiled_catalog_passes_release_validation() {
         let catalog = compiled_catalog().expect("compiled models.json is release-valid");
-        assert_eq!(catalog.catalog_revision, 1);
+        assert_eq!(catalog.catalog_revision, 2);
     }
 
     #[test]
-    fn compiled_catalog_declares_the_four_frozen_entries() {
+    fn transcribe_catalog_requires_audio_fields_and_forbids_token_fields() {
+        let index = compiled_entry_index("parakeet-tdt-0.6b-v3");
+        for field in ["profile", "family", "dtype", "execution", "max_duration_ms"] {
+            let mut doc = compiled_value();
+            doc["models"][index]["backends"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                matches!(schema(&doc), Err(CatalogError::MissingBackendField { field: f, .. }) if f == field),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("max_tokens", json!(8192)),
+            ("attention_units", json!(67108864)),
+            ("pooling", json!("cls")),
+            ("normalize", json!(true)),
+            ("dims", json!(1024)),
+        ] {
+            let mut doc = compiled_value();
+            doc["models"][index]["backends"][0][field] = value;
+            assert!(
+                matches!(schema(&doc), Err(CatalogError::ForbiddenBackendField { field: f, .. }) if f == field),
+                "{field}"
+            );
+        }
+        let mut doc = compiled_value();
+        doc["models"][index]["self_check"] = doc["models"][0]["self_check"].clone();
+        assert!(matches!(
+            schema(&doc),
+            Err(CatalogError::SelfCheckUnexpected { .. })
+        ));
+        for task_index in [0, 1] {
+            let mut doc = compiled_value();
+            doc["models"][task_index]["backends"][0]["max_duration_ms"] = json!(600000);
+            assert!(matches!(
+                schema(&doc),
+                Err(CatalogError::ForbiddenBackendField {
+                    field: "max_duration_ms",
+                    ..
+                })
+            ));
+        }
+        for count in [0, 2] {
+            let mut catalog = compiled_catalog().unwrap().clone();
+            catalog.models[index].default_for_task = count != 0;
+            if count == 2 {
+                let mut copy = catalog.models[index].clone();
+                copy.id = "second-speech".into();
+                copy.backends.clear();
+                copy.files.clear();
+                catalog.models.push(copy);
+            }
+            assert!(
+                matches!(validate_schema(&catalog), Err(CatalogError::DefaultForTask { task, count: actual }) if task == "transcribe" && count == actual)
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_catalog_declares_the_five_frozen_entries() {
         let catalog = compiled_catalog().unwrap();
         let ids: Vec<&str> = catalog
             .models
@@ -1965,7 +2217,8 @@ mod tests {
                 "gte-modernbert-base",
                 "gte-reranker-modernbert-base",
                 "qwen3-embedding-0.6b",
-                "qwen3-reranker-0.6b"
+                "qwen3-reranker-0.6b",
+                "parakeet-tdt-0.6b-v3"
             ]
         );
         for id in [
@@ -2049,7 +2302,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.backends.len())
                 .sum::<usize>(),
-            14
+            18
         );
         for entry in &catalog.models {
             for backend in &entry.backends {
@@ -2065,9 +2318,9 @@ mod tests {
     }
 
     #[test]
-    fn release_rejects_id_sets_other_than_the_frozen_four() {
+    fn release_rejects_id_sets_other_than_the_frozen_five() {
         let missing = release_error(|doc| {
-            doc["models"].as_array_mut().unwrap().pop();
+            doc["models"].as_array_mut().unwrap().remove(2);
         });
         assert!(
             matches!(missing, CatalogError::FrozenIdSet { .. }),

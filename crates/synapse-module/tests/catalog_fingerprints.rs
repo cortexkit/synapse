@@ -78,7 +78,12 @@ fn every_catalog_backend_fingerprint_matches_its_declared_numeric_profile() {
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
     let mut checked = 0;
-    for entry in catalog["models"].as_array().unwrap() {
+    for entry in catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry["task"].as_str(), Some("embed" | "rerank")))
+    {
         for backend in entry["backends"].as_array().unwrap() {
             // Keep the existing Metal fingerprint calculation unchanged so adding
             // ANE entries does not change consumers' Metal model identities. The
@@ -190,7 +195,12 @@ fn ane_catalog_fingerprints_bind_the_pinned_manifest_profiles() {
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
     let mut computed_pins = Vec::new();
-    for entry in catalog["models"].as_array().unwrap() {
+    for entry in catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry["task"].as_str(), Some("embed" | "rerank")))
+    {
         for backend in entry["backends"]
             .as_array()
             .unwrap()
@@ -318,7 +328,12 @@ fn catalog_tokenizer_pins_match_original_snapshots() {
     let catalog: Value = serde_json::from_str(include_str!("../src/catalog/models.json")).unwrap();
     let tokenizers: BTreeMap<String, String> =
         serde_json::from_str(include_str!("fixtures/catalog-tokenizer-digests.json")).unwrap();
-    for entry in catalog["models"].as_array().unwrap() {
+    for entry in catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry["task"].as_str(), Some("embed" | "rerank")))
+    {
         let repository = entry["upstream"]["hf_repo"]
             .as_str()
             .unwrap()

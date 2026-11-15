@@ -676,6 +676,7 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
         [
             "gte-modernbert-base",
             "gte-reranker-modernbert-base",
+            "parakeet-tdt-0.6b-v3",
             "qwen3-embedding-0.6b",
             "qwen3-reranker-0.6b"
         ]
@@ -733,6 +734,19 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
             assert_eq!(backend["runnable"], name == "metal");
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["self_check"], Value::Null);
+            if row["task"] == "transcribe" {
+                assert_eq!(backend["max_duration_ms"], 600000);
+                for field in [
+                    "max_tokens",
+                    "attention_units",
+                    "pooling",
+                    "normalize",
+                    "dims",
+                    "recommended_batch",
+                ] {
+                    assert!(backend.get(field).is_none(), "{field}");
+                }
+            }
         }
         // Download bytes count only files a runnable backend would fetch.
         let total: u64 = entry["files"]
@@ -764,6 +778,7 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
             vec![
                 "gte-modernbert-base",
                 "gte-reranker-modernbert-base",
+                "parakeet-tdt-0.6b-v3",
                 "qwen3-embedding-0.6b",
             ],
         ),
@@ -774,6 +789,11 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
         ),
         (104, serde_json::json!({"installed":true}), vec![]),
         (105, serde_json::json!({"installed":false}), ids.clone()),
+        (
+            107,
+            serde_json::json!({"task":"transcribe"}),
+            vec!["parakeet-tdt-0.6b-v3"],
+        ),
         (
             106,
             serde_json::json!({"query":"rerank","runnable_here":true,"task":"rerank"}),
@@ -1913,7 +1933,7 @@ async fn catalog_unavailable_backend_is_listed_but_never_downloaded() {
         serde_json::from_str(include_str!("../../src/catalog/models.json")).unwrap();
     let mut h = CatalogHarness::start_catalog("ok", None, catalog, BTreeMap::new(), "", None).await;
     let listing = h.call("models.catalog", serde_json::json!({})).await;
-    assert_eq!(listing["models"].as_array().unwrap().len(), 4);
+    assert_eq!(listing["models"].as_array().unwrap().len(), 5);
     for entry in listing["models"].as_array().unwrap() {
         assert_eq!(entry["install_state"], "not_installed");
         for backend in entry["backends"].as_array().unwrap() {

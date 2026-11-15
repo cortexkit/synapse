@@ -1330,6 +1330,7 @@ struct RuntimeState {
     release_catalog: catalog::Catalog,
     runnable_backends: BTreeSet<String>,
     backend_reasons: BTreeMap<String, &'static str>,
+    backend_floor_observed: BTreeMap<String, Value>,
     catalog_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     serving_gates: Mutex<BTreeMap<String, Arc<tokio::sync::RwLock<()>>>>,
     lane_execution_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -2396,6 +2397,17 @@ fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<Recom
     }
 }
 
+fn recommended_batch_for_model(
+    spec: &StoredModelConfig,
+    max_tokens: Option<usize>,
+) -> Option<RecommendedBatch> {
+    if spec.task == "transcribe" {
+        None
+    } else {
+        recommended_batch_for_engine(&spec.engine, max_tokens.unwrap_or(spec.max_tokens))
+    }
+}
+
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         now_ms()
@@ -2509,6 +2521,7 @@ impl RuntimeState {
         validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
         let release_catalog = runtime_release_catalog()?;
         let (runnable_backends, backend_reasons) = detected_catalog_backends(&config);
+        let backend_floor_observed = catalog_floor_observations(&config, &runnable_backends);
         let hf_endpoint = config.hf_endpoint;
         let inline = config.inline;
         let jobs = config.jobs;
@@ -2555,6 +2568,7 @@ impl RuntimeState {
             hf_endpoint,
             release_catalog,
             runnable_backends,
+            backend_floor_observed,
             backend_reasons,
             catalog_locks: Mutex::new(BTreeMap::new()),
             serving_gates: Mutex::new(BTreeMap::new()),
@@ -3341,6 +3355,12 @@ impl CatalogProfile {
         execution: Option<&str>,
         attention_units: Option<usize>,
     ) -> Result<OwnedCatalogConfig, ModuleError> {
+        if self.model()["operation"] == "transcribe" {
+            return Err(ModuleError::Config(format!(
+                "{}: transcribe lane has no embed owned config",
+                self.slug
+            )));
+        }
         let family = if self.model()["architecture"]["family"] == "qwen3" {
             OwnedFamily::Qwen3
         } else {
@@ -3413,7 +3433,119 @@ impl CatalogProfile {
         })
     }
 
+    fn transcribe_config(&self) -> Result<TranscribeCatalogConfig, ModuleError> {
+        if self.model()["operation"] != "transcribe" {
+            return Err(ModuleError::Config(format!(
+                "{}: embed/rerank lane has no transcribe config",
+                self.slug
+            )));
+        }
+        let profile = transcribe_host::TranscribeProfile::pinned(&self.id)
+            .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let dtype = OwnedDType::parse(
+            self.profile()["storage_dtype"]
+                .as_str()
+                .expect("storage dtype"),
+        )
+        .map_err(|error| ModuleError::Config(error.to_string()))?;
+        let lane = profile.lane.as_str();
+        let revision = profile.kernel_revision.as_str();
+        let mut identity = match lane {
+            "owned-metal" => EngineIdentity {
+                engine: lane.into(),
+                version: synapse_engine_owned::ENGINE_VERSION.into(),
+                build_flags: BTreeMap::from([
+                    ("backend".into(), "metal-mpsgraph".into()),
+                    ("family".into(), "parakeet-tdt".into()),
+                    ("dtype".into(), dtype.as_str().into()),
+                    ("kernel_revision".into(), revision.into()),
+                    ("risk_class".into(), "abort_safe".into()),
+                ]),
+            },
+            "owned-cuda" => owned_cuda_engine_identity("parakeet-tdt", dtype.as_str(), revision),
+            _ => worker_catalog_identity(
+                lane,
+                revision,
+                &[("family", "parakeet-tdt"), ("kernel_revision", revision)],
+            ),
+        };
+        identity.build_flags.extend([
+            ("profile".into(), self.id.clone()),
+            (
+                "compute_dtype".into(),
+                self.profile()["compute_dtype"]
+                    .as_str()
+                    .expect("compute dtype")
+                    .into(),
+            ),
+            ("storage_dtype".into(), dtype.as_str().into()),
+        ]);
+        Ok(TranscribeCatalogConfig {
+            family: "parakeet-tdt",
+            dtype,
+            max_encoder_frames: profile.max_encoder_frames,
+            execution: if lane == "owned-metal" {
+                "explicit"
+            } else {
+                "supervised"
+            }
+            .into(),
+            identity,
+        })
+    }
+
+    fn transcribe_numeric_profile(&self, config: &TranscribeCatalogConfig) -> NumericProfile {
+        let mut numeric = serde_json::from_value(json!({
+            "model_digest": self.artifact_digest(), "quant": config.dtype.as_str(),
+            "engine": config.identity, "sanitized_tokenizer_digest": "",
+            "pooling": {"custom": "none"}, "normalization": "none",
+            "dtype": config.dtype.as_str(), "flash_attention": "disabled",
+            "certified_shape": {"max_context_tokens": config.max_encoder_frames,
+                "max_batch_tokens": config.max_encoder_frames, "max_micro_batch_tokens": config.max_encoder_frames,
+                "max_sequences": 1}, "thread_policy": "balanced",
+        })).expect("transcribe numeric profile");
+        self.apply_numeric_profile(&mut numeric);
+        numeric
+    }
+
     fn apply_numeric_profile(&self, numeric: &mut NumericProfile) {
+        if self.model()["operation"] == "transcribe" {
+            let config = self
+                .transcribe_config()
+                .expect("validated transcribe profile");
+            numeric.model_digest = self.model()["checkpoint_digest"]
+                .as_str()
+                .expect("checkpoint digest")
+                .into();
+            numeric.operation = Some("transcribe".into());
+            numeric.input_grammar = None;
+            numeric.prompt_template = None;
+            numeric.kernel_revision = Some(config.identity.build_flags["kernel_revision"].clone());
+            numeric.speech_frontend = Some(synapse_speech::SPEECH_FRONTEND_REVISION.into());
+            numeric.decode_rule = Some(synapse_speech::DECODE_RULE_REVISION.into());
+            numeric.sanitized_tokenizer_digest = self.model()["tokenizer_digest"]
+                .as_str()
+                .expect("tokenizer digest")
+                .into();
+            numeric.pooling = PoolingStrategy::Custom("none".into());
+            numeric.normalization = NormalizationMode::None;
+            let frames = config.max_encoder_frames as u32;
+            numeric.certified_shape = CertifiedShapeEnvelope {
+                max_context_tokens: frames,
+                max_batch_tokens: frames,
+                max_micro_batch_tokens: frames,
+                max_sequences: 1,
+            };
+            numeric.rotation = self.profile()["rotation"].as_str().map(str::to_string);
+            numeric.converted_package_digest = self.profile()["converted_package_digest"]
+                .as_str()
+                .map(str::to_string);
+            numeric.manifest_profile_digest =
+                Some(sha256_hex(&synapse_parity::canonical::canonical_bytes(
+                    &self.typed.profile_entry(&self.id).expect("profile entry"),
+                )));
+            return;
+        }
         let input_grammar = format!(
             "synapse-input-grammar-v1:{}",
             self.typed
@@ -3469,6 +3601,19 @@ impl CatalogProfile {
         });
     }
 }
+
+#[derive(Clone, Debug)]
+struct TranscribeCatalogConfig {
+    family: &'static str,
+    dtype: OwnedDType,
+    max_encoder_frames: usize,
+    execution: String,
+    identity: EngineIdentity,
+}
+
+#[cfg(test)]
+#[path = "catalog_lane_tests.rs"]
+mod catalog_lane_tests;
 
 #[derive(Clone, Debug)]
 struct OwnedCatalogConfig {
@@ -16472,25 +16617,26 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 buckets.dedup();
             }
 
-            let (max_tokens, max_tokens_source) =
-                if spec.engine_identity.build_flags.contains_key("profile") {
-                    (Some(8192), Some("manifest".to_string()))
-                } else if let Some(ref buckets) = bucket_ladder {
-                    if let Some(&largest_bucket) = buckets.last() {
-                        let source = if spec.engine == "owned-metal" {
-                            "runtime_bucket"
-                        } else {
-                            "worker_bucket"
-                        };
-                        (Some(largest_bucket), Some(source.to_string()))
+            let (max_tokens, max_tokens_source) = if spec.task == "transcribe" {
+                (None, None)
+            } else if spec.engine_identity.build_flags.contains_key("profile") {
+                (Some(8192), Some("manifest".to_string()))
+            } else if let Some(ref buckets) = bucket_ladder {
+                if let Some(&largest_bucket) = buckets.last() {
+                    let source = if spec.engine == "owned-metal" {
+                        "runtime_bucket"
                     } else {
-                        (Some(spec.max_tokens), Some("catalog".to_string()))
-                    }
-                } else if is_loaded {
-                    (Some(spec.max_tokens), Some("catalog".to_string()))
+                        "worker_bucket"
+                    };
+                    (Some(largest_bucket), Some(source.to_string()))
                 } else {
-                    (Some(spec.max_tokens), Some("catalog_unloaded".to_string()))
-                };
+                    (Some(spec.max_tokens), Some("catalog".to_string()))
+                }
+            } else if is_loaded {
+                (Some(spec.max_tokens), Some("catalog".to_string()))
+            } else {
+                (Some(spec.max_tokens), Some("catalog_unloaded".to_string()))
+            };
 
             let dims = if is_loaded { exec_info.dims } else { None };
             let dtype = dtype_for_slot(&spec, exec_info.dtype);
@@ -16605,8 +16751,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                     .map(|perf| perf.cold_load_ms)
             });
 
-            let recommended_batch =
-                recommended_batch_for_engine(&spec.engine, max_tokens.unwrap_or(spec.max_tokens));
+            let recommended_batch = recommended_batch_for_model(&spec, max_tokens);
 
             ModelCatalogEntry {
                 model_id: spec.model_id,
@@ -16646,7 +16791,15 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
                 Ok(install) => install.is_some(),
                 Err(error) => return error_payload(state, error),
             };
-            if !state.runtime.runnable_backends.contains(&backend.backend) || !installed {
+            if catalog_lane_backend_reason(
+                &state.runtime,
+                entry,
+                backend,
+                synapse_core::Platform::current(),
+            )
+            .is_some()
+                || !installed
+            {
                 continue;
             }
         }
@@ -23635,7 +23788,7 @@ mod tests {
         let compiled = catalog::compiled_catalog().unwrap();
         let declared = certification_catalog().unwrap();
         let cells = synapse_certify::derive_cells(&declared.lanes);
-        assert_eq!(cells.len(), 30);
+        assert_eq!(cells.len(), 38);
         for cell in &cells {
             let backend = compiled
                 .entry(&cell.model)
@@ -26048,15 +26201,25 @@ mod catalog_runtime_tests {
                     "{lane}: engine {} receives the wrong artifact format",
                     spec.engine
                 );
-                let advice = recommended_batch_for_engine(&spec.engine, spec.max_tokens)
-                    .unwrap_or_else(|| {
-                        panic!("{lane}: engine {} has no batch advice", spec.engine)
-                    });
-                assert!(advice.rows > 0 && advice.token_budget > 0, "{lane}");
+                if entry.task == "transcribe" {
+                    assert!(recommended_batch_for_model(&spec, None).is_none(), "{lane}");
+                    let mut row = json!({"model_id": lane, "max_tokens": spec.max_tokens,
+                        "recommended_batch": {"rows":8,"token_budget":8192}});
+                    catalog_list_row(&state, &mut row).unwrap();
+                    assert_eq!(row["max_duration_ms"], 600_000, "{lane}");
+                    assert!(row.get("max_tokens").is_none(), "{lane}");
+                    assert!(row.get("recommended_batch").is_none(), "{lane}");
+                } else {
+                    let advice = recommended_batch_for_model(&spec, Some(spec.max_tokens))
+                        .unwrap_or_else(|| {
+                            panic!("{lane}: engine {} has no batch advice", spec.engine)
+                        });
+                    assert!(advice.rows > 0 && advice.token_budget > 0, "{lane}");
+                }
                 lanes += 1;
             }
         }
-        assert_eq!(lanes, 14, "every declared catalog lane must be checked");
+        assert_eq!(lanes, 18, "every declared catalog lane must be checked");
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
@@ -26071,7 +26234,7 @@ mod catalog_runtime_tests {
         let mut lanes = 0;
         for entry in &state.runtime.release_catalog.models {
             for backend in &entry.backends {
-                if backend.engine != CUDA_WORKER_ENGINE {
+                if backend.engine != CUDA_WORKER_ENGINE || entry.task == "transcribe" {
                     continue;
                 }
                 assert_eq!(backend.execution.as_deref(), Some("explicit"));
@@ -26142,7 +26305,13 @@ mod catalog_runtime_tests {
     #[test]
     fn catalog_gpu_specs_use_manifest_preload_identity_and_package() {
         let (root, state) = isolated_catalog_state("gpu-specs", false);
-        for entry in &state.runtime.release_catalog.models {
+        for entry in state
+            .runtime
+            .release_catalog
+            .models
+            .iter()
+            .filter(|entry| entry.task != "transcribe")
+        {
             for name in ["cuda", "vulkan"] {
                 let backend = entry.backend(name).unwrap();
                 let profile = CatalogProfile::load(backend.profile.as_deref().unwrap()).unwrap();
@@ -26272,7 +26441,13 @@ mod catalog_runtime_tests {
                 "stage a feature-off {name} worker: {}",
                 source.display()
             );
-            for entry in &state.runtime.release_catalog.models {
+            for entry in state
+                .runtime
+                .release_catalog
+                .models
+                .iter()
+                .filter(|entry| entry.task != "transcribe")
+            {
                 let backend = entry.backend(name).unwrap();
                 let mut spec = catalog_lane_spec(&state, entry, backend, false).unwrap();
                 let dir = root.join(&spec.model_id);
@@ -26930,7 +27105,7 @@ mod catalog_runtime_tests {
             models_catalog(state.clone(), json!({})).await,
             "models.catalog",
         );
-        assert_eq!(result["models"].as_array().unwrap().len(), 4);
+        assert_eq!(result["models"].as_array().unwrap().len(), 5);
         for row in result["models"].as_array().unwrap() {
             assert_eq!(row["download_bytes"], 0);
             assert_eq!(row["install_state"], "not_installed");
@@ -27369,6 +27544,174 @@ fn catalog_direct_ane_worker() -> Option<PathBuf> {
 fn direct_ane_catalog_available(macos: bool, worker: Option<&Path>) -> bool {
     macos && worker.is_some_and(Path::is_file)
 }
+fn catalog_floor_observations(
+    config: &ModuleConfig,
+    runnable: &BTreeSet<String>,
+) -> BTreeMap<String, Value> {
+    let mut observed = BTreeMap::new();
+    for (backend, engine) in [("cuda", CUDA_WORKER_ENGINE), ("vulkan", "owned-vulkan")] {
+        if !runnable.contains(backend) {
+            continue;
+        }
+        let configured = config
+            .preload_models
+            .iter()
+            .find(|m| m.engine == engine && m.worker_bin.is_some())
+            .and_then(|m| m.worker_bin.as_deref());
+        if let Some(worker) = resolve_catalog_worker(engine, configured) {
+            if let Ok(output) =
+                catalog_probe::cached_probe(&worker, catalog_probe::ProbeKind::Floor)
+            {
+                if let Ok(envelope) = catalog_probe::floor_result(output) {
+                    observed.insert(backend.into(), envelope["observed"].clone());
+                }
+            }
+        }
+    }
+    observed
+}
+
+#[derive(Debug)]
+struct CatalogLaneRefusal {
+    code: &'static str,
+    details: String,
+}
+
+fn transcribe_profile_floor_reason(
+    profile: &Value,
+    observed: &Value,
+) -> Option<CatalogLaneRefusal> {
+    let required: &[&str] = match profile["lane"].as_str() {
+        Some("owned-cuda") => &[
+            "cuda_min_driver_api",
+            "cuda_min_compute_major",
+            "cuda_min_compute_minor",
+        ],
+        Some("owned-vulkan") => &[
+            "vulkan_min_device_local_bytes",
+            "vulkan_min_storage_buffer_range",
+        ],
+        _ => return None,
+    };
+    for field in required {
+        if profile[*field].as_u64().is_none() {
+            return Some(CatalogLaneRefusal {
+                code: "probe_failed",
+                details: format!("missing manifest floor {field}"),
+            });
+        }
+    }
+    let mut readings = Vec::new();
+    match profile["lane"].as_str()? {
+        "owned-cuda" => {
+            for (floor, reading, label) in [
+                (
+                    "cuda_min_driver_api",
+                    &observed["driver_api"],
+                    "CUDA driver API",
+                ),
+                (
+                    "cuda_min_compute_major",
+                    &observed["compute_capability"]["major"],
+                    "CUDA compute major",
+                ),
+                (
+                    "cuda_min_compute_minor",
+                    &observed["compute_capability"]["minor"],
+                    "CUDA compute minor",
+                ),
+            ] {
+                if reading.as_u64().is_none() {
+                    return Some(CatalogLaneRefusal {
+                        code: "probe_failed",
+                        details: format!("missing {label} reading for {floor}"),
+                    });
+                }
+            }
+            let major = profile["cuda_min_compute_major"].as_u64()?;
+            let minor = profile["cuda_min_compute_minor"].as_u64()?;
+            let actual_major = observed["compute_capability"]["major"].as_u64()?;
+            let actual_minor = observed["compute_capability"]["minor"].as_u64()?;
+            if (actual_major, actual_minor) < (major, minor) {
+                return Some(CatalogLaneRefusal { code: "device_below_floor", details: format!("CUDA compute capability {actual_major}.{actual_minor} below this lane's {major}.{minor} floor") });
+            }
+            readings.push((
+                "CUDA driver API",
+                profile["cuda_min_driver_api"].as_u64()?,
+                observed["driver_api"].as_u64(),
+            ));
+        }
+        "owned-vulkan" => {
+            let heap = observed["device_local_heaps"].as_array().and_then(|heaps| {
+                heaps
+                    .iter()
+                    .map(Value::as_u64)
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|h| h.into_iter().max())
+            });
+            readings.push((
+                "device-local memory bytes",
+                profile["vulkan_min_device_local_bytes"].as_u64()?,
+                heap,
+            ));
+            readings.push((
+                "storage buffer range bytes",
+                profile["vulkan_min_storage_buffer_range"].as_u64()?,
+                observed["max_storage_buffer_range"].as_u64(),
+            ));
+        }
+        _ => return None,
+    }
+    for (label, floor, actual) in readings {
+        let Some(actual) = actual else {
+            return Some(CatalogLaneRefusal {
+                code: "probe_failed",
+                details: format!("missing {label} reading for this lane's {floor} floor"),
+            });
+        };
+        if actual < floor {
+            return Some(CatalogLaneRefusal {
+                code: "device_below_floor",
+                details: format!("{label} {actual} below this lane's {floor} floor"),
+            });
+        }
+    }
+    None
+}
+
+fn catalog_lane_backend_reason(
+    runtime: &RuntimeState,
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    platform: synapse_core::Platform,
+) -> Option<CatalogLaneRefusal> {
+    if let Some(code) = catalog_backend_reason(runtime, &backend.backend, platform) {
+        return Some(CatalogLaneRefusal {
+            code,
+            details: String::new(),
+        });
+    }
+    if entry.task != "transcribe" || !matches!(backend.backend.as_str(), "cuda" | "vulkan") {
+        return None;
+    }
+    let profile = match CatalogProfile::load(backend.profile.as_deref().unwrap_or("")) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return Some(CatalogLaneRefusal {
+                code: "probe_failed",
+                details: error.to_string(),
+            })
+        }
+    };
+    transcribe_profile_floor_reason(
+        profile.profile(),
+        runtime
+            .backend_floor_observed
+            .get(&backend.backend)
+            .unwrap_or(&Value::Null),
+    )
+}
+
 fn catalog_backend_reason(
     runtime: &RuntimeState,
     backend: &str,
@@ -27771,11 +28114,10 @@ fn catalog_entry_complete(
     entry: &catalog::CatalogEntry,
 ) -> Result<bool, WireOperationError> {
     use store::CatalogBlobCache;
-    for backend in entry
-        .backends
-        .iter()
-        .filter(|b| state.runtime.runnable_backends.contains(&b.backend))
-    {
+    for backend in entry.backends.iter().filter(|b| {
+        catalog_lane_backend_reason(&state.runtime, entry, b, synapse_core::Platform::current())
+            .is_none()
+    }) {
         if current_catalog_install(state, entry, &backend.backend)?.is_none() {
             return Ok(false);
         }
@@ -27810,7 +28152,15 @@ async fn models_catalog(state: Arc<ModuleState>, params: Value) -> HandlerOutcom
             let runnable = entry
                 .backends
                 .iter()
-                .filter(|b| state.runtime.runnable_backends.contains(&b.backend))
+                .filter(|b| {
+                    catalog_lane_backend_reason(
+                        &state.runtime,
+                        entry,
+                        b,
+                        synapse_core::Platform::current(),
+                    )
+                    .is_none()
+                })
                 .map(|b| b.backend.as_str())
                 .collect::<Vec<_>>();
             if params
@@ -27850,7 +28200,20 @@ async fn models_catalog(state: Arc<ModuleState>, params: Value) -> HandlerOutcom
                 } else {
                     Value::Null
                 };
-                backends.push(json!({"backend":b.backend,"lane_id":catalog::lane_id(&entry.id,&b.backend),"fingerprint":b.fingerprint,"runnable":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current()).is_none(),"reason":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current()),"installed":installed,"self_check":check}));
+                let refusal = catalog_lane_backend_reason(
+                    &state.runtime,
+                    entry,
+                    b,
+                    synapse_core::Platform::current(),
+                );
+                let mut row = json!({"backend":b.backend,"lane_id":catalog::lane_id(&entry.id,&b.backend),"fingerprint":b.fingerprint,"runnable":refusal.is_none(),"reason":refusal.as_ref().map(|r| r.code),"installed":installed,"self_check":check});
+                if let Some(refusal) = refusal.filter(|r| !r.details.is_empty()) {
+                    row["reason_details"] = json!(refusal.details);
+                }
+                if let Some(duration) = b.max_duration_ms {
+                    row["max_duration_ms"] = json!(duration);
+                }
+                backends.push(row);
             }
             rows.push(json!({"id":entry.id,"task":entry.task,"name":entry.name,"description":entry.description,"default_for_task":entry.default_for_task,"upstream":entry.upstream,"manifest_digest":manifest,"download_bytes":entry.download_bytes(&runnable),"install_state":install_state,"backends":backends}));
         }
@@ -27898,12 +28261,34 @@ async fn models_download(state: Arc<ModuleState>, params: Value) -> HandlerOutco
             .lock()
             .expect("catalog disk lock");
         let entry = catalog_entry_for_management(&state.runtime, &params.catalog_id)?;
-        if !entry
-            .backends
-            .iter()
-            .any(|b| state.runtime.runnable_backends.contains(&b.backend))
-        {
+        if !entry.backends.iter().any(|b| {
+            catalog_lane_backend_reason(&state.runtime, entry, b, synapse_core::Platform::current())
+                .is_none()
+        }) {
             return Err(catalog_backend_unavailable(&state, entry, None));
+        }
+        if entry.task == "transcribe" {
+            for backend in entry.backends.iter().filter(|b| {
+                catalog_lane_backend_reason(
+                    &state.runtime,
+                    entry,
+                    b,
+                    synapse_core::Platform::current(),
+                )
+                .is_none()
+            }) {
+                let profile =
+                    CatalogProfile::load(backend.profile.as_deref().expect("speech profile"))
+                        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+                let config = profile
+                    .transcribe_config()
+                    .map_err(|error| artifact_invalid_error(error.to_string()))?;
+                validate_catalog_lane_fingerprint(
+                    entry,
+                    backend,
+                    &profile.transcribe_numeric_profile(&config).fingerprint(),
+                )?;
+            }
         }
         let request_key = params
             .request_key
@@ -27964,7 +28349,24 @@ fn catalog_backend_unavailable(
     entry: &catalog::CatalogEntry,
     selected: Option<&catalog::CatalogBackend>,
 ) -> WireOperationError {
-    let backends = entry.backends.iter().filter(|b| selected.is_none_or(|s| s.backend == b.backend)).map(|b| json!({"backend":b.backend,"reason":catalog_backend_reason(&state.runtime,&b.backend, synapse_core::Platform::current())})).collect::<Vec<_>>();
+    let backends = entry
+        .backends
+        .iter()
+        .filter(|b| selected.is_none_or(|s| s.backend == b.backend))
+        .map(|b| {
+            let refusal = catalog_lane_backend_reason(
+                &state.runtime,
+                entry,
+                b,
+                synapse_core::Platform::current(),
+            );
+            let mut row = json!({"backend":b.backend,"reason":refusal.as_ref().map(|r| r.code)});
+            if let Some(refusal) = refusal.filter(|r| !r.details.is_empty()) {
+                row["reason_details"] = json!(refusal.details);
+            }
+            row
+        })
+        .collect::<Vec<_>>();
     catalog_wire_error(
         "backend_unavailable",
         json!({"catalog_id":entry.id,"lane_id":selected.map(|b| catalog::lane_id(&entry.id,&b.backend)),"backends":backends}),
@@ -28132,7 +28534,15 @@ async fn fetch_catalog_download(
         let targets = entry
             .backends
             .iter()
-            .filter(|b| plan_state.runtime.runnable_backends.contains(&b.backend))
+            .filter(|b| {
+                catalog_lane_backend_reason(
+                    &plan_state.runtime,
+                    &entry,
+                    b,
+                    synapse_core::Platform::current(),
+                )
+                .is_none()
+            })
             .map(|b| b.backend.clone())
             .collect::<Vec<_>>();
         let files = entry
@@ -28727,6 +29137,55 @@ fn catalog_profile_lane_spec(
         let _ = fs::remove_file(&temporary);
         ingested.map_err(|error| artifact_invalid_error(error.to_string()))?;
     }
+    if entry.task == "transcribe" {
+        let config = profile
+            .transcribe_config()
+            .map_err(|error| artifact_invalid_error(error.to_string()))?;
+        if verify
+            && sha256_file(&tokenizer_path).ok().as_deref()
+                != Some(files["tokenizer"].sha256.as_str())
+        {
+            return Err(artifact_invalid_error(
+                "transcribe tokenizer digest mismatch",
+            ));
+        }
+        let numeric = profile.transcribe_numeric_profile(&config);
+        validate_catalog_lane_fingerprint(entry, backend, &numeric.fingerprint())?;
+        return Ok(StoredModelConfig {
+            model_id: catalog::lane_id(&entry.id, &backend.backend),
+            engine: backend.engine.clone(),
+            task: "transcribe".into(),
+            artifact_digest: digest.clone(),
+            artifact_format: default_artifact_format(&backend.engine),
+            tokenizer_sanitized_digest: numeric.sanitized_tokenizer_digest.clone(),
+            model_locator: ModelAssetLocator::CacheDigest { digest },
+            tokenizer_locator: ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", files["tokenizer"].sha256),
+            },
+            model_source_url: local_file_url(&package_path),
+            tokenizer_source_url: local_file_url(&tokenizer_path),
+            pooling: "none".into(),
+            normalize: false,
+            // Speech admission uses the profile's duration and frame limits, not
+            // StoredModelConfig's required token limit. Zero is unused for transcribe.
+            max_tokens: 0,
+            quant: config.dtype.as_str().into(),
+            pin: false,
+            owned_family: Some(config.family.into()),
+            owned_dtype: Some(config.dtype.as_str().into()),
+            owned_execution: Some(config.execution),
+            owned_attention_units: None,
+            config_locator: files.get("config").map(|f| ModelAssetLocator::CacheDigest {
+                digest: format!("sha256:{}", f.sha256),
+            }),
+            extra_locators: Vec::new(),
+            engine_identity: config.identity,
+            numeric_profile_id: numeric.numeric_profile_id(),
+            fingerprint: numeric.fingerprint(),
+            worker_bin: None,
+            worker_runtime_dir: None,
+        });
+    }
     let sanitized_digest = if verify {
         // Count the tokens actually sent to the model, including special tokens
         // and any query/document template, before enforcing the 8192-token limit.
@@ -28790,7 +29249,13 @@ fn catalog_profile_lane_spec(
 fn sync_installed_catalog_slots(state: &ModuleState) -> Result<(), WireOperationError> {
     for entry in &state.runtime.release_catalog.models {
         for backend in &entry.backends {
-            if !state.runtime.runnable_backends.contains(&backend.backend)
+            if catalog_lane_backend_reason(
+                &state.runtime,
+                entry,
+                backend,
+                synapse_core::Platform::current(),
+            )
+            .is_some()
                 || current_catalog_install(state, entry, &backend.backend)?.is_none()
             {
                 continue;
@@ -28821,7 +29286,13 @@ fn catalog_lanes_needing_revalidation(
     let mut lanes = Vec::new();
     for entry in &state.runtime.release_catalog.models {
         for backend in &entry.backends {
-            if !state.runtime.runnable_backends.contains(&backend.backend)
+            if catalog_lane_backend_reason(
+                &state.runtime,
+                entry,
+                backend,
+                synapse_core::Platform::current(),
+            )
+            .is_some()
                 || current_catalog_install(state, entry, &backend.backend)?.is_none()
                 || catalog_self_check_projection(state, entry, backend)?["state"] != "pending"
             {
@@ -28918,7 +29389,10 @@ mod transcribe_self_check {
         pub engine_identity: Value,
     }
 
-    fn key(state: &ModuleState, lane: &Lane) -> Result<(String, Value), WireOperationError> {
+    pub(super) fn key(
+        state: &ModuleState,
+        lane: &Lane,
+    ) -> Result<(String, Value), WireOperationError> {
         let revision = format!(
             "{}:{}",
             lane.profile,
@@ -29542,6 +30016,9 @@ fn catalog_self_check_key(
     entry: &catalog::CatalogEntry,
     backend: &catalog::CatalogBackend,
 ) -> Result<(String, Value), WireOperationError> {
+    if entry.task == "transcribe" {
+        return transcribe_self_check::key(state, &catalog_transcribe_lane(entry, backend)?);
+    }
     let identity = if let Some(profile) = backend.profile.as_deref() {
         CatalogProfile::load(profile)
             .and_then(|profile| profile.owned_config(backend.execution.as_deref(), None))
@@ -29592,6 +30069,9 @@ fn catalog_self_check_projection(
     entry: &catalog::CatalogEntry,
     backend: &catalog::CatalogBackend,
 ) -> Result<Value, WireOperationError> {
+    if entry.task == "transcribe" {
+        return transcribe_self_check::projection(state, &catalog_transcribe_lane(entry, backend)?);
+    }
     use rusqlite::OptionalExtension;
     let (id, _) = catalog_self_check_key(state, entry, backend)?;
     let row = state
@@ -30953,13 +31433,7 @@ async fn ensure_catalog_lane_ready_owned(
             let parameters_started = std::time::Instant::now();
             let spec = catalog_lane_spec(&state, &entry, &backend, true)?;
             catalog_validation_timing(&lane, "parameters", parameters_started);
-            if spec.fingerprint.0 != backend.fingerprint {
-                return Err(catalog_wire_error(
-                    "artifact_invalid",
-                    json!({"model_id":lane,"expected_fingerprint":backend.fingerprint,"actual_fingerprint":spec.fingerprint}),
-                    "catalog fingerprint differs from verified artifact parameters",
-                ));
-            }
+            validate_catalog_lane_fingerprint(&entry, &backend, &spec.fingerprint)?;
             if let Some(slot) = state
                 .runtime
                 .catalog
@@ -31096,9 +31570,58 @@ fn startup_catalog_runtime(state: &ModuleState) -> Result<(), ModuleError> {
         .record_jobs_failed(failed.len() as u64);
     sync_installed_catalog_slots(state).map_err(|e| ModuleError::Config(e.message))
 }
+fn validate_catalog_lane_fingerprint(
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    fingerprint: &Fingerprint,
+) -> Result<(), WireOperationError> {
+    if fingerprint.0 != backend.fingerprint {
+        return Err(catalog_wire_error(
+            "artifact_invalid",
+            json!({"model_id":catalog::lane_id(&entry.id,&backend.backend),"expected_fingerprint":backend.fingerprint,"actual_fingerprint":fingerprint}),
+            "catalog fingerprint differs from verified artifact parameters",
+        ));
+    }
+    Ok(())
+}
+
+fn catalog_transcribe_lane(
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+) -> Result<transcribe_self_check::Lane, WireOperationError> {
+    let profile = backend.profile.as_deref().expect("transcribe profile");
+    let config = CatalogProfile::load(profile)
+        .and_then(|p| p.transcribe_config())
+        .map_err(|error| artifact_invalid_error(error.to_string()))?;
+    Ok(transcribe_self_check::Lane {
+        catalog_id: entry.id.clone(),
+        backend: backend.backend.clone(),
+        profile: profile.into(),
+        fingerprint: backend.fingerprint.clone(),
+        manifest_digest: entry.manifest_digest(),
+        engine_identity: serde_json::to_value(config.identity).expect("identity"),
+    })
+}
+
 fn catalog_list_row(state: &ModuleState, row: &mut Value) -> Result<(), WireOperationError> {
     let id = row["model_id"].as_str().unwrap_or("").to_string();
     if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &id) {
+        if entry.task == "transcribe" {
+            let object = row.as_object_mut().expect("catalog row");
+            for field in [
+                "max_tokens",
+                "max_tokens_source",
+                "recommended_batch",
+                "bucket_ladder",
+                "dims",
+                "pooling",
+                "normalize",
+                "attention_units",
+            ] {
+                object.remove(field);
+            }
+            row["max_duration_ms"] = json!(backend.max_duration_ms.expect("transcribe duration"));
+        }
         let check = catalog_self_check_projection(state, entry, backend)?;
         row["certified"] = json!(check["state"] == "passed");
         row["serving_admission"] = json!(if check["state"] == "failed" {

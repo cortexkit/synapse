@@ -1,5 +1,5 @@
 {
-  "catalog_revision": 1,
+  "catalog_revision": 2,
   "models": [
     {
       "id": "gte-modernbert-base",
@@ -374,6 +374,64 @@
           "attention_units": 67108864,
           "max_tokens": 8192,
           "fingerprint": "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7"
+        }
+      ]
+    },
+    {
+      "id": "parakeet-tdt-0.6b-v3",
+      "task": "transcribe",
+      "name": "Parakeet TDT 0.6B v3",
+      "description": "Batch speech transcription in 25 European languages with word timestamps.",
+      "default_for_task": true,
+      "upstream": {
+        "hf_repo": "nvidia/parakeet-tdt-0.6b-v3",
+        "revision": "541d1f99c6b0c3cd0b11a95167540bb8edefd82b"
+      },
+      "files": [
+        {
+          "path": "model.safetensors", "role": "model",
+          "sha256": "3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",
+          "size_bytes": 2508311120, "backends": ["metal", "ane", "cuda", "vulkan"]
+        },
+        {
+          "path": "tokenizer.json", "role": "tokenizer",
+          "sha256": "bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91",
+          "size_bytes": 1159960, "backends": ["metal", "ane", "cuda", "vulkan"]
+        },
+        {
+          "path": "config.json", "role": "config",
+          "sha256": "e747b85e1bdfd300c8b8ac63bac8dd5221f8fe9bc275b48d06c735fcd6971b6e",
+          "size_bytes": 1153, "backends": ["metal", "ane", "cuda", "vulkan"]
+        }
+      ],
+      "backends": [
+        {
+          "backend": "metal", "engine": "owned-metal",
+          "profile": "parakeet-tdt-0.6b-v3.owned-metal",
+          "family": "parakeet-tdt", "dtype": "f32", "execution": "explicit",
+          "max_duration_ms": 600000,
+          "fingerprint": "a9fd8c153e040e61e457d4c8e40b942e2d91310501c9ec56510c994db319dcf6"
+        },
+        {
+          "backend": "ane", "engine": "ane-direct-worker",
+          "profile": "parakeet-tdt-0.6b-v3.ane-direct-worker",
+          "family": "parakeet-tdt", "dtype": "f16", "execution": "supervised",
+          "max_duration_ms": 600000,
+          "fingerprint": "716c0d8eb47500d371fe218beaa0e89853c105530fb457e425653375139abc19"
+        },
+        {
+          "backend": "cuda", "engine": "owned-cuda",
+          "profile": "parakeet-tdt-0.6b-v3.owned-cuda",
+          "family": "parakeet-tdt", "dtype": "f32", "execution": "supervised",
+          "max_duration_ms": 600000,
+          "fingerprint": "be2c2b674600f7230a853c7d7023ad5844b61a246525825c9bcec7d1c462e782"
+        },
+        {
+          "backend": "vulkan", "engine": "owned-vulkan",
+          "profile": "parakeet-tdt-0.6b-v3.owned-vulkan",
+          "family": "parakeet-tdt", "dtype": "f32", "execution": "supervised",
+          "max_duration_ms": 600000,
+          "fingerprint": "567c6a6f10c0145d1a56a15e1f570168d036246356a807f922f816a907af2b7f"
         }
       ]
     }
