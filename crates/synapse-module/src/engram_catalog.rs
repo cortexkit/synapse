@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // `decode-worker` is where a deployed config points `worker_runtime_dir` (crash
 // budgets and worker sockets); `certification` holds older probe evidence.
 // Both are rebuildable, so Engram never copies their contents.
-const CATALOG: &[u8] = br#"{"schema_version":1,"module_id":"synapse","entries":[{"entry_id":"synapse/store","class":"portable","mechanism":"whole-db","path":"store.db","writer_interaction":"backup-api-live"},{"entry_id":"synapse/certification","class":"rebuild","mechanism":"filetree","path":"certification"},{"entry_id":"synapse/decode-worker","class":"rebuild","mechanism":"filetree","path":"decode-worker"},{"entry_id":"synapse/logs","class":"excluded","mechanism":"filetree","path":"logs","reason":"Operational logs are disposable diagnostics, not module data."}]}"#;
+const CATALOG: &[u8] = br#"{"schema_version":1,"module_id":"synapse","entries":[{"entry_id":"synapse/store","class":"portable","mechanism":"whole-db","path":"store.db","writer_interaction":"backup-api-live"},{"entry_id":"synapse/certification","class":"rebuild","mechanism":"filetree","path":"certification"},{"entry_id":"synapse/decode-worker","class":"rebuild","mechanism":"filetree","path":"decode-worker"},{"entry_id":"synapse/logs","class":"excluded","mechanism":"filetree","path":"logs","reason":"Operational logs are disposable diagnostics, not module data."},{"entry_id":"synapse/media-audio","class":"excluded","mechanism":"filetree","path":"media-audio","reason":"Private uploaded recordings have short retention and must never enter backups."}]}"#;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -146,6 +146,16 @@ mod tests {
                 "synapse/decode-worker"
             ]
         );
+
+        let audio = parsed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["entry_id"] == "synapse/media-audio")
+            .unwrap();
+        assert_eq!(audio["class"], "excluded");
+        assert_eq!(audio["path"], "media-audio");
+        assert!(audio["reason"].as_str().unwrap().contains("recordings"));
 
         #[cfg(unix)]
         {

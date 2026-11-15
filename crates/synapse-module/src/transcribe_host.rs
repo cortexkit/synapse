@@ -440,6 +440,27 @@ impl TranscribeHost {
         })
     }
 
+    pub(crate) fn quarantine_retry_after_ms(&self) -> Option<u64> {
+        match &self.backend {
+            Backend::Worker(engine, model) => engine.transcribe_quarantine_retry_after_ms(model),
+            #[cfg(unix)]
+            Backend::Ane(engine) => engine.serving.transcribe_quarantine_retry_after_ms(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unload(&mut self) -> Result<(), TranscribeHostError> {
+        match &mut self.backend {
+            Backend::Metal(engine, model) => TranscribeEngine::unload(engine, model),
+            Backend::Worker(engine, _) => engine.shutdown_for_pause()?,
+            #[cfg(unix)]
+            Backend::Ane(engine) => engine.unload()?,
+            #[cfg(test)]
+            Backend::InProcessTest(_) => {}
+        }
+        Ok(())
+    }
+
     /// Run on a dedicated blocking thread that owns the engine call until it
     /// completes. A media job may stop waiting, but the thread must still drain
     /// the worker response before discarding that job's result.

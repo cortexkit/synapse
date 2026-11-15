@@ -824,6 +824,46 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 16,
+        statements: r#"
+            CREATE TABLE media_jobs (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                binding TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                accepted_ms INTEGER NOT NULL,
+                deadline_ms INTEGER,
+                retained_ms INTEGER NOT NULL,
+                result TEXT,
+                failure TEXT,
+                expired INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(owner, client_id)
+            );
+            CREATE INDEX media_jobs_lane ON media_jobs(lane, state);
+            CREATE TABLE media_objects (
+                id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                state TEXT NOT NULL,
+                received INTEGER NOT NULL DEFAULT 0,
+                retained_ms INTEGER NOT NULL,
+                output BLOB
+            );
+            CREATE TABLE media_observation_pages (
+                job_id TEXT NOT NULL REFERENCES media_jobs(id) ON DELETE CASCADE,
+                part TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY(job_id, part, page)
+            );
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -844,6 +884,9 @@ const RESTORE_APPLICATION_TABLES: &[&str] = &[
     "download_acquisitions",
     "download_key_bindings",
     "jobs",
+    "media_jobs",
+    "media_objects",
+    "media_observation_pages",
     "knob_assignments",
     "models",
     "perf_rows",
@@ -883,6 +926,9 @@ const RESTORE_KEEP_TABLES: &[&str] = &[
 // reloads both missing rows and refuses with CertificationMismatch until a
 // probe re-derives them.
 const RESTORE_CLEAR_TABLES: &[&str] = &[
+    "media_observation_pages",
+    "media_jobs",
+    "media_objects",
     "serving_sessions",
     "serving_retained_states",
     "serving_approvals",
@@ -9852,7 +9898,7 @@ mod tests {
                 .unwrap();
         }
         let store = SynapseStore::open(&descriptor).unwrap();
-        assert_eq!(newest_schema_version(), 15);
+        assert_eq!(newest_schema_version(), 16);
         let finished = store.get_job("finished").unwrap().unwrap();
         assert_eq!(finished.state, JOB_STATE_DONE);
         assert_eq!(finished.request_digest, "digest");
@@ -10220,7 +10266,7 @@ mod tests {
                         );
                         store.store
                     }
-                    10..=15 => store,
+                    10..=16 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -10377,6 +10423,9 @@ mod tests {
                 "download_key_bindings" => 0,
                 "catalog_self_checks" => 0,
                 "self_check_run_seq" => 1,
+                // Media state has no predecessor to translate at v16. Admission
+                // and populated restore fixtures exercise its transactional writers.
+                "media_jobs" | "media_objects" | "media_observation_pages" => 0,
                 other => panic!(
                     "table {other} has no declared population expectation; \
                      populate it in the step-through fence (or declare why it \
@@ -12219,6 +12268,17 @@ mod tests {
                         terminal_at_ms, params_json, page_count
                     ) VALUES ('job-{seed}', 'key-{seed}', 'digest-{seed}', 'embed.batch',
                               1, 'done', 1, 2, 100, 2, X'7B7D', 1);
+                    INSERT INTO media_objects (
+                        id, owner, mime, bytes, sha256, state, received, retained_ms
+                    ) VALUES ('object-{seed}', 'owner-{seed}', 'audio/wav', 100,
+                              'sha-{seed}', 'committed', 100, 3600000);
+                    INSERT INTO media_jobs (
+                        id, owner, client_id, binding, lane, object_id, state,
+                        accepted_ms, retained_ms, result
+                    ) VALUES ('media-{seed}', 'owner-{seed}', 'client-{seed}', '{{}}',
+                              'speech-cuda', 'object-{seed}', 'done', 1, 3600000, '{{}}');
+                    INSERT INTO media_observation_pages (job_id, part, page, data)
+                        VALUES ('media-{seed}', 'encoder_output', 0, X'00000000');
                     INSERT INTO result_pages (
                         request_digest, page_no, page_json, committed_at
                     ) VALUES ('digest-{seed}', 0, X'7B7D', 2);

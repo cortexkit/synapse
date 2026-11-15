@@ -68,6 +68,7 @@ pub use store::{
     RestoreImportReport, SynapseStore, SynapseStoreError, RECLAIM_FREELIST_MIN_BYTES,
     RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
 };
+mod media_jobs;
 pub mod transcribe_host;
 pub mod worker_host;
 
@@ -505,6 +506,7 @@ struct SynapseHandlerInner {
     #[cfg(feature = "test-support")]
     initialize_count: std::sync::atomic::AtomicUsize,
     approval_operators: Mutex<HashMap<RouteHandle, String>>,
+    media_principals: Mutex<HashMap<RouteHandle, String>>,
     /// The `flow_id` from each bound route's scope, for routes the daemon
     /// opened on behalf of a flow (an automation acting for its owner).
     /// Recorded at bind; `flow_refusal` uses it to refuse methods on such
@@ -1325,6 +1327,7 @@ type CoreMlTestWorkerFactory = Arc<
 
 struct RuntimeState {
     certify_observation: bool,
+    media: media_jobs::Runtime,
     ane_direct: AneDirectConfig,
     hf_endpoint: String,
     release_catalog: catalog::Catalog,
@@ -2424,6 +2427,7 @@ impl SynapseHandler {
                 #[cfg(feature = "test-support")]
                 initialize_count: std::sync::atomic::AtomicUsize::new(0),
                 approval_operators: Mutex::new(HashMap::new()),
+                media_principals: Mutex::new(HashMap::new()),
                 flow_routes: Mutex::new(HashMap::new()),
                 diagnostics_routes: Mutex::new(HashMap::new()),
                 connection_end: Arc::new(OnceLock::new()),
@@ -2487,6 +2491,7 @@ impl SynapseHandler {
             runtime,
             model_cache,
         });
+        media_jobs::startup(&state)?;
         startup_catalog_runtime(&state)?;
         Ok(state)
     }
@@ -2564,6 +2569,7 @@ impl RuntimeState {
             .collect();
         Ok(Self {
             certify_observation: config.certify_observation,
+            media: media_jobs::Runtime::default(),
             ane_direct: config.ane_direct,
             hf_endpoint,
             release_catalog,
@@ -4166,6 +4172,7 @@ impl ModuleHandler for SynapseHandler {
                             .map_err(|error| error.to_string())?;
                         let _ = handler.inner.state.set(Arc::clone(&state));
                         start_catalog_revalidation(Arc::clone(&state));
+                        media_jobs::start_maintenance(&state);
                         let _ = start_perf_sampler(state);
                         Ok(())
                     })
@@ -4207,11 +4214,28 @@ impl ModuleHandler for SynapseHandler {
                 operators.remove(&req.handle);
             }
         }
+        if let Some(principal) = req.principal.as_ref() {
+            let owner = match principal {
+                Principal::Direct => "principal:direct".to_string(),
+                Principal::Reserved { module_id } => format!("principal:reserved:{module_id}"),
+                Principal::Unverified => "principal:unverified".to_string(),
+            };
+            self.inner
+                .media_principals
+                .lock()
+                .expect("media principals")
+                .insert(req.handle, owner);
+        }
         self.inner.record_bind_scope(req);
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.inner
+            .media_principals
+            .lock()
+            .expect("media principals")
+            .remove(handle);
         if let Ok(mut operators) = self.inner.approval_operators.lock() {
             operators.remove(handle);
         }
@@ -4331,6 +4355,25 @@ impl ModuleHandler for SynapseHandler {
                 "permission_refused",
                 "diagnostics.findings requires a head, authorized flow, or unscoped management route",
             );
+        }
+        if envelope.method.starts_with("media.")
+            || envelope.method == "role.describe"
+            || envelope.method == "certify.transcribe_observation"
+        {
+            let principal = self
+                .inner
+                .media_principals
+                .lock()
+                .expect("media principals")
+                .get(&ctx.route_handle())
+                .cloned();
+            return media_jobs::handle(
+                state,
+                principal.as_deref(),
+                &envelope.method,
+                envelope.params,
+            )
+            .await;
         }
         let approved_by = self
             .inner
@@ -6372,6 +6415,17 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     } else {
         None
     };
+    if state
+        .runtime
+        .release_catalog
+        .resolve_reserved(&params.model_id)
+        .is_some_and(|(entry, _)| entry.task == "transcribe")
+    {
+        return match media_jobs::unload(&state.runtime, Some(&params.model_id), false).await {
+            Ok(()) => result_outcome(json!({"model_id":params.model_id,"state":"unloaded"})),
+            Err(error) => result_outcome(error_payload(&state, error)),
+        };
+    }
     let Some(snapshot) = model_slot_snapshot(&state.runtime, &params.model_id) else {
         return result_outcome(error_payload(&state, catalog_unknown(&params.model_id)));
     };
@@ -16905,6 +16959,17 @@ fn management_operations() -> Vec<ManagementOperation> {
     vec![
         op("diagnostics.findings", Query),
         op("certify.observations", Query),
+        op("certify.transcribe_observation", Query),
+        op("role.describe", Query),
+        op("media.submit", Mutate),
+        op("media.status", Query),
+        op("media.result", Query),
+        op("media.cancel", Mutate),
+        op("media.upload_begin", Mutate),
+        op("media.upload_append", Mutate),
+        op("media.upload_status", Query),
+        op("media.upload_commit", Mutate),
+        op("media.read", Query),
         op("lanes.pause", Mutate),
         op("lanes.resume", Mutate),
         op("lanes.status", Query),
@@ -16955,7 +17020,15 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // Trust tier and bindings are left undeclared: subc-protocol 0.19 made
     // them optional because the daemon reads neither on any production path,
     // and a declaration nothing consumes only drifts from the truth unnoticed.
+    let media = load_module_config()
+        .and_then(|config| RuntimeState::from_catalog(config, Vec::new()))
+        .map(|runtime| media_jobs::declaration(&runtime))
+        .unwrap_or_else(|_| json!({"groups":["jobs"],"jobs_survive_restart":false,"engines":[]}));
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .role_declarations(BTreeMap::from([(
+            "media-provider/v1".into(),
+            media.as_object().expect("media declaration").clone(),
+        )]))
         .protocol_ver(PROTOCOL_VERSION)
         .provides(vec![ProviderRole::ManagementSurface {
             operations: management_operations(),
@@ -16976,6 +17049,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
                 "flow-scopes/v1".to_string(),
+                "media-provider/v1".to_string(),
                 subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
@@ -20439,7 +20513,7 @@ mod tests {
         );
         assert_eq!(
             manifest.capabilities.as_ref().unwrap().provides,
-            vec!["flow-scopes/v1", "bind-no-project/v1"]
+            vec!["flow-scopes/v1", "media-provider/v1", "bind-no-project/v1"]
         );
         manifest.validate_flow_operations().unwrap();
         assert!(operations.iter().any(
@@ -28915,7 +28989,8 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
             .lock()
             .expect("catalog disk lock");
         let entry = catalog_entry_for_management(&state.runtime, &params.catalog_id)?;
-        let holders = catalog_holders(&state, entry)?;
+        let mut holders = catalog_holders(&state, entry)?;
+        holders.extend(media_jobs::holders(&state, entry)?);
         if !holders.is_empty() {
             return Err(catalog_wire_error(
                 "model_in_use",

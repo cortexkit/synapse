@@ -384,6 +384,7 @@ async fn drain(state: &Arc<ModuleState>) -> Result<(), WireOperationError> {
             .map_err(|e| transient_model_load_error(format!("pause unload: {e}")))??;
         }
     }
+    media_jobs::unload(&state.runtime, None, true).await?;
     drain_progress(&state.runtime, None, "releasing_global_lock", true);
     #[cfg(unix)]
     if let Some(supervisor) = state

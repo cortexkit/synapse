@@ -152,6 +152,29 @@ impl WorkerHost {
 }
 
 impl WorkerEngine {
+    #[cfg(all(test, unix))]
+    pub(crate) fn quarantine_transcribe_for_test(&self, model: &LoadedModel) {
+        let mut host = self.lock_host().unwrap();
+        let key = host
+            .loaded_models
+            .get(&model.model_id)
+            .unwrap()
+            .crash_key
+            .clone();
+        for _ in 0..host.config.crash_budget.max_crashes {
+            host.record_crash(key.clone());
+        }
+    }
+
+    pub(crate) fn transcribe_quarantine_retry_after_ms(&self, model: &LoadedModel) -> Option<u64> {
+        let mut host = self.lock_host().ok()?;
+        let key = host.loaded_models.get(&model.model_id)?.crash_key.clone();
+        match host.quarantine_error(&key) {
+            Some(WorkerHostError::Quarantined { retry_after_ms, .. }) => retry_after_ms,
+            _ => None,
+        }
+    }
+
     pub(crate) fn load_transcribe(
         &self,
         artifact: &ValidatedArtifact,

@@ -67,9 +67,13 @@ reqwest = { workspace = true }
 url = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-log = { workspace = true }
+cortexkit-role-media = "=0.1.11"
+base64 = "0.22"
 tracing = { workspace = true }
 
 [dev-dependencies]
+cortexkit-role-media-conformance = "=0.2.8"
+async-trait = "0.1"
 # Let self-check deadline tests pause time during their initial subscription poll.
 tokio = { workspace = true, features = ["test-util"] }
 syn = { version = "2", features = ["full", "visit"] }

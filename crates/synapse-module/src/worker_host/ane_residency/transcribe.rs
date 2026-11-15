@@ -100,6 +100,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneWorkerChannel<S> {
 
 #[cfg(unix)]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
+    pub(crate) fn transcribe_quarantine_retry_after_ms(&self) -> Option<u64> {
+        self.channel.cooldown_remaining()
+    }
+
     async fn admit_self_check(&self, frames: usize) -> Result<AneShapeLease, AneResidencyError> {
         if self.channel.retired.load(Ordering::Acquire) {
             return Err(AneResidencyError::Channel("worker is retired".into()));

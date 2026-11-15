@@ -346,6 +346,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-role-media"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c26e268c5196554d471dd27dfa53c35dbe219603ed82213c5424e27756a75c77"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "cortexkit-store"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2014,8 +2027,10 @@ name = "synapse-module"
 version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cortexkit-lease",
  "cortexkit-log",
+ "cortexkit-role-media",
  "cortexkit-store",
  "cortexkit-store-types",
  "half",

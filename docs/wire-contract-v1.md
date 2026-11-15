@@ -233,7 +233,110 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
 `approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
-`lanes.resume`, `lanes.status`, and `diagnostics.findings`.
+`lanes.resume`, `lanes.status`, `diagnostics.findings`, `role.describe`,
+`media.submit`, `media.status`, `media.result`, `media.cancel`,
+`media.upload_begin`, `media.upload_append`, `media.upload_status`,
+`media.upload_commit`, `media.read`, and `certify.transcribe_observation`.
+
+### Local batch transcription (`media-provider/v1`)
+
+This surface follows `cortexkit-role-media` 0.1.11. Successful RESPONSE bodies
+are exactly `{result: answer}`; ERROR bodies are `{code, message, detail}` with
+`detail.class` (`permanent` or `transient`). Local transcription needs neither
+a vault credential nor a host binding and writes no usage or price record.
+Identity comes from the daemon's route principal, never request params. Foreign
+job/object ids are indistinguishable from unknown ids. Flow-scoped routes refuse
+all of these operations with `flow_scope_refused`.
+
+- **role.describe** {} — query; declares group `jobs`,
+  `jobs_survive_restart: false`, and engines `{kind: "transcribe", provider:
+  "local", model, local: true, formats: ["audio/wav"], latency_class: "batch",
+  max_input_bytes: 268435456, max_duration_ms}`. The same engine facts appear in
+  `role_declarations["media-provider/v1"]`. No `bias_limit` is declared.
+- **media.submit** {client_job_id, kind: "transcribe", model, input: {audio,
+  language?, bias?}, decision_id?, deadline_ms?} — mutate; returns `{job_id}`.
+  `client_job_id` is 1–128 Unicode scalar values and is scoped to the principal.
+  Replaying equal decoded JSON returns the original id, including after failure
+  or restart, without new work. A changed `kind`, `input`, `model`, `decision_id`
+  or `deadline_ms` refuses with `client_job_id_reuse {field}`, in that order.
+  Refused submissions remember nothing. `language` is accepted and ignored;
+  non-empty bias refuses with `invalid_params {field: "bias"}`.
+- **media.status** {job_id} — query; returns `{status, failure?}` where status is
+  `queued`, `running`, `done`, `failed` or `cancelled`. Exactly failed jobs carry
+  `{code, class, message, retry_after_ms?, detail?}`. Deadlines include queue time.
+- **media.result** {job_id} — query; done jobs return `{text, words: [{text,
+  start_ms, end_ms}], no_speech}` with no language. Answers exceeding 3 MiB are
+  stored as JSON and returned through `{output_object: {mime, bytes, sha256,
+  object_id}}`, readable with `media.read`. Certification mode adds the
+  observation descriptor below. Other statuses refuse with `job_not_done
+  {status}`. Unknown/foreign jobs refuse with `unknown_job`.
+- **media.cancel** {job_id} — mutate; returns `{status}`. Cancellation is terminal
+  immediately; the first terminal status wins. In-flight work drains on its lane
+  owner and its output is discarded. Cancellation does not count as a worker
+  crash or consume the crash budget that can quarantine a lane.
+- **media.upload_begin** {mime, bytes, sha256} — mutate; returns `{upload_id}`.
+- **media.upload_append** {upload_id, offset, data} — mutate; appends contiguous
+  base64 data, at most 2 MiB decoded per request, and returns `{received}`.
+  Refusals include `upload_chunk_too_large`, `upload_offset_mismatch {received}`,
+  and `upload_size_mismatch`, without changing the committed offset.
+- **media.upload_status** {upload_id} — query; returns `{state, received}`.
+- **media.upload_commit** {upload_id} — mutate; verifies size and lowercase hex
+  SHA-256, then returns `{state: "committed", sha256, mime, bytes}`. The upload id
+  becomes the object id. States are `open`, `committed`, `gone`. Unknown/foreign
+  uploads give `unknown_upload`; lost open uploads give `upload_gone`.
+- **media.read** {object_id, offset, length} — query; returns `{data}` base64,
+  with length 1–2,097,152 bytes. Unknown/foreign/gone objects give `unknown_object`;
+  uncommitted uploads give `upload_not_committed`. Object facts are authoritative;
+  mismatches give `object_mismatch {field: "input.audio"}`.
+- **certify.transcribe_observation** {job_id, part, page} — query; available only
+  in certification observation mode, otherwise `certify_observation_disabled`.
+  Part is `encoder_output` or `decode_trace`. Each reply is `{data}` containing
+  base64 of at most 512 KiB raw bytes. The result's `observation` contains
+  `{lane_id, fingerprint, valid_encoder_frames, triples, encoder_output,
+  decode_trace}`, where triples is base64 and each large part is
+  `{bytes, sha256, pages}`. Pages expire with their job result.
+
+The catalog engine id `parakeet-tdt-0.6b-v3` selects the first runnable backend
+in catalog order (Metal, ANE, CUDA, Vulkan). Lane ids append `-metal`, `-ane`,
+`-cuda` or `-vulkan` and pin that backend. Neither form switches to another
+backend when the selected one is not installed, failed its self-check, or is
+paused or quarantined. Non-runnable engines are not declared
+and submit refuses `backend_unavailable`. Runnable uninstalled engines remain
+declared and refuse `model_not_installed {download_op: "models.download"}`.
+Persisted numerical failures remain declared and refuse permanent
+`self_check_failed`. Transient load/self-check faults and worker quarantine
+remain declared and refuse `engine_crashed` with `retry_after_ms`; quarantine
+also names `lane_id` and `quarantined: true`. Neural Engine pause refuses
+`lane_paused` without selecting a different backend.
+
+Each lane runs one transcription at a time and admits at most 16 non-terminal
+jobs; catalog jobs count against their selected lane. Upload reservations and
+stored audio total at most 1 GiB. Refusals beyond either bound are transient
+`queue_full` with `retry_after_ms`, before storing any job/audio. Accepted input
+is RIFF/WAVE PCM16 or float32 (including extensible variants), 8–192 kHz and
+1–8 channels, up to 256 MiB. Malformed, unsupported or non-finite WAV input
+refuses `invalid_params {field: "audio"}` before engine work. A stated duration
+over the limit refuses `input_too_large {field: "input.audio", limit:
+"max_duration_ms"}` at submit. A decoded duration/frame overflow instead makes
+the accepted job fail with the same permanent code and details before loading
+a host, reserving compiled programs for the request's frame count, or running
+inference. Duration failures also carry
+`{duration_ms, max_duration_ms, valid_encoder_frames, max_encoder_frames}`.
+The byte limit uses `input_too_large {field: "input.audio", limit:
+"max_input_bytes"}`.
+
+Audio bytes live only in owner-only `media-audio` beneath the data folder
+(0700 directory and 0600 files on Unix; the user data ACL on Windows), explicitly
+excluded from Engram backups. SQLite holds metadata, replay bindings and results,
+never inline recordings. Open uploads expire after one hour without append and
+become gone on restart. Committed uploads survive restart and remain at least
+one hour after commit, or the later of job end and last result/read. Terminal
+jobs/results/replays survive restart; queued/running jobs become failed with
+transient `module_restarted`. Retention sweeps remove expired audio and results;
+startup also removes orphaned audio. These retention, replay and word-shape
+rules apply to this media surface.
+
+### Other management operations
 
 - **diagnostics.findings** {window_ms?} — read-only query. Omitted/null params
   mean `{}`; `window_ms` omitted/null defaults to 21,600,000 ms (six hours).
