@@ -92,7 +92,9 @@ are not engine progress events. Per-fixture JSONL and the final summary record
 timing, cosine, WER, memory and the certified ladder maximum. The trace-exemption
 field records whether the first differing head decision qualified for the
 reference's low-logit-margin exception; it does not exempt the encoder gate.
-The gate also enforces a 10 GB GPU-inclusive lifetime `phys_footprint` budget.
+The gate also enforces a 10 GB memory budget: the process's peak
+`phys_footprint`, the macOS figure for memory charged to the process, which on
+Apple GPUs includes GPU buffers. It keeps the longest rung within a 16 GB Mac.
 `SYNAPSE_METAL_SPEECH_ENCODER_SAVE` saves raw little-endian fp32 encoder outputs
 per fixture to a directory; `SYNAPSE_METAL_SPEECH_ENCODER_COMPARE` reads such a
 directory from a previous engine run and records each fixture's maximum absolute
