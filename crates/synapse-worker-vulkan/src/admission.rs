@@ -20,6 +20,13 @@ pub fn requirements(manifest: &Manifest, slug: Option<&str>) -> Result<Required,
         .filter(|p| p.lane == Lane::OwnedVulkan && slug.is_none_or(|s| p.model == s))
     {
         let model = &manifest.models[&profile.model];
+        // The model-less probe gates the whole Vulkan backend for embedding and
+        // reranking. Speech floors are several times larger, so folding them in
+        // would switch off embedding on GPUs that run it fine; a speech lane is
+        // checked against its own floor when it is probed by model.
+        if slug.is_none() && model.operation == Operation::Transcribe {
+            continue;
+        }
         let floors = if model.operation == Operation::Transcribe {
             crate::transcribe::floors(
                 model,

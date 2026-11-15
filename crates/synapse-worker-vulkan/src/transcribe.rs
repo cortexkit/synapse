@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn transcribe_floors_cover_exact_inventory_and_enter_global_probe() {
+    fn transcribe_floors_cover_exact_inventory_and_stay_out_of_global_probe() {
         let manifest = crate::manifest();
         let model = &manifest.models["parakeet-tdt-0.6b-v3"];
         let profile = &manifest.profiles["parakeet-tdt-0.6b-v3.owned-vulkan"];
@@ -692,9 +692,11 @@ mod tests {
             Some(required.min_storage_buffer_range),
             profile.vulkan_min_storage_buffer_range
         );
+        // The model-less backend probe covers embedding and reranking only:
+        // Qwen3's 1.76 GB floor, not the speech lane's 3.28 GB.
         let global = crate::admission::requirements(&manifest, None).unwrap();
-        assert!(global.min_device_local_bytes >= required.min_device_local_bytes);
-        assert!(global.min_storage_buffer_range >= required.min_storage_buffer_range);
+        assert_eq!(global.min_device_local_bytes, 1_764_145_408);
+        assert_eq!(global.min_storage_buffer_range, 310_618_112);
         assert_eq!(
             crate::admission::requirements(&manifest, Some("parakeet-tdt-0.6b-v3")).unwrap(),
             required
@@ -706,7 +708,7 @@ mod tests {
             .unwrap()
             .vulkan_min_device_local_bytes = Some(required.min_device_local_bytes - 1);
         assert_eq!(
-            crate::admission::requirements(&broken, None).unwrap_err(),
+            crate::admission::requirements(&broken, Some("parakeet-tdt-0.6b-v3")).unwrap_err(),
             "manifest_mismatch"
         );
     }
