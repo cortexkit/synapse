@@ -636,7 +636,7 @@ async fn management_fixture() {
         models_catalog(state.clone(), json!({})).await,
         "models.catalog",
     );
-    assert_eq!(rows["models"].as_array().unwrap().len(), 4);
+    assert_eq!(rows["models"].as_array().unwrap().len(), 5);
     for row in rows["models"].as_array().unwrap() {
         let download = response_result(
             models_download(state.clone(), json!({"catalog_id":row["id"]})).await,
