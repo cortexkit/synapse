@@ -34,7 +34,7 @@
       "gte-reranker-modernbert-base.owned-metal": "96ec4ca41db7fa1716f28d37b88dde89a5fe316e6c91b7ae9c5b96c900fec7a0",
       "gte-reranker-modernbert-base.owned-vulkan": "1da21b3ab0d541caec40a65fd1cf2cec5c8f1ec590ebc5df360d6bf9471da783",
       "parakeet-tdt-0.6b-v3.ane-direct-worker": "eaf1c15fb6d358c9675c83c91a68ea099ad9008aef52b7284377b917857a4820",
-      "parakeet-tdt-0.6b-v3.owned-cuda": "5116448f7979c70a0031e3e0db00fcdf43ec3730350c312a188d2dd728bf12c3",
+      "parakeet-tdt-0.6b-v3.owned-cuda": "e41be8497607e06c51552af7a1d12d6108c227e50a43ecc2a7d4a6bb0177c67c",
       "parakeet-tdt-0.6b-v3.owned-metal": "641ec0b90dc3f34cffecf88e39dc357932b8444da9c18324f6572a57d4bcfec7",
       "parakeet-tdt-0.6b-v3.owned-vulkan": "0ae0837a03fca46e34f6900dcbb9cb2d73f36dc2ed911a27a595937587bf28b2",
       "qwen3-embedding-0.6b.ane-direct-worker": "05e8ac1af8e3e78e2cbde230ddb16d6fb08379df42b984f2a366e7da2b72a511",
@@ -883,17 +883,17 @@
       }
     },
     "parakeet-tdt-0.6b-v3.owned-cuda": {
-      "compute_dtype": "f16",
+      "compute_dtype": "f32",
       "conversion_rule": "v1",
-      "converted_package_digest": "sha256:55144098605bbd64592686c407a31b09f16bca33b02c3e3b04b46bbe705287a3",
+      "converted_package_digest": "sha256:1f89f0a76ef7f1bc738eaaac4befd6bc2dd94cf5c3bad2ae2b98885657ecddec",
       "cuda_min_compute_major": 7,
       "cuda_min_compute_minor": 5,
       "cuda_min_driver_api": 13020,
-      "fp32_tensors": [],
+      "fp32_tensors": "all",
       "lane": "owned-cuda",
       "model": "parakeet-tdt-0.6b-v3",
-      "rerank_tolerance_class": "fp16",
-      "storage_dtype": "f16",
+      "rerank_tolerance_class": "fp32",
+      "storage_dtype": "f32",
       "transcribe": {
         "confirmations": {
           "decode_rule": {

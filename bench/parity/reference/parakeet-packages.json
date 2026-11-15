@@ -9,9 +9,9 @@
       "sha256": "bbd41622921c3c3ad3a663aaf02799f29be33173569656d913738c16392fc192"
     },
     "parakeet-tdt-0.6b-v3.owned-cuda": {
-      "bytes": 1254196308,
+      "bytes": 2508311520,
       "integer_counters_verified": 24,
-      "sha256": "55144098605bbd64592686c407a31b09f16bca33b02c3e3b04b46bbe705287a3"
+      "sha256": "1f89f0a76ef7f1bc738eaaac4befd6bc2dd94cf5c3bad2ae2b98885657ecddec"
     },
     "parakeet-tdt-0.6b-v3.owned-vulkan": {
       "bytes": 1254196308,

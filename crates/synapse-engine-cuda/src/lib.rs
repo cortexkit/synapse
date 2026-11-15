@@ -18,6 +18,7 @@ use synapse_core::{
 mod cuda;
 pub mod manifest;
 mod model;
+pub mod transcribe;
 
 pub use cuda::probe_hardware_floor;
 

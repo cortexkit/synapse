@@ -313,24 +313,31 @@ fn tolerance_class_and_fp32_lists_follow_the_rule() {
         if profile.rerank_tolerance_class == ToleranceClass::Fp32 {
             fp32_class.push(id.clone());
         }
-        if matches!(profile.lane, Lane::OwnedCuda | Lane::OwnedVulkan) {
+        if matches!(profile.lane, Lane::OwnedCuda | Lane::OwnedVulkan)
+            && id != "parakeet-tdt-0.6b-v3.owned-cuda"
+        {
             assert_eq!(profile.fp32_tensors, Fp32Tensors::List(vec![]), "{id}");
             assert_eq!(profile.storage_dtype, DType::F16, "{id}");
         }
     }
     // The expected values below are written out by hand from the rule in
-    // src/rules.rs (the f32 Metal gte-reranker and Parakeet profiles are fp32-class;
+    // src/rules.rs (Metal gte-reranker and Metal/CUDA Parakeet are fp32-class;
     // direct ANE keeps exactly its CPU-stage tensors in fp32), so a bug in that
     // rule cannot also make this test pass.
     assert_eq!(
         fp32_class,
         [
             "gte-reranker-modernbert-base.owned-metal",
+            "parakeet-tdt-0.6b-v3.owned-cuda",
             "parakeet-tdt-0.6b-v3.owned-metal",
         ]
     );
     assert_eq!(
         m.profiles["gte-reranker-modernbert-base.owned-metal"].fp32_tensors,
+        Fp32Tensors::All(AllMarker::All)
+    );
+    assert_eq!(
+        m.profiles["parakeet-tdt-0.6b-v3.owned-cuda"].fp32_tensors,
         Fp32Tensors::All(AllMarker::All)
     );
     assert_eq!(

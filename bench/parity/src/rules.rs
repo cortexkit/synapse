@@ -42,11 +42,12 @@ pub const ANE_CPU_STAGES: [&str; 8] = [
 ];
 
 pub fn storage_dtype(model_slug: &str, lane: Lane) -> DType {
-    if lane == Lane::OwnedMetal
+    if (lane == Lane::OwnedMetal
         && matches!(
             model_slug,
             "gte-reranker-modernbert-base" | "parakeet-tdt-0.6b-v3"
-        )
+        ))
+        || (lane == Lane::OwnedCuda && model_slug == "parakeet-tdt-0.6b-v3")
     {
         DType::F32
     } else {
@@ -121,11 +122,12 @@ pub fn stage_tensors(model: &Model, stage: &str) -> Result<Vec<String>> {
 
 pub fn fp32_tensors(model_slug: &str, model: &Model, lane: Lane) -> Result<Fp32Tensors> {
     Ok(match lane {
-        Lane::OwnedCuda | Lane::OwnedVulkan => Fp32Tensors::List(vec![]),
-        Lane::OwnedMetal => match storage_dtype(model_slug, lane) {
-            DType::F32 => Fp32Tensors::All(AllMarker::All),
-            DType::F16 => Fp32Tensors::List(vec![]),
-        },
+        Lane::OwnedCuda | Lane::OwnedVulkan | Lane::OwnedMetal => {
+            match storage_dtype(model_slug, lane) {
+                DType::F32 => Fp32Tensors::All(AllMarker::All),
+                DType::F16 => Fp32Tensors::List(vec![]),
+            }
+        }
         Lane::AneDirect => {
             let mut set = BTreeSet::new();
             for stage in ane_cpu_stages(model) {
