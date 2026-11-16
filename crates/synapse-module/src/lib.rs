@@ -321,7 +321,18 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
             .await
         {
             Ok((handle, serving)) => {
-                let _ = handler.inner.module_handle.set(handle);
+                // The SDK runs on_hello_ack, and with it the whole boot, before it returns
+                // this handle, so the boot can't start the publisher; start it here instead.
+                // A failed boot panics inside on_hello_ack, so the state is always set by now.
+                match (handler.inner.state.get(), subc_connection_file_from_args()) {
+                    (Some(state), Ok(path)) => event_outbox::start(state, handle, path),
+                    (state, path) => tracing::warn!(
+                        target: "lifecycle",
+                        state_ready = state.is_some(),
+                        connection_file = path.is_ok(),
+                        "event publisher not started; committed events stay in the outbox"
+                    ),
+                }
                 serving.await
             }
             Err(error) => Err(error),
@@ -510,7 +521,6 @@ struct SynapseHandler {
 }
 
 struct SynapseHandlerInner {
-    module_handle: OnceLock<subc_client_rs::ModuleHandle>,
     module_id: String,
     state: OnceLock<Arc<ModuleState>>,
     initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
@@ -2434,7 +2444,6 @@ impl SynapseHandler {
     fn new(module_id: String) -> Self {
         Self {
             inner: Arc::new(SynapseHandlerInner {
-                module_handle: OnceLock::new(),
                 module_id,
                 state: OnceLock::new(),
                 initialization: OnceLock::new(),
@@ -4188,12 +4197,6 @@ impl ModuleHandler for SynapseHandler {
                             .map_err(|error| error.to_string())?;
                         let _ = handler.inner.state.set(Arc::clone(&state));
                         diagnostics_findings::start(&state);
-                        if let (Some(handle), Ok(path)) = (
-                            handler.inner.module_handle.get(),
-                            subc_connection_file_from_args(),
-                        ) {
-                            event_outbox::start(&state, handle.clone(), path);
-                        }
                         start_catalog_revalidation(Arc::clone(&state));
                         media_jobs::start_maintenance(&state);
                         let _ = start_perf_sampler(state);

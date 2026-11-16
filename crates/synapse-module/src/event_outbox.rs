@@ -291,7 +291,8 @@ async fn drain(store: Arc<SynapseStore>, mut bus: impl EventBus, clock: Clock) {
         .await;
         match result {
             Ok(published) => {
-                if published {
+                if published && outage {
+                    tracing::info!(target: "lifecycle", "event publisher reconnected");
                     outage = false;
                 }
                 backoff = Duration::from_millis(250);
@@ -299,9 +300,11 @@ async fn drain(store: Arc<SynapseStore>, mut bus: impl EventBus, clock: Clock) {
                     tokio::time::sleep(IDLE_POLL).await;
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 if !outage {
                     tracing::warn!(
+                        target: "lifecycle",
+                        %error,
                         "event publisher unavailable; committed events remain in the outbox"
                     );
                     outage = true;
@@ -324,6 +327,7 @@ pub(super) fn start(
         client: None,
         module_id: state.module_id.clone(),
     };
+    tracing::info!(target: "lifecycle", "event publisher started");
     tokio::spawn(drain(state.store.clone(), bus, Clock::new(crate::now_ms())));
 }
 
