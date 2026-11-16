@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenizers::{
-    models::bpe::BPE, normalizers::unicode::NFC, pre_tokenizers::PreTokenizerWrapper, AddedToken,
+    decoders::byte_level::ByteLevel, models::bpe::BPE, normalizers::unicode::NFC,
+    pre_tokenizers::PreTokenizerWrapper, AddedToken,
 };
 
 use crate::{Error, Result};
@@ -79,6 +80,7 @@ impl Tokenizer {
         let pretokenizer: PreTokenizerWrapper = serde_json::from_slice(pretokenizer)
             .map_err(|e| Error::InvalidTokenizer(e.to_string()))?;
         let mut ordinary = tokenizers::Tokenizer::new(model);
+        ordinary.with_decoder(Some(ByteLevel::default()));
         ordinary.with_normalizer(Some(NFC));
         ordinary.with_pre_tokenizer(Some(pretokenizer));
         let config: serde_json::Value =
@@ -116,6 +118,18 @@ impl Tokenizer {
             .encode(text, false)
             .map(|encoded| encoded.get_ids().to_vec())
             .map_err(|e| Error::InvalidTokenizer(e.to_string()))
+    }
+
+    pub(super) fn decode_generated(&self, ids: &[u32]) -> Result<String> {
+        if ids
+            .iter()
+            .any(|&id| self.ordinary.id_to_token(id).is_none())
+        {
+            return Err(Error::InvalidAsrOutput("unknown generated token"));
+        }
+        self.ordinary
+            .decode(ids, true)
+            .map_err(|_| Error::InvalidAsrOutput("generated token decoding failed"))
     }
 
     /// Count the exact forwarded context, not a sum of independently encoded terms.

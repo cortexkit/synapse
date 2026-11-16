@@ -4,10 +4,15 @@
 mod frontend;
 mod language;
 #[cfg(feature = "qwen")]
+mod parse;
+#[cfg(feature = "qwen")]
 mod prompt;
 
+pub use crate::timing::align_words;
 pub use frontend::{audio_tokens, mel_frames, Features, Frontend};
 pub use language::{language_code, language_name, LANGUAGES};
+#[cfg(feature = "qwen")]
+pub use parse::ParsedTranscript;
 #[cfg(feature = "qwen")]
 pub use prompt::*;
 

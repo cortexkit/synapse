@@ -123,6 +123,23 @@ limit. `LANGUAGES`, `language_name` and `language_code` share all 30 pinned mode
 names between hint rendering and output parsing; the served catalog separately
 narrows its declared languages to the Parakeet word-timing companion's set.
 
+`Tokenizer::parse` accepts generated ids only and returns transcript text and a
+contract language code, never raw model output. With no hint, a language line
+and `<asr_text>` marker are required; `None` and unknown language names report no
+language. With a valid hint, the continuation needs no marker and reports the
+table's canonical base code, including for regional hints. Unsupported hints
+map to `invalid_params` with field `language`; malformed output has a distinct
+`InvalidAsrOutput` error.
+
+`qwen::align_words` is available without the tokenizer feature. It splits Qwen
+text on whitespace and uses `synapse-wer-norm-v1` only for edit-distance matching,
+leaving spelling and punctuation unchanged. Matches and substitutions borrow
+Parakeet times; unaligned runs divide the gap evenly, including zero-length gaps
+between overlapping anchors. Empty-normalizing words never align. Bad companion
+times are refused rather than changed. The serving caller must treat a companion
+with no words as `no_speech` and skip Qwen; nonempty text without companion words
+is an internal-invariant error.
+
 ```sh
 cargo test --locked -p synapse-speech --features qwen --test qwen
 cargo test --locked -p synapse-speech --no-default-features --test qwen

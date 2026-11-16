@@ -353,6 +353,146 @@ fn qwen_every_sealed_prompt_and_span_matches_reference() {
     assert_eq!(checked, 6559);
 }
 
+#[cfg(feature = "qwen")]
+#[test]
+fn qwen_every_sealed_generated_output_matches_reference() {
+    let tokenizer = qwen::Tokenizer::pinned();
+    let mut checked = 0;
+    for case in corpus()["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let trace = trace(id);
+        if trace["generated_ids"].is_null() {
+            continue;
+        }
+        let ids: Vec<u32> = serde_json::from_value(trace["generated_ids"].clone()).unwrap();
+        let hint = case["language_hint"]
+            .as_str()
+            .map(|name| qwen::language_code(name).unwrap());
+        let parsed = tokenizer
+            .parse(&ids, hint)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(parsed.text, trace["text"].as_str().unwrap(), "{id}");
+        assert_eq!(
+            parsed.language.as_deref(),
+            trace["language"].as_str().and_then(qwen::language_code),
+            "{id}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 6559);
+}
+
+#[cfg(feature = "qwen")]
+#[test]
+fn qwen_sealed_generated_parser_boundaries() {
+    use synapse_speech::Error;
+    let bytes = include_bytes!("fixtures/qwen-generated.json");
+    assert_eq!(bytes.len(), 1294);
+    assert_eq!(
+        sha(bytes),
+        "208d5b49e6f416f531a208ac02ca054bc3e28f13bcce9609bee2c27d7d0f476f"
+    );
+    let fixtures: Value = serde_json::from_slice(bytes).unwrap();
+    let tokenizer = qwen::Tokenizer::pinned();
+    for case in fixtures["cases"].as_array().unwrap() {
+        let ids: Vec<u32> = serde_json::from_value(case["generated_ids"].clone()).unwrap();
+        let result = tokenizer.parse(&ids, case["hint"].as_str());
+        if let Some(message) = case["error"].as_str() {
+            assert!(
+                matches!(result, Err(Error::InvalidAsrOutput(actual)) if actual == message),
+                "{}",
+                case["id"]
+            );
+        } else {
+            let parsed = result.unwrap();
+            assert_eq!(
+                parsed.text,
+                case["text"].as_str().unwrap(),
+                "{}",
+                case["id"]
+            );
+            assert_eq!(
+                parsed.language.as_deref(),
+                case["language"].as_str(),
+                "{}",
+                case["id"]
+            );
+        }
+    }
+    for &(code, _) in qwen::LANGUAGES {
+        let parsed = tokenizer
+            .parse(&[58929, 558, 13, 151645], Some(code))
+            .unwrap();
+        assert_eq!(parsed.text, "Venice.");
+        assert_eq!(parsed.language.as_deref(), Some(code));
+    }
+    assert_eq!(
+        tokenizer
+            .parse(&[], Some("EN-us"))
+            .unwrap()
+            .language
+            .as_deref(),
+        Some("en")
+    );
+    assert!(
+        matches!(tokenizer.parse(&[], Some("zz")), Err(Error::UnsupportedLanguage(code)) if code == "zz")
+    );
+    assert!(matches!(
+        tokenizer.parse(&[u32::MAX], Some("en")),
+        Err(Error::InvalidAsrOutput(_))
+    ));
+    let prompt = tokenizer
+        .render(qwen::PromptRequest {
+            terms: &["<asr_text>"],
+            prompt: None,
+            language: None,
+            audio_tokens: 1,
+            bias_limit: 100,
+        })
+        .unwrap();
+    assert!(prompt.ids.contains(&qwen::ASR_TEXT));
+    assert!(matches!(
+        tokenizer.parse(&[58929, 558, 13], None),
+        Err(Error::InvalidAsrOutput("missing <asr_text> marker"))
+    ));
+}
+
+#[test]
+fn word_normalizer_matches_both_sealed_corpora() {
+    use synapse_parity::speech::{normalize_words as reference_normalize, NORMALIZER};
+    use synapse_speech::{normalize_words, WORD_NORMALIZER_REVISION};
+    assert_eq!(WORD_NORMALIZER_REVISION, NORMALIZER);
+    let mut checked = 0;
+    let mut check = |case: &Value| {
+        for key in ["ground_truth", "text"] {
+            if let Some(text) = case[key].as_str() {
+                assert_eq!(
+                    normalize_words(text),
+                    reference_normalize(text),
+                    "{key}: {text}"
+                );
+                checked += 1;
+            }
+        }
+    };
+    for case in corpus()["cases"].as_array().unwrap() {
+        let trace = trace(case["id"].as_str().unwrap());
+        check(&trace);
+    }
+    let index = json(parity().join("fixtures/index.json"));
+    let seal = &index["parakeet-tdt-0.6b-v3.ref-v1.transformers-5.16.1.seed-0"];
+    let bytes = fs::read(parity().join(seal["path"].as_str().unwrap())).unwrap();
+    assert_eq!(bytes.len() as u64, seal["bytes"].as_u64().unwrap());
+    assert_eq!(sha(&bytes), seal["sha256"].as_str().unwrap());
+    let parakeet: Value = serde_json::from_slice(&bytes).unwrap();
+    for case in parakeet["cases"].as_array().unwrap() {
+        check(case);
+    }
+    // Parakeet's 47 synthetic frontend-boundary cases have no human reference;
+    // Qwen's over-limit refusal has ground truth but no generated transcript.
+    assert_eq!(checked, 2 * 6559 + 1 + 1200 + 1247);
+}
+
 /// Public PCM is reconstructed with the pinned corpus recipes and checked against
 /// each trace's model-input digest. Set SYNAPSE_QWEN_PARITY_INPUTS to that mirror.
 #[test]

@@ -1583,6 +1583,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "unicode-casefold",
+ "unicode-general-category",
+ "unicode-normalization",
 ]
 
 [[package]]

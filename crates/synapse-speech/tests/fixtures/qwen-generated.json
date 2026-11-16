@@ -1,0 +1,12 @@
+{
+  "provenance": "Synthetic parser boundary continuations using pinned Qwen vocabulary ids. English and None prefixes and Venice. text are copied from sealed single-name-8555-292519-0002 and noise-49 traces. The unknown name and missing-marker cases are constructed, not model inference.",
+  "cases": [
+    {"id": "valid-language", "generated_ids": [11528, 6364, 151704, 58929, 558, 13, 151645], "hint": null, "text": "Venice.", "language": "en"},
+    {"id": "language-none", "generated_ids": [11528, 2240, 151704, 151645], "hint": null, "text": "", "language": null},
+    {"id": "unknown-language-name", "generated_ids": [11528, 220, 58929, 558, 13, 151704, 58929, 558, 13, 151645], "hint": null, "text": "Venice.", "language": null},
+    {"id": "hinted-without-marker", "generated_ids": [58929, 558, 13, 151645], "hint": "en", "text": "Venice.", "language": "en"},
+    {"id": "unhinted-without-marker", "generated_ids": [58929, 558, 13, 151645], "hint": null, "error": "missing <asr_text> marker"},
+    {"id": "missing-language-line", "generated_ids": [151704, 58929, 558, 13, 151645], "hint": null, "error": "missing language line"},
+    {"id": "alternate-stop-token", "generated_ids": [11528, 6364, 151704, 58929, 558, 13, 151643], "hint": null, "text": "Venice.", "language": "en"}
+  ]
+}

@@ -6,11 +6,13 @@ mod decode;
 mod frontend;
 pub mod qwen;
 mod text;
+mod timing;
 
 pub use audio::{decode_wav, resample, Audio, MAX_AUDIO_BYTES, SAMPLE_RATE};
 pub use decode::{greedy, DecodeOutput, Joint, JointLogits, TraceStep, Triple};
 pub use frontend::{actual_mel_frames, valid_encoder_frames, valid_mel_frames, Features, Frontend};
 pub use text::{Tokenizer, Transcript, Word, TOKENIZER_SHA256};
+pub use timing::{normalize_words, WORD_NORMALIZER_REVISION};
 
 pub const SPEECH_FRONTEND_REVISION: &str = "synapse-parakeet-speech-frontend-v1";
 pub const DECODE_RULE_REVISION: &str = "synapse-parakeet-tdt-greedy-v1";
@@ -36,8 +38,13 @@ pub enum Error {
     InvalidJoint(&'static str),
     #[error("invalid tokenizer or token: {0}")]
     InvalidTokenizer(String),
+    /// Callers map this error to invalid_params with field "language".
     #[error("unsupported Qwen3-ASR language: {0}")]
     UnsupportedLanguage(String),
+    #[error("invalid Qwen3-ASR output: {0}")]
+    InvalidAsrOutput(&'static str),
+    #[error("invalid companion word timing: {0}")]
+    InvalidWordTiming(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -7389,8 +7389,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "synapse-parity",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
+ "unicode-casefold",
+ "unicode-general-category",
+ "unicode-normalization",
 ]
 
 [[package]]
