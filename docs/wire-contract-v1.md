@@ -205,18 +205,18 @@ certified-equivalent profile, else substitution_rejected/not_certified).
 
 ## 4. Flow-scoped routes
 
-Checks: `tests::flow_routes_serve_only_diagnostics_and_other_routes_are_unchanged` and
+Checks: `tests::flow_routes_serve_diagnostics_and_event_bodies_only` and
 `tests::the_flow_refusal_names_the_method_and_the_flow` (module library).
 
-Synapse declares `flow-scopes/v1` and lists only `diagnostics.findings` in
-`flow_operations`. On routes whose scope carries a `flow_id`, Synapse serves
-only that operation. Every other method, including other queries, mutations and
+Synapse declares `flow-scopes/v1` and lists `diagnostics.findings` and `events_get`
+in `flow_operations`. Routes whose scope carries a `flow_id` serve only these
+read-only queries. Every other method, including other queries, mutations and
 undeclared names, gets the channel-level error `flow_scope_refused`, naming the
 method and the flow. Query classification is not an unattended-access policy:
 inference queries can load models and consume hardware. The other operations on
 routes without a `flow_id` are unaffected.
 
-`diagnostics.findings` accepts head scopes and daemon-authorized flow scopes;
+Both queries accept head scopes and daemon-authorized flow scopes;
 bare worker/ephemeral scopes and unauthorized flows receive `permission_refused`.
 Unscoped management routes remain available to operator clients. Route scope,
 not request params, establishes flow identity and authorization.
@@ -241,7 +241,7 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
 `approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
-`lanes.resume`, `lanes.status`, `diagnostics.findings`, `role.describe`,
+`lanes.resume`, `lanes.status`, `diagnostics.findings`, `events_get`, `role.describe`,
 `media.submit`, `media.status`, `media.result`, `media.cancel`,
 `media.upload_begin`, `media.upload_append`, `media.upload_status`,
 `media.upload_commit`, `media.read`, `certify.transcribe_observation`,
@@ -319,7 +319,7 @@ all of these operations with `flow_scope_refused`.
   in certification observation mode, otherwise `certify_observation_disabled`.
   Like the two certification operations below, it is principal-scoped and refused
   on [flow-scoped routes](#4-flow-scoped-routes), identified by the daemon-stamped
-  flow scope; only `diagnostics.findings` is allowed there.
+  flow scope; only `diagnostics.findings` and `events_get` are allowed there.
   Part is `encoder_output` or `decode_trace`. Each reply is `{data}` containing
   base64 of at most 512 KiB raw bytes. The result's `observation` contains
   `{lane_id, fingerprint, valid_encoder_frames, triples, encoder_output,
@@ -1328,3 +1328,53 @@ a hardware UUID, only its salted SHA-256 digest
 (`machine.platform_uuid_sha256` on Apple rows, `machine.gpu.uuid_sha256` on
 CUDA and Vulkan rows); `crates/synapse-certify/README.md` gives the exact
 construction.
+
+## 11. Fleet bus event hints
+
+Synapse publishes the following versioned subjects. `{acct}` is the bus account
+resolved by `cortexkit-bus-client`; the `event.synapse.*` suffixes are logical
+subject names, not unqualified NATS subjects.
+
+| Subject | JSON body (inline or fetched) |
+| --- | --- |
+| `ck.{acct}.event.synapse.job_page.v1` | `{event_id, job_id, page_seq, job_state}` |
+| `ck.{acct}.event.synapse.findings_changed.v1` | `{event_id, generation, worst_severity}` |
+| `ck.{acct}.event.synapse.download_state.v1` | `{event_id, download_id, state}` |
+
+`event_id` is a fresh UUID v4 and is also sent as `Nats-Msg-Id = event_id`, so
+retries use the same message id. Identifiers are opaque strings; `page_seq` and
+`generation` are integers. Job-page events follow committed embed pages (zero-based
+`page_seq`) or media terminal states (`page_seq: 0`). Download events follow each
+actual `models.download` state change, including initial `queued`. Findings events
+carry only the generation and worst severity (`ok`, `warn`, or `error`), not finding
+bodies; readers re-read `diagnostics.findings`.
+
+Events are hints to **look now**, not replacements for polling. Existing replies
+and polling remain unchanged and authoritative. Fact and outbox writes
+commit together; publication is asynchronous, may be delayed during bus outages,
+and can be retried. All published outbox rows are retained for seven days. Synapse
+declares no durable consumer. Flow-scoped routes allow only `diagnostics.findings`
+and `events_get`.
+
+### Findings claim-check and `events_get`
+
+`job_page` and `download_state` carry their bodies inline. Only `findings_changed`
+is declared in the HELLO manifest's `events`, at version 1 with `headers: ["event_key"]`.
+Its notice has an **empty payload**, `Nats-Msg-Id` and `event_key` equal to the
+event's UUID, and `Ck-Content-Digest` equal to the bare lowercase SHA-256 hex of
+the exact stored body bytes. The shared bus stream codec writes the digest and
+message-id headers; no findings text or job content is published.
+
+The read-only query `events_get` accepts
+`{event_key, event_name: "findings_changed", version: 1}` and replies with
+`{body, digest, event_key, event_name, published_at}`. `body` is a JSON **string**
+containing the original serialized `{event_id, generation, worst_severity}`,
+not a newly computed finding. `digest` is the same bare lowercase SHA-256 hex as
+the notice. An unknown key, another event name, or another version is refused
+`event_not_visible`. `published_at` is RFC 3339 UTC and always denotes the event's
+store commit time, not the outbox publisher's internal sent marker. Fetches work
+before the publish acknowledgment, so a fast notice reader never races that marker.
+
+The exact stored bytes remain fetchable even after newer findings generations
+exist, for at least seven days after publication. Samples pinned by a stale-file
+test live in `crates/synapse-module/tests/samples/findings-changed-v1/`.

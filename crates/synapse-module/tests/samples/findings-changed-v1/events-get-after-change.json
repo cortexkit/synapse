@@ -1,0 +1,20 @@
+{
+  "name": "events-get-after-change",
+  "request": {
+    "method": "events_get",
+    "params": {
+      "event_key": "00000000-0000-4000-8000-000000000001",
+      "event_name": "findings_changed",
+      "version": 1
+    }
+  },
+  "response": {
+    "result": {
+      "body": "{\"event_id\":\"00000000-0000-4000-8000-000000000001\",\"generation\":1,\"worst_severity\":\"error\"}",
+      "digest": "f42a0c178a1f81dec655b1d898cc3471766dd07072d2ff2132b6ba3ce8c56f4b",
+      "event_key": "00000000-0000-4000-8000-000000000001",
+      "event_name": "findings_changed",
+      "published_at": "2023-11-14T22:13:20.000Z"
+    }
+  }
+}

@@ -872,6 +872,10 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE media_jobs ADD COLUMN transcribe_fingerprint TEXT;
         "#,
     },
+    Migration {
+        version: 18,
+        statements: crate::event_outbox::MIGRATION,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -971,6 +975,10 @@ const RESTORE_CLEAR_TABLES: &[&str] = &[
 // Moving the counter back to a captured value would hand out generations
 // already used, so a stale completion could match a newer run's row.
 const RESTORE_LIVE_ONLY_TABLES: &[&str] = &[
+    // Publication history and diagnostic generations belong to the live store,
+    // not a captured database snapshot. Startup compares findings after restore.
+    "event_outbox",
+    "findings_state",
     "module_meta",
     "self_check_run_seq",
     "cortexkit_fence",
@@ -6214,11 +6222,12 @@ impl SynapseStore {
             ));
         }
         self.store.with_conn_fenced(|tx| {
-            let (request_digest, visible_page_count, state): (String, i64, String) = tx.query_row(
-                "SELECT request_digest, page_count, state FROM jobs WHERE job_id = ?1",
-                params![job_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+            let (request_digest, visible_page_count, state, kind): (String, i64, String, String) =
+                tx.query_row(
+                    "SELECT request_digest, page_count, state, kind FROM jobs WHERE job_id = ?1",
+                    params![job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
             if visible_page_count != i64::from(page_no) {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "page {page_no} cannot follow visible page count {visible_page_count}"
@@ -6235,6 +6244,10 @@ impl SynapseStore {
                  ) VALUES (?1, ?2, ?3, ?4)",
                 params![request_digest, page_no as i64, page_json, now_ms as i64,],
             )?;
+            if kind == "embed.batch" {
+                // Page rows carry no unique job id, so enqueue here rather than in a page trigger.
+                crate::event_outbox::enqueue_job_page(tx, job_id, page_no, &state, now_ms)?;
+            }
             for item in items {
                 tx.execute(
                     "INSERT INTO checkpoints (
@@ -9906,7 +9919,7 @@ mod tests {
                 .unwrap();
         }
         let store = SynapseStore::open(&descriptor).unwrap();
-        assert_eq!(newest_schema_version(), 17);
+        assert_eq!(newest_schema_version(), 18);
         let finished = store.get_job("finished").unwrap().unwrap();
         assert_eq!(finished.state, JOB_STATE_DONE);
         assert_eq!(finished.request_digest, "digest");
@@ -10278,6 +10291,17 @@ mod tests {
                     // tables, so it needs no rows of its own: it runs over the
                     // rows the earlier arms wrote.
                     10..=17 => store,
+                    18 => {
+                        store
+                            .with_conn(|conn| {
+                                conn.execute_batch(
+                            "INSERT INTO event_outbox(event_id,subject,body,created_at) VALUES \
+                             ('fixture-event','event.synapse.findings_changed.v1','{}',1);"
+                        )
+                            })
+                            .unwrap();
+                        store
+                    }
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };
@@ -10391,6 +10415,7 @@ mod tests {
         for table in &tables {
             let expected_min: i64 = match table.as_str() {
                 "module_meta" => 1,
+                "event_outbox" | "findings_state" => 1,
                 "jobs" => 1,
                 "result_pages" => 1,
                 "checkpoints" => 1,
@@ -12647,6 +12672,72 @@ mod tests {
         let kept = RESTORE_KEEP_TABLES.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(cleared, application);
         assert!(kept.is_subset(&cleared));
+    }
+
+    #[test]
+    fn restore_keeps_live_outbox_and_forward_only_findings_generation() {
+        let (capture_root, capture_descriptor) = temp_descriptor("restore-event-capture");
+        let capture = SynapseStore::open(&capture_descriptor).unwrap();
+        populate_every_restore_table(&capture, "capture");
+        capture.store.with_conn_fenced(|tx| tx.execute_batch(
+            "UPDATE findings_state SET digest='captured',findings_generation=4; \
+             INSERT INTO event_outbox(event_id,subject,body,created_at) VALUES('capture-event','event.synapse.findings_changed.v1','{}',1);"
+        )).unwrap();
+        let (live_root, live_descriptor) = temp_descriptor("restore-event-live");
+        let live = SynapseStore::open(&live_descriptor).unwrap();
+        populate_every_restore_table(&live, "live");
+        live.store.with_conn_fenced(|tx| tx.execute_batch(
+            "UPDATE findings_state SET digest='live',findings_generation=9; \
+             INSERT INTO event_outbox(event_id,subject,body,created_at) VALUES('live-event','event.synapse.findings_changed.v1','{}',1);"
+        )).unwrap();
+        drop(live);
+        SynapseStore::restore_from_capture(
+            &live_descriptor,
+            &sqlite_path(&capture_descriptor).unwrap(),
+        )
+        .unwrap();
+        let restored = SynapseStore::open(&live_descriptor).unwrap();
+        restored
+            .store
+            .with_conn(|c| {
+                let generation: u64 =
+                    c.query_row("SELECT findings_generation FROM findings_state", [], |r| {
+                        r.get(0)
+                    })?;
+                assert_eq!(generation, 9);
+                let digest: String =
+                    c.query_row("SELECT digest FROM findings_state", [], |r| r.get(0))?;
+                assert_eq!(digest, "live");
+                let captured: u64 = c.query_row(
+                    "SELECT count(*) FROM event_outbox WHERE event_id='capture-event'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let live: u64 = c.query_row(
+                    "SELECT count(*) FROM event_outbox WHERE event_id='live-event'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!((captured, live), (0, 1));
+                Ok(())
+            })
+            .unwrap();
+        restored
+            .record_findings_digest("post-restore", "ok", 2)
+            .unwrap();
+        let generation: u64 = restored
+            .store
+            .with_conn(|c| {
+                c.query_row("SELECT findings_generation FROM findings_state", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(generation, 10);
+        drop(restored);
+        drop(capture);
+        std::fs::remove_dir_all(live_root).unwrap();
+        std::fs::remove_dir_all(capture_root).unwrap();
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "name": "events-get-wrong-name",
+  "request": {
+    "method": "events_get",
+    "params": {
+      "event_key": "00000000-0000-4000-8000-000000000001",
+      "event_name": "job_page",
+      "version": 1
+    }
+  },
+  "response": {
+    "error": {
+      "code": "event_not_visible",
+      "message": "event is not visible"
+    }
+  }
+}

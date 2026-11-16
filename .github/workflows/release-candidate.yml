@@ -271,18 +271,18 @@ jobs:
           set -euo pipefail
           protocol=$(awk '/^name = "subc-protocol"$/{getline; gsub(/[\"]/,""); print $3}' Cargo.lock)
           # Synapse reads no project identity from routes and declares bind-no-project/v1.
-          # The requires_core floor 0.20.154 was confirmed with SUBC for
-          # subc-protocol 0.34.x. ck 0.20.154 ships daemon 0.39.0, required by client 0.33.
-          # A new protocol minor needs that floor rechecked with SUBC.
+          # SUBC confirmed the requires_core floor 0.21.6 for subc-protocol
+          # 0.37.x: its daemon 0.45.3 first supplied registration channels.
+          # Client 0.41.0 uses protocol 0.37.x with the test daemon 0.49.0.
           case "$protocol" in
-            0.34.*) ;;
+            0.37.*) ;;
             *)
-              echo "subc-protocol is $protocol, not 0.34.x: recheck the ck-subc floor with subconscious before releasing" >&2
+              echo "subc-protocol is $protocol, not 0.37.x: recheck the ck-subc floor with subconscious before releasing" >&2
               exit 1
               ;;
           esac
-          printf '{\n  "requires_core": "0.20.154"\n}\n' > dist/release-manifest.json
-          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.20.154',d"
+          printf '{\n  "requires_core": "0.21.6"\n}\n' > dist/release-manifest.json
+          python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.21.6',d"
       - name: Upload assets to candidate draft
         env:
           GH_TOKEN: ${{ github.token }}

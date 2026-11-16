@@ -83,6 +83,8 @@ pub enum CrashAuthority {
 
 #[derive(Clone, Debug)]
 pub struct WorkerHostConfig {
+    /// Signals diagnostic readers when a crash quarantine is entered or released.
+    pub findings_changed: Option<Arc<tokio::sync::Notify>>,
     pub worker_bin: PathBuf,
     pub runtime_dir: PathBuf,
     pub worker_id: String,
@@ -120,6 +122,7 @@ pub struct WorkerHostConfig {
 impl WorkerHostConfig {
     pub fn new(worker_bin: impl Into<PathBuf>, runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
+            findings_changed: None,
             worker_bin: worker_bin.into(),
             runtime_dir: runtime_dir.into(),
             worker_id: "default".to_string(),
@@ -817,7 +820,11 @@ impl WorkerHost {
             return Ok(());
         };
         if self.config.catalog_lane.is_some() {
-            self.quarantined.remove(&loaded.crash_key);
+            if self.quarantined.remove(&loaded.crash_key) {
+                if let Some(notify) = &self.config.findings_changed {
+                    notify.notify_one();
+                }
+            }
             self.quarantine_until.remove(&loaded.crash_key);
             self.crashes.remove(&loaded.crash_key);
         }
@@ -1338,6 +1345,9 @@ impl WorkerHost {
             let now = self.now();
             if now >= until {
                 self.quarantined.remove(key);
+                if let Some(notify) = &self.config.findings_changed {
+                    notify.notify_one();
+                }
                 self.quarantine_until.remove(key);
                 self.crashes.remove(key);
                 return None;
@@ -1365,7 +1375,11 @@ impl WorkerHost {
                 self.quarantine_until
                     .insert(key.clone(), now + CATALOG_QUARANTINE_COOLDOWN);
             }
-            self.quarantined.insert(key);
+            if self.quarantined.insert(key) {
+                if let Some(notify) = &self.config.findings_changed {
+                    notify.notify_one();
+                }
+            }
             true
         } else {
             false
@@ -3206,6 +3220,43 @@ mod tests {
         let second = crash_key(&path, &runtime, Some("synapse-owned-cuda-second"));
         assert_ne!(first, second);
         assert!(first.contains("stable_model_worker_id"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quarantine_and_release_notify_findings_only_on_transitions() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut config = WorkerHostConfig::new("unused-worker", ".");
+        config.catalog_lane = Some("lane".into());
+        config.crash_budget = CrashBudget { max_crashes: 1 };
+        config.findings_changed = Some(notify.clone());
+        let mut host = WorkerHost::new(config);
+        let now = Instant::now();
+        host.clock = Some(now);
+        assert!(host.record_crash("model".into()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .is_ok()
+        );
+        assert!(host.record_crash("model".into()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .is_err()
+        );
+        host.clock = Some(now + CATALOG_QUARANTINE_COOLDOWN);
+        assert!(host.quarantine_error("model").is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .is_ok()
+        );
+        assert!(host.quarantine_error("model").is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

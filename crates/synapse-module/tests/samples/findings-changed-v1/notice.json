@@ -1,0 +1,10 @@
+{
+  "body": "",
+  "headers": {
+    "Ck-Content-Digest": "f42a0c178a1f81dec655b1d898cc3471766dd07072d2ff2132b6ba3ce8c56f4b",
+    "Nats-Msg-Id": "00000000-0000-4000-8000-000000000001",
+    "event_key": "00000000-0000-4000-8000-000000000001"
+  },
+  "name": "notice",
+  "subject": "ck.box_test.event.synapse.findings_changed.v1"
+}

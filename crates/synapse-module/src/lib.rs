@@ -20,6 +20,7 @@ mod catalog_migration;
 mod catalog_probe;
 mod diagnostics_findings;
 mod engram_catalog;
+mod event_outbox;
 mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
@@ -315,7 +316,16 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         version = env!("CARGO_PKG_VERSION"),
         "synapse started"
     );
-    let outcome = subc_client_rs::serve(manifest(&module_id), handler).await;
+    let outcome =
+        match subc_client_rs::serve_from_env_with_handle(manifest(&module_id), handler.clone())
+            .await
+        {
+            Ok((handle, serving)) => {
+                let _ = handler.inner.module_handle.set(handle);
+                serving.await
+            }
+            Err(error) => Err(error),
+        };
     let uptime_s = started.elapsed().as_secs();
     match &outcome {
         // `reason` tells a planned stop (`goodbye`) from a daemon that vanished
@@ -500,6 +510,7 @@ struct SynapseHandler {
 }
 
 struct SynapseHandlerInner {
+    module_handle: OnceLock<subc_client_rs::ModuleHandle>,
     module_id: String,
     state: OnceLock<Arc<ModuleState>>,
     initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
@@ -549,8 +560,8 @@ impl SynapseHandlerInner {
     }
 
     /// A flow acts for its owner without the owner present, so on a flow's
-    /// route synapse serves only diagnostics.findings. Other queries can load
-    /// models or run inference, so query classification alone is not a safe
+    /// route synapse serves only diagnostics and stored event bodies. Other
+    /// queries can load models or run inference, so query classification alone is not a safe
     /// allowlist for unattended diagnosis.
     fn flow_refusal(&self, route: &RouteHandle, method: &str) -> Option<HandlerOutcome> {
         let flow_id = match self.flow_routes.lock() {
@@ -559,14 +570,14 @@ impl SynapseHandlerInner {
             // refuse rather than serve a mutation unchecked.
             Err(_) => "unknown".to_string(),
         };
-        if method == "diagnostics.findings" {
+        if matches!(method, "diagnostics.findings" | "events_get") {
             return None;
         }
         Some(channel_error(
             "flow_scope_refused",
             format!(
                 "{method} is not available on a flow-scoped route (flow {flow_id}): \
-                  flows may call only diagnostics.findings"
+                  flows may call only diagnostics.findings and events_get"
             ),
         ))
     }
@@ -1326,6 +1337,8 @@ type CoreMlTestWorkerFactory = Arc<
 >;
 
 struct RuntimeState {
+    findings_changed: Arc<Notify>,
+    findings_recompute: Mutex<()>,
     certify_observation: bool,
     media: media_jobs::Runtime,
     ane_direct: AneDirectConfig,
@@ -2421,6 +2434,7 @@ impl SynapseHandler {
     fn new(module_id: String) -> Self {
         Self {
             inner: Arc::new(SynapseHandlerInner {
+                module_handle: OnceLock::new(),
                 module_id,
                 state: OnceLock::new(),
                 initialization: OnceLock::new(),
@@ -2569,6 +2583,8 @@ impl RuntimeState {
             .collect();
         Ok(Self {
             certify_observation: config.certify_observation,
+            findings_changed: Arc::new(Notify::new()),
+            findings_recompute: Mutex::new(()),
             media: media_jobs::Runtime::default(),
             ane_direct: config.ane_direct,
             hf_endpoint,
@@ -4171,6 +4187,13 @@ impl ModuleHandler for SynapseHandler {
                             .initialize(&ack)
                             .map_err(|error| error.to_string())?;
                         let _ = handler.inner.state.set(Arc::clone(&state));
+                        diagnostics_findings::start(&state);
+                        if let (Some(handle), Ok(path)) = (
+                            handler.inner.module_handle.get(),
+                            subc_connection_file_from_args(),
+                        ) {
+                            event_outbox::start(&state, handle.clone(), path);
+                        }
                         start_catalog_revalidation(Arc::clone(&state));
                         media_jobs::start_maintenance(&state);
                         let _ = start_perf_sampler(state);
@@ -4342,18 +4365,23 @@ impl ModuleHandler for SynapseHandler {
         {
             return refusal;
         }
-        if envelope.method == "diagnostics.findings"
-            && !self
-                .inner
-                .diagnostics_routes
-                .lock()
-                .ok()
-                .and_then(|routes| routes.get(&ctx.route_handle()).copied())
-                .unwrap_or(false)
+        if matches!(
+            envelope.method.as_str(),
+            "diagnostics.findings" | "events_get"
+        ) && !self
+            .inner
+            .diagnostics_routes
+            .lock()
+            .ok()
+            .and_then(|routes| routes.get(&ctx.route_handle()).copied())
+            .unwrap_or(false)
         {
             return channel_error(
                 "permission_refused",
-                "diagnostics.findings requires a head, authorized flow, or unscoped management route",
+                format!(
+                    "{} requires a head, authorized flow, or unscoped management route",
+                    envelope.method
+                ),
             );
         }
         if envelope.method.starts_with("media.")
@@ -4474,6 +4502,7 @@ async fn dispatch_request(
             Ok(snapshot) => result_outcome(models_list_payload(&state, snapshot)),
             Err(error) => channel_error("store_failure", error.to_string()),
         },
+        "events_get" => event_outbox::events_get(&state, request.params),
         "certify.observations" => certify_observations(state),
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
@@ -6049,6 +6078,11 @@ fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRunt
     if let Ok(mut catalog) = runtime.catalog.lock() {
         if let Some(slot) = catalog.get_mut(model_id) {
             let clear_loaded = !matches!(state, ModelRuntimeState::Ready);
+            if diagnostics_findings::cached_quarantine(&slot.state)
+                != diagnostics_findings::cached_quarantine(&state)
+            {
+                runtime.findings_changed.notify_one();
+            }
             slot.state = state;
             if clear_loaded {
                 slot.loaded = None;
@@ -6074,6 +6108,9 @@ fn set_model_slot_ready(
 ) {
     if let Ok(mut catalog) = runtime.catalog.lock() {
         if let Some(slot) = catalog.get_mut(model_id) {
+            if diagnostics_findings::cached_quarantine(&slot.state) {
+                runtime.findings_changed.notify_one();
+            }
             slot.loaded = Some(model);
             slot.state = ModelRuntimeState::Ready;
             slot.last_cold_load_ms = Some(cold_load_ms);
@@ -6125,6 +6162,9 @@ fn register_runtime_catalog_model(
         Some(slot) => {
             slot.spec = spec;
             if slot.loaded.is_none() {
+                if diagnostics_findings::cached_quarantine(&slot.state) {
+                    runtime.findings_changed.notify_one();
+                }
                 slot.state = ModelRuntimeState::Unloaded;
             }
             slot.notify.notify_waiters();
@@ -6625,6 +6665,9 @@ fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
         {
             false
         } else {
+            if diagnostics_findings::cached_quarantine(&slot.state) {
+                state.runtime.findings_changed.notify_one();
+            }
             slot.state = ModelRuntimeState::Loading;
             slot.notify.notify_waiters();
             true
@@ -6752,8 +6795,10 @@ async fn load_catalog_model_task(
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
     let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
-    let worker_load_context =
-        WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec);
+    let worker_load_context = WorkerLoadContext {
+        findings_changed: Some(state.runtime.findings_changed.clone()),
+        ..WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec)
+    };
     #[cfg(all(test, unix))]
     let worker_load_context = WorkerLoadContext {
         coreml_worker_factory: state
@@ -6987,6 +7032,7 @@ fn record_owned_package_roles(
 
 #[derive(Clone)]
 struct WorkerLoadContext {
+    findings_changed: Option<Arc<Notify>>,
     timeout: Duration,
     forward_lines_per_sec: u32,
     #[cfg(all(test, unix))]
@@ -6997,6 +7043,7 @@ impl WorkerLoadContext {
     fn new(timeout: Duration, forward_lines_per_sec: u32) -> Self {
         Self {
             timeout,
+            findings_changed: None,
             forward_lines_per_sec,
             #[cfg(all(test, unix))]
             coreml_worker_factory: None,
@@ -7530,6 +7577,7 @@ fn load_worker_backend_blocking(
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.model_id = Some(spec.model_id.clone());
     config.catalog_lane = catalog_lane.map(str::to_owned);
+    config.findings_changed = worker_load_context.findings_changed;
     config.worker_forward_lines_per_sec = worker_load_context.forward_lines_per_sec;
     config.engine_identity = Some(spec.engine_identity.clone());
     config.isolate_crash_key_by_worker_id = spec.engine == CUDA_WORKER_ENGINE;
@@ -14712,7 +14760,7 @@ fn store_owned_probe_outcome(
     };
     let mut unconstrained_row = row.clone();
     unconstrained_row.constraint_runtime_identities.clear();
-    state
+    let result = state
         .store
         .store_owned_decode_cert_rows_if_current(
             &snapshot_inputs,
@@ -14725,7 +14773,11 @@ fn store_owned_probe_outcome(
                 StableError::engine_crashed(Some(100)),
                 format!("write owned-decode probe evidence: {error}"),
             )
-        })
+        });
+    if result.is_ok() {
+        state.runtime.findings_changed.notify_one();
+    }
+    result
 }
 
 fn store_probe_cert_row(
@@ -14777,7 +14829,7 @@ fn store_probe_outcome_for_fingerprint(
         module_generation: state.module_generation,
         evidence,
     };
-    state
+    let result = state
         .store
         .store_class_scoped_cert_row(&row)
         .map_err(|error| {
@@ -14785,7 +14837,11 @@ fn store_probe_outcome_for_fingerprint(
                 StableError::engine_crashed(Some(100)),
                 format!("write certification row: {error}"),
             )
-        })
+        });
+    if result.is_ok() {
+        state.runtime.findings_changed.notify_one();
+    }
+    result
 }
 
 fn store_probe_perf_row(
@@ -16960,6 +17016,7 @@ fn management_operations() -> Vec<ManagementOperation> {
 
     vec![
         op("diagnostics.findings", Query),
+        op("events_get", Query),
         op("certify.observations", Query),
         op("certify.transcribe_observation", Query),
         op("certify.transcribe_measurements", Query),
@@ -17059,7 +17116,15 @@ fn manifest(module_id: &str) -> ModuleManifest {
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
-        .flow_operations(Some(vec!["diagnostics.findings".to_string()]))
+        .flow_operations(Some(vec![
+            "diagnostics.findings".to_string(),
+            "events_get".to_string(),
+        ]))
+        .events(Some(vec![subc_protocol::manifest::EventDeclaration::new(
+            "findings_changed",
+            1,
+        )
+        .with_headers(vec!["event_key".to_string()])]))
         // Examined and none declarable (Some([]) is the wire form of that claim;
         // None would mean the vocabulary is un-adopted): synapse mutates nothing
         // outside its own store and models directory, and observation-anchored
@@ -20500,8 +20565,43 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn acknowledging_cached_quarantine_notifies_findings_release() {
+        let spec = stuck_model_spec();
+        let id = spec.model_id.clone();
+        let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![spec]).unwrap();
+        set_model_slot_state(
+            &runtime,
+            &id,
+            ModelRuntimeState::Failed(WireOperationError::from_stable(
+                StableError::engine_crashed(Some(250)),
+                "worker is quarantined",
+            )),
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            runtime.findings_changed.notified()
+        )
+        .await
+        .is_ok());
+        assert!(catalog_failed_load(&runtime, &id, true).is_some());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            runtime.findings_changed.notified()
+        )
+        .await
+        .is_ok());
+        assert!(catalog_failed_load(&runtime, &id, true).is_none());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1),
+            runtime.findings_changed.notified()
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
-    fn flow_routes_serve_only_diagnostics_and_other_routes_are_unchanged() {
+    fn flow_routes_serve_diagnostics_and_event_bodies_only() {
         let handler = SynapseHandler::new("synapse".into());
         let inner = &handler.inner;
         let flow = bind_with_scope(1, Some("flow-7"));
@@ -20513,7 +20613,7 @@ mod tests {
         let manifest = manifest("synapse");
         assert_eq!(
             manifest.flow_operations,
-            Some(vec!["diagnostics.findings".into()])
+            Some(vec!["diagnostics.findings".into(), "events_get".into()])
         );
         assert_eq!(
             manifest.capabilities.as_ref().unwrap().provides,
@@ -20523,11 +20623,25 @@ mod tests {
         assert!(operations.iter().any(
             |op| op.name == "diagnostics.findings" && op.kind == ManagementOperationKind::Query
         ));
+        assert!(operations
+            .iter()
+            .any(|op| op.name == "events_get" && op.kind == ManagementOperationKind::Query));
+        assert_eq!(
+            manifest.events,
+            Some(vec![subc_protocol::manifest::EventDeclaration::new(
+                "findings_changed",
+                1
+            )
+            .with_headers(vec!["event_key".into()])])
+        );
         assert!(operations.iter().any(|op| op.name == "embed.query"));
         for op in &operations {
             let on_flow = refusal_code(inner.flow_refusal(&flow.handle, &op.name));
-            if op.name == "diagnostics.findings" {
-                assert_eq!(on_flow, None, "diagnosis must be served to a flow");
+            if matches!(op.name.as_str(), "diagnostics.findings" | "events_get") {
+                assert_eq!(
+                    on_flow, None,
+                    "diagnosis and event bodies must be served to a flow"
+                );
             } else {
                 assert_eq!(
                     on_flow.as_deref(),
@@ -20567,6 +20681,58 @@ mod tests {
         );
         assert_eq!(routes.get(&head.handle), Some(&true));
         assert_eq!(routes.get(&unauthorized_flow.handle), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn authorized_flow_can_fetch_committed_findings_body() {
+        let (root, descriptor) = test_storage_descriptor("flow-events-get");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        store
+            .record_findings_digest("stale", "error", 1700000000000)
+            .unwrap();
+        let key: String = store
+            .store
+            .with_conn(|c| c.query_row("SELECT event_id FROM event_outbox", [], |r| r.get(0)))
+            .unwrap();
+        let profile = test_machine_profile("test-os");
+        store.observe_profile(&profile, 1, 1).unwrap();
+        let state = test_module_state(store.clone(), profile);
+        let handler = SynapseHandler::new("synapse".into());
+        assert!(handler.inner.state.set(state.clone()).is_ok());
+        let route = bind_with_scope(5, Some("findings-flow"));
+        handler.on_bind(&route).await;
+        assert!(handler
+            .inner
+            .flow_refusal(&route.handle, "events_get")
+            .is_none());
+        assert_eq!(
+            handler
+                .inner
+                .diagnostics_routes
+                .lock()
+                .unwrap()
+                .get(&route.handle),
+            Some(&true)
+        );
+        let response = response_result(
+            dispatch_request(
+                state.clone(),
+                MethodEnvelope {
+                    method: "events_get".into(),
+                    params: json!({"event_key":key,"event_name":"findings_changed","version":1}),
+                },
+                None,
+            )
+            .await,
+            "events_get",
+        );
+        let body: Value = serde_json::from_str(response["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["event_id"], key);
+        assert_eq!(body["worst_severity"], "error");
+        drop(handler);
+        drop(state);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -29420,6 +29586,7 @@ fn start_catalog_revalidation(state: Arc<ModuleState>) {
             Err(error) => {
                 tracing::warn!(target: "synapse.catalog", error = %error.message,
                     "catalog revalidation skipped: could not list lanes");
+                diagnostics_findings::refresh(&state);
                 return;
             }
         };
@@ -29435,6 +29602,7 @@ fn start_catalog_revalidation(state: Arc<ModuleState>) {
                     "catalog self-check at startup did not pass"),
             }
         }
+        diagnostics_findings::refresh(&state);
     });
 }
 
@@ -30250,6 +30418,9 @@ fn catalog_complete_check(
         }
     }).map_err(catalog_store_error);
     invalidate_validated_readiness(&state.runtime);
+    if matches!(result, Ok(true)) {
+        state.runtime.findings_changed.notify_one();
+    }
     result
 }
 fn owned_numerical_catalog_check(
@@ -31313,6 +31484,9 @@ fn catalog_failed_load(
     // Waiters all observe the completed attempt's error. A fresh request
     // acknowledges it, so a later retry can start one new attempt.
     if acknowledge {
+        if diagnostics_findings::cached_quarantine(&slot.state) {
+            runtime.findings_changed.notify_one();
+        }
         slot.state = ModelRuntimeState::Unloaded;
         slot.notify.notify_waiters();
     }
@@ -31553,6 +31727,9 @@ async fn ensure_catalog_lane_ready_owned(
                 .get_mut(&lane)
             {
                 slot.spec = spec;
+                if diagnostics_findings::cached_quarantine(&slot.state) {
+                    state.runtime.findings_changed.notify_one();
+                }
                 slot.state = ModelRuntimeState::Loading;
             }
             Ok(())

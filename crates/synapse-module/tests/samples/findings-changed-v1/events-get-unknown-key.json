@@ -1,0 +1,17 @@
+{
+  "name": "events-get-unknown-key",
+  "request": {
+    "method": "events_get",
+    "params": {
+      "event_key": "unknown",
+      "event_name": "findings_changed",
+      "version": 1
+    }
+  },
+  "response": {
+    "error": {
+      "code": "event_not_visible",
+      "message": "event is not visible"
+    }
+  }
+}

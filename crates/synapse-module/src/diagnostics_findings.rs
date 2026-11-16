@@ -73,7 +73,13 @@ fn finding(
     }))
 }
 
-fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Value, ()> {
+struct Inputs {
+    stale: Vec<(u64, Value)>,
+    failed_checks: Vec<(u64, Value)>,
+    quarantined: Vec<(u64, Value)>,
+}
+
+fn inputs(state: &ModuleState, generated_at_ms: u64) -> Result<Inputs, ()> {
     // Unlike a diagnosis, an unreadable store is a failed query, not healthy evidence.
     state.store.storage_health_inputs().map_err(|_| ())?;
     let health = module_health(state);
@@ -122,9 +128,7 @@ fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Va
         };
         // Cold load failures retain a quarantine refusal but no fence expiry.
         // Label that cached evidence instead of claiming the fence is still active.
-        let cached = matches!(&slot.state, ModelRuntimeState::Failed(error)
-            if error.message.contains("quarantined")
-                || error.details.as_ref().is_some_and(|detail| detail["quarantined"] == true));
+        let cached = cached_quarantine(&slot.state);
         if active || cached {
             quarantined.push((
                 generated_at_ms,
@@ -132,6 +136,19 @@ fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Va
             ));
         }
     }
+    Ok(Inputs {
+        stale,
+        failed_checks,
+        quarantined,
+    })
+}
+
+fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Value, ()> {
+    let Inputs {
+        stale,
+        failed_checks,
+        quarantined,
+    } = inputs(state, generated_at_ms)?;
     let mut findings = Vec::new();
     findings.extend(finding(
         "certification_stale",
@@ -171,12 +188,164 @@ fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Va
     Ok(body["result"].take())
 }
 
+pub(super) fn refresh(state: &ModuleState) {
+    let _guard = state
+        .runtime
+        .findings_recompute
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let result = (|| {
+        let Inputs {
+            stale,
+            failed_checks,
+            quarantined,
+        } = inputs(state, now_ms())?;
+        let worst = if !stale.is_empty() {
+            "error"
+        } else if !failed_checks.is_empty() || !quarantined.is_empty() {
+            "warn"
+        } else {
+            "ok"
+        };
+        let mut findings = Vec::new();
+        for (code, lanes) in [
+            ("certification_stale", stale),
+            ("catalog_self_check_failed", failed_checks),
+            ("worker_quarantined", quarantined),
+        ] {
+            let mut ids = lanes
+                .into_iter()
+                .filter_map(|(_, value)| value["lane_id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            ids.sort();
+            if !ids.is_empty() {
+                findings.push((code, ids));
+            }
+        }
+        findings.sort();
+        #[derive(serde::Serialize)]
+        struct Digest<'a> {
+            worst_severity: &'a str,
+            findings: Vec<(&'a str, Vec<String>)>,
+        }
+        let digest = serde_json::to_string(&Digest {
+            worst_severity: worst,
+            findings,
+        })
+        .map_err(|_| ())?;
+        state
+            .store
+            .record_findings_digest(&digest, worst, now_ms())
+            .map_err(|_| ())?;
+        Ok::<_, ()>(())
+    })();
+    if result.is_err() {
+        tracing::warn!("could not recompute diagnostic findings");
+    }
+}
+
+pub(super) fn cached_quarantine(state: &ModelRuntimeState) -> bool {
+    matches!(state, ModelRuntimeState::Failed(error)
+        if error.message.contains("quarantined")
+            || error.details.as_ref().is_some_and(|detail| detail["quarantined"] == true))
+}
+
+async fn listen<F, Fut>(notify: Arc<Notify>, mut recompute: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        notify.notified().await;
+        recompute().await;
+    }
+}
+
+pub(super) fn start(state: &Arc<ModuleState>) {
+    let notify = state.runtime.findings_changed.clone();
+    let weak = Arc::downgrade(state);
+    tokio::spawn(listen(notify, move || {
+        let weak = weak.clone();
+        async move {
+            if let Some(state) = weak.upgrade() {
+                // Worker mutations notify under their lock; read only after that lock is released.
+                let _ = tokio::task::spawn_blocking(move || refresh(&state)).await;
+            }
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::{
         response_result, test_machine_profile, test_module_state, test_storage_descriptor,
     };
+
+    #[tokio::test]
+    async fn notifications_during_recompute_coalesce_into_one_final_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (root, descriptor) = test_storage_descriptor("findings-notifications");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let notify = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let value = Arc::new(AtomicUsize::new(1));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = {
+            let (store, resume, value, passes) =
+                (store.clone(), resume.clone(), value.clone(), passes.clone());
+            tokio::spawn(listen(notify.clone(), move || {
+                let (store, resume, value, passes, entered_tx, done_tx) = (
+                    store.clone(),
+                    resume.clone(),
+                    value.clone(),
+                    passes.clone(),
+                    entered_tx.clone(),
+                    done_tx.clone(),
+                );
+                async move {
+                    let observed = value.load(Ordering::SeqCst);
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered_tx.send(()).unwrap();
+                        resume.notified().await;
+                    }
+                    store
+                        .record_findings_digest(&format!("state-{observed}"), "warn", 1000)
+                        .unwrap();
+                    done_tx.send(()).unwrap();
+                }
+            }))
+        };
+        notify.notify_one();
+        entered_rx.recv().await.unwrap();
+        value.store(2, Ordering::SeqCst);
+        notify.notify_one();
+        value.store(3, Ordering::SeqCst);
+        notify.notify_one();
+        resume.notify_one();
+        done_rx.recv().await.unwrap();
+        done_rx.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert!(done_rx.try_recv().is_err());
+        let (digest, generation): (String, u64) = store
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT digest,findings_generation FROM findings_state",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((digest, generation), ("state-3".into(), 2));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn diagnostics_findings_request_samples_and_strict_params() {
@@ -250,6 +419,18 @@ mod tests {
             })
             .unwrap();
         let healthy = test_module_state(Arc::clone(&store), profile_a);
+        refresh(&healthy);
+        let generation = || {
+            store
+                .store
+                .with_conn(|c| {
+                    c.query_row("SELECT findings_generation FROM findings_state", [], |r| {
+                        r.get::<_, u64>(0)
+                    })
+                })
+                .unwrap()
+        };
+        assert_eq!(generation(), 0, "healthy initial digest does not emit");
         assert_eq!(
             json!({"result": reply(&healthy, 21_600_000, 10_000_000).unwrap()}),
             json!({"result": {"findings": [], "generated_at_ms": 10_000_000, "window_ms": 21_600_000}}),
@@ -260,6 +441,14 @@ mod tests {
             .observe_certification_stale(&profile_b.revisioned_hash(), 13)
             .unwrap();
         let stale = test_module_state(Arc::clone(&store), profile_b);
+        refresh(&stale);
+        assert_eq!(
+            generation(),
+            1,
+            "stale certification advances the generation once"
+        );
+        refresh(&stale);
+        assert_eq!(generation(), 1, "an unchanged digest is silent");
         let result = response_result(
             dispatch_request(
                 Arc::clone(&stale),
