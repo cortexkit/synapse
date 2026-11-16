@@ -2,10 +2,37 @@
 // on CUDA; Rust owns only the shared greedy policy and wire observations.
 #include "cuda_family_common.cuh"
 #include <cublas_v2.h>
+#include "parakeet_allocation_meter.h"
 
 namespace {
 using synapse_cuda_family::DeviceAllocation;
-using Buffer = DeviceAllocation<float>;
+struct Buffer : DeviceAllocation<float> {
+    ParakeetAllocationMeter *meter;
+    explicit Buffer(ParakeetAllocationMeter &m) : meter(&m) {}
+    Buffer(ParakeetAllocationMeter &m, size_t elements) : meter(&m) { allocate(elements); }
+    Buffer(Buffer &&other) noexcept : meter(other.meter) { *this = std::move(other); }
+    Buffer &operator=(Buffer &&other) noexcept {
+        if (this != &other) {
+            reset();
+            meter = other.meter;
+            pointer = other.pointer;
+            count = other.count;
+            other.pointer = nullptr;
+            other.count = 0;
+        }
+        return *this;
+    }
+    ~Buffer() { reset(); }
+    void allocate(size_t elements) {
+        reset();
+        DeviceAllocation<float>::allocate(elements);
+        meter->allocate(count * sizeof(float));
+    }
+    void reset() {
+        if (pointer) meter->release(count * sizeof(float));
+        DeviceAllocation<float>::reset();
+    }
+};
 thread_local std::string error;
 constexpr int H = 1024, D = 640, HEADS = 8, HD = 128, TILE = 128;
 
@@ -134,8 +161,9 @@ struct Context {
     cublasHandle_t blas=nullptr;
     int device=0, frames=0, valid=0, next_layer=0;
     size_t peak=0;
+    ParakeetAllocationMeter meter;
     std::unordered_map<std::string,Buffer> weights;
-    Buffer hidden, pos, projected, h, cell, predictor;
+    Buffer hidden{meter}, pos{meter}, projected{meter}, h{meter}, cell{meter}, predictor{meter};
     Context() {
         FAMILY_CUDA_CHECK(cudaGetDevice(&device));
         FAMILY_CUBLAS_CHECK(cublasCreate(&blas));
@@ -161,7 +189,7 @@ struct Context {
         norm<<<frames,256>>>(x,y,w(name+".weight"),w(name+".bias"),frames);
     }
     void feedforward(const std::string &l,int index) {
-        Buffer n(frames*H),a(frames*4096),b(frames*H);
+        Buffer n(meter,frames*H),a(meter,frames*4096),b(meter,frames*H);
         std::string ff=l+".feed_forward"+std::to_string(index);
         ln(hidden.pointer,n.pointer,l+".norm_feed_forward"+std::to_string(index));
         linear(n.pointer,a.pointer,ff+".linear1",frames,H,4096);
@@ -184,7 +212,7 @@ extern "C" void *synapse_parakeet_create(){
 }
 extern "C" void synapse_parakeet_destroy(void *p){ if(p){auto *c=static_cast<Context*>(p); cudaSetDevice(c->device); delete c;} }
 extern "C" int synapse_parakeet_weight(void *p,const char *name,const float *data,size_t n){
-    return guard([&]{ auto &c=*static_cast<Context*>(p);c.bind(); Buffer b(n);
+    return guard([&]{ auto &c=*static_cast<Context*>(p);c.bind(); Buffer b(c.meter,n);
         FAMILY_CUDA_CHECK(cudaMemcpy(b.pointer,data,n*sizeof(float),cudaMemcpyHostToDevice));
         c.weights.emplace(name,std::move(b));c.memory(); });
 }
@@ -192,18 +220,19 @@ extern "C" int synapse_parakeet_weight(void *p,const char *name,const float *dat
 extern "C" int synapse_parakeet_begin(void *p,const float *mel,int mel_rows,int valid_mel,int rung){
     return guard([&]{
         auto &c=*static_cast<Context*>(p);c.bind();
+        c.meter.begin_request();
         c.frames=rung;c.valid=(valid_mel+7)/8;c.next_layer=0;
         c.projected.reset();c.h.reset();c.cell.reset();c.predictor.reset();
         c.hidden.allocate(rung*H);c.pos.allocate((2*rung-1)*H);
         FAMILY_CUDA_CHECK(cudaMemset(c.hidden.pointer,0,rung*H*sizeof(float)));
-        Buffer input(mel_rows*128);
+        Buffer input(c.meter,mel_rows*128);
         FAMILY_CUDA_CHECK(cudaMemcpy(input.pointer,mel,mel_rows*128*sizeof(float),cudaMemcpyHostToDevice));
         int a1=(mel_rows+1)/2,a2=(a1+1)/2,a3=(a2+1)/2;
         int v1=(valid_mel+1)/2,v2=(v1+1)/2,v3=(v2+1)/2;
         const std::string sub="encoder.subsampling.";
         for(int start=0;start<rung;start+=TILE){
             int rows=std::min(TILE,rung-start),s1=4*start-3,n1=4*rows+3,s2=2*start-1,n2=2*rows+1;
-            Buffer a(n1*64*256),b(n2*32*256),d(n2*32*256),e(rows*16*256),f(rows*16*256),flat(rows*4096);
+            Buffer a(c.meter,n1*64*256),b(c.meter,n2*32*256),d(c.meter,n2*32*256),e(c.meter,rows*16*256),f(c.meter,rows*16*256),flat(c.meter,rows*4096);
             conv2d<<<(n1*64*256+255)/256,256>>>(input.pointer,a.pointer,c.w(sub+"layers.0.weight"),
                 c.w(sub+"layers.0.bias"),0,mel_rows,128,s1,n1,v1,a1,true);
             conv2d<<<(n2*32*256+255)/256,256>>>(a.pointer,b.pointer,c.w(sub+"layers.2.weight"),
@@ -230,8 +259,8 @@ extern "C" int synapse_parakeet_layer(void *p,int layer){
         int t=c.frames;std::string l="encoder.layers."+std::to_string(layer);
         c.feedforward(l,1);
         {
-            Buffer n(t*H),q(t*H),k(t*H),v(t*H),r((2*t-1)*H),att(t*H),out(t*H);
-            Buffer qu(TILE*HD),qv(TILE*HD),ac(TILE*t),bd(TILE*(2*t-1));
+            Buffer n(c.meter,t*H),q(c.meter,t*H),k(c.meter,t*H),v(c.meter,t*H),r(c.meter,(2*t-1)*H),att(c.meter,t*H),out(c.meter,t*H);
+            Buffer qu(c.meter,TILE*HD),qv(c.meter,TILE*HD),ac(c.meter,TILE*t),bd(c.meter,TILE*(2*t-1));
             c.ln(c.hidden.pointer,n.pointer,l+".norm_self_att");
             std::string a=l+".self_attn";
             c.linear(n.pointer,q.pointer,a+".q_proj",t,H,H);
@@ -260,7 +289,7 @@ extern "C" int synapse_parakeet_layer(void *p,int layer){
             residual<<<(t*H+255)/256,256>>>(c.hidden.pointer,out.pointer,t*H,1.f);c.memory();
         }
         {
-            Buffer n(t*H),a(t*2*H),g(t*H),d(t*H),out(t*H);
+            Buffer n(c.meter,t*H),a(c.meter,t*2*H),g(c.meter,t*H),d(c.meter,t*H),out(c.meter,t*H);
             c.ln(c.hidden.pointer,n.pointer,l+".norm_conv");
             std::string cv=l+".conv";
             c.linear(n.pointer,a.pointer,cv+".pointwise_conv1",t,H,2*H);
@@ -271,7 +300,7 @@ extern "C" int synapse_parakeet_layer(void *p,int layer){
             residual<<<(t*H+255)/256,256>>>(c.hidden.pointer,out.pointer,t*H,1.f);c.memory();
         }
         c.feedforward(l,2);
-        Buffer normalized(t*H);c.ln(c.hidden.pointer,normalized.pointer,l+".norm_out");
+        Buffer normalized(c.meter,t*H);c.ln(c.hidden.pointer,normalized.pointer,l+".norm_out");
         c.hidden=std::move(normalized);c.sync();++c.next_layer;
     });
 }
@@ -287,7 +316,7 @@ extern "C" int synapse_parakeet_finish(void *p,float *encoder){
 }
 
 static void predict(Context &c,int token){
-    Buffer a(4*D),b(4*D);
+    Buffer a(c.meter,4*D),b(c.meter,4*D);
     const float *input=c.w("decoder.embedding.weight")+token*D;
     for(int layer=0;layer<2;++layer){
         std::string base="decoder.lstm.",suffix="_l"+std::to_string(layer);
@@ -309,9 +338,10 @@ extern "C" int synapse_parakeet_predict(void *p,int token,int reset){
 extern "C" int synapse_parakeet_joint(void *p,int frame,float *logits){
     return guard([&]{ auto &c=*static_cast<Context*>(p);c.bind();
         if(frame<0 || frame>=c.valid) throw std::runtime_error("invalid encoder frame");
-        Buffer input(D),out(8198);
+        Buffer input(c.meter,D),out(c.meter,8198);
         joint_input<<<(D+255)/256,256>>>(c.projected.pointer,c.predictor.pointer,input.pointer,frame);
         c.linear(input.pointer,out.pointer,"joint.head",1,D,8198,true);
         FAMILY_CUDA_CHECK(cudaMemcpy(logits,out.pointer,8198*sizeof(float),cudaMemcpyDeviceToHost));c.memory(); });
 }
 extern "C" size_t synapse_parakeet_peak(void *p){return static_cast<Context*>(p)->peak;}
+extern "C" size_t synapse_parakeet_request_peak(void *p){return static_cast<Context*>(p)->meter.peak;}

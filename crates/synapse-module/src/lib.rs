@@ -4359,6 +4359,8 @@ impl ModuleHandler for SynapseHandler {
         if envelope.method.starts_with("media.")
             || envelope.method == "role.describe"
             || envelope.method == "certify.transcribe_observation"
+            || envelope.method == "certify.transcribe_measurements"
+            || envelope.method == "certify.transcribe_observe_rerun"
         {
             let principal = self
                 .inner
@@ -16960,6 +16962,8 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("diagnostics.findings", Query),
         op("certify.observations", Query),
         op("certify.transcribe_observation", Query),
+        op("certify.transcribe_measurements", Query),
+        op("certify.transcribe_observe_rerun", Mutate),
         op("role.describe", Query),
         op("media.submit", Mutate),
         op("media.status", Query),
@@ -29548,6 +29552,17 @@ mod transcribe_self_check {
         )
     }
 
+    pub(crate) fn wall_ms(
+        state: &ModuleState,
+        lane: &Lane,
+    ) -> Result<Option<u64>, WireOperationError> {
+        use rusqlite::OptionalExtension;
+        let (id, _) = key(state, lane)?;
+        state.store.store.with_conn(|conn| {
+            conn.query_row("SELECT self_check_wall_ms FROM catalog_self_checks WHERE check_id=?1 AND state='passed'", [&id], |r| r.get(0)).optional().map(Option::flatten)
+        }).map_err(catalog_store_error)
+    }
+
     fn ensure_using(
         state: &ModuleState,
         lane: &Lane,
@@ -29570,7 +29585,8 @@ mod transcribe_self_check {
                 saved["reason"].as_str().unwrap_or("reference mismatch"),
             ));
         }
-        let generation = if saved["state"] == "passed" {
+        let cached = saved["state"] == "passed" && wall_ms(state, lane)?.is_some();
+        let generation = if cached {
             None
         } else {
             Some(catalog_check_generation(state, &id, &key)?)
@@ -29589,6 +29605,7 @@ mod transcribe_self_check {
                 return Err(failed(lane, &id, &reason));
             }
         };
+        let mut elapsed_ms = None;
         let execution = (|| {
             phase("loading");
             // Loading a worker host validates its reported transcription revisions.
@@ -29596,7 +29613,7 @@ mod transcribe_self_check {
             if host.profile().id != lane.profile {
                 return Err(crashed("self-check host profile differs from lane"));
             }
-            if saved["state"] == "passed" {
+            if cached {
                 return Ok((host, None));
             }
             let mismatch = {
@@ -29645,6 +29662,7 @@ mod transcribe_self_check {
                         break;
                     }
                 }
+                elapsed_ms = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
                 mismatch
             };
             Ok((host, mismatch))
@@ -29657,6 +29675,10 @@ mod transcribe_self_check {
                     "passed"
                 };
                 if let Some(generation) = generation {
+                    state.store.store.with_conn_fenced(|tx| {
+                        tx.execute("UPDATE catalog_self_checks SET self_check_wall_ms=?3 WHERE check_id=?1 AND generation=?2 AND state='running'", rusqlite::params![id,generation,elapsed_ms])?;
+                        Ok(())
+                    }).map_err(catalog_store_error)?;
                     if !catalog_complete_check(state, &id, generation, status, mismatch.as_deref())?
                     {
                         return Err(crashed("speech self-check generation changed"));
@@ -29802,6 +29824,8 @@ mod transcribe_self_check {
                                 req_id: req_id.clone(),
                                 valid_encoder_frames: out.valid_encoder_frames,
                                 count: out.triples.len(),
+                                peak_device_memory_bytes: None,
+                                peak_storage_buffer_bytes: None,
                             },
                             Some(synapse_core::encode_transcript_frame(&out.triples)),
                         ),
@@ -29894,6 +29918,9 @@ mod transcribe_self_check {
                     };
                     let checked_generation = generation();
                     let checked_at = projection(&state, &lane).unwrap()["checked_at_ms"].clone();
+                    let checked_wall = wall_ms(&state, &lane).unwrap().unwrap();
+                    assert!(checked_wall < 2000);
+                    assert_ne!(json!(checked_wall), checked_at);
                     drop(
                         ensure(
                             &state,
@@ -29908,6 +29935,7 @@ mod transcribe_self_check {
                         3,
                         "cached pass runs no inference"
                     );
+                    assert_eq!(wall_ms(&state, &lane).unwrap(), Some(checked_wall));
                     assert_eq!(
                         generation(),
                         checked_generation,

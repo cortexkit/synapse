@@ -10,6 +10,9 @@ pub(crate) struct WorkerTranscription {
     pub transcript_frame: Vec<u8>,
     pub observation: Option<TranscribeObservationFrames>,
     pub progress: Vec<WorkerResponse>,
+    pub timing: crate::transcribe_host::ProgressTiming,
+    pub peak_device_memory_bytes: Option<u64>,
+    pub peak_storage_buffer_bytes: Option<u64>,
 }
 
 pub(super) fn decode_transcription(
@@ -19,18 +22,27 @@ pub(super) fn decode_transcription(
     expected_frames: usize,
     observe: bool,
 ) -> Result<WorkerTranscription, WorkerHostError> {
+    let decoding_started = std::time::Instant::now();
     let fail = |msg: &str| WorkerHostError::Protocol(msg.into());
-    let (valid_encoder_frames, count) = match response {
-        WorkerResponse::Transcript {
-            valid_encoder_frames,
-            count,
-            ..
-        } => (valid_encoder_frames, count),
-        WorkerResponse::Err { code, msg, .. } => {
-            return Err(WorkerHostError::WorkerErr { code, msg })
-        }
-        _ => return Err(fail("expected TRANSCRIPT")),
-    };
+    let (valid_encoder_frames, count, peak_device_memory_bytes, peak_storage_buffer_bytes) =
+        match response {
+            WorkerResponse::Transcript {
+                valid_encoder_frames,
+                count,
+                peak_device_memory_bytes,
+                peak_storage_buffer_bytes,
+                ..
+            } => (
+                valid_encoder_frames,
+                count,
+                peak_device_memory_bytes,
+                peak_storage_buffer_bytes,
+            ),
+            WorkerResponse::Err { code, msg, .. } => {
+                return Err(WorkerHostError::WorkerErr { code, msg })
+            }
+            _ => return Err(fail("expected TRANSCRIPT")),
+        };
     if valid_encoder_frames != expected_frames {
         return Err(fail(
             "TRANSCRIPT valid_encoder_frames differs from shared speech core",
@@ -94,11 +106,16 @@ pub(super) fn decode_transcription(
     } else {
         None
     };
+    let mut timing = frames.timing;
+    timing.boundaries(std::time::Duration::ZERO, decoding_started.elapsed());
     Ok(WorkerTranscription {
         output,
         transcript_frame,
         observation,
         progress: frames.progress,
+        timing,
+        peak_device_memory_bytes,
+        peak_storage_buffer_bytes,
     })
 }
 
@@ -246,6 +263,8 @@ mod tests {
                     req_id: "speech".into(),
                     valid_encoder_frames: 1,
                     count: 0,
+                    peak_device_memory_bytes: None,
+                    peak_storage_buffer_bytes: None,
                 },
                 vec![],
             ),
@@ -267,6 +286,8 @@ mod tests {
             req_id: "speech".into(),
             valid_encoder_frames: 129,
             count: 0,
+            peak_device_memory_bytes: None,
+            peak_storage_buffer_bytes: None,
         };
         let sent = expected.clone();
         let peer = tokio::spawn(async move {
@@ -548,6 +569,7 @@ mod tests {
         let frames = liveness::TranscribeFrames {
             parts,
             progress: vec![],
+            timing: Default::default(),
         };
         assert!(matches!(
             decode_transcription(response, Some(raw), frames, 2, true),

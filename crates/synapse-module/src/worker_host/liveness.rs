@@ -38,6 +38,7 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 pub(super) struct TranscribeFrames {
     pub parts: Vec<(WorkerResponse, Vec<u8>)>,
     pub progress: Vec<WorkerResponse>,
+    pub timing: crate::transcribe_host::ProgressTiming,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -105,6 +106,7 @@ pub(super) async fn exchange_collect<S: AsyncRead + AsyncWrite + Unpin>(
         .ok_or_else(|| WorkerHostError::Protocol("exchange has no request id".into()))?;
     let started = Instant::now();
     let mut last = started;
+    let mut timing_last = started;
     let mut idle_until = last + window(phase);
     let mut completed = 0;
     let mut max_gap = Duration::ZERO;
@@ -158,8 +160,12 @@ pub(super) async fn exchange_collect<S: AsyncRead + AsyncWrite + Unpin>(
                 completed = next, "completed work received");
             completed = next;
             if let Some(collection) = collection.as_deref_mut() {
+                if next_phase == WorkerProgressPhase::Inference {
+                    collection.timing.signal(timing_last.elapsed());
+                }
                 collection.progress.push(response);
             }
+            timing_last = Instant::now();
             phase = next_phase;
             last = Instant::now();
             idle_until = last + window(phase);
@@ -186,12 +192,17 @@ pub(super) async fn exchange_collect<S: AsyncRead + AsyncWrite + Unpin>(
                     .validate_raw_frame(&raw)
                     .map_err(|error| WorkerHostError::Protocol(error.to_string()))?;
                 if matches!(response, WorkerResponse::Transcript { .. }) {
+                    if let Some(collection) = collection.as_deref_mut() {
+                        collection.timing.finish(timing_last.elapsed());
+                    }
                     return Ok((response, Some(raw)));
                 }
                 observation_part += 1;
                 if let Some(collection) = collection.as_deref_mut() {
+                    collection.timing.signal(timing_last.elapsed());
                     collection.parts.push((response, raw));
                 }
+                timing_last = Instant::now();
                 continue;
             }
         }
@@ -284,6 +295,84 @@ pub(super) async fn exchange_collect<S: AsyncRead + AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn transcribe_progress_intervals_include_observations_and_both_boundaries() {
+        for observe in [false, true] {
+            let (mut module, mut worker) = tokio::io::duplex(8192);
+            let peer = tokio::spawn(async move {
+                let _: WorkerRequest = read_json(&mut worker, 8192).await.unwrap();
+                read_raw(&mut worker, 8192).await.unwrap();
+                if observe {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    write_json(
+                        &mut worker,
+                        &WorkerResponse::Progress {
+                            req_id: "speech".into(),
+                            completed: 1,
+                            phase: WorkerProgressPhase::Inference,
+                        },
+                        8192,
+                    )
+                    .await
+                    .unwrap();
+                    tokio::time::sleep(Duration::from_millis(29)).await;
+                    write_json(
+                        &mut worker,
+                        &WorkerResponse::EncoderOutput {
+                            req_id: "speech".into(),
+                            frames: 1,
+                        },
+                        8192,
+                    )
+                    .await
+                    .unwrap();
+                    write_raw(&mut worker, &[0; 4096], 8192).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(11)).await;
+                    write_json(
+                        &mut worker,
+                        &WorkerResponse::DecodeTrace {
+                            req_id: "speech".into(),
+                            steps: 0,
+                        },
+                        8192,
+                    )
+                    .await
+                    .unwrap();
+                    write_raw(&mut worker, &[], 8192).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(43)).await;
+                write_json(
+                    &mut worker,
+                    &WorkerResponse::Transcript {
+                        req_id: "speech".into(),
+                        valid_encoder_frames: 1,
+                        count: 0,
+                        peak_device_memory_bytes: None,
+                        peak_storage_buffer_bytes: None,
+                    },
+                    8192,
+                )
+                .await
+                .unwrap();
+                write_raw(&mut worker, &[], 8192).await.unwrap();
+            });
+            let mut collection = TranscribeFrames::default();
+            exchange_collect(
+                &mut module,
+                &transcribe(observe),
+                Some(&[0; 512]),
+                8192,
+                true,
+                None,
+                Some(&mut collection),
+            )
+            .await
+            .unwrap();
+            peer.await.unwrap();
+            assert_eq!(collection.timing.longest_ms(), 43);
+        }
+    }
     use synapse_core::{encode_f32_frame, encode_i32_frame, WorkerPooling, WorkerTokenItem};
 
     fn transcribe(observe: bool) -> WorkerRequest {
@@ -310,6 +399,8 @@ mod tests {
                         req_id: "speech".into(),
                         valid_encoder_frames: 1,
                         count: 1,
+                        peak_device_memory_bytes: None,
+                        peak_storage_buffer_bytes: None,
                     },
                     4096,
                 )

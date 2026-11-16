@@ -114,7 +114,7 @@ pub(super) fn serve_transcribe<S: Read + Write>(
     else {
         unreachable!()
     };
-    let result = (|| -> Result<TranscribeOutput> {
+    let result = (|| -> Result<(TranscribeOutput, Option<u64>)> {
         let mel = decode_f32_frame(&raw)?;
         let request = TranscribeRequest {
             mel,
@@ -144,15 +144,16 @@ pub(super) fn serve_transcribe<S: Read + Write>(
             };
             let mut writer =
                 synapse_core::worker_framing_sync::ProgressWriter::new(stream, &req_id, max_frame);
-            engine.transcribe_with_progress(engine_model, request, &mut || {
+            let output = engine.transcribe_with_progress(engine_model, request, &mut || {
                 writer
                     .completed(synapse_core::WorkerProgressPhase::Inference)
                     .map_err(Into::into)
-            })
+            })?;
+            Ok((output, engine.request_peak_device_bytes()))
         }
     })();
     match result {
-        Ok(output) => write_transcription(stream, max_frame, &req_id, output),
+        Ok((output, peak)) => write_transcription(stream, max_frame, &req_id, output, peak),
         Err(error) => {
             let message = error.to_string();
             let code = if message.starts_with("invalid_request") {
@@ -182,6 +183,7 @@ fn write_transcription<S: Write>(
     max_frame: u32,
     req_id: &str,
     output: TranscribeOutput,
+    peak_device_memory_bytes: Option<u64>,
 ) -> Result<()> {
     let triples = encode_transcript_frame(&output.triples);
     ensure!(
@@ -231,6 +233,8 @@ fn write_transcription<S: Write>(
             req_id: req_id.into(),
             valid_encoder_frames: output.valid_encoder_frames,
             count: output.triples.len(),
+            peak_device_memory_bytes,
+            peak_storage_buffer_bytes: None,
         },
         max_frame,
     )?;
@@ -275,7 +279,14 @@ mod tests {
     fn transcribe_response_order_and_raw_lengths() {
         for observe in [false, true] {
             let mut bytes = Vec::new();
-            write_transcription(&mut bytes, DEFAULT_MAX_FRAME_BYTES, "t", output(observe)).unwrap();
+            write_transcription(
+                &mut bytes,
+                DEFAULT_MAX_FRAME_BYTES,
+                "t",
+                output(observe),
+                Some(123456),
+            )
+            .unwrap();
             let mut stream = Cursor::new(bytes);
             if observe {
                 let r: WorkerResponse =
@@ -297,6 +308,8 @@ mod tests {
                 WorkerResponse::Transcript {
                     valid_encoder_frames: 1,
                     count: 1,
+                    peak_device_memory_bytes: Some(123456),
+                    peak_storage_buffer_bytes: None,
                     ..
                 }
             ));
@@ -311,7 +324,7 @@ mod tests {
     #[test]
     fn transcribe_response_refuses_oversize_before_any_observation() {
         let mut bytes = Vec::new();
-        assert!(write_transcription(&mut bytes, 100, "t", output(true)).is_err());
+        assert!(write_transcription(&mut bytes, 100, "t", output(true), None).is_err());
         assert!(bytes.is_empty());
     }
 

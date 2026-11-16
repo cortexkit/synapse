@@ -372,6 +372,14 @@ pub(super) fn finish(state: &ModuleState, id: &str, result: Answer<Value>) -> An
         if !pending {
             return Ok(());
         }
+        let measurements = output
+            .as_mut()
+            .and_then(|v| v.as_object_mut())
+            .and_then(|m| m.remove("_measurements"));
+        let fingerprint = output
+            .as_mut()
+            .and_then(|v| v.as_object_mut())
+            .and_then(|m| m.remove("_fingerprint"));
         if let Some(observation) = output
             .as_mut()
             .and_then(|v| v.as_object_mut())
@@ -419,13 +427,15 @@ pub(super) fn finish(state: &ModuleState, id: &str, result: Answer<Value>) -> An
             }
         }
         t.execute(
-            "UPDATE media_jobs SET state=?2,result=?3,failure=?4,retained_ms=?5 WHERE id=?1",
+            "UPDATE media_jobs SET state=?2,result=?3,failure=?4,retained_ms=?5,transcribe_measurements=?6,transcribe_fingerprint=?7 WHERE id=?1",
             params![
                 id,
                 status,
                 output.map(|v| v.to_string()),
                 error.map(|v| v.to_string()),
-                now + RETENTION_MS
+                now + RETENTION_MS,
+                measurements.map(|v|v.to_string()),
+                fingerprint.and_then(|v|v.as_str().map(str::to_owned))
             ],
         )?;
         t.execute("UPDATE media_objects SET retained_ms=max(retained_ms,?2) WHERE id=(SELECT object_id FROM media_jobs WHERE id=?1)",params![id,now+RETENTION_MS])?;
@@ -532,7 +542,7 @@ pub(super) fn observation(state: &ModuleState, owner: &str, p: Value) -> Answer<
 pub(super) fn sweep(state: &ModuleState, now: u64) -> Answer<()> {
     expire_deadlines(state, now)?;
     let ids: Vec<String> = db(state, |c| {
-        let mut q=c.prepare("SELECT id FROM media_objects WHERE state!='gone' AND retained_ms<=?1 AND NOT EXISTS(SELECT 1 FROM media_jobs WHERE object_id=media_objects.id AND state IN ('queued','running'))")?;
+        let mut q=c.prepare("SELECT id FROM media_objects WHERE state NOT IN ('gone','rerun') AND retained_ms<=?1 AND NOT EXISTS(SELECT 1 FROM media_jobs WHERE object_id=media_objects.id AND state IN ('queued','running'))")?;
         let ids = q.query_map([now], |r| r.get(0))?.collect();
         ids
     })?;
@@ -552,7 +562,7 @@ pub(super) fn sweep(state: &ModuleState, now: u64) -> Answer<()> {
     }
     mutate(state, |t| {
         t.execute("DELETE FROM media_observation_pages WHERE job_id IN (SELECT id FROM media_jobs WHERE state NOT IN ('queued','running') AND retained_ms<=?1)",[now])?;
-        t.execute("UPDATE media_jobs SET result=NULL,expired=1 WHERE state NOT IN ('queued','running') AND retained_ms<=?1",[now])?;
+        t.execute("UPDATE media_jobs SET result=NULL,transcribe_measurements=NULL,expired=1 WHERE state NOT IN ('queued','running') AND retained_ms<=?1",[now])?;
         Ok(())
     })
 }
@@ -564,7 +574,7 @@ pub(super) fn recover(state: &ModuleState) -> Answer<()> {
         t.execute("UPDATE media_objects SET retained_ms=max(retained_ms,?1) WHERE id IN (SELECT object_id FROM media_jobs WHERE state IN ('queued','running'))",[now+RETENTION_MS])?;
         t.execute("UPDATE media_jobs SET state='failed',failure=?1,retained_ms=?2 WHERE state IN ('queued','running')",params![error,now+RETENTION_MS])?;
         t.execute(
-            "UPDATE media_objects SET state='gone' WHERE state='open'",
+            "UPDATE media_objects SET state='gone' WHERE state IN ('open','rerun')",
             [],
         )?;
         Ok(())
@@ -593,4 +603,138 @@ pub(super) fn job_audio(state: &ModuleState, id: &str) -> Answer<Vec<u8>> {
         })
     })?;
     fs::read(path(state, &object)?).map_err(internal)
+}
+
+struct CompletedCertification {
+    lane: String,
+    fingerprint: Option<String>,
+    measurements: Option<String>,
+    object: String,
+    sha256: String,
+}
+
+fn completed_certification(
+    state: &ModuleState,
+    owner: &str,
+    p: &Value,
+) -> Answer<CompletedCertification> {
+    let id = string(p, "job_id")?;
+    let row = db(state, |c| {
+        c.query_row("SELECT j.state,j.lane,j.transcribe_fingerprint,j.transcribe_measurements,j.object_id,o.sha256 FROM media_jobs j JOIN media_objects o ON o.id=j.object_id WHERE j.owner=?1 AND j.id=?2 AND j.expired=0 AND j.retained_ms>?3", params![owner,id,clock_ms(state)], |r| {
+            Ok((r.get::<_,String>(0)?, CompletedCertification {lane:r.get(1)?,fingerprint:r.get(2)?,measurements:r.get(3)?,object:r.get(4)?,sha256:r.get(5)?}))
+        }).optional()
+    })?;
+    let (status, job) = row.ok_or_else(|| fault("unknown_job", None))?;
+    if status != "done" {
+        let mut error = fault("job_not_done", None);
+        error.0["detail"]["status"] = json!(status);
+        return Err(error);
+    }
+    Ok(job)
+}
+
+pub(super) fn measurements(state: &ModuleState, owner: &str, p: Value) -> Answer<Value> {
+    if !state.runtime.certify_observation {
+        return Err(fault("certify_observation_disabled", None));
+    }
+    let job = completed_certification(state, owner, &p)?;
+    let missing = |field: &str| {
+        fault(
+            "measurement_unavailable",
+            Some(&format!("certify.transcribe_measurements.{field}")),
+        )
+    };
+    let value: Value = serde_json::from_str(
+        job.measurements
+            .as_deref()
+            .ok_or_else(|| missing("self_check_wall_ms"))?,
+    )
+    .map_err(internal)?;
+    for field in ["self_check_wall_ms", "longest_progress_interval_ms"] {
+        if !value[field].is_u64() {
+            return Err(missing(field));
+        }
+    }
+    for (field, required) in [
+        (
+            "peak_device_memory_bytes",
+            job.lane.ends_with("-cuda") || job.lane.ends_with("-vulkan"),
+        ),
+        ("peak_storage_buffer_bytes", job.lane.ends_with("-vulkan")),
+    ] {
+        if required && !value[field].as_u64().is_some_and(|n| n > 0) {
+            return Err(missing(field));
+        }
+    }
+    Ok(value)
+}
+
+pub(super) struct RerunInput {
+    pub lane: String,
+    pub fingerprint: String,
+    pub bytes: Vec<u8>,
+    pub object: String,
+}
+
+pub(super) fn rerun_input(state: &ModuleState, owner: &str, p: &Value) -> Answer<RerunInput> {
+    let job = completed_certification(state, owner, p)?;
+    let audio: objects::MediaValue = parse(p["audio"].clone(), "audio")?;
+    objects::check_media(&audio).map_err(|_| invalid("audio"))?;
+    let object = audio
+        .object_id
+        .as_ref()
+        .filter(|_| audio.data.is_none())
+        .ok_or_else(|| invalid("audio.object_id"))?;
+    if audio.mime != "audio/wav" {
+        return Err(unsupported("audio.mime"));
+    }
+    if audio.sha256 != job.sha256 {
+        return Err(fault("object_mismatch", Some("audio.sha256")));
+    }
+    let used: bool = db(state, |c| {
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media_jobs WHERE object_id=?1)",
+            [object],
+            |r| r.get(0),
+        )
+    })?;
+    if *object == job.object || used {
+        return Err(invalid("audio.object_id"));
+    }
+    let bytes = audio_bytes(state, owner, &audio)?;
+    if bytes.len() as u64 != audio.bytes || format!("{:x}", Sha256::digest(&bytes)) != job.sha256 {
+        return Err(fault("object_mismatch", Some("audio.sha256")));
+    }
+    Ok(RerunInput {
+        lane: job.lane,
+        fingerprint: job
+            .fingerprint
+            .ok_or_else(|| fault("measurement_unavailable", Some("job_id")))?,
+        bytes,
+        object: object.clone(),
+    })
+}
+
+pub(super) fn claim_rerun(state: &ModuleState, object: &str) -> Answer<()> {
+    let changed = mutate(state, |t| {
+        t.execute(
+            "UPDATE media_objects SET state='rerun' WHERE id=?1 AND state='committed'",
+            [object],
+        )
+    })?;
+    if changed != 1 {
+        return Err(fault("unknown_object", None));
+    }
+    Ok(())
+}
+
+pub(super) fn delete_rerun(state: &ModuleState, object: &str) -> Answer<()> {
+    fs::remove_file(path(state, object)?).map_err(internal)?;
+    mutate(state, |t| {
+        t.execute(
+            "UPDATE media_objects SET state='gone',output=NULL WHERE id=?1",
+            [object],
+        )?;
+        Ok(())
+    })
 }

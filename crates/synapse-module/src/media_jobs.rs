@@ -226,6 +226,10 @@ pub(super) async fn handle(
     }
     let answer = if method == "media.submit" {
         submit(state.clone(), owner, params).await
+    } else if method == "certify.transcribe_observe_rerun" {
+        observe_rerun(state.clone(), owner, params).await
+    } else if method == "certify.transcribe_measurements" {
+        persistence::measurements(&state, owner, params)
     } else {
         let _gate = state.runtime.media.gate.lock().expect("media gate");
         persistence::sweep(&state, clock_ms(&state)).and_then(|_| match method {
@@ -420,7 +424,7 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
                 Err(error)
             } else {
                 persistence::job_audio(&state, &job_id)
-                    .and_then(|bytes| run(&state, &entry, &backend, &bytes, cached))
+                    .and_then(|bytes| run(&state, &entry, &backend, &bytes, cached, true))
             };
             let _gate = state.runtime.media.gate.lock().expect("media gate");
             if let Err(error) = persistence::finish(&state, &job_id, result) {
@@ -438,11 +442,12 @@ fn run(
     backend: &catalog::CatalogBackend,
     audio: &[u8],
     cached: &mut Lane,
+    observe: bool,
 ) -> Answer<Value> {
     #[cfg(test)]
     {
         let run = state.runtime.media.runner.lock().unwrap().clone();
-        if let Some(run) = run {
+        if let Some(run) = run.filter(|_| observe) {
             return checked_output(run(&catalog::lane_id(&entry.id, &backend.backend), audio)?);
         }
     }
@@ -471,7 +476,12 @@ fn run(
         }
     }
     let host = cached.host.as_ref().expect("loaded speech host");
-    let result = host.transcribe(audio, |_| {}).map_err(|e| {
+    let result = if observe {
+        host.transcribe(audio, |_| {})
+    } else {
+        host.transcribe_self_check(audio, |_| {})
+    }
+    .map_err(|e| {
         if let Some(retry) = host.quarantine_retry_after_ms() {
             return quarantined(&catalog::lane_id(&entry.id, &backend.backend), retry);
         }
@@ -481,6 +491,12 @@ fn run(
             _ => fault("engine_crashed", None),
         }
     })?;
+    if !observe {
+        return Ok(
+            json!({"observe":false,"valid_encoder_frames":result.output.valid_encoder_frames,
+            "triples":base64_encode(&result.transcript_frame)}),
+        );
+    }
     let words = result
         .transcript
         .words
@@ -490,6 +506,14 @@ fn run(
     let mut output = json!({"text":result.transcript.text,"words":words,"no_speech":result.transcript.no_speech});
     output = checked_output(output)?;
     if state.runtime.certify_observation {
+        let self_check_wall_ms = transcribe_self_check::wall_ms(state, &lane).map_err(wire)?;
+        output["_measurements"] = measurement_snapshot(
+            &backend.backend,
+            &result,
+            self_check_wall_ms,
+            host.ane_shapes(),
+        );
+        output["_fingerprint"] = json!(backend.fingerprint);
         if let Some(frames) = result.observation {
             // Raw observation bytes are internal until completion atomically
             // stores bounded pages and publishes only their descriptors.
@@ -497,6 +521,71 @@ fn run(
         }
     }
     Ok(output)
+}
+
+fn measurement_snapshot(
+    backend: &str,
+    result: &transcribe_host::TranscribeResult,
+    self_check_wall_ms: Option<u64>,
+    ane_shapes: Vec<Value>,
+) -> Value {
+    json!({
+        "self_check_wall_ms":self_check_wall_ms,
+        "longest_progress_interval_ms":result.timing.longest_ms(),
+        "ane_shapes":if backend == "ane" {ane_shapes} else {Vec::new()},
+        "peak_device_memory_bytes":if matches!(backend, "cuda" | "vulkan") {result.peak_device_memory_bytes} else {None},
+        "peak_storage_buffer_bytes":if backend == "vulkan" {result.peak_storage_buffer_bytes} else {None}
+    })
+}
+
+async fn observe_rerun(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<Value> {
+    if !state.runtime.certify_observation {
+        return Err(fault("certify_observation_disabled", None));
+    }
+    let (entry, backend, bytes, object, guard) = {
+        let _gate = state.runtime.media.gate.lock().expect("media gate");
+        let input = persistence::rerun_input(&state, owner, &params)?;
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk");
+        let (entry, backend) = select(&state, &input.lane)?;
+        if backend.fingerprint != input.fingerprint {
+            return Err(fault("object_mismatch", Some("job_id")));
+        }
+        let pause = lane_pause::admit(&state.runtime, &input.lane).map_err(wire)?;
+        let serving = lane_serving_gate(&state.runtime, &input.lane)
+            .try_read_owned()
+            .map_err(|_| fault("model_loading", None))?;
+        if current_catalog_install(&state, &entry, &backend.backend)
+            .map_err(wire)?
+            .is_none()
+        {
+            return Err(fault("model_not_installed", None));
+        }
+        persistence::check_lane_capacity(&state, &input.lane)?;
+        persistence::claim_rerun(&state, &input.object)?;
+        (entry, backend, input.bytes, input.object, (pause, serving))
+    };
+    // The detached task owns the upload and lane guards even if the caller stops waiting.
+    tokio::spawn(async move {
+        let lock = lane_cache(
+            &state.runtime,
+            &catalog::lane_id(&entry.id, &backend.backend),
+        );
+        let mut cached = lock.lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&state, &entry, &backend, &bytes, &mut cached, false)
+            }))
+            .unwrap_or_else(|_| Err(fault("engine_crashed", None)));
+            let _gate = state.runtime.media.gate.lock().expect("media gate");
+            persistence::delete_rerun(&state, &object)?;
+            result
+        })
+        .await
+        .map_err(internal)?
+    })
+    .await
+    .map_err(internal)?
 }
 
 fn checked_output(output: Value) -> Answer<Value> {

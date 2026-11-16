@@ -864,6 +864,14 @@ const MIGRATIONS: &[Migration] = &[
             );
         "#,
     },
+    Migration {
+        version: 17,
+        statements: r#"
+            ALTER TABLE catalog_self_checks ADD COLUMN self_check_wall_ms INTEGER;
+            ALTER TABLE media_jobs ADD COLUMN transcribe_measurements TEXT;
+            ALTER TABLE media_jobs ADD COLUMN transcribe_fingerprint TEXT;
+        "#,
+    },
 ];
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -9898,7 +9906,7 @@ mod tests {
                 .unwrap();
         }
         let store = SynapseStore::open(&descriptor).unwrap();
-        assert_eq!(newest_schema_version(), 16);
+        assert_eq!(newest_schema_version(), 17);
         let finished = store.get_job("finished").unwrap().unwrap();
         assert_eq!(finished.state, JOB_STATE_DONE);
         assert_eq!(finished.request_digest, "digest");
@@ -10266,7 +10274,10 @@ mod tests {
                         );
                         store.store
                     }
-                    10..=16 => store,
+                    // Migration 17 only adds nullable columns to existing
+                    // tables, so it needs no rows of its own: it runs over the
+                    // rows the earlier arms wrote.
+                    10..=17 => store,
                     _ => panic!("no fixture rows for migration {version}"),
                 }
             };

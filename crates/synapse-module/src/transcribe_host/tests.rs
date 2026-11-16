@@ -244,6 +244,8 @@ fn transcribe_host_self_check_keeps_observe_off_and_refuses_audio_before_worker_
                 req_id: req_id.clone(),
                 valid_encoder_frames: 2,
                 count: 0,
+                peak_device_memory_bytes: None,
+                peak_storage_buffer_bytes: None,
             },
             Some(vec![]),
         )

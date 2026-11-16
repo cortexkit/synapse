@@ -179,7 +179,7 @@ fn insert_check(
     )
     .unwrap();
     tx.execute(
-        "INSERT INTO catalog_self_checks VALUES (?1,?2,?3,?4,?5,?6,'historical-os','historical-fixture',?7,?8,123,'historical-reason')",
+        "INSERT INTO catalog_self_checks (check_id,catalog_id,manifest_digest,backend,fingerprint,engine_identity_json,os_build,fixture_revision,state,generation,checked_at_ms,reason) VALUES (?1,?2,?3,?4,?5,?6,'historical-os','historical-fixture',?7,?8,123,'historical-reason')",
         params![id,entry.id,digest,backend,fingerprint,serde_json::to_string_pretty(&identity).unwrap(),state,generation],
     )?;
     Ok(id)

@@ -110,8 +110,23 @@ fn exchange(
             WorkerResponse::Transcript {
                 valid_encoder_frames,
                 count,
+                peak_device_memory_bytes,
                 ..
             } => {
+                let Some(super::super::LoadedModel {
+                    engine: super::super::LoadedEngine::Transcribe { engine, .. },
+                    ..
+                }) = &state.loaded
+                else {
+                    panic!("speech engine missing")
+                };
+                assert!(peak_device_memory_bytes.is_some_and(|bytes| bytes > 0));
+                assert_eq!(peak_device_memory_bytes, engine.request_peak_device_bytes());
+                println!(
+                    "{id} request_peak_device_memory_bytes={} device_wide_lifetime_peak_bytes={}",
+                    peak_device_memory_bytes.unwrap(),
+                    engine.peak_device_bytes()
+                );
                 assert_eq!(stage, if observe { 2 } else { 0 });
                 output.valid_encoder_frames = Some(valid_encoder_frames as u64);
                 output.engine_started = true;

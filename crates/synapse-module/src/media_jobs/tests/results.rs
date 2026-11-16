@@ -48,6 +48,443 @@ fn triples(values: &[[i32; 3]]) -> Vec<synapse_core::TranscriptRecord> {
         .collect()
 }
 
+#[cfg(unix)]
+fn certification_mock(
+    profile: transcribe_host::TranscribeProfile,
+    seen: Arc<std::sync::Mutex<Vec<bool>>>,
+) -> transcribe_host::TranscribeHost {
+    use synapse_core::{WorkerRequest, WorkerResponse};
+    let engine =
+        worker_host::WorkerEngine::new(worker_host::WorkerHostConfig::new("unused", "unused"))
+            .unwrap();
+    let model = engine.insert_loaded_model_for_test("speech".into(), 1024, 0, None);
+    engine.attach_mock_worker_frames_for_test(move |request, _| {
+        let WorkerRequest::Transcribe {
+            req_id,
+            observe,
+            valid_mel_frames,
+            ..
+        } = request
+        else {
+            panic!("unexpected request")
+        };
+        let frames = valid_mel_frames.div_ceil(8);
+        let mut seen = seen.lock().unwrap();
+        let peak = if seen.is_empty() { 123456 } else { 999999 };
+        seen.push(*observe);
+        std::thread::sleep(Duration::from_millis(23));
+        let mut replies = Vec::new();
+        if *observe {
+            replies.push((
+                WorkerResponse::EncoderOutput {
+                    req_id: req_id.clone(),
+                    frames,
+                },
+                Some(vec![0; frames * 4096]),
+            ));
+            replies.push((
+                WorkerResponse::DecodeTrace {
+                    req_id: req_id.clone(),
+                    steps: 0,
+                },
+                Some(vec![]),
+            ));
+        }
+        replies.push((
+            WorkerResponse::Transcript {
+                req_id: req_id.clone(),
+                valid_encoder_frames: frames,
+                count: 1,
+                peak_device_memory_bytes: Some(peak),
+                peak_storage_buffer_bytes: Some(65432),
+            },
+            Some(synapse_core::encode_transcript_frame(&triples(&[[
+                piece_id("▁the"),
+                0,
+                1,
+            ]]))),
+        ));
+        replies
+    });
+    transcribe_host::TranscribeHost::worker_for_test(profile, engine, model)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transcribe_certification_snapshot_units_and_backend_nullability_from_mock() {
+    let result = tokio::task::spawn_blocking(|| {
+        certification_mock(
+            transcribe_host::TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-cuda").unwrap(),
+            Default::default(),
+        )
+        .transcribe_self_check(&wav(4008), |_| {})
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    let shapes = json!([{"encoder_frames":128,"executables":(0..24).map(|layer|json!({"id":format!("layer-{layer}"),"layers":[layer]})).collect::<Vec<_>>(),"cpu_stages":["frontend"]}]);
+    for backend in ["cuda", "vulkan", "metal", "ane"] {
+        let snapshot = measurement_snapshot(
+            backend,
+            &result,
+            Some(37),
+            shapes.as_array().unwrap().clone(),
+        );
+        assert_eq!(snapshot.as_object().unwrap().len(), 5);
+        assert_eq!(snapshot["self_check_wall_ms"], 37);
+        assert!(snapshot["longest_progress_interval_ms"].as_u64().unwrap() >= 23);
+        assert_eq!(
+            snapshot["peak_device_memory_bytes"],
+            if matches!(backend, "cuda" | "vulkan") {
+                json!(123456)
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            snapshot["peak_storage_buffer_bytes"],
+            if backend == "vulkan" {
+                json!(65432)
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            snapshot["ane_shapes"],
+            if backend == "ane" {
+                shapes.clone()
+            } else {
+                json!([])
+            }
+        );
+    }
+}
+
+#[cfg(unix)]
+async fn fresh_upload(state: &Arc<ModuleState>, owner: &str, bytes: &[u8]) -> Value {
+    let mut facts = media(bytes);
+    facts.as_object_mut().unwrap().remove("data");
+    let upload = call(state, owner, "media.upload_begin", facts.clone())
+        .await
+        .unwrap()["upload_id"]
+        .clone();
+    call(
+        state,
+        owner,
+        "media.upload_append",
+        json!({"upload_id":upload,"offset":0,"data":base64_encode(bytes)}),
+    )
+    .await
+    .unwrap();
+    call(
+        state,
+        owner,
+        "media.upload_commit",
+        json!({"upload_id":upload}),
+    )
+    .await
+    .unwrap();
+    facts["object_id"] = upload;
+    facts
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_private_identical_and_deletes_upload(
+) {
+    let (root, mut state) = fixture("transcribe-certification-rerun", true);
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime)
+        .unwrap()
+        .certify_observation = true;
+    *state.runtime.media.runner.lock().unwrap() = None;
+    let backend = first(&state);
+    let lane = catalog::lane_id(MODEL, &backend);
+    let entry = state.runtime.release_catalog.entry(MODEL).unwrap();
+    let check_lane = catalog_transcribe_lane(entry, entry.backend(&backend).unwrap()).unwrap();
+    let (check_id, key) = transcribe_self_check::key(&state, &check_lane).unwrap();
+    let generation = catalog_check_generation(&state, &check_id, &key).unwrap();
+    catalog_complete_check(&state, &check_id, generation, "passed", None).unwrap();
+    state
+        .store
+        .store
+        .with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE catalog_self_checks SET self_check_wall_ms=37 WHERE check_id=?1",
+                [&check_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let profile = selected_profile(&state);
+    let recorded = seen.clone();
+    let host = tokio::task::spawn_blocking(move || certification_mock(profile, recorded))
+        .await
+        .unwrap();
+    lane_cache(&state.runtime, &lane).lock().await.host = Some(host);
+    let bytes = wav(4008);
+    let mut submit = request("certification-original");
+    submit["input"]["audio"] = media(&bytes);
+    let id = call(&state, "alice", "media.submit", submit).await.unwrap()["job_id"].clone();
+    assert_eq!(done(&state, id.as_str().unwrap()).await["status"], "done");
+    let original = call(&state, "alice", "media.result", json!({"job_id":id}))
+        .await
+        .unwrap();
+    let measurements = call(
+        &state,
+        "alice",
+        "certify.transcribe_measurements",
+        json!({"job_id":id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(measurements["self_check_wall_ms"], 37);
+    assert!(
+        measurements["longest_progress_interval_ms"]
+            .as_u64()
+            .unwrap()
+            >= 23
+    );
+    assert_eq!(measurements.as_object().unwrap().len(), 5);
+    assert!(!original
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|key| key.starts_with('_')));
+    let original_object: String = state
+        .store
+        .store
+        .with_conn_fenced(|tx| {
+            let object = tx.query_row(
+                "SELECT object_id FROM media_jobs WHERE id=?1",
+                [id.as_str().unwrap()],
+                |row| row.get::<_, String>(0),
+            )?;
+            tx.execute(
+                "UPDATE media_objects SET state='gone' WHERE id=?1",
+                [&object],
+            )?;
+            Ok(object)
+        })
+        .unwrap();
+    fs::remove_file(
+        persistence::directory(&state)
+            .unwrap()
+            .join(original_object),
+    )
+    .unwrap();
+
+    for method in [
+        "certify.transcribe_measurements",
+        "certify.transcribe_observe_rerun",
+    ] {
+        assert_eq!(
+            call(&state, "bob", method, json!({"job_id":id}))
+                .await
+                .unwrap_err()
+                .0["code"],
+            "unknown_job"
+        );
+    }
+    let different = fresh_upload(&state, "alice", &wav(4010)).await;
+    let before = state
+        .store
+        .store
+        .with_conn(|c| Ok(c.total_changes()))
+        .unwrap();
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "certify.transcribe_observe_rerun",
+            json!({"job_id":id,"audio":different})
+        )
+        .await
+        .unwrap_err()
+        .0["detail"]["field"],
+        "audio.sha256"
+    );
+    assert_eq!(
+        state
+            .store
+            .store
+            .with_conn(|c| Ok(c.total_changes()))
+            .unwrap(),
+        before,
+        "SHA refusal writes nothing"
+    );
+    assert_eq!(*seen.lock().unwrap(), [true]);
+
+    let upload = fresh_upload(&state, "alice", &bytes).await;
+    for (field, value) in [("bytes", json!(1)), ("mime", json!("audio/mp3"))] {
+        let mut wrong = upload.clone();
+        wrong[field] = value;
+        assert!(call(
+            &state,
+            "alice",
+            "certify.transcribe_observe_rerun",
+            json!({"job_id":id,"audio":wrong})
+        )
+        .await
+        .is_err());
+    }
+    let foreign = fresh_upload(&state, "bob", &bytes).await;
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "certify.transcribe_observe_rerun",
+            json!({"job_id":id,"audio":foreign})
+        )
+        .await
+        .unwrap_err()
+        .0["code"],
+        "unknown_object"
+    );
+    let held = lane_cache(&state.runtime, &lane).lock_owned().await;
+    let rerun_state = state.clone();
+    let rerun_params = json!({"job_id":id,"audio":upload});
+    let pending = tokio::spawn(async move {
+        call(
+            &rerun_state,
+            "alice",
+            "certify.transcribe_observe_rerun",
+            rerun_params,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [true],
+        "rerun must wait for the normal lane lock"
+    );
+    drop(held);
+    let rerun = pending.await.unwrap().unwrap();
+    assert_eq!(
+        rerun,
+        json!({"observe":false,"valid_encoder_frames":original["observation"]["valid_encoder_frames"],"triples":original["observation"]["triples"]})
+    );
+    assert_eq!(*seen.lock().unwrap(), [true, false]);
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "media.upload_status",
+            json!({"upload_id":upload["object_id"]})
+        )
+        .await
+        .unwrap()["state"],
+        "gone"
+    );
+    assert!(!persistence::directory(&state)
+        .unwrap()
+        .join(upload["object_id"].as_str().unwrap())
+        .exists());
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "certify.transcribe_measurements",
+            json!({"job_id":id})
+        )
+        .await
+        .unwrap(),
+        measurements
+    );
+    assert_eq!(
+        call(&state, "alice", "media.result", json!({"job_id":id}))
+            .await
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "certify.transcribe_observe_rerun",
+            json!({"job_id":id,"audio":upload})
+        )
+        .await
+        .unwrap_err()
+        .0["code"],
+        "unknown_object"
+    );
+    state
+        .store
+        .store
+        .with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE catalog_self_checks SET self_check_wall_ms=777 WHERE check_id=?1",
+                [&check_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut later = request("certification-later");
+    later["input"]["audio"] = media(&bytes);
+    let later_id = call(&state, "alice", "media.submit", later).await.unwrap()["job_id"].clone();
+    assert_eq!(
+        done(&state, later_id.as_str().unwrap()).await["status"],
+        "done"
+    );
+    let later_measurements = call(
+        &state,
+        "alice",
+        "certify.transcribe_measurements",
+        json!({"job_id":later_id}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(later_measurements["self_check_wall_ms"], 777);
+    if matches!(backend.as_str(), "cuda" | "vulkan") {
+        assert_eq!(later_measurements["peak_device_memory_bytes"], 999999);
+    }
+    assert_eq!(
+        call(
+            &state,
+            "alice",
+            "certify.transcribe_measurements",
+            json!({"job_id":id})
+        )
+        .await
+        .unwrap(),
+        measurements
+    );
+    cleanup(root, state).await;
+}
+
+#[tokio::test]
+async fn transcribe_certification_operations_refuse_without_observation_mode() {
+    let (root, state) = fixture("transcribe-certification-disabled", true);
+    for method in [
+        "certify.transcribe_measurements",
+        "certify.transcribe_observe_rerun",
+    ] {
+        let before = state
+            .store
+            .store
+            .with_conn(|c| Ok(c.total_changes()))
+            .unwrap();
+        assert_eq!(
+            call(&state, "alice", method, json!({"job_id":"unknown"}))
+                .await
+                .unwrap_err()
+                .0["code"],
+            "certify_observation_disabled"
+        );
+        assert_eq!(
+            state
+                .store
+                .store
+                .with_conn(|c| Ok(c.total_changes()))
+                .unwrap(),
+            before
+        );
+    }
+    cleanup(root, state).await;
+}
+
 #[tokio::test]
 async fn media_results_use_shared_words_silence_zero_durations_and_final_clamp() {
     let the = piece_id("▁the");
@@ -228,6 +665,8 @@ async fn media_results_mock_worker_observation_pages_are_exact_private_and_expir
                         req_id: req_id.clone(),
                         valid_encoder_frames: 129,
                         count: 1,
+                        peak_device_memory_bytes: None,
+                        peak_storage_buffer_bytes: None,
                     },
                     Some(sent_transcript.clone()),
                 ),

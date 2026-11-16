@@ -2512,7 +2512,7 @@ impl Scheduler {
                 slot.inventory = Some(inventory.clone());
                 slot.promise = None;
                 if let Some(sink) = state.inventory_sink.as_mut() {
-                    sink.push(Arc::clone(&inventory));
+                    sink.push((key.clone(), Arc::clone(&inventory)));
                 }
                 state.stats.admitted += 1;
                 // Learn only from a standalone admission, measured from the

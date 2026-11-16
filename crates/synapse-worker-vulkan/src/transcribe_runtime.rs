@@ -19,6 +19,7 @@ struct LayerCapture {
 pub struct Engine {
     arena: Arena,
     maximum: usize,
+    largest_storage_buffer: u64,
     joint: HostJoint,
     #[cfg(test)]
     layer_capture: Option<LayerCapture>,
@@ -36,6 +37,7 @@ impl Engine {
         let maximum = transcribe::maximum(profile)?;
         transcribe::validate_weights(model, header)?;
         let plan = transcribe::buffer_plan(model, maximum)?;
+        let largest_storage_buffer = plan.iter().map(|buffer| buffer.bytes).max().unwrap_or(0);
         ensure!(
             synapse_parity::vulkan::arena_bytes(&plan) == required.min_device_local_bytes,
             "manifest_mismatch"
@@ -59,6 +61,7 @@ impl Engine {
         Ok(Self {
             arena,
             maximum,
+            largest_storage_buffer,
             joint: HostJoint::load(header, data),
             #[cfg(test)]
             layer_capture: None,
@@ -595,6 +598,8 @@ impl Engine {
         }
         Ok(Output {
             valid_encoder_frames,
+            peak_device_memory_bytes: Some(self.device_bytes()),
+            peak_storage_buffer_bytes: Some(self.largest_storage_buffer),
             encoder,
             triples: decoded
                 .triples

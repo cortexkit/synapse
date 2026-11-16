@@ -114,6 +114,7 @@ mod enabled {
         fn synapse_parakeet_predict(p: *mut c_void, token: i32, reset: i32) -> i32;
         fn synapse_parakeet_joint(p: *mut c_void, frame: i32, logits: *mut f32) -> i32;
         fn synapse_parakeet_peak(p: *mut c_void) -> usize;
+        fn synapse_parakeet_request_peak(p: *mut c_void) -> usize;
     }
     fn native_error() -> anyhow::Error {
         // The native error is a thread-local NUL-terminated string, valid until
@@ -154,6 +155,15 @@ mod enabled {
                 .and_then(|(_, _, c)| c.lock().ok())
                 .map(|c| unsafe { synapse_parakeet_peak(c.0.as_ptr()) })
                 .unwrap_or(0)
+        }
+        /// Explicit engine allocations at the last request's high-water mark.
+        /// Opaque CUDA/cuBLAS internal allocations are not attributable here.
+        pub fn request_peak_device_bytes(&self) -> Option<u64> {
+            self.loaded.as_ref().and_then(|(_, _, c)| {
+                c.lock()
+                    .ok()
+                    .map(|c| unsafe { synapse_parakeet_request_peak(c.0.as_ptr()) as u64 })
+            })
         }
         pub fn transcribe_with_progress(
             &self,

@@ -193,6 +193,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
 
 #[cfg(unix)]
 impl DirectAneEngine {
+    pub(crate) fn transcribe_shapes(&self) -> Vec<serde_json::Value> {
+        self.serving.supervisor.transcribe_shapes(
+            self.serving.channel.worker_id(),
+            &self.serving.metadata.model_ref,
+        )
+    }
+
     pub(crate) fn admit_self_check(
         &self,
         frames: usize,
@@ -306,6 +313,8 @@ mod tests {
                                         req_id,
                                         valid_encoder_frames: 129,
                                         count: 0,
+                                        peak_device_memory_bytes: None,
+                                        peak_storage_buffer_bytes: None,
                                     },
                                     DEFAULT_MAX_FRAME_BYTES,
                                 )
@@ -474,7 +483,8 @@ mod tests {
         let speech_worker: Arc<dyn AneShapeWorker> = speech.clone();
         let embed_ref = "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:pinned";
         let speech_ref = "ane-direct:parakeet-tdt-0.6b-v3.ane-direct-worker:pinned";
-        let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        let mut supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        supervisor.enable_observations();
         for shape in [128, 256, 512] {
             drop(
                 supervisor
@@ -491,6 +501,30 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(supervisor.inner.lock().reserved_executables(), 80);
+        let frozen_shapes = supervisor.transcribe_shapes("speech-only", speech_ref);
+        assert_eq!(frozen_shapes.len(), 1);
+        assert_eq!(frozen_shapes[0]["encoder_frames"], 128);
+        let executables = frozen_shapes[0]["executables"].as_array().unwrap();
+        assert_eq!(executables.len(), 24);
+        assert_eq!(
+            executables
+                .iter()
+                .map(|e| e["id"].as_str().unwrap())
+                .collect::<HashSet<_>>()
+                .len(),
+            24
+        );
+        assert_eq!(
+            executables
+                .iter()
+                .flat_map(|e| e["layers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_u64().unwrap()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            (0..24).collect()
+        );
         assert_eq!(
             *embed_events.lock().unwrap(),
             [(true, 128), (true, 256), (true, 512), (false, 128)]
@@ -508,6 +542,11 @@ mod tests {
         }
         assert_eq!(supervisor.inner.lock().reserved_executables(), 84);
         assert_eq!(*speech_events.lock().unwrap(), [(true, 128), (false, 128)]);
+        assert_eq!(
+            supervisor.transcribe_shapes("speech-only", speech_ref),
+            frozen_shapes,
+            "eviction cannot erase admitted shapes"
+        );
         drop(
             supervisor
                 .lease(&speech_worker, speech_ref, 128)
@@ -519,6 +558,11 @@ mod tests {
             [(true, 128), (false, 128), (true, 128)]
         );
         assert_eq!(supervisor.inner.lock().reserved_executables(), 80);
+        assert_eq!(
+            supervisor.transcribe_shapes("speech-only", speech_ref),
+            frozen_shapes,
+            "readmission deduplicates each encoder rung"
+        );
         supervisor
             .retire(&embed_worker, embedding.shutdown())
             .await

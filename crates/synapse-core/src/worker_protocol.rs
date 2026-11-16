@@ -574,6 +574,12 @@ pub enum WorkerResponse {
         req_id: String,
         valid_encoder_frames: usize,
         count: usize,
+        /// Request-scoped engine-owned device allocation high-water mark, in bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peak_device_memory_bytes: Option<u64>,
+        /// Largest storage-buffer allocation/range used by the request, in bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peak_storage_buffer_bytes: Option<u64>,
     },
     Text {
         req_id: String,
@@ -944,6 +950,8 @@ mod tests {
                     req_id: "speech-1".into(),
                     valid_encoder_frames: 1,
                     count: 1,
+                    peak_device_memory_bytes: None,
+                    peak_storage_buffer_bytes: None,
                 },
                 r#"{"type":"TRANSCRIPT","req_id":"speech-1","valid_encoder_frames":1,"count":1}"#,
                 vec![0; 12],
@@ -972,8 +980,36 @@ mod tests {
             req_id: "overflow".into(),
             valid_encoder_frames: 1,
             count: usize::MAX,
+            peak_device_memory_bytes: None,
+            peak_storage_buffer_bytes: None,
         };
         assert!(overflow.validate_raw_frame(&[]).is_err());
+    }
+
+    #[test]
+    fn transcribe_memory_telemetry_is_optional_and_round_trips_in_v4() {
+        let old = r#"{"type":"TRANSCRIPT","req_id":"speech","valid_encoder_frames":1,"count":0}"#;
+        let mut reply: WorkerResponse = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&reply).unwrap(), old);
+        let WorkerResponse::Transcript {
+            peak_device_memory_bytes,
+            peak_storage_buffer_bytes,
+            ..
+        } = &mut reply
+        else {
+            panic!("expected transcript")
+        };
+        assert!(peak_device_memory_bytes.is_none() && peak_storage_buffer_bytes.is_none());
+        *peak_device_memory_bytes = Some(123456);
+        *peak_storage_buffer_bytes = Some(65432);
+        let encoded = serde_json::to_value(&reply).unwrap();
+        assert_eq!(encoded["peak_device_memory_bytes"], 123456);
+        assert_eq!(encoded["peak_storage_buffer_bytes"], 65432);
+        assert_eq!(
+            serde_json::from_value::<WorkerResponse>(encoded).unwrap(),
+            reply
+        );
+        assert_eq!(WORKER_PROTOCOL_VERSION, 4);
     }
 
     #[test]

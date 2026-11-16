@@ -12,6 +12,7 @@ fn main() {
         "src/port/cuda_modernbert.cu",
         "src/port/cuda_qwen3.cu",
         "src/port/cuda_parakeet.cu",
+        "src/port/parakeet_allocation_meter.h",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }

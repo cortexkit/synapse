@@ -244,7 +244,8 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `lanes.resume`, `lanes.status`, `diagnostics.findings`, `role.describe`,
 `media.submit`, `media.status`, `media.result`, `media.cancel`,
 `media.upload_begin`, `media.upload_append`, `media.upload_status`,
-`media.upload_commit`, `media.read`, and `certify.transcribe_observation`.
+`media.upload_commit`, `media.read`, `certify.transcribe_observation`,
+`certify.transcribe_measurements`, and `certify.transcribe_observe_rerun`.
 
 ### Local batch transcription (`media-provider/v1`)
 
@@ -316,6 +317,9 @@ all of these operations with `flow_scope_refused`.
   mismatches give `object_mismatch {field: "input.audio"}`.
 - **certify.transcribe_observation** {job_id, part, page} — query; available only
   in certification observation mode, otherwise `certify_observation_disabled`.
+  Like the two certification operations below, it is principal-scoped and refused
+  on [flow-scoped routes](#4-flow-scoped-routes), identified by the daemon-stamped
+  flow scope; only `diagnostics.findings` is allowed there.
   Part is `encoder_output` or `decode_trace`. Each reply is `{data}` containing
   base64 of at most 512 KiB raw bytes. The result's `observation` contains
   `{lane_id, fingerprint, valid_encoder_frames, triples, encoder_output,
@@ -324,6 +328,51 @@ all of these operations with `flow_scope_refused`.
   SHA-256, and count zero-based pages of at most 524,288 raw bytes (an empty
   part has zero pages). Pages are principal-scoped, reject an invalid part or
   page with `invalid_params {field}`, and expire with their job result.
+- **certify.transcribe_measurements** {job_id} — query; certification observation
+  mode only (`certify_observation_disabled` otherwise), principal-scoped to a
+  completed, unexpired job. Returns exactly `{self_check_wall_ms,
+  longest_progress_interval_ms, ane_shapes, peak_device_memory_bytes,
+  peak_storage_buffer_bytes}`. These values are frozen atomically at the original
+  job's completion; later inference and observe-off reruns cannot change them.
+  `self_check_wall_ms` is unsigned integer milliseconds for the lane's first-load
+  self-check: its three sealed short clips, timed from after model load and shape
+  admission to the last clip's text compare, covering each clip's WAV decode,
+  frontend, engine call and text check. It excludes model load and compile. `longest_progress_interval_ms` is unsigned
+  integer milliseconds for the largest gap between consecutive completed-work
+  progress or complete observation frames (an `ENCODER_OUTPUT` or `DECODE_TRACE`
+  header and its entire validated raw payload, never a partial frame), including inference start and end as
+  boundaries. Setup/load/compile and queue time are excluded; a no-progress
+  request reports its whole inference interval, not zero. Timer heartbeats do not
+  reduce the interval. `ane_shapes` is empty off ANE; on ANE it is the cumulative
+  admitted encoder-rung inventory, including evicted shapes, through completion:
+  `[{encoder_frames, executables: [{id, layers}], cpu_stages}]`. Encoder frames
+  and layer indices are integers. Each rung has 24 uniquely named executables
+  partitioning layers 0–23 exactly once; `cpu_stages` holds diagnostic stage names.
+  `peak_device_memory_bytes` is unsigned integer bytes, positive on CUDA/Vulkan
+  and null elsewhere: the request's engine-owned device-allocation high-water
+  mark, including persistent model, input, rung and workspace allocations.
+  CUDA counts explicit engine allocations, not other processes or opaque
+  CUDA/cuBLAS internal allocations. `peak_storage_buffer_bytes` is unsigned
+  integer bytes, positive on Vulkan and null elsewhere, for the largest allocated
+  storage-buffer range used by the request. Both nullable fields are always
+  present. Unmeasured required telemetry refuses with `measurement_unavailable`
+  naming `certify.transcribe_measurements.<field>`, never a fabricated zero.
+  Worker protocol v4 is unchanged: `TRANSCRIPT` replies optionally carry
+  `peak_device_memory_bytes` and `peak_storage_buffer_bytes`, omitted when not measured.
+- **certify.transcribe_observe_rerun** {job_id, audio} — mutate; certification
+  observation mode only (`certify_observation_disabled` otherwise), principal-scoped
+  to the original completed, unexpired job. `audio` is a fresh committed upload
+  `{object_id, mime: "audio/wav", bytes, sha256}` of the identical WAV. Ownership,
+  all object facts, actual bytes and equality to the original audio SHA-256 are
+  checked before work or writes. A SHA mismatch refuses with `object_mismatch
+  {field: "audio.sha256"}`. The original pinned lane/fingerprint is required;
+  normal lane locking, pause gates and residency budgets still apply. The rerun
+  forces observe=false and returns exactly `{observe: false,
+  valid_encoder_frames, triples}`, with triples as base64 little-endian i32
+  `(token_id, frame_index, duration)` records. The fresh upload is deleted after
+  use, including inference failure; original measurements and results are unchanged.
+  Both operations return `unknown_job` for foreign/unknown jobs and `job_not_done`
+  for non-completed jobs. Neither operation is allowed on a flow route.
 
 #### Engine ids and declaration states
 

@@ -252,6 +252,42 @@ pub struct TranscribeResult {
     pub transcript_frame: Vec<u8>,
     pub observation: Option<TranscribeObservationFrames>,
     pub progress: Vec<WorkerResponse>,
+    pub(crate) timing: ProgressTiming,
+    pub(crate) peak_device_memory_bytes: Option<u64>,
+    pub(crate) peak_storage_buffer_bytes: Option<u64>,
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct ProgressTiming {
+    first: Option<std::time::Duration>,
+    longest: std::time::Duration,
+    last: std::time::Duration,
+}
+
+impl ProgressTiming {
+    pub(crate) fn signal(&mut self, gap: std::time::Duration) {
+        self.first.get_or_insert(gap);
+        self.longest = self.longest.max(gap);
+    }
+
+    pub(crate) fn finish(&mut self, gap: std::time::Duration) {
+        self.last = gap;
+        self.longest = self.longest.max(gap);
+    }
+
+    pub(crate) fn boundaries(&mut self, before: std::time::Duration, after: std::time::Duration) {
+        self.last += after;
+        self.longest = if let Some(first) = self.first.as_mut() {
+            *first += before;
+            self.longest.max(*first).max(self.last)
+        } else {
+            self.longest + before + after
+        };
+    }
+
+    pub(crate) fn longest_ms(&self) -> u64 {
+        self.longest.as_millis().try_into().unwrap_or(u64::MAX)
+    }
 }
 
 enum Backend {
@@ -497,14 +533,28 @@ impl TranscribeHost {
         &self.profile
     }
 
+    pub(crate) fn ane_shapes(&self) -> Vec<serde_json::Value> {
+        match &self.backend {
+            #[cfg(unix)]
+            Backend::Ane(engine) => engine.transcribe_shapes(),
+            _ => Vec::new(),
+        }
+    }
+
     fn transcribe_mode(
         &self,
         wav: &[u8],
         mode: ObservationMode,
         metal_progress: impl FnMut(Progress),
     ) -> Result<TranscribeResult, TranscribeHostError> {
+        let start = std::time::Instant::now();
         let prepared = prepare_wav(&self.profile, wav, mode)?;
-        self.transcribe_prepared(prepared, metal_progress)
+        let frontend = start.elapsed();
+        let mut result = self.transcribe_prepared(prepared, metal_progress)?;
+        result
+            .timing
+            .boundaries(frontend, std::time::Duration::ZERO);
+        Ok(result)
     }
 
     fn transcribe_prepared(
@@ -512,6 +562,10 @@ impl TranscribeHost {
         prepared: PreparedTranscription,
         mut metal_progress: impl FnMut(Progress),
     ) -> Result<TranscribeResult, TranscribeHostError> {
+        let mut timing = ProgressTiming::default();
+        let mut peak_device_memory_bytes = None;
+        let mut peak_storage_buffer_bytes = None;
+        let mut last = std::time::Instant::now();
         let (output, transcript_frame, observation, progress) = match &self.backend {
             #[cfg(test)]
             Backend::InProcessTest(run) => (
@@ -522,7 +576,11 @@ impl TranscribeHost {
             ),
             Backend::Metal(engine, model) => {
                 let output = engine
-                    .transcribe_with_progress(model, prepared.request, &mut metal_progress)
+                    .transcribe_with_progress(model, prepared.request, &mut |progress| {
+                        timing.signal(last.elapsed());
+                        last = std::time::Instant::now();
+                        metal_progress(progress);
+                    })
                     .map_err(TranscribeHostError::Engine)?;
                 let observation =
                     output
@@ -532,6 +590,7 @@ impl TranscribeHost {
                             encoder_output: synapse_core::encode_f32_frame(&o.encoder_output),
                             decode_trace: synapse_core::encode_decode_trace_frame(&o.decode_trace),
                         });
+                timing.finish(last.elapsed());
                 (output, None, observation, Vec::new())
             }
             Backend::Worker(engine, model) => {
@@ -540,6 +599,9 @@ impl TranscribeHost {
                     prepared.request,
                     prepared.valid_encoder_frames,
                 )?;
+                timing = result.timing;
+                peak_device_memory_bytes = result.peak_device_memory_bytes;
+                peak_storage_buffer_bytes = result.peak_storage_buffer_bytes;
                 (
                     result.output,
                     Some(result.transcript_frame),
@@ -551,6 +613,7 @@ impl TranscribeHost {
             Backend::Ane(engine) => {
                 let result = engine
                     .transcribe_with_frames(prepared.request, prepared.valid_encoder_frames)?;
+                timing = result.timing;
                 (
                     result.output,
                     Some(result.transcript_frame),
@@ -559,14 +622,24 @@ impl TranscribeHost {
                 )
             }
         };
-        finish(
+        #[cfg(test)]
+        if matches!(&self.backend, Backend::InProcessTest(_)) {
+            timing.finish(last.elapsed());
+        }
+        let tail = std::time::Instant::now();
+        let mut result = finish(
             output,
             transcript_frame,
             observation,
             progress,
             prepared.valid_encoder_frames,
             prepared.audio_duration_ms,
-        )
+        )?;
+        timing.boundaries(std::time::Duration::ZERO, tail.elapsed());
+        result.timing = timing;
+        result.peak_device_memory_bytes = peak_device_memory_bytes;
+        result.peak_storage_buffer_bytes = peak_storage_buffer_bytes;
+        Ok(result)
     }
 }
 
@@ -618,6 +691,9 @@ fn finish(
         output,
         observation,
         progress,
+        timing: ProgressTiming::default(),
+        peak_device_memory_bytes: None,
+        peak_storage_buffer_bytes: None,
     })
 }
 

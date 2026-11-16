@@ -4637,7 +4637,7 @@ pub mod ane_residency {
         measured_loads: BTreeMap<(String, usize), std::time::Duration>,
         // Kept outside residency slots so eviction and confirmed-exit recovery
         // cannot erase certification evidence. Disabled supervisors retain nothing.
-        inventory_sink: Option<Vec<Arc<AnePlacementInventory>>>,
+        inventory_sink: Option<Vec<(ShapeKey, Arc<AnePlacementInventory>)>>,
         #[cfg(test)]
         recorded_samples: Vec<BTreeMap<String, Vec<usize>>>,
     }
@@ -5378,12 +5378,36 @@ pub mod ane_residency {
                 .get_or_insert_with(Vec::new);
         }
 
+        #[cfg(any(unix, test))]
+        pub(crate) fn transcribe_shapes(
+            &self,
+            worker_id: &str,
+            model_ref: &str,
+        ) -> Vec<serde_json::Value> {
+            let state = self.inner.lock();
+            let mut shapes = BTreeMap::new();
+            if let Some(sink) = &state.inventory_sink {
+                for (key, inventory) in sink {
+                    if key.worker_id == worker_id && key.model_ref == model_ref {
+                        shapes.insert(
+                            key.shape,
+                            serde_json::json!({"encoder_frames":key.shape,
+                            "executables":inventory.executables,"cpu_stages":inventory.cpu_stages}),
+                        );
+                    }
+                }
+            }
+            shapes.into_values().collect()
+        }
+
         /// Retained ADMITTED events and the independently maintained admission total.
         pub fn observations(&self) -> Option<(Vec<AnePlacementInventory>, u64)> {
             let state = self.inner.lock();
             state.inventory_sink.as_ref().map(|sink| {
                 (
-                    sink.iter().map(|inventory| (**inventory).clone()).collect(),
+                    sink.iter()
+                        .map(|(_, inventory)| (**inventory).clone())
+                        .collect(),
                     state.stats.admitted,
                 )
             })

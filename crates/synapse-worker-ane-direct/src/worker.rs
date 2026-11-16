@@ -600,6 +600,8 @@ pub(crate) fn transcribe_responses(
             req_id: req_id.into(),
             valid_encoder_frames: output.frames,
             count: triples.len(),
+            peak_device_memory_bytes: None,
+            peak_storage_buffer_bytes: None,
         },
         Some(synapse_core::encode_transcript_frame(&triples)),
     ));

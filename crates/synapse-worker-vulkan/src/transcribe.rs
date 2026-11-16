@@ -18,6 +18,8 @@ pub struct Output {
     pub encoder: Vec<f32>,
     pub trace: Vec<synapse_core::DecodeTraceRecord>,
     pub triples: Vec<synapse_core::TranscriptRecord>,
+    pub peak_device_memory_bytes: Option<u64>,
+    pub peak_storage_buffer_bytes: Option<u64>,
 }
 
 pub fn write_output(
@@ -65,6 +67,8 @@ pub fn write_output(
             req_id: req_id.into(),
             valid_encoder_frames: output.valid_encoder_frames,
             count: output.triples.len(),
+            peak_device_memory_bytes: output.peak_device_memory_bytes,
+            peak_storage_buffer_bytes: output.peak_storage_buffer_bytes,
         },
         max_frame,
     )?;
@@ -717,6 +721,8 @@ mod tests {
     fn transcribe_response_order_and_raw_bytes_are_exact() {
         let output = Output {
             valid_encoder_frames: 1,
+            peak_device_memory_bytes: Some(123456),
+            peak_storage_buffer_bytes: Some(65432),
             encoder: vec![0.; 1024],
             trace: vec![synapse_core::DecodeTraceRecord {
                 frame_index: 0,
@@ -774,6 +780,8 @@ mod tests {
                 WorkerResponse::Transcript {
                     valid_encoder_frames: 1,
                     count: 1,
+                    peak_device_memory_bytes: Some(123456),
+                    peak_storage_buffer_bytes: Some(65432),
                     ..
                 }
             ));
