@@ -177,6 +177,7 @@ struct Device {
     cooperative: Option<vk::Pipeline>,
     attention: vk::Pipeline,
     speech: vk::Pipeline,
+    speech_gemm: vk::Pipeline,
     heap_index: u32,
 }
 impl Drop for Device {
@@ -189,6 +190,7 @@ impl Drop for Device {
             self.raw.destroy_pipeline(self.plain, None);
             self.raw.destroy_pipeline(self.attention, None);
             self.raw.destroy_pipeline(self.speech, None);
+            self.raw.destroy_pipeline(self.speech_gemm, None);
             self.raw.destroy_pipeline_layout(self.pipeline_layout, None);
             self.raw.destroy_descriptor_pool(self.descriptor_pool, None);
             self.raw
@@ -341,6 +343,7 @@ impl Device {
             cooperative: None,
             attention: vk::Pipeline::null(),
             speech: vk::Pipeline::null(),
+            speech_gemm: vk::Pipeline::null(),
         };
         let raw = &device.raw;
         let pool = unsafe {
@@ -426,6 +429,7 @@ impl Device {
         device.plain = make_pipeline("plain")?;
         device.attention = make_pipeline("attention")?;
         device.speech = make_pipeline("transcribe")?;
+        device.speech_gemm = make_pipeline("transcribe_gemm")?;
         device.cooperative = if coop_enabled {
             Some(make_pipeline("cooperative")?)
         } else {
@@ -692,7 +696,9 @@ impl Arena {
             && params.inner.is_multiple_of(16)
             && params.cols.is_multiple_of(16)
             && device.cooperative.is_some();
-        let pipeline = if params.op >= 100 {
+        let pipeline = if params.op == 100 {
+            device.speech_gemm
+        } else if params.op >= 100 {
             device.speech
         } else if params.op == ATTENTION_OP {
             device.attention
@@ -734,7 +740,7 @@ impl Arena {
             device.raw.update_descriptor_sets(&writes, &[]);
         }
         let groups = if params.op == 100 {
-            params.rows.div_ceil(8) * params.cols.div_ceil(8)
+            speech_gemm_groups(params.rows, params.cols)
         } else if cooperative {
             params.rows.div_ceil(16) * params.cols.div_ceil(16)
         } else {
@@ -789,6 +795,228 @@ impl Arena {
                 &[],
             );
         })
+    }
+}
+
+fn speech_gemm_groups(rows: u32, cols: u32) -> u32 {
+    rows.div_ceil(32) * cols.div_ceil(32)
+}
+
+const SPEECH_BATCH_CAPACITY: usize = 128;
+
+// Large attention tiles can keep a Windows GPU busy long enough that combining
+// many dispatches approaches its two-second timeout. Above this padded frame
+// rung, retain the old engine's one-dispatch-per-submit granularity instead.
+const MAX_BATCHED_SPEECH_RUNG: usize = 1024;
+
+struct SpeechBatchPolicy {
+    dispatch_limit: usize,
+}
+
+impl SpeechBatchPolicy {
+    fn for_rung(rung: usize) -> Self {
+        Self {
+            dispatch_limit: if rung > MAX_BATCHED_SPEECH_RUNG {
+                1
+            } else {
+                SPEECH_BATCH_CAPACITY
+            },
+        }
+    }
+
+    fn submit_after(&self, pending: usize) -> bool {
+        pending >= self.dispatch_limit
+    }
+}
+
+struct SpeechDispatch {
+    params: Params,
+    descriptors: Vec<vk::DescriptorBufferInfo>,
+    groups: u32,
+}
+
+/// Keeps descriptor sets immutable until the complete layer has finished. The
+/// embedding/reranking path retains its independent single-dispatch pool.
+struct SpeechBatch {
+    device: Arc<Device>,
+    pool: vk::DescriptorPool,
+    pending: Vec<SpeechDispatch>,
+    policy: SpeechBatchPolicy,
+}
+
+impl SpeechBatch {
+    fn new(device: Arc<Device>) -> Result<Self> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(7 * SPEECH_BATCH_CAPACITY as u32)];
+        let pool = unsafe {
+            device.raw.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(SPEECH_BATCH_CAPACITY as u32)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }?;
+        Ok(Self {
+            device,
+            pool,
+            pending: Vec::with_capacity(SPEECH_BATCH_CAPACITY),
+            policy: SpeechBatchPolicy::for_rung(0),
+        })
+    }
+
+    fn push(
+        &mut self,
+        arena: &Arena,
+        params: Params,
+        buffers: [&str; 7],
+        count: u32,
+    ) -> Result<()> {
+        ensure!(params.op >= 100, "non-speech op in speech batch");
+        let descriptors = buffers
+            .iter()
+            .map(|name| arena.descriptor(name))
+            .collect::<Result<_>>()?;
+        let groups = if params.op == 100 {
+            speech_gemm_groups(params.rows, params.cols)
+        } else {
+            count.div_ceil(64)
+        };
+        self.pending.push(SpeechDispatch {
+            params,
+            descriptors,
+            groups,
+        });
+        if self.policy.submit_after(self.pending.len()) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let dispatches = std::mem::take(&mut self.pending);
+        let device = &self.device;
+        // The preceding flush waited for completion. No pending command buffer
+        // references sets from this pool when it is reset.
+        unsafe {
+            device
+                .raw
+                .reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty())
+        }?;
+        let layouts = vec![device.descriptor_layout; dispatches.len()];
+        let sets = unsafe {
+            device.raw.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.pool)
+                    .set_layouts(&layouts),
+            )
+        }?;
+        for (dispatch, &set) in dispatches.iter().zip(&sets) {
+            let writes: Vec<_> = dispatch
+                .descriptors
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(d))
+                })
+                .collect();
+            unsafe { device.raw.update_descriptor_sets(&writes, &[]) };
+        }
+        device.submit(|command| unsafe {
+            // Make uploads visible once. Between dispatches, compute-to-compute
+            // ordering covers read-after-write and write-after-write dependencies,
+            // and keeps scratch writes from overtaking preceding reads.
+            let before = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+            device.raw.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &before,
+                &[],
+                &[],
+            );
+            for (index, (dispatch, &set)) in dispatches.iter().zip(&sets).enumerate() {
+                if index > 0 {
+                    let dependency = [vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )];
+                    device.raw.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &dependency,
+                        &[],
+                        &[],
+                    );
+                }
+                let pipeline = if dispatch.params.op == 100 {
+                    device.speech_gemm
+                } else {
+                    device.speech
+                };
+                device
+                    .raw
+                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
+                device.raw.cmd_bind_descriptor_sets(
+                    command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    device.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let bytes: Vec<_> = dispatch
+                    .params
+                    .words()
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect();
+                device.raw.cmd_push_constants(
+                    command,
+                    device.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &bytes,
+                );
+                device.raw.cmd_dispatch(
+                    command,
+                    dispatch.groups.min(65535),
+                    dispatch.groups.div_ceil(65535),
+                    1,
+                );
+            }
+            let after = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+            device.raw.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &after,
+                &[],
+                &[],
+            );
+        })
+    }
+}
+
+impl Drop for SpeechBatch {
+    fn drop(&mut self) {
+        unsafe { self.device.raw.destroy_descriptor_pool(self.pool, None) };
     }
 }
 
@@ -1615,6 +1843,99 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::attention_lanes;
+    use super::speech_gemm_groups;
+    use super::SpeechBatchPolicy;
+
+    #[test]
+    fn transcribe_long_rungs_submit_each_dispatch_before_accumulating_more_work() {
+        for rung in [2048, 4096, 8192] {
+            let policy = SpeechBatchPolicy::for_rung(rung);
+            let mut pending = 0;
+            let mut submissions = Vec::new();
+            // The longest rung has 26 fixed and 3*64 tiled attention dispatches.
+            for _ in 0..218 {
+                pending += 1;
+                if policy.submit_after(pending) {
+                    submissions.push(pending);
+                    pending = 0;
+                }
+            }
+            if pending > 0 {
+                submissions.push(pending);
+            }
+            assert_eq!(submissions, vec![1; 218], "rung {rung}");
+        }
+        for rung in [128, 256, 512, 1024] {
+            let policy = SpeechBatchPolicy::for_rung(rung);
+            assert!(!policy.submit_after(127));
+            assert!(policy.submit_after(128));
+        }
+    }
+
+    #[test]
+    fn transcribe_gemm_register_tiles_cover_ragged_rows_columns_and_offsets() {
+        let source = include_str!("../shaders/transcribe_gemm.comp");
+        assert!(source.contains("shared float tile_x[32*64]"));
+        assert!(source.contains("shared float tile_w[32*64]"));
+        let (rows, cols, inner, offset) = (35usize, 37usize, 65usize, 3usize);
+        let x: Vec<_> = (0..rows * inner).map(|i| (i % 7) as f32 - 3.).collect();
+        let w: Vec<_> = (0..cols * inner).map(|i| (i % 5) as f32 - 2.).collect();
+        let mut y = vec![f32::NAN; (rows + offset) * cols];
+        let mut written = vec![0u32; rows * cols];
+        assert_eq!(speech_gemm_groups(rows as u32, cols as u32), 4);
+        for group in 0..speech_gemm_groups(rows as u32, cols as u32) as usize {
+            let row0 = group / cols.div_ceil(32) * 32;
+            let col0 = group % cols.div_ceil(32) * 32;
+            let mut sums = [[[0.; 4]; 4]; 64];
+            for start in (0..inner).step_by(64) {
+                let mut tx = [0.; 32 * 64];
+                let mut tw = [0.; 32 * 64];
+                for r in 0..32 {
+                    for k in 0..64 {
+                        if row0 + r < rows && start + k < inner {
+                            tx[r * 64 + (k ^ ((r % 8) * 8))] = x[(row0 + r) * inner + start + k];
+                        }
+                        if col0 + r < cols && start + k < inner {
+                            tw[r * 64 + (k ^ ((r % 8) * 4))] = w[(col0 + r) * inner + start + k];
+                        }
+                    }
+                }
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    let (row, col) = (lane / 8, lane % 8);
+                    for k in 0..64 {
+                        for (r, row_sum) in sum.iter_mut().enumerate() {
+                            for (c, value) in row_sum.iter_mut().enumerate() {
+                                *value += tx[(row + r * 8) * 64 + (k ^ ((row % 8) * 8))]
+                                    * tw[(col + c * 8) * 64 + (k ^ ((col % 8) * 4))];
+                            }
+                        }
+                    }
+                }
+            }
+            for (lane, sum) in sums.iter().enumerate() {
+                for (r, row_sum) in sum.iter().enumerate() {
+                    for (c, value) in row_sum.iter().enumerate() {
+                        let rr = row0 + lane / 8 + r * 8;
+                        let cc = col0 + lane % 8 + c * 8;
+                        if rr < rows && cc < cols {
+                            y[(rr + offset) * cols + cc] = value + cc as f32;
+                            written[rr * cols + cc] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(y[..offset * cols].iter().all(|v| v.is_nan()));
+        assert!(written.iter().all(|&n| n == 1));
+        for row in 0..rows {
+            for col in 0..cols {
+                let dot: f32 = (0..inner)
+                    .map(|k| x[row * inner + k] * w[col * inner + k])
+                    .sum();
+                assert_eq!(y[(row + offset) * cols + col], dot + col as f32);
+            }
+        }
+    }
 
     /// The attention shader sizes its tiles from the lane count alone; every
     /// supported head width must fit its registers and shared arrays.

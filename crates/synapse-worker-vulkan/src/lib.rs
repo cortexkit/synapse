@@ -4,6 +4,8 @@ pub mod protocol;
 #[cfg(feature = "vulkan")]
 pub mod runtime;
 pub mod transcribe;
+#[cfg(feature = "vulkan")]
+mod transcribe_gemv;
 #[cfg(all(test, feature = "vulkan"))]
 mod transcribe_layers;
 

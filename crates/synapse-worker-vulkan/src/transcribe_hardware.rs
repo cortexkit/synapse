@@ -67,6 +67,7 @@ fn exchange(
     frames: usize,
     valid: usize,
     observe: bool,
+    expected_refusal: Option<&str>,
 ) -> (SpeechObservation, usize, f64) {
     let mut stream = Exchange {
         output: Vec::new(),
@@ -131,6 +132,10 @@ fn exchange(
                 count,
                 ..
             } => {
+                assert!(
+                    expected_refusal.is_none(),
+                    "{id}: expected {expected_refusal:?}, got a transcript"
+                );
                 assert_eq!(stage, if observe { 2 } else { 0 });
                 output.valid_encoder_frames = Some(valid_encoder_frames as u64);
                 output.engine_started = true;
@@ -145,8 +150,8 @@ fn exchange(
                 break;
             }
             WorkerResponse::Err { code, .. } => {
-                assert_eq!(stage, 0);
-                assert_eq!(code, "duration_limit");
+                assert_eq!(stage, 0, "{id}: worker error after partial output: {code}");
+                expect_fixture_error(id, expected_refusal, &code);
                 output.refusal = Some(SpeechRefusal {
                     code,
                     details: [0, 0, valid.div_ceil(8) as u64, 0],
@@ -158,6 +163,25 @@ fn exchange(
     }
     assert_eq!(input.position(), input.get_ref().len() as u64);
     (output, progress, gap)
+}
+
+fn expect_fixture_error(id: &str, expected: Option<&str>, actual: &str) {
+    assert_eq!(Some(actual), expected, "{id}: unexpected worker error");
+}
+
+#[test]
+#[should_panic(expected = "in-limit-fixture: unexpected worker error")]
+fn transcribe_hardware_in_limit_error_is_not_mislabelled_as_duration_refusal() {
+    expect_fixture_error("in-limit-fixture", None, "duration_limit");
+}
+
+#[test]
+fn transcribe_hardware_only_expected_duration_refusal_is_accepted() {
+    expect_fixture_error(
+        "over-limit-fixture",
+        Some("duration_limit"),
+        "duration_limit",
+    );
 }
 
 fn env_path(name: &str) -> PathBuf {
@@ -341,8 +365,8 @@ fn diagnose_trace_failure(
 
     // Repeat only a failing fixture. This distinguishes a stable numerical
     // difference from uninitialized/reused GPU memory or observation changes.
-    let (repeat, _, _) = exchange(loaded, &fixture.id, mel, frames, valid, true);
-    let (plain, _, _) = exchange(loaded, &fixture.id, mel, frames, valid, false);
+    let (repeat, _, _) = exchange(loaded, &fixture.id, mel, frames, valid, true, None);
+    let (plain, _, _) = exchange(loaded, &fixture.id, mel, frames, valid, false, None);
     let repeated_encoder = repeat.encoder_output.as_ref().unwrap();
     report["repeat_encoder_max_abs"] = json!(max_abs(encoder, repeated_encoder));
     report["repeat_encoder_bit_identical"] = json!(
@@ -592,8 +616,20 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         };
         let prepare_s = prepare_started.elapsed().as_secs_f64();
         let inference_started = Instant::now();
-        let (mut output, progress, gap) =
-            exchange(&mut loaded, &fixture.id, &mel, frames, valid, true);
+        eprintln!(
+            "{}: starting mel_frames={frames} valid_mel_frames={valid} expected_refusal={:?}",
+            fixture.id,
+            over.then_some("duration_limit")
+        );
+        let (mut output, progress, gap) = exchange(
+            &mut loaded,
+            &fixture.id,
+            &mel,
+            frames,
+            valid,
+            true,
+            over.then_some("duration_limit"),
+        );
         let observe_s = inference_started.elapsed().as_secs_f64();
         let mut plain_s = 0.;
         let LoadedEngine::Speech(engine) = &mut loaded.engine else {
@@ -728,7 +764,7 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             if fixture.encoder.is_some() {
                 let plain_started = Instant::now();
                 let (plain, plain_progress, plain_gap) =
-                    exchange(&mut loaded, &fixture.id, &mel, frames, valid, false);
+                    exchange(&mut loaded, &fixture.id, &mel, frames, valid, false, None);
                 plain_s = plain_started.elapsed().as_secs_f64();
                 assert_eq!(output.valid_encoder_frames, plain.valid_encoder_frames);
                 assert_eq!(output.triples, plain.triples);

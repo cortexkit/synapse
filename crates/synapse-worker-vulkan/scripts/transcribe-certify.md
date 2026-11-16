@@ -34,8 +34,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
 
 The `--lib transcribe` Vulkan filter includes
 `transcribe::tests::transcribe_crlf_shader_builds_identical_spirv`: it compiles
-a real CRLF copy with the pinned compiler and requires the same SPIR-V bytes
-as the embedded production shader. It also checks F32-only weights, refusal of
+a real CRLF copy of both speech shaders with the pinned compiler and requires
+the same SPIR-V bytes as each embedded production shader. It also checks seeded
+SIMD/scalar agreement for the predictor and joint shapes, F32-only weights, refusal of
 old/mixed F16 packages, and all nineteen unrelated profile digests. Only the
 explicit hardware test remains ignored in that filtered run; execute it below
 after package conversion and corpus setup.

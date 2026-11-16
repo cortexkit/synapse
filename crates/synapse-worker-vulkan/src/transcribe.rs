@@ -103,6 +103,24 @@ pub fn input_shape(mel: usize, valid: usize, maximum: usize) -> Result<(usize, u
     Ok((frames, rung))
 }
 
+#[cfg(any(feature = "vulkan", test))]
+pub(crate) fn with_validated_input<T>(
+    mel: &[f32],
+    mel_rows: usize,
+    valid: usize,
+    maximum: usize,
+    device_work: impl FnOnce(usize, usize) -> Result<T>,
+) -> Result<T> {
+    // Reject the duration before inspecting/uploading the payload or scheduling
+    // device work, even when an earlier request has lost the Vulkan device.
+    let (frames, rung) = input_shape(mel_rows, valid, maximum)?;
+    ensure!(
+        mel_rows.checked_mul(128) == Some(mel.len()) && mel.iter().all(|x| x.is_finite()),
+        "invalid_mel_frames"
+    );
+    device_work(frames, rung)
+}
+
 pub fn validate_frame_envelope(maximum: usize, max_frame: u32) -> Result<()> {
     let (_, rung) = input_shape(maximum * 8 + 1, maximum * 8, maximum)?;
     ensure!(
@@ -197,11 +215,13 @@ pub(crate) fn validate_weights(
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod joint {
+    use crate::transcribe_gemv::Gemv;
     use std::collections::BTreeMap;
     use synapse_speech::{Error, Joint, JointLogits};
 
     pub struct HostJoint {
         weights: BTreeMap<String, Vec<f32>>,
+        gemv: Gemv,
         pub projected: Vec<f32>,
         h: [Vec<f32>; 2],
         cell: [Vec<f32>; 2],
@@ -227,6 +247,7 @@ pub(crate) mod joint {
                 .collect();
             Self {
                 weights,
+                gemv: Gemv::detect(),
                 projected: Vec::new(),
                 h: [vec![0.; 640], vec![0.; 640]],
                 cell: [vec![0.; 640], vec![0.; 640]],
@@ -237,10 +258,12 @@ pub(crate) mod joint {
         fn linear(&self, input: &[f32], name: &str) -> Vec<f32> {
             let w = &self.weights[&format!("{name}.weight")];
             let bias = &self.weights[&format!("{name}.bias")];
-            w.chunks_exact(input.len())
-                .zip(bias)
-                .map(|(row, b)| row.iter().zip(input).fold(0., |a, (w, x)| a + w * x) + b)
-                .collect()
+            let mut output = vec![0.; bias.len()];
+            self.gemv.apply(w, input, &mut output);
+            for (out, b) in output.iter_mut().zip(bias) {
+                *out += b;
+            }
+            output
         }
         fn predict(&mut self, token: u32) {
             let mut input = self.weights["decoder.embedding.weight"]
@@ -251,19 +274,15 @@ pub(crate) mod joint {
                 let hh = &self.weights[&format!("decoder.lstm.weight_hh_l{layer}")];
                 let bi = &self.weights[&format!("decoder.lstm.bias_ih_l{layer}")];
                 let bh = &self.weights[&format!("decoder.lstm.bias_hh_l{layer}")];
-                let gates: Vec<f32> = (0..2560)
-                    .map(|r| {
-                        let a = ih[r * 640..(r + 1) * 640]
-                            .iter()
-                            .zip(&input)
-                            .fold(0., |a, (w, x)| a + w * x);
-                        let b = hh[r * 640..(r + 1) * 640]
-                            .iter()
-                            .zip(&self.h[layer])
-                            .fold(0., |a, (w, x)| a + w * x);
-                        (a + bi[r]) + (b + bh[r])
-                    })
-                    .collect();
+                // All four gates remain contiguous, rather than packing four
+                // independent matrices or reducing precision for a BLAS call.
+                let mut gates = [0.; 2560];
+                let mut recurrent = [0.; 2560];
+                self.gemv.apply(ih, &input, &mut gates);
+                self.gemv.apply(hh, &self.h[layer], &mut recurrent);
+                for r in 0..2560 {
+                    gates[r] = (gates[r] + bi[r]) + (recurrent[r] + bh[r]);
+                }
                 for i in 0..640 {
                     let sigmoid = |x: f32| 1. / (1. + (-x).exp());
                     self.cell[layer][i] = sigmoid(gates[640 + i]) * self.cell[layer][i]
@@ -340,6 +359,7 @@ pub(crate) mod joint {
             projected[0] = 0.25;
             let mut joint = HostJoint {
                 weights,
+                gemv: Gemv::detect(),
                 projected,
                 h: [vec![9.; 640], vec![9.; 640]],
                 cell: [vec![9.; 640], vec![9.; 640]],
@@ -399,6 +419,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transcribe_duration_refusal_precedes_payload_and_device_work() {
+        for frames in [7501usize, 8192, 8193] {
+            // Deliberately omit the large payload: duration takes precedence
+            // over payload validation, uploads, subsampling and GPU state.
+            let valid = (frames - 1) * 8 + 1;
+            let result: Result<()> = with_validated_input(&[], valid + 1, valid, 7500, |_, _| {
+                panic!("over-limit input reached device work")
+            });
+            assert_eq!(result.unwrap_err().to_string(), "duration_limit");
+        }
+        let mut started = false;
+        let mel = vec![0.; 9 * 128];
+        with_validated_input(&mel, 9, 8, 7500, |frames, rung| {
+            assert_eq!((frames, rung), (1, 128));
+            started = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(started);
+    }
+
+    #[test]
     fn transcribe_f32_promotion_changes_only_the_vulkan_speech_profile_digest() {
         let manifest = crate::manifest();
         let frozen: serde_json::Value = serde_json::from_str(include_str!(concat!(
@@ -447,7 +489,7 @@ mod tests {
         );
         assert_eq!(
             synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
-            "owned-vulkan-transcribe-v2-f32"
+            "owned-vulkan-transcribe-v3-f32"
         );
     }
 
@@ -536,9 +578,6 @@ mod tests {
             .unwrap()
             .replace("\r\n", "\n");
         let temporary = tempfile::tempdir().unwrap();
-        let input = temporary.path().join("transcribe-crlf.comp");
-        let output = temporary.path().join("transcribe-crlf.spv");
-        std::fs::write(&input, source.replace('\n', "\r\n")).unwrap();
         let sdk =
             std::path::PathBuf::from(std::env::var_os("VULKAN_SDK").expect("pinned build SDK"));
         let compiler = sdk.join(if cfg!(windows) {
@@ -546,54 +585,68 @@ mod tests {
         } else {
             "bin/glslc"
         });
-        let result = std::process::Command::new(compiler)
-            .args(["-O", "-fshader-stage=compute", "--target-env=vulkan1.2"])
-            .arg(input)
-            .arg("-o")
-            .arg(&output)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "CRLF shader build: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let embedded = crate::SHADERS
-            .iter()
-            .find(|(name, _)| *name == "transcribe")
-            .unwrap()
-            .1;
-        assert_eq!(
-            std::fs::read(output).unwrap(),
-            embedded,
-            "CRLF must not change compiled shader bytes"
-        );
+        for name in ["transcribe", "transcribe_gemm"] {
+            let source = if name == "transcribe" {
+                source.clone()
+            } else {
+                std::fs::read_to_string(root.join(format!("shaders/{name}.comp")))
+                    .unwrap()
+                    .replace("\r\n", "\n")
+            };
+            let input = temporary.path().join(format!("{name}-crlf.comp"));
+            let output = temporary.path().join(format!("{name}-crlf.spv"));
+            std::fs::write(&input, source.replace('\n', "\r\n")).unwrap();
+            let result = std::process::Command::new(&compiler)
+                .args(["-O", "-fshader-stage=compute", "--target-env=vulkan1.2"])
+                .arg(input)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "CRLF shader build: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let embedded = crate::SHADERS
+                .iter()
+                .find(|(shader, _)| *shader == name)
+                .unwrap()
+                .1;
+            assert_eq!(
+                std::fs::read(output).unwrap(),
+                embedded,
+                "CRLF must not change compiled shader bytes"
+            );
+        }
     }
 
     #[cfg(feature = "vulkan")]
     #[test]
     fn transcribe_shader_has_no_half_precision_float_type() {
-        let bytes = crate::SHADERS
-            .iter()
-            .find(|(name, _)| *name == "transcribe")
-            .unwrap()
-            .1;
-        let words: Vec<_> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| u32::from_le_bytes(*w))
-            .collect();
-        let (mut offset, mut floats) = (5, Vec::new());
-        while offset < words.len() {
-            let instruction = words[offset];
-            if instruction & 0xffff == 22 {
-                floats.push(words[offset + 2]);
+        for name in ["transcribe", "transcribe_gemm"] {
+            let bytes = crate::SHADERS
+                .iter()
+                .find(|(shader, _)| *shader == name)
+                .unwrap()
+                .1;
+            let words: Vec<_> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes(*w))
+                .collect();
+            let (mut offset, mut floats) = (5, Vec::new());
+            while offset < words.len() {
+                let instruction = words[offset];
+                if instruction & 0xffff == 22 {
+                    floats.push(words[offset + 2]);
+                }
+                offset += (instruction >> 16) as usize;
             }
-            offset += (instruction >> 16) as usize;
+            assert!(floats.contains(&32));
+            assert!(!floats.contains(&16));
         }
-        assert!(floats.contains(&32));
-        assert!(!floats.contains(&16));
     }
     use std::io::Cursor;
     use synapse_core::{

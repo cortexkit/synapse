@@ -1,5 +1,5 @@
 //! GPU encoder and encoder projection; the sequential joint stays in this worker.
-use super::{Arena, Params, Prepared};
+use super::{Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy};
 use crate::transcribe::{self, joint::HostJoint, TILE};
 use anyhow::{ensure, Result};
 use synapse_core::{DecodeTraceRecord, TranscriptRecord};
@@ -18,6 +18,7 @@ struct LayerCapture {
 
 pub struct Engine {
     arena: Arena,
+    batch: std::cell::RefCell<SpeechBatch>,
     maximum: usize,
     largest_storage_buffer: u64,
     joint: HostJoint,
@@ -58,8 +59,11 @@ impl Engine {
                 ,"weight_precision":"f32"
             }})
         );
+        let batch =
+            std::cell::RefCell::new(SpeechBatch::new(std::sync::Arc::clone(&arena.device))?);
         Ok(Self {
             arena,
+            batch,
             maximum,
             largest_storage_buffer,
             joint: HostJoint::load(header, data),
@@ -185,7 +189,12 @@ impl Engine {
     }
 
     fn run(&self, p: Params, buffers: [&str; 7], count: usize) -> Result<()> {
-        self.arena.dispatch(p, buffers, u32::try_from(count)?)
+        self.batch
+            .borrow_mut()
+            .push(&self.arena, p, buffers, u32::try_from(count)?)
+    }
+    fn flush(&self) -> Result<()> {
+        self.batch.borrow_mut().flush()
     }
     fn simple(&self, op: u32, input: &str, output: &str, rows: usize, cols: usize) -> Result<()> {
         self.run(
@@ -306,6 +315,9 @@ impl Engine {
         valid_encoder: usize,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<()> {
+        // A failed request may have left unsubmitted work. Never replay it in
+        // the next request, whose scratch buffers are about to be overwritten.
+        self.batch.borrow_mut().pending.clear();
         let mut input = synapse_core::encode_f32_frame(mel);
         self.arena.transfer("mel", &mut input, true)?;
         for start in (0..rows).step_by(TILE) {
@@ -393,6 +405,7 @@ impl Engine {
                 ],
                 n * 1024,
             )?;
+            self.flush()?;
         }
         #[cfg(test)]
         self.capture_layer("subsampling", valid_encoder)?;
@@ -543,6 +556,7 @@ impl Engine {
             self.ff(&layer, 2, rows)?;
             self.norm("hidden", "norm", &format!("{layer}.norm_out"), rows)?;
             self.simple(112, "norm", "hidden", rows * 1024, 1)?;
+            self.flush()?;
             #[cfg(test)]
             self.capture_layer(&format!("layer-{i:02}"), valid_encoder)?;
             progress()?;
@@ -555,7 +569,8 @@ impl Engine {
             1024,
             640,
             true,
-        )
+        )?;
+        self.flush()
     }
 
     fn download(&self, name: &str, count: usize) -> Result<Vec<f32>> {
@@ -572,12 +587,17 @@ impl Engine {
         observe: bool,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<Output> {
-        let (valid_encoder_frames, rows) = transcribe::input_shape(mel_rows, valid, self.maximum)?;
-        ensure!(
-            mel.len() == mel_rows * 128 && mel.iter().all(|x| x.is_finite()),
-            "invalid_mel_frames"
-        );
-        self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
+        let valid_encoder_frames = transcribe::with_validated_input(
+            mel,
+            mel_rows,
+            valid,
+            self.maximum,
+            |valid_encoder_frames, rows| {
+                self.batch.borrow_mut().policy = SpeechBatchPolicy::for_rung(rows);
+                self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
+                Ok(valid_encoder_frames)
+            },
+        )?;
         // Observation only copies the finished encoder. The projection and joint
         // evaluations are identical in both modes.
         let encoder = if observe {

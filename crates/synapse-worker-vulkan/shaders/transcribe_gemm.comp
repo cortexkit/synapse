@@ -1,0 +1,48 @@
+#version 450
+// A separate pipeline keeps this shared-memory reservation out of other ops.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { float x[]; };
+layout(set=0,binding=1,std430) readonly buffer Weight { float w[]; };
+layout(set=0,binding=2,std430) writeonly buffer Output { float y[]; };
+layout(set=0,binding=4,std430) readonly buffer Bias { float b[]; };
+layout(push_constant) uniform Params {
+    uint op; uint rows; uint cols; uint inner;
+    uint seq; uint heads; uint kv_heads; uint dim;
+    uint flags; uint offset; uint stride; uint window;
+    float eps; float theta; float scale; float unused;
+} p;
+
+// 32x32 outputs and K=64: 16 f32 accumulators per thread, two barriers per
+// 64 terms. XOR swizzles separate each thread's broadcast bank without padding
+// past Vulkan's 16 KiB minimum shared-memory capacity. Global loads stay linear.
+shared float tile_x[32*64];
+shared float tile_w[32*64];
+void main() {
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    uint column_tiles=(p.cols+31)/32;
+    uint row0=group/column_tiles*32, col0=group%column_tiles*32;
+    if(row0>=p.rows) return;
+    uint lane=gl_LocalInvocationID.x, row=lane/8, col=lane%8;
+    vec4 sums[4];
+    for(uint r=0;r<4;r++) sums[r]=vec4(0.0);
+    for(uint start=0;start<p.inner;start+=64) {
+        for(uint j=lane;j<32*64;j+=64) {
+            uint r=j/64, k=j%64;
+            tile_x[r*64+(k^((r%8)*8))]=(row0+r<p.rows && start+k<p.inner)?x[(row0+r)*p.inner+start+k]:0.0;
+            tile_w[r*64+(k^((r%8)*4))]=(col0+r<p.cols && start+k<p.inner)?w[(col0+r)*p.inner+start+k]:0.0;
+        }
+        barrier();
+        for(uint k=0;k<64;k++) {
+            uint wk=k^((col%8)*4), xk=k^((row%8)*8);
+            vec4 weights=vec4(tile_w[col*64+wk],tile_w[(col+8)*64+wk],
+                               tile_w[(col+16)*64+wk],tile_w[(col+24)*64+wk]);
+            for(uint r=0;r<4;r++) sums[r]+=tile_x[(row+r*8)*64+xk]*weights;
+        }
+        // Readers finish before the next K tile overwrites shared storage.
+        barrier();
+    }
+    for(uint r=0;r<4;r++) for(uint c=0;c<4;c++) {
+        uint rr=row0+row+r*8, cc=col0+col+c*8;
+        if(rr<p.rows && cc<p.cols) y[(rr+p.offset)*p.cols+cc]=sums[r][c]+((p.flags!=0)?b[cc]:0.0);
+    }
+}

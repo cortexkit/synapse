@@ -18,29 +18,7 @@ float hc(uint i) { return uintBitsToFloat(c[i]); }
 float hz(uint i) { return uintBitsToFloat(z[i]); }
 float fz(uint i) { return uintBitsToFloat(z[i]); }
 float fv(uint i) { return uintBitsToFloat(v[i]); }
-shared float tile_x[256];
-shared float tile_w[256];
-void linear() {
-    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
-    uint column_tiles=(p.cols+7)/8;
-    uint row0=group/column_tiles*8, col0=group%column_tiles*8;
-    if(row0>=p.rows) return;
-    uint lane=gl_LocalInvocationID.x, row=row0+lane/8, col=col0+lane%8;
-    float a=0.0;
-    for(uint start=0;start<p.inner;start+=32) {
-        for(uint j=lane;j<256;j+=64) {
-            uint r=j/32, k=start+j%32;
-            tile_x[j]=(row0+r<p.rows && k<p.inner)?x[(row0+r)*p.inner+k]:0.0;
-            tile_w[j]=(col0+r<p.cols && k<p.inner)?float(w[(col0+r)*p.inner+k]):0.0;
-        }
-        memoryBarrierShared(); barrier();
-        for(uint k=0;k<32;k++) a+=tile_x[(lane/8)*32+k]*tile_w[(lane%8)*32+k];
-        barrier();
-    }
-    if(row<p.rows && col<p.cols) y[(row+p.offset)*p.cols+col]=a+((p.flags!=0)?hb(col):0.0);
-}
 void main() {
-    if(p.op==100) { linear(); return; }
     uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64+gl_LocalInvocationID.x;
     if(p.op==101) { // LayerNorm, including its learned bias.
         if(i>=p.rows) return;

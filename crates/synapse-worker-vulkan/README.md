@@ -13,6 +13,21 @@ for required numerical/observation/progress checks and the explicit MoltenVK
 diagnostic. The profile's 600-second target and allocation floors are not
 hardware certification until the complete native runs pass.
 
+The f32 host decoder selects AVX (x86_64), NEON (aarch64), or a scalar GEMV
+once at load. The four LSTM gates stay contiguous; only the f32 reduction order
+changes. Encoder linears use a dedicated 32×32×64 shared-memory GEMM with 4×4
+register outputs per thread, leaving other speech ops free of that shared-memory
+reservation. Speech dispatches retain immutable descriptor sets and submit at
+subsampling-tile/layer/projection boundaries, bounded to 128 dispatches. Inputs
+whose padded frame count exceeds 1024 instead submit each dispatch separately
+to avoid combining long-running GPU work near the Windows GPU timeout. Layer
+progress is emitted only after its work has completed.
+The encoder's supported padded frame-count buckets, manifest digest, speech
+decode rule and embedding/reranking shader-set hash are unchanged. The new
+speech revision still requires full hardware certification. Its catalog entry
+must then be regenerated to bind the certified model/profile to the new kernel
+revision.
+
 Enable the GPU build with Vulkan SDK **1.4.357.0**, setting `VULKAN_SDK` to its
 platform directory (containing `bin/glslc`, or `Bin/glslc.exe` on Windows):
 
