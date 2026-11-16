@@ -1214,7 +1214,7 @@ mod tests {
     use super::*;
 
     fn manifest_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../synapse-module/owned-decode-manifests")
     }
 
     #[test]

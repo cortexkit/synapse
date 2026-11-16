@@ -26,6 +26,7 @@ crates/                     production Rust crates
   synapse-module/           the subc module (ck-synapse): ops, catalog, store, worker host
   synapse-native-probe/     safe wrappers for the Windows calls the machine profile reads
   synapse-opctl/            operator CLI (ck-synapse-opctl)
+  synapse-owned-decode/     owned-decode contracts, sidecar, routing, grammar scheduler, pure certification
   synapse-release-checks/   Python gates the tag workflow runs over prebuilt release assets
   synapse-speech/           WAV/log-mel front end, Token-and-Duration Transducer (TDT) loop, word timing
   synapse-worker-ane/       Core ML Neural Engine embedding worker (Rust launcher + Swift)
@@ -48,9 +49,7 @@ workers/                    non-Rust worker processes: ane-prefill-sidecar (Swif
                             release.yml, design-gate.yml
 ```
 
-Inside `crates/synapse-module`, the owned-generation code sits next to `src/` in
-`owned-decode-routing/`, `owned-decode-grammar-scheduler/`,
-`owned-decode-certification/`, `owned-decode-sidecar/` and `owned-decode-manifests/`.
+`crates/synapse-module/owned-decode-manifests/` retains the checked-in decode records.
 Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal decode
 kernels and `owned-decode-worker/` the supervisor and protocol.
 

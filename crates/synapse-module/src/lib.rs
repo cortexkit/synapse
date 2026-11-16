@@ -25,40 +25,14 @@ mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
-/// Certification probes, immutable fixture batteries and oracles,
-/// scheduler-evidence ingestion, the approval-backed serving predicate, and
-/// validation of all twelve owned-metal-decode release requirements. The source
-/// lives under
-/// `crates/synapse-module/owned-decode-certification/`; the `#[path]`
-/// attribute wires that directory into the crate as a module.
-#[path = "../owned-decode-certification/mod.rs"]
+/// Pure certification APIs plus the module's store-backed probe write seam.
 pub mod owned_decode_certification;
-/// Module-owned schemas and checked-in records for the production owned-decode
-/// lane. Loaded by catalog validation and CI probes. See
-/// `owned_decode_contracts::load_manifest_dir`.
-pub mod owned_decode_contracts;
-/// Grammar compilation and the dedicated DECODE scheduler for the owned-decode
-/// lane: JSON-schema-subset parsing and validation, checked-in grammar limits,
-/// the byte-level constrained automaton, the `token-id-json-constraint-v1`
-/// representation, and the `QueueClass::Decode` scheduler with quantum
-/// sequencing. The source lives under
-/// `crates/synapse-module/owned-decode-grammar-scheduler/`; the `#[path]`
-/// attribute wires that directory into the crate as a module.
-#[path = "../owned-decode-grammar-scheduler/mod.rs"]
-pub mod owned_decode_grammar_scheduler;
-/// Module-side request processing and lane routing for the owned-metal-decode
-/// lane: catalog validation, family registration, identity computation, Q8
-/// ingest orchestration, certification access, approval-backed lane selection
-/// and fallback,
-/// provenance, and end-to-end `microllm.oneshot` orchestration. The source lives
-/// under `crates/synapse-module/owned-decode-routing/`; the `#[path]` attribute
-/// wires that directory into the crate as a module.
-#[path = "../owned-decode-routing/mod.rs"]
-pub mod owned_decode_routing;
-/// Runtime-owned sidecar normalization and bounded target-token hint banking.
-/// Sidecar completions never receive authority to commit target decode state.
-#[path = "../owned-decode-sidecar/mod.rs"]
-pub mod owned_decode_sidecar;
+pub use synapse_owned_decode::{
+    owned_decode_contracts, owned_decode_grammar_scheduler, owned_decode_routing,
+    owned_decode_sidecar,
+};
+#[cfg(test)]
+mod owned_decode_routing_store_tests;
 #[cfg(test)]
 mod rerank_readout_tests;
 mod rollback;

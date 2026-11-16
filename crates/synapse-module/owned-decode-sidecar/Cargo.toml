@@ -5,11 +5,9 @@ edition = "2021"
 publish = false
 
 [lib]
-path = "mod.rs"
+path = "../../synapse-owned-decode/owned-decode-sidecar/mod.rs"
 
-# This manifest lets the pure sidecar contracts and colocated tests compile
-# independently; the standalone crate avoids changes to synapse-module routing
-# and its crate root.
+# Compile the moved sidecar contracts and their colocated tests independently.
 [workspace]
 
 [dependencies]

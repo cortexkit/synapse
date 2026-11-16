@@ -1417,7 +1417,8 @@ mod tests {
     use crate::owned_decode_certification::probe::OracleReproducingProbe;
 
     fn manifest_dir() -> ManifestDir {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../synapse-module/owned-decode-manifests");
         crate::owned_decode_contracts::load_manifest_dir(&path).expect("manifests load")
     }
 

@@ -34,10 +34,8 @@
 //! - [`metal_probe`]: the checkpoint-gated certification probe that runs the
 //!   real Metal step engines on the mandatory `macos-metal` lane.
 //!
-//! The source lives under `crates/synapse-module/owned-decode-certification/`;
-//! a `#[path]` attribute in the crate root wires that directory in as this
-//! module, matching the `owned-decode-routing` and
-//! `owned-decode-grammar-scheduler` precedent.
+//! Pure certification lives in `synapse-owned-decode`; store-backed probe
+//! snapshots and terminal writes remain in `synapse-module`.
 
 pub mod certification_unit;
 pub mod fixture_groups;

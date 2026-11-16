@@ -1,7 +1,7 @@
 [
   {
     "path": "crates/synapse-module/src/lib.rs",
-    "max_lines": 32172,
+    "max_lines": 32145,
     "reason": "Predates the rule; split by area the next time this file is worked on."
   },
   {

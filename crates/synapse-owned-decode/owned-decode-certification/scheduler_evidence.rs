@@ -192,8 +192,8 @@ mod tests {
         // preserved in the evidence history, not overwritten. (This test
         // previously asserted the blocked pre-commit state; it tracks the
         // checked-in manifest's status, which the v2 measurement flipped.)
-        let manifest_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests");
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../synapse-module/owned-decode-manifests");
         let manifests = crate::owned_decode_contracts::load_manifest_dir(&manifest_dir)
             .expect("checked-in manifests load");
         let status = ingest_scheduler_evidence(&manifests.scheduler);

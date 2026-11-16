@@ -7319,6 +7319,7 @@ dependencies = [
  "synapse-core",
  "synapse-engine-owned",
  "synapse-module",
+ "synapse-owned-decode",
  "synapse-parity",
  "synapse-speech",
  "thiserror 1.0.69",
@@ -7350,6 +7351,24 @@ dependencies = [
  "subc-os",
  "subc-protocol",
  "tokio",
+]
+
+[[package]]
+name = "synapse-owned-decode"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "hex",
+ "safetensors 0.6.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "synapse-engine-owned",
+ "synapse-parity",
+ "thiserror 1.0.69",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]

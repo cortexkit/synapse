@@ -25,6 +25,7 @@ matrix determine supported backends and published assets.
 | `synapse-engine-owned/owned-decode-worker` | Owned-decode supervisor, protocol and crash budget. |
 | `synapse-engine-cuda` | Owned CUDA engine and hardware-floor checks. |
 | `synapse-module` | Management operations, model cache, durable jobs and worker host; `ck-synapse`. |
+| `synapse-owned-decode` | Owned-decode contracts, sidecar normalization, routing, grammar scheduling and pure certification. |
 | `synapse-opctl` | Operator client; `ck-synapse-opctl`. |
 | `synapse-worker-llama` | Supervised GGUF worker. |
 | `synapse-worker-ane` | Rust launcher and Swift Core ML worker. |

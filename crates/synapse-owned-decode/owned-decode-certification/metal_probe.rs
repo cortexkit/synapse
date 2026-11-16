@@ -424,8 +424,8 @@ fn lfm2_greedy_decode(
 #[test]
 #[ignore]
 fn metal_certification_probe_four_lanes() {
-    let manifest_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("owned-decode-manifests");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../synapse-module/owned-decode-manifests");
     let manifests = crate::owned_decode_contracts::load_manifest_dir(&manifest_dir)
         .expect("checked-in manifests load");
 

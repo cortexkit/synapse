@@ -131,7 +131,7 @@ rerank quality scoring.
 | Engram descriptor | `crates/synapse-module/src/engram_catalog.rs` | backup catalog written at startup |
 | Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
 | Core ML materialization | `crates/synapse-module/src/ane_artifact.rs` | digest-keyed extraction of Core ML bundles |
-| Decode routing | `crates/synapse-module/owned-decode-routing/` | lane choice, ANE prefill router |
+| Owned decode | `crates/synapse-owned-decode/` | contracts, sidecar, routing, grammar scheduler, pure certification |
 | Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TranscribeEngine`, `TokenBatch` |
 | Shared speech core | `crates/synapse-speech/src/` | WAV front end, TDT loop, detokenization and word timing |
 | Tokenizer | `crates/synapse-core/src/tokenizer.rs` | sanitized tokenization, digests, truncation disclosure |

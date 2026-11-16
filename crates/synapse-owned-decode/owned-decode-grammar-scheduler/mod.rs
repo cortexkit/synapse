@@ -18,9 +18,8 @@
 //!   cancellation and deadline removal, and N-token quantum sequencing
 //!   ([`scheduler`]).
 //!
-//! The source lives under `crates/synapse-module/owned-decode-grammar-scheduler/`;
-//! a `#[path]` attribute in the crate root wires that directory in as this module,
-//! matching the way `owned-decode-routing` is wired.
+//! This module belongs to `synapse-owned-decode` and is re-exported by
+//! `synapse-module` for its existing callers.
 //!
 //! Everything here is pure Rust with no Metal dependency, so the mechanism and its
 //! measurements can be exercised before the numeric scheduler values are committed

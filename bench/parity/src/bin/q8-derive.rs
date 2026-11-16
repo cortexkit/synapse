@@ -8,17 +8,17 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[path = "../../../../crates/synapse-module/owned-decode-routing/error.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/error.rs"]
 pub mod decode_error;
-#[path = "../../../../crates/synapse-module/owned-decode-routing/family.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/family.rs"]
 pub mod decode_family;
-#[path = "../../../../crates/synapse-module/owned-decode-routing/q8artifact.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/q8artifact.rs"]
 pub mod q8artifact;
-#[path = "../../../../crates/synapse-module/owned-decode-routing/q8asr.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/q8asr.rs"]
 pub mod q8asr;
-#[path = "../../../../crates/synapse-module/owned-decode-routing/q8ingest.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/q8ingest.rs"]
 pub mod q8ingest;
-#[path = "../../../../crates/synapse-module/owned-decode-routing/tensor_source.rs"]
+#[path = "../../../../crates/synapse-owned-decode/owned-decode-routing/tensor_source.rs"]
 mod tensor_source;
 
 mod owned_decode_routing {
