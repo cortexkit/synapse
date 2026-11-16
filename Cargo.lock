@@ -1512,9 +1512,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-media-conformance"
-version = "0.2.9"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a247b857f7bbb219f75c7fff90643e331b8c2d8a8cacab42bfdb8e2ae04471"
+checksum = "14cdc924cc83f9bcde0517efc1e8f51375ea37c994db257f4710ea0ddf24df4c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

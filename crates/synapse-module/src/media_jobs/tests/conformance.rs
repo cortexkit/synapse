@@ -18,6 +18,7 @@ struct LocalSubject {
     state: Arc<ModuleState>,
     control: Arc<(Mutex<Control>, Condvar)>,
     held: Mutex<Option<tokio::sync::OwnedMutexGuard<Lane>>>,
+    last_submit_id: Mutex<Option<String>>,
 }
 
 impl LocalSubject {
@@ -27,6 +28,7 @@ impl LocalSubject {
             state,
             control: Arc::default(),
             held: Mutex::default(),
+            last_submit_id: Mutex::default(),
         }
     }
 
@@ -53,9 +55,9 @@ impl MediaSubject for LocalSubject {
     }
 
     async fn configure_engines(&self, _: Vec<Engine>) -> SubjectResult<()> {
-        // Synapse's catalog, not the kit's synthetic multi-kind registry, owns
-        // declarations. Never manufacture engine facts to satisfy a kit case.
-        Ok(())
+        // The local catalog owns engine declarations, so this subject does not
+        // accept engine declarations from the conformance kit.
+        Err(SubjectError::unsupported("configure_engines"))
     }
 
     async fn engine_declaration(&self) -> SubjectResult<Vec<Engine>> {
@@ -79,6 +81,10 @@ impl MediaSubject for LocalSubject {
     }
 
     async fn call_as(&self, principal: &str, request: Request) -> SubjectResult<Value> {
+        if request.method == "media.submit" {
+            *self.last_submit_id.lock().unwrap() =
+                request.params["client_job_id"].as_str().map(str::to_owned);
+        }
         let mut params = request.params;
         // The only fixture-model translation is to the real local catalog id.
         if request.method == "media.submit" && params["model"] == "transcribe" {
@@ -196,21 +202,16 @@ async fn media_published_transcribe_conformance_report() {
             // Known conformance gaps are reported, not passing results. Any new
             // failure must be reviewed, including provider contract mismatches.
             let expected = match name {
-                "wire_extension" => "describe omitted the engine with unknown enum values",
+                // The kit assumes French is unsupported, but the local catalog declares it.
                 "submit_refuses_outside_declared_facts" => {
-                    "expected field input.format: {\"code\":\"unsupported\",\"detail\":{\"class\":\"permanent\",\"field\":\"kind\"}"
+                    assert_eq!(
+                        subject.last_submit_id.lock().unwrap().as_deref(),
+                        Some("input.language"),
+                        "unexpected accepted request"
+                    );
+                    "media.submit accepted instead of unsupported: {\"result\":{\"job_id\":"
                 }
-                "input_too_large" => "media.submit accepted instead of input_too_large",
-                "describe_matches_engine_declaration" | "describe_checker_codes" => {
-                    "describe/declaration facts differ"
-                }
-                "empty_output_is_a_failure" | "chunked_result_checksum" => {
-                    "subject hook script_engine: model not declared is not implemented"
-                }
-                "usage_feed_oversize_entry_acks" => {
-                    "subject hook seed_usage_entry is not implemented"
-                }
-                _ => "usage.read: wire refusal; Some(Object {\"code\": String(\"unknown_method\")",
+                _ => panic!("unexpected kit failure for {name}: {reason}"),
             };
             assert!(
                 reason.contains(expected),
@@ -230,5 +231,5 @@ async fn media_published_transcribe_conformance_report() {
         "MEDIA_CONFORMANCE totals: passed={}, not_applicable={}, failed={}",
         counts[0], counts[1], counts[2]
     );
-    assert_eq!(counts, [0, 19, 27], "pinned kit applicability changed");
+    assert_eq!(counts, [19, 26, 1], "pinned kit applicability changed");
 }
