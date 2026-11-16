@@ -1,7 +1,8 @@
 # synapse-speech
 
-Portable processing for the pinned `nvidia/parakeet-tdt-0.6b-v3` model. The crate
-has no engine, module, store or daemon dependency and can be checked for
+Portable processing for the pinned `nvidia/parakeet-tdt-0.6b-v3` and
+`Qwen/Qwen3-ASR-1.7B` models. The crate has no engine, module, store or daemon
+dependency. Its default Parakeet-only build can be checked for
 `aarch64-apple-ios` without an Apple SDK or native tokenizer library.
 
 `assets/tokenizer.json` is an unmodified NVIDIA Parakeet tokenizer from
@@ -83,3 +84,73 @@ Replay supplies the sealed top-two decision heads to the real generic loop and
 checks exact traces, including row indices into the stored encoder output. It
 certifies loop policy, not neural predictor arithmetic or hardware kernels;
 those belong to the engine implementations and hardware certification.
+
+## Qwen3-ASR frontend and prompts
+
+The `qwen` module has an independent frontend; Parakeet's feature computation
+and constants are unchanged. Qwen uses 16-kHz PCM, a periodic 400-sample Hann
+window, 200-sample reflection padding, 160-sample hop, 128 Slaney-normalized mel
+bins, base-10 log floor `1e-10`, a waveform-wide eight-log-unit clamp, and
+`(log_mel + 4) / 4`. The final short-time Fourier transform (STFT) frame is
+dropped: both actual and valid frame counts are `floor(samples / 160)`.
+Reflection padding, like the pinned torch
+implementation, requires more than 200 input samples. Audio tokens are
+`13 * (frames / 100) + ceil((frames % 100) / 8)`, not `ceil(frames / 8)`.
+The [frozen frontend rules](../../bench/parity/reference/qwen3-asr-reference.json)
+specify the mel scale and Slaney filter-area normalization.
+
+Enable the **`qwen` Cargo feature** for `qwen::Tokenizer` and prompt rendering.
+Without it, neither the encoder nor its tokenizer/regex dependencies are linked.
+The unmodified Apache-2.0 `vocab.json` and `merges.txt` assets come from
+`Qwen/Qwen3-ASR-1.7B` revision `7278e1e70fe206f11671096ffdd38061171dd6e5`;
+`qwen::VOCAB_SHA256` and `qwen::MERGES_SHA256` enforce their original byte seals.
+Encoding uses Unicode Normalization Form C (NFC) and byte-level byte-pair encoding
+(BPE), with special-token parsing disabled for caller text. Non-special added
+tokens, including `<asr_text>`, keep
+their pinned ordinary-text ids; only the renderer can insert chat/audio framing.
+The bundled, checksum-checked `pretokenizer.json` records the actual reference
+processor's split: qwen-asr 0.0.6 loads the processor with
+`fix_mistral_regex=True`, replacing plain Qwen2's regex with a case-aware split.
+For example, it separates `YouTube` where plain Qwen2 does not. Template markers
+are inserted as ids.
+
+`Tokenizer::render(PromptRequest)` counts the full forwarded context, including
+comma-space separators and the newline before a kept caller prompt. It drops
+the prompt first, then trailing terms until the context fits `bias_limit`, and
+returns the exact ids, placeholder span and `bias_applied` accounting. The limit
+is supplied by the caller; this crate does not select or certify a serving bias
+limit. `LANGUAGES`, `language_name` and `language_code` share all 30 pinned model
+names between hint rendering and output parsing; the served catalog separately
+narrows its declared languages to the Parakeet word-timing companion's set.
+
+```sh
+cargo test --locked -p synapse-speech --features qwen --test qwen
+cargo test --locked -p synapse-speech --no-default-features --test qwen
+cargo clippy --locked -p synapse-speech --features qwen --all-targets -- -D warnings
+```
+
+The ordinary tests compare every executable sealed corpus case's prompt ids,
+span, frame/token counts and detected language with the reference, plus two
+small sealed mel tensors. The additional `qwen-prompts.json` goldens were generated
+with the pinned template and qwen-asr 0.0.6's processor under Transformers 4.57.6,
+including its regex patch and `split_special_tokens=True` for context only. They
+cover caller prompts, literal markers, Unicode, hints, trimming, and the
+case-sensitive split. The feature-off test inspects Cargo's
+normal dependency graph to keep the Parakeet-only dependency boundary explicit.
+
+For all 6,559 executable cases (1,556 distinct PCM tensors), reconstruct the
+public corpus recipes into a mirror containing `<recording-key>.pcm` and
+`<mel-sha256>.mel`, both row-major little-endian f32. The recording keys are from
+`bench/parity/reference/qwen3-asr-corpus.json`, and the mel seals and exact input
+PCM digests are in `bench/parity/fixtures/qwen3-asr-1.7b/traces/`. The single
+over-duration refusal has no mel/prompt execution. Missing or corrupt mirror
+files fail, never silently skip:
+
+```sh
+SYNAPSE_QWEN_PARITY_INPUTS=/absolute/path/to/public-pcm-mel-mirror \
+cargo test --locked -p synapse-speech --test qwen qwen_all_mel_reference -- --ignored --nocapture --test-threads=1
+```
+
+The all-mel test checks every fixture's exact counts and seals; identical PCM
+must name the same mel seal and is computed only once. This is frontend and
+prompt parity, not encoder, decoding, name-recall or hardware certification.

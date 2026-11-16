@@ -1,9 +1,10 @@
-//! Platform-independent Parakeet TDT speech processing. Engines supply the neural
-//! predictor and joint; this crate owns audio, features, decode policy and text.
+//! Platform-independent speech processing. Engines supply neural inference;
+//! this crate owns audio, features, decode policy and text.
 
 mod audio;
 mod decode;
 mod frontend;
+pub mod qwen;
 mod text;
 
 pub use audio::{decode_wav, resample, Audio, MAX_AUDIO_BYTES, SAMPLE_RATE};
@@ -35,6 +36,8 @@ pub enum Error {
     InvalidJoint(&'static str),
     #[error("invalid tokenizer or token: {0}")]
     InvalidTokenizer(String),
+    #[error("unsupported Qwen3-ASR language: {0}")]
+    UnsupportedLanguage(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
