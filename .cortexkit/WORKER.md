@@ -7,6 +7,12 @@ Command Line Tools alone do not supply `metal`/`metallib`. Hardware tests need t
 actual platform, pinned model files and any explicit opt-in described by the test.
 A portable test pass or a skipped hardware case is not hardware certification.
 
+## Source file sizes
+
+- Don't grow a file listed as a size exception; put new code in a new module, split by area.
+- Keep new hand-written source files under 5,000 lines.
+- Keep large test suites out of the library crate.
+
 ## What to run for a change
 
 While iterating, run only the filtered tests for the code you touched,

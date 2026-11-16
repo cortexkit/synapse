@@ -1,0 +1,22 @@
+[
+  {
+    "path": "crates/synapse-module/src/lib.rs",
+    "max_lines": 32172,
+    "reason": "Predates the rule; split by area the next time this file is worked on."
+  },
+  {
+    "path": "crates/synapse-module/src/store.rs",
+    "max_lines": 14339,
+    "reason": "Predates the rule; split by area the next time this file is worked on."
+  },
+  {
+    "path": "crates/synapse-module/src/worker_host/mod.rs",
+    "max_lines": 13774,
+    "reason": "Predates the rule; split by area the next time this file is worked on."
+  },
+  {
+    "path": "crates/synapse-worker-decode/src/runner.rs",
+    "max_lines": 5799,
+    "reason": "Predates the rule; split by area the next time this file is worked on."
+  }
+]

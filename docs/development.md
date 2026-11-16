@@ -2,6 +2,8 @@
 
 ## Build and test a change
 
+Keep new hand-written source files under 5,000 lines, don't grow size-exception files (put new code in a new module split by area), and keep large test suites out of the library crate.
+
 Implement the change, then run only the filtered tests for the code you touched,
 plus formatting and Clippy for the touched crates. Run them on the Linux build
 server (`ck motor run --vcpus 4 --cwd "$PWD" -- COMMAND...`, or

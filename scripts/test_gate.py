@@ -175,6 +175,7 @@ class PlanTests(unittest.TestCase):
                         "scripts.test_ci_parallel", "check-release-candidate.py --self-test",
                         "crates/synapse-release-checks", "test_release_matrix.py",
                         "public-banlist-check.sh", "check-cortexkit-layout.sh",
+                        "scripts/check-file-sizes.py", "scripts.test_file_sizes",
                         "check-no-external-path-deps.sh --self-test", "scripts.test_module_runtime_deps",
                         "ane-direct-embed-harness.sh --self-test ."):
             self.assertIn(command, guards)
