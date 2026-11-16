@@ -739,8 +739,8 @@ impl Arena {
         unsafe {
             device.raw.update_descriptor_sets(&writes, &[]);
         }
-        let groups = if params.op == 100 {
-            speech_gemm_groups(params.rows, params.cols)
+        let groups = if params.op >= 100 {
+            speech_groups(&params, count)
         } else if cooperative {
             params.rows.div_ceil(16) * params.cols.div_ceil(16)
         } else {
@@ -798,8 +798,29 @@ impl Arena {
     }
 }
 
-fn speech_gemm_groups(rows: u32, cols: u32) -> u32 {
-    rows.div_ceil(32) * cols.div_ceil(32)
+/// Speech GEMM flag: add the bias bound at binding 4.
+const SPEECH_GEMM_BIAS: u32 = 1;
+/// Speech GEMM flag: compute three projections of one input in one dispatch,
+/// with weights at bindings 1, 3 and 4 and outputs at bindings 2, 5 and 6.
+const SPEECH_GEMM_THREE: u32 = 2;
+
+fn speech_gemm_groups(params: &Params) -> u32 {
+    let matrices = if params.flags & SPEECH_GEMM_THREE != 0 {
+        3
+    } else {
+        1
+    };
+    params.rows.div_ceil(32) * params.cols.div_ceil(32) * matrices
+}
+
+/// Workgroups for a speech operation over `count` elements.
+fn speech_groups(params: &Params, count: u32) -> u32 {
+    match params.op {
+        100 => speech_gemm_groups(params),
+        // LayerNorm reduces each row with its own 64-thread workgroup.
+        101 => params.rows,
+        _ => count.div_ceil(64),
+    }
 }
 
 const SPEECH_BATCH_CAPACITY: usize = 128;
@@ -877,11 +898,7 @@ impl SpeechBatch {
             .iter()
             .map(|name| arena.descriptor(name))
             .collect::<Result<_>>()?;
-        let groups = if params.op == 100 {
-            speech_gemm_groups(params.rows, params.cols)
-        } else {
-            count.div_ceil(64)
-        };
+        let groups = speech_groups(&params, count);
         self.pending.push(SpeechDispatch {
             params,
             descriptors,
@@ -1843,8 +1860,8 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::attention_lanes;
-    use super::speech_gemm_groups;
     use super::SpeechBatchPolicy;
+    use super::{speech_gemm_groups, speech_groups, Params, SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE};
 
     #[test]
     fn transcribe_long_rungs_submit_each_dispatch_before_accumulating_more_work() {
@@ -1875,38 +1892,183 @@ mod tests {
     #[test]
     fn transcribe_gemm_register_tiles_cover_ragged_rows_columns_and_offsets() {
         let source = include_str!("../shaders/transcribe_gemm.comp");
-        assert!(source.contains("shared float tile_x[32*64]"));
-        assert!(source.contains("shared float tile_w[32*64]"));
-        let (rows, cols, inner, offset) = (35usize, 37usize, 65usize, 3usize);
-        let x: Vec<_> = (0..rows * inner).map(|i| (i % 7) as f32 - 3.).collect();
-        let w: Vec<_> = (0..cols * inner).map(|i| (i % 5) as f32 - 2.).collect();
-        let mut y = vec![f32::NAN; (rows + offset) * cols];
-        let mut written = vec![0u32; rows * cols];
-        assert_eq!(speech_gemm_groups(rows as u32, cols as u32), 4);
-        for group in 0..speech_gemm_groups(rows as u32, cols as u32) as usize {
-            let row0 = group / cols.div_ceil(32) * 32;
-            let col0 = group % cols.div_ceil(32) * 32;
-            let mut sums = [[[0.; 4]; 4]; 64];
-            for start in (0..inner).step_by(64) {
-                let mut tx = [0.; 32 * 64];
-                let mut tw = [0.; 32 * 64];
-                for r in 0..32 {
-                    for k in 0..64 {
-                        if row0 + r < rows && start + k < inner {
-                            tx[r * 64 + (k ^ ((r % 8) * 8))] = x[(row0 + r) * inner + start + k];
-                        }
-                        if col0 + r < cols && start + k < inner {
-                            tw[r * 64 + (k ^ ((r % 8) * 4))] = w[(col0 + r) * inner + start + k];
-                        }
+        assert!(source.contains("const uint DEPTH=32;"));
+        assert!(source.contains("const uint STRIDE=9;"));
+        assert!(source.contains("shared vec4 tile_x[DEPTH*STRIDE];"));
+        assert!(source.contains("shared vec4 tile_w[DEPTH*STRIDE];"));
+        // Rows below the column count select column-major workgroup order;
+        // larger row counts select row-major order. Both orders are covered,
+        // with and without the fused three-projection mode.
+        for (rows, cols, inner, offset, flags) in [
+            (35, 37, 65, 3, SPEECH_GEMM_BIAS),
+            (70, 33, 40, 1, SPEECH_GEMM_BIAS),
+            (35, 37, 65, 0, 0),
+            (35, 37, 65, 0, SPEECH_GEMM_THREE),
+            (100, 20, 96, 0, SPEECH_GEMM_THREE),
+        ] {
+            let params = Params {
+                op: 100,
+                rows,
+                cols,
+                inner,
+                offset,
+                flags,
+                ..Default::default()
+            };
+            let (rows, cols, inner, offset) = (
+                rows as usize,
+                cols as usize,
+                inner as usize,
+                offset as usize,
+            );
+            let mut random = Lcg((rows * cols + inner) as u64);
+            let x = random.values(rows * inner);
+            let weights = [0, 1, 2].map(|_| random.values(cols * inner));
+            let bias = random.values(cols);
+            let bias = if flags & SPEECH_GEMM_THREE != 0 {
+                // The third weight occupies the bias binding.
+                weights[2].clone()
+            } else {
+                bias
+            };
+            let matrices = if flags & SPEECH_GEMM_THREE != 0 { 3 } else { 1 };
+            let (outputs, written) =
+                emulate_speech_gemm(&params, &x, [&weights[0], &weights[1], &bias], &bias[..]);
+            for (matrix, (output, written)) in outputs.iter().zip(&written).enumerate() {
+                if matrix >= matrices {
+                    assert!(written.iter().all(|&n| n == 0));
+                    continue;
+                }
+                assert!(output[..offset * cols].iter().all(|v| v.is_nan()));
+                assert!(written.iter().all(|&n| n == 1), "{rows}x{cols} {flags}");
+                let w = if matrix == 2 { &bias } else { &weights[matrix] };
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let products = (0..inner).map(|k| (x[row * inner + k], w[col * inner + k]));
+                        // Ascending k from zero, then the bias: the order of
+                        // the scalar shader that preceded the tiled one.
+                        let sequential = products.clone().fold(0f32, |sum, (a, b)| sum + a * b);
+                        let exact: f64 = products
+                            .clone()
+                            .map(|(a, b)| f64::from(a) * f64::from(b))
+                            .sum();
+                        let magnitude: f64 = products
+                            .map(|(a, b)| (f64::from(a) * f64::from(b)).abs())
+                            .sum();
+                        let added = if flags & SPEECH_GEMM_BIAS != 0 {
+                            bias[col]
+                        } else {
+                            0.
+                        };
+                        let actual = output[(row + offset) * cols + col];
+                        assert_eq!(actual.to_bits(), (sequential + added).to_bits());
+                        let reference = exact + f64::from(added);
+                        // Sequential f32 rounding is bounded by inner * eps * magnitude.
+                        let tolerance = 1e-5 * (magnitude + f64::from(added.abs())).max(1.);
+                        assert!((f64::from(actual) - reference).abs() <= tolerance);
                     }
                 }
+            }
+        }
+    }
+
+    /// Deterministic values in [-1, 1) with fractional bits, so that a
+    /// different summation order would change the rounded result.
+    struct Lcg(u64);
+    impl Lcg {
+        fn values(&mut self, count: usize) -> Vec<f32> {
+            (0..count)
+                .map(|_| {
+                    self.0 = self
+                        .0
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.
+                })
+                .collect()
+        }
+    }
+
+    /// Runs transcribe_gemm.comp's algorithm on the CPU, workgroup by workgroup
+    /// and thread by thread, with the same group order, loads, shared-memory
+    /// layout and multiply-add order. Returns the three output bindings
+    /// (NaN where unwritten) and how often each output element was written.
+    fn emulate_speech_gemm(
+        params: &Params,
+        x: &[f32],
+        weights: [&[f32]; 3],
+        bias: &[f32],
+    ) -> ([Vec<f32>; 3], [Vec<u32>; 3]) {
+        const DEPTH: usize = 32;
+        const STRIDE: usize = 9;
+        let (rows, cols, inner) = (
+            params.rows as usize,
+            params.cols as usize,
+            params.inner as usize,
+        );
+        let offset = params.offset as usize;
+        let matrices = if params.flags & SPEECH_GEMM_THREE != 0 {
+            3
+        } else {
+            1
+        };
+        let mut outputs = [0, 1, 2].map(|_| vec![f32::NAN; (rows + offset) * cols]);
+        let mut written = [0, 1, 2].map(|_| vec![0u32; rows * cols]);
+        let (row_tiles, column_tiles) = (rows.div_ceil(32), cols.div_ceil(32));
+        let groups = speech_gemm_groups(params) as usize;
+        assert_eq!(groups, row_tiles * column_tiles * matrices);
+        for group in 0..groups.min(65535) * groups.div_ceil(65535) {
+            if group >= groups {
+                continue;
+            }
+            let (row_tile, column_tile) = if rows < cols * matrices {
+                (group % row_tiles, group / row_tiles)
+            } else {
+                (
+                    group / (column_tiles * matrices),
+                    group % (column_tiles * matrices),
+                )
+            };
+            let matrix = column_tile / column_tiles;
+            let (row0, col0) = (row_tile * 32, column_tile % column_tiles * 32);
+            let fetch = |start: usize, lane: usize| {
+                let (k, first) = (start + lane % 32, lane / 32 * 16);
+                let (mut input, mut weight) = ([0f32; 16], [0f32; 16]);
+                for (j, (a, b)) in input.iter_mut().zip(&mut weight).enumerate() {
+                    let (r, c) = (row0 + first + j, col0 + first + j);
+                    if k < inner && r < rows {
+                        *a = x[r * inner + k];
+                    }
+                    if k < inner && c < cols {
+                        *b = weights[matrix][c * inner + k];
+                    }
+                }
+                (input, weight)
+            };
+            let mut next: Vec<_> = (0..64).map(|lane| fetch(0, lane)).collect();
+            let mut sums = [[[0f32; 4]; 4]; 64];
+            for start in (0..inner).step_by(DEPTH) {
+                // NaN marks shared slots that no thread staged.
+                let mut tile_x = [[f32::NAN; 4]; DEPTH * STRIDE];
+                let mut tile_w = [[f32::NAN; 4]; DEPTH * STRIDE];
+                for (lane, (input, weight)) in next.iter().enumerate() {
+                    let (k, base) = (lane % 32, lane / 32 * 4);
+                    for g in 0..4 {
+                        tile_x[k * STRIDE + base + g] = input[4 * g..4 * g + 4].try_into().unwrap();
+                        tile_w[k * STRIDE + base + g] =
+                            weight[4 * g..4 * g + 4].try_into().unwrap();
+                    }
+                }
+                if start + DEPTH < inner {
+                    next = (0..64).map(|lane| fetch(start + DEPTH, lane)).collect();
+                }
                 for (lane, sum) in sums.iter_mut().enumerate() {
-                    let (row, col) = (lane / 8, lane % 8);
-                    for k in 0..64 {
+                    for k in 0..DEPTH {
+                        let inputs = tile_x[k * STRIDE + lane / 8];
+                        let weights = tile_w[k * STRIDE + lane % 8];
                         for (r, row_sum) in sum.iter_mut().enumerate() {
                             for (c, value) in row_sum.iter_mut().enumerate() {
-                                *value += tx[(row + r * 8) * 64 + (k ^ ((row % 8) * 8))]
-                                    * tw[(col + c * 8) * 64 + (k ^ ((col % 8) * 4))];
+                                *value += inputs[r] * weights[c];
                             }
                         }
                     }
@@ -1915,24 +2077,108 @@ mod tests {
             for (lane, sum) in sums.iter().enumerate() {
                 for (r, row_sum) in sum.iter().enumerate() {
                     for (c, value) in row_sum.iter().enumerate() {
-                        let rr = row0 + lane / 8 + r * 8;
-                        let cc = col0 + lane % 8 + c * 8;
+                        let (rr, cc) = (row0 + lane / 8 * 4 + r, col0 + lane % 8 * 4 + c);
                         if rr < rows && cc < cols {
-                            y[(rr + offset) * cols + cc] = value + cc as f32;
-                            written[rr * cols + cc] += 1;
+                            let added = if params.flags & SPEECH_GEMM_BIAS != 0 {
+                                bias[cc]
+                            } else {
+                                0.
+                            };
+                            outputs[matrix][(rr + offset) * cols + cc] = value + added;
+                            written[matrix][rr * cols + cc] += 1;
                         }
                     }
                 }
             }
         }
-        assert!(y[..offset * cols].iter().all(|v| v.is_nan()));
-        assert!(written.iter().all(|&n| n == 1));
-        for row in 0..rows {
-            for col in 0..cols {
-                let dot: f32 = (0..inner)
-                    .map(|k| x[row * inner + k] * w[col * inner + k])
-                    .sum();
-                assert_eq!(y[(row + offset) * cols + col], dot + col as f32);
+        (outputs, written)
+    }
+
+    /// Mirrors LayerNorm in transcribe.comp: one 64-thread workgroup per row,
+    /// strided per-thread sums, then the fixed pairwise tree.
+    fn emulate_layer_norm(x: &[f32], weight: &[f32], bias: &[f32], cols: usize) -> Vec<f32> {
+        let workgroup_sum = |partial: &mut [f32; 64]| {
+            let mut half_width = 32;
+            while half_width > 0 {
+                let (low, high) = partial.split_at_mut(half_width);
+                for (a, b) in low.iter_mut().zip(&high[..half_width]) {
+                    *a += *b;
+                }
+                half_width >>= 1;
+            }
+            partial[0]
+        };
+        let mut output = vec![f32::NAN; x.len()];
+        for (row, out) in x.chunks(cols).zip(output.chunks_mut(cols)) {
+            let mut partial = [0f32; 64];
+            for (lane, sum) in partial.iter_mut().enumerate() {
+                for value in row.iter().skip(lane).step_by(64) {
+                    *sum += value;
+                }
+            }
+            let mean = workgroup_sum(&mut partial) / cols as f32;
+            let mut partial = [0f32; 64];
+            for (lane, sum) in partial.iter_mut().enumerate() {
+                for value in row.iter().skip(lane).step_by(64) {
+                    let a = value - mean;
+                    *sum += a * a;
+                }
+            }
+            let inv = 1. / (workgroup_sum(&mut partial) / cols as f32 + 1e-5).sqrt();
+            for (((out, value), w), b) in out.iter_mut().zip(row).zip(weight).zip(bias) {
+                *out = (value - mean) * inv * w + b;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn transcribe_layer_norm_workgroup_reduction_matches_f64_reference() {
+        let source = include_str!("../shaders/transcribe.comp");
+        assert!(source.contains("shared float partial[64];"));
+        for (rows, cols, center) in [
+            (3usize, 1024usize, 0f32),
+            (2, 1024, 40.),
+            (2, 1000, 3.),
+            (2, 50, -2.),
+        ] {
+            let params = Params {
+                op: 101,
+                rows: rows as u32,
+                cols: cols as u32,
+                ..Default::default()
+            };
+            // One workgroup per row; the shader returns from any extra groups.
+            assert_eq!(speech_groups(&params, rows as u32), rows as u32);
+            let mut random = Lcg((rows * cols) as u64);
+            let x: Vec<_> = random
+                .values(rows * cols)
+                .into_iter()
+                .map(|v| center + 3. * v)
+                .collect();
+            let weight = random.values(cols);
+            let bias = random.values(cols);
+            let actual = emulate_layer_norm(&x, &weight, &bias, cols);
+            for (row, out) in x.chunks(cols).zip(actual.chunks(cols)) {
+                let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / cols as f64;
+                let variance = row
+                    .iter()
+                    .map(|&v| (f64::from(v) - mean).powi(2))
+                    .sum::<f64>()
+                    / cols as f64;
+                let inv = 1. / (variance + 1e-5).sqrt();
+                for (k, ((&value, &actual), (&w, &b))) in row
+                    .iter()
+                    .zip(out)
+                    .zip(weight.iter().zip(&bias))
+                    .enumerate()
+                {
+                    let reference = (f64::from(value) - mean) * inv * f64::from(w) + f64::from(b);
+                    assert!(
+                        (f64::from(actual) - reference).abs() <= 2e-5,
+                        "{rows}x{cols} column {k}: {actual} vs {reference}"
+                    );
+                }
             }
         }
     }

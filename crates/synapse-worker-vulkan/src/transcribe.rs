@@ -489,7 +489,7 @@ mod tests {
         );
         assert_eq!(
             synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
-            "owned-vulkan-transcribe-v3-f32"
+            "owned-vulkan-transcribe-v4-f32"
         );
     }
 

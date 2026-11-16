@@ -1,10 +1,17 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // A separate pipeline keeps this shared-memory reservation out of other ops.
 layout(local_size_x=64) in;
 layout(set=0,binding=0,std430) readonly buffer Input { float x[]; };
 layout(set=0,binding=1,std430) readonly buffer Weight { float w[]; };
 layout(set=0,binding=2,std430) writeonly buffer Output { float y[]; };
-layout(set=0,binding=4,std430) readonly buffer Bias { float b[]; };
+// With flags bit 2, one dispatch computes three projections of the same input:
+// weights in bindings 1, 3 and 4, outputs in bindings 2, 5 and 6. Otherwise
+// binding 4 holds the bias that flags bit 1 adds.
+layout(set=0,binding=3,std430) readonly buffer SecondWeight { float w1[]; };
+layout(set=0,binding=4,std430) readonly buffer BiasOrThirdWeight { float b[]; };
+layout(set=0,binding=5,std430) writeonly buffer SecondOutput { float y1[]; };
+layout(set=0,binding=6,std430) writeonly buffer ThirdOutput { float y2[]; };
 layout(push_constant) uniform Params {
     uint op; uint rows; uint cols; uint inner;
     uint seq; uint heads; uint kv_heads; uint dim;
@@ -12,37 +19,107 @@ layout(push_constant) uniform Params {
     float eps; float theta; float scale; float unused;
 } p;
 
-// 32x32 outputs and K=64: 16 f32 accumulators per thread, two barriers per
-// 64 terms. XOR swizzles separate each thread's broadcast bank without padding
-// past Vulkan's 16 KiB minimum shared-memory capacity. Global loads stay linear.
-shared float tile_x[32*64];
-shared float tile_w[32*64];
-void main() {
-    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
-    uint column_tiles=(p.cols+31)/32;
-    uint row0=group/column_tiles*32, col0=group%column_tiles*32;
-    if(row0>=p.rows) return;
-    uint lane=gl_LocalInvocationID.x, row=lane/8, col=lane%8;
-    vec4 sums[4];
-    for(uint r=0;r<4;r++) sums[r]=vec4(0.0);
-    for(uint start=0;start<p.inner;start+=64) {
-        for(uint j=lane;j<32*64;j+=64) {
-            uint r=j/64, k=j%64;
-            tile_x[r*64+(k^((r%8)*8))]=(row0+r<p.rows && start+k<p.inner)?x[(row0+r)*p.inner+start+k]:0.0;
-            tile_w[r*64+(k^((r%8)*4))]=(col0+r<p.cols && start+k<p.inner)?w[(col0+r)*p.inner+start+k]:0.0;
-        }
-        barrier();
-        for(uint k=0;k<64;k++) {
-            uint wk=k^((col%8)*4), xk=k^((row%8)*8);
-            vec4 weights=vec4(tile_w[col*64+wk],tile_w[(col+8)*64+wk],
-                               tile_w[(col+16)*64+wk],tile_w[(col+24)*64+wk]);
-            for(uint r=0;r<4;r++) sums[r]+=tile_x[(row+r*8)*64+xk]*weights;
-        }
-        // Readers finish before the next K tile overwrites shared storage.
-        barrier();
+// 32x32 outputs per workgroup and 4x4 f32 accumulators per thread. Every
+// output adds its products in ascending k from zero, as a scalar dot product
+// would, and the bias last. K advances in chunks of 32. Shared tiles are
+// k-major, so a thread reads its four rows or four columns as one vec4. The
+// nine-vec4 row stride spreads the transposing stores across all banks.
+// Shared memory is 2*32*9*16 bytes = 9 KiB, under Vulkan's 16 KiB minimum.
+const uint DEPTH=32;
+const uint STRIDE=9;
+shared vec4 tile_x[DEPTH*STRIDE];
+shared vec4 tile_w[DEPTH*STRIDE];
+// The next chunk's input and weight values. Their global loads are issued
+// before the current chunk's multiply-adds so that memory latency overlaps them.
+float next_x[16];
+float next_w[16];
+
+// Thread lane loads column k = lane % 32 of the chunk for sixteen consecutive
+// rows: rows 0-15 for lanes 0-31, rows 16-31 for lanes 32-63. Each warp-wide
+// load therefore reads 32 consecutive floats.
+void fetch(uint row0, uint col0, uint start, uint matrix, uint lane) {
+    uint k=start+lane%32, first=lane/32*16;
+    bool inside=k<p.inner;
+    [[unroll]] for(uint j=0;j<16;j++) {
+        uint r=row0+first+j;
+        next_x[j]=0.0;
+        if(inside && r<p.rows) next_x[j]=x[r*p.inner+k];
     }
-    for(uint r=0;r<4;r++) for(uint c=0;c<4;c++) {
-        uint rr=row0+row+r*8, cc=col0+col+c*8;
-        if(rr<p.rows && cc<p.cols) y[(rr+p.offset)*p.cols+cc]=sums[r][c]+((p.flags!=0)?b[cc]:0.0);
+    // The matrix is the same for the whole workgroup, so each branch is uniform.
+    if(matrix==0) {
+        [[unroll]] for(uint j=0;j<16;j++) {
+            uint c=col0+first+j;
+            next_w[j]=0.0;
+            if(inside && c<p.cols) next_w[j]=w[c*p.inner+k];
+        }
+    } else if(matrix==1) {
+        [[unroll]] for(uint j=0;j<16;j++) {
+            uint c=col0+first+j;
+            next_w[j]=0.0;
+            if(inside && c<p.cols) next_w[j]=w1[c*p.inner+k];
+        }
+    } else {
+        [[unroll]] for(uint j=0;j<16;j++) {
+            uint c=col0+first+j;
+            next_w[j]=0.0;
+            if(inside && c<p.cols) next_w[j]=b[c*p.inner+k];
+        }
+    }
+}
+
+// Groups of four rows (or columns) become one vec4 at shared row k.
+void stage(uint lane) {
+    uint k=lane%32, group=lane/32*4;
+    [[unroll]] for(uint g=0;g<4;g++) {
+        tile_x[k*STRIDE+group+g]=vec4(next_x[4*g],next_x[4*g+1],next_x[4*g+2],next_x[4*g+3]);
+        tile_w[k*STRIDE+group+g]=vec4(next_w[4*g],next_w[4*g+1],next_w[4*g+2],next_w[4*g+3]);
+    }
+}
+
+void main() {
+    uint matrices=((p.flags&2u)!=0u)?3u:1u;
+    uint row_tiles=(p.rows+31)/32, column_tiles=(p.cols+31)/32;
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    if(group>=row_tiles*column_tiles*matrices) return;
+    // Neighbouring workgroups run together and share one operand tile through
+    // the cache. They share the larger operand, so it is read from memory once,
+    // while the smaller operand is reread from cache.
+    uint row_tile, column_tile;
+    if(p.rows<p.cols*matrices) {
+        column_tile=group/row_tiles;
+        row_tile=group%row_tiles;
+    } else {
+        row_tile=group/(column_tiles*matrices);
+        column_tile=group%(column_tiles*matrices);
+    }
+    uint matrix=column_tile/column_tiles;
+    uint row0=row_tile*32, col0=column_tile%column_tiles*32;
+    uint lane=gl_LocalInvocationID.x;
+    // This thread's outputs: rows 4*rows4..+3 and columns 4*cols4..+3 of the tile.
+    uint rows4=lane/8, cols4=lane%8;
+    vec4 sums[4];
+    [[unroll]] for(uint r=0;r<4;r++) sums[r]=vec4(0.0);
+    fetch(row0,col0,0,matrix,lane);
+    for(uint start=0;start<p.inner;start+=DEPTH) {
+        // Readers of the previous chunk finish before it is overwritten.
+        barrier();
+        stage(lane);
+        barrier();
+        if(start+DEPTH<p.inner) fetch(row0,col0,start+DEPTH,matrix,lane);
+        [[unroll]] for(uint k=0;k<DEPTH;k++) {
+            vec4 inputs=tile_x[k*STRIDE+rows4];
+            vec4 weights=tile_w[k*STRIDE+cols4];
+            [[unroll]] for(uint r=0;r<4;r++) sums[r]+=inputs[r]*weights;
+        }
+    }
+    [[unroll]] for(uint r=0;r<4;r++) [[unroll]] for(uint c=0;c<4;c++) {
+        uint rr=row0+rows4*4+r, cc=col0+cols4*4+c;
+        if(rr<p.rows && cc<p.cols) {
+            uint index=(rr+p.offset)*p.cols+cc;
+            float value=sums[r][c]+(((p.flags&1u)!=0u)?b[cc]:0.0);
+            if(matrix==0) y[index]=value;
+            else if(matrix==1) y1[index]=value;
+            else y2[index]=value;
+        }
     }
 }

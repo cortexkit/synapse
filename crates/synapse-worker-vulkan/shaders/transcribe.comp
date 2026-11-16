@@ -18,16 +18,40 @@ float hc(uint i) { return uintBitsToFloat(c[i]); }
 float hz(uint i) { return uintBitsToFloat(z[i]); }
 float fz(uint i) { return uintBitsToFloat(z[i]); }
 float fv(uint i) { return uintBitsToFloat(v[i]); }
+// LayerNorm partial sums: 256 bytes, too small to limit occupancy of other ops.
+shared float partial[64];
+// Sums one value per thread in a fixed pairwise tree. Every thread of the
+// workgroup must call it; all of them receive the same total.
+float workgroup_sum(float value) {
+    uint lane=gl_LocalInvocationID.x;
+    partial[lane]=value;
+    barrier();
+    for(uint half_width=32;half_width>0;half_width>>=1) {
+        if(lane<half_width) partial[lane]+=partial[lane+half_width];
+        barrier();
+    }
+    float total=partial[0];
+    // A later call must not overwrite the total before every thread has read it.
+    barrier();
+    return total;
+}
 void main() {
     uint i=(gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x)*64+gl_LocalInvocationID.x;
-    if(p.op==101) { // LayerNorm, including its learned bias.
-        if(i>=p.rows) return;
-        float mean=0.0, variance=0.0;
-        for(uint k=0;k<p.cols;k++) mean+=x[i*p.cols+k];
-        mean/=float(p.cols);
-        for(uint k=0;k<p.cols;k++) { float a=x[i*p.cols+k]-mean; variance+=a*a; }
-        float inv=inversesqrt(variance/float(p.cols)+1e-5);
-        for(uint k=0;k<p.cols;k++) y[i*p.cols+k]=(x[i*p.cols+k]-mean)*inv*float(w[k])+hb(k);
+    if(p.op==101) { // LayerNorm with its learned bias; one 64-thread workgroup per row.
+        uint row=i/64, lane=i%64;
+        // The whole workgroup shares the row, so it returns together and the
+        // barriers in workgroup_sum stay in uniform control flow.
+        if(row>=p.rows) return;
+        uint base=row*p.cols;
+        // Each thread sums the columns congruent to its lane, then the tree adds
+        // the 64 partial sums. Mean and variance stay two-pass f32.
+        float sum=0.0;
+        for(uint k=lane;k<p.cols;k+=64) sum+=x[base+k];
+        float mean=workgroup_sum(sum)/float(p.cols);
+        float squares=0.0;
+        for(uint k=lane;k<p.cols;k+=64) { float a=x[base+k]-mean; squares+=a*a; }
+        float inv=inversesqrt(workgroup_sum(squares)/float(p.cols)+1e-5);
+        for(uint k=lane;k<p.cols;k+=64) y[base+k]=(x[base+k]-mean)*inv*float(w[k])+hb(k);
     } else if(p.op==102) {
         if(i<p.rows*p.cols) y[i]=x[i]/(1.0+exp(-x[i]));
     } else if(p.op==103) {

@@ -433,7 +433,7 @@
           "profile": "parakeet-tdt-0.6b-v3.owned-vulkan",
           "family": "parakeet-tdt", "dtype": "f32", "execution": "supervised",
           "max_duration_ms": 600000,
-          "fingerprint": "c8b71e823557097f58f53d127219f0ff3e919d4b703f3d948342e82341b9c018"
+          "fingerprint": "c92431c2eb3646d269eb08f4b3960107325b60f3fad2cb9c9185a362d5763e14"
         }
       ]
     }

@@ -1,5 +1,7 @@
 //! GPU encoder and encoder projection; the sequential joint stays in this worker.
-use super::{Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy};
+use super::{
+    Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy, SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE,
+};
 use crate::transcribe::{self, joint::HostJoint, TILE};
 use anyhow::{ensure, Result};
 use synapse_core::{DecodeTraceRecord, TranscriptRecord};
@@ -226,7 +228,7 @@ impl Engine {
                 rows: rows as u32,
                 cols: cols as u32,
                 inner: inner as u32,
-                flags: u32::from(bias),
+                flags: if bias { SPEECH_GEMM_BIAS } else { 0 },
                 ..Default::default()
             },
             [
@@ -239,6 +241,31 @@ impl Engine {
                 "dummy",
             ],
             rows * cols,
+        )
+    }
+    /// The query, key and value projections of `norm`, in one dispatch. Each
+    /// output is computed exactly as by three separate bias-free `linear` calls.
+    fn query_key_value(&self, attention: &str, rows: usize) -> Result<()> {
+        let weight = |name: &str| format!("weight:{attention}.{name}.weight");
+        self.run(
+            Params {
+                op: 100,
+                rows: rows as u32,
+                cols: 1024,
+                inner: 1024,
+                flags: SPEECH_GEMM_THREE,
+                ..Default::default()
+            },
+            [
+                "norm",
+                &weight("q_proj"),
+                "q",
+                &weight("k_proj"),
+                &weight("v_proj"),
+                "k",
+                "v",
+            ],
+            rows * 3 * 1024,
         )
     }
     fn norm(&self, input: &str, output: &str, name: &str, rows: usize) -> Result<()> {
@@ -390,7 +417,7 @@ impl Engine {
                     rows: n as u32,
                     cols: 1024,
                     inner: 4096,
-                    flags: 1,
+                    flags: SPEECH_GEMM_BIAS,
                     offset: start as u32,
                     ..Default::default()
                 },
@@ -423,17 +450,7 @@ impl Engine {
             self.ff(&layer, 1, rows)?;
             self.norm("hidden", "norm", &format!("{layer}.norm_self_att"), rows)?;
             let att = format!("{layer}.self_attn");
-            for (buffer, name) in [("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")] {
-                self.linear(
-                    "norm",
-                    buffer,
-                    &format!("{att}.{name}"),
-                    rows,
-                    1024,
-                    1024,
-                    false,
-                )?;
-            }
+            self.query_key_value(&att, rows)?;
             self.linear(
                 "pos",
                 "relative",
