@@ -1,6 +1,9 @@
-//! GPU encoder and encoder projection; the sequential joint stays in this worker.
+//! GPU encoder and encoder projection, then the greedy decode. The decode rule
+//! runs on the host; its predictor and joint run on the GPU when the device
+//! supports that decoder, and on the host otherwise.
 use super::{
-    Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy, SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE,
+    speech_decode::GpuJoint, Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy,
+    SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE,
 };
 use crate::transcribe::{self, joint::HostJoint, TILE};
 use anyhow::{ensure, Result};
@@ -8,6 +11,22 @@ use synapse_core::{DecodeTraceRecord, TranscriptRecord};
 use synapse_parity::{manifest::Profile, safetensors::Header};
 
 use crate::transcribe::Output;
+
+/// Where the predictor and joint run, chosen once at load.
+enum Decoder {
+    Gpu(GpuJoint),
+    /// The host decoder, used when the GPU decoder could not be prepared.
+    Host(HostJoint),
+}
+
+impl Decoder {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Gpu(_) => "gpu",
+            Self::Host(_) => "host",
+        }
+    }
+}
 
 #[cfg(test)]
 type LayerObserver = Box<dyn Fn(&str, &[f32]) -> Result<()>>;
@@ -23,7 +42,9 @@ pub struct Engine {
     batch: std::cell::RefCell<SpeechBatch>,
     maximum: usize,
     largest_storage_buffer: u64,
-    joint: HostJoint,
+    decoder: Decoder,
+    /// Valid encoder frames of the last request, whose projection is on the GPU.
+    decoded_frames: usize,
     #[cfg(test)]
     layer_capture: Option<LayerCapture>,
 }
@@ -50,6 +71,15 @@ impl Engine {
             let mut bytes = data[tensor.data_offsets.0..tensor.data_offsets.1].to_vec();
             arena.transfer(&format!("weight:{name}"), &mut bytes, true)?;
         }
+        // The host decoder needs its own f32 copy of the decoder weights, so
+        // it is only loaded when the GPU decoder is unavailable.
+        let (decoder, host_reason) = match GpuJoint::new(&arena) {
+            Ok(joint) => (Decoder::Gpu(joint), None),
+            Err(error) => (
+                Decoder::Host(HostJoint::load(header, data)),
+                Some(format!("{error:#}")),
+            ),
+        };
         eprintln!(
             "{}",
             serde_json::json!({"vulkan_transcribe_load_report": {
@@ -59,6 +89,8 @@ impl Engine {
                 "min_storage_buffer_range": required.min_storage_buffer_range,
                 "allocations": 1
                 ,"weight_precision":"f32"
+                ,"decoder": decoder.label()
+                ,"host_decoder_reason": host_reason
             }})
         );
         let batch =
@@ -68,10 +100,16 @@ impl Engine {
             batch,
             maximum,
             largest_storage_buffer,
-            joint: HostJoint::load(header, data),
+            decoder,
+            decoded_frames: 0,
             #[cfg(test)]
             layer_capture: None,
         })
+    }
+
+    /// "gpu" or "host": where this engine runs the predictor and joint.
+    pub fn decoder(&self) -> &'static str {
+        self.decoder.label()
     }
 
     pub fn device_bytes(&self) -> u64 {
@@ -131,8 +169,8 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_projection(&self) -> &[f32] {
-        &self.joint.projected
+    pub(crate) fn debug_projection(&self) -> Result<Vec<f32>> {
+        self.download("projected", self.decoded_frames * 640)
     }
 
     #[cfg(test)]
@@ -184,10 +222,26 @@ impl Engine {
         projected: Vec<f32>,
         frames: usize,
     ) -> Result<synapse_speech::DecodeOutput> {
-        let saved = std::mem::replace(&mut self.joint.projected, projected);
-        let result = synapse_speech::greedy(&mut self.joint, frames, true, |_| {});
-        self.joint.projected = saved;
-        Ok(result?)
+        match &mut self.decoder {
+            Decoder::Host(joint) => {
+                let saved = std::mem::replace(&mut joint.projected, projected);
+                let result = synapse_speech::greedy(joint, frames, true, |_| {});
+                joint.projected = saved;
+                Ok(result?)
+            }
+            Decoder::Gpu(joint) => {
+                // Replace the device projection for the replay, then restore it.
+                let saved = read_f32(&self.arena, "projected", self.decoded_frames * 640)?;
+                let mut bytes = synapse_core::encode_f32_frame(&projected);
+                self.arena.transfer("projected", &mut bytes, true)?;
+                joint.frames = frames;
+                let result = synapse_speech::greedy(joint, frames, true, |_| {});
+                let mut bytes = synapse_core::encode_f32_frame(&saved);
+                self.arena.transfer("projected", &mut bytes, true)?;
+                joint.frames = self.decoded_frames;
+                Ok(result?)
+            }
+        }
     }
 
     fn run(&self, p: Params, buffers: [&str; 7], count: usize) -> Result<()> {
@@ -591,9 +645,7 @@ impl Engine {
     }
 
     fn download(&self, name: &str, count: usize) -> Result<Vec<f32>> {
-        let mut bytes = vec![0; count * 4];
-        self.arena.transfer(name, &mut bytes, false)?;
-        Ok(synapse_core::decode_f32_frame(&bytes)?)
+        read_f32(&self.arena, name, count)
     }
 
     pub fn transcribe(
@@ -622,14 +674,28 @@ impl Engine {
         } else {
             Vec::new()
         };
-        self.joint.projected = self.download("projected", valid_encoder_frames * 640)?;
+        self.decoded_frames = valid_encoder_frames;
+        if let Decoder::Host(joint) = &mut self.decoder {
+            joint.projected = read_f32(&self.arena, "projected", valid_encoder_frames * 640)?;
+        }
         let mut progress_error = None;
-        let decoded =
-            synapse_speech::greedy(&mut self.joint, valid_encoder_frames, observe, |_| {
-                if progress_error.is_none() {
-                    progress_error = progress().err();
-                }
-            })?;
+        let mut report = |_: usize| {
+            if progress_error.is_none() {
+                progress_error = progress().err();
+            }
+        };
+        let decoded = match &mut self.decoder {
+            Decoder::Host(joint) => {
+                synapse_speech::greedy(joint, valid_encoder_frames, observe, &mut report)?
+            }
+            Decoder::Gpu(joint) => {
+                joint.frames = valid_encoder_frames;
+                // A failed submission surfaces as its own Vulkan error rather
+                // than as the decode rule's generic joint error.
+                synapse_speech::greedy(joint, valid_encoder_frames, observe, &mut report)
+                    .map_err(|error| joint.take_device_error().unwrap_or_else(|| error.into()))?
+            }
+        };
         if let Some(error) = progress_error {
             return Err(error);
         }
@@ -665,4 +731,10 @@ impl Engine {
                 .collect(),
         })
     }
+}
+
+fn read_f32(arena: &Arena, name: &str, count: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0; count * 4];
+    arena.transfer(name, &mut bytes, false)?;
+    Ok(synapse_core::decode_f32_frame(&bytes)?)
 }

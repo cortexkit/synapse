@@ -3,12 +3,13 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 // Attention has its own pipeline because its shared-memory tiles would
 // otherwise be reserved by every other kernel and lower their occupancy.
-const SHADERS: [(&str, &str); 5] = [
+const SHADERS: [(&str, &str); 6] = [
     ("plain", "vulkan1.2"),
     ("cooperative", "vulkan1.3"),
     ("attention", "vulkan1.2"),
     ("transcribe", "vulkan1.2"),
     ("transcribe_gemm", "vulkan1.2"),
+    ("transcribe_decode", "vulkan1.2"),
 ];
 
 fn verify_spirv(bytes: &[u8]) {

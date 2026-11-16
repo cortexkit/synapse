@@ -1,0 +1,197 @@
+#version 450
+// One Parakeet TDT decode step: the two-layer LSTM predictor, its projection,
+// the joint head and the head's two best tokens. The host keeps the greedy
+// decode rule; this shader only replaces its matrix work.
+//
+// Every 640-wide dot product is summed in the order of the x86-64 AVX host
+// kernel (transcribe_gemv.rs): sixteen partial sums, partial j holding the
+// columns congruent to j modulo 16 in increasing order, then the pairs j and
+// j+8 added and the eight pair sums added in order; rows past the matrix's
+// last multiple of four are summed in plain column order, as the host does.
+// `precise` keeps every product and sum separately rounded, as on the host,
+// instead of letting the compiler fuse them into multiply-adds.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { float x[]; };
+layout(set=0,binding=1,std430) readonly buffer Matrix { float w[]; };
+layout(set=0,binding=2,std430) buffer State { float s[]; };
+layout(set=0,binding=3,std430) readonly buffer RecurrentMatrix { float u[]; };
+layout(set=0,binding=4,std430) readonly buffer Bias { float bias[]; };
+layout(set=0,binding=5,std430) readonly buffer RecurrentBias { float recurrent_bias[]; };
+layout(set=0,binding=6,std430) buffer Result { uint r[]; };
+layout(push_constant) uniform Params {
+    uint op;             // 120 LSTM layer, 121 predictor projection, 122 joint head, 123 top two
+    uint rows;           // matrix rows, or the number of token logits for the top two
+    uint input_offset;   // first element of the input vector
+    uint input_in_state; // 1: the input vector is in the state buffer, 0: in the input buffer
+    uint recurrent;      // LSTM: the layer's previous hidden state in the state buffer
+    uint hidden;         // LSTM: where the layer's new hidden state is written
+    uint cell;           // LSTM: the layer's cell state, updated in place
+    uint predictor;      // joint head: the predictor output in the state buffer
+    uint output_offset;  // projection and head: output; top two: the token logits
+} p;
+
+const uint WIDTH=640;
+const uint LANES=16;
+
+shared float partial[128];
+shared float gates[4];
+shared float first_value[64];
+shared float second_value[64];
+shared uint first_index[64];
+shared uint second_index[64];
+shared uint nonfinite[64];
+
+float input_at(uint k) {
+    if(p.op==122) { // The joint input is relu(encoder projection + predictor output).
+        precise float sum=x[p.input_offset+k]+s[p.predictor+k];
+        return max(sum,0.0);
+    }
+    return p.input_in_state!=0 ? s[p.input_offset+k] : x[p.input_offset+k];
+}
+
+// This thread's partial sum of row `row` of the matrix at binding 1.
+float matrix_lane(uint row, uint lane) {
+    precise float sum=0.0;
+    for(uint k=lane;k<WIDTH;k+=LANES) {
+        precise float product=w[row*WIDTH+k]*input_at(k);
+        sum=sum+product;
+    }
+    return sum;
+}
+
+// This thread's partial sum of row `row` of the recurrent matrix times the
+// previous hidden state.
+float recurrent_lane(uint row, uint lane) {
+    precise float sum=0.0;
+    for(uint k=lane;k<WIDTH;k+=LANES) {
+        precise float product=u[row*WIDTH+k]*s[p.recurrent+k];
+        sum=sum+product;
+    }
+    return sum;
+}
+
+// Adds the sixteen partial sums starting at `base` like the AVX host kernel.
+float combine(uint base) {
+    precise float total=partial[base]+partial[base+8];
+    for(uint j=1;j<8;j++) {
+        precise float pair=partial[base+j]+partial[base+8+j];
+        total=total+pair;
+    }
+    return total;
+}
+
+float sigmoid(float v) {
+    precise float denominator=1.0+exp(-v);
+    return 1.0/denominator;
+}
+
+// Vulkan leaves the precision of the tanh builtin to the implementation, and
+// fast approximations are allowed, so tanh uses the single-precision Cephes
+// formulation: an odd polynomial near zero, otherwise 1 - 2/(exp(2|v|) + 1).
+float tanh_f32(float v) {
+    float magnitude=abs(v);
+    if(magnitude<0.625) {
+        precise float z=v*v;
+        precise float polynomial=((((-5.70498872745e-3*z+2.06390887954e-2)*z
+            -5.37397155531e-2)*z+1.33314422036e-1)*z-3.33332819422e-1);
+        precise float result=polynomial*z*v+v;
+        return result;
+    }
+    // tanh rounds to exactly 1 well before 20; the bound keeps exp finite.
+    precise float e=exp(2.0*min(magnitude,20.0));
+    precise float result=1.0-2.0/(e+1.0);
+    return v<0.0 ? -result : result;
+}
+
+bool is_finite(float v) {
+    return (floatBitsToUint(v)&0x7f800000u)!=0x7f800000u;
+}
+
+// The host's order: a higher value wins, and on equal values the lower index.
+bool better(float a, uint ia, float b, uint ib) {
+    return a>b || (a==b && ia<ib);
+}
+
+void main() {
+    uint lane=gl_LocalInvocationID.x;
+    uint group=gl_WorkGroupID.x;
+    if(p.op==120) { // One LSTM layer for hidden unit `group`: four gate rows of 16 threads.
+        uint gate=lane/LANES, j=lane%LANES, row=gate*WIDTH+group;
+        partial[lane]=matrix_lane(row,j);
+        partial[64+lane]=recurrent_lane(row,j);
+        barrier();
+        if(lane<4) {
+            uint gate_row=lane*WIDTH+group;
+            precise float from_input=combine(lane*LANES)+bias[gate_row];
+            precise float from_state=combine(64+lane*LANES)+recurrent_bias[gate_row];
+            gates[lane]=from_input+from_state;
+        }
+        barrier();
+        if(lane==0) { // PyTorch gate order: input, forget, cell candidate, output.
+            precise float kept=sigmoid(gates[1])*s[p.cell+group];
+            precise float added=sigmoid(gates[0])*tanh_f32(gates[2]);
+            precise float cell=kept+added;
+            s[p.cell+group]=cell;
+            s[p.hidden+group]=sigmoid(gates[3])*tanh_f32(cell);
+        }
+    } else if(p.op==121 || p.op==122) { // Matrix rows plus bias; four rows per workgroup.
+        uint row=group*4+lane/LANES;
+        // Rows past the end compute a valid row and discard it, so that every
+        // thread reaches the barrier.
+        partial[lane]=matrix_lane(min(row,p.rows-1),lane%LANES);
+        barrier();
+        if(lane%LANES==0 && row<p.rows) {
+            precise float sum=0.0;
+            if(row<p.rows/4*4) {
+                sum=combine(lane);
+            } else {
+                // The host kernel works in blocks of four rows and sums the
+                // remaining rows (the head's last two) in plain column order.
+                for(uint k=0;k<WIDTH;k++) {
+                    precise float product=w[row*WIDTH+k]*input_at(k);
+                    sum=sum+product;
+                }
+            }
+            precise float value=sum+bias[row];
+            s[p.output_offset+row]=value;
+        }
+    } else if(p.op==123) { // The two best token logits, in one workgroup.
+        float v1=uintBitsToFloat(0xff7fffffu), v2=v1; // The most negative finite float.
+        uint i1=0xffffffffu, i2=0xffffffffu, bad=0;
+        for(uint i=lane;i<p.rows;i+=64) {
+            float v=s[p.output_offset+i];
+            if(!is_finite(v)) bad=1;
+            if(better(v,i,v1,i1)) { v2=v1; i2=i1; v1=v; i1=i; }
+            else if(better(v,i,v2,i2)) { v2=v; i2=i; }
+        }
+        first_value[lane]=v1; first_index[lane]=i1;
+        second_value[lane]=v2; second_index[lane]=i2;
+        nonfinite[lane]=bad;
+        barrier();
+        for(uint half_width=32;half_width>0;half_width>>=1) {
+            if(lane<half_width) {
+                uint o=lane+half_width;
+                float a1=first_value[lane], a2=second_value[lane];
+                float b1=first_value[o], b2=second_value[o];
+                uint ia1=first_index[lane], ia2=second_index[lane];
+                uint ib1=first_index[o], ib2=second_index[o];
+                if(better(a1,ia1,b1,ib1)) {
+                    if(!better(a2,ia2,b1,ib1)) { second_value[lane]=b1; second_index[lane]=ib1; }
+                } else {
+                    first_value[lane]=b1; first_index[lane]=ib1;
+                    if(better(a1,ia1,b2,ib2)) { second_value[lane]=a1; second_index[lane]=ia1; }
+                    else { second_value[lane]=b2; second_index[lane]=ib2; }
+                }
+                nonfinite[lane]|=nonfinite[o];
+            }
+            barrier();
+        }
+        if(lane==0) {
+            r[0]=first_index[0];
+            r[1]=second_index[0];
+            r[2]=floatBitsToUint(first_value[0]);
+            r[3]=floatBitsToUint(second_value[0]);
+            r[4]=nonfinite[0];
+        }
+    }
+}

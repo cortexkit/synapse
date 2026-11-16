@@ -353,7 +353,7 @@ fn diagnose_trace_failure(
     let LoadedEngine::Speech(engine) = &loaded.engine else {
         panic!("wrong engine");
     };
-    let projected = engine.debug_projection().to_vec();
+    let projected = engine.debug_projection()?;
     std::fs::write(
         evidence.join(format!("{}-encoder.f32le", fixture.id)),
         synapse_core::encode_f32_frame(encoder),
@@ -551,7 +551,10 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let bytes = std::fs::metadata(env_path("SYNAPSE_VULKAN_SPEECH_PACKAGE"))
         .unwrap()
         .len();
-    let precision_report = json!({"weight_precision":"f32","profile":profile_id,
+    let LoadedEngine::Speech(engine) = &loaded.engine else {
+        panic!("wrong engine");
+    };
+    let precision_report = json!({"weight_precision":"f32","profile":profile_id,"decoder":engine.decoder(),
             "package_bytes":bytes,"package_sha256":loaded.model_ref,"load_s":started.elapsed().as_secs_f64(),"production_load_binding_checked":true});
     assert!(started.elapsed().as_secs() < 600);
     let revision = loaded_response("load".into(), &loaded);

@@ -141,7 +141,7 @@ pub fn prepare(required: Required) -> Result<Prepared> {
 #[cfg(all(target_os = "macos", feature = "moltenvk-diagnostic"))]
 pub fn prepare_moltenvk_parity(loader: &std::path::Path, required: Required) -> Result<Prepared> {
     let instance = instance_from_loader(loader.as_os_str(), true)?;
-    let device = Device::with_instance(required, instance, true)?;
+    let device = Device::with_instance(required, instance, AdapterChoice::AppleDiagnostic)?;
     eprintln!(
         "MoltenVK plain-path adapter: {}",
         serde_json::to_string(&device.adapter)?
@@ -160,8 +160,64 @@ pub fn prepare_moltenvk_parity(loader: &std::path::Path, required: Required) -> 
 #[cfg(not(feature = "moltenvk-diagnostic"))]
 pub struct DiagnosticApiAbsent;
 
+#[path = "transcribe_decode.rs"]
+mod speech_decode;
 #[path = "transcribe_runtime.rs"]
 pub mod transcribe;
+
+/// Which physical device `Device::with_instance` opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterChoice {
+    /// The adapter chosen by the production vendor, feature and memory policy.
+    Admitted,
+    /// The Apple adapter of the explicit MoltenVK diagnostic build.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "moltenvk-diagnostic")),
+        allow(dead_code)
+    )]
+    AppleDiagnostic,
+    /// The first CPU (software) adapter, such as lavapipe, so that unit tests
+    /// can run shaders on machines without a GPU. Never used outside tests.
+    #[cfg(test)]
+    Software,
+}
+
+/// Creates a compute pipeline from one of the embedded SPIR-V shaders.
+fn compute_pipeline(
+    raw: &ash::Device,
+    pipeline_layout: vk::PipelineLayout,
+    name: &str,
+) -> Result<vk::Pipeline> {
+    let bytes = SHADERS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .context("missing embedded shader")?
+        .1;
+    let code = ash::util::read_spv(&mut Cursor::new(bytes))?;
+    let module = unsafe {
+        raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+    }?;
+    let entry = c"main";
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(entry);
+    let info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(pipeline_layout);
+    let result = unsafe { raw.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+    unsafe {
+        raw.destroy_shader_module(module, None);
+    }
+    result.map(|p| p[0]).map_err(|(pipelines, e)| {
+        for pipeline in pipelines {
+            unsafe {
+                raw.destroy_pipeline(pipeline, None);
+            }
+        }
+        anyhow!("create compute pipeline: {e}")
+    })
+}
 
 struct Device {
     instance: Instance,
@@ -203,14 +259,28 @@ impl Drop for Device {
 
 impl Device {
     fn new(required: Required) -> Result<Arc<Self>> {
-        Self::with_instance(required, instance()?, false)
+        Self::with_instance(required, instance()?, AdapterChoice::Admitted)
+    }
+
+    /// A device on the first software adapter, bypassing admission.
+    #[cfg(test)]
+    fn software_for_tests() -> Result<Arc<Self>> {
+        Self::with_instance(
+            Required {
+                min_storage_buffer_range: 0,
+                min_device_local_bytes: 0,
+            },
+            instance()?,
+            AdapterChoice::Software,
+        )
     }
 
     fn with_instance(
         required: Required,
         instance: Instance,
-        diagnostic: bool,
+        choice: AdapterChoice,
     ) -> Result<Arc<Self>> {
+        let diagnostic = choice == AdapterChoice::AppleDiagnostic;
         let physicals =
             unsafe { instance.raw.enumerate_physical_devices() }.context("vulkan_no_device")?;
         let adapters: Vec<Adapter> = physicals
@@ -233,13 +303,19 @@ impl Device {
         } else {
             adapters
         };
-        let adapter = if diagnostic {
-            adapters
+        let adapter = match choice {
+            AdapterChoice::AppleDiagnostic => adapters
                 .into_iter()
                 .next()
-                .context("no Apple diagnostic adapter")?
-        } else {
-            crate::admission::select(adapters, required).map_err(|code| anyhow!(code))?
+                .context("no Apple diagnostic adapter")?,
+            #[cfg(test)]
+            AdapterChoice::Software => adapters
+                .into_iter()
+                .find(|a| a.cpu)
+                .context("no software Vulkan adapter")?,
+            AdapterChoice::Admitted => {
+                crate::admission::select(adapters, required).map_err(|code| anyhow!(code))?
+            }
         };
         let physical = physicals[adapter.index];
         let queues = unsafe {
@@ -394,38 +470,7 @@ impl Device {
             )
         }?;
         device.pipeline_layout = pipeline_layout;
-        let make_pipeline = |name: &str| -> Result<vk::Pipeline> {
-            let bytes = SHADERS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .context("missing embedded shader")?
-                .1;
-            let code = ash::util::read_spv(&mut Cursor::new(bytes))?;
-            let module = unsafe {
-                raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-            }?;
-            let entry = c"main";
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(module)
-                .name(entry);
-            let info = vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(pipeline_layout);
-            let result =
-                unsafe { raw.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
-            unsafe {
-                raw.destroy_shader_module(module, None);
-            }
-            result.map(|p| p[0]).map_err(|(pipelines, e)| {
-                for pipeline in pipelines {
-                    unsafe {
-                        raw.destroy_pipeline(pipeline, None);
-                    }
-                }
-                anyhow!("create compute pipeline: {e}")
-            })
-        };
+        let make_pipeline = |name: &str| compute_pipeline(raw, pipeline_layout, name);
         device.plain = make_pipeline("plain")?;
         device.attention = make_pipeline("attention")?;
         device.speech = make_pipeline("transcribe")?;

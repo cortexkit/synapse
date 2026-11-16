@@ -293,6 +293,34 @@ pub(crate) mod joint {
             }
             self.predictor = self.linear(&input, "decoder.decoder_projector");
         }
+
+        /// A host decoder over the given decoder and joint tensors.
+        #[cfg(test)]
+        pub(crate) fn from_weights(
+            weights: BTreeMap<String, Vec<f32>>,
+            projected: Vec<f32>,
+        ) -> Self {
+            Self {
+                weights,
+                gemv: Gemv::detect(),
+                projected,
+                h: [vec![0.; 640], vec![0.; 640]],
+                cell: [vec![0.; 640], vec![0.; 640]],
+                predictor: vec![0.; 640],
+                logits: vec![0.; 8198],
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn predictor(&self) -> &[f32] {
+            &self.predictor
+        }
+
+        /// The whole head output of the last evaluation.
+        #[cfg(test)]
+        pub(crate) fn head(&self) -> &[f32] {
+            &self.logits
+        }
     }
     impl Joint for HostJoint {
         fn reset(&mut self) -> synapse_speech::Result<()> {
@@ -489,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
-            "owned-vulkan-transcribe-v4-f32"
+            "owned-vulkan-transcribe-v5-f32"
         );
     }
 
@@ -585,7 +613,7 @@ mod tests {
         } else {
             "bin/glslc"
         });
-        for name in ["transcribe", "transcribe_gemm"] {
+        for name in ["transcribe", "transcribe_gemm", "transcribe_decode"] {
             let source = if name == "transcribe" {
                 source.clone()
             } else {
@@ -624,7 +652,7 @@ mod tests {
     #[cfg(feature = "vulkan")]
     #[test]
     fn transcribe_shader_has_no_half_precision_float_type() {
-        for name in ["transcribe", "transcribe_gemm"] {
+        for name in ["transcribe", "transcribe_gemm", "transcribe_decode"] {
             let bytes = crate::SHADERS
                 .iter()
                 .find(|(shader, _)| *shader == name)
