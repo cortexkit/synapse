@@ -224,6 +224,8 @@ impl Model {
         observe: bool,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<parakeet::Output> {
+        #[cfg(test)]
+        let model_started = parakeet::HostTiming::enabled().then(std::time::Instant::now);
         ensure!(
             self.profile.operation() == "transcribe",
             "operation_mismatch"
@@ -247,6 +249,10 @@ impl Model {
                 .projection
                 .as_ref()
                 .context("missing_projection_surface")?;
+            #[cfg(test)]
+            let encoder_started = model_started.map(|_| std::time::Instant::now());
+            #[cfg(test)]
+            let prefix = model_started.map(|s| s.elapsed()).unwrap_or_default();
             for (layer, executable) in resident.executables.iter().enumerate() {
                 let (src, dst) = if layer % 2 == 0 {
                     (&resident.a, &resident.b)
@@ -265,6 +271,8 @@ impl Model {
                 }
                 progress()?;
             }
+            #[cfg(test)]
+            let encoder_elapsed = encoder_started.map(|s| s.elapsed()).unwrap_or_default();
             let timed = parakeet::HostTiming::enabled();
             let readback_started = timed.then(std::time::Instant::now);
             let projection = transcribe_rows(projected, shape, parakeet::DECODER, frames);
@@ -274,7 +282,11 @@ impl Model {
                 vec![]
             };
             let readback = readback_started.map(|s| s.elapsed()).unwrap_or_default();
+            #[cfg(test)]
+            let setup_started = model_started.map(|_| std::time::Instant::now());
             let mut joint = parakeet::TdtJoint::new(self, &projection, frames);
+            #[cfg(test)]
+            let remaining = prefix + setup_started.map(|s| s.elapsed()).unwrap_or_default();
             let decode_started = timed.then(std::time::Instant::now);
             let mut progress_failure = None;
             let decoded = synapse_speech::greedy(&mut joint, frames, observe, |_| {
@@ -285,6 +297,22 @@ impl Model {
             if let Some(error) = progress_failure {
                 return Err(error);
             }
+            #[cfg(test)]
+            let stage_timing = decode_started.map(|started| {
+                let mut record = joint.timing.report(frames, readback, started.elapsed());
+                record["encoder_ms"] = serde_json::json!(encoder_elapsed.as_secs_f64() * 1000.0);
+                record["remaining_model_ms"] = serde_json::json!(remaining.as_secs_f64() * 1000.0);
+                record["predictor_calls"] = serde_json::json!(joint.timing.predictor_calls());
+                record
+            });
+            #[cfg(test)]
+            if let Some(record) = stage_timing
+                .as_ref()
+                .filter(|_| std::env::var_os("ANE_PARAKEET_STAGE_RUN_ID").is_none())
+            {
+                eprintln!("{record}");
+            }
+            #[cfg(not(test))]
             if let Some(started) = decode_started {
                 eprintln!(
                     "{}",
@@ -295,6 +323,8 @@ impl Model {
                 frames,
                 encoder,
                 decoded,
+                #[cfg(test)]
+                stage_timing,
             })
         })
     }

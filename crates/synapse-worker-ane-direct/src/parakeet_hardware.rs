@@ -14,6 +14,8 @@ mod component_probe;
 mod reporting;
 #[path = "parakeet_self_check.rs"]
 mod self_check;
+#[path = "parakeet_stage_kit.rs"]
+mod stage_kit;
 
 const PROFILE: &str = "parakeet-tdt-0.6b-v3.ane-direct-worker";
 
@@ -195,6 +197,11 @@ fn certify(summary: &mut Value) -> Result<()> {
     );
     let smoke = std::env::var("ANE_PARAKEET_SMOKE").as_deref() == Ok("1");
     let timing = std::env::var("ANE_PARAKEET_TIMING").as_deref() == Ok("1");
+    let mut stage_kit = stage_kit::Kit::open()?;
+    ensure!(
+        stage_kit.is_none() || (!smoke && !timing),
+        "stage kit requires full mode"
+    );
     summary["mode"] = json!(if timing {
         "timing-not-certification"
     } else if smoke {
@@ -280,6 +287,22 @@ fn certify(summary: &mut Value) -> Result<()> {
             }
         }
         selected = ladder.into_values().chain(corpus.into_values()).collect();
+    }
+    if let Some(kit) = &stage_kit {
+        selected.retain(|(f, c)| f.split.is_some() && c["log_mel"].is_null());
+        ensure!(
+            selected.len() == 1200,
+            "stage kit requires exactly 1200 sealed WAV cases"
+        );
+        ensure!(
+            selected.iter().all(|(f, _)| f.duration_ms <= maximum),
+            "stage envelope omits corpus clips"
+        );
+        summary["stage_run_id"] = json!(kit.run_id);
+        summary["mode"] = json!("matched-stage-corpus-not-certification");
+        summary["coverage"]["status"] = json!("corpus-only");
+        summary["stage_boundary"] =
+            json!("model inference; frontend, IPC/queue and formatting unmeasured");
     }
     for (fixture, _) in &selected {
         if fixture.duration_ms <= maximum {
@@ -427,6 +450,19 @@ fn certify(summary: &mut Value) -> Result<()> {
             let mut quiet_max_gap = 0.0f64;
             row["engine_started"] = json!(true);
             row["phase"] = json!("quiet-inference");
+            if let Some(kit) = &mut stage_kit {
+                // Warm the admitted shape and its buffers without adding a corpus observation.
+                let started = Instant::now();
+                let warmup =
+                    model.transcribe_progress(&mel, frames, valid, true, &mut || Ok(()))?;
+                kit.warmup(
+                    &fixture.id,
+                    shape,
+                    valid_encoder,
+                    started.elapsed().as_secs_f64(),
+                    &warmup,
+                )?;
+            }
             // Repeating the quiet mode distinguishes buffer reuse or nondeterminism
             // from an observation-only change. Readbacks copy completed work only.
             if !case["log_mel"].is_null() {
@@ -463,6 +499,9 @@ fn certify(summary: &mut Value) -> Result<()> {
             let observed = model
                 .transcribe_progress(&mel, frames, valid, true, &mut || progress.completed())?;
             let elapsed = started.elapsed().as_secs_f64();
+            if let Some(kit) = &mut stage_kit {
+                kit.record(&fixture.id, shape, valid_encoder, elapsed, &observed)?;
+            }
             row["phase"] = json!("grading");
             if let Err(error) = progress.finish(120.0) {
                 gate_failures.push(error.to_string());
@@ -737,7 +776,7 @@ fn certify(summary: &mut Value) -> Result<()> {
             failures
                 .push("full certification requires every corpus case in all ten WER splits".into());
         }
-        if largest_ladder != maximum {
+        if stage_kit.is_none() && largest_ladder != maximum {
             failures.push("requested maximum ladder did not pass every gate".into());
         }
     }
@@ -750,7 +789,12 @@ fn certify(summary: &mut Value) -> Result<()> {
             || !row["numerical_findings"]["trace"].is_null())
         .count());
     summary["gate_failures"] = json!(failures);
-    if !smoke && !timing && failures.is_empty() && maximum == speech_profile.max_duration_ms {
+    if !smoke
+        && !timing
+        && stage_kit.is_none()
+        && failures.is_empty()
+        && maximum == speech_profile.max_duration_ms
+    {
         summary["certified_max_duration_ms"] = json!(maximum);
     }
     summary["active_fixture"] = Value::Null;
@@ -943,6 +987,7 @@ fn encoder_distribution_reports_every_frame_without_hiding_gate_failures() {
 #[test]
 fn comparison_reports_truncation_frames_and_tensor_differences() {
     let output = |frames, triples| Output {
+        stage_timing: None,
         frames,
         encoder: vec![],
         decoded: synapse_speech::DecodeOutput {

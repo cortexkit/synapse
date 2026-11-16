@@ -107,6 +107,7 @@ fn host_timing_does_not_change_decoded_bytes() {
     );
     assert!(joint.timing.predictor > Default::default());
     assert!(joint.timing.joint > Default::default());
+    assert_eq!(joint.timing.predictor_calls(), 3);
 }
 
 #[test]

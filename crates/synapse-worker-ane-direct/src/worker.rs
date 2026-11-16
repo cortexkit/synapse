@@ -665,6 +665,7 @@ mod transcribe_tests {
 
     fn output() -> crate::parakeet::Output {
         crate::parakeet::Output {
+            stage_timing: None,
             frames: 1,
             encoder: vec![0.25; 1024],
             decoded: synapse_speech::DecodeOutput {

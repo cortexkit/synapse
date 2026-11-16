@@ -1,0 +1,15 @@
+{
+  "Sources/FluidAudio/ASR/Parakeet/SlidingWindow/TDT/AsrManager+Pipeline.swift": [
+    ["            let encoderOutputProvider: MLFeatureProvider", "#if STAGE_KIT\n            let stageModelStart = StageKit.current == nil ? nil : ProcessInfo.processInfo.systemUptime\n#endif\n            let encoderOutputProvider: MLFeatureProvider"],
+    ["                encoderOutputProvider = try await encoderModel.compatPrediction(\n                    from: encoderInput,\n                    options: predictionOptions\n                )", "#if STAGE_KIT\n                let stageEncoderStart = StageKit.start()\n#endif\n                encoderOutputProvider = try await encoderModel.compatPrediction(\n                    from: encoderInput,\n                    options: predictionOptions\n                )\n#if STAGE_KIT\n                StageKit.finish(\"encoder\", stageEncoderStart, model: encoderModel)\n#endif"],
+    ["            if let preprocessorAudioArray {\n                await sharedMLArrayCache.returnArray(preprocessorAudioArray)\n            }\n            return (hypothesis, encoderSequenceLength)", "#if STAGE_KIT\n            StageKit.segment(stageModelStart, valid: encoderSequenceLength, padded: rawEncoderOutput)\n#endif\n            if let preprocessorAudioArray {\n                await sharedMLArrayCache.returnArray(preprocessorAudioArray)\n            }\n            return (hypothesis, encoderSequenceLength)"]
+  ],
+  "Sources/FluidAudio/ASR/Parakeet/SlidingWindow/TDT/Decoder/TdtModelInference.swift": [
+    ["        let output = try model.prediction(\n            from: input,\n            options: predictionOptions\n        )", "#if STAGE_KIT\n        let stagePredictorStart = StageKit.start()\n#endif\n        let output = try model.prediction(\n            from: input,\n            options: predictionOptions\n        )\n#if STAGE_KIT\n        StageKit.finish(\"predictor\", stagePredictorStart, model: model)\n#endif"],
+    ["        let output = try model.prediction(\n            from: inputProvider,\n            options: predictionOptions\n        )", "#if STAGE_KIT\n        let stageJointStart = StageKit.start()\n#endif\n        let output = try model.prediction(\n            from: inputProvider,\n            options: predictionOptions\n        )\n#if STAGE_KIT\n        StageKit.finish(\"joint\", stageJointStart, model: model)\n#endif"]
+  ],
+  "Sources/FluidAudio/ASR/Parakeet/SlidingWindow/TDT/Decoder/TdtDecoderV3.swift": [
+    ["                    hypothesis.ySequence.append(label)", "                    hypothesis.ySequence.append(label)\n#if STAGE_KIT\n                    StageKit.token()\n#endif"],
+    ["                        hypothesis.ySequence.append(token)", "                        hypothesis.ySequence.append(token)\n#if STAGE_KIT\n                        StageKit.token()\n#endif"]
+  ]
+}

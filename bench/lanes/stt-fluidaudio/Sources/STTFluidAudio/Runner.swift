@@ -43,6 +43,11 @@ struct Runner {
         }
         let request = try JSONDecoder().decode(Request.self, from: Data(contentsOf: URL(fileURLWithPath: argument("--request"))))
         let start = ProcessInfo.processInfo.systemUptime
+#if STAGE_KIT
+        let stageMode = CommandLine.arguments.contains("--stage-run-id")
+        let lane = stageMode ? try StageRunner.lockLane() : nil
+        defer { if let lane { close(lane) } }
+#endif
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuAndNeuralEngine
         let models = try AsrModels.loadLocal(
@@ -51,6 +56,13 @@ struct Runner {
             encoderComputeUnits: .cpuAndNeuralEngine)
         let manager = AsrManager()
         try await manager.loadModels(models)
+#if STAGE_KIT
+        if stageMode {
+            try await StageRunner.run(request, manager: manager, models: models, backend: backend,
+                                      cold: ProcessInfo.processInfo.systemUptime - start)
+            return
+        }
+#endif
         if let first = request.utterances.first { _ = try await transcribe(first, manager: manager) }
         let cold = ProcessInfo.processInfo.systemUptime - start
         let warm = ProcessInfo.processInfo.systemUptime

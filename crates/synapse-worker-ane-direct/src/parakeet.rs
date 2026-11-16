@@ -27,6 +27,8 @@ pub struct Output {
     pub frames: usize,
     pub encoder: Vec<f32>,
     pub decoded: synapse_speech::DecodeOutput,
+    #[cfg(test)]
+    pub stage_timing: Option<serde_json::Value>,
 }
 
 pub fn max_encoder_frames(profile: &Profile) -> Result<usize> {
@@ -753,6 +755,12 @@ impl HostTiming {
             "greedy_bookkeeping_ms": ms(decode.saturating_sub(self.predictor + self.joint)),
             "decode_steps": self.steps, "accepted_tokens": self.accepted,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn predictor_calls(&self) -> usize {
+        // Greedy primes the predictor once, then advances it per accepted token.
+        self.accepted + 1
     }
 }
 
