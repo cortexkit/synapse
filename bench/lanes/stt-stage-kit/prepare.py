@@ -43,7 +43,9 @@ def main():
     if len(manifest) != 1200 or len(by_id) != 1200:
         raise ValueError("expected 1200 unique verified manifest rows")
     reference_path = ROOT / "bench/parity/fixtures/parakeet-tdt-0.6b-v3/reference.json"
-    cases = [c for c in json.loads(reference_path.read_text())["cases"] if c.get("split") and c.get("log_mel") is None]
+    # All 1200 corpus clips have sealed WAVs; 32 also seal a mel tensor, which the
+    # stage kit ignores so both engines start from the same audio bytes.
+    cases = [c for c in json.loads(reference_path.read_text())["cases"] if c.get("split")]
     if {c["id"] for c in cases} != set(by_id):
         raise ValueError("manifest does not match the sealed WAV fixture population")
     # This stable sort is the signed hardware harness's order, including ties.

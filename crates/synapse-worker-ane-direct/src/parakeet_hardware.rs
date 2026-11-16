@@ -61,8 +61,13 @@ fn fixture_features(
     wavs: &Path,
     inputs: &Value,
     frontend: &synapse_speech::Frontend,
+    prefer_wav: bool,
 ) -> Result<(Vec<f32>, usize, usize)> {
-    if !case["log_mel"].is_null() {
+    // The stage kit times both engines from the same WAV bytes, so it decodes every
+    // corpus clip from audio even where the corpus also seals its mel tensor.
+    if !case["log_mel"].is_null()
+        && !(prefer_wav && !inputs[case["id"].as_str().unwrap_or("")].is_null())
+    {
         return Ok((
             f32le(&artifact(&case["log_mel"], parity, mirror)?)?,
             case["mel_frames"].as_u64().context("mel_frames")? as usize,
@@ -289,7 +294,8 @@ fn certify(summary: &mut Value) -> Result<()> {
         selected = ladder.into_values().chain(corpus.into_values()).collect();
     }
     if let Some(kit) = &stage_kit {
-        selected.retain(|(f, c)| f.split.is_some() && c["log_mel"].is_null());
+        // Every corpus clip has a sealed WAV, including those whose mel is also sealed.
+        selected.retain(|(f, _)| f.split.is_some());
         ensure!(
             selected.len() == 1200,
             "stage kit requires exactly 1200 sealed WAV cases"
@@ -347,7 +353,7 @@ fn certify(summary: &mut Value) -> Result<()> {
                 );
                 if fixture.duration_ms > speech_profile.max_duration_ms {
                     let (mel, frames, valid) =
-                        fixture_features(case, &parity, &mirror, &wavs, &inputs, &frontend)?;
+                        fixture_features(case, &parity, &mirror, &wavs, &inputs, &frontend, false)?;
                     let error = super::validate_input(&model.profile, &mel, frames, valid)
                         .err()
                         .context("above-limit input was admitted")?;
@@ -363,8 +369,15 @@ fn certify(summary: &mut Value) -> Result<()> {
                 return Ok(());
             }
             let prepared = Instant::now();
-            let (mel, frames, valid) =
-                fixture_features(case, &parity, &mirror, &wavs, &inputs, &frontend)?;
+            let (mel, frames, valid) = fixture_features(
+                case,
+                &parity,
+                &mirror,
+                &wavs,
+                &inputs,
+                &frontend,
+                stage_kit.is_some(),
+            )?;
             row["timing"]["prepare_seconds"] = json!(prepared.elapsed().as_secs_f64());
             let valid_encoder = super::validate_input(&model.profile, &mel, frames, valid)?;
             ensure!(
