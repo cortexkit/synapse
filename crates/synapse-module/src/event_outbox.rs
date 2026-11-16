@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use cortexkit_bus_trait::{ContentDigest, Headers, Stream};
+use cortexkit_bus_trait::{ContentDigest, Headers};
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -215,22 +215,17 @@ impl EventBus for FleetBus {
                 .publish_event(name, 1, None, &event.event_id, event.body.clone())
                 .await
                 .map_err(|e| e.to_string())?,
-            Content::ClaimCheck { digest, headers } => {
-                let names = cortexkit_bus_naming::AccountNames::derive(client.acct())
-                    .map_err(|e| e.to_string())?;
-                let subject = names
-                    .event_subject(&self.module_id, name, 1)
-                    .map_err(|e| e.to_string())?;
-                // Stream publishes no body bytes and adds the digest/message-id headers.
-                // bus-client 0.1.2's publish_event cannot set these claim-check headers;
-                // the planned 0.1.3 publish_claim_check helper is the intended replacement.
-                client
-                    .connection()
-                    .stream(names.streams().event.clone())
-                    .publish(&subject, &event.event_id, digest, headers)
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
+            Content::ClaimCheck { digest, headers } => client
+                .publish_claim_check(
+                    "findings_changed",
+                    1,
+                    None,
+                    &event.event_id,
+                    digest,
+                    headers,
+                )
+                .await
+                .map_err(|e| e.to_string())?,
         };
         Ok(receipt.duplicate())
     }
