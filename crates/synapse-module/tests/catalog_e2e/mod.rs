@@ -735,7 +735,12 @@ async fn compiled_catalog_listing_is_frozen_sorted_and_filters_intersect() {
             assert_eq!(backend["installed"], false);
             assert_eq!(backend["self_check"], Value::Null);
             if row["task"] == "transcribe" {
-                assert_eq!(backend["max_duration_ms"], 600000);
+                // A lane certified for shorter audio than the profile allows serves only
+                // its certified length.
+                let served = declared
+                    .get("certified_max_duration_ms")
+                    .unwrap_or(&declared["max_duration_ms"]);
+                assert_eq!(backend["max_duration_ms"], *served);
                 for field in [
                     "max_tokens",
                     "attention_units",
