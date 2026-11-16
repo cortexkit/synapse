@@ -20,6 +20,7 @@ pub mod inventory;
 pub mod manifest;
 pub mod oracle;
 pub mod preload;
+pub mod qwen_asr;
 pub mod rules;
 pub mod safetensors;
 pub mod speech;

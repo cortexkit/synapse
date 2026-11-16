@@ -9542,6 +9542,13 @@
     "sha256": "931e22464f4ddd98f4675a2ddfed9228538bcee9d575842e4dcab19c6fda6931",
     "transformers_version": "5.16.1"
   },
+  "qwen3-asr-1.7b.ref-v1.transformers-4.57.6.seed-0": {
+    "model": "qwen3-asr-1.7b",
+    "path": "fixtures/qwen3-asr-1.7b/reference.json",
+    "seed": 0,
+    "sha256": "2fd7eda40227674a3f2389c734afdda30bf130add2320fad0ad4b51f4b007d54",
+    "transformers_version": "4.57.6"
+  },
   "qwen3-embedding-0.6b.ref-v1.transformers-5.16.1.seed-0": {
     "model": "qwen3-embedding-0.6b",
     "path": "fixtures/qwen3-embedding-0.6b/qwen3-embedding-0.6b.ref-v1.transformers-5.16.1.seed-0.json",

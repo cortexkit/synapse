@@ -74,7 +74,7 @@ pub fn buffer_plan(
     let intermediate = arch.int("intermediate_size")?;
     let (q_dim, kv_dim) = match arch.family {
         Family::Modernbert => (hidden, hidden),
-        Family::ParakeetTdt => {
+        Family::ParakeetTdt | Family::Qwen3Asr => {
             return Err(perr!(
                 "speech allocation floors require the transcribe kernel's buffer inventory"
             ))

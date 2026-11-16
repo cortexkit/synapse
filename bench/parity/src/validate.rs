@@ -18,6 +18,7 @@ use crate::hadamard;
 use crate::manifest::{
     profile_id, Family, Grammar, GrammarKind, Head, Lane, Manifest, Model, Normalization,
     Operation, Pooling, ReadoutKind, ALL_MODEL_SLUGS as MODEL_SLUGS, MANIFEST_FILE, SCHEMA,
+    SERVING_MODEL_SLUGS,
 };
 use crate::oracle::check_template;
 use crate::rules::{check_profile, MODERNBERT_ROTATION};
@@ -155,7 +156,24 @@ fn check_model(slug: &str, model: &Model, parity_dir: &Path) -> Result<()> {
             model.hf_revision
         ));
     }
-    for required in ["config.json", "model.safetensors", "tokenizer.json"] {
+    let qwen_asr = model.architecture.family == Family::Qwen3Asr;
+    let required = if qwen_asr {
+        vec![
+            "config.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "model.safetensors.index.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+            "chat_template.json",
+            "generation_config.json",
+            "preprocessor_config.json",
+        ]
+    } else {
+        vec!["config.json", "model.safetensors", "tokenizer.json"]
+    };
+    for required in required {
         if !model.files.contains_key(required) {
             return Err(perr!("no pinned digest for `{required}`"));
         }
@@ -170,12 +188,22 @@ fn check_model(slug: &str, model: &Model, parity_dir: &Path) -> Result<()> {
     if !is_sha256_hex(&model.tensor_index_sha256) {
         return Err(perr!("tensor_index_sha256 is not lowercase SHA-256 hex"));
     }
-    if model.checkpoint_digest != format!("sha256:{}", model.files["model.safetensors"]) {
+    let checkpoint_digest = if qwen_asr {
+        crate::qwen_asr::file_map_digest(model, &crate::qwen_asr::SHARDS)?
+    } else {
+        format!("sha256:{}", model.files["model.safetensors"])
+    };
+    if model.checkpoint_digest != checkpoint_digest {
         return Err(perr!(
             "checkpoint_digest must be `sha256:` + the model.safetensors digest"
         ));
     }
-    if model.tokenizer_digest != format!("sha256:{}", model.files["tokenizer.json"]) {
+    let tokenizer_digest = if qwen_asr {
+        crate::qwen_asr::file_map_digest(model, &crate::qwen_asr::TOKENIZER_FILES)?
+    } else {
+        format!("sha256:{}", model.files["tokenizer.json"])
+    };
+    if model.tokenizer_digest != tokenizer_digest {
         return Err(perr!(
             "tokenizer_digest must be `sha256:` + the tokenizer.json digest"
         ));
@@ -216,16 +244,28 @@ fn check_model(slug: &str, model: &Model, parity_dir: &Path) -> Result<()> {
         .collect();
     check_tensor_index(model, &index)?;
     if model.operation == Operation::Transcribe {
-        if model.architecture.family != Family::ParakeetTdt
-            || model.grammar.is_some()
+        if !matches!(
+            model.architecture.family,
+            Family::ParakeetTdt | Family::Qwen3Asr
+        ) || model.grammar.is_some()
             || model.output.is_some()
             || model.head.is_some()
         {
             return Err(perr!(
-                "Parakeet transcribe must have no grammar, output or rerank head"
+                "transcribe must have no grammar, output or rerank head"
             ));
         }
-        for name in ["processor_config.json", "generation_config.json"] {
+        let configs = if qwen_asr {
+            vec![
+                "preprocessor_config.json",
+                "chat_template.json",
+                "generation_config.json",
+                "model.safetensors.index.json",
+            ]
+        } else {
+            vec!["processor_config.json", "generation_config.json"]
+        };
+        for name in configs {
             let bytes = std::fs::read(dir.join(name)).map_err(|e| perr!("read {name}: {e}"))?;
             check_pinned_copy(model, name, &bytes)?;
         }
@@ -529,7 +569,9 @@ pub fn check_head(model: &Model, config: &Value, index: &BTreeMap<String, Vec<u6
                 None,
             )
         }
-        Family::ParakeetTdt => return Err(perr!("transcribe has no rerank head")),
+        Family::ParakeetTdt | Family::Qwen3Asr => {
+            return Err(perr!("transcribe has no rerank head"))
+        }
     };
     let required: Vec<String> = {
         let mut keys: Vec<String> = tensors.values().map(|t| t.key.clone()).collect();
@@ -628,7 +670,7 @@ pub fn validate_inventory(parity_dir: &Path) -> Result<()> {
 
 fn check_profiles(manifest: &Manifest) -> Result<()> {
     let mut expected_ids = BTreeSet::new();
-    for slug in MODEL_SLUGS {
+    for slug in SERVING_MODEL_SLUGS {
         for lane in Lane::ALL {
             expected_ids.insert(profile_id(slug, lane));
         }

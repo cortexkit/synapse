@@ -282,6 +282,51 @@
       "tensor_prefix": "",
       "tokenizer_digest": "sha256:bd321b096832a3f270bd3b2a88823957920f1a5c5ada71114a26ea729d0cbe91"
     },
+    "qwen3-asr-1.7b": {
+      "architecture": {
+        "class": "Qwen3ASRForConditionalGeneration",
+        "family": "qwen3_asr",
+        "params": {
+          "audio_hidden_size": 1024,
+          "audio_intermediate_size": 4096,
+          "audio_num_heads": 16,
+          "audio_num_layers": 24,
+          "audio_output_dim": 2048,
+          "conv_channels": 480,
+          "head_dim": 128,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "n_window": 50,
+          "n_window_infer": 800,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "num_mel_bins": 128,
+          "rope_theta": 1000000.0,
+          "tie_word_embeddings": true,
+          "vocab_size": 151936
+        }
+      },
+      "checkpoint_digest": "sha256:e015d5d8e894becc138716575bf026c2f38e23e17d5c49f78bffb7009502f7a0",
+      "files": {
+        "chat_template.json": "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
+        "config.json": "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",
+        "generation_config.json": "1da527824d81e07118facff437e03f2e24a23311e3bdeb2368973fe77e5f275c",
+        "merges.txt": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        "model-00001-of-00002.safetensors": "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6",
+        "model-00002-of-00002.safetensors": "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc",
+        "model.safetensors.index.json": "f994739fe38e5210b9e3e8ce6c6307315e2ceac3cb630e7b7414d69dce520f60",
+        "preprocessor_config.json": "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d",
+        "tokenizer_config.json": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+        "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+      },
+      "hf_repo": "Qwen/Qwen3-ASR-1.7B",
+      "hf_revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+      "operation": "transcribe",
+      "tensor_index_sha256": "770e80a19435f932c2734389a105d66eb5aa0c7936277968e23c5cbd614ef96c",
+      "tensor_prefix": "thinker.model.",
+      "tokenizer_digest": "sha256:82fdba21a8396777bc8f7b64ca28eeba8ea8db6add87450cecfd8f70c72d44b6"
+    },
     "qwen3-embedding-0.6b": {
       "architecture": {
         "class": "Qwen3ForCausalLM",

@@ -43,7 +43,12 @@ pub fn check_checkpoint(
             )));
         }
     }
-    let header = read_header_bytes(&dir.join("model.safetensors")).map_err(at)?;
+    let qwen_asr = model.architecture.family == Family::Qwen3Asr;
+    let header = if qwen_asr {
+        crate::qwen_asr::merged_header(dir).map_err(at)?
+    } else {
+        read_header_bytes(&dir.join("model.safetensors")).map_err(at)?
+    };
     if sha256_hex(&header) != model.tensor_index_sha256 {
         return Err(at(perr!(
             "model.safetensors header differs from tensor_index_sha256"
@@ -74,6 +79,23 @@ pub fn check_checkpoint(
         tokenizer_config.as_ref(),
     )
     .map_err(at)?;
+
+    if qwen_asr {
+        let vocab = read_json(&dir.join("vocab.json")).map_err(at)?;
+        let vocab = vocab
+            .as_object()
+            .ok_or_else(|| at(perr!("vocab.json must be an object")))?;
+        let limit = model.architecture.int("vocab_size")?;
+        if vocab
+            .values()
+            .any(|id| id.as_u64().is_none_or(|id| id >= limit))
+        {
+            return Err(at(perr!(
+                "Qwen3-ASR vocabulary id outside configured embedding table"
+            )));
+        }
+        return Ok(());
+    }
 
     let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
         .map_err(|error| at(perr!("load tokenizer.json: {error}")))?;

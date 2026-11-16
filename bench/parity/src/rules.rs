@@ -89,7 +89,9 @@ pub fn stage_tensors(model: &Model, stage: &str) -> Result<Vec<String>> {
         "final_norm" => match model.architecture.family {
             Family::Modernbert => vec![],
             Family::Qwen3 => vec![final_norm_key(model)],
-            Family::ParakeetTdt => return Err(perr!("transcribe has no standalone final norm")),
+            Family::ParakeetTdt | Family::Qwen3Asr => {
+                return Err(perr!("transcribe has no standalone final norm"))
+            }
         },
         "gte_classifier_head" => {
             let head = model

@@ -61,6 +61,9 @@ mod tests {
         let family = match model.architecture.family {
             Family::Modernbert => ModelFamily::GteModernBert,
             Family::Qwen3 => ModelFamily::Qwen3,
+            Family::ParakeetTdt | Family::Qwen3Asr => {
+                panic!("{slug} is not an embedding model")
+            }
         };
         let dtype = match profile.storage_dtype {
             DType::F16 => OwnedDType::F16,
@@ -93,6 +96,7 @@ mod tests {
                 match model.operation {
                     Operation::Embed => "embed",
                     Operation::Rerank => "rerank",
+                    Operation::Transcribe => panic!("{slug} is not an embedding model"),
                 }
                 .into(),
             );
@@ -167,6 +171,7 @@ mod tests {
                         .into_iter()
                         .map(|s| Output::Score(f64::from(s)))
                         .collect(),
+                    Operation::Transcribe => panic!("{slug} is not an embedding model"),
                 };
                 assert_eq!(outputs.len(), chunk.len());
                 let grammar = model.grammar().unwrap();

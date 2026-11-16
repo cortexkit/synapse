@@ -25,12 +25,21 @@ pub const MODEL_SLUGS: [&str; 4] = [
     "qwen3-reranker-0.6b",
 ];
 
-pub const ALL_MODEL_SLUGS: [&str; 5] = [
+pub const SERVING_MODEL_SLUGS: [&str; 5] = [
     MODEL_SLUGS[0],
     MODEL_SLUGS[1],
     MODEL_SLUGS[2],
     MODEL_SLUGS[3],
     "parakeet-tdt-0.6b-v3",
+];
+
+pub const ALL_MODEL_SLUGS: [&str; 6] = [
+    SERVING_MODEL_SLUGS[0],
+    SERVING_MODEL_SLUGS[1],
+    SERVING_MODEL_SLUGS[2],
+    SERVING_MODEL_SLUGS[3],
+    SERVING_MODEL_SLUGS[4],
+    "qwen3-asr-1.7b",
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,6 +109,7 @@ pub enum Family {
     Modernbert,
     Qwen3,
     ParakeetTdt,
+    Qwen3Asr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,10 +191,16 @@ pub struct Model {
     pub tensor_prefix: String,
     /// SHA-256 (lowercase hex) of each pinned checkpoint file, by file name.
     pub files: BTreeMap<String, String>,
-    /// SHA-256 of the raw JSON header inside `model.safetensors`; a committed
-    /// copy lives at `checkpoints/<slug>/tensor-index.json`.
+    /// SHA-256 of the raw JSON header inside `model.safetensors`. For sharded
+    /// Qwen3-ASR, hash the canonical key-sorted merge of every shard header;
+    /// offsets remain shard-local and the HF weight map identifies each shard.
+    /// A committed copy lives at `checkpoints/<slug>/tensor-index.json`.
     pub tensor_index_sha256: String,
+    /// Single-file models use that file's digest. Sharded models hash the
+    /// canonical file-name-to-SHA-256 map of all safetensors shards.
     pub checkpoint_digest: String,
+    /// tokenizer.json's digest, or for Qwen3-ASR the canonical digest map of
+    /// merges.txt, tokenizer_config.json and vocab.json.
     pub tokenizer_digest: String,
     pub architecture: Architecture,
     #[serde(default, skip_serializing_if = "Option::is_none")]

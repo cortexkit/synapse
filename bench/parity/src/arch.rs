@@ -265,11 +265,107 @@ pub const PARAKEET_PARAMS: &[ParamSpec] = &[
     ),
 ];
 
+/// Qwen3-ASR stores its encoder and decoder configuration under thinker_config.
+/// Config sources beginning with '/' are JSON pointers into that nested object.
+pub const QWEN3_ASR_PARAMS: &[ParamSpec] = &[
+    spec(
+        "audio_hidden_size",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/d_model"),
+    ),
+    spec(
+        "audio_intermediate_size",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/encoder_ffn_dim"),
+    ),
+    spec(
+        "audio_num_heads",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/encoder_attention_heads"),
+    ),
+    spec(
+        "audio_num_layers",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/encoder_layers"),
+    ),
+    spec(
+        "audio_output_dim",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/output_dim"),
+    ),
+    spec(
+        "conv_channels",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/downsample_hidden_size"),
+    ),
+    spec(
+        "num_mel_bins",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/num_mel_bins"),
+    ),
+    spec(
+        "n_window",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/n_window"),
+    ),
+    spec(
+        "n_window_infer",
+        Kind::Int,
+        Source::Config("/thinker_config/audio_config/n_window_infer"),
+    ),
+    spec(
+        "num_hidden_layers",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/num_hidden_layers"),
+    ),
+    spec(
+        "hidden_size",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/hidden_size"),
+    ),
+    spec(
+        "intermediate_size",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/intermediate_size"),
+    ),
+    spec(
+        "num_attention_heads",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/num_attention_heads"),
+    ),
+    spec(
+        "num_key_value_heads",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/num_key_value_heads"),
+    ),
+    spec(
+        "head_dim",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/head_dim"),
+    ),
+    spec(
+        "vocab_size",
+        Kind::Int,
+        Source::Config("/thinker_config/text_config/vocab_size"),
+    ),
+    spec(
+        "rope_theta",
+        Kind::Float,
+        Source::Config("/thinker_config/text_config/rope_theta"),
+    ),
+    spec(
+        "tie_word_embeddings",
+        Kind::Bool,
+        Source::Config("/thinker_config/text_config/tie_word_embeddings"),
+    ),
+];
+
 pub fn params_for(family: Family) -> &'static [ParamSpec] {
     match family {
         Family::Modernbert => MODERNBERT_PARAMS,
         Family::Qwen3 => QWEN3_PARAMS,
         Family::ParakeetTdt => PARAKEET_PARAMS,
+        Family::Qwen3Asr => QWEN3_ASR_PARAMS,
     }
 }
 
@@ -315,6 +411,11 @@ pub fn class_table(class: &str) -> Result<ClassInfo> {
         }),
         "ParakeetForTDT" => Ok(ClassInfo {
             family: Family::ParakeetTdt,
+            values: BTreeMap::new(),
+            has_classification_head: false,
+        }),
+        "Qwen3ASRForConditionalGeneration" => Ok(ClassInfo {
+            family: Family::Qwen3Asr,
             values: BTreeMap::new(),
             has_classification_head: false,
         }),
@@ -437,7 +538,13 @@ pub fn check_against_config(
                 .and_then(|encoder| encoder.get(key))
                 .cloned()
                 .ok_or_else(|| perr!("{slug}: missing encoder_config.{key}"))?,
-            Source::Config(key) => config.get(key).cloned().ok_or_else(|| {
+            Source::Config(key) => (if key.starts_with('/') {
+                config.pointer(key)
+            } else {
+                config.get(key)
+            })
+            .cloned()
+            .ok_or_else(|| {
                 perr!(
                     "{slug}: architecture parameter `{}` has no `{key}` in the pinned config.json",
                     spec.name
@@ -508,6 +615,7 @@ pub fn expected_tensors(model: &Model) -> Result<BTreeMap<String, Vec<u64>>> {
     };
     match arch.family {
         Family::ParakeetTdt => return crate::speech::expected_tensors(arch),
+        Family::Qwen3Asr => return crate::qwen_asr::expected_tensors(model),
         Family::Modernbert => {
             for flag in ["norm_bias", "attention_bias", "mlp_bias"] {
                 if arch.boolean(flag)? {
@@ -603,6 +711,7 @@ pub fn embedding_key(model: &Model) -> String {
     match model.architecture.family {
         Family::Modernbert => format!("{}embeddings.tok_embeddings.weight", model.tensor_prefix),
         Family::Qwen3 => format!("{}embed_tokens.weight", model.tensor_prefix),
+        Family::Qwen3Asr => "thinker.model.embed_tokens.weight".to_string(),
         Family::ParakeetTdt => "decoder.embedding.weight".to_string(),
     }
 }
@@ -612,6 +721,7 @@ pub fn final_norm_key(model: &Model) -> String {
     match model.architecture.family {
         Family::Modernbert => format!("{}final_norm.weight", model.tensor_prefix),
         Family::Qwen3 => format!("{}norm.weight", model.tensor_prefix),
+        Family::Qwen3Asr => "thinker.model.norm.weight".to_string(),
         Family::ParakeetTdt => "encoder.layers.23.norm_out.weight".to_string(),
     }
 }

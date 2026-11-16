@@ -1,0 +1,87 @@
+{
+  "schema": "synapse-qwen3-asr-reference-v1",
+  "model": "qwen3-asr-1.7b",
+  "environment": {
+    "device": "cpu",
+    "dtype": "fp32",
+    "intraop_threads": 1,
+    "interop_threads": 1,
+    "deterministic_algorithms": true,
+    "attention_implementation": "eager",
+    "mkldnn": false,
+    "seed": 0,
+    "qwen_asr_version": "0.0.6",
+    "qwen_asr_wheel_sha256": "b9c55a38413298f3a990a4475467399daec6e8f4172363053fc42e2166c2dfd3",
+    "torch_version": "2.9.1",
+    "transformers_version": "4.57.6",
+    "transformers_wheel_sha256": "4c9e9de11333ddfe5114bc872c9f370509198acf0b87a832a0ab9458e2bd0550"
+  },
+  "frontend": {
+    "sample_rate": 16000,
+    "mel_bins": 128,
+    "n_fft": 400,
+    "hop_samples": 160,
+    "window": "Hann, periodic=True, 400 samples",
+    "stft_center": true,
+    "stft_pad_mode": "reflect, 200 samples at each edge",
+    "input_padding": "right-zero to longest waveform in batch; batch size is one",
+    "truncation": false,
+    "dither": 0,
+    "spectrum": "abs(complex STFT)^2; drop final time frame",
+    "mel_scale": "Slaney, 0 to 8000 Hz",
+    "mel_norm": "slaney",
+    "log": "log10(max(mel_power, 1e-10))",
+    "clamp": "max(log_mel, max(log_mel over all bins/frames of waveform) - 8)",
+    "normalization": "(clamped_log_mel + 4) / 4; no waveform normalization",
+    "actual_mel_frames": "floor(sample_count / 160)",
+    "valid_mel_frames": "floor(sample_count / 160); audio attention_mask[::160], dropping its last entry when sample_count % 160 != 0",
+    "audio_tokens": "13 * (valid_mel_frames // 100) + ceil((valid_mel_frames % 100) / 8)",
+    "encoder_output": "after thinker.audio_tower.proj2, [audio_tokens, 2048]",
+    "tensor_layout": "row-major little-endian f32; mel [mel_frames,128]"
+  },
+  "generation": {
+    "greedy": true,
+    "stop_ids": [151645, 151643],
+    "include_stop": true,
+    "capped_prefix_may_omit_stop": true,
+    "max_new_tokens": "64 + ceil(tokens_per_second * duration_s)",
+    "initial_tokens_per_second": 6,
+    "minimum_rate_headroom": 1.5,
+    "provisional_tokens_per_second": 25,
+    "slope_calibration": "measure max(6, ceil(1.5 * highest speech tokens/s)) on stopped no-list >=2s LibriSpeech, FLEURS and Earnings-22, including concatenated LibriSpeech; subtract generated language prefix through <asr_text>, retain stop; measured slope must be <=25, but generation and serving slope stay 25",
+    "no_list_definition": "the original request has empty terms and its recorded context_tokens equals zero; tier labels do not determine eligibility",
+    "complete_cap_calibration": "stopped no-list traces only: max_new_tokens at serving slope25 >= ceil(1.5 * generated length), including language prefix and stop",
+    "calibration_exemptions": {"capped_prefixes": ["speech_rate_slope", "complete_cap_headroom"], "name_list_requests": ["speech_rate_slope", "complete_cap_headroom"]},
+    "name_list_rate_evidence": "separately report highest prefix-subtracted rate and fixture among stopped listed >=2s speech traces; preserve all listed outputs, including recitation, at their original caps",
+    "stop_before_sealing_if_slope_above": 25,
+    "provisional_cap_rule": "fixed reference slope 25: record stop_reason=stop when the last generated token is EOS, even exactly at cap; otherwise require exactly cap tokens and record stop_reason=cap; actual logits processor list must be empty",
+    "capped_prefix_identity": "retain the exact cap value and generated prefix, independent of any later serving cap; engine parity compares that exact prefix",
+    "capped_fixture_report": "counts and ordered ids globally, by split, by corpus tier none/30/100/300, and by split/tier; none means no tier label, not necessarily no list",
+    "caller_text_special_token_parsing": false,
+    "margins": "top1 minus top2 of fp32 generation logits at each continuation position"
+  },
+  "checkpoint_weight_facts": {
+    "source_tensors": {
+      "thinker.lm_head.weight": {
+        "shard": "model-00001-of-00002.safetensors",
+        "data_offsets": [634955008, 1257284864],
+        "sha256": "d7d2c2a8e14c215fe1516431e9fca596a2ef521b15e9dde09fc8ec8b8d1e17f9",
+        "fp32_sha256": "cbf07af526ca4f37526ebe72f3146d3610c8a301a7c37b9153d92ef23f2688d7"
+      },
+      "thinker.model.embed_tokens.weight": {
+        "shard": "model-00001-of-00002.safetensors",
+        "data_offsets": [1257284864, 1879614720],
+        "sha256": "d7d2c2a8e14c215fe1516431e9fca596a2ef521b15e9dde09fc8ec8b8d1e17f9",
+        "fp32_sha256": "cbf07af526ca4f37526ebe72f3146d3610c8a301a7c37b9153d92ef23f2688d7"
+      }
+    },
+    "source_tensors_byte_identical": true,
+    "loaded_fp32_sha256": {
+      "thinker.lm_head.weight": "cbf07af526ca4f37526ebe72f3146d3610c8a301a7c37b9153d92ef23f2688d7",
+      "thinker.model.embed_tokens.weight": "cbf07af526ca4f37526ebe72f3146d3610c8a301a7c37b9153d92ef23f2688d7"
+    },
+    "loaded_head_embedding_share_storage": true,
+    "logits_weight_matches_sources": ["thinker.model.embed_tokens.weight", "thinker.lm_head.weight"],
+    "engine_rule": "Use the matrix the official loader exposes as thinker.lm_head.weight, even if config tying changes which source tensor supplies it."
+  }
+}

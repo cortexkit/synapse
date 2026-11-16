@@ -1,0 +1,18 @@
+{
+  "corpus_sha256": "8e5a4f2bd7190562c782d0e67bb2d997c610cbc77b261251d32cbd10cc519198",
+  "reference_rules_sha256": "26140d23af676233f1e61bf55ce1d91c252e612782a495f7cd19c431ae82f873",
+  "revision": "76cc6a4b10f03c40c73ae82baeb55ab83bf793bc",
+  "source_sha256": {
+    "full_run.sh": "49afda36358be8058e3e546fea901d2cf900a3376d7d6211f708dd939b43d46f",
+    "generate_parakeet.py": "e802130feabf8e29420fa763677f53dae40c6c3d2f4116f17019e708a50694cf",
+    "generate_qwen3_asr.py": "c83e13cb02e7621986310ca13232b617492c4f357d88fde8d635a8dd011591bb",
+    "parakeet-corpus.json": "be63e773f3f31c8926a4b238178d1767cf06a729d218bd005526b4b4e025d7f5",
+    "prepare_parakeet.py": "90da041e2a2ee73c36bc550c6e5ec8bd2574c64bb9fc621fb7687cdaddad39ac",
+    "prepare_qwen3_asr.py": "955c0c63f3d9b2712bc5cde17b8c04511996fd260ed9af62d3b4d299f56b676c",
+    "qwen3-asr-name-curation.json": "06570336ce1737e05559324403efbdd89210608a627f03fd356d140af3f23ab0",
+    "qwen3_asr_corpus.py": "bcd4e7a6e643b506aefa27a23f7e504eff9615d71beffb534f8ce2bb73729ae8",
+    "qwen3_asr_reference.py": "d5b4828fea792eaecb8a85e3e01302dbbdc5020205dd3e59a6fd1b18e0e1ec1b",
+    "requirements-qwen3-asr.txt": "6f1524ea17021451ceb28eb08440e08e0da4b5fc97326c8f5b531af34f7f16ab",
+    "run_qwen3_asr_full.py": "24ba100bdb257821be63be4416dfc76487a730edfc76ad282a26446e3bc430b0"
+  }
+}
