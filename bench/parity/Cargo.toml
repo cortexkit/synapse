@@ -18,8 +18,12 @@ default = ["checkpoints"]
 # Checks that read downloaded checkpoints (tokenizer behaviour in particular).
 # Off for consumers that only need the manifest types and the sizing function.
 checkpoints = ["dep:tokenizers"]
+q8-derive = ["dep:anyhow", "dep:hex", "dep:safetensors"]
 
 [dependencies]
+anyhow = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+safetensors = { version = "0.6.2", optional = true }
 half = "2.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,3 +36,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"], 
 [[bin]]
 name = "parity-manifest"
 path = "src/bin/parity-manifest.rs"
+
+[[bin]]
+name = "q8-derive"
+path = "src/bin/q8-derive.rs"
+required-features = ["q8-derive"]

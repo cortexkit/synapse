@@ -308,6 +308,11 @@
         }
       },
       "checkpoint_digest": "sha256:e015d5d8e894becc138716575bf026c2f38e23e17d5c49f78bffb7009502f7a0",
+      "derived_artifacts": {
+        "f16_digest": "sha256:a51f2c7bf8ecca63e25d74e5b7044cfaa2cd65d7ecb9a3e480dc2ea7a7f29bf3",
+        "q8_0_digest": "sha256:c7555f746972f0433121e05ed9accf2f69d8d15cbf32b5ca0b46e9727c1db1e9",
+        "quantizer_revision": "q8-ingest-v1"
+      },
       "files": {
         "chat_template.json": "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff",
         "config.json": "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",

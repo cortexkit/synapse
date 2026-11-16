@@ -15,12 +15,41 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use half::{bf16, f16};
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::tensor::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::owned_decode_routing::family::Family;
+use crate::owned_decode_routing::tensor_source::TensorSource;
+
+/// Quantizer inputs include speech models without admitting them to text-decode
+/// routing. `Family` remains the closed Qwen3-0.6B/LFM2 text-decode registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantizerFamily {
+    Qwen3_0_6b,
+    Lfm2_1_2b,
+    Qwen3Asr,
+}
+
+impl From<Family> for QuantizerFamily {
+    fn from(family: Family) -> Self {
+        match family {
+            Family::Qwen3_0_6b => Self::Qwen3_0_6b,
+            Family::Lfm2_1_2b => Self::Lfm2_1_2b,
+        }
+    }
+}
+
+impl QuantizerFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Qwen3_0_6b => "qwen3-0.6b",
+            Self::Lfm2_1_2b => "lfm2-1.2b",
+            Self::Qwen3Asr => "qwen3-asr-1.7b",
+        }
+    }
+}
 
 const Q8_BLOCK_ELEMENTS: usize = 32;
 const Q8_BLOCK_BYTES: usize = 34;
@@ -74,6 +103,22 @@ pub fn derive_and_cache_q8_blocks(
     source_manifest_digest: &str,
     quantizer_revision: &str,
 ) -> Result<CachedQ8Artifact> {
+    derive_q8(
+        source_path,
+        cache_root,
+        family.into(),
+        source_manifest_digest,
+        quantizer_revision,
+    )
+}
+
+pub(super) fn derive_q8(
+    source_path: &Path,
+    cache_root: &Path,
+    family: QuantizerFamily,
+    source_manifest_digest: &str,
+    quantizer_revision: &str,
+) -> Result<CachedQ8Artifact> {
     ensure!(
         !source_manifest_digest.trim().is_empty(),
         "Q8 source manifest digest must not be empty"
@@ -105,18 +150,13 @@ pub fn derive_and_cache_q8_blocks(
         return Ok(cached);
     }
 
-    let model_path = resolve_model_path(source_path)?;
-    let model_root = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let config_path = model_root.join("config.json");
+    let tensors = TensorSource::open(source_path)?;
+    let config_path = tensors.root.join("config.json");
     let config: Value = serde_json::from_slice(
         &fs::read(&config_path)
             .with_context(|| format!("read decode config {}", config_path.display()))?,
     )
     .with_context(|| format!("parse decode config {}", config_path.display()))?;
-    let source_bytes = fs::read(&model_path)
-        .with_context(|| format!("read safetensors source {}", model_path.display()))?;
-    let tensors = SafeTensors::deserialize(&source_bytes)
-        .with_context(|| format!("parse safetensors source {}", model_path.display()))?;
     let tensor_names = tensor_order(family, &config, &tensors)?;
 
     let nonce = format!("{}.{}", std::process::id(), crate::now_ms());
@@ -130,7 +170,9 @@ pub fn derive_and_cache_q8_blocks(
         let mut offset = 0_u64;
         let mut inventory = Vec::with_capacity(tensor_names.len());
         for name in tensor_names {
-            let tensor = lookup_tensor(&tensors, &name)?;
+            let resolved = tensors.resolve(&name)?;
+            let (record, bytes) = tensors.read(resolved)?;
+            let tensor = TensorView::new(record.dtype, record.shape, &bytes)?;
             let shape = tensor.shape().to_vec();
             ensure!(shape.len() == 2, "Q8 tensor {name} must be a matrix");
             let row_width = shape[1];
@@ -321,7 +363,7 @@ fn directory_bytes(path: &Path) -> Result<u64> {
 fn load_cached_artifact(
     object_path: &Path,
     metadata_path: &Path,
-    family: Family,
+    family: QuantizerFamily,
     source_manifest_digest: &str,
     quantizer_revision: &str,
 ) -> Result<Option<CachedQ8Artifact>> {
@@ -356,20 +398,18 @@ fn load_cached_artifact(
     }))
 }
 
-fn resolve_model_path(source_path: &Path) -> Result<PathBuf> {
-    if source_path.is_file() {
-        return Ok(source_path.to_path_buf());
-    }
-    let model_path = source_path.join("model.safetensors");
-    ensure!(
-        model_path.is_file(),
-        "Q8 ingest requires model.safetensors under {}",
-        source_path.display()
-    );
-    Ok(model_path)
-}
-
-fn tensor_order(family: Family, config: &Value, tensors: &SafeTensors<'_>) -> Result<Vec<String>> {
+pub(super) fn tensor_order(
+    family: QuantizerFamily,
+    config: &Value,
+    tensors: &TensorSource,
+) -> Result<Vec<String>> {
+    let config = if family == QuantizerFamily::Qwen3Asr {
+        config
+            .pointer("/thinker_config/text_config")
+            .context("missing ASR text config")?
+    } else {
+        config
+    };
     let layers = config
         .get("num_hidden_layers")
         .and_then(Value::as_u64)
@@ -382,9 +422,13 @@ fn tensor_order(family: Family, config: &Value, tensors: &SafeTensors<'_>) -> Re
         .unwrap_or(true);
     let mut names = Vec::new();
     match family {
-        Family::Qwen3_0_6b => {
+        QuantizerFamily::Qwen3_0_6b | QuantizerFamily::Qwen3Asr => {
             for index in 0..layers {
-                let prefix = format!("layers.{index}");
+                let prefix = if family == QuantizerFamily::Qwen3Asr {
+                    format!("thinker.model.layers.{index}")
+                } else {
+                    format!("layers.{index}")
+                };
                 for suffix in [
                     "self_attn.q_proj.weight",
                     "self_attn.k_proj.weight",
@@ -398,7 +442,7 @@ fn tensor_order(family: Family, config: &Value, tensors: &SafeTensors<'_>) -> Re
                 }
             }
         }
-        Family::Lfm2_1_2b => {
+        QuantizerFamily::Lfm2_1_2b => {
             let full_attention = config
                 .get("full_attn_idxs")
                 .and_then(Value::as_array)
@@ -442,33 +486,20 @@ fn tensor_order(family: Family, config: &Value, tensors: &SafeTensors<'_>) -> Re
         }
     }
 
-    let head = if tied || lookup_tensor(tensors, "lm_head.weight").is_err() {
+    let head = if family == QuantizerFamily::Qwen3Asr {
+        if tensors.tensors.contains_key("thinker.lm_head.weight") {
+            "thinker.lm_head.weight"
+        } else {
+            ensure!(tied, "untied ASR head is missing");
+            "thinker.model.embed_tokens.weight"
+        }
+    } else if tied || tensors.resolve("lm_head.weight").is_err() {
         "embed_tokens.weight"
     } else {
         "lm_head.weight"
     };
     names.push(head.to_string());
     Ok(names)
-}
-
-fn lookup_tensor<'data>(
-    tensors: &SafeTensors<'data>,
-    base_name: &str,
-) -> Result<safetensors::tensor::TensorView<'data>> {
-    let candidates = [
-        base_name.to_string(),
-        format!("bert.{base_name}"),
-        format!("model.{base_name}"),
-        format!("model.bert.{base_name}"),
-        format!("lfm.{base_name}"),
-        format!("model.lfm.{base_name}"),
-    ];
-    for candidate in &candidates {
-        if let Ok(tensor) = tensors.tensor(candidate) {
-            return Ok(tensor);
-        }
-    }
-    bail!("missing Q8 tensor; tried {}", candidates.join(", "))
 }
 
 fn write_q8_tensor(
@@ -541,7 +572,7 @@ fn write_q8_tensor(
     Ok(written)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)
         .with_context(|| format!("open Q8 object for verification {}", path.display()))?;
     let mut digest = Sha256::new();
@@ -780,14 +811,14 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod checkpoint_tests {
     use serde_json::json;
 
     use super::*;
 
     #[test]
-    #[ignore = "requires the Qwen3 and LFM2 checkpoints in the Hugging Face cache"]
+    #[ignore = "requires the pinned Qwen3-Embedding-0.6B and LFM2 checkpoints"]
     fn checkpoint_q8_ingest_derives_both_production_families() {
         let cache_root = std::env::var_os("SYNAPSE_OWNED_DECODE_Q8_CACHE_ROOT")
             .map(PathBuf::from)
@@ -795,7 +826,7 @@ mod checkpoint_tests {
         for (family, env_name, expected_digest) in [
             (
                 Family::Qwen3_0_6b,
-                "SYNAPSE_UNIFIED_RT_QWEN3_0_6B",
+                "SYNAPSE_Q8_REGRESSION_QWEN3_EMBEDDING_0_6B",
                 "17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2",
             ),
             (

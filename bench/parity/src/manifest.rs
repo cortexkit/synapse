@@ -203,6 +203,9 @@ pub struct Model {
     /// merges.txt, tokenizer_config.json and vocab.json.
     pub tokenizer_digest: String,
     pub architecture: Architecture,
+    /// Backend-independent Q8 decoder and f16 remainder; not a serving profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_artifacts: Option<DerivedArtifacts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grammar: Option<Grammar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +223,14 @@ pub struct Architecture {
     /// Parameter name to value. The allowed names, their JSON types and the
     /// checkpoint field each comes from are fixed per family in `arch`.
     pub params: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedArtifacts {
+    pub quantizer_revision: String,
+    pub q8_0_digest: String,
+    pub f16_digest: String,
 }
 
 impl Model {

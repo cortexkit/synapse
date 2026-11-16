@@ -157,6 +157,21 @@ fn check_model(slug: &str, model: &Model, parity_dir: &Path) -> Result<()> {
         ));
     }
     let qwen_asr = model.architecture.family == Family::Qwen3Asr;
+    if qwen_asr {
+        let pins = model
+            .derived_artifacts
+            .as_ref()
+            .ok_or_else(|| perr!("missing ASR derived_artifacts"))?;
+        if pins.quantizer_revision != "q8-ingest-v1"
+            || [&pins.q8_0_digest, &pins.f16_digest]
+                .iter()
+                .any(|digest| !digest.strip_prefix("sha256:").is_some_and(is_sha256_hex))
+        {
+            return Err(perr!("invalid ASR derived_artifacts pins"));
+        }
+    } else if model.derived_artifacts.is_some() {
+        return Err(perr!("derived_artifacts are only defined for Qwen3-ASR"));
+    }
     let required = if qwen_asr {
         vec![
             "config.json",

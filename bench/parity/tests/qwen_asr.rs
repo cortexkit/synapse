@@ -37,6 +37,39 @@ fn qwen_asr_addition_preserves_every_existing_profile_and_grammar_digest() {
 }
 
 #[test]
+fn qwen_asr_requires_both_backend_independent_derived_pins() {
+    let baseline = manifest();
+    let pins = baseline.models["qwen3-asr-1.7b"]
+        .derived_artifacts
+        .as_ref()
+        .unwrap();
+    assert_eq!(pins.quantizer_revision, "q8-ingest-v1");
+    assert_eq!(
+        pins.q8_0_digest,
+        "sha256:c7555f746972f0433121e05ed9accf2f69d8d15cbf32b5ca0b46e9727c1db1e9"
+    );
+    assert_eq!(
+        pins.f16_digest,
+        "sha256:a51f2c7bf8ecca63e25d74e5b7044cfaa2cd65d7ecb9a3e480dc2ea7a7f29bf3"
+    );
+    for field in ["missing", "q8", "f16", "revision"] {
+        let mut changed = baseline.clone();
+        let pins = &mut changed
+            .models
+            .get_mut("qwen3-asr-1.7b")
+            .unwrap()
+            .derived_artifacts;
+        match field {
+            "missing" => *pins = None,
+            "q8" => pins.as_mut().unwrap().q8_0_digest = "invalid".into(),
+            "f16" => pins.as_mut().unwrap().f16_digest = "invalid".into(),
+            _ => pins.as_mut().unwrap().quantizer_revision = "unknown".into(),
+        }
+        assert!(validate::validate_manifest(&changed, &parity_dir()).is_err());
+    }
+}
+
+#[test]
 fn qwen_asr_independent_tensor_inventory_matches_both_shards() {
     let manifest = manifest();
     let model = &manifest.models["qwen3-asr-1.7b"];

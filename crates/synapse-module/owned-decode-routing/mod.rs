@@ -35,8 +35,10 @@ pub mod identity;
 pub mod lane;
 pub mod provenance;
 pub mod q8artifact;
+pub mod q8asr;
 pub mod q8ingest;
 pub mod request;
+mod tensor_source;
 
 use std::{collections::BTreeSet, sync::Arc};
 
