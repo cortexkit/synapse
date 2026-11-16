@@ -91,6 +91,9 @@ pub fn dispatch(command: Command, source: Option<&str>) -> Result<serde_json::Va
         source,
     )?;
     let mut runner = live::LiveRunner::new(options.clone(), source)?;
+    if command.model == synapse_parity::speech::MODEL {
+        return runner.transcribe(&command.row);
+    }
     let record =
         synapse_certify::produce(&mut runner, &options.assets, &command.row, &command.model)?;
     synapse_certify::write_record(&record, &options.checkout)?;

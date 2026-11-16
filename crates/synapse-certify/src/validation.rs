@@ -1,7 +1,7 @@
 //! Offline validation using candidate-owned catalog pins and embedded references.
 use crate::{
-    derive_cells, hex, identity, refuse, safe_file, self_check, Catalog, Record, Result,
-    RECORD_SCHEMA,
+    derive_cells, hex, identity, refuse, safe_file, self_check, Catalog, CertificationRecord,
+    Record, Result, RECORD_SCHEMA,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -17,7 +17,27 @@ pub fn validate_record(
     assets: &Path,
     catalog: &Catalog,
 ) -> Result<()> {
+    validate_record_claims(record, checkout, catalog)?;
+    for artifact in &record.executed_artifacts {
+        if crate::digest(assets, &artifact.file)? != artifact.sha256 {
+            return Err(refuse(format!(
+                "executed artifact digest mismatch: {}",
+                artifact.file
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_record_claims(
+    record: &Record,
+    checkout: &Path,
+    catalog: &Catalog,
+) -> Result<()> {
     identity(record)?;
+    if record.operation == "transcribe" {
+        return Err(refuse("transcribe_requires_task_record"));
+    }
     let cells = derive_cells(&catalog.lanes);
     let cell = cells
         .iter()
@@ -113,14 +133,6 @@ pub fn validate_record(
             return Err(refuse("placement_inventory_failed"));
         }
     }
-    for artifact in &record.executed_artifacts {
-        if crate::digest(assets, &artifact.file)? != artifact.sha256 {
-            return Err(refuse(format!(
-                "executed artifact digest mismatch: {}",
-                artifact.file
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -132,13 +144,32 @@ pub fn validate(
     assets: &Path,
     catalog: &Catalog,
 ) -> Result<Vec<(String, String)>> {
+    validate_records(
+        &records
+            .iter()
+            .cloned()
+            .map(CertificationRecord::Legacy)
+            .collect::<Vec<_>>(),
+        checkout,
+        assets,
+        catalog,
+    )
+}
+
+pub fn validate_records(
+    records: &[CertificationRecord],
+    checkout: &Path,
+    assets: &Path,
+    catalog: &Catalog,
+) -> Result<Vec<(String, String)>> {
     let required = derive_cells(&catalog.lanes)
         .into_iter()
         .map(|cell| (cell.row_id, cell.model))
         .collect::<BTreeSet<_>>();
     let mut found = BTreeSet::new();
     for record in records {
-        let key = (record.row_id.clone(), record.model.clone());
+        let (row, model, _) = record.key();
+        let key = (row.to_string(), model.to_string());
         if !required.contains(&key) {
             return Err(refuse(format!(
                 "undeclared_certification_cell: {}/{}",
@@ -148,7 +179,7 @@ pub fn validate(
         if !found.insert(key) {
             return Err(refuse("duplicate_certification_cell"));
         }
-        validate_record(record, checkout, assets, catalog)?;
+        record.validate(checkout, assets, catalog)?;
     }
     if let Some((row, model)) = required.difference(&found).next() {
         return Err(refuse(format!("missing_certification_cell: {row}/{model}")));
@@ -207,16 +238,17 @@ pub fn validate_checkout(
             if value["schema"] != RECORD_SCHEMA {
                 return Err(refuse("record_schema_mismatch"));
             }
-            let record: Record =
+            let record: CertificationRecord =
                 serde_json::from_value(value).map_err(|error| refuse(error.to_string()))?;
-            if record.row_id != row_id
-                || Some(record.model.as_str()) != path.file_stem().and_then(|s| s.to_str())
-                || record.source_commit != source
+            let (record_row, model, commit) = record.key();
+            if record_row != row_id
+                || Some(model) != path.file_stem().and_then(|s| s.to_str())
+                || commit != source
             {
                 return Err(refuse("record_path_mismatch"));
             }
             records.push(record);
         }
     }
-    validate(&records, checkout, assets, catalog)
+    validate_records(&records, checkout, assets, catalog)
 }

@@ -19,7 +19,7 @@ pub const ROW_BACKENDS: [(&str, &str); 8] = [
 pub type CatalogLane = (String, String, String, String);
 
 /// Plain catalog data at the module-to-validator boundary. Tasks are keyed by
-/// catalog id and contain the catalog's `embed` or `rerank` task.
+/// catalog id and contain the catalog's `embed`, `rerank` or `transcribe` task.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     pub lanes: Vec<CatalogLane>,

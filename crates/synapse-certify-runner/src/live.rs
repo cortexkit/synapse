@@ -62,6 +62,22 @@ pub(crate) fn worker(row: &str) -> Option<&'static str> {
     }
 }
 impl LiveRunner {
+    pub(crate) fn transcribe(&mut self, row: &str) -> Result<Value> {
+        self.prepare(row)?;
+        if row != "metal-m5" && self.probe_floor(row, synapse_parity::speech::MODEL)? != "ok" {
+            return Err(refuse(format!(
+                "real hardware pass required on {}: transcribe device floor probe refused",
+                crate::transcribe::required_machine(row)
+            )));
+        }
+        self.runtime.block_on(crate::transcribe::run(
+            &self.options,
+            &self.source,
+            row,
+            self.floor.as_ref(),
+            &self.layout.as_ref().expect("prepared layout").1,
+        ))
+    }
     pub fn new(mut options: Options, source: &str) -> Result<Self> {
         options.assets = dunce::canonicalize(&options.assets).map_err(err)?;
         options.checkout = dunce::canonicalize(&options.checkout).map_err(err)?;
@@ -74,7 +90,7 @@ impl LiveRunner {
             layout: None,
         })
     }
-    fn prepare(&mut self, row: &str) -> Result<()> {
+    pub(crate) fn prepare(&mut self, row: &str) -> Result<()> {
         if let Some((existing, _)) = &self.layout {
             if existing != row {
                 return Err(refuse("runner cannot change row during a run"));
@@ -146,7 +162,7 @@ impl Drop for DaemonTask {
     }
 }
 
-struct Session {
+pub(crate) struct Session {
     child: tokio::process::Child,
     daemon: DaemonTask,
     stream: TcpStream,
@@ -199,7 +215,7 @@ async fn rpc(
     .map_err(err)?
 }
 impl Session {
-    async fn shutdown(&mut self) -> Result<()> {
+    pub(crate) async fn shutdown(&mut self) -> Result<()> {
         self.child.start_kill().map_err(err)?;
         self.child.wait().await.map_err(err)?;
         self.daemon.0.abort();
@@ -261,7 +277,7 @@ fn candidate_command(
     command
 }
 
-async fn start(layout: &crate::assets::Layout, endpoint: &str) -> Result<Session> {
+pub(crate) async fn start(layout: &crate::assets::Layout, endpoint: &str) -> Result<Session> {
     let root = &layout.root;
     std::fs::create_dir_all(root.join("data")).map_err(err)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
@@ -880,7 +896,7 @@ fn any_truncated(response: &Value) -> bool {
         .is_some_and(|items| items.iter().any(|item| item["truncated"] == true))
 }
 
-fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
+pub(crate) fn machine(row: &str, floor: Option<&Value>) -> Result<Value> {
     #[cfg(target_os = "macos")]
     {
         let output =

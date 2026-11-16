@@ -10,10 +10,12 @@ use std::path::{Component, Path, PathBuf};
 mod catalog;
 pub mod command;
 pub mod self_check;
+pub mod transcribe;
 mod validation;
 
 pub use catalog::{derive_cells, row_backend, Catalog, CatalogLane, Cell, ROW_BACKENDS};
-pub use validation::{validate, validate_checkout, validate_record};
+pub use transcribe::CertificationRecord;
+pub use validation::{validate, validate_checkout, validate_record, validate_records};
 pub const GATES: [&str; 10] = [
     "complete",
     "dimension",

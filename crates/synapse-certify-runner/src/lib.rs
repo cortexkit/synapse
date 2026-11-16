@@ -6,6 +6,7 @@ mod catalog;
 pub mod command;
 pub mod live;
 mod mirror;
+mod transcribe;
 
 use synapse_certify::Error;
 

@@ -70,6 +70,46 @@ class ReleaseChecks(unittest.TestCase):
         self.write_catalog()
         self.assertEqual(self.cells(), [('metal-m5', 'single')])
 
+    def test_transcribe_cells_are_certified_but_not_competitor_benchmarked(self):
+        self.catalog['models'].append({'id': 'speech', 'task': 'transcribe',
+                                       'backends': [{'backend': backend} for backend in ('metal', 'ane', 'cuda', 'vulkan')]})
+        self.write_catalog()
+        speech = {(row, 'speech') for row in ROWS}
+        self.assertEqual(set(self.cells()) - set(check.benchmark_cells(self.root)), speech)
+        self.assertTrue(speech <= set(self.cells()))
+
+    def test_transcribe_release_gate_refuses_missing_measurements_and_false_gates(self):
+        model = 'parakeet-tdt-0.6b-v3'
+        profile = model + '.owned-cuda'
+        self.catalog['models'].append({'id': model, 'task': 'transcribe', 'backends': [
+            {'backend': 'cuda', 'engine': 'owned-cuda', 'fingerprint': 'pin'}]})
+        self.write_catalog()
+        manifest = self.root / 'bench/parity/models.json'
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({'profiles': {profile: {'transcribe': {'max_duration_ms': 600000}}}}))
+        seal = {'bytes': 40, 'reassembled_bytes': 40, 'sha256': 'a' * 64, 'reassembled_sha256': 'a' * 64, 'pages': 1}
+        record: dict[str, Any] = dict(schema=3, row_id='cuda-linux-nvidia', model=model, operation='transcribe', profile_id=profile,
+                      fingerprint='pin', status='passed', precision_class='fp32', max_duration_ms=600000, max_encoder_frames=7500,
+                      measurements=dict(self_check_wall_ms=1999, longest_progress_interval_ms=119999, ane_shapes=[], peak_device_memory_bytes=1),
+                      self_check={'state': 'passed', 'fingerprints': ['pin']}, executed_ladder=['ladder-600000ms'],
+                      split_wer={'test-clean': [0.1, 0.1]}, expected_refusals=[], observe_rerun={'bit_identical': True, 'fixture_ids': ['fixture']},
+                      graded_fixtures=[dict(id='fixture', lane_id=model + '-cuda', fingerprint='pin', integrity_passed=True,
+                                            encoder_output=seal, decode_trace=seal, trace_passed=True, trace_error=None, encoder_min_cosine=1.0)])
+        check.transcribe_record(self.root, record)
+        for field in ['self_check_wall_ms', 'longest_progress_interval_ms', 'ane_shapes', 'peak_device_memory_bytes']:
+            bad = copy.deepcopy(record)
+            del bad['measurements'][field]
+            with self.assertRaises((ValueError, KeyError)):
+                check.transcribe_record(self.root, bad)
+        for field, value in [('trace_passed', False), ('integrity_passed', False), ('encoder_min_cosine', 0.998), ('fingerprint', 'wrong')]:
+            bad = copy.deepcopy(record)
+            bad['graded_fixtures'][0][field] = value
+            self.rejects(check.transcribe_record, self.root, bad)
+        for field, value in [('self_check_wall_ms', 2000), ('longest_progress_interval_ms', 120000), ('peak_device_memory_bytes', 0)]:
+            bad = copy.deepcopy(record)
+            bad['measurements'][field] = value
+            self.rejects(check.transcribe_record, self.root, bad)
+
     def test_removing_cuda_removes_cells_profiles_and_refuses_leftover(self):
         entries, records, assets, cert, report_dir = self.evidence_fixture()
         before = set(self.cells())

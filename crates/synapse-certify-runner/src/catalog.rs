@@ -15,7 +15,7 @@ pub(crate) struct Pin {
     pub task: String,
 }
 
-async fn bounded(
+pub(crate) async fn bounded(
     client: &mut impl Client,
     method: &str,
     params: Value,
@@ -68,7 +68,7 @@ pub(crate) async fn install(
             .into(),
         task: entry["task"]
             .as_str()
-            .filter(|s| matches!(*s, "embed" | "rerank"))
+            .filter(|s| matches!(*s, "embed" | "rerank" | "transcribe"))
             .ok_or_else(|| refuse("catalog task missing"))?
             .into(),
     };
@@ -221,6 +221,25 @@ mod tests {
     }
     fn listed() -> Value {
         json!({"models": [{"model_id": "model-metal", "self_check": {"state": "passed"}, "fingerprints": ["pin"]}]})
+    }
+    #[tokio::test]
+    async fn transcribe_task_installs_the_pinned_backend_cell() {
+        let mut client = stub(vec![
+            json!({"models":[{"id":"parakeet-tdt-0.6b-v3","task":"transcribe","backends":[{"backend":"cuda","lane_id":"parakeet-tdt-0.6b-v3-cuda","fingerprint":"pin","runnable":true}]}]}),
+            json!({"job_id":"download"}),
+            json!({"state":"committed"}),
+        ]);
+        let pin = install(
+            &mut client,
+            "cuda-linux-nvidia",
+            "parakeet-tdt-0.6b-v3",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pin.task, "transcribe");
+        assert_eq!(pin.lane_id, "parakeet-tdt-0.6b-v3-cuda");
+        assert_eq!(pin.fingerprint, "pin");
     }
     #[tokio::test]
     async fn loading_retries_same_fixture_after_hint_and_never_completes_it() {

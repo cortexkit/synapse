@@ -47,6 +47,70 @@ def benchmark_cells(root):
     return [(row, model) for row, model in catalog_cells(root) if models[model].get('task') != 'transcribe']
 
 
+def transcribe_record(root, record):
+    """Reject incomplete speech evidence before the candidate's full offline check."""
+    r = record
+    models = load(root / 'crates/synapse-module/src/catalog/models.json')['models']
+    model = next((m for m in models if m['id'] == r['model']), None)
+    if model is None or model.get('task') != 'transcribe':
+        raise ValueError('speech catalog task mismatch')
+    backend = ROW_BACKENDS[r['row_id']]
+    lane = next((b for b in model['backends'] if b['backend'] == backend), None)
+    if lane is None:
+        raise ValueError('speech catalog lane missing')
+    require(r['fingerprint'] == lane['fingerprint'] and
+            r['profile_id'] == r['model'] + '.' + lane['engine'], 'speech catalog pin mismatch')
+    profile = load(root / 'bench/parity/models.json')['profiles'][r['profile_id']]
+    speech = profile['transcribe']
+    require(r['schema'] == 3 and r['operation'] == 'transcribe' and r['status'] == 'passed', 'speech schema or status mismatch')
+    require(r['precision_class'] == speech.get('precision_class', 'fp32'), 'speech precision mismatch')
+    maximum = r['max_duration_ms']
+    require(type(maximum) is int and 0 < maximum <= speech['max_duration_ms'] and
+            r['max_encoder_frames'] == (maximum * 16 // 160 + 7) // 8, 'speech maximum mismatch')
+    measures = r['measurements']
+    for field, ceiling in [('self_check_wall_ms', 2000), ('longest_progress_interval_ms', 120000)]:
+        require(type(measures[field]) is int and 0 <= measures[field] < ceiling, 'speech timing gate: ' + field)
+    require(r['self_check']['state'] == 'passed' and r['self_check']['fingerprints'] == [r['fingerprint']], 'speech self-check failed')
+    require(isinstance(measures['ane_shapes'], list), 'speech shape inventory missing')
+    if backend == 'ane':
+        require(measures['ane_shapes'], 'ANE speech shape inventory empty')
+        for shape in measures['ane_shapes']:
+            executables = shape['executables']
+            require(len(executables) == 24 and len({e['id'] for e in executables}) == 24 and
+                    sorted(layer for e in executables for layer in e['layers']) == list(range(24)), 'ANE speech executable inventory failed')
+    if backend in ('cuda', 'vulkan'):
+        require(type(measures['peak_device_memory_bytes']) is int and measures['peak_device_memory_bytes'] > 0, 'speech peak memory missing')
+    if backend == 'vulkan':
+        require(measures['peak_device_memory_bytes'] <= profile['vulkan_min_device_local_bytes'] and
+                type(measures['peak_storage_buffer_bytes']) is int and
+                0 < measures['peak_storage_buffer_bytes'] <= profile['vulkan_min_storage_buffer_range'], 'Vulkan speech memory floor exceeded')
+    graded = r['graded_fixtures']
+    require(graded and r['executed_ladder'] and r['split_wer'], 'speech graded coverage missing')
+    for rates in r['split_wer'].values():
+        require(len(rates) == 2 and all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in rates) and
+                rates[1] - rates[0] <= 0.005, 'speech WER gate failed')
+    for fixture in graded:
+        require(fixture['lane_id'] == r['model'] + '-' + backend and fixture['fingerprint'] == r['fingerprint'] and
+                fixture['integrity_passed'] is True, 'speech observation integrity failed')
+        for part in ('encoder_output', 'decode_trace'):
+            seal = fixture[part]
+            require(seal['bytes'] == seal['reassembled_bytes'] and seal['sha256'] == seal['reassembled_sha256'] and
+                    re.fullmatch('[a-f0-9]{64}', seal['sha256']) and seal['pages'] == (seal['bytes'] + 524287) // 524288,
+                    'speech observation seal mismatch')
+        require(fixture['trace_passed'] is True or (r['precision_class'] == 'fp16' and fixture['trace_error']), 'speech trace gate failed')
+        if fixture['encoder_min_cosine'] is not None:
+            minimum = fixture['encoder_min_cosine']
+            require(math.isfinite(minimum) and -1 <= minimum <= 1 and
+                    (r['precision_class'] == 'fp16' or minimum >= 0.999), 'speech encoder gate failed')
+    for refusal in r['expected_refusals']:
+        require(refusal['code'] == 'input_too_large' and refusal['field'] == 'input.audio' and
+                refusal['limit'] == 'max_duration_ms' and refusal['max_duration_ms'] == maximum and
+                refusal['max_encoder_frames'] == r['max_encoder_frames'] and refusal['duration_ms'] > maximum and
+                refusal['worker_requests'] == refusal['shape_admissions'] == 0, 'speech expected refusal failed')
+    rerun = r['observe_rerun']
+    require(rerun['bit_identical'] is True and rerun['fixture_ids'], 'speech observe rerun missing')
+
+
 def cuda_models(cells):
     return {model for row, model in cells if ROW_BACKENDS[row] == 'cuda'}
 
@@ -189,6 +253,8 @@ def stress_evidence(stress):
 def evidence(root, s, assets, entries):
     cert = root / 'docs/evidence/certification' / s
     cells = catalog_cells(root)
+    tasks = {model['id']: model.get('task') for model in
+             load(root / 'crates/synapse-module/src/catalog/models.json')['models']}
     paths = [cert / row / (model + '.json') for row, model in cells]
     records = [load(path) for path in paths]
     for path in cert.rglob('*.json'):
@@ -200,6 +266,8 @@ def evidence(root, s, assets, entries):
     for r, (row, model) in zip(records, cells):
         require(r['source_commit'] == s and r['row_id'] == row and r['model'] == model, 'record path mismatch')
         require(r['status'] == 'passed', 'record must be passed')
+        if tasks.get(model) == 'transcribe' or r.get('operation') == 'transcribe':
+            transcribe_record(root, r)
         # Records store hardware UUIDs only as salted digests;
         # a raw value means the record came from an older or altered producer.
         machine = r.get('machine') or {}
