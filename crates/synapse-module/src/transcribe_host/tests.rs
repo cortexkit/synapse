@@ -102,6 +102,25 @@ fn transcribe_duration_and_resampled_frame_limits_refuse_before_features() {
 }
 
 #[test]
+fn transcribe_ane_certified_duration_refuses_before_features_without_changing_profile() {
+    let p = TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.ane-direct-worker").unwrap();
+    assert_eq!(p.max_duration_ms, 600_000);
+    assert_eq!(p.max_encoder_frames, 7500);
+    let error = prepare_wav(&p, &wav(81_860 * 16, 16_000), ObservationMode::Serving)
+        .err()
+        .unwrap();
+    let TranscribeHostError::DurationLimit(details) = error else {
+        panic!("expected certified duration refusal")
+    };
+    assert_eq!(details.duration_ms, 81_860);
+    assert_eq!(details.max_duration_ms, 81_850);
+    let exact = prepare_wav(&p, &wav(81_850 * 16, 16_000), ObservationMode::Serving).unwrap();
+    assert_eq!(exact.duration_ms, 81_850);
+    assert_eq!(exact.valid_encoder_frames, 1024);
+    assert_eq!(exact.request.valid_mel_frames, 8185);
+}
+
+#[test]
 fn transcribe_largest_padded_mel_frame_must_fit_negotiated_limit() {
     let p = profile();
     let bytes = (8192 * 8 + 1) * 128 * 4;

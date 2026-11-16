@@ -387,6 +387,16 @@ Both checks precede engine work; there is no silent truncation or hidden
 chunking. Zero-sample WAVs, truncated chunks, other codecs/bit depths and
 out-of-range channel counts or rates are invalid audio.
 
+The direct Neural Engine Parakeet lane (`parakeet-tdt-0.6b-v3-ane`) currently
+serves audio up to 81,850 ms, the longest duration certified on hardware; Metal,
+CUDA and Vulkan Parakeet lanes keep their 600,000 ms limit. A catalog backend may
+declare a positive `certified_max_duration_ms` no greater than its profile's
+`max_duration_ms`; the serving limit is the smaller of the two, or the profile
+limit when no cap is declared. `role.describe`, `models.catalog` and
+`models.list` report this serving limit as `max_duration_ms`, and both duration
+checks above use it. The cap is serving policy only: it changes no lane
+fingerprint, profile digest or installed-byte manifest digest.
+
 Audio bytes live only in owner-only `media-audio` beneath the data folder
 (0700 directory and 0600 files on Unix; the user data ACL on Windows), explicitly
 excluded from Engram backups. SQLite holds metadata, replay bindings and results,

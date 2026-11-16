@@ -104,6 +104,141 @@ fn first(state: &ModuleState) -> String {
     select(state, MODEL).unwrap().1.backend
 }
 
+fn ane_fixture(label: &str) -> (PathBuf, Arc<ModuleState>) {
+    let (root, mut state) = fixture(label, true);
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime)
+        .unwrap()
+        .runnable_backends = BTreeSet::from(["ane".into()]);
+    (root, state)
+}
+
+async fn duration_request(state: &Arc<ModuleState>, id: &str, duration_ms: u32) -> Value {
+    let samples = duration_ms * 16;
+    let size = samples * 2;
+    let mut wav = b"RIFF".to_vec();
+    wav.extend_from_slice(&(size + 36).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+    wav.extend_from_slice(&16_000u32.to_le_bytes());
+    wav.extend_from_slice(&32_000u32.to_le_bytes());
+    wav.extend_from_slice(b"\x02\0\x10\0data");
+    wav.extend_from_slice(&size.to_le_bytes());
+    wav.resize(size as usize + 44, 0);
+    let sha = format!("{:x}", Sha256::digest(&wav));
+    let upload = call(
+        state,
+        "alice",
+        "media.upload_begin",
+        json!({"mime":"audio/wav","bytes":wav.len(),"sha256":sha}),
+    )
+    .await
+    .unwrap()["upload_id"]
+        .clone();
+    let mut received = 0;
+    for chunk in wav.chunks(2 * 1024 * 1024) {
+        call(
+            state,
+            "alice",
+            "media.upload_append",
+            json!({"upload_id":upload,"offset":received,"data":base64_encode(chunk)}),
+        )
+        .await
+        .unwrap();
+        received += chunk.len();
+    }
+    call(
+        state,
+        "alice",
+        "media.upload_commit",
+        json!({"upload_id":upload}),
+    )
+    .await
+    .unwrap();
+    json!({"client_job_id":id,"kind":"transcribe","model":format!("{MODEL}-ane"),
+        "input":{"audio":{"mime":"audio/wav","bytes":wav.len(),"sha256":sha,"object_id":upload}}})
+}
+
+#[tokio::test]
+async fn media_ane_certified_duration_refuses_before_host_or_shape_admission() {
+    let (root, state) = ane_fixture("media-ane-over-cap");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    // The inference hook runs before loading a host or asking the Neural Engine
+    // scheduler to admit and compile an audio shape.
+    *state.runtime.media.runner.lock().unwrap() = Some(Arc::new(move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Err(internal("over-limit audio reached inference"))
+    }));
+    let request = duration_request(&state, "one-frame-over", 81_860).await;
+    let job = call(&state, "alice", "media.submit", request)
+        .await
+        .unwrap();
+    let status = done(&state, job["job_id"].as_str().unwrap()).await;
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["failure"]["code"], "input_too_large");
+    assert_eq!(status["failure"]["detail"]["field"], "input.audio");
+    assert_eq!(status["failure"]["detail"]["limit"], "max_duration_ms");
+    assert_eq!(status["failure"]["detail"]["duration_ms"], 81_860);
+    assert_eq!(status["failure"]["detail"]["max_duration_ms"], 81_850);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(lane_cache(&state.runtime, &format!("{MODEL}-ane"))
+        .lock()
+        .await
+        .host
+        .is_none());
+    cleanup(root, state).await;
+}
+
+#[tokio::test]
+async fn media_ane_certified_duration_stated_refusal_and_declaration() {
+    let (root, state) = ane_fixture("media-ane-stated-cap");
+    let described = call(&state, "alice", "role.describe", json!({}))
+        .await
+        .unwrap();
+    let engines = described["engines"].as_array().unwrap();
+    assert_eq!(engines.len(), 2);
+    assert!(engines
+        .iter()
+        .all(|engine| engine["max_duration_ms"] == 81_850));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    *state.runtime.media.runner.lock().unwrap() = Some(Arc::new(move |_, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Err(internal("over-limit audio reached inference"))
+    }));
+    let mut request = request("stated-one-frame-over");
+    request["model"] = json!(format!("{MODEL}-ane"));
+    request["input"]["audio"]["duration_ms"] = json!(81_860);
+    let error = call(&state, "alice", "media.submit", request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.0["code"], "input_too_large");
+    assert_eq!(error.0["detail"]["field"], "input.audio");
+    assert_eq!(error.0["detail"]["limit"], "max_duration_ms");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    cleanup(root, state).await;
+}
+
+#[tokio::test]
+async fn media_ane_certified_duration_accepts_exact_cap() {
+    let (root, state) = ane_fixture("media-ane-exact-cap");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    *state.runtime.media.runner.lock().unwrap() = Some(Arc::new(move |lane, _| {
+        assert_eq!(lane, format!("{MODEL}-ane"));
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"text":"hello","words":[],"no_speech":false}))
+    }));
+    let mut request = duration_request(&state, "exact-cap", 81_850).await;
+    request["input"]["audio"]["duration_ms"] = json!(81_850);
+    let job = call(&state, "alice", "media.submit", request)
+        .await
+        .unwrap();
+    let status = done(&state, job["job_id"].as_str().unwrap()).await;
+    assert_eq!(status["status"], "done");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    cleanup(root, state).await;
+}
+
 #[tokio::test]
 async fn media_declaration_selection_and_five_states() {
     let (root, state) = fixture("media-states", false);

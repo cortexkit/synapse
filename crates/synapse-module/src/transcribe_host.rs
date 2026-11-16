@@ -203,10 +203,21 @@ pub fn prepare_wav(
     // that exact count for admission, including the input-duration refusal.
     let samples = (audio.samples.len() as u64 * 16_000).div_ceil(audio.sample_rate as u64) as usize;
     let valid_encoder_frames = synapse_speech::valid_encoder_frames(samples as u64) as usize;
-    if duration_ms > profile.max_duration_ms || valid_encoder_frames > profile.max_encoder_frames {
+    // Keep the numerical profile intact for identity and worker negotiation;
+    // serving must also obey the independently certified catalog duration.
+    let max_duration_ms = crate::catalog::compiled_catalog()
+        .map_err(|error| TranscribeHostError::Profile(error.to_string()))?
+        .models
+        .iter()
+        .flat_map(|entry| &entry.backends)
+        .find(|backend| backend.profile.as_deref() == Some(profile.id.as_str()))
+        .and_then(crate::catalog::CatalogBackend::effective_max_duration_ms)
+        .ok_or_else(|| TranscribeHostError::Profile("missing catalog serving duration".into()))?
+        .min(profile.max_duration_ms);
+    if duration_ms > max_duration_ms || valid_encoder_frames > profile.max_encoder_frames {
         return Err(TranscribeHostError::DurationLimit(DurationLimit {
             duration_ms,
-            max_duration_ms: profile.max_duration_ms,
+            max_duration_ms,
             valid_encoder_frames,
             max_encoder_frames: profile.max_encoder_frames,
         }));

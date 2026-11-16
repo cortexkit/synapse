@@ -120,6 +120,10 @@ pub(crate) struct CatalogBackend {
     pub max_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_ms: Option<u64>,
+    /// Serving admission only: hardware certification may cover less audio than
+    /// the numerical profile. This does not describe model or installed bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certified_max_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pooling: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +131,13 @@ pub(crate) struct CatalogBackend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dims: Option<u64>,
     pub fingerprint: String,
+}
+
+impl CatalogBackend {
+    pub(crate) fn effective_max_duration_ms(&self) -> Option<u64> {
+        self.max_duration_ms
+            .map(|maximum| maximum.min(self.certified_max_duration_ms.unwrap_or(maximum)))
+    }
 }
 
 /// The reference data a freshly loaded catalog lane is checked against on
@@ -780,6 +791,11 @@ fn validate_backend(id: &str, task: &str, row: &CatalogBackend) -> Result<(), Ca
         let duration = row
             .max_duration_ms
             .ok_or_else(|| missing("max_duration_ms"))?;
+        if let Some(certified) = row.certified_max_duration_ms {
+            if certified == 0 || certified > duration {
+                return Err(invalid("certified_max_duration_ms", certified.to_string()));
+            }
+        }
         let profile = crate::transcribe_host::TranscribeProfile::pinned(
             row.profile.as_deref().ok_or_else(|| missing("profile"))?,
         )
@@ -815,6 +831,14 @@ fn validate_backend(id: &str, task: &str, row: &CatalogBackend) -> Result<(), Ca
             }
         }
     } else {
+        if row.certified_max_duration_ms.is_some() {
+            return Err(CatalogError::ForbiddenBackendField {
+                id: id.into(),
+                backend,
+                task: task.into(),
+                field: "certified_max_duration_ms",
+            });
+        }
         if row.max_duration_ms.is_some() {
             return Err(CatalogError::ForbiddenBackendField {
                 id: id.into(),
@@ -2145,6 +2169,56 @@ mod tests {
     }
 
     #[test]
+    fn certified_duration_is_positive_bounded_and_transcribe_only() {
+        let index = compiled_entry_index("parakeet-tdt-0.6b-v3");
+        for certified in [0, 600_001] {
+            let mut doc = compiled_value();
+            doc["models"][index]["backends"][0]["certified_max_duration_ms"] = json!(certified);
+            assert!(matches!(
+                schema(&doc),
+                Err(CatalogError::InvalidBackendField {
+                    field: "certified_max_duration_ms",
+                    ..
+                })
+            ));
+        }
+        for certified in [1, 81_850, 600_000] {
+            let mut doc = compiled_value();
+            doc["models"][index]["backends"][0]["certified_max_duration_ms"] = json!(certified);
+            let catalog = schema(&doc).unwrap();
+            assert_eq!(
+                catalog.models[index].backends[0].effective_max_duration_ms(),
+                Some(certified)
+            );
+        }
+        for task_index in [0, 1] {
+            let mut doc = compiled_value();
+            doc["models"][task_index]["backends"][0]["certified_max_duration_ms"] = json!(81_850);
+            assert!(matches!(
+                schema(&doc),
+                Err(CatalogError::ForbiddenBackendField {
+                    field: "certified_max_duration_ms",
+                    ..
+                })
+            ));
+        }
+        for entry in &compiled_catalog().unwrap().models {
+            for backend in &entry.backends {
+                let capped = entry.task == "transcribe" && backend.backend == "ane";
+                assert_eq!(backend.certified_max_duration_ms, capped.then_some(81_850));
+                assert_eq!(
+                    backend.effective_max_duration_ms(),
+                    if capped {
+                        Some(81_850)
+                    } else {
+                        backend.max_duration_ms
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn transcribe_catalog_requires_audio_fields_and_forbids_token_fields() {
         let index = compiled_entry_index("parakeet-tdt-0.6b-v3");
         for field in ["profile", "family", "dtype", "execution", "max_duration_ms"] {
@@ -2351,7 +2425,7 @@ mod tests {
     #[test]
     fn existing_catalog_lane_ids_and_fingerprints_are_unchanged() {
         let catalog = compiled_catalog().unwrap();
-        for (id, backend, fingerprint) in [
+        let pins = [
             // This catalog lane's fingerprint changed on purpose: it opts in to
             // f16 weight projections, recorded in its engine identity as
             // projection_dtype = f16 and graph revision 5. It was
@@ -2391,7 +2465,76 @@ mod tests {
                 "ane",
                 "afa50ba3e4c56f42c750d10751f91b700f812c73862bdec8977d3a3db169aef3",
             ),
-        ] {
+            (
+                "gte-modernbert-base",
+                "cuda",
+                "5f07dca3b028ed3db106e4f9d05ad0452ea43199c0830e600a480b0c2eb81010",
+            ),
+            (
+                "gte-modernbert-base",
+                "vulkan",
+                "9d281846adc39572fcc10bdd06ee43eefd17d45f4702a85a05e0ca285a922182",
+            ),
+            (
+                "gte-reranker-modernbert-base",
+                "cuda",
+                "829c20af3757ecd5bb53ab89507ff64d4382225688f5888d6236ffc1670f2d4d",
+            ),
+            (
+                "gte-reranker-modernbert-base",
+                "vulkan",
+                "160e6ae78d2bad1aa4b5a8a4125dc0f2e820e2aea5509057d7ac7cd656426c99",
+            ),
+            (
+                "qwen3-embedding-0.6b",
+                "cuda",
+                "9628e6a8b0f30e9eb459f09cfb985306bbbaf2440579d38660e9795c4353554b",
+            ),
+            (
+                "qwen3-embedding-0.6b",
+                "vulkan",
+                "9a33500fe3db4e4ff48e1afd8319f195e18a64a79d955e1dfaa5e4b3ee54aeb9",
+            ),
+            (
+                "qwen3-reranker-0.6b",
+                "cuda",
+                "28ac017d49cf3ec25f1a343a5316287cfeefb131ac6ed5bbf3c56ca392090688",
+            ),
+            (
+                "qwen3-reranker-0.6b",
+                "vulkan",
+                "be2a9be41f50a203e9b2ae9dbd7a998eb6522f9376aa40224a3a588357c947d7",
+            ),
+            (
+                "parakeet-tdt-0.6b-v3",
+                "metal",
+                "a9fd8c153e040e61e457d4c8e40b942e2d91310501c9ec56510c994db319dcf6",
+            ),
+            (
+                "parakeet-tdt-0.6b-v3",
+                "ane",
+                "716c0d8eb47500d371fe218beaa0e89853c105530fb457e425653375139abc19",
+            ),
+            (
+                "parakeet-tdt-0.6b-v3",
+                "cuda",
+                "be2c2b674600f7230a853c7d7023ad5844b61a246525825c9bcec7d1c462e782",
+            ),
+            (
+                "parakeet-tdt-0.6b-v3",
+                "vulkan",
+                "567c6a6f10c0145d1a56a15e1f570168d036246356a807f922f816a907af2b7f",
+            ),
+        ];
+        assert_eq!(
+            pins.len(),
+            catalog
+                .models
+                .iter()
+                .map(|entry| entry.backends.len())
+                .sum::<usize>()
+        );
+        for (id, backend, fingerprint) in pins {
             assert_eq!(lane_id(id, backend), format!("{id}-{backend}"));
             assert_eq!(
                 catalog

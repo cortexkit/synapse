@@ -170,12 +170,16 @@ fn engines(runtime: &RuntimeState) -> Vec<Engine> {
             })
             .collect();
         if let Some(first) = runnable.first() {
-            engines.push(engine(&entry.id, first.max_duration_ms.unwrap_or(0), entry));
+            engines.push(engine(
+                &entry.id,
+                first.effective_max_duration_ms().unwrap_or(0),
+                entry,
+            ));
         }
         for backend in runnable {
             engines.push(engine(
                 &catalog::lane_id(&entry.id, &backend.backend),
-                backend.max_duration_ms.unwrap_or(0),
+                backend.effective_max_duration_ms().unwrap_or(0),
                 entry,
             ));
         }
@@ -376,18 +380,21 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
                 .map_err(internal)?;
         let samples = (decoded.samples.len() as u64 * 16_000).div_ceil(decoded.sample_rate as u64);
         let frames = synapse_speech::valid_encoder_frames(samples);
+        let max_duration_ms = backend
+            .effective_max_duration_ms()
+            .expect("transcribe duration");
         if audio
             .duration_ms
-            .is_some_and(|duration| duration > profile.max_duration_ms)
+            .is_some_and(|duration| duration > max_duration_ms)
         {
             return Err(input_limit("max_duration_ms"));
         }
-        let duration_failure = if decoded.duration_ms() > profile.max_duration_ms
+        let duration_failure = if decoded.duration_ms() > max_duration_ms
             || frames > profile.max_encoder_frames as u64
         {
             let mut e = input_limit("max_duration_ms");
             e.0["detail"]["duration_ms"] = json!(decoded.duration_ms());
-            e.0["detail"]["max_duration_ms"] = json!(profile.max_duration_ms);
+            e.0["detail"]["max_duration_ms"] = json!(max_duration_ms);
             e.0["detail"]["valid_encoder_frames"] = json!(frames);
             e.0["detail"]["max_encoder_frames"] = json!(profile.max_encoder_frames);
             Some(e)

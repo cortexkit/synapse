@@ -26280,7 +26280,15 @@ mod catalog_runtime_tests {
                     let mut row = json!({"model_id": lane, "max_tokens": spec.max_tokens,
                         "recommended_batch": {"rows":8,"token_budget":8192}});
                     catalog_list_row(&state, &mut row).unwrap();
-                    assert_eq!(row["max_duration_ms"], 600_000, "{lane}");
+                    assert_eq!(
+                        row["max_duration_ms"],
+                        if backend.backend == "ane" {
+                            81_850
+                        } else {
+                            600_000
+                        },
+                        "{lane}"
+                    );
                     assert!(row.get("max_tokens").is_none(), "{lane}");
                     assert!(row.get("recommended_batch").is_none(), "{lane}");
                 } else {
@@ -28284,7 +28292,7 @@ async fn models_catalog(state: Arc<ModuleState>, params: Value) -> HandlerOutcom
                 if let Some(refusal) = refusal.filter(|r| !r.details.is_empty()) {
                     row["reason_details"] = json!(refusal.details);
                 }
-                if let Some(duration) = b.max_duration_ms {
+                if let Some(duration) = b.effective_max_duration_ms() {
                     row["max_duration_ms"] = json!(duration);
                 }
                 backends.push(row);
@@ -31695,7 +31703,9 @@ fn catalog_list_row(state: &ModuleState, row: &mut Value) -> Result<(), WireOper
             ] {
                 object.remove(field);
             }
-            row["max_duration_ms"] = json!(backend.max_duration_ms.expect("transcribe duration"));
+            row["max_duration_ms"] = json!(backend
+                .effective_max_duration_ms()
+                .expect("transcribe duration"));
         }
         let check = catalog_self_check_projection(state, entry, backend)?;
         row["certified"] = json!(check["state"] == "passed");

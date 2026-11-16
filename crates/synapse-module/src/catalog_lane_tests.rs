@@ -37,6 +37,14 @@ fn catalog_transcribe_config_never_uses_an_embed_owned_family() {
         assert_eq!(numeric.engine, config.identity);
         assert_eq!(numeric.fingerprint().0, backend.fingerprint);
         assert_eq!(
+            numeric.manifest_profile_digest.as_deref(),
+            Some(profile.typed.digests.profiles[&profile.id].as_str())
+        );
+        assert_eq!(
+            profile.typed.profile_digest(&profile.id).unwrap(),
+            profile.typed.digests.profiles[&profile.id]
+        );
+        assert_eq!(
             numeric.sanitized_tokenizer_digest,
             profile.model()["tokenizer_digest"]
         );
@@ -62,6 +70,29 @@ fn catalog_transcribe_config_never_uses_an_embed_owned_family() {
             .to_string()
             .contains("has no transcribe config"));
     }
+    drop(state);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_certified_duration_does_not_change_lane_identity_or_installed_bytes() {
+    let (root, state) = isolated_catalog_state("speech-cap-identities", false);
+    let mut lanes = 0;
+    for entry in &state.runtime.release_catalog.models {
+        let mut uncapped = entry.clone();
+        for backend in &mut uncapped.backends {
+            backend.certified_max_duration_ms = None;
+        }
+        assert_eq!(entry.manifest_digest(), uncapped.manifest_digest());
+        for (backend, original) in entry.backends.iter().zip(&uncapped.backends) {
+            let capped = catalog_lane_spec(&state, entry, backend, false).unwrap();
+            let original = catalog_lane_spec(&state, &uncapped, original, false).unwrap();
+            assert_eq!(capped.numeric_profile_id, original.numeric_profile_id);
+            assert_eq!(capped.fingerprint, original.fingerprint);
+            lanes += 1;
+        }
+    }
+    assert_eq!(lanes, 18);
     drop(state);
     fs::remove_dir_all(root).unwrap();
 }
@@ -93,9 +124,14 @@ fn catalog_transcribe_lane_refuses_embed_and_rerank_before_token_length_checks()
 
 #[tokio::test]
 async fn catalog_transcribe_list_and_catalog_publish_duration_not_token_advice() {
-    let (root, state) = isolated_catalog_state("speech-audio-rows", true);
+    let (root, mut state) = isolated_catalog_state("speech-audio-rows", true);
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime)
+        .unwrap()
+        .runnable_backends
+        .insert("ane".into());
     let entry = state.runtime.release_catalog.entry(SPEECH).unwrap();
     install_record(&state, entry, "metal");
+    install_record(&state, entry, "ane");
     let listed = models_list_payload(&state, state.store.catalog_snapshot().unwrap());
     let row = listed["models"]
         .as_array()
@@ -105,6 +141,13 @@ async fn catalog_transcribe_list_and_catalog_publish_duration_not_token_advice()
         .unwrap();
     assert_eq!(row["max_duration_ms"], 600000);
     assert_eq!(row["self_check"]["state"], "pending");
+    let ane = listed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["model_id"] == format!("{SPEECH}-ane"))
+        .unwrap();
+    assert_eq!(ane["max_duration_ms"], 81_850);
     for field in [
         "max_tokens",
         "max_tokens_source",
@@ -125,7 +168,14 @@ async fn catalog_transcribe_list_and_catalog_publish_duration_not_token_advice()
     assert_eq!(rows.len(), 1);
     assert_eq!(catalog["catalog_revision"], 2);
     for row in rows[0]["backends"].as_array().unwrap() {
-        assert_eq!(row["max_duration_ms"], 600000);
+        assert_eq!(
+            row["max_duration_ms"],
+            if row["backend"] == "ane" {
+                81_850
+            } else {
+                600_000
+            }
+        );
         for field in [
             "max_tokens",
             "attention_units",

@@ -418,6 +418,7 @@
           "profile": "parakeet-tdt-0.6b-v3.ane-direct-worker",
           "family": "parakeet-tdt", "dtype": "f16", "execution": "supervised",
           "max_duration_ms": 600000,
+          "certified_max_duration_ms": 81850,
           "fingerprint": "716c0d8eb47500d371fe218beaa0e89853c105530fb457e425653375139abc19"
         },
         {
