@@ -299,9 +299,10 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
     subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone());
-    // `serve` takes the handler, so keep a handle on the one slot the stop line
-    // needs: how the daemon connection ended, which the SDK reports to the
-    // handler just before `serve` returns.
+    // On the registration-channel launch path the SDK exits the process from
+    // inside `on_connection_end` and never returns from `serve`, so the stop line
+    // is written in that hook. This slot tells the code after `serve` whether the
+    // hook already wrote it.
     let connection_end = Arc::clone(&handler.inner.connection_end);
     // One line when serving starts and one when it ends, so a restart that the
     // daemon or an operator caused can be read from this log alone. Without them
@@ -343,11 +344,13 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         // (`eof`, `reset`) and from this module closing the connection itself
         // (`closed`), which the bare stop line could not. On the error arm the
         // SDK reports no reason; the error itself says why.
+        // The hook already logged the stop; only a return without one is logged here.
+        Ok(()) if connection_end.get().is_some() => {}
         Ok(()) => tracing::info!(
             target: "lifecycle",
             module = %module_id,
             uptime_s,
-            reason = connection_end_reason(connection_end.get().copied()),
+            reason = connection_end_reason(None),
             "synapse stopped: serve loop returned"
         ),
         Err(error) => tracing::warn!(
@@ -537,6 +540,9 @@ struct SynapseHandlerInner {
     /// How the daemon connection ended, set once by the SDK's end-of-connection
     /// callback and read by the `synapse stopped` log line.
     connection_end: Arc<OnceLock<ConnectionEnd>>,
+    /// When the handler was built, just before serving; the stop line reports
+    /// uptime from it.
+    started: std::time::Instant,
 }
 
 impl SynapseHandlerInner {
@@ -2454,6 +2460,7 @@ impl SynapseHandler {
                 flow_routes: Mutex::new(HashMap::new()),
                 diagnostics_routes: Mutex::new(HashMap::new()),
                 connection_end: Arc::new(OnceLock::new()),
+                started: std::time::Instant::now(),
             }),
         }
     }
@@ -4273,11 +4280,20 @@ impl ModuleHandler for SynapseHandler {
         }
     }
 
-    /// Remembers how the daemon connection ended so the `synapse stopped` line
-    /// can say it. The SDK calls this at most once per connection, and this
-    /// module serves exactly one connection per process.
+    /// Writes the `synapse stopped` line. On the registration-channel launch path
+    /// the SDK exits the process right after this hook returns, so code after
+    /// `serve` never runs there. The SDK calls this at most once per connection,
+    /// and this module serves exactly one connection per process.
     async fn on_connection_end(&self, end: ConnectionEnd) {
-        let _ = self.inner.connection_end.set(end);
+        if self.inner.connection_end.set(end).is_ok() {
+            tracing::info!(
+                target: "lifecycle",
+                module = %self.inner.module_id,
+                uptime_s = self.inner.started.elapsed().as_secs(),
+                reason = connection_end_reason(Some(end)),
+                "synapse stopped: connection ended"
+            );
+        }
     }
 
     /// Report degraded health when probe-dependent lanes refuse requests because
