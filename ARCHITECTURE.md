@@ -3,21 +3,24 @@
 ## What synapse is
 
 Synapse is a local inference service. It runs as the `synapse` module on the subc
-bus (binary `ck-synapse`) and serves embedding, reranking and small-model generation
-to other fleet modules. Embedding and reranking run only on synapse's own engines:
-Metal and the Neural Engine on Apple hardware, CUDA and Vulkan on Linux and Windows.
-There is no CPU embedding lane and no remote gateway: a machine with no runnable
-backend gets `backend_unavailable`, and modules that want hosted inference call their
-provider directly. Some engines run inside the module process; the rest run in
-supervised worker processes that the module spawns and talks to over local IPC. The
+bus (binary `ck-synapse`) and serves embedding, reranking, batch transcription and
+small-model generation to other fleet modules. Embedding, reranking and
+transcription run only on synapse's own engines: Metal and the Neural Engine on
+Apple hardware, CUDA and Vulkan on Linux and Windows. There is no CPU lane for
+these tasks and no remote gateway. Without a runnable backend, requests refuse
+`backend_unavailable` for embed/rerank or `unsupported` for media transcription;
+modules that want hosted inference call their provider directly. Some engines run
+inside the module process; the rest run in supervised worker processes that the
+module spawns and talks to over local IPC. The
 repository also holds a benchmark and research tree (`bench/`).
 
 Models come from two places:
 - **The catalog**, compiled into the binary (`crates/synapse-module/src/catalog/models.json`):
   ModernBERT (gte-modernbert-base, gte-reranker-modernbert-base) and Qwen3 0.6B
-  (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B), each pinned per backend with its
-  fingerprint. Installs are explicit (`models.download`); a catalog lane checks
-  itself on the device at first load and needs no probe or approval.
+  (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B), plus Parakeet TDT 0.6B v3 for
+  transcription, each pinned per backend with its fingerprint. Installs are
+  explicit (`models.download`); a catalog lane checks itself on the device at first
+  load and needs no probe or approval.
 - **Legacy lanes**, loaded from config preloads or `model.load`. They keep their
   existing ids, fingerprints and probe/approval gates, because stored vectors depend
   on them.
@@ -38,11 +41,21 @@ Engram at startup. Owned-generation logic lives in sibling directories of `src/`
 `owned-decode-certification`, `owned-decode-sidecar` and `owned-decode-manifests`.
 
 **`synapse-core`** (`crates/synapse-core`). Shared vocabulary for the module and the
-workers: engine traits (`EmbedEngine`, `RerankEngine`, `GenerateEngine`), the
-sanitized tokenizer, numeric profiles and fingerprints, the machine profile, the
-scheduler, the stable error-code contract, response envelopes, the worker protocol,
-framing and transports (UNIX socket and Windows named pipe), the child-process spawn
-helper and the `ckdev-` test-binary helper.
+workers: engine traits (`EmbedEngine`, `RerankEngine`, `GenerateEngine`,
+`TranscribeEngine`), the sanitized tokenizer, numeric profiles and fingerprints,
+the machine profile, the scheduler, the stable error-code contract, response
+envelopes, the worker protocol, framing and transports (UNIX socket and Windows
+named pipe), the child-process spawn helper and the `ckdev-` test-binary helper.
+
+**`synapse-speech`** (`crates/synapse-speech`). Reusable WAV decoding, resampling,
+log-mel features, greedy Token-and-Duration Transducer (TDT) decoding,
+detokenization and word timing, independent of the module, store and daemon. The
+`media-provider/v1` transcribe path runs through
+`crates/synapse-module/src/media_jobs.rs` (uploads, jobs and observation pages) and
+`transcribe_host.rs` (catalog load, self-check and inference). Engines receive mel
+features, not audio: Metal runs in-process; ANE direct, CUDA and Vulkan use dedicated
+transcribe worker processes. See the [wire contract](docs/wire-contract-v1.md#local-batch-transcription-media-providerv1)
+for engine selection, limits and refusals.
 
 **`synapse-native-probe`** (`crates/synapse-native-probe`). The few unsafe native
 calls the machine profile needs on Windows, kept out of `synapse-core`.
@@ -108,6 +121,7 @@ rerank quality scoring.
 | --- | --- | --- |
 | Module entry and ops | `crates/synapse-module/src/lib.rs` | `dispatch_request`, `management_operations`, handlers, config |
 | Model catalog | `crates/synapse-module/src/catalog/` | `models.json` pins, backend declarations, manifest digests |
+| Batch transcription | `crates/synapse-module/src/media_jobs.rs`, `transcribe_host.rs` | local media jobs, audio retention, catalog transcribe hosts and observation paging |
 | Store | `crates/synapse-module/src/store.rs` | SQLite schema, migrations, engine allow-list, jobs, certification, approvals |
 | Worker host | `crates/synapse-module/src/worker_host/mod.rs` | spawn, handshake, requests, restarts, quarantine |
 | Worker liveness | `crates/synapse-module/src/worker_host/liveness.rs` | no-progress limits |
@@ -118,7 +132,8 @@ rerank quality scoring.
 | Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
 | Core ML materialization | `crates/synapse-module/src/ane_artifact.rs` | digest-keyed extraction of Core ML bundles |
 | Decode routing | `crates/synapse-module/owned-decode-routing/` | lane choice, ANE prefill router |
-| Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TokenBatch` |
+| Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TranscribeEngine`, `TokenBatch` |
+| Shared speech core | `crates/synapse-speech/src/` | WAV front end, TDT loop, detokenization and word timing |
 | Tokenizer | `crates/synapse-core/src/tokenizer.rs` | sanitized tokenization, digests, truncation disclosure |
 | Fingerprints | `crates/synapse-core/src/fingerprint.rs` | `NumericProfile`, `Fingerprint`, aliases |
 | Machine profile | `crates/synapse-core/src/machine_profile.rs` | profile fields and hash |

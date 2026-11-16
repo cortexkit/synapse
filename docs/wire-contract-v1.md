@@ -46,7 +46,7 @@ safe_to_retry_same_request, message, details?}. `details` is an optional object.
 Transient errors may carry retry_after_ms. Never poll-hammer
 a permanent code.
 
-The `code` field uses two vocabularies. Core `StableErrorCode` supplies
+Error-code vocabularies are surface-specific. Core `StableErrorCode` supplies
 `queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
 `substitution_rejected`, `artifact_invalid`, `engine_crashed`,
 `probe_required`, `migration_required`, and `module_restarted` here.
@@ -55,6 +55,13 @@ Owned-decode refusals use a separate vocabulary:
 `microllm.oneshot` requests when grammar is disabled by module or approval
 configuration, or when no certified enabled owned-decode grammar lane is
 available.
+
+The [local transcription surface](#local-batch-transcription-media-providerv1)
+uses the `media-provider/v1` envelope and refusal vocabulary, not the catalog
+result envelope below. In particular, undeclared engines use `unsupported`
+(not `unknown_model` or `backend_unavailable`), changed replay bindings use
+`client_job_id_reuse` (not `idempotency_conflict`), and audio limits use
+`input_too_large`. Media error details live in singular `detail`.
 
 - `sequence_too_long` — class `permanent`, no `retry_after_ms`, not safe to
   retry the same request. A catalog-installed lane refuses a composed input
@@ -216,11 +223,12 @@ not request params, establishes flow identity and authorization.
 
 ## 5. Operations
 
-Checks: `management_registry_matches_wire_contract`,
-`inventory_parse_survives_a_crlf_checkout`, and
-`drift_scanner_detects_added_ops_and_missing_documentation` (`wire_contract`
-integration target). The operation-specific skeleton and catalog e2e tests prove
-runtime behavior; inventory checks alone do not prove numerical execution.
+Checks: `wire_contract_documents_every_management_operation` (module library)
+compares the registry with the inventory below, including on CRLF checkouts;
+`stable_errors_are_exhaustively_documented_and_keep_wire_names` (`wire_contract`
+integration target) checks the core error vocabulary. The operation-specific
+skeleton and catalog e2e tests prove runtime behavior; inventory checks alone do
+not prove numerical execution.
 
 The management registry in this snapshot is `embed.query`, `embed.batch`,
 `embed.result`, `rerank.score`, `microllm.oneshot`,
@@ -244,8 +252,9 @@ This surface follows `cortexkit-role-media` 0.1.11. Successful RESPONSE bodies
 are exactly `{result: answer}`; ERROR bodies are `{code, message, detail}` with
 `detail.class` (`permanent` or `transient`). Local transcription needs neither
 a vault credential nor a host binding and writes no usage or price record.
-Identity comes from the daemon's route principal, never request params. Foreign
-job/object ids are indistinguishable from unknown ids. Flow-scoped routes refuse
+Identity comes from the route principal (the caller identity supplied by the
+daemon), never request params. Foreign job/object ids are indistinguishable from
+unknown ids. Flow-scoped routes refuse
 all of these operations with `flow_scope_refused`.
 
 - **role.describe** {} — query; declares group `jobs`,
@@ -316,19 +325,43 @@ all of these operations with `flow_scope_refused`.
   part has zero pages). Pages are principal-scoped, reject an invalid part or
   page with `invalid_params {field}`, and expire with their job result.
 
-The catalog engine id `parakeet-tdt-0.6b-v3` selects the first runnable backend
-in catalog order (Metal, ANE, CUDA, Vulkan). Lane ids append `-metal`, `-ane`,
-`-cuda` or `-vulkan` and pin that backend. Neither form switches to another
-backend when the selected one is not installed, failed its self-check, or is
-paused or quarantined. Non-runnable engines are not declared
-and submit naming an undeclared model (unknown or non-runnable) refuses permanent
-`unsupported {field: "model"}` without storing or starting work. Runnable uninstalled engines remain
-declared and refuse `model_not_installed {download_op: "models.download"}`.
-Persisted numerical failures remain declared and refuse permanent
-`self_check_failed`. Transient load/self-check faults and worker quarantine
-remain declared and refuse `engine_crashed` with `retry_after_ms`; quarantine
-also names `lane_id` and `quarantined: true`. Neural Engine pause refuses
-`lane_paused` without selecting a different backend.
+#### Engine ids and declaration states
+
+The request's `model` names one of these engines, as advertised by `role.describe`:
+
+| Engine id | Backend selection | Platform |
+| --- | --- | --- |
+| `parakeet-tdt-0.6b-v3` | First runnable backend in catalog order: Metal, ANE, CUDA, Vulkan | macOS, Linux, Windows |
+| `parakeet-tdt-0.6b-v3-metal` | In-process owned Metal | macOS |
+| `parakeet-tdt-0.6b-v3-ane` | Direct Neural Engine worker | macOS |
+| `parakeet-tdt-0.6b-v3-cuda` | Owned CUDA worker | Linux, Windows |
+| `parakeet-tdt-0.6b-v3-vulkan` | Owned Vulkan worker | Linux, Windows |
+
+The catalog id therefore prefers Metal over ANE on macOS and CUDA over Vulkan
+on Linux and Windows, subject to backend availability and device floors. To
+request the Neural Engine explicitly, use `parakeet-tdt-0.6b-v3-ane`. Selection
+happens before checking install, self-check, pause or quarantine state. Neither
+the catalog id nor a lane id falls back when its selected backend cannot serve.
+There is no CPU lane, hosted fallback or live streaming transcription.
+
+| State of the selected backend | Engine declared? | Serving outcome |
+| --- | --- | --- |
+| Not runnable on this machine | No | Permanent `unsupported {field: "model"}`; no work or storage |
+| Runnable, not installed | Yes | Permanent `model_not_installed {download_op: "models.download"}` |
+| Installed, persisted self-check failure | Yes | Permanent `self_check_failed {model_id, backend, check_id, reason}`; no `retry_after_ms` |
+| Installed, transient load/self-check fault or worker quarantine | Yes | `engine_crashed` with `retry_after_ms`; quarantine also names `lane_id` and `quarantined: true` |
+| Installed, no serving refusal | Yes | Job accepted for execution |
+
+An unknown model also refuses `unsupported {field: "model"}`. Permanent
+self-check failures rerun only after a change to the self-check key (catalog id,
+manifest digest, backend, fingerprint, engine identity, OS build or fixture
+revision), or after the model is removed and downloaded again.
+A load/runtime failure or the 2000 ms self-check ceiling
+is transient instead. Neural Engine pause (`lanes.pause` scope `neural_engine`)
+keeps the engine declared but refuses `lane_paused`, without selecting another
+backend. Installs use `models.download`; no probe or approval is required.
+
+#### Admission limits and retention
 
 Each lane runs one transcription at a time and admits at most 16 non-terminal
 jobs; catalog jobs count against their selected lane. Upload reservations and
@@ -346,6 +379,14 @@ inference. Duration failures also carry
 The byte limit uses `input_too_large {field: "input.audio", limit:
 "max_input_bytes"}`.
 
+`max_duration_ms` is the selected lane's certified limit, not a global promise
+of ten-minute support. Input duration is `ceil(sample_frames * 1000 / sample_rate)`
+before resampling. The resampled 16 kHz sample count also determines
+`valid_encoder_frames`, which must not exceed that lane's certified frame limit.
+Both checks precede engine work; there is no silent truncation or hidden
+chunking. Zero-sample WAVs, truncated chunks, other codecs/bit depths and
+out-of-range channel counts or rates are invalid audio.
+
 Audio bytes live only in owner-only `media-audio` beneath the data folder
 (0700 directory and 0600 files on Unix; the user data ACL on Windows), explicitly
 excluded from Engram backups. SQLite holds metadata, replay bindings and results,
@@ -356,6 +397,31 @@ jobs/results/replays survive restart; queued/running jobs become failed with
 transient `module_restarted`. Retention sweeps remove expired audio and results;
 startup also removes orphaned audio. These retention, replay and word-shape
 rules apply to this media surface.
+
+#### Reading certification observation frames
+
+Certification observations copy results without changing inference. Outside
+`certify_observation` mode the result omits `observation`, and
+`certify.transcribe_observation` refuses `certify_observation_disabled`.
+The descriptor's `lane_id` and `fingerprint` identify the lane that actually ran,
+including when the job was submitted under the catalog id. All raw values are
+little-endian:
+
+| Field or paged part | Raw encoding |
+| --- | --- |
+| `triples` (inline base64) | Consecutive i32 `(token_id, frame_index, duration)` triples, 12 bytes each |
+| `encoder_output` (paged) | Row-major f32, `valid_encoder_frames * 1024` values |
+| `decode_trace` (paged) | 40-byte records: i32 `frame_index`, `token_top1`, `token_top2`, `duration_top1`, `duration_top2`; f32 `token_logit1`, `token_logit2`, `duration_logit1`, `duration_logit2`; u32 `flags` |
+
+Trace duration ids 0–4 select durations of 0, 1, 2, 3 or 4 encoder frames,
+respectively (80 ms per frame). Flag bit 0 means emitted and bit 1 means cap hit,
+with all other bits zero. `encoder_output` and `decode_trace`
+are descriptors only, never inline raw arrays. For each part, read page indices
+`0` through `pages - 1` with `{job_id, part, page}`, base64-decode each reply's
+`data`, and concatenate in index order. Verify the concatenation against the
+descriptor's `bytes` and SHA-256 before decoding records. Page boundaries are
+byte offsets, not record boundaries; an empty part requires no reads. Pages are
+deleted with the job and remain private to its route principal.
 
 ### Other management operations
 
@@ -516,6 +582,8 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   `device_below_floor` or `worker_missing`. Download bytes sum distinct manifest
   files needed by runnable backends, independent of installation (zero with none).
   Catalog values and pinned upstream revisions come from the compiled document.
+  Transcribe backend rows additionally carry their certified `max_duration_ms`;
+  token-shaped limits are not part of those rows.
 - **`models.download`** (mutate) `{catalog_id, request_key?}` → a flat download
   status, initially `queued` or `downloading`, before off-request-path fetching
   completes. No automatic downloads occur. Checks, in order: a derived lane id
@@ -623,6 +691,10 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   have lane id `<catalog_id>-<backend>`, one fingerprint, and initial state
   `unloaded` with `max_tokens_source: catalog_unloaded`. Unload keeps the row;
   remove deletes it. Free-form field presence and decode gates are unchanged.
+  Transcribe rows instead carry `max_duration_ms` and omit `max_tokens`,
+  `max_tokens_source`, `recommended_batch`, `bucket_ladder`, `dims`, `pooling`,
+  `normalize` and `attention_units`; their envelope counts audio duration and
+  encoder frames, not text tokens.
 - **model.load / model.status, probe.start / probe.status / probe.report** —
   load and probe start/status are job-shaped (poll-first); `probe.report` is a
   query. Probe is EXPLICIT, never auto-triggered; certification + perf rows are
@@ -641,17 +713,20 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
 
 ### Catalog serving and migration
 
-The compiled catalog has four frozen ids: `gte-modernbert-base` (embed,
+The compiled catalog (`catalog_revision: 2`) has five frozen ids:
+`gte-modernbert-base` (embed,
 `Alibaba-NLP/gte-modernbert-base`, revision `e7f32e3c00f91d699e8c43b53106206bcc72bb22`),
 `gte-reranker-modernbert-base` (rerank, `Alibaba-NLP/gte-reranker-modernbert-base`,
 revision `f7481e6055501a30fb19d090657df9ec1f79ab2c`), `qwen3-embedding-0.6b`
 (embed, `Qwen/Qwen3-Embedding-0.6B`, revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`),
-and `qwen3-reranker-0.6b` (rerank, `Qwen/Qwen3-Reranker-0.6B`, revision
-`e61197ed45024b0ed8a2d74b80b4d909f1255473`). The first three declare only Metal;
-the last has no backends or files. No catalog ANE/CUDA/Vulkan backend ships in
-this release. On Linux/Windows the Metal rows remain visible but report
-`not_supported_on_platform`; `runnable_here: true` returns no entries and
-`download_bytes` is zero. There is no CPU fallback.
+`qwen3-reranker-0.6b` (rerank, `Qwen/Qwen3-Reranker-0.6B`, revision
+`e61197ed45024b0ed8a2d74b80b4d909f1255473`), and `parakeet-tdt-0.6b-v3`
+(transcribe, `nvidia/parakeet-tdt-0.6b-v3`, revision
+`541d1f99c6b0c3cd0b11a95167540bb8edefd82b`). Transcribe backend platforms are
+listed in the engine table above. `models.catalog` retains non-runnable backend
+rows with a reason such as `not_supported_on_platform`; `runnable_here: true`
+filters to entries with a backend runnable on the current machine.
+There is no CPU fallback.
 
 A catalog id selects the first runnable backend in catalog order; a declared
 lane id or fingerprint pins a backend. The selected lane never falls back to

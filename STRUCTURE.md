@@ -27,6 +27,7 @@ crates/                     production Rust crates
   synapse-native-probe/     safe wrappers for the Windows calls the machine profile reads
   synapse-opctl/            operator CLI (ck-synapse-opctl)
   synapse-release-checks/   Python gates the tag workflow runs over prebuilt release assets
+  synapse-speech/           WAV/log-mel front end, Token-and-Duration Transducer (TDT) loop, word timing
   synapse-worker-ane/       Core ML Neural Engine embedding worker (Rust launcher + Swift)
   synapse-worker-ane-direct/ direct Neural Engine worker for the -ane catalog lanes
   synapse-worker-cuda/      CUDA embedding and reranking worker
@@ -70,7 +71,13 @@ binary that speaks `crates/synapse-core/src/worker_protocol.rs` over the transpo
 binary name to `crates/synapse-core/src/worker_engine_names.rs`, wire spawning in
 `crates/synapse-module/src/worker_host/mod.rs`, add the engine to the allow-list in
 `crates/synapse-module/src/store.rs` if it serves embedding or reranking, and add the
-crate to the root `Cargo.toml` members. The worker receives token ids, not text.
+crate to the root `Cargo.toml` members. Embed/rerank workers receive token ids,
+not text; transcribe workers receive mel features, not audio.
+
+**Batch transcription.** `crates/synapse-module/src/media_jobs.rs` owns the local
+`media-provider/v1` operations, uploads, job retention and certification pages;
+`transcribe_host.rs` loads and self-checks catalog lanes. Shared audio processing
+and TDT decoding live in `crates/synapse-speech`, independent of the module/store.
 
 **New catalog model or backend.** Add the model to `bench/parity/models.json` and its
 reference fixtures (see `docs/reference-generation.md`), then add the entry or backend
