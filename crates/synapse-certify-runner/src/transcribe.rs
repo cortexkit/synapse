@@ -535,22 +535,23 @@ pub(crate) async fn run(
         .clone()
         .ok_or_else(|| refuse("transcribe profile missing"))?;
     let audio_root = layout.root.join("transcribe-audio");
-    let prepared = tokio::process::Command::new("python3")
-        .arg(
-            options
-                .checkout
-                .join("crates/synapse-certify-runner/scripts/prepare-transcribe-audio.py"),
-        )
-        .arg("--repo")
-        .arg(&options.checkout)
-        .arg("--cache")
-        .arg(&options.mirror)
-        .arg("--output")
-        .arg(&audio_root)
-        .kill_on_drop(true)
-        .status()
-        .await
-        .map_err(err)?;
+    let prepared =
+        synapse_core::without_launch_nonce_tokio(tokio::process::Command::new("python3"))
+            .arg(
+                options
+                    .checkout
+                    .join("crates/synapse-certify-runner/scripts/prepare-transcribe-audio.py"),
+            )
+            .arg("--repo")
+            .arg(&options.checkout)
+            .arg("--cache")
+            .arg(&options.mirror)
+            .arg("--output")
+            .arg(&audio_root)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(err)?;
     if !prepared.success() {
         return Err(refuse(
             "speech audio preparation failed; install the pinned reference environment",
