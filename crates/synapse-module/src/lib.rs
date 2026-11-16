@@ -28392,7 +28392,7 @@ fn catalog_entry_complete(
         if current_catalog_install(state, entry, &backend.backend)?.is_none() {
             return Ok(false);
         }
-        for file in entry.backend_files(&backend.backend).values() {
+        for (_, file) in entry.backend_named_files(&backend.backend) {
             if CatalogCache(&state.model_cache)
                 .blob_size(&file.sha256)
                 .map_err(catalog_store_error)?
@@ -29072,9 +29072,8 @@ async fn fetch_catalog_download(
                 manifest_digest: manifest.clone(),
                 backend: b.clone(),
                 members: entry
-                    .backend_files(b)
-                    .values()
-                    .map(|f| store::CatalogInstallMember {
+                    .backend_named_files(b)
+                    .map(|(_, f)| store::CatalogInstallMember {
                         path: f.path.clone(),
                         digest: f.sha256.clone(),
                     })
@@ -31701,7 +31700,7 @@ async fn ensure_catalog_lane_ready_owned(
             let _disk = state.runtime.catalog_disk.lock().expect("catalog disk lock");
             catalog_validation_timing(&lane, "disk_lock", lock_started);
             let install = current_catalog_install(&state,&entry,&backend.backend)?.ok_or_else(|| catalog_wire_error("model_not_installed",json!({"catalog_id":entry.id,"lane_id":lane,"download_op":"models.download","download_job_id":null}),"catalog installation disappeared"))?;
-            for file in entry.backend_files(&backend.backend).values() {
+            for (_, file) in entry.backend_named_files(&backend.backend) {
                 let member = install
                     .members
                     .iter()

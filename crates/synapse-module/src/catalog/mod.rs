@@ -27,6 +27,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub(crate) mod package;
+
+#[cfg(test)]
+mod package_tests;
+
 /// The compiled catalog document shipped with this release.
 pub(crate) const COMPILED_CATALOG_JSON: &str = include_str!("models.json");
 
@@ -43,8 +48,8 @@ pub(crate) const ALLOWED_ENGINES: [&str; 4] = [
     "owned-vulkan",
 ];
 
-/// Every file role. Per backend there is exactly one `model` and one
-/// `tokenizer` file and at most one `config` file.
+/// Every file role. Qwen3-ASR source packages allow multiple model and config
+/// files; other families keep one model, one tokenizer and at most one config.
 pub(crate) const ALLOWED_ROLES: [&str; 3] = ["model", "tokenizer", "config"];
 
 /// Pooling values the worker protocol parses (`WorkerPooling`).
@@ -400,13 +405,25 @@ impl CatalogEntry {
             .sum()
     }
 
-    /// The files a backend loads, keyed by role.
+    /// Legacy single-file role lookup. Multi-file consumers use
+    /// `backend_named_files` so repeated roles cannot hide pinned files.
     pub(crate) fn backend_files(&self, backend: &str) -> BTreeMap<&str, &CatalogFile> {
         self.files
             .iter()
             .filter(|file| file.backends.iter().any(|name| name == backend))
             .map(|file| (file.role.as_str(), file))
             .collect()
+    }
+
+    /// All files for a backend, with their catalog names, in manifest order.
+    pub(crate) fn backend_named_files<'a>(
+        &'a self,
+        backend: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a CatalogFile)> + Clone {
+        self.files
+            .iter()
+            .filter(move |file| file.backends.iter().any(|name| name == backend))
+            .map(|file| (file.path.as_str(), file))
     }
 }
 
@@ -639,23 +656,7 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
             });
         }
     }
-    for backend in &entry.backends {
-        let files = entry
-            .files
-            .iter()
-            .filter(|file| file.backends.contains(&backend.backend));
-        for (role, min, max) in [("model", 1, 1), ("tokenizer", 1, 1), ("config", 0, 1)] {
-            let count = files.clone().filter(|file| file.role == role).count();
-            if count < min || count > max {
-                return Err(CatalogError::RoleCardinality {
-                    id,
-                    backend: backend.backend.clone(),
-                    role,
-                    count,
-                });
-            }
-        }
-    }
+    validate_file_roles(entry)?;
 
     if entry.task == "transcribe" && entry.self_check.is_some() {
         return Err(CatalogError::SelfCheckUnexpected { id });
@@ -675,6 +676,30 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), CatalogError> {
         (Some(check), false) => validate_self_check(entry, embed, check)
             .map_err(|reason| CatalogError::SelfCheckShape { id, reason }),
     }
+}
+
+fn validate_file_roles(entry: &CatalogEntry) -> Result<(), CatalogError> {
+    for backend in &entry.backends {
+        let multiple = backend.family.as_deref() == Some("qwen3-asr");
+        let maximum = if multiple { usize::MAX } else { 1 };
+        let files = entry.backend_named_files(&backend.backend);
+        for (role, min, max) in [
+            ("model", 1, maximum),
+            ("tokenizer", 1, 1),
+            ("config", 0, maximum),
+        ] {
+            let count = files.clone().filter(|(_, file)| file.role == role).count();
+            if count < min || count > max {
+                return Err(CatalogError::RoleCardinality {
+                    id: entry.id.clone(),
+                    backend: backend.backend.clone(),
+                    role,
+                    count,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn profile_manifest(
@@ -712,7 +737,7 @@ fn validate_profile_files(entry: &CatalogEntry) -> Result<(), CatalogError> {
         let model = manifest
             .model(&entry.id)
             .expect("profile model was validated");
-        for file in entry.backend_files(&backend.backend).values() {
+        for (_, file) in entry.backend_named_files(&backend.backend) {
             if model.files.get(&file.path) != Some(&file.sha256) {
                 return Err(CatalogError::SelfCheckShape {
                     id: entry.id.clone(),
