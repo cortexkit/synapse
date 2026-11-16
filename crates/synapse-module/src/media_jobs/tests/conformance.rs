@@ -18,7 +18,6 @@ struct LocalSubject {
     state: Arc<ModuleState>,
     control: Arc<(Mutex<Control>, Condvar)>,
     held: Mutex<Option<tokio::sync::OwnedMutexGuard<Lane>>>,
-    last_submit_id: Mutex<Option<String>>,
 }
 
 impl LocalSubject {
@@ -28,7 +27,6 @@ impl LocalSubject {
             state,
             control: Arc::default(),
             held: Mutex::default(),
-            last_submit_id: Mutex::default(),
         }
     }
 
@@ -81,10 +79,6 @@ impl MediaSubject for LocalSubject {
     }
 
     async fn call_as(&self, principal: &str, request: Request) -> SubjectResult<Value> {
-        if request.method == "media.submit" {
-            *self.last_submit_id.lock().unwrap() =
-                request.params["client_job_id"].as_str().map(str::to_owned);
-        }
         let mut params = request.params;
         // The only fixture-model translation is to the real local catalog id.
         if request.method == "media.submit" && params["model"] == "transcribe" {
@@ -199,24 +193,7 @@ async fn media_published_transcribe_conformance_report() {
         let outcome = cortexkit_role_media_conformance::run_case(&subject, name).await;
         println!("MEDIA_CONFORMANCE {name}: {outcome:?}");
         if let Outcome::Failed(reason) = &outcome {
-            // Known conformance gaps are reported, not passing results. Any new
-            // failure must be reviewed, including provider contract mismatches.
-            let expected = match name {
-                // The kit assumes French is unsupported, but the local catalog declares it.
-                "submit_refuses_outside_declared_facts" => {
-                    assert_eq!(
-                        subject.last_submit_id.lock().unwrap().as_deref(),
-                        Some("input.language"),
-                        "unexpected accepted request"
-                    );
-                    "media.submit accepted instead of unsupported: {\"result\":{\"job_id\":"
-                }
-                _ => panic!("unexpected kit failure for {name}: {reason}"),
-            };
-            assert!(
-                reason.contains(expected),
-                "unexpected kit failure: {reason}"
-            );
+            panic!("kit failure for {name}: {reason}");
         }
         counts[match outcome {
             Outcome::Passed => 0,
@@ -231,5 +208,5 @@ async fn media_published_transcribe_conformance_report() {
         "MEDIA_CONFORMANCE totals: passed={}, not_applicable={}, failed={}",
         counts[0], counts[1], counts[2]
     );
-    assert_eq!(counts, [19, 26, 1], "pinned kit applicability changed");
+    assert_eq!(counts, [20, 26, 0], "pinned kit applicability changed");
 }
