@@ -364,6 +364,110 @@ fn expected_store_path(data_home: &Path) -> PathBuf {
     data_home.join("cortexkit").join(MODULE_ID).join("store.db")
 }
 
+async fn wait_for_module_log(logs_dir: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // Read every segment so a UTC date rollover cannot hide the line.
+        let contents = std::fs::read_dir(logs_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect::<String>();
+        if contents.contains(needle) {
+            return contents;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for '{needle}' in {}:\n{contents}",
+            logs_dir.display()
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn event_publisher_attempts_delivery_after_daemon_boot() {
+    let daemon = start_daemon().await;
+    let config = serde_json::json!({
+        "preload_models": serde_json::from_str::<Value>(&deterministic_preload_config()).unwrap(),
+        "inline": { "max_items": 1 }
+    })
+    .to_string();
+    let mut command =
+        synapse_module_command(&daemon.connection_file_path, None, Some(&config), &[]);
+    command
+        .env("XDG_DATA_HOME", &daemon.data_home)
+        .env("LOCALAPPDATA", &daemon.data_home)
+        .env("CORTEXKIT_MODEL_CACHE", daemon.data_home.join("models"));
+    let module = ModuleProcess {
+        child: command.spawn().expect("spawn synapse-module"),
+    };
+    let (daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, module).await;
+    certify_preloaded_models(&mut consumer, route, 60).await;
+
+    // Exceed the inline limit to commit a durable result page and its outbox event.
+    let accepted = route_request(
+        &mut consumer,
+        route,
+        200,
+        serde_json::json!({
+            "method": "embed.batch",
+            "params": {
+                "model": "test-minilm",
+                "request_key": "publisher-start-e2e",
+                "items": [
+                    { "id": "first", "text": "hello world" },
+                    { "id": "second", "text": "hello again" }
+                ]
+            }
+        }),
+    )
+    .await;
+    let job_id = accepted["result"]["job_id"].as_str().expect("durable job");
+    let done = poll_embed_result(&mut consumer, route, 300, job_id).await;
+    assert_eq!(done["result"]["state"], "done", "{done}");
+    assert!(done["result"]["page_count"].as_u64().unwrap() > 0);
+
+    // The fixture daemon has no bus configured. A retained row alone cannot
+    // distinguish an outage from a publisher that never started; its lifecycle
+    // warning proves the publisher reached the delivery loop.
+    let logs_dir = daemon
+        .data_home
+        .join("cortexkit")
+        .join(MODULE_ID)
+        .join("logs");
+    let contents = wait_for_module_log(
+        &logs_dir,
+        "event publisher unavailable; committed events remain in the outbox",
+    )
+    .await;
+    let warning = contents
+        .lines()
+        .find(|line| {
+            line.contains("event publisher unavailable; committed events remain in the outbox")
+        })
+        .expect("publisher outage warning");
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(warning.contains("lifecycle:"), "{warning}");
+    assert!(warning.contains("error="), "{warning}");
+
+    let conn =
+        Connection::open(expected_store_path(&daemon.data_home)).expect("open synapse store");
+    let (events, unpublished): (u64, u64) = conn
+        .query_row(
+            "SELECT count(*), count(*) FILTER (WHERE published_at IS NULL) FROM event_outbox \
+             WHERE subject = 'event.synapse.job_page.v1' AND json_extract(body, '$.job_id') = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read committed job-page events");
+    assert!(events > 0, "durable batch must enqueue a job-page event");
+    assert_eq!(unpublished, events, "an outage must retain pending events");
+}
+
 #[tokio::test]
 async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
     let (daemon, _module, mut consumer, route) = open_route().await;
