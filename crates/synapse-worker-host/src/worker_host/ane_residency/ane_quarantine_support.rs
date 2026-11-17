@@ -7,7 +7,7 @@ use synapse_core::{
 };
 use tokio::io::DuplexStream;
 
-async fn channel() -> (
+pub async fn channel() -> (
     AneWorkerChannel<DuplexStream>,
     Arc<AtomicBool>,
     Arc<AtomicU64>,
@@ -94,7 +94,7 @@ async fn channel() -> (
     )
 }
 
-async fn infer(
+pub async fn infer(
     channel: &AneWorkerChannel<DuplexStream>,
 ) -> Result<WorkerResponse, AneResidencyError> {
     let request = WorkerRequest::EmbedBatch {
@@ -117,54 +117,4 @@ async fn infer(
         )
         .await
         .map(|(response, _)| response)
-}
-
-#[tokio::test]
-async fn two_consecutive_ane_hangs_use_catalog_quarantine() {
-    let (channel, _, starts) = channel().await;
-    for _ in 0..2 {
-        assert!(matches!(
-            infer(&channel).await,
-            Err(AneResidencyError::Channel(_))
-        ));
-        channel.restart().await.unwrap();
-    }
-    assert_eq!(
-        starts.load(Ordering::Relaxed),
-        2,
-        "quarantine confirms exit without spawning again"
-    );
-    let error = infer(&channel).await.unwrap_err();
-    assert!(matches!(error, AneResidencyError::Quarantined { .. }));
-    let wire = crate::ane_lane_error_to_wire(error, "catalog-ane-test");
-    assert_eq!(wire.code, "engine_crashed");
-    assert!(wire.retry_after_ms.unwrap() > 0);
-    assert_eq!(
-        wire.details,
-        Some(serde_json::json!({"lane_id":"catalog-ane-test","quarantined":true}))
-    );
-}
-
-#[tokio::test]
-async fn ane_hang_success_hang_does_not_quarantine() {
-    let (channel, hung, _) = channel().await;
-    assert!(matches!(
-        infer(&channel).await,
-        Err(AneResidencyError::Channel(_))
-    ));
-    channel.restart().await.unwrap();
-    hung.store(false, Ordering::Relaxed);
-    assert!(matches!(
-        infer(&channel).await.unwrap(),
-        WorkerResponse::Vectors { .. }
-    ));
-    assert_eq!(channel.faults.lock().unwrap().strikes, 0);
-    hung.store(true, Ordering::Relaxed);
-    assert!(matches!(
-        infer(&channel).await,
-        Err(AneResidencyError::Channel(_))
-    ));
-    assert_eq!(channel.faults.lock().unwrap().strikes, 1);
-    assert_eq!(channel.cooldown_remaining(), None);
-    channel.shutdown().await.unwrap();
 }

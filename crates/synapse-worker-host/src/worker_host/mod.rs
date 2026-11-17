@@ -48,10 +48,12 @@ mod quarantine_tests;
 
 // Catalog users cannot manually probe and approve a worker to restore serving.
 // A finite ten-minute cool-down lets a desktop lane recover without that step.
-pub(crate) const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
+pub const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
 mod liveness;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod test_support;
 mod transcribe;
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 use synapse_core::{read_raw, write_raw};
 #[cfg(all(test, unix))]
 mod framing_tests;
@@ -371,7 +373,7 @@ pub struct WorkerHost {
     loaded_models: HashMap<String, LoadedWorkerModel>,
     quarantined: HashSet<String>,
     quarantine_until: HashMap<String, Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clock: Option<Instant>,
     #[cfg(test)]
     test_idle_window: Option<Duration>,
@@ -399,7 +401,7 @@ impl WorkerHost {
             loaded_models: HashMap::new(),
             quarantined: HashSet::new(),
             quarantine_until: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clock: None,
             #[cfg(test)]
             test_idle_window: None,
@@ -1007,7 +1009,7 @@ impl WorkerHost {
                 _,
             )) => {
                 ensure_req_id(&req_id, &got)?;
-                crate::transcribe_host::validate_worker_load(
+                crate::exchange::validate_worker_load(
                     cfg,
                     self.config.max_frame,
                     transcribe_revision.as_ref(),
@@ -1326,7 +1328,7 @@ impl WorkerHost {
     }
 
     fn now(&self) -> Instant {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(now) = self.clock {
             return now;
         }
@@ -1612,7 +1614,7 @@ impl WorkerEngine {
     }
 
     /// Reads this model's crash fence without expiring it or restarting a worker.
-    pub(crate) fn model_quarantined(&self, model: &LoadedModel) -> Result<bool, WorkerHostError> {
+    pub fn model_quarantined(&self, model: &LoadedModel) -> Result<bool, WorkerHostError> {
         let host = self.lock_host()?;
         Ok(host
             .loaded_models
@@ -1663,29 +1665,29 @@ impl WorkerEngine {
         LoadedModel { model_id }
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn attach_mock_worker_for_test<F>(&self, respond: F)
+    #[cfg(all(unix, any(test, feature = "test-support")))]
+    pub fn attach_mock_worker_for_test<F>(&self, respond: F)
     where
         F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
     {
         self.runtime().block_on(async {
-            tests::attach_mock_worker(&mut self.lock_host().unwrap(), respond);
+            test_support::attach_mock_worker(&mut self.lock_host().unwrap(), respond);
         });
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn attach_mock_worker_frames_for_test<F>(&self, respond: F)
+    #[cfg(all(unix, any(test, feature = "test-support")))]
+    pub fn attach_mock_worker_frames_for_test<F>(&self, respond: F)
     where
         F: Fn(&WorkerRequest, Option<&[u8]>) -> Vec<(WorkerResponse, Option<Vec<u8>>)>
             + Send
             + 'static,
     {
         self.runtime().block_on(async {
-            tests::attach_mock_worker_frames(&mut self.lock_host().unwrap(), respond);
+            test_support::attach_mock_worker_frames(&mut self.lock_host().unwrap(), respond);
         });
     }
 
-    pub(crate) fn embed_batch_with_job(
+    pub fn embed_batch_with_job(
         &self,
         model: &LoadedModel,
         batch: TokenBatch,
@@ -1700,7 +1702,7 @@ impl WorkerEngine {
         result.map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
     }
 
-    pub(crate) fn rerank_with_job(
+    pub fn rerank_with_job(
         &self,
         model: &LoadedModel,
         request: RerankRequest,
@@ -1715,7 +1717,7 @@ impl WorkerEngine {
         result.map_err(|error| error.to_engine_error(EngineErrorStage::Inference))
     }
 
-    pub(crate) fn generate_with_job(
+    pub fn generate_with_job(
         &self,
         model: &LoadedModel,
         request: GenerateRequest,
@@ -1785,7 +1787,7 @@ impl WorkerEngine {
     /// Pause draining has already fenced inference. Confirm process exit before
     /// releasing the inherited hardware lock; an UNLOAD acknowledgement alone
     /// leaves the worker process (and its descriptor) alive.
-    pub(crate) fn shutdown_for_pause(&self) -> Result<(), WorkerHostError> {
+    pub fn shutdown_for_pause(&self) -> Result<(), WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime().block_on(async {
             if let Some(connection) = host.connection.as_mut() {
@@ -2691,6 +2693,8 @@ fn worker_generation_from_nonce(nonce: &str) -> Result<u64, WorkerHostError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::test_support::*;
     use super::*;
     #[test]
     #[cfg(unix)]
@@ -3312,79 +3316,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    type SeenRequests = Vec<(WorkerRequest, Option<Vec<u8>>)>;
-
-    /// Connects `host` to an in-process mock worker that answers each request
-    /// with `respond`. The returned task yields every request (and its raw
-    /// frame) once the host drops the connection.
-    #[cfg(unix)]
-    pub(super) fn attach_mock_worker<F>(
-        host: &mut WorkerHost,
-        respond: F,
-    ) -> tokio::task::JoinHandle<SeenRequests>
-    where
-        F: Fn(&WorkerRequest, Option<&[u8]>) -> (WorkerResponse, Option<Vec<u8>>) + Send + 'static,
-    {
-        attach_mock_worker_frames(host, move |request, raw| vec![respond(request, raw)])
-    }
-
-    #[cfg(unix)]
-    pub(super) fn attach_mock_worker_frames<F>(
-        host: &mut WorkerHost,
-        respond: F,
-    ) -> tokio::task::JoinHandle<SeenRequests>
-    where
-        F: Fn(&WorkerRequest, Option<&[u8]>) -> Vec<(WorkerResponse, Option<Vec<u8>>)>
-            + Send
-            + 'static,
-    {
-        let (module, mut worker) = tokio::net::UnixStream::pair().unwrap();
-        // The mock below speaks the protocol in-process; the host still owns a
-        // child process per connection, so give it a harmless one.
-        let child = Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        host.connection = Some(WorkerConnection {
-            stream: module,
-            child,
-            logs: LogRing::new(),
-            worker_generation: 1,
-            packed: None,
-            unusable: false,
-        });
-        tokio::spawn(async move {
-            let mut seen = Vec::new();
-            while let Ok(request) =
-                read_json::<WorkerRequest, _>(&mut worker, DEFAULT_MAX_FRAME_BYTES).await
-            {
-                let raw = if request.carries_raw_frame() {
-                    Some(
-                        read_raw(&mut worker, DEFAULT_MAX_FRAME_BYTES)
-                            .await
-                            .unwrap(),
-                    )
-                } else {
-                    None
-                };
-                for (response, raw_out) in respond(&request, raw.as_deref()) {
-                    write_json(&mut worker, &response, DEFAULT_MAX_FRAME_BYTES)
-                        .await
-                        .unwrap();
-                    if let Some(raw_out) = raw_out {
-                        write_raw(&mut worker, &raw_out, DEFAULT_MAX_FRAME_BYTES)
-                            .await
-                            .unwrap();
-                    }
-                }
-                seen.push((request, raw));
-            }
-            seen
-        })
-    }
-
-    #[cfg(unix)]
     fn host_for_engine(engine: &str) -> WorkerHost {
         let mut config = WorkerHostConfig::new("/bin/false", std::env::temp_dir());
         config.engine_identity = Some(EngineIdentity {
@@ -3742,6 +3673,8 @@ mod tests {
 /// workers are driven through [`AneShapeWorker`], whose connection is held only
 /// for a single exchange ([`AneWorkerChannel`]).
 pub mod ane_residency {
+    #[cfg(any(test, feature = "test-support"))]
+    pub mod ane_quarantine_support;
     #[cfg(test)]
     mod quarantine_tests;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -3755,7 +3688,7 @@ pub mod ane_residency {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     use synapse_core::{read_json, read_raw, write_json, write_raw};
     use synapse_core::{
         AnePlacementInventory, TransportError, WorkerRequest, WorkerResponse, ERR_ANE_LANE_BUSY,
@@ -5384,7 +5317,7 @@ pub mod ane_residency {
         /// Core ML can borrow an owned descriptor without depending on direct-ANE
         /// ownership. An absent or released lock is not a Core ML load refusal.
         #[cfg(unix)]
-        pub(crate) fn held_lane_lock(&self) -> Option<Arc<std::fs::File>> {
+        pub fn held_lane_lock(&self) -> Option<Arc<std::fs::File>> {
             self.inner
                 .lane_lock
                 .lock()
@@ -5603,8 +5536,8 @@ pub mod ane_residency {
         }
 
         /// Executables reserved against the budget, and leases currently held.
-        #[cfg(all(test, unix))]
-        pub(crate) fn reservation_snapshot(&self) -> (usize, u32) {
+        #[cfg(all(unix, any(test, feature = "test-support")))]
+        pub fn reservation_snapshot(&self) -> (usize, u32) {
             let state = self.inner.lock();
             (
                 state.reserved_executables(),
@@ -6494,7 +6427,7 @@ pub mod ane_residency {
         /// Replaces the pinned compile-cost seed in tests. Mock workers compile
         /// instantly, so test channels start with a zero seed (no early
         /// refusals, arrival order); the real-hardware stress clears it.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_compile_seed: Mutex<Option<std::time::Duration>>,
     }
 
@@ -6534,8 +6467,12 @@ pub mod ane_residency {
                 pid: Mutex::new(stream_pid),
                 #[cfg(test)]
                 classify_gate: Mutex::new(None),
-                #[cfg(test)]
-                test_compile_seed: Mutex::new(Some(std::time::Duration::ZERO)),
+                #[cfg(any(test, feature = "test-support"))]
+                test_compile_seed: Mutex::new(if cfg!(test) {
+                    Some(std::time::Duration::ZERO)
+                } else {
+                    None
+                }),
             })
         }
 
@@ -7017,7 +6954,7 @@ pub mod ane_residency {
             shape: usize,
             layers: usize,
         ) -> std::time::Duration {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(seed) = *self.test_compile_seed.lock().unwrap() {
                 return seed;
             }
@@ -7361,8 +7298,8 @@ pub mod ane_residency {
 
     /// Unit tests may inspect the production path to check this guard, but must
     /// never open it: another process may be using the machine's Neural Engine.
-    #[cfg(all(test, unix))]
-    pub(crate) fn assert_test_ane_lock_path(path: &Path) {
+    #[cfg(all(unix, any(test, feature = "test-support")))]
+    pub fn assert_test_ane_lock_path(path: &Path) {
         fn resolved(path: &Path) -> PathBuf {
             path.parent()
                 .and_then(|parent| parent.canonicalize().ok())
@@ -9594,20 +9531,24 @@ pub mod ane_residency {
         }
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) use tests::{
+    #[cfg(all(unix, any(test, feature = "test-support")))]
+    pub use test_support::{
         module_mock_engine, module_mock_engine_admission, module_mock_engine_controlled,
         module_mock_engine_resident, ModuleMockControl,
     };
 
+    #[cfg(any(test, all(unix, feature = "test-support")))]
+    mod test_support;
+
     #[cfg(test)]
     mod tests {
+        use super::test_support::*;
         use super::*;
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         use std::time::Duration;
         use synapse_core::{
             decode_f32_frame, encode_f32_frame, encode_i32_frame, AneExecutable, WorkerPooling,
-            WorkerTokenItem, DEFAULT_MAX_FRAME_BYTES, ERR_SHAPE_NOT_ADMITTED,
+            WorkerTokenItem, DEFAULT_MAX_FRAME_BYTES,
         };
         use tokio::io::DuplexStream;
 
@@ -9620,477 +9561,6 @@ pub mod ane_residency {
                 std::panic::catch_unwind(|| assert_test_ane_lock_path(&production)).is_err(),
                 "production lock guard must reject the machine-wide path before any file open"
             );
-        }
-
-        struct MockChannel(AneWorkerChannel<DuplexStream>);
-        impl std::ops::Deref for MockChannel {
-            type Target = AneWorkerChannel<DuplexStream>;
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-        impl AneShapeWorker for MockChannel {
-            fn stream_idle(&self) -> bool {
-                self.0.stream_idle()
-            }
-            fn worker_id(&self) -> &str {
-                self.0.worker_id()
-            }
-            fn generation(&self) -> u64 {
-                self.0.generation()
-            }
-            fn exit_unconfirmed(&self) -> bool {
-                self.0.exit_unconfirmed.load(Ordering::Acquire)
-            }
-            fn admit_shape_at_generation<'a>(
-                &'a self,
-                generation: u64,
-                model_ref: &'a str,
-                shape: usize,
-            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
-                self.0
-                    .admit_shape_at_generation(generation, model_ref, shape)
-            }
-            fn evict_shape_at_generation<'a>(
-                &'a self,
-                generation: u64,
-                model_ref: &'a str,
-                shape: usize,
-            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
-                self.0
-                    .evict_shape_at_generation(generation, model_ref, shape)
-            }
-            fn executable_count(&self, _: &str) -> Result<usize, AneResidencyError> {
-                Ok(LAYERS as usize)
-            }
-            /// Mock compiles have no modelled cost: they queue in arrival
-            /// order and are never refused early, as before the compile queue.
-            fn compile_cost_seed(&self, _: &str, _: usize, _: usize) -> Duration {
-                Duration::ZERO
-            }
-            fn admit_shape<'a>(
-                &'a self,
-                model_ref: &'a str,
-                shape: usize,
-            ) -> BoxFuture<'a, Result<AnePlacementInventory, AneResidencyError>> {
-                self.0.admit_shape(model_ref, shape)
-            }
-            fn evict_shape<'a>(
-                &'a self,
-                model_ref: &'a str,
-                shape: usize,
-            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
-                self.0.evict_shape(model_ref, shape)
-            }
-            fn restart(&self) -> BoxFuture<'_, Result<(), AneResidencyError>> {
-                self.0.restart()
-            }
-            fn restart_with_exit_signal<'a>(
-                &'a self,
-                exited: tokio::sync::oneshot::Sender<()>,
-            ) -> BoxFuture<'a, Result<(), AneResidencyError>> {
-                self.0.restart_with_exit_signal(exited)
-            }
-        }
-        type Channel = Arc<MockChannel>;
-
-        /// What the mock workers observe, kept independently of the
-        /// supervisor's own accounting so the budget checks can fail.
-        #[derive(Default)]
-        struct Ledger {
-            loads: Vec<WorkerRequest>,
-            // Read only by the Unix-only pause tests.
-            #[cfg(unix)]
-            confirmed_exits: u32,
-            inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
-            admit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
-            fail_inference: bool,
-            invalid_inference: Option<InvalidInference>,
-            evict_gate: Option<(Arc<Notify>, Arc<Notify>)>,
-            /// Requests currently running on (model_ref, shape); a request
-            /// counts itself here only while it holds that shape's lease.
-            in_flight: HashMap<(String, usize), u32>,
-            /// Shapes compiled in some live mock worker.
-            resident: HashSet<(String, usize)>,
-            max_per_model: usize,
-            max_total: usize,
-            /// `admit <model> <shape>` / `evict <model> <shape>`, in arrival order.
-            events: Vec<String>,
-            leased_evicts: u64,
-            shape_not_admitted: u64,
-            /// Admissions the mock answers with `ERR`, once each.
-            fail_admit: HashSet<(String, usize)>,
-            fail_evict: HashSet<(String, usize)>,
-            fail_confirm_exit: bool,
-            exit_gate: Option<(Arc<Notify>, Arc<Notify>)>,
-            no_reply_admit: HashSet<(String, usize)>,
-            no_reply_evict: HashSet<(String, usize)>,
-            exhaust_admit: HashMap<(String, usize), usize>,
-            admit_attempts: HashMap<(String, usize), usize>,
-            admit_delay: Duration,
-            connects: HashMap<String, u32>,
-            /// Inference requests (embed or rerank) the mock worker received.
-            inference_frames: u64,
-            /// Their request ids, in arrival order.
-            inference_ids: Vec<String>,
-            capture_token_ids: bool,
-            captured_token_ids: Vec<Vec<u32>>,
-        }
-
-        type SharedLedger = Arc<Mutex<Ledger>>;
-
-        #[derive(Clone, Copy)]
-        enum InvalidInference {
-            Nonfinite,
-            Dimensions,
-        }
-
-        fn record_token_ids(
-            ledger: &SharedLedger,
-            lengths: impl Iterator<Item = usize>,
-            raw: &[u8],
-        ) {
-            let mut ledger = ledger.lock().unwrap();
-            if !ledger.capture_token_ids {
-                return;
-            }
-            let ids = synapse_core::decode_i32_frame(raw).unwrap();
-            let mut offset = 0;
-            for length in lengths {
-                ledger.captured_token_ids.push(
-                    ids[offset..offset + length]
-                        .iter()
-                        .map(|id| u32::try_from(*id).unwrap())
-                        .collect(),
-                );
-                offset += length;
-            }
-            assert_eq!(offset, ids.len());
-        }
-
-        fn record_residency(ledger: &mut Ledger) {
-            let mut per_model: HashMap<&str, usize> = HashMap::new();
-            for (model, _) in &ledger.resident {
-                *per_model.entry(model.as_str()).or_default() += 1;
-            }
-            let largest = per_model.values().copied().max().unwrap_or(0);
-            ledger.max_per_model = ledger.max_per_model.max(largest);
-            ledger.max_total = ledger.max_total.max(ledger.resident.len());
-        }
-
-        /// One mock direct-ANE worker process: compiles shapes on admit,
-        /// refuses inference on a shape it has not admitted, and loses every
-        /// shape when its connection closes.
-        async fn serve_mock<S: AsyncRead + AsyncWrite + Unpin>(
-            mut stream: S,
-            ledger: SharedLedger,
-        ) {
-            let max = DEFAULT_MAX_FRAME_BYTES;
-            let mut own: HashSet<(String, usize)> = HashSet::new();
-            while let Ok(request) = read_json::<WorkerRequest, _>(&mut stream, max).await {
-                let raw = if request.carries_raw_frame() {
-                    match read_raw(&mut stream, max).await {
-                        Ok(raw) => Some(raw),
-                        Err(_) => break,
-                    }
-                } else {
-                    None
-                };
-                if matches!(
-                    request,
-                    WorkerRequest::EmbedBatch { .. } | WorkerRequest::RerankSequences { .. }
-                ) {
-                    {
-                        let mut ledger = ledger.lock().unwrap();
-                        ledger.inference_frames += 1;
-                        if let Some(id) = request.req_id() {
-                            ledger.inference_ids.push(id.to_owned());
-                        }
-                    }
-                    let gate = ledger.lock().unwrap().inference_gate.take();
-                    if let Some((started, release)) = gate {
-                        started.notify_one();
-                        release.notified().await;
-                    }
-                    if std::mem::take(&mut ledger.lock().unwrap().fail_inference) {
-                        break;
-                    }
-                }
-                let (response, raw_out) = match &request {
-                    WorkerRequest::Load {
-                        req_id,
-                        artifact_digest,
-                        runtime_config,
-                        ..
-                    } => {
-                        ledger.lock().unwrap().loads.push(request.clone());
-                        let direct_profile = runtime_config
-                            .get("profile")
-                            .filter(|id| id.ends_with(".ane-direct-worker"));
-                        (
-                            WorkerResponse::Loaded {
-                                req_id: req_id.clone(),
-                                model_ref: direct_profile
-                                    .map(|profile| {
-                                        format!("ane-direct:{profile}:{artifact_digest}")
-                                    })
-                                    .unwrap_or_else(|| format!("mock:{artifact_digest}")),
-                                dims: if direct_profile.is_some() { 1 } else { 4 },
-                                cold_load_ms: 0,
-                                buckets: direct_profile.map(|_| ANE_SHAPE_LADDER.to_vec()),
-                                ane_cached_shapes: None,
-                                transcribe_revision: None,
-                            },
-                            None,
-                        )
-                    }
-                    WorkerRequest::AneAdmitShape {
-                        req_id,
-                        model_ref,
-                        shape,
-                    } => {
-                        let key = (model_ref.clone(), *shape);
-                        let unacknowledged = ledger.lock().unwrap().no_reply_admit.remove(&key);
-                        if unacknowledged {
-                            own.insert(key.clone());
-                            ledger.lock().unwrap().resident.insert(key);
-                            continue;
-                        }
-                        let gate = ledger.lock().unwrap().admit_gate.take();
-                        if let Some((started, release)) = gate {
-                            started.notify_one();
-                            release.notified().await;
-                        }
-                        let delay = ledger.lock().unwrap().admit_delay;
-                        tokio::time::sleep(delay).await;
-                        let key = (model_ref.clone(), *shape);
-                        let mut ledger = ledger.lock().unwrap();
-                        *ledger.admit_attempts.entry(key.clone()).or_default() += 1;
-                        let exhausted =
-                            ledger.exhaust_admit.get_mut(&key).is_some_and(|remaining| {
-                                if *remaining > 0 {
-                                    *remaining -= 1;
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        if exhausted {
-                            ledger.events.push(format!("exhaust {model_ref} {shape}"));
-                            (
-                                WorkerResponse::Err {
-                                    req_id: Some(req_id.clone()),
-                                    code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
-                                    msg: "injected ANE resource exhaustion".into(),
-                                },
-                                None,
-                            )
-                        } else if ledger.fail_admit.remove(&key) {
-                            (
-                                WorkerResponse::Err {
-                                    req_id: Some(req_id.clone()),
-                                    code: "compile_failed".to_string(),
-                                    msg: "injected admission failure".to_string(),
-                                },
-                                None,
-                            )
-                        } else {
-                            own.insert(key.clone());
-                            ledger.resident.insert(key);
-                            ledger.events.push(format!("admit {model_ref} {shape}"));
-                            record_residency(&mut ledger);
-                            let inventory = AnePlacementInventory {
-                                executables: vec![AneExecutable {
-                                    id: format!("{model_ref}-{shape}"),
-                                    layers: (0..LAYERS).collect(),
-                                }],
-                                cpu_stages: vec!["token_embedding".to_string()],
-                            };
-                            (
-                                WorkerResponse::Admitted {
-                                    req_id: req_id.clone(),
-                                    inventory,
-                                    cache_hit_layers: None,
-                                    compiled_layers: None,
-                                },
-                                None,
-                            )
-                        }
-                    }
-                    WorkerRequest::AneEvictShape {
-                        req_id,
-                        model_ref,
-                        shape,
-                    } => {
-                        let unacknowledged = ledger
-                            .lock()
-                            .unwrap()
-                            .no_reply_evict
-                            .remove(&(model_ref.clone(), *shape));
-                        if unacknowledged {
-                            continue;
-                        }
-                        let failed = ledger
-                            .lock()
-                            .unwrap()
-                            .fail_evict
-                            .remove(&(model_ref.clone(), *shape));
-                        if failed {
-                            write_json(
-                                &mut stream,
-                                &WorkerResponse::Err {
-                                    req_id: Some(req_id.clone()),
-                                    code: "evict_failed".into(),
-                                    msg: "injected eviction failure".into(),
-                                },
-                                max,
-                            )
-                            .await
-                            .unwrap();
-                            continue;
-                        }
-                        let gate = ledger.lock().unwrap().evict_gate.clone();
-                        if let Some((started, release)) = gate {
-                            started.notify_one();
-                            release.notified().await;
-                        }
-                        let key = (model_ref.clone(), *shape);
-                        let mut ledger = ledger.lock().unwrap();
-                        if ledger.in_flight.get(&key).copied().unwrap_or(0) > 0 {
-                            ledger.leased_evicts += 1;
-                        }
-                        own.remove(&key);
-                        ledger.resident.remove(&key);
-                        ledger.events.push(format!("evict {model_ref} {shape}"));
-                        record_residency(&mut ledger);
-                        (
-                            WorkerResponse::Evicted {
-                                req_id: req_id.clone(),
-                            },
-                            None,
-                        )
-                    }
-                    WorkerRequest::EmbedBatch {
-                        req_id,
-                        model_ref,
-                        items,
-                        ..
-                    } => {
-                        let rungs: Vec<usize> = items
-                            .iter()
-                            .map(|item| ladder_rung(item.n_tokens).unwrap())
-                            .collect();
-                        let total: usize = items.iter().map(|item| item.n_tokens).sum();
-                        assert_eq!(
-                            raw.as_ref().map(Vec::len),
-                            Some(total * 4),
-                            "the id frame holds every item's tokens"
-                        );
-                        record_token_ids(
-                            &ledger,
-                            items.iter().map(|item| item.n_tokens),
-                            raw.as_ref().unwrap(),
-                        );
-                        if rungs
-                            .iter()
-                            .all(|rung| own.contains(&(model_ref.clone(), *rung)))
-                        {
-                            let invalid = ledger.lock().unwrap().invalid_inference.take();
-                            let dims = if matches!(invalid, Some(InvalidInference::Dimensions)) {
-                                2
-                            } else {
-                                1
-                            };
-                            let values: Vec<f32> = rungs
-                                .iter()
-                                .flat_map(|rung| {
-                                    vec![
-                                        if matches!(invalid, Some(InvalidInference::Nonfinite)) {
-                                            f32::NAN
-                                        } else {
-                                            *rung as f32
-                                        };
-                                        dims
-                                    ]
-                                })
-                                .collect();
-                            (
-                                WorkerResponse::Vectors {
-                                    req_id: req_id.clone(),
-                                    dims,
-                                    n: items.len(),
-                                },
-                                Some(encode_f32_frame(&values)),
-                            )
-                        } else {
-                            ledger.lock().unwrap().shape_not_admitted += 1;
-                            (
-                                WorkerResponse::Err {
-                                    req_id: Some(req_id.clone()),
-                                    code: ERR_SHAPE_NOT_ADMITTED.to_string(),
-                                    msg: format!("{model_ref} rungs {rungs:?} are not resident"),
-                                },
-                                None,
-                            )
-                        }
-                    }
-                    WorkerRequest::RerankSequences {
-                        req_id,
-                        model_ref,
-                        sequences,
-                    } => {
-                        let rungs: Vec<_> = sequences
-                            .iter()
-                            .map(|s| ladder_rung(s.n_tokens).unwrap())
-                            .collect();
-                        assert_eq!(
-                            raw.as_ref().map(Vec::len),
-                            Some(sequences.iter().map(|s| s.n_tokens).sum::<usize>() * 4)
-                        );
-                        record_token_ids(
-                            &ledger,
-                            sequences.iter().map(|item| item.n_tokens),
-                            raw.as_ref().unwrap(),
-                        );
-                        if rungs
-                            .iter()
-                            .all(|rung| own.contains(&(model_ref.clone(), *rung)))
-                        {
-                            (
-                                WorkerResponse::Scores {
-                                    req_id: req_id.clone(),
-                                },
-                                Some(encode_f32_frame(
-                                    &rungs.iter().map(|rung| *rung as f32).collect::<Vec<_>>(),
-                                )),
-                            )
-                        } else {
-                            ledger.lock().unwrap().shape_not_admitted += 1;
-                            (
-                                WorkerResponse::Err {
-                                    req_id: Some(req_id.clone()),
-                                    code: ERR_SHAPE_NOT_ADMITTED.into(),
-                                    msg: "rerank shape not admitted".into(),
-                                },
-                                None,
-                            )
-                        }
-                    }
-                    other => (WorkerResponse::unsupported_request(other), None),
-                };
-                if write_json(&mut stream, &response, max).await.is_err() {
-                    break;
-                }
-                if let Some(raw_out) = raw_out {
-                    if write_raw(&mut stream, &raw_out, max).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            let mut ledger = ledger.lock().unwrap();
-            for key in own {
-                ledger.resident.remove(&key);
-            }
         }
 
         // This v3 peer accepts ordinary requests but has no packed request tags.
@@ -12177,202 +11647,6 @@ pub mod ane_residency {
             assert_eq!(admitted.shape(), 512);
             drop((admitted, held_128));
             drop(overtaking.await.unwrap().unwrap());
-        }
-
-        #[cfg(unix)]
-        pub(crate) fn module_mock_engine(
-            started: Arc<Notify>,
-            release: Arc<Notify>,
-        ) -> Arc<DirectAneEngine> {
-            module_mock_engine_gate(started, release, false)
-        }
-
-        #[cfg(unix)]
-        pub(crate) fn module_mock_engine_admission(
-            started: Arc<Notify>,
-            release: Arc<Notify>,
-        ) -> Arc<DirectAneEngine> {
-            module_mock_engine_gate(started, release, true)
-        }
-
-        #[cfg(unix)]
-        fn module_mock_engine_gate(
-            started: Arc<Notify>,
-            release: Arc<Notify>,
-            admission: bool,
-        ) -> Arc<DirectAneEngine> {
-            let ledger = SharedLedger::default();
-            if admission {
-                ledger.lock().unwrap().admit_gate = Some((started, release));
-            } else {
-                ledger.lock().unwrap().inference_gate = Some((started, release));
-            }
-            module_mock_engine_for(ledger)
-        }
-
-        /// Lets module tests hold the mock worker's next admission (compile)
-        /// or inference open and count the compiles it performed.
-        #[cfg(unix)]
-        pub(crate) struct ModuleMockControl(SharedLedger);
-
-        #[cfg(unix)]
-        impl ModuleMockControl {
-            #[cfg(target_os = "macos")]
-            pub(crate) fn enable_token_capture(&self) {
-                self.0.lock().unwrap().capture_token_ids = true;
-            }
-
-            #[cfg(target_os = "macos")]
-            pub(crate) fn take_token_ids(&self) -> Vec<Vec<u32>> {
-                std::mem::take(&mut self.0.lock().unwrap().captured_token_ids)
-            }
-            pub(crate) fn hold_next_admission(&self, started: Arc<Notify>, release: Arc<Notify>) {
-                self.0.lock().unwrap().admit_gate = Some((started, release));
-            }
-
-            pub(crate) fn hold_next_inference(&self, started: Arc<Notify>, release: Arc<Notify>) {
-                self.0.lock().unwrap().inference_gate = Some((started, release));
-            }
-
-            /// Compiles the mock worker has run for `shape`, on any model.
-            pub(crate) fn compiles(&self, shape: usize) -> usize {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .admit_attempts
-                    .iter()
-                    .filter(|((_, admitted), _)| *admitted == shape)
-                    .map(|(_, count)| *count)
-                    .sum()
-            }
-
-            /// Inference requests the mock worker has received.
-            pub(crate) fn inferences(&self) -> u64 {
-                self.0.lock().unwrap().inference_frames
-            }
-
-            /// Worker processes the engine has started, restarts included.
-            pub(crate) fn worker_starts(&self) -> u32 {
-                self.0.lock().unwrap().connects.values().sum()
-            }
-
-            pub(crate) fn loads(&self) -> usize {
-                self.0.lock().unwrap().loads.len()
-            }
-
-            #[cfg(unix)]
-            pub(crate) fn confirmed_exits(&self) -> u32 {
-                self.0.lock().unwrap().confirmed_exits
-            }
-
-            pub(crate) fn hold_next_exit(&self, started: Arc<Notify>, release: Arc<Notify>) {
-                self.0.lock().unwrap().exit_gate = Some((started, release));
-            }
-        }
-
-        #[cfg(unix)]
-        pub(crate) fn module_mock_engine_controlled() -> (Arc<DirectAneEngine>, ModuleMockControl) {
-            let ledger = SharedLedger::default();
-            (
-                module_mock_engine_for(ledger.clone()),
-                ModuleMockControl(ledger),
-            )
-        }
-
-        #[cfg(unix)]
-        fn module_mock_engine_for(ledger: SharedLedger) -> Arc<DirectAneEngine> {
-            module_mock_engine_for_owner(
-                ledger,
-                AneResidencySupervisor::new(Default::default()),
-                "module-mock",
-                "gte-modernbert-base.ane-direct-worker",
-            )
-        }
-
-        #[cfg(unix)]
-        pub(crate) fn module_mock_engine_resident(
-            supervisor: AneResidencySupervisor,
-            owner: &str,
-            profile: &str,
-        ) -> (Arc<DirectAneEngine>, ModuleMockControl) {
-            let ledger = SharedLedger::default();
-            (
-                module_mock_engine_for_owner(ledger.clone(), supervisor, owner, profile),
-                ModuleMockControl(ledger),
-            )
-        }
-
-        #[cfg(unix)]
-        fn module_mock_engine_for_owner(
-            ledger: SharedLedger,
-            supervisor: AneResidencySupervisor,
-            owner: &str,
-            profile: &str,
-        ) -> Arc<DirectAneEngine> {
-            let runtime = Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            );
-            let owner_id = owner.to_owned();
-            let connector: AneWorkerConnector<tokio::net::UnixStream> = Box::new(move || {
-                let ledger = ledger.clone();
-                let owner_id = owner_id.clone();
-                Box::pin(async move {
-                    *ledger.lock().unwrap().connects.entry(owner_id).or_default() += 1;
-                    let (stream, server) = tokio::net::UnixStream::pair().unwrap();
-                    let task = tokio::spawn(serve_mock(server, ledger.clone()));
-                    Ok(AneWorkerSession {
-                        pid: None,
-                        packed: None,
-                        stream,
-                        confirm_exit: Box::pin(async move {
-                            task.await
-                                .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
-                            let gate = ledger.lock().unwrap().exit_gate.take();
-                            if let Some((started, release)) = gate {
-                                started.notify_one();
-                                release.notified().await;
-                            }
-                            #[cfg(unix)]
-                            {
-                                ledger.lock().unwrap().confirmed_exits += 1;
-                            }
-                            Ok(())
-                        }),
-                    })
-                })
-            });
-            let channel = Arc::new(
-                runtime
-                    .block_on(AneWorkerChannel::connect(
-                        owner,
-                        synapse_core::DEFAULT_MAX_FRAME_BYTES,
-                        connector,
-                    ))
-                    .unwrap(),
-            );
-            let serving = Arc::new(
-                AneServing::new(
-                    channel,
-                    supervisor,
-                    AneServingMetadata {
-                        model_ref: format!("ane-direct:{profile}:sha256:test"),
-                        dims: 1,
-                        buckets: ANE_SHAPE_LADDER.to_vec(),
-                        pooling: synapse_core::WorkerPooling::Mean,
-                        normalize: true,
-                        timeout: Duration::from_secs(1),
-                    },
-                )
-                .unwrap(),
-            );
-            Arc::new(DirectAneEngine {
-                serving,
-                runtime: Some(runtime),
-            })
         }
 
         async fn serving_fixture(ledger: &SharedLedger) -> Arc<AneServing<DuplexStream>> {

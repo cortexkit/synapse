@@ -38,7 +38,7 @@ pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 pub(super) struct TranscribeFrames {
     pub parts: Vec<(WorkerResponse, Vec<u8>)>,
     pub progress: Vec<WorkerResponse>,
-    pub timing: crate::transcribe_host::ProgressTiming,
+    pub timing: crate::exchange::ProgressTiming,
 }
 
 #[allow(clippy::too_many_arguments)]

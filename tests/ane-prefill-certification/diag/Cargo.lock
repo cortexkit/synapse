@@ -2494,6 +2494,7 @@ dependencies = [
  "synapse-parity",
  "synapse-speech",
  "synapse-store",
+ "synapse-worker-host",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2564,6 +2565,21 @@ dependencies = [
  "synapse-core",
  "synapse-owned-decode",
  "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "synapse-worker-host"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "owned-decode-worker",
+ "serde",
+ "serde_json",
+ "synapse-core",
+ "synapse-owned-decode",
+ "synapse-speech",
+ "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 

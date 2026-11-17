@@ -21,7 +21,7 @@ pub(super) fn validate_loaded_request(
         },
     ) = (request, response)
     {
-        crate::transcribe_host::validate_worker_load(
+        crate::exchange::validate_worker_load(
             &RuntimeConfig {
                 values: runtime_config.clone(),
             },
@@ -100,7 +100,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneWorkerChannel<S> {
 
 #[cfg(unix)]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
-    pub(crate) fn transcribe_quarantine_retry_after_ms(&self) -> Option<u64> {
+    pub fn transcribe_quarantine_retry_after_ms(&self) -> Option<u64> {
         self.channel.cooldown_remaining()
     }
 
@@ -193,17 +193,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
 
 #[cfg(unix)]
 impl DirectAneEngine {
-    pub(crate) fn transcribe_shapes(&self) -> Vec<serde_json::Value> {
+    pub fn transcribe_shapes(&self) -> Vec<serde_json::Value> {
         self.serving.supervisor.transcribe_shapes(
             self.serving.channel.worker_id(),
             &self.serving.metadata.model_ref,
         )
     }
 
-    pub(crate) fn admit_self_check(
-        &self,
-        frames: usize,
-    ) -> Result<AneShapeLease, AneResidencyError> {
+    pub fn admit_self_check(&self, frames: usize) -> Result<AneShapeLease, AneResidencyError> {
         self.runtime
             .as_ref()
             .expect("live ANE runtime")
@@ -212,7 +209,7 @@ impl DirectAneEngine {
 
     // The caller holds the ordinary scheduler lease across this exchange, so
     // no compile or second scheduler wait belongs to the timed self-check.
-    pub(crate) fn transcribe_self_check_admitted(
+    pub fn transcribe_self_check_admitted(
         &self,
         request: TranscribeRequest,
         expected_frames: usize,
@@ -226,7 +223,7 @@ impl DirectAneEngine {
         )
     }
 
-    pub(crate) fn transcribe_with_frames(
+    pub fn transcribe_with_frames(
         &self,
         request: TranscribeRequest,
         expected_frames: usize,

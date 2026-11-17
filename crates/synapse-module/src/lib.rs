@@ -13,7 +13,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
 mod ane_artifact;
 mod catalog;
 mod catalog_migration;
@@ -48,8 +47,9 @@ pub use store::{
 };
 mod media_jobs;
 pub mod transcribe_host;
-pub mod worker_host;
-
+pub use synapse_worker_host::worker_host;
+#[cfg(all(test, unix))]
+mod worker_host_integration_tests;
 /// Plain, compiled lane declarations and tasks for offline certification. The
 /// validator never obtains catalog pins from a checkout or from record fields.
 pub fn certification_catalog() -> synapse_certify::Result<synapse_certify::Catalog> {

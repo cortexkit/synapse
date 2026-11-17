@@ -1,16 +1,16 @@
 use super::*;
-use crate::transcribe_host::TranscribeObservationFrames;
+use crate::exchange::TranscribeObservationFrames;
 use synapse_core::{
     decode_decode_trace_frame, decode_transcript_frame, encode_f32_frame, TranscribeObservation,
     TranscribeOutput, TranscribeRequest,
 };
 
-pub(crate) struct WorkerTranscription {
+pub struct WorkerTranscription {
     pub output: TranscribeOutput,
     pub transcript_frame: Vec<u8>,
     pub observation: Option<TranscribeObservationFrames>,
     pub progress: Vec<WorkerResponse>,
-    pub timing: crate::transcribe_host::ProgressTiming,
+    pub timing: crate::exchange::ProgressTiming,
     pub peak_device_memory_bytes: Option<u64>,
     pub peak_storage_buffer_bytes: Option<u64>,
 }
@@ -169,8 +169,8 @@ impl WorkerHost {
 }
 
 impl WorkerEngine {
-    #[cfg(all(test, unix))]
-    pub(crate) fn quarantine_transcribe_for_test(&self, model: &LoadedModel) {
+    #[cfg(all(unix, any(test, feature = "test-support")))]
+    pub fn quarantine_transcribe_for_test(&self, model: &LoadedModel) {
         let mut host = self.lock_host().unwrap();
         let key = host
             .loaded_models
@@ -183,7 +183,7 @@ impl WorkerEngine {
         }
     }
 
-    pub(crate) fn transcribe_quarantine_retry_after_ms(&self, model: &LoadedModel) -> Option<u64> {
+    pub fn transcribe_quarantine_retry_after_ms(&self, model: &LoadedModel) -> Option<u64> {
         let mut host = self.lock_host().ok()?;
         let key = host.loaded_models.get(&model.model_id)?.crash_key.clone();
         match host.quarantine_error(&key) {
@@ -192,7 +192,7 @@ impl WorkerEngine {
         }
     }
 
-    pub(crate) fn load_transcribe(
+    pub fn load_transcribe(
         &self,
         artifact: &ValidatedArtifact,
         cfg: &RuntimeConfig,
@@ -201,7 +201,7 @@ impl WorkerEngine {
             .block_on(self.lock_host()?.load_model(artifact, cfg))
     }
 
-    pub(crate) fn transcribe_with_frames(
+    pub fn transcribe_with_frames(
         &self,
         model: &LoadedModel,
         request: TranscribeRequest,
@@ -628,8 +628,7 @@ mod tests {
             );
         });
         let profile =
-            crate::transcribe_host::TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-cuda")
-                .unwrap();
+            crate::exchange::TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-cuda").unwrap();
         let mut cfg = profile.runtime_config(&RuntimeConfig::default());
         cfg.values
             .insert("artifact_path".into(), "unused.safetensors".into());

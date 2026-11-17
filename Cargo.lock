@@ -7323,6 +7323,7 @@ dependencies = [
  "synapse-parity",
  "synapse-speech",
  "synapse-store",
+ "synapse-worker-host",
  "thiserror 1.0.69",
  "tokenizers 0.21.4",
  "tokio",
@@ -7498,6 +7499,22 @@ dependencies = [
  "synapse-engine-owned",
  "synapse-module",
  "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "synapse-worker-host"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "owned-decode-worker",
+ "serde",
+ "serde_json",
+ "synapse-certify",
+ "synapse-core",
+ "synapse-owned-decode",
+ "synapse-speech",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

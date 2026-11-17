@@ -99,7 +99,7 @@ class ParallelCiTests(unittest.TestCase):
         job = PORTABLE["jobs"]["nextest"]
         step = next(s for s in job["steps"] if s.get("name") == "nextest")
         packages = ["synapse-core", "synapse-speech", "synapse-native-probe", "synapse-module",
-                    "synapse-owned-decode", "synapse-store", "synapse-certify",
+                    "synapse-owned-decode", "synapse-store", "synapse-worker-host", "synapse-certify",
                     "synapse-certify-runner", "synapse-worker-llama", "owned-decode-worker",
                     "synapse-opctl", "synapse-engine-cuda",
                     "synapse-worker-cuda", "synapse-worker-vulkan"]
@@ -107,7 +107,7 @@ class ParallelCiTests(unittest.TestCase):
         self.assertEqual(PORTABLE["env"]["SYNAPSE_TEST_CRATES"].split(), expected_crates)
         # Clippy still covers the macOS-only decode worker, which has no tests off macOS.
         self.assertEqual(PORTABLE["env"]["SYNAPSE_CRATES"].split(),
-                          expected_crates[:20] + ["-p", "synapse-worker-decode"] + expected_crates[20:])
+                          expected_crates[:22] + ["-p", "synapse-worker-decode"] + expected_crates[22:])
         for platform, partition in (("linux", "2/4"), ("windows", "1/1")):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)

@@ -123,9 +123,10 @@ rerank quality scoring.
 | Model catalog | `crates/synapse-module/src/catalog/` | `models.json` pins, backend declarations, manifest digests |
 | Batch transcription | `crates/synapse-module/src/media_jobs.rs`, `transcribe_host.rs` | local media jobs, audio retention, catalog transcribe hosts and observation paging |
 | Store | `crates/synapse-store/` | SQLite schema, migrations, engine allow-list, jobs, certification, approvals, event-outbox persistence; publisher stays in the module |
-| Worker host | `crates/synapse-module/src/worker_host/mod.rs` | spawn, handshake, requests, restarts, quarantine |
-| Worker liveness | `crates/synapse-module/src/worker_host/liveness.rs` | no-progress limits |
-| Direct ANE residency | `crates/synapse-module/src/worker_host/ane_residency/` | compile scheduler, executable budget, eviction |
+| Worker host crate | `crates/synapse-worker-host/` | Supervised worker processes, transcription exchange, liveness and ANE residency |
+| Worker host | `crates/synapse-worker-host/src/worker_host/mod.rs` | spawn, handshake, requests, restarts, quarantine |
+| Worker liveness | `crates/synapse-worker-host/src/worker_host/liveness.rs` | no-progress limits |
+| Direct ANE residency | `crates/synapse-worker-host/src/worker_host/ane_residency/` | compile scheduler, executable budget, eviction |
 | Neural Engine pause | `crates/synapse-module/src/lane_pause.rs` | timed pause of the ANE lanes |
 | Diagnostics | `crates/synapse-module/src/diagnostics_findings.rs` | `diagnostics.findings` |
 | Engram descriptor | `crates/synapse-module/src/engram_catalog.rs` | backup catalog written at startup |

@@ -10,8 +10,8 @@
     "reason": "Predates the rule; split by area the next time this file is worked on."
   },
   {
-    "path": "crates/synapse-module/src/worker_host/mod.rs",
-    "max_lines": 13774,
+    "path": "crates/synapse-worker-host/src/worker_host/mod.rs",
+    "max_lines": 13048,
     "reason": "Predates the rule; split by area the next time this file is worked on."
   },
   {

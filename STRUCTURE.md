@@ -23,13 +23,14 @@ crates/                     production Rust crates
   synapse-core/             shared types, engine traits, tokenizer, worker protocol, scheduler
   synapse-engine-cuda/      CUDA embedding and reranking engine (PTX kernel ports)
   synapse-engine-owned/     Metal embedding engine, Metal decode kernels, owned-decode supervisor (macOS)
-  synapse-module/           the subc module (ck-synapse): ops, catalog, worker host, outbox publisher
+  synapse-module/           the subc module (ck-synapse): ops, catalog, media jobs, outbox publisher
   synapse-native-probe/     safe wrappers for the Windows calls the machine profile reads
   synapse-opctl/            operator CLI (ck-synapse-opctl)
   synapse-owned-decode/     owned-decode contracts, sidecar, routing, grammar scheduler, pure certification
   synapse-release-checks/   Python gates the tag workflow runs over prebuilt release assets
   synapse-speech/           WAV/log-mel front end, Token-and-Duration Transducer (TDT) loop, word timing
   synapse-store/            SQLite persistence, migrations and event-outbox rows
+  synapse-worker-host/      Supervised workers, transcription exchange and ANE residency
   synapse-worker-ane/       Core ML Neural Engine embedding worker (Rust launcher + Swift)
   synapse-worker-ane-direct/ direct Neural Engine worker for the -ane catalog lanes
   synapse-worker-cuda/      CUDA embedding and reranking worker
@@ -55,7 +56,7 @@ Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal dec
 kernels and `owned-decode-worker/` the supervisor and protocol.
 
 The model catalog is `crates/synapse-module/src/catalog/models.json`, validated by
-`catalog/mod.rs`. Worker supervision is in `crates/synapse-module/src/worker_host/`:
+`catalog/mod.rs`. Worker supervision is in `crates/synapse-worker-host/src/worker_host/`:
 `mod.rs` (spawn, handshake, requests, quarantine), `liveness.rs` (no-progress limits)
 and `ane_residency/` (the direct Neural Engine compile scheduler and executable budget).
 
@@ -69,7 +70,7 @@ commons crates; `bench/parity` is excluded and has its own lock), `DECISIONS.md`
 binary that speaks `crates/synapse-core/src/worker_protocol.rs` over the transports in
 `worker_transport/` and reports progress while it works. Add its HELLO identity and
 binary name to `crates/synapse-core/src/worker_engine_names.rs`, wire spawning in
-`crates/synapse-module/src/worker_host/mod.rs`, add the engine to the allow-list in
+`crates/synapse-worker-host/src/worker_host/mod.rs`, add the engine to the allow-list in
 `crates/synapse-store/src/store.rs` if it serves embedding or reranking, and add the
 crate to the root `Cargo.toml` members. Embed/rerank workers receive token ids,
 not text; transcribe workers receive mel features, not audio.
