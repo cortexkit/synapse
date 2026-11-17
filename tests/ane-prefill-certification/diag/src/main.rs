@@ -179,7 +179,7 @@ fn main() -> Result<()> {
     );
     let vocabulary_size = model.vocabulary_size();
     let mut decoder = MetalStepDecoder::new(
-        &model,
+        model,
         Precision::F16,
         args.cache_bucket,
         weight_quantization,
@@ -199,7 +199,7 @@ fn main() -> Result<()> {
                 WeightQuantization::None,
             )?;
             let mut prefill_decoder = MetalStepDecoder::new(
-                &prefill_model,
+                prefill_model,
                 Precision::F16,
                 args.cache_bucket,
                 WeightQuantization::None,
@@ -340,7 +340,7 @@ fn validate_coreml_output(
 #[allow(clippy::too_many_arguments)]
 fn analyze_control(
     compute_units: &str,
-    decoder: &mut MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder,
     pure_trace: &Trace,
     pure_cache_bits: &[u16],
     control_cache_bits: &[u16],
@@ -456,7 +456,7 @@ fn divergence_from_rows(
 }
 
 fn forced_row(
-    decoder: &mut MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder,
     mut cache: MetalStepKvCache,
     mut logits: Vec<f32>,
     prefix: &[u32],
@@ -481,7 +481,7 @@ fn read_input(path: &Path) -> Result<TokenizedRow> {
 }
 
 fn gpu_prefill(
-    decoder: &mut MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder,
     prompt: &[u32],
 ) -> Result<(MetalStepKvCache, Vec<f32>)> {
     let mut cache = MetalStepKvCache { position: 0 };
@@ -494,7 +494,7 @@ fn gpu_prefill(
     Ok((cache, final_logits))
 }
 
-fn collect_cache_bits(decoder: &MetalStepDecoder<'_>) -> Result<Vec<u16>> {
+fn collect_cache_bits(decoder: &MetalStepDecoder) -> Result<Vec<u16>> {
     let mut bits = Vec::new();
     for layer in 0..LAYERS {
         bits.extend(decoder.inspect_cache_bits(layer)?);
@@ -503,7 +503,7 @@ fn collect_cache_bits(decoder: &MetalStepDecoder<'_>) -> Result<Vec<u16>> {
 }
 
 fn generate(
-    decoder: &mut MetalStepDecoder<'_>,
+    decoder: &mut MetalStepDecoder,
     mut cache: MetalStepKvCache,
     mut logits: Vec<f32>,
     count: usize,
@@ -703,8 +703,10 @@ fn read_u16(path: &Path) -> Result<Vec<u16>> {
     let bytes = fs::read(path).with_context(|| format!("read cache {}", path.display()))?;
     ensure!(bytes.len() % 2 == 0, "cache byte length is not even");
     Ok(bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -715,7 +717,9 @@ fn read_f32(path: &Path) -> Result<Vec<f32>> {
         "logits byte length is not divisible by four"
     );
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
