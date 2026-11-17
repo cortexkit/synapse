@@ -109,10 +109,12 @@ def wer_counts(binary, cases, baseline, actual):
     return rows
 
 
-def quality(cases, fp32, q8, counts):
-    """Require complete matched arms. Rates are ratios, not percent values."""
+def quality(cases, fp32, q8, counts, *, partial=False):
+    """Grade complete matched arms; partial mode defers every incomplete aggregate."""
     wanted = {c["id"] for c in cases if not c.get("refusal")}
-    if set(fp32) != wanted or set(q8) != wanted or set(counts) != wanted:
+    ready = set(q8)
+    if (set(fp32) != wanted or set(counts) != ready or not ready <= wanted
+            or (not partial and ready != wanted)):
         raise ValueError("incomplete quality fixture coverage")
     scorer = name_scorer()
     failures, groups, measurements = [], defaultdict(list), {}
@@ -121,12 +123,13 @@ def quality(cases, fp32, q8, counts):
         if case.get("refusal"):
             continue
         id = case["id"]
-        failure = probe_failure(case, q8[id])
-        if failure:
-            failures.append(failure)
-        failure = cap_failure(q8[id], fp32[id])
-        if failure:
-            failures.append({**failure, "id": id})
+        if id in ready:
+            failure = probe_failure(case, q8[id])
+            if failure:
+                failures.append(failure)
+            failure = cap_failure(q8[id], fp32[id])
+            if failure:
+                failures.append({**failure, "id": id})
         # Compare identical list configurations, never pool listed arms with no-list
         # speech: an easy arm must not conceal a failing tier or control list.
         arm = case.get("list_id") or ("none" if not case.get("terms") else
@@ -134,6 +137,8 @@ def quality(cases, fp32, q8, counts):
         if case["ground_truth"]:
             groups[(case["split"], arm, case.get("tier"))].append(id)
     for (split, arm, tier), ids in sorted(groups.items(), key=lambda item: str(item[0])):
+        if not set(ids) <= ready:
+            continue
         words = sum(counts[id]["words"] for id in ids)
         before = sum(counts[id]["baseline_edits"] for id in ids)
         after = sum(counts[id]["actual_edits"] for id in ids)
@@ -160,7 +165,7 @@ def quality(cases, fp32, q8, counts):
     for tier in (None, 30, 100, 300):
         for listed in (False, True):
             rows = [c for c in earnings_all if c.get("tier") == tier and bool(c.get("terms")) == listed]
-            if not rows:
+            if not rows or not {c["id"] for c in rows} <= ready:
                 continue
             a, b = names(rows, fp32), names(rows, q8)
             measurements[f"earnings/{tier}/{listed}"] = {"fp32": a, "q8": b}
@@ -177,23 +182,36 @@ def quality(cases, fp32, q8, counts):
         tier_failures = []
         if len(controls) != 1200 or len(rows) != 200:
             raise ValueError("incomplete C4 tier")
-        insertion = names(controls, q8)["false"]
-        if insertion * 1000 > len(controls):
+        dependencies = ({c["id"] for c in controls + rows}
+                        | {c["id"].rsplit("-tier-", 1)[0] + "-global" for c in rows}
+                        | {c["id"].rsplit("-control-", 1)[0] for c in controls})
+        if not dependencies <= wanted:
+            raise ValueError("incomplete C4 tier dependencies")
+        complete = dependencies <= ready
+        insertion = names(controls, q8)["false"] if {c["id"] for c in controls} <= ready else None
+        if insertion is not None and insertion * 1000 > len(controls):
             tier_failures.append({"gate": "control-insertions", "tier": tier,
                                   "pairs": len(controls), "insertions": insertion})
         # Compare retained names only, with the tier's extended vocabulary for
         # false occurrences in both the tier and the whole-call baseline.
         global_traces = {}
-        for c in rows:
-            global_traces[c["id"]] = q8[c["id"].rsplit("-tier-", 1)[0] + "-global"]
-        a, b = names(rows, global_traces, lambda c: c["retained_terms"]), names(rows, q8, lambda c: c["retained_terms"])
-        all_a, all_b = names(rows, global_traces), names(rows, q8)
-        if a["recall"] is None or b["recall"] < a["recall"] - .02 or all_b["false"] > all_a["false"] + 2:
-            tier_failures.append({"gate": "tier-vs-global", "tier": tier, "global": a, "tier_names": b,
-                                  "global_false": all_a["false"], "tier_false": all_b["false"]})
+        name_dependencies = ({c["id"] for c in rows}
+                             | {c["id"].rsplit("-tier-", 1)[0] + "-global" for c in rows})
+        if name_dependencies <= ready:
+            for c in rows:
+                global_traces[c["id"]] = q8[c["id"].rsplit("-tier-", 1)[0] + "-global"]
+            a, b = names(rows, global_traces, lambda c: c["retained_terms"]), names(rows, q8, lambda c: c["retained_terms"])
+            all_a, all_b = names(rows, global_traces), names(rows, q8)
+            if a["recall"] is None or b["recall"] < a["recall"] - .02 or all_b["false"] > all_a["false"] + 2:
+                tier_failures.append({"gate": "tier-vs-global", "tier": tier, "global": a, "tier_names": b,
+                                      "global_false": all_a["false"], "tier_false": all_b["false"]})
         for list_id in sorted({c["list_id"] for c in controls}):
             for split in sorted({c["split"] for c in controls}):
                 arm = [c for c in controls if c["list_id"] == list_id and c["split"] == split]
+                arm_dependencies = ({c["id"] for c in arm}
+                                    | {c["id"].rsplit("-control-", 1)[0] for c in arm})
+                if not arm_dependencies <= ready:
+                    continue
                 words = sum(counts[c["id"]]["words"] for c in arm)
                 listed = sum(counts[c["id"]]["actual_edits"] for c in arm)
                 unlisted = sum(counts[c["id"].rsplit("-control-", 1)[0]]["actual_edits"] for c in arm)
@@ -203,12 +221,17 @@ def quality(cases, fp32, q8, counts):
         # WER, aligned recall and false-occurrence gates also apply with the
         # tier's identical lists in the fp32 and Q8 runs.
         inherited = tier_quality[tier]
+        if partial and tier == 30:
+            failures.extend(tier_failures + inherited)
+        if not complete:
+            continue
         tiers[str(tier)] = {"passed": not tier_failures and not inherited,
                             "pairs": len(controls), "insertions": insertion,
                             "failures": tier_failures + inherited,
                             "longest_context_tokens": max(q8[c["id"]]["context_tokens"] for c in controls + rows)}
         if tier == 30 and not tiers["30"]["passed"]:
-            failures.extend(tier_failures + inherited)
+            if not partial:
+                failures.extend(tier_failures + inherited)
             break
     passing = [t for t in (30, 100, 300) if tiers.get(str(t), {}).get("passed")]
     n = min(2048, math.ceil(tiers[str(max(passing))]["longest_context_tokens"] / 64) * 64) if passing else None
