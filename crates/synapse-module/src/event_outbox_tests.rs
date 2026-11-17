@@ -37,14 +37,14 @@ fn fixture(label: &str) -> (PathBuf, Arc<SynapseStore>) {
 
 fn sql(store: &SynapseStore, sql: &str) {
     store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| tx.execute_batch(sql))
         .unwrap();
 }
 
 fn count(store: &SynapseStore, table: &str) -> u64 {
     store
-        .store
+        .sqlite()
         .with_conn(|c| c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)))
         .unwrap()
 }
@@ -123,7 +123,7 @@ fn media_terminal_event_is_atomic_and_has_contract_body() {
     fail_after_insert(&store);
     assert!(
         store
-            .store
+            .sqlite()
             .with_conn_fenced(
                 |tx| tx.execute("UPDATE media_jobs SET state='done' WHERE id='media'", [])
             )
@@ -131,7 +131,7 @@ fn media_terminal_event_is_atomic_and_has_contract_body() {
     );
     assert_eq!(count(&store, "event_outbox"), 0);
     let state: String = store
-        .store
+        .sqlite()
         .with_conn(|c| c.query_row("SELECT state FROM media_jobs", [], |r| r.get(0)))
         .unwrap();
     assert_eq!(state, "queued");
@@ -224,7 +224,7 @@ fn findings_event_is_atomic_and_has_contract_body() {
         .is_err());
     assert_eq!(count(&store, "event_outbox"), 0);
     let generation: u64 = store
-        .store
+        .sqlite()
         .with_conn(|c| {
             c.query_row("SELECT findings_generation FROM findings_state", [], |r| {
                 r.get(0)
@@ -292,7 +292,7 @@ const SAMPLE_KEY: &str = "00000000-0000-4000-8000-000000000001";
 const SAMPLE_BODY: &str = r#"{"event_id":"00000000-0000-4000-8000-000000000001","generation":1,"worst_severity":"error"}"#;
 
 fn insert_sample(store: &SynapseStore) {
-    store.store.with_conn_fenced(|tx| {
+    store.sqlite().with_conn_fenced(|tx| {
         tx.execute("INSERT INTO event_outbox(event_id,subject,body,created_at) VALUES (?1,?2,?3,1700000000000)",params![SAMPLE_KEY,FINDINGS_SUBJECT,SAMPLE_BODY])?;
         Ok(())
     }).unwrap();

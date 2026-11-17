@@ -36,7 +36,10 @@ mod owned_decode_routing_store_tests;
 #[cfg(test)]
 mod rerank_readout_tests;
 mod rollback;
-mod store;
+#[cfg(test)]
+mod store_integration_tests;
+pub use synapse_store as store;
+use synapse_store::{owned_decode_catalog_entry, PerfKnob};
 #[cfg(test)]
 mod test_binaries;
 pub use store::{
@@ -132,22 +135,6 @@ use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
 use tracing::Instrument;
 use url::Url;
-
-impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
-    fn admission_boundary_matches(
-        &self,
-        snapshot: &owned_decode_routing::lane::AdmissionBoundarySnapshot,
-    ) -> Result<bool, String> {
-        self.owned_decode_dispatch_admission_matches(
-            snapshot.profile_activation_epoch,
-            &snapshot.model_id,
-            &snapshot.decode_fingerprint,
-            &snapshot.approval_semantic_digest,
-            snapshot.approval_generation,
-        )
-        .map_err(|error| error.to_string())
-    }
-}
 
 pub const DEFAULT_MODULE_ID: &str = "synapse";
 
@@ -462,34 +449,6 @@ pub enum ModuleError {
     Config(String),
     #[error("singleton: {0}")]
     SingletonHeld(String),
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PerfKnob {
-    Performance,
-    #[default]
-    Balanced,
-    Quiet,
-}
-
-impl PerfKnob {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Performance => "performance",
-            Self::Balanced => "balanced",
-            Self::Quiet => "quiet",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "performance" => Ok(Self::Performance),
-            "balanced" => Ok(Self::Balanced),
-            "quiet" => Ok(Self::Quiet),
-            other => Err(format!("unknown performance knob '{other}'")),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -10073,53 +10032,6 @@ fn owned_decode_resolution_refusal(
     owned_decode_resolution_refusal_for_platform(&spec.engine, cfg!(target_os = "macos"))
 }
 
-fn owned_decode_catalog_entry(
-    spec: &StoredModelConfig,
-) -> Result<owned_decode_routing::CatalogEntry, owned_decode_routing::error::OwnedDecodeError> {
-    use owned_decode_routing::identity::{ActivationDType, Q8Identity, WeightQuant};
-
-    let family_name = spec.owned_family.as_deref().unwrap_or_default();
-    let family = owned_decode_routing::family::Family::parse(family_name)?;
-    let activation_dtype = ActivationDType::parse(spec.owned_dtype.as_deref().unwrap_or_default())?;
-    let weight_quant = WeightQuant::parse(&spec.quant)?;
-    let flag = |name: &str| spec.engine_identity.build_flags.get(name).cloned();
-    let q8 = if weight_quant.is_q8() {
-        Some(Q8Identity {
-            quantizer_revision: flag("quantizer_revision")
-                .filter(|value| !value.trim().is_empty())
-                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
-            derived_digest: flag("derived_digest")
-                .filter(|value| !value.trim().is_empty())
-                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
-        })
-    } else {
-        None
-    };
-    Ok(owned_decode_routing::CatalogEntry {
-        entry_id: spec.model_id.clone(),
-        engine: owned_decode_routing::CATALOG_ENGINE.to_string(),
-        task: owned_decode_routing::CATALOG_TASK.to_string(),
-        lane: owned_decode_routing::CATALOG_LANE.to_string(),
-        worker: owned_decode_routing::CATALOG_WORKER.to_string(),
-        risk_class: owned_decode_routing::CATALOG_RISK_CLASS.to_string(),
-        family,
-        activation_dtype,
-        weight_quant,
-        arithmetic_identity_revision: flag("arithmetic_identity_revision")
-            .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string()),
-        metallib_revision: flag("metallib_revision")
-            .unwrap_or_else(|| "owned-decode-metallib-v1".to_string()),
-        max_context_tokens: flag("max_context_tokens")
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or_else(|| spec.max_tokens.min(u32::MAX as usize) as u32),
-        artifact_source_digest: spec.artifact_digest.clone(),
-        q8,
-        owned_family: spec.owned_family.clone(),
-        owned_dtype: Some("f16".to_string()),
-        quant: Some(spec.quant.clone()),
-    })
-}
-
 fn owned_decode_processing_fingerprint(
     entry: &owned_decode_routing::CatalogEntry,
 ) -> Result<Fingerprint, owned_decode_routing::error::OwnedDecodeError> {
@@ -18280,7 +18192,7 @@ mod tests {
         fixture
             .state
             .store
-            .store
+            .sqlite()
             .with_conn_fenced(|tx| {
                 tx.execute("DELETE FROM catalog_install_members", [])?;
                 tx.execute("DELETE FROM catalog_installs", [])?;
@@ -18339,7 +18251,7 @@ mod tests {
             move || {
                 state
                     .store
-                    .store
+                    .sqlite()
                     .with_conn(|_| {
                         held.notify_one();
                         wait.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -20684,7 +20596,7 @@ mod tests {
             .record_findings_digest("stale", "error", 1700000000000)
             .unwrap();
         let key: String = store
-            .store
+            .sqlite()
             .with_conn(|c| c.query_row("SELECT event_id FROM event_outbox", [], |r| r.get(0)))
             .unwrap();
         let profile = test_machine_profile("test-os");
@@ -21262,7 +21174,7 @@ mod tests {
             // Cold loads and pause expiry must use the same per-store lock on
             // every test platform, including when no supervisor was installed.
             let database = store
-                .store
+                .sqlite()
                 .with_conn(|conn| {
                     Ok(PathBuf::from(
                         conn.path().expect("test store has a database file"),
@@ -22471,7 +22383,7 @@ mod tests {
 
         // Seed store with > 64 MiB of data and then delete it to create freelist pages.
         store
-            .store
+            .sqlite()
             .with_conn(|conn| {
                 conn.execute(
                     "CREATE TABLE bloat_seed (id INTEGER PRIMARY KEY, data BLOB)",
@@ -25529,7 +25441,7 @@ mod tests {
 
         state
             .store
-            .store
+            .sqlite()
             .with_conn(|conn| {
                 conn.execute(
                     "INSERT INTO cert_rows (
@@ -27464,7 +27376,7 @@ mod catalog_runtime_tests {
         let backend = entry.backend("metal").unwrap().clone();
         state
             .store
-            .store
+            .sqlite()
             .with_conn_fenced(|tx| {
                 tx.execute(
                     "INSERT INTO catalog_installs VALUES (?1,?2,?3)",
@@ -29179,7 +29091,7 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
         invalidate_validated_readiness(&state.runtime);
         let freed = state
             .store
-            .store
+            .sqlite()
             .with_conn_fenced(|tx| {
                 let mut q = tx.prepare(
                     "SELECT DISTINCT digest FROM catalog_install_members WHERE catalog_id=?1",
@@ -29545,7 +29457,7 @@ fn catalog_lanes_needing_revalidation(
             }
             let passed_before: bool = state
                 .store
-                .store
+                .sqlite()
                 .with_conn(|conn| {
                     conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM catalog_self_checks \
@@ -29685,7 +29597,7 @@ mod transcribe_self_check {
     ) -> Result<Value, WireOperationError> {
         use rusqlite::OptionalExtension;
         let (id, _) = key(state, lane)?;
-        let row = state.store.store.with_conn(|conn| {
+        let row = state.store.sqlite().with_conn(|conn| {
             conn.query_row("SELECT state, checked_at_ms, reason FROM catalog_self_checks WHERE check_id=?1", [&id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<u64>>(1)?, r.get::<_, Option<String>>(2)?))).optional()
         }).map_err(catalog_store_error)?;
@@ -29718,7 +29630,7 @@ mod transcribe_self_check {
     ) -> Result<Option<u64>, WireOperationError> {
         use rusqlite::OptionalExtension;
         let (id, _) = key(state, lane)?;
-        state.store.store.with_conn(|conn| {
+        state.store.sqlite().with_conn(|conn| {
             conn.query_row("SELECT self_check_wall_ms FROM catalog_self_checks WHERE check_id=?1 AND state='passed'", [&id], |r| r.get(0)).optional().map(Option::flatten)
         }).map_err(catalog_store_error)
     }
@@ -29835,7 +29747,7 @@ mod transcribe_self_check {
                     "passed"
                 };
                 if let Some(generation) = generation {
-                    state.store.store.with_conn_fenced(|tx| {
+                    state.store.sqlite().with_conn_fenced(|tx| {
                         tx.execute("UPDATE catalog_self_checks SET self_check_wall_ms=?3 WHERE check_id=?1 AND generation=?2 AND state='running'", rusqlite::params![id,generation,elapsed_ms])?;
                         Ok(())
                     }).map_err(catalog_store_error)?;
@@ -30066,7 +29978,7 @@ mod transcribe_self_check {
                     let generation = || {
                         state
                             .store
-                            .store
+                            .sqlite()
                             .with_conn(|conn| {
                                 conn.query_row(
                                     "SELECT generation FROM catalog_self_checks WHERE check_id=?1",
@@ -30183,7 +30095,7 @@ mod transcribe_self_check {
                 // This is the same catalog-id reset used by model removal/download.
                 state
                     .store
-                    .store
+                    .sqlite()
                     .with_conn_fenced(|tx| {
                         tx.execute(
                             "DELETE FROM catalog_self_checks WHERE catalog_id=?1",
@@ -30347,7 +30259,7 @@ fn catalog_self_check_projection(
     let (id, _) = catalog_self_check_key(state, entry, backend)?;
     let row = state
         .store
-        .store
+        .sqlite()
         .with_conn(|conn| {
             conn.query_row(
                 "SELECT state, checked_at_ms, reason FROM catalog_self_checks WHERE check_id=?1",
@@ -30384,7 +30296,7 @@ fn catalog_check_generation(
     key: &Value,
 ) -> Result<u64, WireOperationError> {
     invalidate_validated_readiness(&state.runtime);
-    let result = state.store.store.with_conn_fenced(|tx| {
+    let result = state.store.sqlite().with_conn_fenced(|tx| {
         tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
         let generation: u64 = tx.query_row("SELECT value FROM self_check_run_seq WHERE id=0",[],|r| r.get(0))?;
         tx.execute("INSERT INTO catalog_self_checks (check_id,catalog_id,manifest_digest,backend,fingerprint,engine_identity_json,os_build,fixture_revision,state,generation,checked_at_ms,reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'running',?9,NULL,NULL) ON CONFLICT(check_id) DO UPDATE SET state='running',generation=excluded.generation,checked_at_ms=NULL,reason=NULL",rusqlite::params![id,key["catalog_id"].as_str(),key["manifest_digest"].as_str(),key["backend"].as_str(),key["fingerprint"].as_str(),key["engine_identity"].to_string(),key["os_build"].as_str(),key["fixture_revision"].as_str(),generation])?;
@@ -30401,7 +30313,7 @@ fn catalog_complete_check(
     reason: Option<&str>,
 ) -> Result<bool, WireOperationError> {
     invalidate_validated_readiness(&state.runtime);
-    let result = state.store.store.with_conn_fenced(|tx| {
+    let result = state.store.sqlite().with_conn_fenced(|tx| {
         if status == "pending" {
             tx.execute("UPDATE self_check_run_seq SET value=value+1 WHERE id=0",[])?;
             Ok(tx.execute("UPDATE catalog_self_checks SET state='pending',generation=(SELECT value FROM self_check_run_seq WHERE id=0),checked_at_ms=NULL,reason=NULL WHERE check_id=?1 AND state='running' AND generation=?2",rusqlite::params![id,generation])? > 0)
@@ -30691,7 +30603,7 @@ fn profile_preload_check_status(
     use rusqlite::OptionalExtension;
     state
         .store
-        .store
+        .sqlite()
         .with_conn(|conn| {
             conn.query_row(
                 "SELECT state FROM catalog_self_checks WHERE check_id=?1",
@@ -30956,7 +30868,7 @@ fn validated_model_readiness(
     let passed_generation =
         state
             .store
-            .store
+            .sqlite()
             .with_conn(|conn| {
                 conn.query_row(
             "SELECT generation FROM catalog_self_checks WHERE check_id=?1 AND state='passed'",
@@ -31829,7 +31741,7 @@ async fn ensure_catalog_lane_ready_owned(
 fn startup_catalog_runtime(state: &ModuleState) -> Result<(), ModuleError> {
     sweep_owned_package_orphans(state.model_cache.root())
         .map_err(|error| ModuleError::Config(format!("sweep removed owned packages: {error}")))?;
-    state.store.store.with_conn_fenced(|tx| {
+    state.store.sqlite().with_conn_fenced(|tx| {
         tx.execute("UPDATE catalog_self_checks SET state='pending',checked_at_ms=NULL,reason=NULL WHERE state='running'",[])?;
         Ok(())
     }).map_err(|e| ModuleError::Config(e.to_string()))?;
@@ -31939,7 +31851,7 @@ fn catalog_engine_fault(id: &str, call: &str) -> Result<(), EngineError> {
 }
 
 fn catalog_cache_roots(state: &ModuleState) -> Result<Vec<String>, SynapseStoreError> {
-    let mut roots = state.store.store.with_conn(|conn| {
+    let mut roots = state.store.sqlite().with_conn(|conn| {
         let mut query = conn.prepare("SELECT digest FROM catalog_install_members UNION SELECT digest FROM download_acquisitions")?;
         let roots = query.query_map([],|r| r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
         Ok(roots)

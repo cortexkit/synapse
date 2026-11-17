@@ -43,7 +43,7 @@ fn fixture(label: &str, installed: bool) -> (PathBuf, Arc<ModuleState>) {
         let entry = state.runtime.release_catalog.entry(MODEL).unwrap();
         state
             .store
-            .store
+            .sqlite()
             .with_conn_fenced(|t| {
                 for b in &entry.backends {
                     t.execute(
@@ -279,7 +279,7 @@ async fn media_declaration_selection_and_five_states() {
     let backend = entry.backend(&selected).unwrap();
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|t| {
             t.execute(
                 "INSERT INTO catalog_installs VALUES(?1,?2,?3)",
@@ -322,7 +322,7 @@ async fn media_declaration_selection_and_five_states() {
     );
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|t| {
             t.execute("DELETE FROM catalog_self_checks", [])?;
             Ok(())
@@ -395,7 +395,7 @@ async fn media_undeclared_model_refuses_before_storing_or_starting_work() {
         assert_eq!(error.0["code"], "unsupported", "{model}");
         assert_eq!(error.0["detail"]["field"], "model", "{model}");
         assert_eq!(error.0["detail"]["class"], "permanent", "{model}");
-        let rows: (u64, u64) = state.store.store.with_conn(|c| {
+        let rows: (u64, u64) = state.store.sqlite().with_conn(|c| {
             c.query_row("SELECT (SELECT count(*) FROM media_jobs), (SELECT count(*) FROM media_objects)", [], |r| Ok((r.get(0)?, r.get(1)?)))
         }).unwrap();
         assert_eq!(rows, (0, 0), "{model}");
@@ -424,7 +424,7 @@ async fn media_undeclared_facts_refuse_before_storing_work() {
         assert_eq!(error.0["detail"]["class"], "permanent", "{name}");
         let jobs: u64 = state
             .store
-            .store
+            .sqlite()
             .with_conn(|c| c.query_row("SELECT count(*) FROM media_jobs", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(jobs, 0, "{name}");
@@ -447,7 +447,7 @@ async fn media_declared_mime_with_malformed_audio_is_invalid_params() {
     }
     let jobs: u64 = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| c.query_row("SELECT count(*) FROM media_jobs", [], |r| r.get(0)))
         .unwrap();
     assert_eq!(jobs, 0);
@@ -706,7 +706,7 @@ async fn media_audio_options_upload_capacity_permissions_retention_and_restart()
     // allocation is needed to test rejection before the fifth file is created.
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|t| {
             t.execute("UPDATE media_objects SET state='gone'", [])?;
             Ok(())
@@ -904,7 +904,7 @@ async fn media_restart_fails_only_nonterminal_work_and_retains_objects_for_one_h
     );
     let earliest: u64 = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| {
             c.query_row(
                 "SELECT min(retained_ms) FROM media_objects WHERE state='committed'",
@@ -1006,7 +1006,7 @@ async fn media_quarantine_never_falls_back_and_submit_does_not_store() {
     }
     let jobs: u64 = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| c.query_row("SELECT count(*) FROM media_jobs", [], |r| r.get(0)))
         .unwrap();
     assert_eq!(jobs, 0);

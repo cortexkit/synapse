@@ -734,7 +734,7 @@ pub(super) fn holders(
     }
     let pending = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| {
             let mut q = c.prepare(
                 "SELECT id FROM media_jobs WHERE lane LIKE ?1 AND state IN ('queued','running')",

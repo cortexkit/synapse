@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(passes.load(Ordering::SeqCst), 2);
         assert!(done_rx.try_recv().is_err());
         let (digest, generation): (String, u64) = store
-            .store
+            .sqlite()
             .with_conn(|c| {
                 c.query_row(
                     "SELECT digest,findings_generation FROM findings_state",
@@ -422,7 +422,7 @@ mod tests {
         refresh(&healthy);
         let generation = || {
             store
-                .store
+                .sqlite()
                 .with_conn(|c| {
                     c.query_row("SELECT findings_generation FROM findings_state", [], |r| {
                         r.get::<_, u64>(0)

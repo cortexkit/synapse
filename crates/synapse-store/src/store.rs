@@ -15,7 +15,98 @@ use synapse_core::{
 };
 use thiserror::Error;
 
-use crate::{owned_decode_certification::CertificationRecord, PerfKnob};
+use synapse_owned_decode::{owned_decode_certification::CertificationRecord, owned_decode_routing};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfKnob {
+    Performance,
+    #[default]
+    Balanced,
+    Quiet,
+}
+
+impl PerfKnob {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Performance => "performance",
+            Self::Balanced => "balanced",
+            Self::Quiet => "quiet",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "performance" => Ok(Self::Performance),
+            "balanced" => Ok(Self::Balanced),
+            "quiet" => Ok(Self::Quiet),
+            other => Err(format!("unknown performance knob '{other}'")),
+        }
+    }
+}
+
+pub fn owned_decode_catalog_entry(
+    spec: &StoredModelConfig,
+) -> Result<owned_decode_routing::CatalogEntry, owned_decode_routing::error::OwnedDecodeError> {
+    use owned_decode_routing::identity::{ActivationDType, Q8Identity, WeightQuant};
+
+    let family_name = spec.owned_family.as_deref().unwrap_or_default();
+    let family = owned_decode_routing::family::Family::parse(family_name)?;
+    let activation_dtype = ActivationDType::parse(spec.owned_dtype.as_deref().unwrap_or_default())?;
+    let weight_quant = WeightQuant::parse(&spec.quant)?;
+    let flag = |name: &str| spec.engine_identity.build_flags.get(name).cloned();
+    let q8 = if weight_quant.is_q8() {
+        Some(Q8Identity {
+            quantizer_revision: flag("quantizer_revision")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
+            derived_digest: flag("derived_digest")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unsupported)?,
+        })
+    } else {
+        None
+    };
+    Ok(owned_decode_routing::CatalogEntry {
+        entry_id: spec.model_id.clone(),
+        engine: owned_decode_routing::CATALOG_ENGINE.to_string(),
+        task: owned_decode_routing::CATALOG_TASK.to_string(),
+        lane: owned_decode_routing::CATALOG_LANE.to_string(),
+        worker: owned_decode_routing::CATALOG_WORKER.to_string(),
+        risk_class: owned_decode_routing::CATALOG_RISK_CLASS.to_string(),
+        family,
+        activation_dtype,
+        weight_quant,
+        arithmetic_identity_revision: flag("arithmetic_identity_revision")
+            .unwrap_or_else(|| "owned-decode-arithmetic-v1".to_string()),
+        metallib_revision: flag("metallib_revision")
+            .unwrap_or_else(|| "owned-decode-metallib-v1".to_string()),
+        max_context_tokens: flag("max_context_tokens")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or_else(|| spec.max_tokens.min(u32::MAX as usize) as u32),
+        artifact_source_digest: spec.artifact_digest.clone(),
+        q8,
+        owned_family: spec.owned_family.clone(),
+        owned_dtype: Some("f16".to_string()),
+        quant: Some(spec.quant.clone()),
+    })
+}
+
+impl owned_decode_routing::lane::AdmissionBoundaryReader for SynapseStore {
+    fn admission_boundary_matches(
+        &self,
+        snapshot: &owned_decode_routing::lane::AdmissionBoundarySnapshot,
+    ) -> Result<bool, String> {
+        self.owned_decode_dispatch_admission_matches(
+            snapshot.profile_activation_epoch,
+            &snapshot.model_id,
+            &snapshot.decode_fingerprint,
+            &snapshot.approval_semantic_digest,
+            snapshot.approval_generation,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
 
 const NAMESPACE: &str = "synapse_module";
 const APPROVAL_MIGRATION_SEED_DIGEST: &str =
@@ -2019,7 +2110,7 @@ pub struct PerfRow {
 pub struct KnobAssignmentRow {
     pub machine_profile_hash: String,
     pub workload: String,
-    pub(crate) knob: PerfKnob,
+    pub knob: PerfKnob,
     pub model_id: String,
     pub numeric_profile_id: NumericProfileId,
     pub fingerprint: Fingerprint,
@@ -2147,6 +2238,11 @@ fn validate_restore_table_set(
 }
 
 impl SynapseStore {
+    /// Modules that own their tables' SQL beside the feature, such as media jobs, access SQLite through this handle.
+    pub fn sqlite(&self) -> &SqliteStore {
+        &self.store
+    }
+
     /// Import only durable operator intent from an Engram scratch database.
     ///
     /// Opening the capture first applies this binary's normal forward migrations
@@ -2878,8 +2974,9 @@ impl SynapseStore {
         seed_revision: &str,
         schema_revision: &str,
     ) -> Result<ApprovalMigrationResult, SynapseStoreError> {
-        const SEED_SOURCE: &str =
-            include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json");
+        const SEED_SOURCE: &str = include_str!(
+            "../../synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json"
+        );
         self.migrate_owned_decode_approvals_from_seed(SEED_SOURCE, seed_revision, schema_revision)
     }
 
@@ -3089,9 +3186,9 @@ impl SynapseStore {
                 });
             }
         }
-        let context_buckets: crate::owned_decode_contracts::ContextBucketsManifest =
+        let context_buckets: synapse_owned_decode::owned_decode_contracts::ContextBucketsManifest =
             serde_json::from_str(include_str!(
-                "../owned-decode-manifests/decode-context-buckets-v1.json"
+                "../../synapse-module/owned-decode-manifests/decode-context-buckets-v1.json"
             ))
             .expect("checked-in decode context buckets parse");
         let unmappable = self.store.with_conn(|conn| {
@@ -3126,7 +3223,7 @@ impl SynapseStore {
                 if config.engine != "owned-metal-decode" || config.task != "generate" {
                     return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
                 }
-                let Ok(catalog_entry) = crate::owned_decode_catalog_entry(&config) else {
+                let Ok(catalog_entry) = owned_decode_catalog_entry(&config) else {
                     return Ok(Some((entry.source_catalog_entry_id.clone(), 0)));
                 };
                 let decode_fingerprint = catalog_entry
@@ -5932,7 +6029,7 @@ impl SynapseStore {
         Ok(())
     }
 
-    pub(crate) fn knob_assignment(
+    pub fn knob_assignment(
         &self,
         machine_profile_hash: &str,
         workload: &str,
@@ -8720,7 +8817,7 @@ fn validate_owned_decode_cert_row(
 /// `passed` and the given manifest revision. Any other entry, including a
 /// G-DEC id, means the evidence claims something the probe does not measure,
 /// and a `g_dec` key is the v1 shape; both fail closed.
-pub(crate) fn probe_gate_evidence_passed(evidence: &Value, manifest_revision: &str) -> bool {
+pub fn probe_gate_evidence_passed(evidence: &Value, manifest_revision: &str) -> bool {
     if evidence.get("g_dec").is_some() {
         return false;
     }
@@ -9202,26 +9299,21 @@ fn new_job_id(request_key: &str, generation: u64, now_ms: u64) -> String {
     format!("job_{}", hex::encode(&hasher.finalize()[..16]))
 }
 
-#[cfg(test)]
-pub(crate) fn configure_serving_catalog_for_test(store: &SynapseStore) -> String {
-    tests::configure_serving_catalog(store).1
+#[cfg(any(test, feature = "test-support"))]
+pub fn configure_serving_catalog_for_test(store: &SynapseStore) -> String {
+    test_support::configure_serving_catalog(store).1
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "test_support.rs"]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::owned_decode_certification::{
-        ArtifactLineage, CertificationGateResult, CertificationRecord, CertificationUnit,
-        DerivedArtifactLineage, EmbedLoadResult, KvMatrixCandidate, KvMatrixResult,
-        KvSelectionEvidence, M5MeasurementEvidence, MachineScopedEvidence, MachineTuple,
-        MtpSpeedRepetition, MtpSpeedResult, PlatformEnvelopeResult, ProbeEvidence,
-        RuntimeConfiguration, SerialOracleFidelityResult, SpeculativeSerialFidelityResult,
-        SpeculativeTelemetry, TimingArmEvidence, TokenFidelityEvidence, TokenTapResult,
-        AGENTIC_BATTERY_ID, EMBED_LOAD_ID, LLAMA_CPP_ORACLE_REVISION, PLATFORM_ENVELOPE_ID,
-        WAVE_1_CONTEXT_CEILING_TOKENS,
-    };
     use cortexkit_store_types::{Isolation, StorageBackend};
     use synapse_core::MachineProfile;
 
@@ -9307,263 +9399,6 @@ mod tests {
             worker_bin: None,
             worker_runtime_dir: None,
         }
-    }
-
-    fn serving_catalog_fingerprint() -> String {
-        "d".repeat(64)
-    }
-
-    fn serving_artifact_request() -> ArtifactIngestRequest {
-        ArtifactIngestRequest {
-            model_id: "qwen3.8-27b".to_string(),
-            source_format: "gguf".to_string(),
-            source_quantization: "q4_k_m".to_string(),
-            source_digest: "a".repeat(64),
-            q8_derivation: Some(Q8IngestDerivation {
-                derivation_contract: Q8_INGEST_DERIVATION_CONTRACT.to_string(),
-                deterministic_inputs_digest: "b".repeat(64),
-                derived_quantization: "q8_0".to_string(),
-                derived_digest: "c".repeat(64),
-                verified_derived_digest: "c".repeat(64),
-            }),
-        }
-    }
-
-    fn complete_serving_certification(
-        artifact: &ModelArtifactId,
-        catalog_fingerprint: &str,
-    ) -> CertificationRecord {
-        let machine = MachineTuple {
-            machine_profile_hash: "machine-profile".to_string(),
-            macos_build: "25F84".to_string(),
-            unified_memory_bytes: 128 * 1024 * 1024 * 1024,
-        };
-        let runtime = RuntimeConfiguration {
-            runtime_config_digest: "runtime-config".to_string(),
-            runtime_revision: "runtime-v1".to_string(),
-        };
-        let unit = CertificationUnit {
-            base_artifact_id: artifact.artifact_id.clone(),
-            native_mtp_head_digest: "native-mtp-head".to_string(),
-            depth_controller_gate_digest: "depth-controller-gate".to_string(),
-            catalog_fingerprint: catalog_fingerprint.to_string(),
-        };
-        let timing_arm = |session: &str, tokens_per_second| TimingArmEvidence {
-            loaded_session_id: session.to_string(),
-            machine_profile_hash: machine.machine_profile_hash.clone(),
-            macos_build: machine.macos_build.clone(),
-            ac_power_connected: true,
-            one_minute_load_average: 1.0,
-            mean_tokens_per_second: tokens_per_second,
-        };
-        let candidates = [256, 512, 1024]
-            .into_iter()
-            .flat_map(|block_size_tokens| {
-                [4096, 8192, 16384]
-                    .into_iter()
-                    .map(move |reused_prefix_bucket_tokens| KvMatrixCandidate {
-                        block_size_tokens,
-                        reused_prefix_bucket_tokens,
-                        alignment_valid: true,
-                        retained_memory_overhead_percent: 10.0,
-                        warm_ttft_ms: if (block_size_tokens, reused_prefix_bucket_tokens)
-                            == (1024, 4096)
-                        {
-                            1.0
-                        } else {
-                            2.0
-                        },
-                    })
-            })
-            .collect::<Vec<_>>();
-        let selected = candidates
-            .iter()
-            .find(|candidate| {
-                (
-                    candidate.block_size_tokens,
-                    candidate.reused_prefix_bucket_tokens,
-                ) == (1024, 4096)
-            })
-            .cloned()
-            .expect("fixture includes the selected KV cell");
-        let manifest_digest = "agentic-manifest-digest".to_string();
-        CertificationRecord {
-            record_id: "serving-certification-record".to_string(),
-            manifest_digest: manifest_digest.clone(),
-            artifact_lineage: ArtifactLineage {
-                artifact_id: artifact.artifact_id.clone(),
-                model_id: artifact.model_id.clone(),
-                quantization: "gguf-q4-k-m-compatible".to_string(),
-                source_digest: artifact.source_digest.clone(),
-                derived: Some(DerivedArtifactLineage {
-                    derivation_contract: Q8_INGEST_DERIVATION_CONTRACT.to_string(),
-                    deterministic_inputs_digest: "b".repeat(64),
-                    source_digest: artifact.source_digest.clone(),
-                    derived_digest: artifact
-                        .derived_digest
-                        .clone()
-                        .expect("fixture is Q8 derived"),
-                    verified_derived_digest: artifact
-                        .derived_digest
-                        .clone()
-                        .expect("fixture is Q8 derived"),
-                }),
-            },
-            unit: unit.clone(),
-            machine_evidence: MachineScopedEvidence {
-                machine: machine.clone(),
-                probe: ProbeEvidence {
-                    probe_id: "certification-probe".to_string(),
-                    harness_revision: "harness-r1".to_string(),
-                    observed_at_ms: 1,
-                },
-                runtime: runtime.clone(),
-                m5_measurement: M5MeasurementEvidence {
-                    measurement_id: "m5-native-head-cost".to_string(),
-                    measurement_revision: "m5-r1".to_string(),
-                    machine_profile_hash: machine.machine_profile_hash.clone(),
-                    base_artifact_id: unit.base_artifact_id.clone(),
-                    catalog_fingerprint: unit.catalog_fingerprint.clone(),
-                    native_mtp_head_digest: unit.native_mtp_head_digest.clone(),
-                    runtime_config_digest: runtime.runtime_config_digest.clone(),
-                    head_forward_ms: 1.0,
-                    backbone_step_ms: 4.0,
-                    controller_constants_digest: "controller-constants".to_string(),
-                    registered: true,
-                    depth_zero_executes_no_head_work: true,
-                    positive_depth_chains_command_buffer: true,
-                },
-            },
-            gate_results: vec![
-                CertificationGateResult::SerialOracleFidelity(SerialOracleFidelityResult {
-                    manifest_digest: manifest_digest.clone(),
-                    battery_id: AGENTIC_BATTERY_ID.to_string(),
-                    oracle_revision: LLAMA_CPP_ORACLE_REVISION.to_string(),
-                    greedy_only: true,
-                    fidelity: TokenFidelityEvidence {
-                        generated_token_ids_match: true,
-                        stop_position_matches: true,
-                        finish_reason_matches: true,
-                    },
-                }),
-                CertificationGateResult::SpeculativeSerialFidelity(
-                    SpeculativeSerialFidelityResult {
-                        manifest_digest: manifest_digest.clone(),
-                        battery_id: AGENTIC_BATTERY_ID.to_string(),
-                        serial_certification_id: "serial-certification".to_string(),
-                        leviathan_greedy_acceptance: true,
-                        fidelity: TokenFidelityEvidence {
-                            generated_token_ids_match: true,
-                            stop_position_matches: true,
-                            finish_reason_matches: true,
-                        },
-                    },
-                ),
-                CertificationGateResult::MtpSpeed(MtpSpeedResult {
-                    manifest_digest: manifest_digest.clone(),
-                    battery_id: AGENTIC_BATTERY_ID.to_string(),
-                    generated_token_window: 256,
-                    serial_warmup_last_three_tok_s: [10.0, 10.5, 10.2],
-                    mtp_warmup_last_three_tok_s: [16.0, 16.5, 16.2],
-                    repetitions: vec![
-                        MtpSpeedRepetition {
-                            serial: timing_arm("session-1", 10.0),
-                            mtp: timing_arm("session-1", 16.0),
-                        },
-                        MtpSpeedRepetition {
-                            serial: timing_arm("session-2", 10.5),
-                            mtp: timing_arm("session-2", 16.5),
-                        },
-                        MtpSpeedRepetition {
-                            serial: timing_arm("session-3", 10.2),
-                            mtp: timing_arm("session-3", 16.2),
-                        },
-                    ],
-                    telemetry: SpeculativeTelemetry {
-                        proposed_depth: 4,
-                        accepted_depth: 3,
-                        acceptance_rate: 0.75,
-                        verification_work: 42,
-                        controller_decisions_digest: "controller-decisions".to_string(),
-                    },
-                }),
-                CertificationGateResult::KvMatrix(KvMatrixResult {
-                    manifest_digest: manifest_digest.clone(),
-                    machine_profile_hash: machine.machine_profile_hash.clone(),
-                    candidates,
-                    selection: KvSelectionEvidence {
-                        selected,
-                        continuation_token_ids_identical: true,
-                        reused_token_count: 4096,
-                        reused_block_count: 4,
-                        prefill_dispatches_over_reused_range: 0,
-                        cold_ttft_ms: 10.0,
-                        warm_ttft_ms: 1.0,
-                        close_restored_allocator_accounting: true,
-                    },
-                }),
-                CertificationGateResult::PlatformEnvelope(PlatformEnvelopeResult {
-                    manifest_digest: manifest_digest.clone(),
-                    envelope_id: PLATFORM_ENVELOPE_ID.to_string(),
-                    machine_profile_hash: machine.machine_profile_hash.clone(),
-                    macos_build: machine.macos_build.clone(),
-                    unified_memory_bytes: machine.unified_memory_bytes,
-                    reserved_embed_rerank_bytes: 1,
-                    artifact_weight_bytes: 1,
-                    kv_bytes_per_token: 1,
-                    mandatory_context_ceiling_tokens: WAVE_1_CONTEXT_CEILING_TOKENS,
-                    admitted_and_exercised_32k_session: true,
-                    exercised_reservation_accounting: true,
-                    exercised_kv_reuse: true,
-                    exercised_streaming: true,
-                    exercised_scheduler_interleaving: true,
-                }),
-                CertificationGateResult::EmbedLoad(EmbedLoadResult {
-                    manifest_digest: manifest_digest.clone(),
-                    workload_id: EMBED_LOAD_ID.to_string(),
-                    runtime_config_digest: runtime.runtime_config_digest.clone(),
-                    concurrent_clients: 8,
-                    poisson_aggregate_rate_per_second: 5.0,
-                    duration_seconds: 120,
-                    warmup_seconds: 10,
-                    completed_samples: 500,
-                    failed_embeddings: 0,
-                    timed_out_embeddings: 0,
-                    nearest_rank_p95_ms: 150.0,
-                    active_decode_context_ceiling_tokens: WAVE_1_CONTEXT_CEILING_TOKENS,
-                    used_shipped_scheduler_configuration: true,
-                }),
-                CertificationGateResult::TokenTap(TokenTapResult {
-                    manifest_digest,
-                    observed_after_acceptance_before_emission: true,
-                    read_only: true,
-                    token_ids_identical_when_enabled: true,
-                    stop_position_identical_when_enabled: true,
-                    finish_reason_identical_when_enabled: true,
-                    emitted_bytes_identical_when_enabled: true,
-                }),
-            ],
-        }
-    }
-
-    pub(super) fn configure_serving_catalog(store: &SynapseStore) -> (ModelArtifactId, String) {
-        let artifact = store
-            .ingest_serving_artifact(&serving_artifact_request(), 1)
-            .expect("valid GGUF source ingests");
-        let catalog_fingerprint = serving_catalog_fingerprint();
-        let record = complete_serving_certification(&artifact, &catalog_fingerprint);
-        store
-            .store_serving_certification(&record, 2)
-            .expect("complete record matches the ingested artifact");
-        store
-            .approve_serving_catalog(
-                &catalog_fingerprint,
-                &record.record_id,
-                "principal:operator",
-                3,
-            )
-            .expect("matching record approves the catalog fingerprint");
-        (artifact, catalog_fingerprint)
     }
 
     fn admit(
@@ -10591,218 +10426,6 @@ mod tests {
     }
 
     #[test]
-    fn certification_lookup_distinguishes_profiles_with_ane_subtypes() {
-        let (root, descriptor) = temp_descriptor("ane-subtype-cert");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let fingerprint = Fingerprint("ane-fingerprint".to_string());
-        let profile_without_ane = MachineProfile {
-            os_build: "23G93".to_string(),
-            arch: "aarch64".to_string(),
-            chip_model: "Apple M5 Max".to_string(),
-            ram_class: "le_64_gib".to_string(),
-            ane_subtype: None,
-            engine_identities: Vec::new(),
-        };
-        let mut profile_with_ane = profile_without_ane.clone();
-        profile_with_ane.ane_subtype = Some("h17(map)".to_string());
-        let without_hash = profile_without_ane.hash();
-        let with_hash = profile_with_ane.hash();
-        assert_ne!(without_hash, with_hash);
-
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: without_hash.clone(),
-                machine_profile_hash: Some(without_hash.clone()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("ane-numeric".to_string())),
-                fingerprint: fingerprint.clone(),
-                certified_at_ms: 10,
-                os_build: "23G93".to_string(),
-                module_generation: 1,
-                evidence: serde_json::json!({"ane_subtype": null}),
-            })
-            .unwrap();
-
-        assert!(store
-            .get_cert_row(CertificationClass::Embedding, &without_hash, &fingerprint)
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_cert_row(CertificationClass::Embedding, &with_hash, &fingerprint)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .has_stale_cert_row(CertificationClass::Embedding, &with_hash, &fingerprint)
-            .unwrap());
-        let refused = crate::ensure_fingerprint_certified(
-            &store,
-            CertificationClass::Embedding,
-            &with_hash,
-            &fingerprint,
-        )
-        .expect_err("a changed ANE profile must require re-probing");
-        assert_eq!(refused.code, "not_certified");
-        assert!(refused.message.contains("stale certification rows"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn uncertified_reprobe_demotes_the_machine_fingerprint_pair() {
-        let (root, descriptor) = temp_descriptor("uncertified-reprobe");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let fingerprint = Fingerprint("decode-fp".to_string());
-        let mut row = ClassScopedCertificationRow {
-            certification_class: CertificationClass::Embedding,
-            assurance_class: AssuranceClass::Measured,
-            status: CertificationStatus::Certified,
-            key_hash: "machine-a".to_string(),
-            machine_profile_hash: Some("machine-a".to_string()),
-            remote_profile_hash: None,
-            identity_revision: None,
-            numeric_profile_id: Some(NumericProfileId("decode-np".to_string())),
-            fingerprint: fingerprint.clone(),
-            certified_at_ms: 10,
-            os_build: "os-a".to_string(),
-            module_generation: 1,
-            evidence: serde_json::json!({"gate": "token_exact"}),
-        };
-        store.store_class_scoped_cert_row(&row).unwrap();
-        assert!(store
-            .get_cert_row(CertificationClass::Embedding, "machine-a", &fingerprint)
-            .unwrap()
-            .is_some());
-
-        row.status = CertificationStatus::Uncertified;
-        row.certified_at_ms = 20;
-        row.evidence = serde_json::json!({
-            "blocking_reason": "token_mismatch",
-            "mismatches": [{"prompt": "corrupted fixture"}],
-        });
-        store.store_class_scoped_cert_row(&row).unwrap();
-
-        assert!(store
-            .get_cert_row(CertificationClass::Embedding, "machine-a", &fingerprint)
-            .unwrap()
-            .is_none());
-        let probe = store
-            .get_probe_row(CertificationClass::Embedding, "machine-a", &fingerprint)
-            .unwrap()
-            .unwrap();
-        assert_eq!(probe.status, CertificationStatus::Uncertified);
-        assert_eq!(probe.evidence, row.evidence);
-        let refused = crate::ensure_fingerprint_certified(
-            &store,
-            CertificationClass::Embedding,
-            "machine-a",
-            &fingerprint,
-        )
-        .expect_err("an uncertified decode outcome must refuse future owned requests");
-        assert_eq!(refused.code, "not_certified");
-        assert!(refused.message.contains("token_mismatch"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embedding_certification_cannot_certify_rerank_with_shared_fingerprint() {
-        let (root, descriptor) = temp_descriptor("cross-class-certification");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let fingerprint = Fingerprint("shared-fingerprint".to_string());
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: "legacy-profile-hash".to_string(),
-                machine_profile_hash: Some("legacy-profile-hash".to_string()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("embedding-profile".to_string())),
-                fingerprint: fingerprint.clone(),
-                certified_at_ms: 1,
-                os_build: "test-os".to_string(),
-                module_generation: 1,
-                evidence: serde_json::json!({"task": "embed"}),
-            })
-            .unwrap();
-        assert!(store
-            .get_cert_row(
-                CertificationClass::Embedding,
-                "legacy-profile-hash",
-                &fingerprint,
-            )
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_cert_row(
-                CertificationClass::Rerank,
-                "legacy-profile-hash",
-                &fingerprint,
-            )
-            .unwrap()
-            .is_none());
-        let refused = crate::ensure_fingerprint_certified(
-            &store,
-            CertificationClass::Rerank,
-            "legacy-profile-hash",
-            &fingerprint,
-        )
-        .expect_err("embedding evidence must not admit a rerank lane");
-        assert_eq!(refused.code, "not_certified");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn legacy_hash_keeps_pre_upgrade_non_owned_certification_visible() {
-        let (root, descriptor) = temp_descriptor("legacy-hash-upgrade");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let profile = MachineProfile {
-            os_build: "test-os".to_string(),
-            arch: "aarch64".to_string(),
-            chip_model: "test-chip".to_string(),
-            ram_class: "test-ram".to_string(),
-            ane_subtype: None,
-            engine_identities: Vec::new(),
-        };
-        let (legacy_hash, revisioned_hash) = crate::module_state_machine_profile_hashes(&profile);
-        assert_ne!(legacy_hash, revisioned_hash);
-        let fingerprint = Fingerprint("pre-upgrade-fingerprint".to_string());
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: legacy_hash.clone(),
-                machine_profile_hash: Some(legacy_hash.clone()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("pre-upgrade".to_string())),
-                fingerprint: fingerprint.clone(),
-                certified_at_ms: 1,
-                os_build: profile.os_build,
-                module_generation: 1,
-                evidence: serde_json::json!({"source": "pre-upgrade"}),
-            })
-            .unwrap();
-        assert!(store
-            .get_cert_row(CertificationClass::Embedding, &legacy_hash, &fingerprint)
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_cert_row(
-                CertificationClass::Embedding,
-                &revisioned_hash,
-                &fingerprint,
-            )
-            .unwrap()
-            .is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn catalog_models_survive_reopen_and_appear_in_snapshot() {
         let (root, descriptor) = temp_descriptor("catalog-models");
         let config = StoredModelConfig {
@@ -11060,7 +10683,10 @@ mod tests {
         assert_eq!(applied.outcome, "applied");
         assert_eq!(applied.rows, 4);
         let computed_seed_digest = hex::encode(Sha256::digest(
-            include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json").as_bytes(),
+            include_str!(
+                "../../synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json"
+            )
+            .as_bytes(),
         ));
         let marker_digest: String = store
             .store
@@ -11108,8 +10734,10 @@ mod tests {
     fn approval_migration_rejects_tampered_seed_bytes_before_parsing() {
         let (root, descriptor) = temp_descriptor("approval-migration-seed-digest");
         let store = SynapseStore::open(&descriptor).unwrap();
-        let tampered = include_str!("../owned-decode-manifests/migration-seed-manifest-v1.json")
-            .replacen("\"grammar_enabled\": true", "\"grammar_enabled\": false", 1);
+        let tampered = include_str!(
+            "../../synapse-module/owned-decode-manifests/migration-seed-manifest-v1.json"
+        )
+        .replacen("\"grammar_enabled\": true", "\"grammar_enabled\": false", 1);
         let result = store
             .migrate_owned_decode_approvals_from_seed(
                 &tampered,
@@ -11894,7 +11522,7 @@ mod tests {
 
     #[test]
     fn owned_decode_refusal_mapping_tracks_each_fenced_predicate_arm() {
-        use crate::owned_decode_routing::lane::{
+        use synapse_owned_decode::owned_decode_routing::lane::{
             serving_predicate, ServingPredicateInputs, ServingRefusal,
         };
 
@@ -12472,193 +12100,6 @@ mod tests {
             .unwrap()
     }
 
-    #[cfg(unix)]
-    fn verification_fixture() -> (
-        std::path::PathBuf,
-        SynapseStore,
-        CatalogInstallRecord,
-        std::path::PathBuf,
-        String,
-    ) {
-        let (root, descriptor) = temp_descriptor("catalog-verification");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let path = root.join("weights");
-        std::fs::write(&path, b"original").unwrap();
-        let digest = crate::sha256_file(&path).unwrap();
-        let install = CatalogInstallRecord {
-            catalog_id: "model".into(),
-            manifest_digest: "manifest".into(),
-            backend: "metal".into(),
-            members: vec![CatalogInstallMember {
-                path: "weights".into(),
-                digest: digest.clone(),
-            }],
-        };
-        store.store.with_conn_fenced(|tx| {
-            tx.execute("INSERT INTO catalog_installs VALUES ('model','manifest','metal')", [])?;
-            tx.execute("INSERT INTO catalog_install_members VALUES ('model','manifest','metal','weights',?1)", params![digest])?;
-            Ok(())
-        }).unwrap();
-        (root, store, install, path, digest)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn catalog_verification_unchanged_cold_load_skips_hash_and_removal_clears_row() {
-        let (root, store, install, path, digest) = verification_fixture();
-        let calls = std::cell::Cell::new(0);
-        for _ in 0..2 {
-            let result = crate::verified_catalog_file_digest(
-                &store,
-                &install,
-                "weights",
-                &digest,
-                &path,
-                |p| {
-                    calls.set(calls.get() + 1);
-                    crate::sha256_file(p).ok()
-                },
-            )
-            .unwrap();
-            assert_eq!(result.as_deref(), Some(digest.as_str()));
-        }
-        assert_eq!(calls.get(), 1);
-        assert_eq!(table_count(&store, "catalog_file_verifications"), 1);
-        store
-            .store
-            .with_conn_fenced(|tx| {
-                tx.execute("DELETE FROM catalog_install_members", [])?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(table_count(&store, "catalog_file_verifications"), 0);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn catalog_verification_touch_forces_rehash() {
-        let (root, store, install, path, digest) = verification_fixture();
-        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-            crate::sha256_file(p).ok()
-        })
-        .unwrap();
-        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(old + std::time::Duration::from_secs(1))
-            .unwrap();
-        let calls = std::cell::Cell::new(0);
-        let result =
-            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-                calls.set(calls.get() + 1);
-                crate::sha256_file(p).ok()
-            })
-            .unwrap();
-        assert_eq!(
-            calls.get(),
-            1,
-            "a changed file identity reused verification"
-        );
-        assert_eq!(result.as_deref(), Some(digest.as_str()));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A file that changes while it is being hashed can't vouch for the bytes
-    /// that are loaded afterwards. The hash closure here returns the expected
-    /// digest (as it would if it read the file before the write) but bumps the
-    /// file's mtime mid-hash. The result must not count as verified, and no
-    /// verification row may be recorded, so the next load hashes in full.
-    #[cfg(unix)]
-    #[test]
-    fn catalog_verification_file_changed_during_hash_is_not_recorded() {
-        let (root, store, install, path, digest) = verification_fixture();
-        let result =
-            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-                let old = std::fs::metadata(p).unwrap().modified().unwrap();
-                std::fs::File::options()
-                    .write(true)
-                    .open(p)
-                    .unwrap()
-                    .set_modified(old + std::time::Duration::from_secs(1))
-                    .unwrap();
-                Some(digest.clone())
-            })
-            .unwrap();
-        assert_eq!(result, None, "a file changed mid-hash must not verify");
-        let calls = std::cell::Cell::new(0);
-        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-            calls.set(calls.get() + 1);
-            crate::sha256_file(p).ok()
-        })
-        .unwrap();
-        assert_eq!(calls.get(), 1, "no verification row may have been recorded");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn catalog_verification_content_change_with_restored_mtime_is_refused() {
-        let (root, store, install, path, digest) = verification_fixture();
-        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-            crate::sha256_file(p).ok()
-        })
-        .unwrap();
-        let old = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::write(&path, b"tampered").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(old)
-            .unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
-        let calls = std::cell::Cell::new(0);
-        let result =
-            crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-                calls.set(calls.get() + 1);
-                crate::sha256_file(p).ok()
-            })
-            .unwrap();
-        assert_ne!(
-            result.as_deref(),
-            Some(digest.as_str()),
-            "corrupted artifact must be refused"
-        );
-        assert_eq!(calls.get(), 1);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn catalog_verification_startup_discards_orphaned_rows() {
-        let (root, store, install, path, digest) = verification_fixture();
-        crate::verified_catalog_file_digest(&store, &install, "weights", &digest, &path, |p| {
-            crate::sha256_file(p).ok()
-        })
-        .unwrap();
-        store.store.with_conn_fenced(|tx| {
-            tx.execute("INSERT INTO catalog_file_verifications VALUES ('orphan','manifest','metal','weights',?1,'1','2','3','4','5')", params![digest])?;
-            Ok(())
-        }).unwrap();
-        assert_eq!(table_count(&store, "catalog_file_verifications"), 2);
-        store
-            .reconcile_persisted_registrations(&|_| false, &FakeBlobCache::default())
-            .unwrap();
-        assert_eq!(table_count(&store, "catalog_file_verifications"), 1);
-        assert!(store
-            .catalog_file_verified(
-                &install,
-                "weights",
-                &digest,
-                &crate::catalog_file_stamp(&path).unwrap()
-            )
-            .unwrap());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn restore_policy_classifies_every_application_table() {
         let application = RESTORE_APPLICATION_TABLES
@@ -12992,8 +12433,8 @@ mod tests {
         );
 
         // Serving predicate check for approvals row refusal.
-        let predicate_refusal = crate::owned_decode_routing::lane::serving_predicate(
-            &crate::owned_decode_routing::lane::ServingPredicateInputs {
+        let predicate_refusal = synapse_owned_decode::owned_decode_routing::lane::serving_predicate(
+            &synapse_owned_decode::owned_decode_routing::lane::ServingPredicateInputs {
                 approval_present: true,
                 approval_enabled: restored_approval.enabled,
                 ..Default::default()
@@ -13001,7 +12442,7 @@ mod tests {
         );
         assert_eq!(
             predicate_refusal,
-            Err(crate::owned_decode_routing::lane::ServingRefusal::CutoverDisabled),
+            Err(synapse_owned_decode::owned_decode_routing::lane::ServingRefusal::CutoverDisabled),
             "approvals row must refuse serving predicate with CutoverDisabled"
         );
 

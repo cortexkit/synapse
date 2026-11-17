@@ -39,13 +39,14 @@ required-features = ["e2e"]
 
 [features]
 default = []
-test-support = ["synapse-engine-owned/test-support", "synapse-owned-decode/test-support"]
+test-support = ["synapse-engine-owned/test-support", "synapse-owned-decode/test-support", "synapse-store/test-support"]
 e2e = ["test-support"]
 
 [dependencies]
 anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }
 synapse-owned-decode = { path = "../synapse-owned-decode" }
+synapse-store = { path = "../synapse-store" }
 synapse-speech = { path = "../synapse-speech" }
 synapse-certify = { path = "../synapse-certify" }
 synapse-parity = { path = "../../bench/parity" }

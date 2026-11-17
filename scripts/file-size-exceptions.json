@@ -1,12 +1,12 @@
 [
   {
     "path": "crates/synapse-module/src/lib.rs",
-    "max_lines": 32145,
+    "max_lines": 32057,
     "reason": "Predates the rule; split by area the next time this file is worked on."
   },
   {
-    "path": "crates/synapse-module/src/store.rs",
-    "max_lines": 14339,
+    "path": "crates/synapse-store/src/store.rs",
+    "max_lines": 13780,
     "reason": "Predates the rule; split by area the next time this file is worked on."
   },
   {

@@ -100,7 +100,7 @@ impl Fixture {
             .map(|table| {
                 let rows = self
                     .store
-                    .store
+                    .sqlite()
                     .with_conn(|conn| {
                         let mut stmt = conn.prepare(&format!(
                             "SELECT * FROM {table} WHERE catalog_id=?1 AND manifest_digest=?2 AND backend=?3 ORDER BY rowid"
@@ -132,7 +132,7 @@ fn seed_history(store: &SynapseStore) {
         })
         .unwrap();
     store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             tx.execute(
                 "INSERT INTO download_acquisitions VALUES (?1, 'historical-blob', 1)",
@@ -144,7 +144,7 @@ fn seed_history(store: &SynapseStore) {
 }
 
 fn seed_group(store: &SynapseStore, entry: &CatalogEntry, digest: &str, backend: &str) {
-    store.store.with_conn_fenced(|tx| {
+    store.sqlite().with_conn_fenced(|tx| {
         tx.execute("INSERT INTO catalog_installs VALUES (?1,?2,?3)", params![entry.id,digest,backend])?;
         for file in entry.files.iter().filter(|file| file.backends.iter().any(|name| name == backend)) {
             tx.execute("INSERT INTO catalog_install_members VALUES (?1,?2,?3,?4,?5)",
@@ -190,7 +190,7 @@ fn snapshot(store: &SynapseStore, tables: &[&str]) -> BTreeMap<String, Rows> {
         .iter()
         .map(|table| {
             let rows = store
-                .store
+                .sqlite()
                 .with_conn(|conn| {
                     let mut stmt =
                         conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
@@ -336,19 +336,19 @@ fn migration_size_mismatch_or_inexact_member_set_is_a_miss() {
         match variant {
             "size" => fs::write(fixture.cache.blob_path(&entry.files[0].sha256), b"short").unwrap(),
             "missing-member" => {
-                fixture.store.store.with_conn_fenced(|tx| {
+                fixture.store.sqlite().with_conn_fenced(|tx| {
                     tx.execute("DELETE FROM catalog_install_members WHERE catalog_id=?1 AND backend='ane' AND path='ane-model.bin'", [&entry.id])?;
                     Ok(())
                 }).unwrap();
             }
             "extra-member" => {
-                fixture.store.store.with_conn_fenced(|tx| {
+                fixture.store.sqlite().with_conn_fenced(|tx| {
                     tx.execute("INSERT INTO catalog_install_members VALUES (?1,?2,'ane','extra','unknown')", params![entry.id,digest])?;
                     Ok(())
                 }).unwrap();
             }
             "wrong-digest" => {
-                fixture.store.store.with_conn_fenced(|tx| {
+                fixture.store.sqlite().with_conn_fenced(|tx| {
                     tx.execute("UPDATE catalog_install_members SET digest='wrong' WHERE catalog_id=?1 AND backend='ane' AND path='ane-model.bin'", [&entry.id])?;
                     Ok(())
                 }).unwrap();
@@ -368,7 +368,7 @@ fn migration_size_mismatch_or_inexact_member_set_is_a_miss() {
 fn migration_quarantine_orphan_does_not_synthesize_an_install() {
     let fixture = Fixture::new("migration-orphan", 1);
     let entry = &fixture.entries[0];
-    fixture.store.store.with_conn_fenced(|tx| {
+    fixture.store.sqlite().with_conn_fenced(|tx| {
         tx.execute("DELETE FROM catalog_installs WHERE catalog_id=?1 AND backend='ane'", [&entry.id])?;
         tx.execute("DELETE FROM catalog_install_members WHERE catalog_id=?1 AND backend='ane' AND path='ane-model.bin'", [&entry.id])?;
         Ok(())
@@ -399,7 +399,7 @@ fn migration_current_install_replaces_only_its_legacy_group() {
     let entry = &fixture.entries[0];
     let new = entry.manifest_digest();
     seed_group(&fixture.store, entry, &new, "ane");
-    fixture.store.store.with_conn_fenced(|tx| {
+    fixture.store.sqlite().with_conn_fenced(|tx| {
         tx.execute("UPDATE catalog_self_checks SET generation=99, state='failed', reason='newer-repair' WHERE catalog_id=?1 AND manifest_digest=?2", params![entry.id,new])?;
         Ok(())
     }).unwrap();
@@ -422,7 +422,7 @@ fn migration_check_id_collision_preserves_existing_row_without_an_install() {
     let new = entry.manifest_digest();
     fixture
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             insert_check(tx, entry, &new, "ane", "failed", 99)?;
             Ok(())
@@ -440,7 +440,7 @@ fn migration_check_id_collision_preserves_existing_row_without_an_install() {
 #[test]
 fn migration_sql_fault_after_first_rekey_rolls_back_every_group() {
     let fixture = Fixture::new("migration-rollback", 1);
-    fixture.store.store.with_conn_fenced(|tx| {
+    fixture.store.sqlite().with_conn_fenced(|tx| {
         tx.execute_batch("CREATE TRIGGER fail_second_rekey BEFORE UPDATE ON catalog_installs
             WHEN OLD.backend='metal' BEGIN SELECT RAISE(ABORT, 'injected second rekey failure'); END;")?;
         Ok(())

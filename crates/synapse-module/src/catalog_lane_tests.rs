@@ -7,7 +7,7 @@ const SPEECH: &str = "parakeet-tdt-0.6b-v3";
 fn install_record(state: &ModuleState, entry: &catalog::CatalogEntry, backend: &str) {
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             tx.execute(
                 "INSERT INTO catalog_installs VALUES (?1,?2,?3)",

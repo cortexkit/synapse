@@ -2493,6 +2493,7 @@ dependencies = [
  "synapse-owned-decode",
  "synapse-parity",
  "synapse-speech",
+ "synapse-store",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2547,6 +2548,23 @@ dependencies = [
  "unicode-casefold",
  "unicode-general-category",
  "unicode-normalization",
+]
+
+[[package]]
+name = "synapse-store"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "cortexkit-store",
+ "cortexkit-store-types",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "synapse-core",
+ "synapse-owned-decode",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

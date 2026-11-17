@@ -78,7 +78,7 @@ pub(crate) fn migrate_legacy_manifest_digests(
     // The fenced callback is one SQLite transaction, including verification.
     // Keep shared blob leases until commit so cache GC cannot remove verified bytes.
     let mut readers = Vec::new();
-    Ok(store.store.with_conn_fenced(|tx| {
+    Ok(store.sqlite().with_conn_fenced(|tx| {
         let mut results = Vec::new();
         for entry in entries {
             let Some((_, old_digest)) = pre_digests.iter().find(|(id, _)| *id == entry.id) else {

@@ -4,13 +4,13 @@ fn db<T>(
     state: &ModuleState,
     f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
 ) -> Answer<T> {
-    state.store.store.with_conn(f).map_err(internal)
+    state.store.sqlite().with_conn(f).map_err(internal)
 }
 fn mutate<T>(
     state: &ModuleState,
     f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
 ) -> Answer<T> {
-    state.store.store.with_conn_fenced(f).map_err(internal)
+    state.store.sqlite().with_conn_fenced(f).map_err(internal)
 }
 pub(super) fn directory(state: &ModuleState) -> Answer<PathBuf> {
     let path: String = db(state, |c| {

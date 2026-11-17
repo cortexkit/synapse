@@ -206,7 +206,7 @@ async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_priva
     catalog_complete_check(&state, &check_id, generation, "passed", None).unwrap();
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             tx.execute(
                 "UPDATE catalog_self_checks SET self_check_wall_ms=37 WHERE check_id=?1",
@@ -253,7 +253,7 @@ async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_priva
         .any(|key| key.starts_with('_')));
     let original_object: String = state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             let object = tx.query_row(
                 "SELECT object_id FROM media_jobs WHERE id=?1",
@@ -289,7 +289,7 @@ async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_priva
     let different = fresh_upload(&state, "alice", &wav(4010)).await;
     let before = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| Ok(c.total_changes()))
         .unwrap();
     assert_eq!(
@@ -307,7 +307,7 @@ async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_priva
     assert_eq!(
         state
             .store
-            .store
+            .sqlite()
             .with_conn(|c| Ok(c.total_changes()))
             .unwrap(),
         before,
@@ -412,7 +412,7 @@ async fn transcribe_certification_measurements_freeze_and_observe_rerun_is_priva
     );
     state
         .store
-        .store
+        .sqlite()
         .with_conn_fenced(|tx| {
             tx.execute(
                 "UPDATE catalog_self_checks SET self_check_wall_ms=777 WHERE check_id=?1",
@@ -463,7 +463,7 @@ async fn transcribe_certification_operations_refuse_without_observation_mode() {
     ] {
         let before = state
             .store
-            .store
+            .sqlite()
             .with_conn(|c| Ok(c.total_changes()))
             .unwrap();
         assert_eq!(
@@ -476,7 +476,7 @@ async fn transcribe_certification_operations_refuse_without_observation_mode() {
         assert_eq!(
             state
                 .store
-                .store
+                .sqlite()
                 .with_conn(|c| Ok(c.total_changes()))
                 .unwrap(),
             before
@@ -778,7 +778,7 @@ async fn media_results_mock_worker_observation_pages_are_exact_private_and_expir
     persistence::sweep(&state, now_ms() + RETENTION_MS + 1).unwrap();
     let pages: u64 = state
         .store
-        .store
+        .sqlite()
         .with_conn(|c| {
             c.query_row("SELECT count(*) FROM media_observation_pages", [], |r| {
                 r.get(0)
