@@ -1,0 +1,29 @@
+{
+  "schema": "qwen3-asr-quant-profile-v1",
+  "status": "uncalibrated",
+  "engine_slices_allowed": false,
+  "weights": "Rust Q8_0 decoder linears/head; pinned f16 remainder expanded to f32",
+  "accumulation": "f32 dot products, norm/softmax reductions and logits",
+  "rounding": "IEEE binary16 round-to-nearest-even, then exact expansion to f32",
+  "f16_boundaries": [
+    "encoder vectors written into the audio placeholder span",
+    "each nn.Linear output except the logits head",
+    "each LayerNorm and RMSNorm output",
+    "encoder positional residual after its add",
+    "encoder and decoder residual stream after each attention/MLP add",
+    "attention probabilities after f32 softmax, before the value dot product",
+    "decoder K and V entries on cache insertion (K after RoPE)"
+  ],
+  "unrounded": [
+    "Conv2d and GELU outputs",
+    "activation products and RoPE intermediates",
+    "attention dot-product outputs before the output linear",
+    "logits, including the head output"
+  ],
+  "tau_rule": "max(0.1, 2 * max teacher margin at a teacher-forced top-1 disagreement)",
+  "maximum_tau": 1.0,
+  "minimum_graded_fraction_per_fixture_set": 0.9,
+  "graded_rule": "teacher margin strictly greater than tau",
+  "tau": null,
+  "fixture_counts": null
+}
