@@ -787,7 +787,8 @@ direct-ANE compile-blocked deadline waits retain `shape_compiling`.
    `details.lane_ids`, then use `models.remove` to delete installation files.
 
 Schema 19 deletes retired Core ML, free-form embed/rerank, and owned-decode
-registrations and their legacy gate tables. Back up the SQLite store before
+registrations, and drops the tables that held their aliases, manual probe
+certifications, generation approvals and serving sessions. Back up the SQLite store before
 upgrading. Older binaries refuse newer schemas; to roll back, stop Synapse and
 restore the pre-upgrade store backup before restarting the older binary.
 - **admission.status** — advisory snapshot: queue depths, current knob,

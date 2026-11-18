@@ -12470,9 +12470,8 @@ mod tests {
 
     #[test]
     fn readme_lists_every_workspace_production_crate() {
-        // Third instance of the enumeration-gap class (issues #2, #5, #8): a
-        // document describing a declared surface silently omits members added
-        // after it was written. The enumeration source here is the workspace
+        // A document that lists a declared surface silently omits members
+        // added after it was written. The enumeration source here is the workspace
         // manifest's member list - the same source Cargo builds from - so a new
         // production crate cannot ship without joining the README sentence
         // this test reads.
@@ -12497,7 +12496,7 @@ mod tests {
 
     #[test]
     fn manifest_provenance_declares_only_facts_this_binary_knows() {
-        // Report the compiled inputs so clean/dirty cache drills observe the
+        // Print the compiled inputs so a reader of the test log sees the
         // artifact's stamp rather than the checkout's current git status.
         println!(
             "SYNAPSE_BUILD_REV={}; SYNAPSE_BUILD_TREE={}",

@@ -4206,9 +4206,8 @@ mod tests {
         // Asserts the PROPERTY the derivation must satisfy, not the derivation
         // itself. Restating `MIGRATIONS.iter().map(..).max()` here would make
         // this agree with the code by construction and pass whatever the
-        // function did; the manifest-side check can only see shape, so a
-        // regressed derivation that still returns a positive number is
-        // invisible there. These two bounds pin it from both sides: `.min()`
+        // function did. A regressed derivation that still returns a positive
+        // number would pass any check that looks only at its type. These two bounds pin it from both sides: `.min()`
         // or a hardcoded low literal breaks the first, and a literal above the
         // list breaks the second.
         //

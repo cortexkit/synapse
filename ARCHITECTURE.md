@@ -20,7 +20,8 @@ Models come from the catalog or preloads:
   (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B), plus Parakeet TDT 0.6B v3 for
   transcription, each pinned per backend with its fingerprint. Installs are
   explicit (`models.download`); a catalog lane checks itself on the device at first
-  load and needs no probe or approval.
+  load and after an OS update. Nothing on the user's machine needs a manual
+  probe or approval.
 - **Profile preloads**, configured with a manifest `profile`. These also check
   themselves on-device. Llama.cpp generation also uses preloads and needs no
   numerical self-check.
@@ -150,8 +151,7 @@ rerank quality scoring.
    idempotent.
 4. The lane is made ready. Serving never downloads: a catalog model that isn't
    installed is refused with `model_not_installed`. The module verifies the installed
-   files, loads the lane and runs its self-check on first use. Parked owned
-   generation still needs current certification and an enabled approval.
+   files, loads the lane and runs its self-check on first use.
 5. The work runs on the chosen lane: an in-process engine, or a worker over the
    worker protocol.
 6. Results are committed in pages as the job runs. Callers read them with
