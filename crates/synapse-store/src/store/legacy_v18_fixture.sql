@@ -11,7 +11,15 @@ INSERT INTO approval_migration_markers
 VALUES ('seed', 'schema', 'digest', 1, 1);
 INSERT INTO cert_rows (certification_class, assurance_class, status, key_hash,
     machine_profile_hash, fingerprint, certified_at_ms, os_build, module_generation, evidence_json)
-VALUES ('embedding', 'measured', 'certified', 'machine', 'machine', 'fp', 1, 'os', 1, '{}');
+VALUES ('embedding', 'measured', 'certified', 'machine', 'machine', 'embed-fp', 1, 'os', 1, '{}'),
+       ('rerank', 'measured', 'certified', 'machine', 'machine', 'rerank-fp', 1, 'os', 1, '{}'),
+       ('legacy_owned_decode', 'measured', 'uncertified', 'machine', 'machine', 'legacy-decode-fp', 1, 'os', 1, '{}');
+INSERT INTO cert_rows (certification_class, assurance_class, status, key_hash,
+    revisioned_machine_profile_hash, profile_activation_epoch, model_id, decode_fingerprint,
+    evidence_schema_revision, fingerprint, certified_at_ms, os_build, module_generation, evidence_json,
+    constraint_runtime_identities_digest)
+VALUES ('measured_owned_decode', 'measured', 'certified', 'profile', 'profile', 1,
+    'qwen-decode', 'decode', 'schema', 'decode-fp', 1, 'os', 1, '{}', 'constraints');
 INSERT INTO cert_row_rebuild_events (outcome, detail, occurred_at_ms)
 VALUES ('rebuilt', 'detail', 1);
 INSERT INTO perf_rows VALUES ('machine', 'qwen-decode', 'generate', 'numeric',
