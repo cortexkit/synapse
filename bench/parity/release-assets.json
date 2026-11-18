@@ -34,13 +34,6 @@
       "reason": "llama.cpp worker; not an embed or rerank lane for the four models"
     },
     {
-      "asset": "ck-synapse-worker-decode-darwin-arm64.zip",
-      "binary": "ck-synapse-worker-decode",
-      "binding": "exempt",
-      "os_arch": "darwin-arm64",
-      "reason": "owned decode worker; decode is not certified by this flow"
-    },
-    {
       "asset": "ck-synapse-linux-x64.zip",
       "binary": "ck-synapse",
       "binding": "certification",
