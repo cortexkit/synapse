@@ -2,8 +2,9 @@
 
 This contract describes implemented local worker transport and host supervision.
 Message types live in `crates/synapse-core/src/worker_protocol.rs`; the module host
-lives in `crates/synapse-module/src/worker_host/`. Owned decode also has its own
-supervisor under `crates/synapse-engine-owned/owned-decode-worker/`.
+lives in `crates/synapse-worker-host/src/worker_host/`. The parked owned decode
+protocol and supervisor are under `crates/synapse-engine-owned/owned-decode-worker/`;
+the module does not spawn that worker.
 
 ## 1. Authenticate the spawned worker
 
@@ -12,7 +13,7 @@ The protocol version and expected engine identity must also agree. The daemon's
 launch credentials are removed from child environments: authenticating a worker
 must not delegate the module's launch authority.
 
-Checks: `worker_host::tests::rejects_stale_worker_nonce` in the module library;
+Checks: `worker_host::tests::rejects_stale_worker_nonce` in `synapse-worker-host`;
 `wrong_engine_identity_and_old_protocol_are_rejected` in core Unix transport tests;
 `stripped_child_environment_contains_neither_launch_nonce_variable` and
 `stripped_tokio_child_environment_contains_neither_launch_nonce_variable` in

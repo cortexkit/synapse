@@ -50,6 +50,7 @@ Error-code vocabularies are surface-specific. Core `StableErrorCode` supplies
 `queue_full`, `deadline_exceeded`, `model_loading`,
 `substitution_rejected`, `artifact_invalid`, `engine_crashed`,
 `probe_required`, `migration_required`, and `module_restarted` here.
+`not_certified` remains a reserved core error name; Synapse no longer emits it.
 `grammar_disabled` is a channel error for `microllm.oneshot` requests that
 supply nonempty grammar; llama.cpp generation accepts free text only.
 
@@ -486,8 +487,8 @@ deleted with the job and remain private to its route principal.
   positive `count`, `first_seen_ms`, `last_seen_ms`, `summary`, `samples`, and
   `hint`. Guidance appears only in `hint`; clients must not execute it automatically.
   Findings are severity ordered (`error`, then `warn`); ties use the order below.
-  Checks read existing runtime catalog, certification, admission and self-check
-  state: they never load a model, execute inference, run a probe or repair state.
+  Checks read existing runtime catalog, worker and self-check state: they never
+  load a model, execute inference or repair state.
   All current checks describe standing conditions, even if they predate the
   requested window; there is no recent-history scan.
   - `catalog_self_check_failed` (`warn`): installed runtime catalog lanes with a
@@ -506,8 +507,7 @@ deleted with the job and remain private to its route principal.
   necessary, preserving retained counts. There is no pagination or truncation
   flag. Only lane identifiers, check times and bounded status evidence are
   returned—never prompts, inputs, embeddings, raw errors, artifact paths or
-  machine-profile details. Performance-stale alone is omitted because it does
-  not refuse serving and must not wake an owner as a certification failure.
+  machine-profile details.
 
 - **lanes.pause** {scope: "neural_engine", duration_ms, reason} — mutate. Starts
   a volatile pause of every direct-ANE lane, including cold lanes.
