@@ -85,6 +85,36 @@ class ParallelCiTests(unittest.TestCase):
                 self.assertNotIn("save-cache", setup)
         self.assertEqual(len(set(lanes)), len(lanes))
 
+    def test_cmake_version_partitions_cache_restore_prefix(self):
+        steps = SETUP["runs"]["steps"]
+        cache = next(s for s in steps if s.get("uses") == "Swatinem/rust-cache@v2")
+        probe = next((s for s in steps if s.get("id") == "cmake"), None)
+        if probe is None:
+            self.fail("cached native builds must detect CMake before restoring")
+        self.assertLess(steps.index(probe), steps.index(cache))
+        self.assertNotIn("if", probe)
+        self.assertIn("${{ steps.cmake.outputs.version }}", cache["with"]["prefix-key"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cmake = root / "cmake"
+            output = root / "output"
+            cmake.write_text("#!/bin/bash\n[[ $1 == --version ]] || exit 2\nprintf '%s\\r\\nMore output\\r\\n' \"$VERSION_LINE\"\n")
+            cmake.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}", GITHUB_OUTPUT=str(output))
+            for line, expected in (("cmake version 4.4.0", "4.4.0"),
+                                   ("cmake version 4.5.1", "4.5.1"),
+                                   ("invalid version output", None)):
+                with self.subTest(line=line):
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-c", probe["run"]],
+                                            env=dict(env, VERSION_LINE=line), capture_output=True)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(output.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(output.read_text(), f"version={expected}\n")
+
     def test_windows_profile_keeps_release_semantics_and_optimized_dependencies(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
         profile = manifest["profile"]["ci-test"]

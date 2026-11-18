@@ -60,22 +60,25 @@ jobs:
         include:
           - os_arch: linux-x64
             runner: ubuntu-24.04
-            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-cuda -p synapse-worker-vulkan
-            features: --features cuda --features vulkan
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-cuda -p synapse-worker-vulkan
+            features: --features synapse-worker-cuda/cuda --features synapse-worker-vulkan/vulkan
+            llama_features: --no-default-features --features vulkan
             binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-cuda ck-synapse-worker-vulkan
             toolkits: CUDA 13.2.1 linux-x86_64 components; Vulkan SDK 1.4.357.0 tarball
             packaging: archive-root zip
           - os_arch: windows-x64
             runner: windows-2025
-            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-cuda -p synapse-worker-vulkan
-            features: --features cuda --features vulkan
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-cuda -p synapse-worker-vulkan
+            features: --features synapse-worker-cuda/cuda --features synapse-worker-vulkan/vulkan
+            llama_features: --no-default-features --features vulkan
             binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-cuda ck-synapse-worker-vulkan
-            toolkits: CUDA 13.2.1 windows-x86_64 components; Vulkan SDK 1.4.357.0 installer; LLVM
+            toolkits: CUDA 13.2.1 windows-x86_64 components; Vulkan SDK 1.4.357.0 installer; LLVM; Ninja
             packaging: scripts/package-owned-cuda.ps1 for CUDA; archive-root zip otherwise
           - os_arch: darwin-arm64
             runner: macos-15
-            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-ane-direct
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-ane-direct
             features: ''
+            llama_features: ''
             binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-ane-direct
             toolkits: full Xcode; no CUDA toolkit or Vulkan SDK
             packaging: archive-root zip
@@ -94,16 +97,29 @@ jobs:
       - name: Select full Xcode
         if: runner.os == 'macOS'
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-      - name: Install LLVM
+      - name: Install LLVM and ensure Ninja is available
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install llvm -y --no-progress
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
           arch: x64
+      - name: Select the x64 MSVC linker for Cargo
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+          if (!(Test-Path -LiteralPath $linker -PathType Leaf)) { throw "MSVC linker not found: $linker" }
+          # Git Bash puts its own link.exe on PATH. Select the linker from the
+          # same MSVC toolset as the include and library paths configured above.
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       - name: Install verified Linux CUDA 13.2.1 components and Vulkan SDK
         if: runner.os == 'Linux'
         shell: bash
@@ -133,7 +149,11 @@ jobs:
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cuda-components/cuda_cudart/lib:$RUNNER_TEMP/cuda-components/libcublas/lib" >> "$GITHUB_ENV"
           curl --fail --location --retry 3 "$VULKAN_LINUX_URL" -o "$RUNNER_TEMP/vulkan.tar.xz"
           python3 scripts/check-release-candidate.py extract --archive "$RUNNER_TEMP/vulkan.tar.xz" --sha256 "$VULKAN_LINUX_SHA256" --destination "$RUNNER_TEMP/vulkan"
-          echo "VULKAN_SDK=$RUNNER_TEMP/vulkan/1.4.357.0/x86_64" >> "$GITHUB_ENV"
+          sdk="$RUNNER_TEMP/vulkan/1.4.357.0/x86_64"
+          # FindVulkan searches the SDK's lib directory, not the nested loader directory.
+          test -f "$sdk/lib/VulkanLoader/lib/libvulkan.so"
+          ln -s VulkanLoader/lib/libvulkan.so "$sdk/lib/libvulkan.so"
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
       - name: Install verified Windows CUDA 13.2.1 components and Vulkan SDK
         if: runner.os == 'Windows'
         shell: pwsh
@@ -180,13 +200,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            # CMake's native tools also need MSVC ahead of the Git Bash tools.
+            linker=$(cygpath -u "$CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER")
+            export PATH="${linker%/*}:$PATH"
+          fi
           bins=()
           for bin in ${{ matrix.binaries }}; do
-            bins+=(--bin "$bin")
+            if [ "$bin" != ck-synapse-worker-llama ]; then
+              bins+=(--bin "$bin")
+            fi
           done
           # Package selection alone also builds local exercisers and mocks.
           # Select shipped targets without hiding tools operators build locally.
           cargo build --release --locked ${{ matrix.packages }} ${{ matrix.features }} "${bins[@]}"
+          # llama requires exactly one backend. Build it separately from the
+          # other GPU workers so their features cannot affect its selection.
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Ninja orders the Vulkan shader ExternalProject's build and install.
+            # A short intermediate directory avoids CMake's object path limit
+            # while the shipped binary still lands in target/release.
+            export CMAKE_GENERATOR=Ninja CARGO_BUILD_BUILD_DIR=D:/t
+          fi
+          cargo build --release --locked -p synapse-worker-llama ${{ matrix.llama_features }} --bin ck-synapse-worker-llama
       - name: Check SPIR-V set digest against synapse-core
         if: runner.os != 'macOS'
         shell: bash
@@ -217,6 +253,10 @@ jobs:
           set -euo pipefail
           CANDIDATE_BIN_DIR="$(pwd)/target/release"
           export CANDIDATE_BIN_DIR
+          if [ "$RUNNER_OS" = Linux ]; then
+            # The llama binary needs the versioned Vulkan loader at runtime.
+            export LD_LIBRARY_PATH="$VULKAN_SDK/lib/VulkanLoader/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
           cargo test --release --locked -p synapse-core --test candidate_workers -- --ignored --nocapture
       - name: Package Windows CUDA with runtime manifests and licenses
         if: runner.os == 'Windows'

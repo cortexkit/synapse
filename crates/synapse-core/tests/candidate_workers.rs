@@ -25,21 +25,15 @@ async fn candidate_hosted_protocol_matrix() {
     .status()
     .unwrap()
     .success());
-    let mut workers = vec![("llama", "llama.cpp-worker", true)];
+    let mut workers = vec![("llama", "llama.cpp-worker")];
     if cfg!(target_os = "macos") {
-        workers.extend([
-            ("decode", "owned-metal-decode", false),
-            ("ane-direct", "ane-direct-worker", true),
-        ]);
+        workers.push(("ane-direct", "ane-direct-worker"));
     } else {
-        workers.extend([
-            ("cuda", "owned-cuda", true),
-            ("vulkan", "owned-vulkan", true),
-        ]);
+        workers.extend([("cuda", "owned-cuda"), ("vulkan", "owned-vulkan")]);
     }
-    for (worker, engine, unsupported) in workers {
+    for (worker, engine) in workers {
         println!("hosted protocol: {worker}");
-        // Every worker, including owned decode, requires the same 8-byte hex nonce.
+        // Every worker requires the same 8-byte hex nonce.
         let nonce = format!(
             "{:016x}",
             std::time::SystemTime::now()
@@ -74,7 +68,7 @@ async fn candidate_hosted_protocol_matrix() {
         )
         .await
         .unwrap();
-        for index in 0..=usize::from(unsupported) {
+        for index in 0..=1 {
             if index == 1 {
                 let request = if worker == "llama" {
                     WorkerRequest::RerankSequences {

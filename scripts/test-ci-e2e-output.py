@@ -113,30 +113,58 @@ class ReleaseTargetsTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / ".github/workflows/release-candidate.yml").read_text())
         job = workflow["jobs"]["build"]
         build = next(s for s in job["steps"] if s.get("name") == "Build every release asset once")
+        inventory = json.loads((ROOT / "bench/parity/release-assets.json").read_text())["assets"]
+        llama = "ck-synapse-worker-llama"
         for matrix in job["strategy"]["matrix"]["include"]:
-            with self.subTest(platform=matrix["os_arch"]), tempfile.TemporaryDirectory() as temp:
+            platform = matrix["os_arch"]
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 cargo = root / "cargo"
-                cargo.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                cargo.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
                                  "from pathlib import Path\n"
-                                 "Path('args.json').write_text(json.dumps(sys.argv[1:]))\n")
+                                 "with Path('calls.jsonl').open('a') as output:\n"
+                                 "    output.write(json.dumps([sys.argv[1:], os.getenv('CMAKE_GENERATOR'), "
+                                 "os.getenv('CARGO_BUILD_BUILD_DIR')]) + '\\n')\n")
                 cargo.chmod(0o755)
                 script = build["run"]
-                for key in ("packages", "features", "binaries"):
-                    script = script.replace("${{ matrix." + key + " }}", matrix[key])
-                env = dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}")
+                for key in ("packages", "features", "binaries", "llama_features"):
+                    script = script.replace("${{ matrix." + key + " }}", matrix.get(key, ""))
+                runner_os = {"linux-x64": "Linux", "windows-x64": "Windows", "darwin-arm64": "macOS"}[platform]
+                env = dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}", RUNNER_OS=runner_os)
+                if runner_os == "Windows":
+                    cygpath = root / "cygpath"
+                    cygpath.write_text("#!/bin/bash\n[[ $1 == -u ]] || exit 1\nprintf '%s\\n' \"$2\"\n")
+                    cygpath.chmod(0o755)
+                    env["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"] = str(root / "MSVC bin" / "link.exe")
+                for name in ("CMAKE_GENERATOR", "CARGO_BUILD_BUILD_DIR"):
+                    env.pop(name, None)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
                                         cwd=root, env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                args = json.loads((root / "args.json").read_text())
-                selected = {args[i + 1] for i, arg in enumerate(args) if arg == "--bin"}
+                calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+                self.assertEqual(len(calls), 2, "llama must build separately from the owned GPU workers")
+                owned, llama_call = calls
+                owned_args, llama_args = owned[0], llama_call[0]
+                selected = [args[i + 1] for args in (owned_args, llama_args)
+                            for i, arg in enumerate(args) if arg == "--bin"]
                 self.assertIn("ck-synapse", selected)
-                self.assertIn("--release", args)
-                self.assertIn("--locked", args)
-                self.assertEqual(selected, set(matrix["binaries"].split()))
+                self.assertCountEqual(selected, matrix["binaries"].split())
+                self.assertCountEqual(selected, [entry["binary"].removesuffix(".exe") for entry in inventory
+                                                 if entry["asset"].endswith(f"-{platform}.zip")])
                 self.assertTrue(all(name.startswith("ck-") for name in selected))
-                self.assertTrue(selected.isdisjoint({"inline_embed_throughput", "subc_call",
-                                                      "synapse-worker-timeout-mock"}))
+                self.assertTrue(set(selected).isdisjoint({"inline_embed_throughput", "subc_call",
+                                                          "synapse-worker-timeout-mock"}))
+                for args in (owned_args, llama_args):
+                    self.assertEqual(args[:3], ["build", "--release", "--locked"])
+                self.assertNotIn("synapse-worker-llama", owned_args)
+                expected = ["build", "--release", "--locked", "-p", "synapse-worker-llama"]
+                if runner_os != "macOS":
+                    expected += ["--no-default-features", "--features", "vulkan"]
+                    self.assertEqual([owned_args[i + 1] for i, arg in enumerate(owned_args) if arg == "--features"],
+                                     ["synapse-worker-cuda/cuda", "synapse-worker-vulkan/vulkan"])
+                self.assertEqual(llama_args, expected + ["--bin", llama])
+                self.assertEqual(owned[1:], [None, None])
+                self.assertEqual(llama_call[1:], ["Ninja", "D:/t"] if runner_os == "Windows" else [None, None])
 
 
 if __name__ == "__main__":

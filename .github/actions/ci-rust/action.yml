@@ -30,13 +30,26 @@ runs:
       with:
         components: clippy, rustfmt
 
+    - name: Detect the CMake version for the build cache
+      id: cmake
+      shell: bash
+      run: |
+        set -euo pipefail
+        version_output=$(cmake --version)
+        version_line=${version_output%%$'\n'*}
+        version_line=${version_line%$'\r'}
+        if [[ ! "$version_line" =~ ^cmake\ version\ ([0-9]+\.[0-9]+\.[0-9]+[-.+[:alnum:]]*)$ ]]; then
+          echo "Unrecognized CMake version: $version_line" >&2
+          exit 1
+        fi
+        echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: synapse
-        # Retain the generation so existing compiled outputs remain reusable.
-        # "static-crt" is a legacy label, not a C runtime linkage setting.
-        # Each lane retains its own outputs instead of evicting the others.
-        prefix-key: v2-static-crt
+        # CMake caches absolute module paths inside target/. Include the version
+        # in the restore prefix so fallback hits cannot cross CMake versions.
+        prefix-key: v2-static-crt-cmake-${{ steps.cmake.outputs.version }}
         shared-key: ci-${{ inputs.lane }}
         cache-workspace-crates: true
         key: ${{ hashFiles('synapse/crates/**', 'synapse/bench/parity/src/**') }}
