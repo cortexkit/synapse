@@ -619,7 +619,8 @@ pub enum WorkerResponse {
         placement_share: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         buckets: Option<Vec<usize>>,
-        /// Direct ANE only: resident shapes per model ref.
+        /// Direct ANE only: resident padded lengths per loaded model, keyed by
+        /// the `model_ref` the worker returned from LOAD.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ane_resident_shapes: Option<BTreeMap<String, Vec<usize>>>,
     },
