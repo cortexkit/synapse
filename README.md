@@ -81,6 +81,7 @@ is not a hardware pass. See [development verification](docs/development.md) and
 
 ## Documentation
 
+- [Installation support check](docs/installation.md) for macOS, Linux, and Windows.
 - [Architecture](docs/architecture.md) and [configuration](docs/configuration.md).
 - [Wire contract](docs/wire-contract-v1.md) and [worker protocol](docs/worker-protocol.md).
 - [Direct ANE serving](docs/ane-serving.md) and [graph layout](docs/ane-graph-layout.md).

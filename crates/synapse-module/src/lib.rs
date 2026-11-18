@@ -13,6 +13,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+mod backend_check;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
@@ -20,6 +21,8 @@ mod diagnostics_findings;
 mod engram_catalog;
 mod event_outbox;
 mod lane_pause;
+pub use backend_check::check_backend;
+use backend_check::{backend_reason, detected_catalog_backends, resolve_worker_binary_sibling};
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
@@ -92,9 +95,10 @@ use subc_protocol::{
     },
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
+#[cfg(test)]
+use synapse_core::worker_binary_file_name;
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
-    worker_binary_file_name,
     worker_engine_names::{LLAMA_ENGINE, LLAMA_WORKER_ENGINE},
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
@@ -4474,21 +4478,6 @@ fn load_catalog_model_blocking(
         engine_identity: spec.engine_identity.clone(),
         owned_tokenizer_policy,
     })
-}
-
-/// Resolve a supervised worker binary when the spec and the engine-specific
-/// env var are both absent: look for the worker shipped beside the running
-/// module binary (release archives unpack every binary at the archive root).
-/// Returns `None` when no sibling exists, so the existing refusal path keeps
-/// its message.
-fn resolve_worker_binary_sibling(engine: &str) -> Option<PathBuf> {
-    let file_name = worker_binary_file_name(engine)?;
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let candidate = dir.join(file_name);
-    #[cfg(windows)]
-    let candidate = candidate.with_extension("exe");
-    candidate.is_file().then_some(candidate)
 }
 
 // Only the macOS direct-ANE backend calls this, but the mapping itself is
@@ -15561,6 +15550,7 @@ mod tests {
 #[cfg(test)]
 mod catalog_runtime_tests {
     use super::*;
+    use crate::backend_check::direct_ane_catalog_available;
 
     /// Waits for a fixture download to reach a terminal state and asserts it
     /// committed. The bound only guards against a hang, so it matches the
@@ -16879,115 +16869,6 @@ fn runtime_release_catalog() -> Result<catalog::Catalog, ModuleError> {
         .cloned()
         .map_err(|e| ModuleError::Config(e.to_string()))
 }
-fn detected_catalog_backends(
-    config: &ModuleConfig,
-) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
-    #[cfg(feature = "test-support")]
-    if let Ok(value) = env::var("SYNAPSE_TEST_RUNNABLE_BACKENDS") {
-        return (
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-            BTreeMap::new(),
-        );
-    }
-    #[cfg(target_os = "macos")]
-    let backends = {
-        let mut backends = BTreeSet::new();
-        if metal::Device::system_default().is_some() {
-            backends.insert("metal".into());
-        }
-        if direct_ane_catalog_available(true, catalog_direct_ane_worker().as_deref()) {
-            backends.insert("ane".into());
-        }
-        backends
-    };
-    #[cfg(target_os = "macos")]
-    {
-        let _ = config;
-        (backends, BTreeMap::new())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let configured = |engine: &str| {
-            config
-                .preload_models
-                .iter()
-                .find(|model| model.engine == engine && model.worker_bin.is_some())
-                .and_then(|model| model.worker_bin.as_deref())
-        };
-        detect_gpu_backends(
-            resolve_catalog_worker(CUDA_WORKER_ENGINE, configured(CUDA_WORKER_ENGINE)),
-            resolve_catalog_worker("owned-vulkan", configured("owned-vulkan")),
-        )
-    }
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn detect_gpu_backends(
-    cuda: Option<PathBuf>,
-    vulkan: Option<PathBuf>,
-) -> (BTreeSet<String>, BTreeMap<String, &'static str>) {
-    let outcomes = std::thread::scope(|scope| {
-        let cuda = scope.spawn(|| detect_worker_backend("cuda", cuda.as_deref()));
-        let vulkan = scope.spawn(|| detect_worker_backend("vulkan", vulkan.as_deref()));
-        [
-            ("cuda", cuda.join().expect("CUDA detection thread")),
-            ("vulkan", vulkan.join().expect("Vulkan detection thread")),
-        ]
-    });
-    let mut runnable = BTreeSet::new();
-    let mut reasons = BTreeMap::new();
-    for (backend, outcome) in outcomes {
-        match outcome {
-            Ok(()) => {
-                runnable.insert(backend.to_string());
-            }
-            Err(reason) => {
-                reasons.insert(backend.to_string(), reason);
-            }
-        }
-    }
-    (runnable, reasons)
-}
-
-#[cfg(any(not(target_os = "macos"), test))]
-fn detect_worker_backend(backend: &str, worker: Option<&Path>) -> Result<(), &'static str> {
-    use catalog_probe::{cached_probe, floor_result, version_result, ProbeKind};
-    let worker = worker.ok_or("worker_missing")?;
-    version_result(
-        cached_probe(worker, ProbeKind::Version).map_err(|error| error.reason)?,
-        backend,
-    )?;
-    if backend != "cuda" || cuda_floor_override().is_none() {
-        let envelope =
-            floor_result(cached_probe(worker, ProbeKind::Floor).map_err(|error| error.reason)?)?;
-        if backend == "cuda" && cuda_reading(&envelope).is_none() {
-            return Err("probe_failed");
-        }
-    }
-    if backend == "cuda" && !owned_cuda_floor_decision(Some(worker)).is_supported() {
-        return Err("device_below_floor");
-    }
-    Ok(())
-}
-#[cfg(target_os = "macos")]
-fn catalog_direct_ane_worker() -> Option<PathBuf> {
-    env::var_os(worker_binary_env_var("ane-direct-worker"))
-        .map(PathBuf::from)
-        .or_else(|| resolve_worker_binary_sibling("ane-direct-worker"))
-}
-// These catalog models use ck-synapse-worker-ane-direct, which calls Apple's
-// Neural Engine API directly. The separate worker that accesses the Neural
-// Engine through Apple's Core ML framework does not satisfy this requirement.
-// Require macOS and the direct worker binary before offering this backend.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-fn direct_ane_catalog_available(macos: bool, worker: Option<&Path>) -> bool {
-    macos && worker.is_some_and(Path::is_file)
-}
 fn catalog_floor_observations(
     config: &ModuleConfig,
     runnable: &BTreeSet<String>,
@@ -17161,20 +17042,12 @@ fn catalog_backend_reason(
     backend: &str,
     platform: synapse_core::Platform,
 ) -> Option<&'static str> {
-    let macos = platform == synapse_core::Platform::MacOs;
-    if macos && matches!(backend, "cuda" | "vulkan") {
-        Some("not_supported_on_platform")
-    } else if runtime.runnable_backends.contains(backend) {
-        None
-    } else if !macos && matches!(backend, "metal" | "ane") {
-        Some("not_supported_on_platform")
-    } else if let Some(reason) = runtime.backend_reasons.get(backend) {
-        Some(*reason)
-    } else if backend == "metal" {
-        Some("device_missing")
-    } else {
-        Some("worker_missing")
-    }
+    backend_reason(
+        &runtime.runnable_backends,
+        &runtime.backend_reasons,
+        backend,
+        platform,
+    )
 }
 fn catalog_wire_error(
     code: &str,

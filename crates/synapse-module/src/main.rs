@@ -4,11 +4,10 @@ use std::{ffi::OsString, path::PathBuf};
 
 const RESTORE_USAGE: &str = "usage: ck-synapse restore-import <scratch-db> [--into <store-dir>]";
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
 
-    // Provenance probes must exit before runtime-required arguments are parsed.
+    // Standalone probes do not start the runtime or parse supervised arguments.
     if arguments.iter().any(|argument| argument == "--version") {
         println!(concat!(
             env!("CARGO_BIN_NAME"),
@@ -23,6 +22,25 @@ async fn main() {
         return;
     }
 
+    if arguments
+        .iter()
+        .any(|argument| argument == "--check-backend")
+    {
+        match synapse_module::check_backend(&arguments, &mut std::io::stdout().lock()) {
+            Ok(0) => return,
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("backend check failed: {error:#}");
+                std::process::exit(3);
+            }
+        }
+    }
+
+    run_module_command(arguments);
+}
+
+#[tokio::main]
+async fn run_module_command(arguments: Vec<OsString>) {
     match synapse_certify::command::parse(&arguments) {
         Ok(Some(command)) => {
             let source = synapse_certify::command::source_stamp(

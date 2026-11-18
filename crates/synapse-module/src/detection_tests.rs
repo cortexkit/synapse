@@ -4,6 +4,7 @@
 #![cfg(test)]
 
 use super::*;
+use backend_check::{detect_gpu_backends, detect_worker_backend};
 use catalog_probe::{cached_probe, forget_cached_probes, run_probe, ProbeKind};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicUsize;

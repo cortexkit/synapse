@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_os = "macos"))]
+mod backend_check;
 mod catalog_e2e;
 mod common;
 mod embed_batch_module_cost;
