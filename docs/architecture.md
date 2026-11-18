@@ -24,7 +24,8 @@ Catalog installation is explicit through `models.download`; serving does not
 fetch missing files. Catalog lanes verify cached members, load lazily and perform
 sealed self-checks. A failed check stays failed for its identity key. Catalog lane
 IDs use `<catalog-id>-<backend>` and are separate from profile preload IDs.
-Moving an index between them requires deliberate identity handling.
+Their fingerprints differ, so a consumer's stored vectors from one lane can't
+be queried with the other; switching lanes means re-embedding.
 
 Owned-decode serving still requires matching certification evidence and an enabled
 approval row. Backend source code existing
