@@ -23,6 +23,7 @@ mod event_outbox;
 mod lane_pause;
 pub use backend_check::check_backend;
 use backend_check::{backend_reason, detected_catalog_backends, resolve_worker_binary_sibling};
+mod settings;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
@@ -85,8 +86,12 @@ use store::{
     JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
-    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandler,
-    RequestCtx, RouteBindRequest, RouteHandle, SubcModuleError,
+    async_trait,
+    config::{
+        ConfigDeclareRequest, ConfigReviewReply, ConfigReviewRequest, ConfigState, ConfigView,
+    },
+    BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandler, RequestCtx,
+    RouteBindRequest, RouteHandle, SubcModuleError,
 };
 use subc_protocol::{
     manifest::{
@@ -160,7 +165,6 @@ const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 3_072;
 const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
 const MAX_ENGINE_BATCH_ITEMS: usize = 8;
 const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
-const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
 const SYNAPSE_EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
 const DEFAULT_MICROLLM_MAX_TOKENS: u32 = 512;
 const DEFAULT_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -230,7 +234,7 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
         );
     }
     let _singleton = acquire_synapse_singleton_lease(&module_id)?;
-    subc_connection_file_from_args()?;
+    let connection_file = subc_connection_file_from_args()?;
     let handler = SynapseHandler::new(module_id.clone());
     // On the registration-channel launch path the SDK exits the process from
     // inside `on_connection_end` and never returns from `serve`, so the stop line
@@ -255,21 +259,11 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
             .await
         {
             Ok((handle, serving)) => {
-                // The SDK runs on_hello_ack, and with it the whole boot, before it returns
-                // this handle, so the boot can't start the publisher; start it here instead.
-                // A failed boot panics inside on_hello_ack, so the state is always set by now.
-                match (handler.inner.state.get(), subc_connection_file_from_args()) {
-                    (Some(state), Ok(path)) => event_outbox::start(state, handle, path),
-                    (state, path) => tracing::warn!(
-                        target: "lifecycle",
-                        state_ready = state.is_some(),
-                        connection_file = path.is_ok(),
-                        "event publisher not started; committed events stay in the outbox"
-                    ),
-                }
-                serving.await
+                handler
+                    .serve_with_settings(handle, serving, connection_file)
+                    .await
             }
-            Err(error) => Err(error),
+            Err(error) => Err(ModuleError::Serve(error)),
         };
     let uptime_s = started.elapsed().as_secs();
     match &outcome {
@@ -294,7 +288,7 @@ pub async fn run_from_env() -> Result<(), ModuleError> {
             "synapse stopped: serve loop failed"
         ),
     }
-    outcome.map_err(ModuleError::Serve)
+    outcome
 }
 
 /// The name the `synapse stopped` line gives for how the daemon connection
@@ -431,7 +425,7 @@ struct SynapseHandler {
 struct SynapseHandlerInner {
     module_id: String,
     state: OnceLock<Arc<ModuleState>>,
-    initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+    startup: settings::Startup,
     #[cfg(feature = "test-support")]
     initialize_count: std::sync::atomic::AtomicUsize,
     media_principals: Mutex<HashMap<RouteHandle, String>>,
@@ -588,7 +582,7 @@ impl WireOperationError {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ModuleConfig {
     /// Discloses engine-bound token IDs for candidate certification, not consumer APIs.
@@ -658,7 +652,7 @@ fn default_cache_max_bytes() -> u64 {
     DEFAULT_CACHE_MAX_BYTES
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct AneDirectConfig {
     // Packing is a per-device serving optimization, not part of numerical identity.
@@ -666,7 +660,7 @@ struct AneDirectConfig {
     tight_packing: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct WorkerConfig {
     #[serde(default = "default_worker_load_timeout_ms")]
@@ -685,7 +679,7 @@ fn default_worker_load_timeout_ms() -> u64 {
     DEFAULT_WORKER_LOAD_TIMEOUT_MS
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct LogConfig {
     #[serde(default)]
@@ -707,7 +701,7 @@ fn default_worker_forward_lines_per_sec() -> u32 {
     DEFAULT_WORKER_FORWARD_LINES_PER_SEC
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct PreloadModelConfig {
     #[serde(default)]
@@ -717,7 +711,7 @@ struct PreloadModelConfig {
     profile: Option<String>,
     #[serde(default)]
     prompt_template: Option<String>,
-    #[serde(default, alias = "kind", alias = "capability")]
+    #[serde(default)]
     task: Option<String>,
     model_path: PathBuf,
     tokenizer_path: PathBuf,
@@ -757,7 +751,7 @@ struct PreloadModelConfig {
     worker_runtime_dir: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct InlineConfig {
     #[serde(default = "default_inline_max_items")]
@@ -790,7 +784,7 @@ impl Default for InlineConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct JobConfig {
     #[serde(default = "default_job_execution_ttl_ms")]
@@ -1685,7 +1679,7 @@ impl SynapseHandler {
             inner: Arc::new(SynapseHandlerInner {
                 module_id,
                 state: OnceLock::new(),
-                initialization: OnceLock::new(),
+                startup: settings::Startup::default(),
                 #[cfg(feature = "test-support")]
                 initialize_count: std::sync::atomic::AtomicUsize::new(0),
                 media_principals: Mutex::new(HashMap::new()),
@@ -1701,13 +1695,16 @@ impl SynapseHandler {
         self.inner.state.get().cloned()
     }
 
-    fn initialize(&self, ack: &ModuleHelloAckBody) -> Result<Arc<ModuleState>, ModuleError> {
+    fn initialize(
+        &self,
+        ack: &ModuleHelloAckBody,
+        config: ModuleConfig,
+    ) -> Result<Arc<ModuleState>, ModuleError> {
         #[cfg(feature = "test-support")]
         self.inner.initialize_count.fetch_add(1, Ordering::SeqCst);
         let descriptor = resolve_storage_descriptor(&ack.storage, &self.inner.module_id)?;
         let store = Arc::new(SynapseStore::open(&descriptor)?);
         let module_generation = store.next_module_generation()?;
-        let config = load_module_config()?;
         validate_hf_endpoint(&config.hf_endpoint).map_err(ModuleError::Config)?;
         let release_catalog = runtime_release_catalog()?;
         let model_cache = Arc::new(ModelCache::new(ModelCache::default_root()?));
@@ -3267,49 +3264,34 @@ fn run_background_maintenance(state: &ModuleState) {
 #[async_trait]
 impl ModuleHandler for SynapseHandler {
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        let mut completion = self
-            .inner
-            .initialization
-            .get_or_init(|| {
-                let handler = self.clone();
-                let ack = ack.clone();
-                let (tx, rx) = tokio::sync::watch::channel(None);
-                // The task owns initialization independently of any HELLO_ACK waiter;
-                // cancelling a callback must not start a second blocking boot.
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let state = handler
-                            .initialize(&ack)
-                            .map_err(|error| error.to_string())?;
-                        let _ = handler.inner.state.set(Arc::clone(&state));
-                        diagnostics_findings::start(&state);
-                        start_catalog_revalidation(Arc::clone(&state));
-                        media_jobs::start_maintenance(&state);
-                        let _ = start_perf_sampler(state);
-                        Ok(())
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
-                    let _ = tx.send(Some(result));
-                });
-                rx
-            })
-            .clone();
-        let result = completion
-            .wait_for(Option::is_some)
-            .await
-            .map(|result| result.as_ref().expect("completed boot").clone())
-            .unwrap_or_else(|error| Err(error.to_string()));
-        if let Err(error) = result {
-            panic!("synapse boot failed after HELLO_ACK: {error}");
-        }
+        let _ = self.inner.startup.ack.set(ack.clone());
+    }
+
+    fn config_declaration(&self) -> Option<ConfigDeclareRequest> {
+        Some(settings::declaration(&self.inner.module_id))
+    }
+
+    async fn config_review(&self, request: ConfigReviewRequest) -> ConfigReviewReply {
+        settings::review(&self.inner.module_id, request)
+    }
+
+    async fn config_apply(&self, view: ConfigView) -> Result<(), Vec<String>> {
+        self.apply_settings(view).await
+    }
+
+    async fn config_files(&self) {
+        self.apply_legacy_settings().await;
+    }
+
+    async fn on_config_state(&self, state: ConfigState) {
+        self.inner.startup.observe(state);
     }
 
     async fn on_bind(&self, req: &RouteBindRequest) -> BindDecision {
         if self.state().is_none() {
             return BindDecision::reject(
-                "module_not_initialized",
-                "synapse has not completed HELLO_ACK initialization",
+                "module_warming",
+                "synapse is waiting for settings or completing startup",
             );
         }
         if let Some(principal) = req.principal.as_ref() {
@@ -3374,8 +3356,8 @@ impl ModuleHandler for SynapseHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let Some(state) = self.state() else {
             return channel_error(
-                "module_not_initialized",
-                "synapse has not completed HELLO_ACK initialization",
+                "module_warming",
+                "synapse is waiting for settings or completing startup",
             );
         };
 
@@ -8533,8 +8515,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // Trust tier and bindings are left undeclared: subc-protocol 0.19 made
     // them optional because the daemon reads neither on any production path,
     // and a declaration nothing consumes only drifts from the truth unnoticed.
-    let media = load_module_config()
-        .and_then(|config| RuntimeState::from_catalog(config, Vec::new()))
+    let media = RuntimeState::from_catalog(ModuleConfig::default(), Vec::new())
         .map(|runtime| media_jobs::declaration(&runtime))
         .unwrap_or_else(|_| json!({"groups":["jobs"],"jobs_survive_restart":false,"engines":[]}));
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
@@ -8545,7 +8526,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
         .protocol_ver(PROTOCOL_VERSION)
         .provides(vec![ProviderRole::ManagementSurface {
             operations: management_operations(),
-            config_schema: json!({ "type": "object" }),
+            config_schema: settings::schema().normalized().clone(),
             observability: Vec::new(),
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             // A deliberate claim, not the enum default: synapse accepts
@@ -8627,206 +8608,6 @@ fn declared_provenance() -> subc_protocol::manifest::ManifestProvenance {
     // is passed as absent. A validation failure here would mean build.rs
     // emitted something malformed, not a runtime condition.
     .expect("build.rs emits a canonical commit, so provenance form validation passes")
-}
-
-fn load_module_config() -> Result<ModuleConfig, ModuleError> {
-    load_module_config_with_environment(|key| env::var_os(key), env::current_dir().ok().as_deref())
-}
-
-fn load_module_config_with_environment(
-    mut env_var: impl FnMut(&str) -> Option<OsString>,
-    cwd: Option<&Path>,
-) -> Result<ModuleConfig, ModuleError> {
-    if let Some(path) = env_var(SYNAPSE_CONFIG_PATH_ENV) {
-        return load_module_config_file(&PathBuf::from(path), ConfigTier::User);
-    }
-    let user_path = default_synapse_config_path(cortexkit_store_types::resolve_config_home())?;
-    if let Some(cwd) = cwd {
-        let project_path = cwd.join(".cortexkit").join("synapse.jsonc");
-        if project_path.is_file() {
-            return load_module_config_file(&project_path, ConfigTier::Project);
-        }
-    }
-    if user_path.is_file() {
-        return load_module_config_file(&user_path, ConfigTier::User);
-    }
-    Ok(ModuleConfig::default())
-}
-
-// The shared resolver owns precedence; reject cwd-relative roots before joining
-// so a missing home cannot silently select a project's user-tier configuration.
-fn default_synapse_config_path(config_home: String) -> Result<PathBuf, ModuleError> {
-    let config_home = PathBuf::from(config_home);
-    if !config_home.is_absolute() {
-        return Err(ModuleError::Config(format!(
-            "config home {} is relative; set XDG_CONFIG_HOME to an absolute path (or provide an absolute HOME / Windows APPDATA or USERPROFILE)",
-            config_home.display()
-        )));
-    }
-    Ok(config_home.join("cortexkit").join("synapse.jsonc"))
-}
-
-#[derive(Clone, Copy)]
-enum ConfigTier {
-    User,
-    Project,
-}
-
-fn load_module_config_file(path: &Path, tier: ConfigTier) -> Result<ModuleConfig, ModuleError> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| ModuleError::Config(format!("read {}: {error}", path.display())))?;
-    parse_module_config_json(&contents, &path.display().to_string(), tier)
-}
-
-fn parse_module_config_json(
-    contents: &str,
-    source: &str,
-    _tier: ConfigTier,
-) -> Result<ModuleConfig, ModuleError> {
-    let stripped = strip_json_comments(contents);
-    let value: Value = serde_json::from_str(&stripped).map_err(ModuleError::Json)?;
-    if value
-        .as_object()
-        .is_some_and(|object| object.contains_key("remote_providers"))
-    {
-        return Err(ModuleError::Config(
-            "remote_providers were removed; modules should call providers directly".to_string(),
-        ));
-    }
-    const ALIAS_ADMIN_KEYS: [&str; 3] = [
-        "alias_admin_enabled",
-        "dev_alias_admin",
-        "enable_alias_admin",
-    ];
-    for object in [&value, &value["dev"]] {
-        if let Some(key) = ALIAS_ADMIN_KEYS
-            .iter()
-            .find(|key| object.get(**key).is_some())
-        {
-            return Err(ModuleError::Config(format!(
-                "alias_admin_enabled was removed (found '{key}'); aliases are no longer supported"
-            )));
-        }
-    }
-    for key in ["grammar_enabled", "sidecar_spec", "decode_chain_k"] {
-        if value.get(key).is_some() {
-            return Err(ModuleError::Config(format!(
-                "{key} was removed; owned decode serving was retired"
-            )));
-        }
-    }
-    if let Some(preloads) = value.get("preload_models").and_then(Value::as_array) {
-        for (index, preload) in preloads.iter().enumerate() {
-            let Some(engine) = preload.get("engine").and_then(Value::as_str) else {
-                continue;
-            };
-            if canonical_engine_name(engine) == "owned-metal-decode" {
-                let model_id = preload
-                    .get("model_id")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("{engine}-{index}"), str::to_owned);
-                return Err(ModuleError::Config(format!(
-                    "preload model_id '{model_id}': owned decode serving was retired"
-                )));
-            }
-        }
-    }
-    let config: ModuleConfig = serde_json::from_value(value).map_err(|error| {
-        if let Some(field) = unknown_field_from_json_error(&error) {
-            tracing::error!(
-                target: "config",
-                source,
-                field,
-                "synapse config parse error: unknown field"
-            );
-            ModuleError::Config(format!(
-                "unknown config field '{field}' in {source} (deny_unknown_fields)"
-            ))
-        } else {
-            tracing::error!(target: "config", source, error = %error, "synapse config parse error");
-            ModuleError::Json(error)
-        }
-    })?;
-    for (index, preload) in config.preload_models.iter().enumerate() {
-        let engine = canonical_engine_name(&preload.engine);
-        let model_id = preload
-            .model_id
-            .clone()
-            .unwrap_or_else(|| format!("{}-{index}", preload.engine));
-        if preload.profile.is_none()
-            && matches!(
-                parse_model_task(preload.task.as_deref(), &engine, &model_id)?,
-                ModelTask::Embed | ModelTask::Rerank
-            )
-        {
-            return Err(ModuleError::Config(format!(
-                "preload model_id '{model_id}': free-form preloads for embed and rerank were removed; specify a profile"
-            )));
-        }
-    }
-    Ok(config)
-}
-
-fn unknown_field_from_json_error(error: &serde_json::Error) -> Option<String> {
-    let message = error.to_string();
-    let marker = "unknown field `";
-    let start = message.find(marker)? + marker.len();
-    let rest = &message[start..];
-    let end = rest.find('`')?;
-    Some(rest[..end].to_string())
-}
-
-fn strip_json_comments(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if in_string {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            output.push(ch);
-            continue;
-        }
-        if ch == '/' {
-            match chars.peek().copied() {
-                Some('/') => {
-                    let _ = chars.next();
-                    for next in chars.by_ref() {
-                        if next == '\n' {
-                            output.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    let _ = chars.next();
-                    let mut previous = '\0';
-                    for next in chars.by_ref() {
-                        if previous == '*' && next == '/' {
-                            break;
-                        }
-                        previous = next;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        output.push(ch);
-    }
-    output
 }
 
 fn parse_model_task(
@@ -8957,6 +8738,7 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::settings::{load_legacy_config, parse_module_config_json, SYNAPSE_CONFIG_PATH_ENV};
     #[cfg(feature = "test-support")]
     mod retired_engine_tests;
     #[cfg(unix)]
@@ -10310,12 +10092,7 @@ mod tests {
 
     #[cfg(unix)]
     fn packing_config() -> ModuleConfig {
-        parse_module_config_json(
-            r#"{"ane_direct":{"tight_packing":true}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .unwrap()
+        parse_module_config_json(r#"{"ane_direct":{"tight_packing":true}}"#, "test").unwrap()
     }
 
     #[cfg(unix)]
@@ -10353,7 +10130,6 @@ mod tests {
         let config = parse_module_config_json(
             r#"{"jobs":{"bulk_quantum_tokens":3072}}"#,
             "existing install",
-            ConfigTier::User,
         )
         .unwrap();
         let before = packing_test_numeric(&config).stable_bytes();
@@ -13423,7 +13199,7 @@ mod tests {
         let Ok(expected) = std::env::var("SYNAPSE_TEST_CONFIG_HOME_EXPECTED") else {
             return;
         };
-        let result = load_module_config_with_environment(|key| env::var_os(key), None);
+        let result = load_legacy_config();
         if expected == "relative-error" {
             let error = result.expect_err("relative config home must be refused");
             assert!(matches!(error, ModuleError::Config(_)));
@@ -13448,7 +13224,7 @@ mod tests {
 
     #[test]
     fn module_config_rejects_unknown_fields() {
-        let error = parse_module_config_json(r#"{ "typo_field": true }"#, "test", ConfigTier::User)
+        let error = parse_module_config_json(r#"{ "typo_field": true }"#, "test")
             .expect_err("unknown fields should fail");
         assert!(matches!(error, ModuleError::Config(_)));
         assert!(error.to_string().contains("typo_field"));
@@ -13457,65 +13233,46 @@ mod tests {
     #[test]
     fn module_config_tight_packing_is_opt_in_and_has_no_other_knobs() {
         for input in ["{}", r#"{"ane_direct":{}}"#] {
-            let config = parse_module_config_json(input, "test", ConfigTier::User).unwrap();
+            let config = parse_module_config_json(input, "test").unwrap();
             assert!(!config.ane_direct.tight_packing);
         }
-        let config = parse_module_config_json(
-            r#"{"ane_direct":{"tight_packing":true}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .unwrap();
+        let config =
+            parse_module_config_json(r#"{"ane_direct":{"tight_packing":true}}"#, "test").unwrap();
         assert!(config.ane_direct.tight_packing);
-        assert!(parse_module_config_json(
-            r#"{"ane_direct":{"tight_packing":1}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .is_err());
-        assert!(parse_module_config_json(
-            r#"{"ane_direct":{"width":256}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .is_err());
+        assert!(
+            parse_module_config_json(r#"{"ane_direct":{"tight_packing":1}}"#, "test",).is_err()
+        );
+        assert!(parse_module_config_json(r#"{"ane_direct":{"width":256}}"#, "test",).is_err());
     }
 
     #[test]
-    fn remote_providers_removed_from_all_config_tiers() {
-        for tier in [ConfigTier::User, ConfigTier::Project] {
-            for providers in ["[]", "null", "[{}]"] {
-                let error = parse_module_config_json(
-                    &format!(r#"{{"remote_providers":{providers}}}"#),
-                    "test",
-                    tier,
-                )
-                .expect_err("remote provider configuration must fail closed");
-                assert_eq!(
-                    error.to_string(),
-                    "config: remote_providers were removed; modules should call providers directly"
-                );
-            }
+    fn remote_providers_removed_from_legacy_config() {
+        for providers in ["[]", "null", "[{}]"] {
+            let error =
+                parse_module_config_json(&format!(r#"{{"remote_providers":{providers}}}"#), "test")
+                    .expect_err("remote provider configuration must fail closed");
+            assert_eq!(
+                error.to_string(),
+                "config: remote_providers were removed; modules should call providers directly"
+            );
         }
     }
 
     #[test]
-    fn free_form_preloads_removed_from_all_config_tiers() {
-        for tier in [ConfigTier::User, ConfigTier::Project] {
-            for task in ["embed", "rerank"] {
-                let contents = format!(
-                    r#"{{"preload_models":[{{"model_id":"removed-{task}","engine":"owned-metal","task":"{task}","model_path":"model","tokenizer_path":"tokenizer"}}]}}"#
-                );
-                let error = parse_module_config_json(&contents, "test", tier)
-                    .expect_err("a free-form preload must fail closed");
-                assert_eq!(error.to_string(), format!(
-                    "config: preload model_id 'removed-{task}': free-form preloads for embed and rerank were removed; specify a profile"
-                ));
-            }
-            parse_module_config_json(r#"{"preload_models":[{"model_id":"llama-generation","engine":"llama","task":"generate","model_path":"model","tokenizer_path":"tokenizer"}]}"#, "test", tier).expect("llama generation preload parses");
-            let profiled = r#"{"preload_models":[{"engine":"owned-metal","profile":"kept-profile","model_path":"model","tokenizer_path":"tokenizer"}]}"#;
-            parse_module_config_json(profiled, "test", tier).expect("kept preload parses");
+    fn free_form_preloads_removed_from_legacy_config() {
+        for task in ["embed", "rerank"] {
+            let contents = format!(
+                r#"{{"preload_models":[{{"model_id":"removed-{task}","engine":"owned-metal","task":"{task}","model_path":"model","tokenizer_path":"tokenizer"}}]}}"#
+            );
+            let error = parse_module_config_json(&contents, "test")
+                .expect_err("a free-form preload must fail closed");
+            assert_eq!(error.to_string(), format!(
+                "config: preload model_id 'removed-{task}': free-form preloads for embed and rerank were removed; specify a profile"
+            ));
         }
+        parse_module_config_json(r#"{"preload_models":[{"model_id":"llama-generation","engine":"llama","task":"generate","model_path":"model","tokenizer_path":"tokenizer"}]}"#, "test").expect("llama generation preload parses");
+        let profiled = r#"{"preload_models":[{"engine":"owned-metal","profile":"kept-profile","model_path":"model","tokenizer_path":"tokenizer"}]}"#;
+        parse_module_config_json(profiled, "test").expect("kept preload parses");
     }
 
     #[test]
@@ -13528,45 +13285,39 @@ mod tests {
             "tokenizer_path": "missing.json",
             "quantizer_revision": "retired-setting"
         }]});
-        for tier in [ConfigTier::User, ConfigTier::Project] {
-            let err = parse_module_config_json(&config.to_string(), "test", tier).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                "config: preload model_id 'qwen3-0.6b-decode-q8': owned decode serving was retired"
-            );
-        }
+        let err = parse_module_config_json(&config.to_string(), "test").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config: preload model_id 'qwen3-0.6b-decode-q8': owned decode serving was retired"
+        );
     }
 
     #[test]
     fn retired_owned_decode_keys_are_refused_by_name() {
         for key in ["grammar_enabled", "sidecar_spec", "decode_chain_k"] {
             let config = format!(r#"{{"{key}":null}}"#);
-            for tier in [ConfigTier::User, ConfigTier::Project] {
-                let err = parse_module_config_json(&config, "test", tier).unwrap_err();
-                assert_eq!(
-                    err.to_string(),
-                    format!("config: {key} was removed; owned decode serving was retired")
-                );
-            }
+            let err = parse_module_config_json(&config, "test").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("config: {key} was removed; owned decode serving was retired")
+            );
         }
     }
 
     #[test]
-    fn alias_admin_removed_from_all_config_tiers() {
-        for tier in [ConfigTier::User, ConfigTier::Project] {
-            for key in [
-                "alias_admin_enabled",
-                "dev_alias_admin",
-                "enable_alias_admin",
-            ] {
-                let setting = format!(r#"{{"{key}":false}}"#);
-                for contents in [setting.clone(), format!(r#"{{"dev":{setting}}}"#)] {
-                    let error = parse_module_config_json(&contents, "test", tier)
-                        .expect_err("even a disabled retired key must fail closed");
-                    assert_eq!(error.to_string(), format!(
-                        "config: alias_admin_enabled was removed (found '{key}'); aliases are no longer supported"
-                    ));
-                }
+    fn alias_admin_removed_from_legacy_config() {
+        for key in [
+            "alias_admin_enabled",
+            "dev_alias_admin",
+            "enable_alias_admin",
+        ] {
+            let setting = format!(r#"{{"{key}":false}}"#);
+            for contents in [setting.clone(), format!(r#"{{"dev":{setting}}}"#)] {
+                let error = parse_module_config_json(&contents, "test")
+                    .expect_err("even a disabled retired key must fail closed");
+                assert_eq!(error.to_string(), format!(
+                    "config: alias_admin_enabled was removed (found '{key}'); aliases are no longer supported"
+                ));
             }
         }
     }
@@ -13601,8 +13352,8 @@ mod tests {
 
     #[test]
     fn module_config_parses_log_settings() {
-        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
-            .expect("default log config should parse");
+        let default =
+            parse_module_config_json(r#"{}"#, "test").expect("default log config should parse");
         assert_eq!(default.log.perf_interval_secs, 0);
         assert_eq!(
             default.log.worker_forward_lines_per_sec,
@@ -13612,44 +13363,33 @@ mod tests {
         let configured = parse_module_config_json(
             r#"{"log":{"perf_interval_secs":5,"worker_forward_lines_per_sec":12}}"#,
             "test",
-            ConfigTier::User,
         )
         .expect("log settings should parse");
         assert_eq!(configured.log.perf_interval_secs, 5);
         assert_eq!(configured.log.worker_forward_lines_per_sec, 12);
 
-        let error = parse_module_config_json(
-            r#"{"log":{"worker_forward_line_per_sec":12}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .expect_err("unknown log fields should fail");
+        let error =
+            parse_module_config_json(r#"{"log":{"worker_forward_line_per_sec":12}}"#, "test")
+                .expect_err("unknown log fields should fail");
         assert!(error.to_string().contains("worker_forward_line_per_sec"));
     }
 
     #[test]
     fn module_config_parses_worker_load_timeout() {
-        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
-            .expect("default worker config should parse");
+        let default =
+            parse_module_config_json(r#"{}"#, "test").expect("default worker config should parse");
         assert_eq!(
             default.worker.load_timeout_ms,
             DEFAULT_WORKER_LOAD_TIMEOUT_MS
         );
 
-        let configured = parse_module_config_json(
-            r#"{"worker":{"load_timeout_ms":240000}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .expect("worker load timeout should parse");
+        let configured =
+            parse_module_config_json(r#"{"worker":{"load_timeout_ms":240000}}"#, "test")
+                .expect("worker load timeout should parse");
         assert_eq!(configured.worker.load_timeout_ms, 240_000);
 
-        let error = parse_module_config_json(
-            r#"{"worker":{"load_timeout_mss":240000}}"#,
-            "test",
-            ConfigTier::User,
-        )
-        .expect_err("unknown worker fields should fail");
+        let error = parse_module_config_json(r#"{"worker":{"load_timeout_mss":240000}}"#, "test")
+            .expect_err("unknown worker fields should fail");
         assert!(error.to_string().contains("load_timeout_mss"));
     }
 
@@ -13661,7 +13401,6 @@ mod tests {
                 "cache_max_bytes": 4096
             }"#,
             "test",
-            ConfigTier::User,
         )
         .expect("valid config");
         assert_eq!(config.microllm_max_tokens, 128);
@@ -13678,7 +13417,6 @@ mod tests {
                 }
             }"#,
             "test",
-            ConfigTier::User,
         )
         .unwrap();
         assert_eq!(split.jobs.execution_ttl_ms, 10);
@@ -13686,16 +13424,10 @@ mod tests {
 
         // Pre-release rename, no compatibility surface: the old key must fail
         // loudly (deny_unknown_fields) instead of being silently accepted.
-        let legacy =
-            parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test", ConfigTier::User);
+        let legacy = parse_module_config_json(r#"{"jobs":{"ttl_ms":40}}"#, "test");
         assert!(legacy.is_err(), "legacy ttl_ms key must be rejected");
         assert!(
-            parse_module_config_json(
-                r#"{"jobs":{"resume_deadline_ms":30}}"#,
-                "test",
-                ConfigTier::User,
-            )
-            .is_err(),
+            parse_module_config_json(r#"{"jobs":{"resume_deadline_ms":30}}"#, "test",).is_err(),
             "retired remote reauthentication deadline must be rejected"
         );
     }

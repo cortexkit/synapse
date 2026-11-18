@@ -272,7 +272,7 @@ pub async fn route_open(stream: &mut TcpStream, corr: u64) -> TestRoute {
                     epoch: value["route_epoch"].as_u64().unwrap() as u32,
                 };
             }
-            FrameType::Error if is_module_timeout(&frame.body) && attempt < 9 => {
+            FrameType::Error if is_retryable_startup_error(&frame.body) && attempt < 9 => {
                 last_error = String::from_utf8_lossy(&frame.body).to_string();
                 sleep(Duration::from_millis(500)).await;
             }
@@ -287,12 +287,13 @@ pub async fn route_open(stream: &mut TcpStream, corr: u64) -> TestRoute {
     panic!("route.open timed out after retries: {last_error}");
 }
 
-fn is_module_timeout(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| value["code"].as_str().map(str::to_string))
-        .as_deref()
-        == Some("module_timeout")
+fn is_retryable_startup_error(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+        matches!(
+            value["code"].as_str(),
+            Some("module_timeout" | "module_warming")
+        )
+    })
 }
 
 pub async fn route_request(

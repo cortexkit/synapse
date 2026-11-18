@@ -691,30 +691,55 @@ fn ack(storage: Option<Value>) -> ModuleHelloAckBody {
 }
 
 #[tokio::test]
-#[should_panic(expected = "synapse boot failed after HELLO_ACK")]
-async fn failed_blocking_boot_panics_with_boot_message() {
+async fn failed_blocking_boot_refuses_managed_settings() {
+    use subc_client_rs::config::ConfigStatus;
+
     let handler = SynapseHandler::new("synapse-test".into());
     handler
         .on_hello_ack(&ack(Some(json!({"malformed":"storage"}))))
         .await;
+    assert!(handler.state().is_none());
+    let view = ConfigView::new(
+        0,
+        settings::schema().defaults(),
+        BTreeMap::new(),
+        vec![],
+        ConfigStatus::Unstamped,
+    );
+    let nack = handler.config_apply(view).await.unwrap_err();
+    assert!(nack[0].contains("boot failed"));
+    assert!(handler.inner.startup.completed().await.is_err());
+    assert!(handler.state().is_none());
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn joined_hello_ack_callbacks_initialize_once_off_executor() {
+fn joined_config_callbacks_initialize_once_off_executor() {
     isolated_test("detection_tests::joined_boot_fixture", &[]);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn managed_settings_boot_uses_daemon_defaults_and_refuses_restart_changes() {
+    isolated_test(
+        "detection_tests::joined_boot_fixture",
+        &[("SYNAPSE_TEST_MANAGED_SETTINGS", "1")],
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "executed with isolated configuration and probe workers"]
 async fn joined_boot_fixture() {
+    use subc_client_rs::config::{ConfigStatus, CONFIG_GATE_CAPABILITY};
+
+    let managed = env::var_os("SYNAPSE_TEST_MANAGED_SETTINGS").is_some();
     let cuda = Stub::new(Value::Null);
     let vulkan =
         Stub::new(json!({"version":version("none (vulkan disabled)"),"floor":{"sleep":true}}));
     cuda.configure(json!({"version":version("cuda"),"floor":{"ready":cuda.root.join("ready"),"release":cuda.root.join("release"),"envelope":cuda_ok()}}));
     let config = cuda.root.join("synapse.jsonc");
-    fs::write(&config, "{}").unwrap();
+    fs::write(&config, r#"{"cache_max_bytes": 12345}"#).unwrap();
     env::set_var("SYNAPSE_CONFIG_PATH", config);
     env::set_var("CORTEXKIT_MODEL_CACHE", cuda.root.join("cache"));
     env::set_var(worker_binary_env_var(CUDA_WORKER_ENGINE), &cuda.worker);
@@ -727,8 +752,27 @@ async fn joined_boot_fixture() {
             path: cuda.root.join("store.db").to_string_lossy().into(),
         },
     };
-    let ack = ack(Some(serde_json::to_value(descriptor).unwrap()));
+    let mut ack = ack(Some(serde_json::to_value(descriptor).unwrap()));
+    if managed {
+        ack.subc_capabilities.push(CONFIG_GATE_CAPABILITY.into());
+    }
     let handler = SynapseHandler::new("synapse-test".into());
+    handler.on_hello_ack(&ack).await;
+    assert!(handler.state().is_none());
+    let defaults = ConfigView::new(
+        0,
+        settings::schema().defaults(),
+        BTreeMap::new(),
+        vec![],
+        ConfigStatus::Unstamped,
+    );
+    let apply = || async {
+        if managed {
+            handler.config_apply(defaults.clone()).await.unwrap();
+        } else {
+            handler.config_files().await;
+        }
+    };
     let waiting = async {
         // This loop polling while boot is still pending is the proof that boot
         // runs off the executor. The bound only turns a blocked executor into a
@@ -750,14 +794,27 @@ async fn joined_boot_fixture() {
         assert_eq!(count, 1);
         assert!(!had_state);
     };
-    let ((), (), ()) = tokio::join!(
-        handler.on_hello_ack(&ack),
-        handler.on_hello_ack(&ack),
-        waiting
-    );
-    assert!(handler.state().is_some());
+    let ((), (), ()) = tokio::join!(apply(), apply(), waiting);
+    let state = handler.state().expect("settings boot completes");
+    let expected_cache_bytes = if managed {
+        DEFAULT_CACHE_MAX_BYTES
+    } else {
+        12345
+    };
+    assert_eq!(state.runtime.cache_max_bytes, expected_cache_bytes);
     assert_eq!(handler.inner.initialize_count.load(Ordering::SeqCst), 1);
-    handler.on_hello_ack(&ack).await;
+    apply().await;
+    if managed {
+        let mut pending = defaults.clone();
+        pending.status = ConfigStatus::Pending;
+        pending.effective["cache_max_bytes"] = json!(12345);
+        let nack = handler.config_apply(pending).await.unwrap_err();
+        assert!(nack[0].starts_with("/cache_max_bytes:"));
+        assert_eq!(
+            handler.state().unwrap().runtime.cache_max_bytes,
+            expected_cache_bytes
+        );
+    }
     assert_eq!(handler.inner.initialize_count.load(Ordering::SeqCst), 1);
     assert_eq!(cuda.counts(), (1, 1));
     assert_eq!(vulkan.counts(), (1, 0));
