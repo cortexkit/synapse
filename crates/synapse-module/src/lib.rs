@@ -34,7 +34,7 @@ mod owned_decode_routing_store_tests;
 #[cfg(test)]
 mod rerank_readout_tests;
 mod rollback;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod store_integration_tests;
 pub use synapse_store as store;
 use synapse_store::{owned_decode_catalog_entry, PerfKnob};
