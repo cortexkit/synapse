@@ -7282,7 +7282,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-module"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7339,7 +7339,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-opctl"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -7419,7 +7419,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-store"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "cortexkit-store",
  "cortexkit-store-types",
@@ -7436,7 +7436,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-ane-direct"
-version = "0.1.0"
+version = "0.1.0-alpha.3"
 dependencies = [
  "ane",
  "anyhow",
@@ -7459,7 +7459,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-cuda"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -7474,7 +7474,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-decode"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -7494,7 +7494,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-host"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -7508,7 +7508,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-llama"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -7526,7 +7526,7 @@ dependencies = [
 
 [[package]]
 name = "synapse-worker-vulkan"
-version = "0.1.0"
+version = "0.1.0-alpha.3"
 dependencies = [
  "anyhow",
  "ash",
