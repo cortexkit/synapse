@@ -17,11 +17,11 @@ Download statuses are flat inside `result`.
 ```json
 {
   "fingerprint": "…",            // strict identity string — persist VERBATIM, compare only, never parse
-  "table_epoch": 0,               // alias-table version; persist (fingerprint, table_epoch) per index
+  "table_epoch": 2,               // frozen at the last published alias-table epoch
   "dims": 384,
   "provenance": { "engine": { "engine": "owned-metal", "version": "…", "build_flags": {} } },
   "module_generation": 3,         // bumps every module boot — cheap restart detection mid-conversation
-  "equivalent_to": [],            // live alias reads; inline, no second call
+  "equivalent_to": [],            // aliases removed; retained as an empty array
   …op payload flattened here…
 }
 ```
@@ -199,7 +199,7 @@ Checks: `embed_query_deadline_one_returns_typed_rejection` (skeleton e2e) and
 
 deadline_ms (absolute budget), max_queue_ms (fast-fail bound — admission is
 atomic accept-or-reject against it), required_fingerprint,
-allow_equivalent (default false: hard substitution rejection),
+ allow_equivalent (accepted and ignored),
 required_epoch, target_fingerprint (embed.query: route only to a matching or
 certified-equivalent profile, else substitution_rejected/not_certified).
 
@@ -235,10 +235,9 @@ The management registry in this snapshot is `embed.query`, `embed.batch`,
 `owned_decode.admit_session`, `owned_decode.decode`, `owned_decode.snapshot`,
 `owned_decode.continue`, `owned_decode.abort`, `owned_decode.close`,
 `owned_decode.session_status`, `owned_decode.disable`, `owned_decode.revoke`,
-`model.load`, `model.status`, `model.unload`, `models.list`, `models.catalog`,
-`models.download`, `models.download.cancel`, `models.remove`, `probe.start`,
-`probe.status`, `probe.report`, `aliases.check_index`, `alias.retract`,
-`alias.declare`, `cache.pin`, `cache.gc`, `admission.status`,
+`model.status`, `model.unload`, `models.list`, `models.catalog`,
+`models.download`, `models.download.cancel`, `models.remove`,
+`cache.pin`, `cache.gc`, `admission.status`,
 `approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
 `approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
 `lanes.resume`, `lanes.status`, `diagnostics.findings`, `events_get`, `role.describe`,
@@ -499,12 +498,6 @@ deleted with the job and remain private to its route principal.
   state: they never load a model, execute inference, run a probe or repair state.
   All current checks describe standing conditions, even if they predate the
   requested window; there is no recent-history scan.
-  - `certification_stale` (`error`): counts exactly the certification-required,
-    non-profile lanes whose previous certification no longer permits serving,
-    using the same lane selection as module health. Samples carry `lane_id` and
-    `stale_since_ms` (the persisted first observed mismatch, or null if unknown).
-    `first_seen_ms` uses that timestamp, otherwise the recorded profile rotation,
-    otherwise report time. `hint` is `Re-certify with: ck-synapse-opctl probe run`.
   - `catalog_self_check_failed` (`warn`): installed runtime catalog lanes with a
     failed current on-device self-check. Samples contain `lane_id` and
     `checked_at_ms`; the earliest check supplies `first_seen_ms` (report time if
@@ -686,7 +679,9 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   after the in-use check may an uninstalled entry return empty manifests and
   zero freed bytes. Malformed or unknown-field params remain channel errors;
   the listed semantic refusals are result-envelope wire errors with details.
-- **models.list** — catalog + per-model state, fingerprints, alias rows,
+- **models.list** — catalog and per-model state and fingerprints. The top-level
+  compatibility fields are `table_epoch: 2` and `alias_rows: []`; per-model
+  `table_epoch` remains null where exposed.
   recommended_batch, per-row token ceiling (`max_tokens`), ceiling source
   (`max_tokens_source`), bucket/shape ladder (`bucket_ladder`), output dimensions
   (`dims`), dtype/precision (`dtype`), device class (`device_class`), serving
@@ -723,7 +718,7 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     refuses every request (or, for a substitutable unconstrained request, is answered by a
     different lane). A consumer deciding where to send traffic wants `serving_admission` below.
   - `serving_admission` (`"enabled"` | `"disabled"`, optional) — whether this lane is approved
-    to take traffic, from the same projection `probe.report` uses, so the two surfaces agree.
+     to take traffic.
     `"enabled"` requires both an enabled approval row and current certification evidence.
     Omitted for lane classes with no approval concept — absence means "not applicable", never
     "enabled".
@@ -732,8 +727,8 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     `self_check_failed`, or
     a recorded operator reason. Absent when the lane is enabled or has no approval concept.
   - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
-    sourced from real measurements (such as observed load duration or benchmark probe
-    data). This is an advisory hint, NOT a performance guarantee or upper bound; actual
+     sourced from observed load duration. This is an advisory hint, not a
+     performance guarantee or upper bound; actual
     load latency depends on residency (whether the model is already loaded in memory) and
     system load. Omitted if no measurement has been recorded for the model.
 
@@ -749,26 +744,14 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   Catalog rows exist for runnable, current-manifest installed backends only,
   have lane id `<catalog_id>-<backend>`, one fingerprint, and initial state
   `unloaded` with `max_tokens_source: catalog_unloaded`. Unload keeps the row;
-  remove deletes it. Free-form field presence and decode gates are unchanged.
+  remove deletes it. Owned-decode approval gates are unchanged.
   Transcribe rows instead carry `max_duration_ms` and omit `max_tokens`,
   `max_tokens_source`, `recommended_batch`, `bucket_ladder`, `dims`, `pooling`,
   `normalize` and `attention_units`; their envelope counts audio duration and
   encoder frames, not text tokens.
-- **model.load / model.status, probe.start / probe.status / probe.report** —
-  load and probe start/status are job-shaped (poll-first); `probe.report` is a
-  query. Probe is EXPLICIT, never auto-triggered; certification + perf rows are
-  keyed by machine profile and stamped with os_build/module_generation; the
-  report returns the full measured capability table plus per-knob assignments.
-  Free-form embed/rerank ops and `microllm.oneshot` routed to an owned-engine lane refuse
-  (`not_certified`/`probe_required`) until the (machine, fingerprint) pair is
-  certified. Lane-1 worker-backed `microllm.oneshot` routes retain their existing
-  dispatch path and do not acquire the owned-lane certification gate.
-  New free-form `owned-metal` registrations reject contradictory pooling with
-  `invalid_request`: GTE ModernBERT embed requires `cls`, GTE rerank requires
-  `mean`, and Qwen3 embed/rerank require `last` (omitted pooling still defaults
-  to `mean` and is rejected when it contradicts the readout). Existing persisted
-  registrations, including matching preload ids, retain their declarations and
-  fingerprints.
+- **model.status** — query by exactly one of `job_id` (a `models.download` job)
+  or `model_id` (a registered lane). Job status reports download progress and
+  its terminal outcome; lane status reports its runtime load state.
 
 ### Catalog serving and migration
 
@@ -801,8 +784,7 @@ it returns transient `engine_crashed` with `{lane_id, quarantined: true}` and a
 positive `retry_after_ms` equal to the remaining fixed ten-minute cool-down.
 The lane stays selected; no other backend is substituted. On expiry the next
 serving request starts a fresh worker with zero strikes. Explicit unload/reload
-or module restart clears the cool-down immediately. This automatic recovery is
-catalog-only; legacy/free-form lanes retain `probe_required`.
+or module restart clears the cool-down immediately.
 
 The same consecutive-fault/cool-down rule applies to direct ANE channels.
 Quarantine closes and confirms the old worker's exit before refunding resident
@@ -817,45 +799,26 @@ direct-ANE compile-blocked deadline waits retain `shape_compiling`.
 
 - ORT and MiniLM product/catalog lanes are removed: use a catalog id and explicitly
   download it. ORT remains only as a bench reference, not a portable CPU floor.
-- Catalog-reserved `probe.start` targets return `invalid_request`: use automatic
-  self-check after explicit installation, not operator probe or approval.
 - Omitted-model local embed/rerank knob routing is removed: specify a model or
   use the task's `default_for_task` entry (the two GTE entries).
 - Unregistered embed/rerank ids no longer return `model_loading`: use the
   `unknown_model` correction flow. Uninstalled catalog ids/lanes return
   `model_not_installed`; call `models.download` rather than polling a load.
-- Free-form embed/rerank with `ort`, `llama` or any non-owned engine is refused
-  with `invalid_request` before network I/O: use an owned engine (`owned-metal`,
-  `ane`, `owned-cuda`, or the owned Vulkan value when available). Invalid engine
-  preload entries are skipped with one WARN; disallowed persisted rows are not
-  restored and their pins are removed. Free-form lanes keep their probe gates.
 - Catalog `certified`/`serving_admission` are one-release compatibility projections:
   consumers must move to `self_check` before those fields are removed next release.
 - Unpinned `source=hf`, revision `main`, URLs containing `resolve/main`, and
   resolved HTTP(S) assets without SHA-256 are rejected before network I/O:
   supply a pinned 40-hex revision and a digest for each resolved network asset,
   regardless of `source` (including `source=file`).
-- `model.load` or preload using any catalog id or `<catalog_id>-<backend>` for
-  `metal`, `ane`, `cuda` or `vulkan` is rejected: use `models.download`.
-  Load returns `invalid_request`; reserved preload ids fail startup naming the
-  entry. Undeclared derived ids are `unknown_model` for serving/status/unload,
-  but `invalid_request` for download/remove; use a declared lane or catalog id.
+ - Preloads using a catalog id or `<catalog_id>-<backend>` fail startup naming
+   the entry. Use `models.download` for those ids. Undeclared derived ids are
+   `unknown_model` for serving/status/unload, but `invalid_request` for
+   download/remove; use a declared lane or catalog id.
 - `model.unload` with a catalog id is rejected: unload a declared lane id from
   `details.lane_ids`, then use `models.remove` to delete installation files.
 
-Legacy preload lanes (including `gte-modernbert-base-f16`,
-`gte-reranker-modernbert-base-f32` and the ANE package-set lane) remain separate:
-same ids, config, fingerprints and probe gates, with no implicit catalog mapping.
-Moving to a catalog id is deliberate and requires re-embedding. Owned decode
-routing, certification, probes and approvals are unchanged.
-
-- **aliases.check_index** {index_fingerprint, provenance_set[]} → valid |
-  migration_required {retracted_pair, rebuild_target} + table_epoch. Call at
-  write-commit when your index holds mixed provenance. Revocation is never
-  retroactive: vectors written under a certified fingerprint stay readable;
-  demotion affects the future only.
 - **admission.status** — advisory snapshot: queue depths, current knob,
-  catalog-wide certification/performance health, and job outcome counters.
+   registered lane counts, and job outcome counters.
   Job counters are per-process since start:
   - `jobs_minted`: jobs admitted in this process;
   - `jobs_completed`: minted jobs that reached a successful terminal state;
@@ -868,11 +831,10 @@ routing, certification, probes and approvals are unchanged.
     (saturating to zero, never underflowing).
   Download jobs count as minted; `committed` counts completed, and `failed`
   or `cancelled` counts failed, preserving the identity above.
-  `catalog_lanes` counts every known lane. `certified_lanes`, `certification_stale`
-  and `performance_stale` count only probe-gated lanes (free-form and decode),
-  including unloaded ones, and exclude catalog lanes. Catalog lanes report
-  `certification_required: false`, `certification_status: not_required`, and
-  their `self_check`; `probe.report` lists known catalog lanes even when unloaded.
+   `catalog_lanes` counts registered lanes, including unloaded ones.
+   `certified_lanes` counts lanes with current owned-decode evidence, not
+   catalog self-check passes. Catalog lanes report `certification_required: false`,
+   `certification_status: not_required`, and their `self_check`.
   The `lanes` array remains resident-only because its
   `meeting_deadlines`, rolling start-delay, waiter, and in-flight values describe
   live execution state. The contract lives in per-request budgets, not this
@@ -881,42 +843,13 @@ routing, certification, probes and approvals are unchanged.
   shared-lease readers, two-phase GC; GC never deletes under a live reader
   or a foreign pin).
 
-### Decode lane certification (additive)
+### Owned-decode lane certification
 
-The shipped decode fixture is selected by model family and dtype. For
-`Qwen/Qwen3-0.6B` f16 it contains 20 raw-completion prompts, each with 64 token
-IDs generated by the pinned greedy reference implementation. Decode
-certification is token-exact across every prompt; there is no numerical
-similarity tolerance. An uncertified row includes `blocking_reason` and the
-first differing token position, expected/actual token IDs, and the diverging
-prompt in its evidence.
-
-`probe.report.result.lanes[]` adds:
-
-- `certification_required`: whether requests on this lane are gated;
-- `certification_status`: `certified`, `uncertified`, or `not_required`, based
-  only on current-profile certification evidence;
-- `serving_admission`: `enabled` or `disabled` for owned-decode lanes, and
-  `null` for lanes without approval-backed admission;
-- `serving_admission_reason`: `null` when enabled or not applicable, otherwise
-  the approval's disable reason or a stable reason such as `approval_absent` or
-  `not_certified`;
-- `certification.status`: `certified` or `uncertified` for a persisted probe
-  outcome;
-- `blocking_reason`: `token_mismatch`, `fixture_unavailable`, a typed probe
-  failure reason, or the existing `probe_required`/platform/quarantine reason.
-
-A failed re-probe replaces the current machine-profile outcome with
-`uncertified`, so later owned-lane `microllm.oneshot` calls fail closed with
-`not_certified`. This demotion is never retroactive: results produced while the
-pair was certified remain valid. Successful probes also write the decode
-performance row used by knob assignment: cold-load milliseconds, median
-single-stream generated tokens/second over the fixture, and median one-item
-latency.
-
-Sampling and all other non-greedy certification semantics are deliberately out
-of scope until sampling ships.
-
+Parked owned-decode lanes serve only with matching persisted certification and
+an enabled approval. `models.list` projects evidence as `certified` and projects
+serving permission separately as `serving_admission` and
+`serving_admission_reason`. No on-device operation writes new certification
+rows. The llama.cpp worker path does not require this certification or approval.
 ### Owned-decode session operations (envelope v2)
 
 Every successful operation below has the management response envelope
@@ -1083,7 +1016,7 @@ can additionally return the normal owned-route errors described by its route.
   next committed boundary. It also requests the in-memory scheduler revoke and
   can unload the artifact when no active session remains.
 
-### Model and alias mutations
+### Model unload
 
 #### `model.unload`
 
@@ -1097,28 +1030,6 @@ can additionally return the normal owned-route errors described by its route.
 - Semantics: unloading a ready model removes its loaded engine and owned-decode
   dispatch cache, but keeps the catalog model registered and its cached artifact
   available for later lazy reload.
-
-#### `alias.declare`
-
-- Params: `{left, right, evidence?}`; `fingerprint_a` and `fingerprint_b` are
-  accepted aliases for `left` and `right`. Both fingerprints must be nonempty;
-  omitted `evidence` becomes `{}`. This handler does not reject additional
-  fields.
-- Result payload: `{module_generation, changed, table_epoch}`.
-- Errors: `substitution_rejected`, `invalid_request`, and `store_failure`.
-- Semantics: alias administration must be enabled in module configuration.
-  Declaring an already-live pair is idempotent (`changed: false`) and preserves
-  its epoch; a new live pair records the evidence and advances `table_epoch`.
-
-#### `alias.retract`
-
-- Params: the same shape as `alias.declare`.
-- Result payload: `{module_generation, changed, table_epoch}`.
-- Errors: `substitution_rejected`, `invalid_request`, and `store_failure`.
-- Semantics: retracting a live pair records its end time and evidence, then
-  advances `table_epoch`; retracting a pair that is not live is idempotent and
-  leaves the epoch unchanged. Retraction affects future alias reads only, not
-  vectors or job pages already produced under the pair.
 
 ### Owned-decode approval administration
 
@@ -1202,9 +1113,8 @@ This field is additive and backwards-compatible; existing consumers reading only
 Checks: `embed_query_row_over_ceiling_reports_submitted_and_content_hashes`
 (skeleton e2e).
 
-- Persist the envelope fingerprint verbatim and the alias-table epoch with an
-  index. Treat a different fingerprint as a different vector space unless an
-  explicitly accepted certified equivalence permits it.
+- Persist the envelope fingerprint verbatim. Treat a different fingerprint
+  as a different vector space; Synapse does not substitute another fingerprint.
 - Resume durable work with the same request key and bound digest, and collect
   every committed page by item ID rather than assuming page order.
 - Verify transport input against `submitted_sha256`; use `content_sha256` and
@@ -1219,10 +1129,8 @@ Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host).
   permanent probe_required on probe-gated lanes). ORT is not shipped;
   catalog lanes use self-check instead. Every request ends in result, typed error,
   or transport closure.
-- Health: cached state only; worker liveness/crash-window and probe-row
-  staleness ride models.list / probe.report / health detail. ANE worker PING
-  refreshes the last Neural Engine placement share used by explicit
-  certification probes.
+- Health and diagnostics read existing state. Failed catalog self-checks and
+  worker quarantine are visible through the catalog and diagnostics surfaces.
 - module_generation on every envelope: if it changes mid-conversation,
   re-poll jobs (prior-generation jobs are terminal module_restarted).
 
@@ -1240,9 +1148,9 @@ per-item content hashes. Reusing a request key with different content returns
 permanent `idempotency_conflict`. Same-key/same-digest resubmission resumes from
 committed item IDs.
 
-`embed.query`, `embed.batch` and `rerank.score` ignore unknown request fields,
-including the retired `accept_declared` field. `microllm.oneshot` remains strict
-and no longer accepts that field.
+`embed.query`, `embed.batch` and `rerank.score` ignore retired request fields
+`accept_declared` and `allow_equivalent`. `microllm.oneshot` remains strict:
+it accepts but ignores `allow_equivalent`, and does not accept `accept_declared`.
 
 Owned-decode responses may add optional `chain_k` provenance. Legacy readers must
 ignore additive provenance fields; this introduces no request field.
@@ -1252,13 +1160,6 @@ ignore additive provenance fields; this introduces no request field.
 Checks: `tests::wire_contract_documents_every_management_operation` (module
 library), `all_sixteen_profiles_have_sealed_model_specific_subsets` and
 `tampered_subset_digest_refuses_and_names_profile` (certification self-checks).
-
-### 2026-08-29: complete management-operation coverage
-
-Added the owned-decode session controls, owned-decode approval administration,
-`model.unload`, and alias declaration/retraction operations. The snapshot now
-records their parameter and result shapes, refusal codes, durable identity and
-fencing semantics, and envelope-v2 decode frames.
 
 ### Grammar refusal retirement
 
@@ -1281,8 +1182,9 @@ runs a quiet, persisted self-check using a compact sealed subset derived from
 the existing catalog-install references are unchanged. An absent reference,
 invalid seal, or numerical mismatch refuses with `self_check_failed`, naming
 the profile. Failed checks stay failed for the same model fingerprint, engine,
-OS build, manifest and subset seal. A preload without `profile` retains its
-existing probe/approval gates, including `probe_required` before probing.
+OS build, manifest and subset seal. Free-form preloads are rejected at startup;
+parked `owned-metal-decode` preloads are exempt and retain their existing
+certification and approval gates.
 
 The fixed subset is `short-0`, `boundary-127`, `boundary-128`, `boundary-129`,
 plus `pool10-000`, `pool10-001`, `pool10-002` for rerankers. It covers short input,

@@ -15,7 +15,7 @@ impl std::io::Write for Writer {
 }
 
 #[test]
-fn startup_skips_retired_coreml_rows_with_one_named_warning() {
+fn startup_skips_retired_coreml_and_free_form_rows_with_one_named_warning_each() {
     let (root, descriptor) = test_storage_descriptor("retired-engine-startup");
     let store = SynapseStore::open(&descriptor).unwrap();
     let config = ModuleConfig::default();
@@ -35,6 +35,16 @@ fn startup_skips_retired_coreml_rows_with_one_named_warning() {
         retired.engine_identity.engine = "ane-coreml-worker".into();
         store.upsert_model(&retired, 2).unwrap();
     }
+    for (id, task) in [
+        ("gte-modernbert-base-f16", "embed"),
+        ("gte-reranker-modernbert-base-f32", "rerank"),
+    ] {
+        let mut retired = kept.clone();
+        retired.model_id = id.into();
+        retired.task = task.into();
+        retired.engine_identity.build_flags.remove("profile");
+        store.upsert_model(&retired, 2).unwrap();
+    }
 
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let writer = Writer(bytes.clone());
@@ -49,13 +59,18 @@ fn startup_skips_retired_coreml_rows_with_one_named_warning() {
     assert_eq!(restored, vec![kept]);
     assert_eq!(
         store.catalog_models().unwrap().len(),
-        3,
+        5,
         "migration owns deletion"
     );
     let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
     let warnings: Vec<_> = logs.lines().filter(|line| line.contains("WARN")).collect();
-    assert_eq!(warnings.len(), 2, "{logs}");
-    for id in ["retired-ane", "retired-ane-coreml-worker"] {
+    assert_eq!(warnings.len(), 4, "{logs}");
+    for id in [
+        "retired-ane",
+        "retired-ane-coreml-worker",
+        "gte-modernbert-base-f16",
+        "gte-reranker-modernbert-base-f32",
+    ] {
         assert_eq!(
             warnings
                 .iter()
@@ -67,7 +82,7 @@ fn startup_skips_retired_coreml_rows_with_one_named_warning() {
     }
     assert!(warnings
         .iter()
-        .all(|line| line.contains("skipping persisted registration with retired engine")));
+        .all(|line| line.contains("skipping retired persisted registration")));
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -105,7 +105,6 @@ fn fixture(lane: &str, assets: &Path) -> (PathBuf, Arc<ModuleState>, Capture) {
         loaded_model,
         backend: engine_backend,
         tokenizer,
-        numeric_profile_id: spec.numeric_profile_id.clone(),
         fingerprint: spec.fingerprint.clone(),
         certification_fingerprint: spec.fingerprint.clone(),
         engine_identity: spec.engine_identity.clone(),

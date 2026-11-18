@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::ExitCode,
     time::Duration,
 };
@@ -47,14 +47,6 @@ enum Command {
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
-    },
-    Model {
-        #[command(subcommand)]
-        command: ModelCommand,
-    },
-    Probe {
-        #[command(subcommand)]
-        command: ProbeCommand,
     },
     Admission {
         #[command(subcommand)]
@@ -154,38 +146,6 @@ mod lane_command_tests {
             .is_err());
         }
     }
-}
-
-#[derive(Debug, Subcommand)]
-enum ModelCommand {
-    /// Submit a model manifest for loading.
-    Load {
-        /// JSON object or path to a file containing the model.load params object.
-        #[arg(long)]
-        manifest: String,
-    },
-    /// Show a model-load job or model runtime state.
-    Status {
-        /// A job_* id returned by model.load, or a model id.
-        reference: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ProbeCommand {
-    /// Start an explicit certification probe job.
-    Run {
-        /// Restrict the probe to one model/lane id.
-        #[arg(long)]
-        lane: Option<String>,
-    },
-    /// Show a probe job's state.
-    Status {
-        /// The job_* id returned by probe run.
-        job_id: String,
-    },
-    /// Show certification, performance, and active assignment rows.
-    Report,
 }
 
 #[derive(Debug, Subcommand)]
@@ -325,39 +285,6 @@ async fn execute(
         Command::Models {
             command: ModelsCommand::List,
         } => call(consumer, identity, "models.list", json!({})).await,
-        Command::Model { command } => match command {
-            ModelCommand::Load { manifest } => {
-                let params = parse_manifest_arg(manifest)?;
-                call(consumer, identity, "model.load", params).await
-            }
-            ModelCommand::Status { reference } => {
-                let params = if reference.starts_with("job_") {
-                    json!({ "job_id": reference })
-                } else {
-                    json!({ "model_id": reference })
-                };
-                call(consumer, identity, "model.status", params).await
-            }
-        },
-        Command::Probe { command } => match command {
-            ProbeCommand::Run { lane } => {
-                let params = lane
-                    .as_ref()
-                    .map(|lane| json!({ "models": [lane] }))
-                    .unwrap_or_else(|| json!({}));
-                call(consumer, identity, "probe.start", params).await
-            }
-            ProbeCommand::Status { job_id } => {
-                call(
-                    consumer,
-                    identity,
-                    "probe.status",
-                    json!({ "job_id": job_id }),
-                )
-                .await
-            }
-            ProbeCommand::Report => call(consumer, identity, "probe.report", json!({})).await,
-        },
         Command::Admission {
             command: AdmissionCommand::Status,
         } => call(consumer, identity, "admission.status", json!({})).await,
@@ -487,14 +414,7 @@ async fn call(
 ) -> Result<CommandOutput> {
     let request = serde_json::to_vec(&json!({ "method": method, "params": params }))
         .context("encode Synapse request")?;
-    let timeout = if matches!(
-        method,
-        "model.load" | "model.status" | "probe.start" | "probe.status"
-    ) {
-        Duration::from_secs(180)
-    } else {
-        Duration::from_secs(60)
-    };
+    let timeout = Duration::from_secs(60);
     let options = CallOptions {
         timeout,
         ..CallOptions::default()
@@ -676,24 +596,6 @@ fn ensure_no_error_envelope(output: &CommandOutput) -> Result<()> {
 
 fn response_error(response: &Value) -> Option<&Map<String, Value>> {
     response.pointer("/result/error").and_then(Value::as_object)
-}
-
-fn parse_manifest_arg(argument: &str) -> Result<Value> {
-    let path = Path::new(argument);
-    let value: Value = if path.is_file() {
-        let bytes = fs::read(path)
-            .with_context(|| format!("read model manifest from {}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse model manifest from {}", path.display()))?
-    } else {
-        serde_json::from_str(argument).with_context(|| {
-            format!("manifest is neither a readable file nor an inline JSON object: {argument}")
-        })?
-    };
-    if !value.is_object() {
-        bail!("model manifest must be a JSON object containing model.load params");
-    }
-    Ok(value)
 }
 
 fn read_submitted_items(args: &EmbedBatchArgs) -> Result<Vec<SubmittedItem>> {
@@ -1030,61 +932,5 @@ mod tests {
         assert!(message.contains("content_sha256 mismatch"));
         assert!(message.contains("submitted="));
         assert!(message.contains("echoed="));
-    }
-
-    #[test]
-    fn manifest_argument_parses_inline_object() {
-        let value = parse_manifest_arg(r#"{"source":"file","engine":"owned-metal"}"#).unwrap();
-        assert_eq!(value["source"], "file");
-        assert_eq!(value["engine"], "owned-metal");
-    }
-
-    #[test]
-    fn manifest_argument_reads_json_file() {
-        // The nonce is a clock reading rather than the thread name: under a test
-        // runner the thread is named for the test's full path, and the `::` in
-        // that name is not a legal filename character on Windows.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir().join(format!(
-            "synapse-opctl-manifest-{}-{nonce}.json",
-            std::process::id(),
-        ));
-        fs::write(
-            &path,
-            r#"{"source":"file","files":{"model":"model.safetensors"}}"#,
-        )
-        .unwrap();
-        let value = parse_manifest_arg(path.to_str().unwrap()).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(value["source"], "file");
-        assert_eq!(value["files"]["model"], "model.safetensors");
-    }
-
-    #[test]
-    fn manifest_argument_rejects_non_object_json() {
-        let error = parse_manifest_arg("[]").unwrap_err();
-        assert!(error.to_string().contains("must be a JSON object"));
-    }
-
-    #[test]
-    fn clap_keeps_inline_manifest_as_one_argument() {
-        let cli = Cli::try_parse_from([
-            "ck-synapse-opctl",
-            "model",
-            "load",
-            "--manifest",
-            r#"{"source":"file"}"#,
-        ])
-        .unwrap();
-        let Command::Model {
-            command: ModelCommand::Load { manifest },
-        } = cli.command
-        else {
-            panic!("expected model load command");
-        };
-        assert_eq!(manifest, r#"{"source":"file"}"#);
     }
 }

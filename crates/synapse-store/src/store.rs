@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_core::{
-    AliasRow, AliasTable, EngineIdentity, Fingerprint, MachineProfile, NumericProfileId,
+    EngineIdentity, Fingerprint, MachineProfile, NumericProfileId,
 };
 use thiserror::Error;
 
@@ -1219,9 +1219,7 @@ pub struct StoredModelConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CatalogSnapshot {
-    pub table_epoch: u64,
     pub models: Vec<ModelCatalogEntry>,
-    pub alias_rows: Vec<AliasRow>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1824,25 +1822,6 @@ pub struct OwnedDecodeMatchInputs {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
-pub struct ClassScopedCertificationRow {
-    pub certification_class: CertificationClass,
-    pub assurance_class: AssuranceClass,
-    pub status: CertificationStatus,
-    pub key_hash: String,
-    pub machine_profile_hash: Option<String>,
-    pub remote_profile_hash: Option<String>,
-    pub identity_revision: Option<String>,
-    pub numeric_profile_id: Option<NumericProfileId>,
-    pub fingerprint: Fingerprint,
-    pub certified_at_ms: u64,
-    pub os_build: String,
-    pub module_generation: u64,
-    pub evidence: Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
-#[allow(dead_code)]
 pub struct ProfileState {
     pub snapshot: Option<MachineProfile>,
     pub revisioned_machine_profile_hash: Option<String>,
@@ -1850,7 +1829,6 @@ pub struct ProfileState {
     pub previous_revisioned_machine_profile_hash: Option<String>,
     pub last_rotation_reason: Option<String>,
     pub last_rotation_at_ms: Option<u64>,
-    pub certification_stale_since_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1921,7 +1899,6 @@ pub struct StorageHealthInputs {
     pub previous_revisioned_machine_profile_hash: Option<String>,
     pub current_revisioned_machine_profile_hash: Option<String>,
     pub profile_activation_epoch: Option<u64>,
-    pub certification_stale_since_ms: Option<u64>,
     pub last_rotation_at_ms: Option<u64>,
     pub last_rotation_reason: Option<String>,
     pub rotation_event_count: u64,
@@ -2091,22 +2068,6 @@ pub struct CertificationRow {
     pub evidence: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct PerfRow {
-    pub machine_profile_hash: String,
-    pub model_id: String,
-    pub workload: String,
-    pub numeric_profile_id: NumericProfileId,
-    pub fingerprint: Fingerprint,
-    pub engine: String,
-    pub measured_at_ms: u64,
-    pub os_build: String,
-    pub module_generation: u64,
-    pub throughput_tok_s: f64,
-    pub cold_load_ms: f64,
-    pub single_item_latency_p50_ms: f64,
-    pub details: Value,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KnobAssignmentRow {
@@ -2642,7 +2603,6 @@ impl SynapseStore {
     }
 
     pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, SynapseStoreError> {
-        let alias_table = self.alias_table()?;
         let models = self
             .catalog_models()?
             .into_iter()
@@ -2688,11 +2648,7 @@ impl SynapseStore {
                 }
             })
             .collect();
-        Ok(CatalogSnapshot {
-            table_epoch: alias_table.table_epoch,
-            models,
-            alias_rows: alias_table.rows,
-        })
+        Ok(CatalogSnapshot { models })
     }
 
     pub fn catalog_models(&self) -> Result<Vec<StoredModelConfig>, SynapseStoreError> {
@@ -2738,44 +2694,6 @@ impl SynapseStore {
         Ok(())
     }
 
-    pub fn alias_table(&self) -> Result<AliasTable, SynapseStoreError> {
-        let rows = self.store.with_conn(|conn| {
-            let table_epoch: i64 = conn.query_row(
-                "SELECT table_epoch FROM module_meta WHERE id = 0",
-                [],
-                |row| row.get(0),
-            )?;
-            let mut stmt = conn.prepare(
-                "SELECT fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json \
-                 FROM alias_rows \
-                 ORDER BY fingerprint_a, fingerprint_b, valid_from_ms",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let evidence_json: String = row.get(4)?;
-                    let evidence = serde_json::from_str(&evidence_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            4,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(AliasRow::with_evidence(
-                        Fingerprint(row.get(0)?),
-                        Fingerprint(row.get(1)?),
-                        row.get::<_, i64>(2)? as u64,
-                        row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                        evidence,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((table_epoch as u64, rows))
-        })?;
-        Ok(AliasTable {
-            table_epoch: rows.0,
-            rows: rows.1,
-        })
-    }
 
     /// Insert an approval row only through this explicit administrative path,
     /// after validation; serving and certification code never call it.
@@ -5072,217 +4990,6 @@ impl SynapseStore {
     }
 
     // Staged storage API consumed by the epic's runtime slice; remove this allow there.
-    #[allow(dead_code)]
-    pub fn store_class_scoped_cert_row(
-        &self,
-        row: &ClassScopedCertificationRow,
-    ) -> Result<(), SynapseStoreError> {
-        if matches!(
-            row.certification_class,
-            CertificationClass::MeasuredOwnedDecode | CertificationClass::LegacyOwnedDecode
-        ) {
-            return Err(SynapseStoreError::Decode(
-                "owned classes require their dedicated row API".to_string(),
-            ));
-        }
-        if row.key_hash.trim().is_empty() || row.fingerprint.0.trim().is_empty() {
-            return Err(SynapseStoreError::Decode(
-                "class-scoped certification identity must be non-empty".to_string(),
-            ));
-        }
-        let evidence_json = serde_json::to_string(&row.evidence)?;
-        let class = row.certification_class.as_str();
-        let sql = format!(
-            "INSERT INTO cert_rows (
-                 certification_class, assurance_class, status, key_hash,
-                 machine_profile_hash, remote_profile_hash, identity_revision,
-                 numeric_profile_id, fingerprint, certified_at_ms, os_build,
-                 module_generation, evidence_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT (key_hash, fingerprint)
-             WHERE certification_class = '{class}' DO UPDATE SET
-                 status = excluded.status,
-                 machine_profile_hash = excluded.machine_profile_hash,
-                 remote_profile_hash = excluded.remote_profile_hash,
-                 identity_revision = excluded.identity_revision,
-                 numeric_profile_id = excluded.numeric_profile_id,
-                 certified_at_ms = excluded.certified_at_ms,
-                 os_build = excluded.os_build,
-                 module_generation = excluded.module_generation,
-                 evidence_json = excluded.evidence_json"
-        );
-        self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                &sql,
-                params![
-                    class,
-                    row.assurance_class.as_str(),
-                    row.status.as_str(),
-                    &row.key_hash,
-                    row.machine_profile_hash.as_deref(),
-                    row.remote_profile_hash.as_deref(),
-                    row.identity_revision.as_deref(),
-                    row.numeric_profile_id.as_ref().map(|id| &id.0),
-                    &row.fingerprint.0,
-                    row.certified_at_ms as i64,
-                    &row.os_build,
-                    row.module_generation as i64,
-                    evidence_json,
-                ],
-            )
-        })?;
-        Ok(())
-    }
-
-    // Staged storage API consumed by the epic's runtime slice; remove this allow there.
-    #[allow(dead_code)]
-    pub fn get_class_scoped_cert_row(
-        &self,
-        certification_class: CertificationClass,
-        key_hash: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<ClassScopedCertificationRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                "SELECT certification_class, assurance_class, status, key_hash,
-                        machine_profile_hash, remote_profile_hash, identity_revision,
-                        numeric_profile_id, fingerprint, certified_at_ms, os_build,
-                        module_generation, evidence_json
-                 FROM cert_rows
-                 WHERE certification_class = ?1 AND key_hash = ?2 AND fingerprint = ?3
-                 ORDER BY certified_at_ms DESC LIMIT 1",
-                params![certification_class.as_str(), key_hash, &fingerprint.0],
-                class_scoped_cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_class_scoped_cert_row).transpose()
-    }
-
-    pub fn get_cert_row(
-        &self,
-        certification_class: CertificationClass,
-        machine_profile_hash: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        if !matches!(
-            certification_class,
-            CertificationClass::Embedding | CertificationClass::Rerank
-        ) {
-            return Err(SynapseStoreError::Decode(
-                "measured certification reads require embedding or rerank class".to_string(),
-            ));
-        }
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
-                     AND certification_class = ?1 AND status = 'certified'
-                     AND key_hash = ?2 AND fingerprint = ?3"
-                ),
-                params![
-                    certification_class.as_str(),
-                    machine_profile_hash,
-                    &fingerprint.0
-                ],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
-    }
-
-    pub fn latest_cert_row(
-        &self,
-        certification_class: CertificationClass,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE certification_class = ?1
-                     AND status = 'certified' AND fingerprint = ?2
-                     ORDER BY certified_at_ms DESC LIMIT 1"
-                ),
-                params![certification_class.as_str(), &fingerprint.0],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
-    }
-
-    pub fn get_probe_row(
-        &self,
-        certification_class: CertificationClass,
-        machine_profile_hash: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
-                     AND certification_class = ?1 AND key_hash = ?2
-                     AND fingerprint = ?3 ORDER BY certified_at_ms DESC LIMIT 1"
-                ),
-                params![
-                    certification_class.as_str(),
-                    machine_profile_hash,
-                    &fingerprint.0
-                ],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
-    }
-
-    pub fn latest_probe_row(
-        &self,
-        certification_class: CertificationClass,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<CertificationRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                &format!(
-                    "{CERT_SELECT_SQL} WHERE assurance_class = 'measured'
-                     AND certification_class = ?1 AND fingerprint = ?2
-                     ORDER BY certified_at_ms DESC LIMIT 1"
-                ),
-                params![certification_class.as_str(), &fingerprint.0],
-                cert_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_cert_row).transpose()
-    }
-
-    pub fn has_stale_cert_row(
-        &self,
-        certification_class: CertificationClass,
-        machine_profile_hash: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<bool, SynapseStoreError> {
-        let count = self.store.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(1) FROM cert_rows
-                 WHERE assurance_class = 'measured' AND certification_class = ?1
-                   AND (status = 'certified' OR (
-                       status = 'uncertified'
-                       AND json_extract(evidence_json, '$.blocking_reason') IS NULL
-                   ))
-                   AND fingerprint = ?2 AND key_hash <> ?3",
-                params![
-                    certification_class.as_str(),
-                    &fingerprint.0,
-                    machine_profile_hash
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-        })?;
-        Ok(count > 0)
-    }
-
     pub fn current_profile_activation_epoch(&self) -> Result<Option<u64>, SynapseStoreError> {
         let epoch = self.store.with_conn(|conn| {
             conn.query_row(
@@ -5299,8 +5006,7 @@ impl SynapseStore {
             conn.query_row(
                 "SELECT snapshot_json, revisioned_machine_profile_hash,
                          profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                         last_rotation_reason, last_rotation_at_ms,
-                         certification_stale_since_ms
+                          last_rotation_reason, last_rotation_at_ms
                   FROM profile_state WHERE id = 0",
                 [],
                 profile_state_from_row,
@@ -5308,34 +5014,6 @@ impl SynapseStore {
         })?;
         validate_profile_state(&state)?;
         Ok(state)
-    }
-
-    /// Persist the first certification mismatch observed for the current profile.
-    /// A hash guard prevents a request that raced a profile rotation from marking
-    /// the newly activated profile stale.
-    pub fn observe_certification_stale(
-        &self,
-        revisioned_machine_profile_hash: &str,
-        observed_at_ms: u64,
-    ) -> Result<Option<u64>, SynapseStoreError> {
-        let observed_at_ms = observed_at_ms.min(i64::MAX as u64) as i64;
-        let stale_since = self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "UPDATE profile_state
-                 SET certification_stale_since_ms = COALESCE(certification_stale_since_ms, ?1)
-                 WHERE id = 0 AND revisioned_machine_profile_hash = ?2",
-                params![observed_at_ms, revisioned_machine_profile_hash],
-            )?;
-            tx.query_row(
-                "SELECT certification_stale_since_ms
-                 FROM profile_state
-                 WHERE id = 0 AND revisioned_machine_profile_hash = ?1",
-                params![revisioned_machine_profile_hash],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-        })?;
-        Ok(stale_since.flatten().map(|value| value as u64))
     }
 
     /// Observe and durably activate a collected profile. The first observation
@@ -5357,8 +5035,7 @@ impl SynapseStore {
             let persisted = tx.query_row(
                 "SELECT snapshot_json, revisioned_machine_profile_hash,
                          profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                         last_rotation_reason, last_rotation_at_ms,
-                         certification_stale_since_ms
+                          last_rotation_reason, last_rotation_at_ms
                   FROM profile_state WHERE id = 0",
                 [],
                 profile_state_from_row,
@@ -5383,7 +5060,6 @@ impl SynapseStore {
                     previous_revisioned_machine_profile_hash: None,
                     last_rotation_reason: None,
                     last_rotation_at_ms: None,
-                    certification_stale_since_ms: None,
                 };
                 return Ok(ProfileActivation {
                     state,
@@ -5424,8 +5100,7 @@ impl SynapseStore {
                      profile_activation_epoch = ?3,
                      previous_revisioned_machine_profile_hash = ?4,
                       last_rotation_reason = ?5,
-                      last_rotation_at_ms = ?6,
-                      certification_stale_since_ms = NULL
+                       last_rotation_at_ms = ?6
                   WHERE id = 0 AND revisioned_machine_profile_hash = ?7
                    AND profile_activation_epoch = ?8",
                 params![
@@ -5443,8 +5118,7 @@ impl SynapseStore {
                 let adopted = tx.query_row(
                     "SELECT snapshot_json, revisioned_machine_profile_hash,
                          profile_activation_epoch, previous_revisioned_machine_profile_hash,
-                         last_rotation_reason, last_rotation_at_ms,
-                         certification_stale_since_ms
+                          last_rotation_reason, last_rotation_at_ms
                   FROM profile_state WHERE id = 0",
                     [],
                     profile_state_from_row,
@@ -5523,7 +5197,6 @@ impl SynapseStore {
                 previous_revisioned_machine_profile_hash: Some(old_hash),
                 last_rotation_reason: Some(reason),
                 last_rotation_at_ms: Some(observed_at_ms),
-                certification_stale_since_ms: None,
             };
             Ok(ProfileActivation {
                 state,
@@ -5878,7 +5551,6 @@ impl SynapseStore {
                 .previous_revisioned_machine_profile_hash,
             current_revisioned_machine_profile_hash: state.revisioned_machine_profile_hash,
             profile_activation_epoch: state.profile_activation_epoch,
-            certification_stale_since_ms: state.certification_stale_since_ms,
             last_rotation_at_ms: state.last_rotation_at_ms,
             last_rotation_reason: state.last_rotation_reason,
             rotation_event_count,
@@ -5888,146 +5560,10 @@ impl SynapseStore {
         })
     }
 
-    pub fn store_perf_row(&self, row: &PerfRow) -> Result<(), SynapseStoreError> {
-        let details_json = serde_json::to_string(&row.details)?;
-        self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "INSERT INTO perf_rows (
-                     machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
-                     engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
-                     cold_load_ms, single_item_latency_p50_ms, details_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(machine_profile_hash, fingerprint) DO UPDATE SET
-                     model_id = excluded.model_id,
-                     workload = excluded.workload,
-                     numeric_profile_id = excluded.numeric_profile_id,
-                     engine = excluded.engine,
-                     measured_at_ms = excluded.measured_at_ms,
-                     os_build = excluded.os_build,
-                     module_generation = excluded.module_generation,
-                     throughput_tok_s = excluded.throughput_tok_s,
-                     cold_load_ms = excluded.cold_load_ms,
-                     single_item_latency_p50_ms = excluded.single_item_latency_p50_ms,
-                     details_json = excluded.details_json",
-                params![
-                    &row.machine_profile_hash,
-                    &row.model_id,
-                    &row.workload,
-                    &row.numeric_profile_id.0,
-                    &row.fingerprint.0,
-                    &row.engine,
-                    row.measured_at_ms as i64,
-                    &row.os_build,
-                    row.module_generation as i64,
-                    row.throughput_tok_s,
-                    row.cold_load_ms,
-                    row.single_item_latency_p50_ms,
-                    details_json,
-                ],
-            )
-        })?;
-        Ok(())
-    }
 
-    pub fn get_perf_row(
-        &self,
-        machine_profile_hash: &str,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<PerfRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
-                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
-                        cold_load_ms, single_item_latency_p50_ms, details_json
-                 FROM perf_rows WHERE machine_profile_hash = ?1 AND fingerprint = ?2",
-                params![machine_profile_hash, &fingerprint.0],
-                perf_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_perf_row).transpose()
-    }
 
-    pub fn latest_perf_row(
-        &self,
-        fingerprint: &Fingerprint,
-    ) -> Result<Option<PerfRow>, SynapseStoreError> {
-        let raw = self.store.with_conn(|conn| {
-            conn.query_row(
-                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
-                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
-                        cold_load_ms, single_item_latency_p50_ms, details_json
-                 FROM perf_rows
-                 WHERE fingerprint = ?1
-                 ORDER BY measured_at_ms DESC
-                 LIMIT 1",
-                params![&fingerprint.0],
-                perf_row_from_row,
-            )
-            .optional()
-        })?;
-        raw.map(decode_perf_row).transpose()
-    }
 
-    pub fn current_perf_rows(
-        &self,
-        machine_profile_hash: &str,
-    ) -> Result<Vec<PerfRow>, SynapseStoreError> {
-        let rows = self.store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT machine_profile_hash, model_id, workload, numeric_profile_id, fingerprint,
-                        engine, measured_at_ms, os_build, module_generation, throughput_tok_s,
-                        cold_load_ms, single_item_latency_p50_ms, details_json
-                 FROM perf_rows
-                 WHERE machine_profile_hash = ?1
-                 ORDER BY workload ASC, throughput_tok_s DESC, model_id ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![machine_profile_hash], perf_row_from_row)?
-                .map(|row| row.and_then(|raw| decode_perf_row(raw).map_err(to_sql_error)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })?;
-        Ok(rows)
-    }
 
-    pub fn replace_knob_assignments(
-        &self,
-        machine_profile_hash: &str,
-        rows: &[KnobAssignmentRow],
-    ) -> Result<(), SynapseStoreError> {
-        self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "DELETE FROM knob_assignments WHERE machine_profile_hash = ?1",
-                params![machine_profile_hash],
-            )?;
-            for row in rows {
-                tx.execute(
-                    "INSERT INTO knob_assignments (
-                         machine_profile_hash, workload, knob, model_id, numeric_profile_id,
-                         fingerprint, engine, measured_at_ms, os_build, module_generation,
-                         throughput_tok_s, single_item_latency_p50_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        &row.machine_profile_hash,
-                        &row.workload,
-                        row.knob.as_str(),
-                        &row.model_id,
-                        &row.numeric_profile_id.0,
-                        &row.fingerprint.0,
-                        &row.engine,
-                        row.measured_at_ms as i64,
-                        &row.os_build,
-                        row.module_generation as i64,
-                        row.throughput_tok_s,
-                        row.single_item_latency_p50_ms,
-                    ],
-                )?;
-            }
-            Ok(())
-        })?;
-        Ok(())
-    }
 
     pub fn knob_assignment(
         &self,
@@ -6050,108 +5586,8 @@ impl SynapseStore {
         raw.map(decode_knob_assignment_row).transpose()
     }
 
-    pub fn knob_assignments(
-        &self,
-        machine_profile_hash: &str,
-    ) -> Result<Vec<KnobAssignmentRow>, SynapseStoreError> {
-        let rows = self.store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT machine_profile_hash, workload, knob, model_id, numeric_profile_id,
-                        fingerprint, engine, measured_at_ms, os_build, module_generation,
-                        throughput_tok_s, single_item_latency_p50_ms
-                 FROM knob_assignments
-                 WHERE machine_profile_hash = ?1
-                 ORDER BY workload ASC, knob ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![machine_profile_hash], knob_assignment_from_row)?
-                .map(|row| {
-                    row.and_then(|raw| decode_knob_assignment_row(raw).map_err(to_sql_error))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })?;
-        Ok(rows)
-    }
 
-    pub fn declare_alias_pair(
-        &self,
-        fingerprint_a: &Fingerprint,
-        fingerprint_b: &Fingerprint,
-        evidence: &Value,
-        now_ms: u64,
-    ) -> Result<(bool, u64), SynapseStoreError> {
-        let row = AliasRow::with_evidence(
-            fingerprint_a.clone(),
-            fingerprint_b.clone(),
-            now_ms,
-            None,
-            evidence.clone(),
-        );
-        let evidence_json = serde_json::to_string(&row.evidence)?;
-        let outcome = self.store.with_conn_fenced(|tx| {
-            let current_epoch = table_epoch_tx(tx)?;
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT rowid FROM alias_rows \
-                     WHERE fingerprint_a = ?1 AND fingerprint_b = ?2 AND valid_to_ms IS NULL",
-                    params![&row.fingerprint_a.0, &row.fingerprint_b.0],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if existing.is_some() {
-                return Ok((false, current_epoch as u64));
-            }
-            tx.execute(
-                "INSERT INTO alias_rows (fingerprint_a, fingerprint_b, valid_from_ms, valid_to_ms, evidence_json) \
-                 VALUES (?1, ?2, ?3, NULL, ?4)",
-                params![
-                    &row.fingerprint_a.0,
-                    &row.fingerprint_b.0,
-                    row.valid_from_ms as i64,
-                    evidence_json,
-                ],
-            )?;
-            let next_epoch = bump_table_epoch_tx(tx)?;
-            Ok((true, next_epoch as u64))
-        })?;
-        Ok(outcome)
-    }
 
-    pub fn retract_alias_pair(
-        &self,
-        fingerprint_a: &Fingerprint,
-        fingerprint_b: &Fingerprint,
-        evidence: &Value,
-        now_ms: u64,
-    ) -> Result<(bool, u64), SynapseStoreError> {
-        let row = AliasRow::with_evidence(
-            fingerprint_a.clone(),
-            fingerprint_b.clone(),
-            now_ms,
-            Some(now_ms),
-            evidence.clone(),
-        );
-        let evidence_json = serde_json::to_string(&row.evidence)?;
-        let outcome = self.store.with_conn_fenced(|tx| {
-            let changed = tx.execute(
-                "UPDATE alias_rows SET valid_to_ms = ?3, evidence_json = ?4 \
-                 WHERE fingerprint_a = ?1 AND fingerprint_b = ?2 AND valid_to_ms IS NULL",
-                params![
-                    &row.fingerprint_a.0,
-                    &row.fingerprint_b.0,
-                    now_ms as i64,
-                    evidence_json,
-                ],
-            )?;
-            if changed == 0 {
-                return Ok((false, table_epoch_tx(tx)? as u64));
-            }
-            let next_epoch = bump_table_epoch_tx(tx)?;
-            Ok((true, next_epoch as u64))
-        })?;
-        Ok(outcome)
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn admit_job(
@@ -7794,10 +7230,6 @@ fn unix_now_ms() -> u64 {
         .as_millis() as u64
 }
 
-const CERT_SELECT_SQL: &str = "SELECT assurance_class, status, machine_profile_hash,
-        remote_profile_hash, identity_revision, numeric_profile_id, fingerprint,
-        certified_at_ms, os_build, module_generation, evidence_json FROM cert_rows";
-
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
 const OWNED_CERT_SELECT_SQL: &str = "SELECT status, revisioned_machine_profile_hash,
@@ -7806,36 +7238,6 @@ const OWNED_CERT_SELECT_SQL: &str = "SELECT status, revisioned_machine_profile_h
         evidence_schema_revision, processing_fingerprint, runtime_config_digest,
         constraint_runtime_identities_json, worker_path_evidence_json,
         g_dec_manifest_revision, evidence_json FROM cert_rows";
-
-struct RawCertificationRow {
-    assurance_class: String,
-    status: String,
-    machine_profile_hash: Option<String>,
-    numeric_profile_id: Option<String>,
-    fingerprint: String,
-    certified_at_ms: u64,
-    os_build: String,
-    module_generation: u64,
-    evidence_json: String,
-}
-
-// Staged storage API consumed by the epic's runtime slice; remove this allow there.
-#[allow(dead_code)]
-struct RawClassScopedCertificationRow {
-    certification_class: String,
-    assurance_class: String,
-    status: String,
-    key_hash: String,
-    machine_profile_hash: Option<String>,
-    remote_profile_hash: Option<String>,
-    identity_revision: Option<String>,
-    numeric_profile_id: Option<String>,
-    fingerprint: String,
-    certified_at_ms: u64,
-    os_build: String,
-    module_generation: u64,
-    evidence_json: String,
-}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -7859,21 +7261,6 @@ struct RawOwnedDecodeCertificationRow {
     evidence_json: String,
 }
 
-struct RawPerfRow {
-    machine_profile_hash: String,
-    model_id: String,
-    workload: String,
-    numeric_profile_id: String,
-    fingerprint: String,
-    engine: String,
-    measured_at_ms: u64,
-    os_build: String,
-    module_generation: u64,
-    throughput_tok_s: f64,
-    cold_load_ms: f64,
-    single_item_latency_p50_ms: f64,
-    details_json: String,
-}
 
 struct RawKnobAssignmentRow {
     machine_profile_hash: String,
@@ -7890,41 +7277,8 @@ struct RawKnobAssignmentRow {
     single_item_latency_p50_ms: f64,
 }
 
-fn cert_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawCertificationRow> {
-    Ok(RawCertificationRow {
-        assurance_class: row.get(0)?,
-        status: row.get(1)?,
-        machine_profile_hash: row.get(2)?,
-        numeric_profile_id: row.get(5)?,
-        fingerprint: row.get(6)?,
-        certified_at_ms: row.get::<_, i64>(7)? as u64,
-        os_build: row.get(8)?,
-        module_generation: row.get::<_, i64>(9)? as u64,
-        evidence_json: row.get(10)?,
-    })
-}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
-#[allow(dead_code)]
-fn class_scoped_cert_row_from_row(
-    row: &Row<'_>,
-) -> rusqlite::Result<RawClassScopedCertificationRow> {
-    Ok(RawClassScopedCertificationRow {
-        certification_class: row.get(0)?,
-        assurance_class: row.get(1)?,
-        status: row.get(2)?,
-        key_hash: row.get(3)?,
-        machine_profile_hash: row.get(4)?,
-        remote_profile_hash: row.get(5)?,
-        identity_revision: row.get(6)?,
-        numeric_profile_id: row.get(7)?,
-        fingerprint: row.get(8)?,
-        certified_at_ms: row.get::<_, i64>(9)? as u64,
-        os_build: row.get(10)?,
-        module_generation: row.get::<_, i64>(11)? as u64,
-        evidence_json: row.get(12)?,
-    })
-}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -7952,23 +7306,6 @@ fn owned_decode_cert_row_from_row(
     })
 }
 
-fn perf_row_from_row(row: &Row<'_>) -> rusqlite::Result<RawPerfRow> {
-    Ok(RawPerfRow {
-        machine_profile_hash: row.get(0)?,
-        model_id: row.get(1)?,
-        workload: row.get(2)?,
-        numeric_profile_id: row.get(3)?,
-        fingerprint: row.get(4)?,
-        engine: row.get(5)?,
-        measured_at_ms: row.get::<_, i64>(6)? as u64,
-        os_build: row.get(7)?,
-        module_generation: row.get::<_, i64>(8)? as u64,
-        throughput_tok_s: row.get(9)?,
-        cold_load_ms: row.get(10)?,
-        single_item_latency_p50_ms: row.get(11)?,
-        details_json: row.get(12)?,
-    })
-}
 
 fn knob_assignment_from_row(row: &Row<'_>) -> rusqlite::Result<RawKnobAssignmentRow> {
     Ok(RawKnobAssignmentRow {
@@ -7987,29 +7324,6 @@ fn knob_assignment_from_row(row: &Row<'_>) -> rusqlite::Result<RawKnobAssignment
     })
 }
 
-fn decode_cert_row(row: RawCertificationRow) -> Result<CertificationRow, SynapseStoreError> {
-    let assurance_class = AssuranceClass::parse(&row.assurance_class)?;
-    let key = match assurance_class {
-        AssuranceClass::Measured => CertificationKey::Measured {
-            machine_profile_hash: row.machine_profile_hash.ok_or_else(|| {
-                SynapseStoreError::Decode(
-                    "measured certification row has no machine profile key".to_string(),
-                )
-            })?,
-        },
-    };
-    Ok(CertificationRow {
-        assurance_class,
-        status: CertificationStatus::parse(&row.status)?,
-        key,
-        numeric_profile_id: NumericProfileId(row.numeric_profile_id.unwrap_or_default()),
-        fingerprint: Fingerprint(row.fingerprint),
-        certified_at_ms: row.certified_at_ms,
-        os_build: row.os_build,
-        module_generation: row.module_generation,
-        evidence: serde_json::from_str(&row.evidence_json)?,
-    })
-}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -8764,26 +8078,6 @@ pub fn probe_gate_evidence_passed(evidence: &Value, manifest_revision: &str) -> 
 }
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
-#[allow(dead_code)]
-fn decode_class_scoped_cert_row(
-    row: RawClassScopedCertificationRow,
-) -> Result<ClassScopedCertificationRow, SynapseStoreError> {
-    Ok(ClassScopedCertificationRow {
-        certification_class: CertificationClass::parse(&row.certification_class)?,
-        assurance_class: AssuranceClass::parse(&row.assurance_class)?,
-        status: CertificationStatus::parse(&row.status)?,
-        key_hash: row.key_hash,
-        machine_profile_hash: row.machine_profile_hash,
-        remote_profile_hash: row.remote_profile_hash,
-        identity_revision: row.identity_revision,
-        numeric_profile_id: row.numeric_profile_id.map(NumericProfileId),
-        fingerprint: Fingerprint(row.fingerprint),
-        certified_at_ms: row.certified_at_ms,
-        os_build: row.os_build,
-        module_generation: row.module_generation,
-        evidence: serde_json::from_str(&row.evidence_json)?,
-    })
-}
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -8814,23 +8108,6 @@ fn decode_owned_decode_cert_row(
     })
 }
 
-fn decode_perf_row(row: RawPerfRow) -> Result<PerfRow, SynapseStoreError> {
-    Ok(PerfRow {
-        machine_profile_hash: row.machine_profile_hash,
-        model_id: row.model_id,
-        workload: row.workload,
-        numeric_profile_id: NumericProfileId(row.numeric_profile_id),
-        fingerprint: Fingerprint(row.fingerprint),
-        engine: row.engine,
-        measured_at_ms: row.measured_at_ms,
-        os_build: row.os_build,
-        module_generation: row.module_generation,
-        throughput_tok_s: row.throughput_tok_s,
-        cold_load_ms: row.cold_load_ms,
-        single_item_latency_p50_ms: row.single_item_latency_p50_ms,
-        details: serde_json::from_str(&row.details_json)?,
-    })
-}
 
 fn decode_knob_assignment_row(
     row: RawKnobAssignmentRow,
@@ -8875,14 +8152,6 @@ fn validate_profile_state(state: &ProfileState) -> Result<(), SynapseStoreError>
             ));
         }
     }
-    if state
-        .certification_stale_since_ms
-        .is_some_and(|value| value > i64::MAX as u64)
-    {
-        return Err(SynapseStoreError::ProfileStateCorrupt(
-            "certification stale timestamp exceeds SQLite range".to_string(),
-        ));
-    }
     if let Some(previous_hash) = state.previous_revisioned_machine_profile_hash.as_deref() {
         if !is_digest(previous_hash) {
             return Err(SynapseStoreError::ProfileStateCorrupt(
@@ -8910,10 +8179,8 @@ fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
         })?;
     let epoch_value = row.get::<_, Option<i64>>(2)?;
     let last_rotation_value = row.get::<_, Option<i64>>(5)?;
-    let certification_stale_since_value = row.get::<_, Option<i64>>(6)?;
     if epoch_value.is_some_and(|value| value < 0)
         || last_rotation_value.is_some_and(|value| value < 0)
-        || certification_stale_since_value.is_some_and(|value| value < 0)
     {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -8924,7 +8191,6 @@ fn profile_state_from_row(row: &Row<'_>) -> rusqlite::Result<ProfileState> {
         previous_revisioned_machine_profile_hash: row.get(3)?,
         last_rotation_reason: row.get(4)?,
         last_rotation_at_ms: last_rotation_value.map(|value| value as u64),
-        certification_stale_since_ms: certification_stale_since_value.map(|value| value as u64),
     })
 }
 
@@ -9160,22 +8426,7 @@ fn upsert_owned_decode_cert_row_tx(
     )
 }
 
-fn table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
-    tx.query_row(
-        "SELECT table_epoch FROM module_meta WHERE id = 0",
-        [],
-        |row| row.get(0),
-    )
-}
 
-fn bump_table_epoch_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
-    let next = table_epoch_tx(tx)? + 1;
-    tx.execute(
-        "UPDATE module_meta SET table_epoch = ?1 WHERE id = 0",
-        params![next],
-    )?;
-    Ok(next)
-}
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
     Ok(JobRecord {
@@ -9704,15 +8955,9 @@ mod tests {
         assert_eq!(paused.state, JOB_STATE_FAILED_PERMANENT);
         assert_eq!(paused.error_json.unwrap()["code"], "invalid_request");
         assert_eq!(paused.terminal_at_ms, Some(now as u64));
-        assert!(store
-            .get_cert_row(
-                CertificationClass::Embedding,
-                "local",
-                &Fingerprint("local".into())
-            )
-            .unwrap()
-            .is_some());
         store.store.with_conn(|conn| {
+            let local_rows: i64 = conn.query_row("SELECT COUNT(*) FROM cert_rows WHERE certification_class = 'embedding' AND fingerprint = 'local'", [], |row| row.get(0))?;
+            assert_eq!(local_rows, 1);
             let remote_rows: i64 = conn.query_row("SELECT COUNT(*) FROM cert_rows WHERE assurance_class = 'declared' OR certification_class = 'remote'", [], |row| row.get(0))?;
             assert_eq!(remote_rows, 0);
             for retired in ["remote_url_bindings", "remote_checkpoints"] {
@@ -9818,25 +9063,11 @@ mod tests {
                     }
                     2 => store,
                     3 => {
-                        let store = SynapseStore { store };
-                        let alias_a = Fingerprint("alias-a".to_string());
+                        store.with_conn_fenced(|tx| {
+                            tx.execute("INSERT INTO alias_rows (fingerprint_a, fingerprint_b, valid_from_ms, evidence_json) VALUES ('alias-a', 'alias-b1', 1001, '{}'), ('alias-a', 'alias-b2', 1002, '{}')", [])?;
+                            Ok(())
+                        }).unwrap();
                         store
-                            .declare_alias_pair(
-                                &alias_a,
-                                &Fingerprint("alias-b1".to_string()),
-                                &serde_json::json!({"source": "fixture"}),
-                                1_001,
-                            )
-                            .unwrap();
-                        store
-                            .declare_alias_pair(
-                                &alias_a,
-                                &Fingerprint("alias-b2".to_string()),
-                                &serde_json::json!({"source": "fixture"}),
-                                1_002,
-                            )
-                            .unwrap();
-                        store.store
                     }
                     4 => {
                         let store = SynapseStore { store };
@@ -9846,46 +9077,12 @@ mod tests {
                         store.store
                     }
                     5 => {
-                        let store = SynapseStore { store };
+                        store.with_conn_fenced(|tx| {
+                            tx.execute("INSERT INTO perf_rows VALUES ('machine-profile-hash', ?1, 'embed.batch', 'numeric-qwen3', 'perf-fingerprint', 'owned-metal-decode', 1004, '23G93', 1, 42.5, 125.0, 18.0, '{}')", [model_ids[0]])?;
+                            tx.execute("INSERT INTO knob_assignments VALUES ('machine-profile-hash', 'embed.batch', 'balanced', ?1, 'numeric-qwen3', 'perf-fingerprint', 'owned-metal-decode', 1004, '23G93', 1, 42.5, 18.0)", [model_ids[0]])?;
+                            Ok(())
+                        }).unwrap();
                         store
-                            .store_perf_row(&PerfRow {
-                                machine_profile_hash: "machine-profile-hash".to_string(),
-                                model_id: model_ids[0].to_string(),
-                                workload: "embed.batch".to_string(),
-                                numeric_profile_id: NumericProfileId("numeric-qwen3".to_string()),
-                                fingerprint: Fingerprint("perf-fingerprint".to_string()),
-                                engine: "owned-metal-decode".to_string(),
-                                measured_at_ms: 1_004,
-                                os_build: "23G93".to_string(),
-                                module_generation: 1,
-                                throughput_tok_s: 42.5,
-                                cold_load_ms: 125.0,
-                                single_item_latency_p50_ms: 18.0,
-                                details: serde_json::json!({"batch_size": 1}),
-                            })
-                            .unwrap();
-                        store
-                            .replace_knob_assignments(
-                                "machine-profile-hash",
-                                &[KnobAssignmentRow {
-                                    machine_profile_hash: "machine-profile-hash".to_string(),
-                                    workload: "embed.batch".to_string(),
-                                    knob: PerfKnob::Balanced,
-                                    model_id: model_ids[0].to_string(),
-                                    numeric_profile_id: NumericProfileId(
-                                        "numeric-qwen3".to_string(),
-                                    ),
-                                    fingerprint: Fingerprint("perf-fingerprint".to_string()),
-                                    engine: "owned-metal-decode".to_string(),
-                                    measured_at_ms: 1_004,
-                                    os_build: "23G93".to_string(),
-                                    module_generation: 1,
-                                    throughput_tok_s: 42.5,
-                                    single_item_latency_p50_ms: 18.0,
-                                }],
-                            )
-                            .unwrap();
-                        store.store
                     }
                     6 => {
                         store.with_conn_fenced(|tx| tx.execute_batch(r#"
@@ -10096,23 +9293,11 @@ mod tests {
 
         let migrated = SynapseStore::open(&descriptor).unwrap();
         assert_eq!(migrated.catalog_models().unwrap().len(), 4);
-        assert_eq!(migrated.alias_table().unwrap().rows.len(), 2);
+        assert_eq!(table_count(&migrated, "alias_rows"), 2);
         assert_eq!(migrated.approvals().unwrap().len(), 4);
         assert_eq!(migrated.rotation_events().unwrap().len(), 1);
-        assert_eq!(
-            migrated
-                .current_perf_rows("machine-profile-hash")
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            migrated
-                .knob_assignments("machine-profile-hash")
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(table_count(&migrated, "perf_rows"), 1);
+        assert_eq!(table_count(&migrated, "knob_assignments"), 1);
         assert_eq!(migrated.checkpoint_count("legacy:step-job").unwrap(), 1);
         let resumed_job_id = migrated
             .store
@@ -10252,7 +9437,7 @@ mod tests {
 
         let reopened = SynapseStore::open(&descriptor).unwrap();
         assert_eq!(reopened.catalog_models().unwrap().len(), 4);
-        assert_eq!(reopened.alias_table().unwrap().rows.len(), 2);
+        assert_eq!(table_count(&reopened, "alias_rows"), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10329,14 +9514,6 @@ mod tests {
         }
 
         let migrated = SynapseStore::open(&descriptor).unwrap();
-        assert!(migrated
-            .get_cert_row(
-                CertificationClass::Embedding,
-                "machine",
-                &Fingerprint("fp".to_string()),
-            )
-            .unwrap()
-            .is_none());
         let legacy_class: String = migrated
             .store
             .with_conn(|conn| {
@@ -10793,38 +9970,6 @@ mod tests {
             .unwrap()
             .is_none());
 
-        for class in [CertificationClass::Embedding, CertificationClass::Rerank] {
-            let class_row = ClassScopedCertificationRow {
-                certification_class: class,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: format!("key-{}", class.as_str()),
-                machine_profile_hash: None,
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: None,
-                fingerprint: Fingerprint("shared-fp".to_string()),
-                certified_at_ms: 1,
-                os_build: String::new(),
-                module_generation: 1,
-                evidence: serde_json::json!({"class": class.as_str()}),
-            };
-            store.store_class_scoped_cert_row(&class_row).unwrap();
-            let mut updated = class_row.clone();
-            updated.certified_at_ms = 2;
-            store.store_class_scoped_cert_row(&updated).unwrap();
-        }
-        let class_count: i64 = store
-            .store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM cert_rows WHERE fingerprint = 'shared-fp'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(class_count, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -10903,48 +10048,6 @@ mod tests {
             store.profile_state().unwrap().profile_activation_epoch,
             Some(3)
         );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn certification_stale_since_persists_across_store_reopen() {
-        let (root, descriptor) = temp_descriptor("certification-stale-since");
-        let profile = MachineProfile {
-            os_build: "os-a".to_string(),
-            arch: "aarch64".to_string(),
-            chip_model: "chip-a".to_string(),
-            ram_class: "le_32_gib".to_string(),
-            ane_subtype: None,
-            engine_identities: Vec::new(),
-        };
-        let profile_hash = profile.revisioned_hash();
-        let store = SynapseStore::open(&descriptor).expect("store opens");
-        store
-            .observe_profile(&profile, 10, 1)
-            .expect("profile activates");
-        assert_eq!(
-            store
-                .observe_certification_stale(&profile_hash, 123)
-                .expect("staleness records"),
-            Some(123)
-        );
-        assert_eq!(
-            store
-                .observe_certification_stale(&profile_hash, 456)
-                .expect("first observation remains fixed"),
-            Some(123)
-        );
-        drop(store);
-
-        let reopened = SynapseStore::open(&descriptor).expect("store reopens");
-        assert_eq!(
-            reopened
-                .profile_state()
-                .expect("profile state reads")
-                .certification_stale_since_ms,
-            Some(123)
-        );
-        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 

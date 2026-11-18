@@ -82,18 +82,15 @@ mod catalog_token_identity_tests;
 
 use cortexkit_lease::{FileLeaseStore, LeaseHandle, LeaseKey, LeaseStore};
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use owned_decode_certification::probe::ProbeSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    ApprovalCertificationHealth, AssuranceClass, CatalogSnapshot, CertificationClass,
-    CertificationKey, CertificationRow, CertificationStatus, CheckpointItem,
-    ClassScopedCertificationRow, EvidenceRequirementsDivergence, JobAdmission, JobAttemptClaim,
-    JobRecord, KnobAssignmentRow, ModelAssetLocator, ModelCatalogEntry,
-    OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal, OwnedDecodeCertificationRow,
-    OwnedDecodeMatchInputs, PerfRow, ProbeWriteOutcome, RecommendedBatch, StorageHealthInputs,
-    StoredModelConfig, CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
+    ApprovalCertificationHealth, CertificationStatus, CheckpointItem,
+    EvidenceRequirementsDivergence, JobAdmission, JobAttemptClaim, JobRecord, ModelAssetLocator,
+    ModelCatalogEntry, OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal,
+    OwnedDecodeMatchInputs, RecommendedBatch, StorageHealthInputs, StoredModelConfig,
+    CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
     JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
@@ -111,17 +108,17 @@ use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
     worker_binary_file_name,
     worker_engine_names::{DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE},
-    worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
+    worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
     EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
     GenerateRequest, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile, ModelCache,
     ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
-    NumericProfile, NumericProfileId, PoolingStrategy, QueueClass, RerankRequest, ResponseEnvelope,
+    NumericProfile, PoolingStrategy, QueueClass, RerankRequest, ResponseEnvelope,
     ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, SidecarSpec,
     StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
     TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
-    WorkerPooling, CUDA_WORKER_ENGINE, MACHINE_PROFILE_HASH_REVISION, OWNED_CUDA_MINIMUM_DEVICE_CC,
-    OWNED_CUDA_MINIMUM_DRIVER_API, OWNED_CUDA_PTX_VIRTUAL_ARCH,
+    WorkerPooling, CUDA_WORKER_ENGINE, OWNED_CUDA_MINIMUM_DEVICE_CC, OWNED_CUDA_MINIMUM_DRIVER_API,
+    OWNED_CUDA_PTX_VIRTUAL_ARCH,
 };
 use synapse_engine_owned::{
     engine_identity_with_projections, ModelFamily as OwnedFamily, OwnedDType,
@@ -163,7 +160,6 @@ const DEFAULT_ESTIMATED_EXECUTION_MS: u64 = 25;
 const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 2;
 const DEFAULT_WORKER_LOAD_TIMEOUT_MS: u64 = 900_000;
 const DEFAULT_WORKER_FORWARD_LINES_PER_SEC: u32 = 50;
-const OWNED_DECODE_PROBE_TIMEOUT_MS: u64 = 900_000;
 const DEFAULT_TRANSIENT_RETRY_AFTER_MS: u64 = 100;
 const DEFAULT_JOB_EXECUTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_JOB_RESULT_RETENTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -171,16 +167,8 @@ const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 3_072;
 const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
 const MAX_ENGINE_BATCH_ITEMS: usize = 8;
-const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
-const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
 const DEFAULT_DECODE_CHAIN_K: u32 = 1;
 const MAX_DECODE_CHAIN_K: u32 = 16;
-const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
-const BALANCED_QUIET_MIN_THROUGHPUT_RATIO: f64 = 0.5;
-const PROBE_PERF_BATCH_TOKEN_BUDGET: usize = 1_024;
-const PROBE_PERF_TARGET_TOTAL_TOKENS: u64 = 4_096;
-const PROBE_PERF_MIN_BATCH_SAMPLES: usize = 3;
-const PROBE_PERF_SINGLE_SAMPLES: usize = 20;
 const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
 const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
 const SYNAPSE_EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
@@ -555,8 +543,6 @@ struct ModuleHealth {
     loaded_models: usize,
     machine_profile_hash: String,
     certification: CertificationHealth,
-    certification_stale: bool,
-    performance_stale: bool,
     lanes: Vec<LaneHealth>,
     previous_revisioned_machine_profile_hash: Option<String>,
     current_revisioned_machine_profile_hash: String,
@@ -570,8 +556,6 @@ struct ModuleHealth {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct CertificationHealth {
-    certification_stale: bool,
-    stale_since_ms: Option<u64>,
     lanes: Vec<CertificationHealthLane>,
 }
 
@@ -587,8 +571,6 @@ struct LaneHealth {
     model_id: String,
     fingerprint: Fingerprint,
     certified: bool,
-    certification_stale: bool,
-    performance_stale: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker: Option<worker_host::WorkerHostHealth>,
 }
@@ -851,11 +833,7 @@ pub(crate) struct ModuleConfig {
     #[serde(default)]
     jobs: JobConfig,
     #[serde(default)]
-    probe: ProbeConfig,
-    #[serde(default)]
     knob: PerfKnob,
-    #[serde(default, alias = "dev_alias_admin", alias = "enable_alias_admin")]
-    alias_admin_enabled: bool,
     #[serde(default = "default_microllm_max_tokens")]
     microllm_max_tokens: u32,
     #[serde(default)]
@@ -872,8 +850,6 @@ pub(crate) struct ModuleConfig {
     decode_chain_k: u32,
     #[serde(default = "default_cache_max_bytes")]
     cache_max_bytes: u64,
-    #[serde(default)]
-    dev: DevConfig,
 }
 
 impl Default for ModuleConfig {
@@ -887,15 +863,12 @@ impl Default for ModuleConfig {
             ane_direct: AneDirectConfig::default(),
             log: LogConfig::default(),
             jobs: JobConfig::default(),
-            probe: ProbeConfig::default(),
             knob: PerfKnob::default(),
-            alias_admin_enabled: false,
             microllm_max_tokens: default_microllm_max_tokens(),
             grammar_enabled: false,
             sidecar_spec: SidecarSpec::default(),
             decode_chain_k: default_decode_chain_k(),
             cache_max_bytes: default_cache_max_bytes(),
-            dev: DevConfig::default(),
         }
     }
 }
@@ -1102,32 +1075,6 @@ impl Default for JobConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProbeConfig {
-    #[serde(default = "default_probe_mean_cosine_threshold")]
-    mean_cosine_threshold: f64,
-    #[serde(default = "default_probe_worst_decile_rank_overlap_threshold")]
-    worst_decile_rank_overlap_threshold: f64,
-}
-
-impl Default for ProbeConfig {
-    fn default() -> Self {
-        Self {
-            mean_cosine_threshold: default_probe_mean_cosine_threshold(),
-            worst_decile_rank_overlap_threshold: default_probe_worst_decile_rank_overlap_threshold(
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevConfig {
-    #[serde(default, alias = "enable_alias_admin")]
-    alias_admin_enabled: bool,
-}
-
 fn default_inline_max_items() -> usize {
     DEFAULT_INLINE_MAX_ITEMS
 }
@@ -1170,14 +1117,6 @@ fn default_job_result_page_bytes() -> usize {
 
 fn default_job_bulk_quantum_tokens() -> u64 {
     DEFAULT_JOB_BULK_QUANTUM_TOKENS
-}
-
-fn default_probe_mean_cosine_threshold() -> f64 {
-    DEFAULT_PROBE_MEAN_COSINE_THRESHOLD
-}
-
-fn default_probe_worst_decile_rank_overlap_threshold() -> f64 {
-    DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1299,11 +1238,9 @@ struct RuntimeState {
     catalog_jobs: Mutex<BTreeMap<String, String>>,
     inline: InlineConfig,
     jobs: JobConfig,
-    probe: ProbeConfig,
     worker_load_timeout: Duration,
     log: LogConfig,
     knob: PerfKnob,
-    alias_admin_enabled: bool,
     microllm_max_tokens: u32,
     grammar_enabled: bool,
     sidecar_spec: SidecarSpec,
@@ -1322,7 +1259,6 @@ struct RuntimeState {
     ane_lane_test_root: Option<PathBuf>,
     lane_pause: lane_pause::LanePause,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
-    job_progress: Arc<Mutex<BTreeMap<String, ModelRuntimeState>>>,
     owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     owned_decode_dispatches:
         Arc<Mutex<BTreeMap<String, Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>>>,
@@ -1365,11 +1301,6 @@ struct ValidatedReadiness {
 #[derive(Clone, Debug)]
 enum ModelRuntimeState {
     Unloaded,
-    Resolving,
-    Downloading {
-        bytes_done: u64,
-        bytes_total: Option<u64>,
-    },
     Validating,
     Loading,
     Ready,
@@ -1615,7 +1546,6 @@ struct EmbeddingModel {
     loaded_model: LoadedModel,
     backend: EmbedBackend,
     tokenizer: SanitizedTokenizer,
-    numeric_profile_id: NumericProfileId,
     fingerprint: Fingerprint,
     certification_fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
@@ -1836,8 +1766,6 @@ struct EmbedQueryParams {
     #[serde(default)]
     required_fingerprint: Option<String>,
     #[serde(default)]
-    allow_equivalent: bool,
-    #[serde(default)]
     required_epoch: Option<u64>,
 }
 
@@ -1860,8 +1788,6 @@ struct EmbedBatchParams {
     #[serde(default)]
     required_fingerprint: Option<String>,
     #[serde(default)]
-    allow_equivalent: bool,
-    #[serde(default)]
     required_epoch: Option<u64>,
 }
 
@@ -1880,8 +1806,6 @@ struct RerankScoreParams {
     target_fingerprint: Option<String>,
     #[serde(default)]
     required_fingerprint: Option<String>,
-    #[serde(default)]
-    allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
 }
@@ -1910,8 +1834,8 @@ struct MicroLlmOneshotParams {
     target_fingerprint: Option<String>,
     #[serde(default)]
     required_fingerprint: Option<String>,
-    #[serde(default)]
-    allow_equivalent: bool,
+    #[serde(default, rename = "allow_equivalent")]
+    _allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
     /// Set only by the session API; once a persistent session reserves
@@ -1958,7 +1882,6 @@ struct EmbedBatchJobWork {
     request_digest: String,
     ids: Vec<String>,
     tokenized: TokenizedBatch,
-    alias_table: AliasTable,
     request_bytes: u64,
     total_tokens: u64,
 }
@@ -1974,87 +1897,6 @@ struct EmbedResultParams {
     job_id: String,
     #[serde(default)]
     page: Option<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum ModelLoadFileSpec {
-    Legacy(String),
-    Detailed { url: String, sha256: String },
-}
-
-impl ModelLoadFileSpec {
-    fn locator(&self) -> &str {
-        match self {
-            Self::Legacy(value) => value,
-            Self::Detailed { url, .. } => url,
-        }
-    }
-
-    fn expected_digest(&self) -> Option<String> {
-        match self {
-            Self::Legacy(_) => None,
-            Self::Detailed { sha256, .. } => Some(normalize_digest(sha256)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ModelLoadFiles {
-    model: ModelLoadFileSpec,
-    tokenizer: ModelLoadFileSpec,
-    #[serde(default)]
-    config: Option<ModelLoadFileSpec>,
-    #[serde(default)]
-    extra: Vec<ModelLoadFileSpec>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ModelLoadParams {
-    source: String,
-    #[serde(default)]
-    revision: Option<String>,
-    #[serde(default)]
-    repo: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    path: Option<String>,
-    files: ModelLoadFiles,
-    #[serde(default)]
-    expected_digest: Option<String>,
-    engine: String,
-    #[serde(default)]
-    pooling: Option<String>,
-    #[serde(default, alias = "kind", alias = "capability")]
-    task: Option<String>,
-    #[serde(default)]
-    pin: bool,
-    #[serde(default)]
-    request_key: Option<String>,
-    #[serde(default)]
-    deadline_ms: Option<u64>,
-    #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
-    normalize: Option<bool>,
-    #[serde(default)]
-    max_tokens: Option<usize>,
-    #[serde(default)]
-    quant: Option<String>,
-    #[serde(default)]
-    family: Option<String>,
-    #[serde(default)]
-    dtype: Option<String>,
-    #[serde(default)]
-    execution: Option<String>,
-    #[serde(default)]
-    attention_units: Option<usize>,
-    #[serde(default)]
-    worker_bin: Option<PathBuf>,
-    #[serde(default)]
-    worker_runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2094,216 +1936,18 @@ struct CacheGcParams {
     grace_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ProbeStartParams {
-    #[serde(default)]
-    request_key: Option<String>,
-    #[serde(default)]
-    deadline_ms: Option<u64>,
-    #[serde(default)]
-    models: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeStatusParams {
-    job_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AliasesCheckIndexParams {
-    index_fingerprint: String,
-    #[serde(default)]
-    provenance_set: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AliasPairParams {
-    #[serde(default, alias = "fingerprint_a")]
-    left: Option<String>,
-    #[serde(default, alias = "fingerprint_b")]
-    right: Option<String>,
-    #[serde(default)]
-    evidence: Option<Value>,
-}
-
-impl AliasPairParams {
-    fn fingerprints(self) -> Result<(Fingerprint, Fingerprint, Value), String> {
-        let left = self
-            .left
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "alias pair requires fingerprint_a".to_string())?;
-        let right = self
-            .right
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| "alias pair requires fingerprint_b".to_string())?;
-        Ok((
-            Fingerprint(left),
-            Fingerprint(right),
-            self.evidence.unwrap_or_else(|| json!({})),
-        ))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeFixture {
-    #[serde(default)]
-    comment: Option<String>,
-    #[serde(default)]
-    generation_command: Option<String>,
-    #[serde(default)]
-    family: Option<String>,
-    #[serde(default)]
-    reference_model: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    dims: Option<usize>,
-    #[serde(default)]
-    pooling: Option<String>,
-    #[serde(default)]
-    normalize: Option<bool>,
-    #[serde(default)]
-    ort_version: Option<String>,
-    #[serde(default)]
-    model_sha256: Option<String>,
-    #[serde(default)]
-    tokenizer_sha256: Option<String>,
-    items: Vec<ProbeFixtureItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeFixtureItem {
-    id: String,
-    text: String,
-    vector: Vec<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RerankProbeFixture {
-    #[serde(default)]
-    generation_command: Option<String>,
-    items: Vec<RerankProbeItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RerankProbeItem {
-    id: String,
-    query: String,
-    candidates: Vec<String>,
-    scores: Vec<f32>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct RerankProbeEvidence {
-    pearson: f64,
-    pairs: usize,
-    requests: usize,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GenerateProbeFixture {
-    family: String,
-    dtype: String,
-    quant: String,
-    model: String,
-    model_revision: String,
-    #[serde(default)]
-    generation_command: Option<String>,
-    generation_command_sha256: String,
-    provenance: Value,
-    #[serde(default)]
-    structural_band: GenerateStructuralBand,
-    items: Vec<GenerateProbeItem>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GenerateProbeItem {
-    id: String,
-    prompt: String,
-    expected_token_ids: Vec<u32>,
-    max_new_tokens: u32,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct GenerateStructuralBand {
-    max_forks: usize,
-    top2_gap_ceiling: f64,
-    #[serde(default)]
-    allowed_forks: Vec<GenerateAllowedFork>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct GenerateAllowedFork {
-    id: String,
-    token_index: usize,
-    oracle_token: u32,
-    alternate_token: u32,
-    oracle_top2: [u32; 2],
-    top2_gap: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct GenerateProbeEvidence {
-    token_exact_matches: usize,
-    accepted_structural_forks: usize,
-    max_certified_forks: usize,
-    items: usize,
-    tokens_compared: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProbeEvidence {
-    mean_cosine: f64,
-    rank_overlap: f64,
-    worst_decile: f64,
-    items: usize,
-}
-
-struct ProbeLaneVectors {
-    model: Arc<EmbeddingModel>,
-    vectors: Vec<Vec<f32>>,
-}
-
-struct ProbeModelResult {
-    lane_result: Value,
-    certified_vectors: Option<Vec<Vec<f32>>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ProbeReferenceKey {
-    family: String,
-    model: String,
-}
-
 struct LaneMeasurementRows {
-    current_certification: Option<CertificationRow>,
-    latest_certification: Option<CertificationRow>,
-    current_probe: Option<CertificationRow>,
-    latest_probe: Option<CertificationRow>,
-    certification_stale: bool,
-    current_performance: Option<PerfRow>,
-    latest_performance: Option<PerfRow>,
-    performance_stale: bool,
+    certified: bool,
 }
 
 struct CatalogLaneMeasurements {
     slot: ModelSlotSnapshot,
-    certification_fingerprint: Fingerprint,
     measurements: LaneMeasurementRows,
 }
 
 struct CatalogMeasurementSummary {
     lanes: Vec<CatalogLaneMeasurements>,
-    certification_stale: bool,
-    performance_stale: bool,
     certified_lanes: usize,
-}
-
-struct PerfBenchResult {
-    throughput_tok_s: f64,
-    cold_load_ms: f64,
-    single_item_latency_p50_ms: f64,
-    details: Value,
 }
 
 struct SystemClock;
@@ -2455,11 +2099,9 @@ impl RuntimeState {
         let hf_endpoint = config.hf_endpoint;
         let inline = config.inline;
         let jobs = config.jobs;
-        let probe = config.probe;
         let worker_load_timeout = Duration::from_millis(config.worker.load_timeout_ms);
         let log = config.log;
         let knob = config.knob;
-        let alias_admin_enabled = config.alias_admin_enabled || config.dev.alias_admin_enabled;
         let microllm_max_tokens = config.microllm_max_tokens;
         let grammar_enabled = config.grammar_enabled;
         config
@@ -2525,11 +2167,9 @@ impl RuntimeState {
             catalog_jobs: Mutex::new(BTreeMap::new()),
             inline,
             jobs,
-            probe,
             worker_load_timeout,
             log,
             knob,
-            alias_admin_enabled,
             microllm_max_tokens,
             grammar_enabled,
             sidecar_spec,
@@ -2548,7 +2188,6 @@ impl RuntimeState {
             lane_pause: lane_pause::LanePause::default(),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
-            job_progress: Arc::new(Mutex::new(BTreeMap::new())),
             owned_decode_q8: Arc::new(Mutex::new(
                 owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
             )),
@@ -2770,13 +2409,6 @@ fn sync_and_load_catalog_models(
     cache: &ModelCache,
 ) -> Result<Vec<StoredModelConfig>, ModuleError> {
     let now = now_ms();
-    // Only rows present before startup are legacy registrations. A duplicate
-    // preload id in this startup must not bypass new-registration validation.
-    let persisted_ids: BTreeSet<_> = store
-        .catalog_models()?
-        .into_iter()
-        .map(|model| model.model_id)
-        .collect();
     for (index, preload) in config.preload_models.clone().into_iter().enumerate() {
         let id = preload
             .model_id
@@ -2796,9 +2428,6 @@ fn sync_and_load_catalog_models(
             continue;
         }
         let spec = build_preload_catalog_model(index, preload, &config.inline, &config.jobs)?;
-        if !persisted_ids.contains(&id) {
-            validate_new_owned_metal_readout(&spec).map_err(ModuleError::Config)?;
-        }
         store.upsert_model(&spec, now)?;
     }
 
@@ -2814,7 +2443,7 @@ fn sync_and_load_catalog_models(
         tracing::warn!(model_id=%id,"skipping persisted catalog-reserved registration");
     }
     for (id, engine) in &reconciled.skipped_retired {
-        tracing::warn!(model_id=%id,%engine,"skipping persisted registration with retired engine");
+        tracing::warn!(model_id=%id,%engine,"skipping retired persisted registration");
     }
     for model in reconciled.registrable {
         let refreshed = normalize_catalog_model(model.clone(), &config.inline, &config.jobs)?;
@@ -2843,6 +2472,7 @@ fn build_preload_catalog_model(
     let catalog = preload
         .profile
         .as_deref()
+        .filter(|profile| !is_test_preload_profile(&engine_name, profile))
         .map(CatalogProfile::load)
         .transpose()?;
     if let Some(catalog) = &catalog {
@@ -2946,6 +2576,10 @@ fn build_preload_catalog_model(
         inline,
         jobs,
     )?;
+    #[cfg(feature = "test-support")]
+    if preload.profile.as_deref().is_some_and(|profile| test_deterministic::is_profile(&engine_name, profile)) {
+        spec.engine_identity.build_flags.insert("profile".into(), test_deterministic::PROFILE.into());
+    }
     if let Some(backend) = declared_llama_backend {
         spec.engine_identity
             .build_flags
@@ -3023,6 +2657,10 @@ fn normalize_catalog_model(
     inline: &InlineConfig,
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
+    #[cfg(feature = "test-support")]
+    if model.engine_identity.build_flags.get("profile").is_some_and(|profile| test_deterministic::is_profile(&model.engine, profile)) {
+        return Ok(model);
+    }
     if model.engine_identity.build_flags.contains_key("profile") {
         let catalog = CatalogProfile::load(&model.engine_identity.build_flags["profile"])?;
         let task = parse_model_task(Some(&model.task), &model.engine, &model.model_id)?;
@@ -3175,6 +2813,18 @@ struct CatalogProfile {
     slug: String,
     manifest: Value,
     typed: synapse_parity::manifest::Manifest,
+}
+
+fn is_test_preload_profile(_engine: &str, _profile: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    return test_deterministic::is_profile(_engine, _profile);
+    #[cfg(not(feature = "test-support"))]
+    false
+}
+
+fn release_profile(identity: &EngineIdentity) -> Option<&str> {
+    identity.build_flags.get("profile").map(String::as_str)
+        .filter(|profile| !is_test_preload_profile(&identity.engine, profile))
 }
 
 impl CatalogProfile {
@@ -3568,7 +3218,7 @@ struct OwnedCatalogConfig {
 
 /// Projection precision of a catalog Metal lane. Catalog lanes are new lanes, so
 /// f16 gte-modernbert catalog lanes opt in to f16 weight projections. Existing
-/// production lanes (preloads and `model.load` lanes) never come through here and
+/// profile preloads never come through here and
 /// keep the f32 projections their fingerprints were certified on.
 fn catalog_projection_dtype(family: OwnedFamily, dtype: OwnedDType) -> ProjectionDtype {
     if family == OwnedFamily::GteModernBert && dtype == OwnedDType::F16 {
@@ -3753,45 +3403,8 @@ fn build_stored_model_config(
     })
 }
 
-fn owned_metal_readout_pooling(family: OwnedFamily, task: ModelTask) -> Option<WorkerPooling> {
-    match (family, task) {
-        (OwnedFamily::GteModernBert, ModelTask::Embed) => Some(WorkerPooling::Cls),
-        (OwnedFamily::GteModernBert, ModelTask::Rerank) => Some(WorkerPooling::Mean),
-        (OwnedFamily::Qwen3, ModelTask::Embed | ModelTask::Rerank) => Some(WorkerPooling::Last),
-        _ => None,
-    }
-}
-
 // Call only at new-registration boundaries, never while rebuilding stored
 // configs: legacy declarations are part of persisted vector fingerprints.
-fn validate_new_owned_metal_readout(spec: &StoredModelConfig) -> Result<(), String> {
-    if spec.engine != "owned-metal" || spec.engine_identity.build_flags.contains_key("profile") {
-        return Ok(());
-    }
-    let family = spec
-        .owned_family
-        .as_deref()
-        .ok_or_else(|| "owned-metal registration is missing family".to_string())?;
-    let family = OwnedFamily::parse(family).map_err(|error| error.to_string())?;
-    let task = parse_model_task(Some(&spec.task), &spec.engine, &spec.model_id)
-        .map_err(|error| error.to_string())?;
-    if let Some(expected) = owned_metal_readout_pooling(family, task) {
-        if spec.pooling != expected.as_str() {
-            let operation = match task {
-                ModelTask::Embed => "embedding",
-                ModelTask::Rerank => "reranking",
-                ModelTask::Generate => "generation",
-            };
-            return Err(format!(
-                "owned-metal {} {operation} computes {}; declare \"pooling\": \"{}\"",
-                family.as_str(),
-                expected.as_str(),
-                expected.as_str()
-            ));
-        }
-    }
-    Ok(())
-}
 
 fn owned_tokenizer_max_tokens(max_tokens: usize, owned: Option<&OwnedCatalogConfig>) -> usize {
     if owned.is_some_and(|profile| profile.family == OwnedFamily::Qwen3) {
@@ -4181,57 +3794,15 @@ impl ModuleHandler for SynapseHandler {
         }
     }
 
-    /// Report degraded health when probe-dependent lanes refuse requests because
-    /// certification is stale, so `ck health` and fleet watchers see the refusal.
-    /// Catalog self-check lanes and stale performance alone do not degrade health.
-    /// Health reads stored rows only; it never runs probes.
     async fn health(&self) -> HealthReport {
         let Some(state) = self.state() else {
             return HealthReport::ok();
         };
         run_background_maintenance(&state);
         let health = module_health(&state);
-        let mut detail_parts = Vec::new();
-        if health.certification_stale {
-            detail_parts.push("certification_stale=true");
-        }
-        if health.performance_stale {
-            detail_parts.push("performance_stale=true");
-        }
-        let detail = if detail_parts.is_empty() {
-            "ok".to_string()
-        } else {
-            format!("ok; {}", detail_parts.join("; "))
-        };
-        let stale_lanes = lanes_refusing_for_stale_certification(&state);
-        let (status, detail) = if stale_lanes.is_empty() {
-            (subc_client_rs::HealthStatus::Ok, detail)
-        } else {
-            let names = stale_lanes
-                .iter()
-                .take(3)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let names = if stale_lanes.len() <= 3
-                && names.len() <= 120
-                && !names.chars().any(char::is_control)
-            {
-                format!(" ({names})")
-            } else {
-                String::new()
-            };
-            (
-                subc_client_rs::HealthStatus::Degraded,
-                format!(
-                    "{} lane(s){names} refuse requests: certification is stale after a machine profile change, such as a macOS update. Re-certify with: ck-synapse-opctl probe run",
-                    stale_lanes.len()
-                ),
-            )
-        };
         HealthReport {
-            status,
-            detail: Some(detail),
+            status: subc_client_rs::HealthStatus::Ok,
+            detail: Some("ok".to_string()),
             metrics: Some(serde_json::to_value(&health).expect("module health should serialize")),
         }
     }
@@ -4402,10 +3973,7 @@ async fn dispatch_request(
         "models.download" => models_download(state, request.params).await,
         "models.download.cancel" => models_download_cancel(state, request.params).await,
         "models.remove" => models_remove(state, request.params).await,
-        "models.list" => match state.store.catalog_snapshot() {
-            Ok(snapshot) => result_outcome(models_list_payload(&state, snapshot)),
-            Err(error) => channel_error("store_failure", error.to_string()),
-        },
+        "models.list" => result_outcome(models_list_payload(&state)),
         "events_get" => event_outbox::events_get(&state, request.params),
         "certify.observations" => certify_observations(state),
         "embed.query" => embed_query(state, request.params).await,
@@ -4432,16 +4000,9 @@ async fn dispatch_request(
         }
         "owned_decode.disable" | "disable" => owned_decode_disable(state, request.params).await,
         "owned_decode.revoke" | "revoke" => owned_decode_revoke(state, request.params).await,
-        "model.load" => model_load(state, request.params).await,
         "model.unload" => model_unload(state, request.params).await,
         "cache.pin" => cache_pin(state, request.params).await,
         "cache.gc" => cache_gc(state, request.params).await,
-        "probe.start" => probe_start(state, request.params).await,
-        "probe.status" => probe_status(state, request.params).await,
-        "probe.report" => probe_report(state).await,
-        "aliases.check_index" => aliases_check_index(state, request.params).await,
-        "alias.retract" => alias_retract(state, request.params).await,
-        "alias.declare" => alias_declare(state, request.params).await,
         "admission.status" => admission_status(state).await,
         "approvals.migrate_owned_decode" => {
             approvals_migrate_owned_decode(state, request.params).await
@@ -5447,7 +5008,6 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         max_queue_ms: params.max_queue_ms,
         target_fingerprint: None,
         required_fingerprint: None,
-        allow_equivalent: false,
         required_epoch: None,
         owned_only: true,
     };
@@ -5938,25 +5498,9 @@ async fn owned_decode_revoke(state: Arc<ModuleState>, params: Value) -> HandlerO
     result_outcome(serde_json::to_value(outcome).expect("serving revoke outcome serializes"))
 }
 
-#[derive(Clone)]
-struct ResolvedModelLoadAsset {
-    source_url: String,
-    expected_digest: Option<String>,
-}
-
-#[derive(Clone)]
-struct ResolvedModelLoadSources {
-    model: ResolvedModelLoadAsset,
-    tokenizer: ResolvedModelLoadAsset,
-    config: Option<ResolvedModelLoadAsset>,
-    extra: Vec<ResolvedModelLoadAsset>,
-}
-
 fn model_runtime_state_name(state: &ModelRuntimeState) -> &'static str {
     match state {
         ModelRuntimeState::Unloaded => "unloaded",
-        ModelRuntimeState::Resolving => "resolving",
-        ModelRuntimeState::Downloading { .. } => "downloading",
         ModelRuntimeState::Validating => "validating",
         ModelRuntimeState::Loading => "loading",
         ModelRuntimeState::Ready => "ready",
@@ -5996,14 +5540,6 @@ fn set_model_slot_state(runtime: &RuntimeState, model_id: &str, state: ModelRunt
     }
 }
 
-fn model_cold_load_ms(runtime: &RuntimeState, model_id: &str) -> Option<f64> {
-    runtime.catalog.lock().ok().and_then(|catalog| {
-        catalog
-            .get(model_id)
-            .and_then(|slot| slot.last_cold_load_ms)
-    })
-}
-
 fn set_model_slot_ready(
     runtime: &RuntimeState,
     model_id: &str,
@@ -6021,26 +5557,6 @@ fn set_model_slot_ready(
             slot.notify.notify_waiters();
         }
     }
-}
-
-fn set_job_progress(runtime: &RuntimeState, job_id: &str, state: ModelRuntimeState) {
-    if let Ok(mut progress) = runtime.job_progress.lock() {
-        progress.insert(job_id.to_string(), state);
-    }
-}
-
-fn clear_job_progress(runtime: &RuntimeState, job_id: &str) {
-    if let Ok(mut progress) = runtime.job_progress.lock() {
-        progress.remove(job_id);
-    }
-}
-
-fn job_progress_state(runtime: &RuntimeState, job_id: &str) -> Option<ModelRuntimeState> {
-    runtime
-        .job_progress
-        .lock()
-        .ok()
-        .and_then(|progress| progress.get(job_id).cloned())
 }
 
 fn register_runtime_catalog_model(
@@ -6101,15 +5617,6 @@ fn model_status_payload(module_generation: u64, slot: &ModelSlotSnapshot) -> Val
     });
     if let Value::Object(map) = &mut payload {
         match &slot.state {
-            ModelRuntimeState::Downloading {
-                bytes_done,
-                bytes_total,
-            } => {
-                map.insert("bytes_done".to_string(), Value::from(*bytes_done));
-                if let Some(bytes_total) = bytes_total {
-                    map.insert("bytes_total".to_string(), Value::from(*bytes_total));
-                }
-            }
             ModelRuntimeState::Failed(error) => {
                 map.insert(
                     "error".to_string(),
@@ -6120,147 +5627,6 @@ fn model_status_payload(module_generation: u64, slot: &ModelSlotSnapshot) -> Val
         }
     }
     payload
-}
-
-fn model_load_job_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
-    let mut payload = json!({
-        "module_generation": state.module_generation,
-        "job_id": record.job_id,
-        "request_key": record.request_key,
-    });
-    if let Value::Object(map) = &mut payload {
-        if record.state == JOB_STATE_DONE {
-            map.insert("state".to_string(), Value::from("ready"));
-            if let Some(Value::Object(result)) = record.result_json.clone() {
-                for (key, value) in result {
-                    map.insert(key, value);
-                }
-            }
-            return payload;
-        }
-        if record.state == JOB_STATE_FAILED_TRANSIENT || record.state == JOB_STATE_FAILED_PERMANENT
-        {
-            map.insert("state".to_string(), Value::from("failed"));
-            map.insert(
-                "error".to_string(),
-                record.error_json.clone().unwrap_or_else(|| {
-                    serde_json::to_value(WireOperationError::from_stable(
-                        StableError::model_loading(Some(100)),
-                        "model load failed without a stored typed error",
-                    ))
-                    .expect("fallback model load error serializes")
-                }),
-            );
-            return payload;
-        }
-        match job_progress_state(&state.runtime, &record.job_id) {
-            Some(ModelRuntimeState::Downloading {
-                bytes_done,
-                bytes_total,
-            }) => {
-                map.insert("state".to_string(), Value::from("downloading"));
-                map.insert("bytes_done".to_string(), Value::from(bytes_done));
-                if let Some(bytes_total) = bytes_total {
-                    map.insert("bytes_total".to_string(), Value::from(bytes_total));
-                }
-            }
-            Some(ModelRuntimeState::Resolving) => {
-                map.insert("state".to_string(), Value::from("resolving"));
-            }
-            Some(ModelRuntimeState::Validating) => {
-                map.insert("state".to_string(), Value::from("validating"));
-            }
-            Some(ModelRuntimeState::Loading | ModelRuntimeState::Ready) => {
-                map.insert("state".to_string(), Value::from("loading"));
-            }
-            Some(ModelRuntimeState::Unloaded | ModelRuntimeState::Failed(_)) | None => {
-                map.insert(
-                    "state".to_string(),
-                    Value::from(if record.state == JOB_STATE_QUEUED {
-                        "resolving"
-                    } else {
-                        "loading"
-                    }),
-                );
-            }
-        }
-    }
-    payload
-}
-
-async fn model_load(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ModelLoadParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid model.load params: {error}"),
-            )
-        }
-    };
-    if params
-        .model_id
-        .as_deref()
-        .is_some_and(|id| state.runtime.release_catalog.is_reserved_id(id))
-    {
-        return result_outcome(error_payload(
-            &state,
-            catalog_wire_error(
-                "invalid_request",
-                json!({"model_id": params.model_id}),
-                "catalog ids must be installed with models.download",
-            ),
-        ));
-    }
-    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
-        Ok(guard) => guard,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    if let Err(message) = validate_model_load_request(&params).and_then(|_| {
-        resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint).map(|_| ())
-    }) {
-        return channel_error("invalid_request", message);
-    }
-    let now = now_ms();
-    let request_key = params
-        .request_key
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("model-load:{}:{now}", state.module_generation));
-    let params_json = match serde_json::to_value(&params) {
-        Ok(value) => value,
-        Err(error) => return channel_error("invalid_request", error.to_string()),
-    };
-    let request_digest = compute_request_digest("model.load", "management", &params_json, &[]);
-    let admission = match state.store.admit_job(&request_key, &request_digest, "model.load", state.module_generation, &params_json, now, state.runtime.jobs.execution_ttl_ms, state.runtime.jobs.result_retention_ttl_ms) {
-        Ok(admission) => admission,
-        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
-            return result_outcome(error_payload(
-                &state,
-                WireOperationError::from_stable(
-                    StableError::idempotency_conflict(),
-                    format!("request_key '{request_key}' was already used for different request content"),
-                ),
-            ))
-        }
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    let record = admission.record().clone();
-    let job_minted = matches!(admission, JobAdmission::Admitted(_));
-    if job_minted {
-        state.runtime.admission_telemetry.record_job_minted();
-        if let Some(model_id) = params.model_id.as_deref() {
-            log_job_admitted(model_id, &record.job_id);
-        }
-        let task_state = Arc::clone(&state);
-        let task_job_id = record.job_id.clone();
-        let task_params = params.clone();
-        set_job_progress(&state.runtime, &task_job_id, ModelRuntimeState::Resolving);
-        tokio::spawn(async move {
-            execute_model_load_job(task_state, task_job_id, task_params).await;
-        });
-    }
-    result_outcome(model_load_job_status_payload(&state, &record))
 }
 
 async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -6278,12 +5644,9 @@ async fn model_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             Ok(Some(record)) if record.kind == store::DOWNLOAD_JOB_KIND => {
                 result_outcome(download_status_payload(&state, &record, true))
             }
-            Ok(Some(record)) if record.kind == "model.load" => {
-                result_outcome(model_load_job_status_payload(&state, &record))
-            }
             Ok(Some(_)) => channel_error(
                 "invalid_request",
-                "job_id does not refer to a model.load job",
+                "job_id does not refer to a models.download job",
             ),
             Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
             Err(error) => channel_error("store_failure", error.to_string()),
@@ -6322,9 +5685,7 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     if model_slot_snapshot(&state.runtime, &params.model_id).is_some_and(|slot| {
         matches!(
             slot.state,
-            ModelRuntimeState::Loading
-                | ModelRuntimeState::Resolving
-                | ModelRuntimeState::Validating
+            ModelRuntimeState::Loading | ModelRuntimeState::Validating
         )
     }) {
         return result_outcome(error_payload(
@@ -6377,10 +5738,7 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     };
     if matches!(
         snapshot.state,
-        ModelRuntimeState::Resolving
-            | ModelRuntimeState::Downloading { .. }
-            | ModelRuntimeState::Validating
-            | ModelRuntimeState::Loading
+        ModelRuntimeState::Validating | ModelRuntimeState::Loading
     ) {
         return result_outcome(error_payload(
             &state,
@@ -6487,7 +5845,7 @@ async fn resolve_model_for_request_inner(
                     return Err(WireOperationError::from_stable(
                         StableError::probe_required(),
                         format!(
-                            "task '{}' has no {} knob assignment on machine profile {}; run probe.start",
+                            "task '{}' has no {} knob assignment on machine profile {}; specify a model id",
                             task.as_str(),
                             state.runtime.knob.as_str(),
                             state.machine_profile_hash,
@@ -6529,16 +5887,12 @@ async fn resolve_model_for_request_inner(
         (ModelRuntimeState::Failed(error), _) if error.class == ErrorClass::Permanent => {
             Err(error.clone())
         }
-        (
-            ModelRuntimeState::Resolving
-            | ModelRuntimeState::Downloading { .. }
-            | ModelRuntimeState::Validating
-            | ModelRuntimeState::Loading,
-            _,
-        ) => Err(WireOperationError::from_stable(
-            StableError::model_loading(Some(250)),
-            format!("model '{model_id}' is loading"),
-        )),
+        (ModelRuntimeState::Validating | ModelRuntimeState::Loading, _) => {
+            Err(WireOperationError::from_stable(
+                StableError::model_loading(Some(250)),
+                format!("model '{model_id}' is loading"),
+            ))
+        }
         _ => {
             begin_background_catalog_load(Arc::clone(&state), model_id.clone());
             Err(WireOperationError::from_stable(
@@ -6560,9 +5914,7 @@ fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
         if slot.loaded.is_some()
             || matches!(
                 slot.state,
-                ModelRuntimeState::Resolving
-                    | ModelRuntimeState::Downloading { .. }
-                    | ModelRuntimeState::Validating
+                ModelRuntimeState::Validating
                     | ModelRuntimeState::Loading
                     | ModelRuntimeState::Ready
             )
@@ -6981,7 +6333,7 @@ fn load_catalog_model_blocking(
         .iter()
         .map(|locator| locator_path(locator, &model_cache))
         .collect::<Result<Vec<_>, _>>()?;
-    let effective_model_path = if spec.engine_identity.build_flags.contains_key("profile") {
+    let effective_model_path = if release_profile(&spec.engine_identity).is_some() {
         model_path.path.clone()
     } else if let Some(profile) = owned_profile.as_ref() {
         assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
@@ -6991,7 +6343,7 @@ fn load_catalog_model_blocking(
     let tokenizer = SanitizedTokenizer::from_file(
         &tokenizer_path.path,
         TokenizerConfig {
-            max_tokens: if spec.engine_identity.build_flags.contains_key("profile") {
+            max_tokens: if release_profile(&spec.engine_identity).is_some() {
                 usize::MAX
             } else {
                 owned_tokenizer_max_tokens(spec.max_tokens, owned_profile.as_ref())
@@ -6999,7 +6351,7 @@ fn load_catalog_model_blocking(
         },
     )
     .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    if let Some(id) = spec.engine_identity.build_flags.get("profile") {
+    if let Some(id) = release_profile(&spec.engine_identity) {
         CatalogProfile::load(id)
             .and_then(|catalog| catalog.validate_readout(&tokenizer))
             .map_err(|error| artifact_invalid_error(error.to_string()))?;
@@ -7128,7 +6480,6 @@ fn load_catalog_model_blocking(
         loaded_model,
         backend,
         tokenizer,
-        numeric_profile_id: spec.numeric_profile_id.clone(),
         fingerprint: spec.fingerprint.clone(),
         certification_fingerprint,
         engine_identity: spec.engine_identity.clone(),
@@ -7515,10 +6866,10 @@ fn model_runtime_config(
     microllm_max_tokens: u32,
 ) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
-    if let Some(profile) = spec.engine_identity.build_flags.get("profile") {
+    if let Some(profile) = release_profile(&spec.engine_identity) {
         runtime_config
             .values
-            .insert("profile".into(), profile.clone());
+            .insert("profile".into(), profile.to_owned());
         runtime_config
             .values
             .insert("operation".into(), spec.task.clone());
@@ -7864,52 +7215,6 @@ fn ensure_owned_cuda_floor(worker: Option<&Path>) -> Result<(), WireOperationErr
     ))
 }
 
-async fn owned_cuda_evidence(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-) -> Result<Option<Value>, WireOperationError> {
-    if model.engine_identity.engine != CUDA_WORKER_ENGINE {
-        return Ok(None);
-    }
-    let worker = state
-        .runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| {
-            catalog
-                .get(&model.model_id)
-                .map(|slot| slot.spec.worker_bin.clone())
-        })
-        .ok_or_else(|| {
-            artifact_invalid_error(format!("missing catalog entry for '{}'", model.model_id))
-        })?;
-    let (decision, observed) = tokio::task::spawn_blocking(move || {
-        let decision = owned_cuda_floor_decision(worker.as_deref());
-        let observed = owned_cuda_floor_observed(&decision, worker.as_deref());
-        (decision, observed)
-    })
-    .await
-    .map_err(|error| transient_model_load_error(format!("CUDA evidence task failed: {error}")))?;
-    Ok(Some(json!({
-        "engine": CUDA_WORKER_ENGINE,
-        "backend": model.engine_identity.build_flags.get("backend"),
-        "ptx_virtual_arch": model.engine_identity.build_flags.get("ptx_virtual_arch").cloned().unwrap_or_else(|| OWNED_CUDA_PTX_VIRTUAL_ARCH.to_string()),
-        "minimum_device_cc": model.engine_identity.build_flags.get("minimum_device_cc").cloned().unwrap_or_else(|| OWNED_CUDA_MINIMUM_DEVICE_CC.to_string()),
-        "minimum_cuda_driver_api": model.engine_identity.build_flags.get("minimum_cuda_driver_api").cloned().unwrap_or_else(|| OWNED_CUDA_MINIMUM_DRIVER_API.to_string()),
-        "floor_state": if decision.is_supported() { "supported" } else { "unsupported" },
-        "floor_refusal": decision.refusal_code(),
-        "observed": observed,
-        "cuda_cache_path": env::var("CUDA_CACHE_PATH").ok(),
-        "worker_host_load_timeout_ms": state.runtime.worker_load_timeout.as_millis(),
-        "worker_host_load_timeout_source": "worker.load_timeout_ms",
-        "cold_load_ms": model_cold_load_ms(&state.runtime, &model.model_id),
-        "warm_load_ms": Value::Null,
-        "device_memory": Value::Null,
-        "resident_process_count": 1,
-    })))
-}
-
 fn artifact_invalid_error(message: impl Into<String>) -> WireOperationError {
     WireOperationError::from_stable(StableError::artifact_invalid(), message)
 }
@@ -7925,7 +7230,7 @@ fn model_cache_load_error(error: ModelCacheError) -> WireOperationError {
         }
         ModelCacheError::Tokenizer(error) => artifact_invalid_error(error.to_string()),
         ModelCacheError::NotFound(digest) => transient_model_load_error(format!(
-            "cache artifact {digest} is missing; re-submit model.load to reacquire it"
+            "cache artifact {digest} is missing; reacquire the model assets"
         )),
         ModelCacheError::Io {
             action,
@@ -7948,404 +7253,6 @@ fn io_to_load_error(action: &str, path: &Path, source: &std::io::Error) -> WireO
         ));
     }
     transient_model_load_error(format!("{action} {}: {source}", path.display()))
-}
-
-struct ModelLoadScratch {
-    path: PathBuf,
-}
-
-impl ModelLoadScratch {
-    fn create(path: PathBuf) -> std::io::Result<Self> {
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ModelLoadScratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn model_load_scratch_path(job_id: &str) -> PathBuf {
-    env::temp_dir().join(format!(
-        "synapse-model-load-{}-{job_id}",
-        std::process::id()
-    ))
-}
-
-fn model_load_owned_profile(
-    engine: &str,
-    root: &Path,
-    params: &ModelLoadParams,
-    config: Option<&ModelCacheMeta>,
-    extra: &[ModelCacheMeta],
-) -> Result<Option<OwnedCatalogConfig>, WireOperationError> {
-    if engine != "owned-metal" && engine != CUDA_WORKER_ENGINE {
-        return Ok(None);
-    }
-    let config = config.ok_or_else(|| {
-        artifact_invalid_error(format!("{engine} model.load requires files.config"))
-    })?;
-    let locator = Some(ModelAssetLocator::CacheDigest {
-        digest: config.digest.clone(),
-    });
-    let extras = extra
-        .iter()
-        .map(|meta| ModelAssetLocator::CacheDigest {
-            digest: meta.digest.clone(),
-        })
-        .collect();
-    let profile = if engine == "owned-metal" {
-        owned_catalog_config(
-            root,
-            params.family.as_deref(),
-            params.dtype.as_deref(),
-            params.execution.as_deref(),
-            params.attention_units,
-            locator,
-            extras,
-        )
-    } else {
-        owned_cuda_catalog_config(
-            params.family.as_deref(),
-            params.dtype.as_deref(),
-            params.execution.as_deref(),
-            params.attention_units,
-            OwnedCudaDeclaredIdentity {
-                kernel_revision: None,
-                ptx_virtual_arch: None,
-                minimum_device_cc: None,
-                minimum_cuda_driver_api: None,
-            },
-        )
-        .map(|mut profile| {
-            profile.config_locator = locator;
-            profile.extra_locators = extras;
-            profile
-        })
-    }
-    .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    Ok(Some(profile))
-}
-
-async fn execute_model_load_job(state: Arc<ModuleState>, job_id: String, params: ModelLoadParams) {
-    let _pause_guard = match lane_pause::admit_load(&state.runtime, &params) {
-        Ok(guard) => guard,
-        Err(error) => {
-            fail_job_with_wire_error(&state, &job_id, true, error);
-            clear_job_progress(&state.runtime, &job_id);
-            return;
-        }
-    };
-    if !matches!(
-        state
-            .store
-            .mark_job_running(&job_id, state.module_generation, now_ms()),
-        Ok(true)
-    ) {
-        clear_job_progress(&state.runtime, &job_id);
-        return;
-    }
-
-    let result = async {
-        let sources = resolve_model_load_sources_at(&params, &state.runtime.hf_endpoint)
-            .map_err(artifact_invalid_error)?;
-        let temp_dir = model_load_scratch_path(&job_id);
-        let scratch = ModelLoadScratch::create(temp_dir.clone())
-            .map_err(|error| io_to_load_error("create temp directory", &temp_dir, &error))?;
-        let temp_dir = scratch.path();
-        let model_path = temp_dir.join("model.bin");
-        let tokenizer_path = temp_dir.join("tokenizer.json");
-        let config_path = sources
-            .config
-            .as_ref()
-            .map(|_| temp_dir.join("config.json"));
-        let extra_paths = sources
-            .extra
-            .iter()
-            .enumerate()
-            .map(|(index, _)| temp_dir.join(format!("extra-{index}.artifact")))
-            .collect::<Vec<_>>();
-
-        set_job_progress(
-            &state.runtime,
-            &job_id,
-            ModelRuntimeState::Downloading {
-                bytes_done: 0,
-                bytes_total: None,
-            },
-        );
-        download_source_to_temp(
-            &sources.model.source_url,
-            &model_path,
-            |bytes_done, bytes_total| {
-                set_job_progress(
-                    &state.runtime,
-                    &job_id,
-                    ModelRuntimeState::Downloading {
-                        bytes_done,
-                        bytes_total,
-                    },
-                );
-            },
-        )?;
-        download_source_to_temp(&sources.tokenizer.source_url, &tokenizer_path, |_, _| {})?;
-        if let (Some(source), Some(path)) = (&sources.config, &config_path) {
-            download_source_to_temp(&source.source_url, path, |_, _| {})?;
-        }
-        for (source, path) in sources.extra.iter().zip(&extra_paths) {
-            download_source_to_temp(&source.source_url, path, |_, _| {})?;
-        }
-
-        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Validating);
-        let engine_name = canonical_engine_name(&params.engine);
-        validate_artifact_file(&model_path, &engine_name)?;
-        for extra_path in &extra_paths {
-            validate_artifact_file(extra_path, &engine_name)?;
-        }
-
-        let pin_module_id = params.pin.then(|| state.module_id.clone());
-        let tokenizer_meta = state
-            .model_cache
-            .ingest(ModelCacheIngest {
-                source_url: local_file_url(&tokenizer_path),
-                expected_digest: sources.tokenizer.expected_digest.clone(),
-                format: "tokenizer_json".to_string(),
-                tokenizer_path: None,
-                pin_module_id: pin_module_id.clone(),
-            })
-            .map_err(model_cache_load_error)?;
-        let model_meta = state
-            .model_cache
-            .ingest(ModelCacheIngest {
-                source_url: local_file_url(&model_path),
-                expected_digest: sources
-                    .model
-                    .expected_digest
-                    .clone()
-                    .or_else(|| params.expected_digest.clone()),
-                format: default_artifact_format(&engine_name),
-                tokenizer_path: Some(tokenizer_path.clone()),
-                pin_module_id: pin_module_id.clone(),
-            })
-            .map_err(model_cache_load_error)?;
-        let config_meta = config_path
-            .as_ref()
-            .map(|path| {
-                state.model_cache.ingest(ModelCacheIngest {
-                    source_url: local_file_url(path),
-                    expected_digest: sources
-                        .config
-                        .as_ref()
-                        .and_then(|source| source.expected_digest.clone()),
-                    format: "json".to_string(),
-                    tokenizer_path: None,
-                    pin_module_id: pin_module_id.clone(),
-                })
-            })
-            .transpose()
-            .map_err(model_cache_load_error)?;
-        let extra_metas = extra_paths
-            .iter()
-            .zip(&sources.extra)
-            .map(|(path, source)| {
-                state.model_cache.ingest(ModelCacheIngest {
-                    source_url: local_file_url(path),
-                    expected_digest: source.expected_digest.clone(),
-                    format: if engine_name == "owned-metal" {
-                        "safetensors".to_string()
-                    } else {
-                        default_artifact_format(&engine_name)
-                    },
-                    tokenizer_path: None,
-                    pin_module_id: pin_module_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(model_cache_load_error)?;
-        let package_digest = package_digest(
-            &model_meta,
-            &tokenizer_meta,
-            config_meta.as_ref(),
-            &extra_metas,
-        );
-        let owned = model_load_owned_profile(
-            &engine_name,
-            temp_dir,
-            &params,
-            config_meta.as_ref(),
-            &extra_metas,
-        )?;
-        let spec = build_loaded_catalog_model(
-            &params,
-            &engine_name,
-            &sources,
-            &model_meta,
-            &tokenizer_meta,
-            package_digest,
-            extra_metas
-                .iter()
-                .map(|meta| ModelAssetLocator::CacheDigest {
-                    digest: meta.digest.clone(),
-                })
-                .collect(),
-            owned,
-            &state.runtime.inline,
-            &state.runtime.jobs,
-        )?;
-        validate_new_owned_metal_readout(&spec).map_err(|message| {
-            catalog_wire_error(
-                "invalid_request",
-                json!({"model_id": spec.model_id}),
-                message,
-            )
-        })?;
-        register_runtime_catalog_model(&state.runtime, spec.clone())?;
-        state.store.upsert_model(&spec, now_ms()).map_err(|error| {
-            transient_model_load_error(format!(
-                "persist catalog entry for '{}': {error}",
-                spec.model_id
-            ))
-        })?;
-        set_job_progress(&state.runtime, &job_id, ModelRuntimeState::Loading);
-        let loaded =
-            ensure_model_loaded_for_control(Arc::clone(&state), &spec.model_id, params.deadline_ms)
-                .await?;
-        let result = json!({
-            "model_id": loaded.model_id,
-            "fingerprint": loaded.fingerprint,
-        });
-        Ok::<_, WireOperationError>(result)
-    }
-    .await;
-
-    clear_job_progress(&state.runtime, &job_id);
-    match result {
-        Ok(result) => {
-            if let Err(error) = state.store.complete_job(&job_id, &result, &[], now_ms()) {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    true,
-                    transient_model_load_error(format!("complete model.load job: {error}")),
-                );
-            } else {
-                state.runtime.admission_telemetry.record_job_completed();
-            }
-        }
-        Err(error) => {
-            fail_job_with_wire_error(&state, &job_id, error.class == ErrorClass::Transient, error);
-        }
-    }
-}
-
-fn validate_model_load_request(params: &ModelLoadParams) -> Result<(), String> {
-    if params.files.model.locator().trim().is_empty()
-        || params.files.tokenizer.locator().trim().is_empty()
-    {
-        return Err("model.load requires files.model and files.tokenizer".to_string());
-    }
-    let engine = canonical_engine_name(&params.engine);
-    let task = parse_model_task(
-        params.task.as_deref(),
-        &engine,
-        params.model_id.as_deref().unwrap_or("model"),
-    )
-    .map_err(|error| error.to_string())?;
-    if matches!(task, ModelTask::Embed | ModelTask::Rerank)
-        && !store::OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str())
-    {
-        return Err(format!(
-            "engine '{engine}' is not an owned embed/rerank engine"
-        ));
-    }
-    if params.source == "hf" && !params.revision.as_deref().is_some_and(pinned_revision) {
-        return Err("model.load source=hf requires a 40-hex revision".to_string());
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn resolve_model_load_sources(
-    params: &ModelLoadParams,
-) -> Result<ResolvedModelLoadSources, String> {
-    resolve_model_load_sources_at(params, &default_hf_endpoint())
-}
-
-fn resolve_model_load_sources_at(
-    params: &ModelLoadParams,
-    endpoint: &str,
-) -> Result<ResolvedModelLoadSources, String> {
-    let resolve = |spec: &ModelLoadFileSpec| -> Result<ResolvedModelLoadAsset, String> {
-        let locator = spec.locator();
-        let source_url = if matches!(spec, ModelLoadFileSpec::Detailed { .. })
-            && (locator.starts_with("https://")
-                || locator.starts_with("http://")
-                || locator.starts_with("file://"))
-        {
-            locator.to_string()
-        } else {
-            match params.source.trim().to_ascii_lowercase().as_str() {
-                "hf" => {
-                    let repo = params
-                        .repo
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .ok_or_else(|| "model.load source=hf requires repo".to_string())?;
-                    huggingface_resolve_url(
-                        endpoint,
-                        repo,
-                        params.revision.as_deref().unwrap_or(""),
-                        locator,
-                    )?
-                }
-                "url" => {
-                    let base = params
-                        .url
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .ok_or_else(|| "model.load source=url requires url".to_string())?;
-                    join_base_url(base, locator)?
-                }
-                "file" => {
-                    let base = params
-                        .path
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .ok_or_else(|| "model.load source=file requires path".to_string())?;
-                    join_file_source(base, locator)?
-                }
-                other => return Err(format!("unsupported model.load source '{other}'")),
-            }
-        };
-        let expected_digest = spec.expected_digest().or_else(|| {
-            std::ptr::eq(spec, &params.files.model)
-                .then(|| params.expected_digest.clone())
-                .flatten()
-        });
-        validate_resolved_asset(&source_url, expected_digest.as_deref(), endpoint)?;
-        Ok(ResolvedModelLoadAsset {
-            source_url,
-            expected_digest,
-        })
-    };
-
-    Ok(ResolvedModelLoadSources {
-        model: resolve(&params.files.model)?,
-        tokenizer: resolve(&params.files.tokenizer)?,
-        config: params.files.config.as_ref().map(resolve).transpose()?,
-        extra: params
-            .files
-            .extra
-            .iter()
-            .map(resolve)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
 }
 
 fn huggingface_resolve_url(
@@ -8381,287 +7288,6 @@ fn huggingface_resolve_url(
     Ok(url.to_string())
 }
 
-fn join_base_url(base: &str, file: &str) -> Result<String, String> {
-    let mut url =
-        Url::parse(base).map_err(|error| format!("invalid url base '{base}': {error}"))?;
-    let had_trailing_slash = base.ends_with('/');
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| format!("url '{base}' cannot accept path segments"))?;
-        if !had_trailing_slash {
-            segments.pop_if_empty();
-        }
-        for segment in file.split('/') {
-            if !segment.is_empty() {
-                segments.push(segment);
-            }
-        }
-    }
-    Ok(url.to_string())
-}
-
-fn join_file_source(base: &str, file: &str) -> Result<String, String> {
-    let base_path = if let Some(path) = base.strip_prefix("file://") {
-        PathBuf::from(path)
-    } else {
-        PathBuf::from(base)
-    };
-    Ok(local_file_url(&base_path.join(file)))
-}
-
-fn package_digest(
-    model: &ModelCacheMeta,
-    tokenizer: &ModelCacheMeta,
-    config: Option<&ModelCacheMeta>,
-    extra: &[ModelCacheMeta],
-) -> String {
-    let mut roles = vec![
-        ("model".to_string(), model.digest.clone()),
-        ("tokenizer".to_string(), tokenizer.digest.clone()),
-    ];
-    if let Some(config) = config {
-        roles.push(("config".to_string(), config.digest.clone()));
-    }
-    roles.extend(extra.iter().map(|meta| {
-        let role = meta
-            .source_url
-            .rsplit('/')
-            .find(|segment| !segment.is_empty())
-            .unwrap_or("extra");
-        (format!("extra:{role}"), meta.digest.clone())
-    }));
-    roles.sort_by(|left, right| left.0.cmp(&right.0));
-    format!(
-        "sha256:{}",
-        sha256_hex(&serde_json::to_vec(&roles).expect("package digest tuple serializes"))
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_loaded_catalog_model(
-    params: &ModelLoadParams,
-    engine_name: &str,
-    sources: &ResolvedModelLoadSources,
-    model_meta: &ModelCacheMeta,
-    tokenizer_meta: &ModelCacheMeta,
-    package_digest: String,
-    extra_locators: Vec<ModelAssetLocator>,
-    owned: Option<OwnedCatalogConfig>,
-    inline: &InlineConfig,
-    jobs: &JobConfig,
-) -> Result<StoredModelConfig, WireOperationError> {
-    let model_id = params.model_id.clone().unwrap_or_else(|| {
-        derive_loaded_model_id(engine_name, &sources.model.source_url, &model_meta.digest)
-    });
-    let task = parse_model_task(params.task.as_deref(), engine_name, &model_id)
-        .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    let pooling = parse_pooling(params.pooling.as_deref().unwrap_or("mean"))
-        .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    let tokenizer_sanitized_digest =
-        model_meta
-            .sanitized_tokenizer_digest
-            .clone()
-            .ok_or_else(|| {
-                artifact_invalid_error("model cache metadata is missing tokenizer digest")
-            })?;
-    build_stored_model_config(
-        model_id,
-        engine_name,
-        task,
-        if owned.is_some() {
-            package_digest
-        } else {
-            model_meta.digest.clone()
-        },
-        default_artifact_format(engine_name),
-        tokenizer_sanitized_digest,
-        ModelAssetLocator::CacheDigest {
-            digest: model_meta.digest.clone(),
-        },
-        ModelAssetLocator::CacheDigest {
-            digest: tokenizer_meta.digest.clone(),
-        },
-        sources.model.source_url.clone(),
-        sources.tokenizer.source_url.clone(),
-        pooling,
-        params.normalize.unwrap_or(true),
-        params.max_tokens.unwrap_or(512),
-        params.quant.clone().unwrap_or_else(|| {
-            owned
-                .as_ref()
-                .map(|profile| profile.dtype.as_str().to_string())
-                .unwrap_or_else(|| default_quant(engine_name))
-        }),
-        params.pin,
-        params.worker_bin.clone(),
-        params.worker_runtime_dir.clone(),
-        extra_locators,
-        owned,
-        inline,
-        jobs,
-    )
-    .map_err(|error| artifact_invalid_error(error.to_string()))
-}
-
-fn derive_loaded_model_id(engine_name: &str, model_source_url: &str, digest: &str) -> String {
-    let base = model_source_url
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(engine_name)
-        .trim_end_matches(".onnx")
-        .trim_end_matches(".gguf")
-        .trim_end_matches(".json");
-    let digest_suffix = digest
-        .strip_prefix("sha256:")
-        .unwrap_or(digest)
-        .chars()
-        .take(8)
-        .collect::<String>();
-    format!(
-        "{}-{}",
-        sanitize_model_id_component(base),
-        digest_suffix.to_ascii_lowercase()
-    )
-}
-
-fn sanitize_model_id_component(value: &str) -> String {
-    let mut output = String::new();
-    let mut last_dash = false;
-    for ch in value.chars() {
-        let ch = ch.to_ascii_lowercase();
-        if ch.is_ascii_alphanumeric() {
-            output.push(ch);
-            last_dash = false;
-        } else if !last_dash {
-            output.push('-');
-            last_dash = true;
-        }
-    }
-    output.trim_matches('-').to_string()
-}
-
-fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOperationError> {
-    let expected_format = default_artifact_format(engine_name);
-    let mut header = [0_u8; 8];
-    let mut file = fs::File::open(path)
-        .map_err(|error| io_to_load_error("open downloaded artifact", path, &error))?;
-    let read = file
-        .read(&mut header)
-        .map_err(|error| io_to_load_error("read downloaded artifact", path, &error))?;
-    match expected_format.as_str() {
-        #[cfg(feature = "test-support")]
-        test_deterministic::NAME if read == 8 && &header == b"SYNTEST1" => Ok(()),
-        "gguf" if read >= 4 && &header[..4] == b"GGUF" => Ok(()),
-        "gguf" => Err(artifact_invalid_error(format!(
-            "expected GGUF magic at {}",
-            path.display()
-        ))),
-        "onnx" if read >= 1 && header[0] == 0x08 => Ok(()),
-        "onnx" => Err(artifact_invalid_error(format!(
-            "expected ONNX protobuf header at {}",
-            path.display()
-        ))),
-        "safetensors-package" if read == 8 => {
-            let header_len = u64::from_le_bytes(header);
-            let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-            if header_len > 0 && header_len.saturating_add(8) <= file_len {
-                Ok(())
-            } else {
-                Err(artifact_invalid_error(format!(
-                    "invalid safetensors header at {}",
-                    path.display()
-                )))
-            }
-        }
-        other => Err(artifact_invalid_error(format!(
-            "unsupported artifact format '{other}' for {}",
-            path.display()
-        ))),
-    }
-}
-
-fn download_source_to_temp(
-    source_url: &str,
-    destination: &Path,
-    mut on_progress: impl FnMut(u64, Option<u64>),
-) -> Result<(), WireOperationError> {
-    let mut output = fs::File::create(destination)
-        .map_err(|error| io_to_load_error("create download destination", destination, &error))?;
-    if let Some(path) = source_url.strip_prefix("file://") {
-        let path = Path::new(path);
-        let total = fs::metadata(path).ok().map(|meta| meta.len());
-        let mut input = fs::File::open(path)
-            .map_err(|error| io_to_load_error("open source artifact", path, &error))?;
-        copy_source_stream(
-            &mut input,
-            &mut output,
-            total,
-            destination,
-            &mut on_progress,
-        )?;
-    } else {
-        let client = reqwest::blocking::Client::new();
-        let mut response = client
-            .get(source_url)
-            .send()
-            .map_err(|error| transient_model_load_error(format!("download {source_url}: {error}")))?
-            .error_for_status()
-            .map_err(|error| {
-                transient_model_load_error(format!("download {source_url}: {error}"))
-            })?;
-        let total = response.content_length();
-        copy_source_stream(
-            &mut response,
-            &mut output,
-            total,
-            destination,
-            &mut on_progress,
-        )?;
-    }
-    output
-        .flush()
-        .map_err(|error| io_to_load_error("flush downloaded artifact", destination, &error))?;
-    Ok(())
-}
-
-fn copy_source_stream(
-    input: &mut impl Read,
-    output: &mut fs::File,
-    total: Option<u64>,
-    destination: &Path,
-    on_progress: &mut impl FnMut(u64, Option<u64>),
-) -> Result<(), WireOperationError> {
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut done = 0_u64;
-    // End-to-end download-progress tests slow the copy down so they can observe
-    // it mid-flight. Only test-support builds honour the override; a shipped
-    // binary never reads it.
-    #[cfg(feature = "test-support")]
-    let delay_ms = env::var("SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|error| io_to_load_error("read source artifact", destination, &error))?;
-        if read == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|error| io_to_load_error("write downloaded artifact", destination, &error))?;
-        done = done.saturating_add(read as u64);
-        on_progress(done, total);
-        #[cfg(feature = "test-support")]
-        if delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        }
-    }
-    Ok(())
-}
-
 async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     let _pause_guard = match lane_pause::admit_params(&state, &params, ModelTask::Embed) {
         Ok(guard) => guard,
@@ -8695,10 +7321,6 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             return result_outcome(error_payload(&state, error));
         }
     };
-    let alias_table = match state.store.alias_table() {
-        Ok(alias_table) => alias_table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
     let request_deadline = request_started
         + Duration::from_millis(
             params
@@ -8720,17 +7342,10 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) =
-        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Embedding)
-    {
-        return result_outcome(error_payload(&state, error));
-    }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
-        params.allow_equivalent,
         params.required_epoch,
     ) {
         return result_outcome(error_payload(&state, error));
@@ -8793,7 +7408,6 @@ async fn embed_query(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         model,
         ids,
         tokenized,
-        alias_table,
         false,
         InlineWorkBudget {
             request_bytes,
@@ -8825,7 +7439,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
             )
         }
     };
-    let mut job_params = json!({"model":params.model,"required_fingerprint":params.required_fingerprint,"target_fingerprint":params.target_fingerprint,"allow_equivalent":params.allow_equivalent,"required_epoch":params.required_epoch,"request_key":params.request_key});
+    let mut job_params = json!({"model":params.model,"required_fingerprint":params.required_fingerprint,"target_fingerprint":params.target_fingerprint,"allow_equivalent":false,"required_epoch":params.required_epoch,"request_key":params.request_key});
     let items = match batch_items(params.items, params.texts) {
         Ok(items) => items,
         Err(message) => return channel_error("invalid_request", message),
@@ -8884,10 +7498,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
     }
 
-    let alias_table = match state.store.alias_table() {
-        Ok(alias_table) => alias_table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
     let request_deadline = request_started
         + Duration::from_millis(
             params
@@ -8909,17 +7519,10 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) =
-        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Embedding)
-    {
-        return result_outcome(error_payload(&state, error));
-    }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
-        params.allow_equivalent,
         params.required_epoch,
     ) {
         return result_outcome(error_payload(&state, error));
@@ -8975,7 +7578,7 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         &json!({
             "target_fingerprint": params.target_fingerprint,
             "required_fingerprint": params.required_fingerprint,
-            "allow_equivalent": params.allow_equivalent,
+            "allow_equivalent": false,
             "required_epoch": params.required_epoch,
             // Preserve the historical local digest so retained request keys still replay.
             "accept_declared": false,
@@ -8996,7 +7599,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
                 request_digest,
                 ids,
                 tokenized,
-                alias_table,
                 request_bytes,
                 total_tokens,
             },
@@ -9026,7 +7628,6 @@ async fn embed_batch(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         model,
         ids,
         tokenized,
-        alias_table,
         true,
         InlineWorkBudget {
             request_bytes,
@@ -9090,10 +7691,6 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         ));
     }
 
-    let alias_table = match state.store.alias_table() {
-        Ok(alias_table) => alias_table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
     let request_deadline = request_started
         + Duration::from_millis(
             params
@@ -9127,17 +7724,10 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     }
     // Certification, admission and execution share the deadline used by resolution.
     let certify_deadline = Some(request_deadline);
-    if let Err(error) =
-        ensure_pre_tokenization_certified(&state, &model, CertificationClass::Rerank)
-    {
-        return result_outcome(error_payload(&state, error));
-    }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
-        params.allow_equivalent,
         params.required_epoch,
     ) {
         return result_outcome(error_payload(&state, error));
@@ -9271,7 +7861,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         );
     }
-    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let equivalent_to = Vec::new();
     let payload = RerankScorePayload {
         scores: scores.scores,
         real_token_counts: tokenized.real_token_counts,
@@ -9279,7 +7869,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     };
     let envelope = ResponseEnvelope {
         fingerprint: model.fingerprint.clone(),
-        table_epoch: alias_table.table_epoch,
+        table_epoch: FROZEN_TABLE_EPOCH,
         dims: 1,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
@@ -9369,10 +7959,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         }
     }
 
-    let alias_table = match state.store.alias_table() {
-        Ok(alias_table) => alias_table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
     let request_deadline = request_started
         + Duration::from_millis(
             params
@@ -9406,10 +7992,8 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
     }
     if let Err(error) = check_fingerprint_constraints(
         &model,
-        &alias_table,
         params.target_fingerprint.as_deref(),
         params.required_fingerprint.as_deref(),
-        params.allow_equivalent,
         params.required_epoch,
     ) {
         return result_outcome(error_payload(&state, error));
@@ -9478,7 +8062,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         Ok(output) => output,
         Err(error) => return result_outcome(error_payload(&state, error)),
     };
-    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let equivalent_to = Vec::new();
     let completed_tokens = (output.n_prompt as u64).saturating_add(output.n_gen as u64);
     let payload = MicroLlmOneshotPayload {
         text: output.text,
@@ -9494,7 +8078,7 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
     };
     let envelope = ResponseEnvelope {
         fingerprint: model.fingerprint.clone(),
-        table_epoch: alias_table.table_epoch,
+        table_epoch: FROZEN_TABLE_EPOCH,
         dims: 0,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
@@ -10248,40 +8832,6 @@ fn cached_supervised_decode_dispatch_for_chain_k(
         .clone())
 }
 
-async fn dispatch_supervised_decode(
-    dispatch: Arc<Mutex<worker_host::SupervisedDecodeDispatch>>,
-    prompt: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-    command: owned_decode_routing::DispatchedCommand,
-) -> Result<owned_decode_routing::ExecutionSuccess, WireOperationError> {
-    tokio::task::spawn_blocking(move || {
-        let mut dispatch = dispatch.lock().map_err(|_| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                "owned-decode dispatch cache is unavailable",
-            )
-        })?;
-        dispatch.set_request(prompt, constraint, deadline_ms);
-        owned_decode_routing::DecodeDispatch::dispatch(&mut *dispatch, &command).map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!(
-                    "owned-decode worker-path dispatch failed: {}",
-                    error.as_str()
-                ),
-            )
-        })
-    })
-    .await
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("owned-decode worker-path task failed: {error}"),
-        )
-    })?
-}
-
 struct OwnedDecodeEnvironmentInputs {
     processing_fingerprint: Fingerprint,
     runtime_config_digest: String,
@@ -10478,90 +9028,6 @@ fn owned_decode_worker_path_identity() -> Value {
     })
 }
 
-/// The gate record a generate probe writes into its certification evidence.
-///
-/// The probe makes one measurement with one verdict (see
-/// `store::PROBE_GATE_ID` for what it covers), so the record names exactly
-/// one gate, passed or failed. The twelve G-DEC acceptance gates are left out
-/// rather than listed as `not_evaluated`: the probe never runs them, and a
-/// G-DEC id in the record, whatever its status, invites a reader or a
-/// consumer keyed on the id to treat the row as evidence about that gate.
-fn owned_decode_probe_gate_evidence(passed: bool) -> Value {
-    json!([{
-        "id": store::PROBE_GATE_ID,
-        "status": if passed { "passed" } else { "failed" },
-        "manifest_revision": store::G_DEC_MANIFEST_REVISION,
-        "measures": [
-            "fixture_tokens_within_structural_band",
-            "configured_chain_shape_matches_k1",
-            "constrained_worker_path_emits_null",
-        ],
-    }])
-}
-
-fn owned_decode_probe_match_inputs(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    profile_hash: String,
-    profile_epoch: u64,
-    constraint_runtime_identities: Vec<String>,
-) -> Result<OwnedDecodeMatchInputs, WireOperationError> {
-    let spec = state
-        .runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| catalog.get(&model.model_id).map(|slot| slot.spec.clone()))
-        .ok_or_else(|| artifact_invalid_error("missing catalog entry for owned-decode probe"))?;
-    let entry = owned_decode_catalog_entry(&spec)
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let decode_fingerprint = entry
-        .decode_identity_inputs()
-        .decode_fingerprint()
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let (runtime_config_digest, _) =
-        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
-    let constraint_runtime_identities = if constraint_runtime_identities.is_empty() {
-        Vec::new()
-    } else {
-        vec![owned_decode_probe_constraint_identity(
-            model,
-            &decode_fingerprint,
-        )?]
-    };
-    Ok(OwnedDecodeMatchInputs {
-        revisioned_machine_profile_hash: profile_hash,
-        profile_activation_epoch: profile_epoch,
-        model_id: entry.entry_id,
-        decode_fingerprint: decode_fingerprint.0,
-        processing_fingerprint: processing_fingerprint.0,
-        runtime_config_digest,
-        constraint_runtime_identities,
-        worker_path_evidence: owned_decode_worker_path_identity(),
-        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
-        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
-    })
-}
-
-fn owned_decode_probe_constraint_identity(
-    model: &EmbeddingModel,
-    decode_fingerprint: &Fingerprint,
-) -> Result<String, WireOperationError> {
-    let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
-    let compiled = owned_decode_grammar_scheduler::compile_grammar(
-        r#"{"type":"null"}"#,
-        &owned_decode_grammar_scheduler::CompileContext {
-            base_decode_fingerprint: decode_fingerprint.clone(),
-            tokenizer_vocabulary_digest: vocabulary_digest,
-        },
-        &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
-    )
-    .map_err(|error| artifact_invalid_error(error.message))?;
-    Ok(compiled.constraint.constraint_runtime_identity.digest())
-}
-
 async fn route_owned_decode_wire(
     state: Arc<ModuleState>,
     params: &MicroLlmOneshotParams,
@@ -10599,13 +9065,9 @@ async fn route_owned_decode_wire(
             Err(error) => return result_outcome(error_payload(&state, error)),
         };
     let resolution_owned_refusal = owned_model.owned_decode_resolution_refusal;
-    let alias_table = match state.store.alias_table() {
-        Ok(table) => table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
     if params
         .required_epoch
-        .is_some_and(|required| required > alias_table.table_epoch)
+        .is_some_and(|required| required > FROZEN_TABLE_EPOCH)
     {
         return result_outcome(error_payload(
             &state,
@@ -10730,10 +9192,7 @@ async fn route_owned_decode_wire(
         decode_fingerprint: fallback.fingerprint.clone(),
         processing_fingerprint: fallback.fingerprint.clone(),
     });
-    let equivalent_fingerprints = alias_table
-        .equivalent_fingerprints_at(&decode_fingerprint, now_ms())
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let equivalent_fingerprints = BTreeSet::new();
     let environment = owned_decode_environment(
         &state,
         &spec,
@@ -10808,7 +9267,7 @@ async fn route_owned_decode_wire(
                 .and_then(|grammar| serde_json::from_str(grammar).ok())
         },
         required_fingerprint: params.required_fingerprint.clone().map(Fingerprint),
-        allow_equivalent: params.allow_equivalent,
+        allow_equivalent: false,
         target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
         required_processing_fingerprint: None,
         owned_only: params.owned_only,
@@ -10988,10 +9447,7 @@ async fn route_owned_decode_wire(
     let engine = selected_model
         .map(|model| model.engine_identity.clone())
         .unwrap_or_else(|| spec.engine_identity.clone());
-    let equivalent_to = alias_table
-        .equivalent_fingerprints_at(&fingerprint, now_ms())
-        .into_iter()
-        .collect();
+    let equivalent_to = Vec::new();
     let provenance = &routed.provenance;
     let payload = MicroLlmOneshotPayload {
         text,
@@ -11011,7 +9467,7 @@ async fn route_owned_decode_wire(
     };
     let envelope = ResponseEnvelope {
         fingerprint,
-        table_epoch: alias_table.table_epoch,
+        table_epoch: FROZEN_TABLE_EPOCH,
         dims: 0,
         provenance: ResponseProvenance {
             engine,
@@ -11314,7 +9770,6 @@ async fn execute_embed_batch_job(
         work.ids,
         vectors,
         work.tokenized,
-        work.alias_table,
         &job_id,
         record.page_count,
     ) {
@@ -11527,12 +9982,11 @@ fn embed_result_pages(
     ids: Vec<String>,
     vectors: Vectors,
     tokenized: TokenizedBatch,
-    alias_table: AliasTable,
     job_id: &str,
     first_page_no: u32,
 ) -> Result<(Value, Vec<PreparedJobPage>), WireOperationError> {
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
-    let equivalent_to = equivalent_fingerprints(&alias_table, model);
+    let equivalent_to = Vec::new();
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
@@ -11576,7 +10030,7 @@ fn embed_result_pages(
             .collect::<Result<Vec<_>, WireOperationError>>()?;
         let envelope = ResponseEnvelope {
             fingerprint: model.fingerprint.clone(),
-            table_epoch: alias_table.table_epoch,
+            table_epoch: FROZEN_TABLE_EPOCH,
             dims,
             provenance: ResponseProvenance {
                 engine: model.engine_identity.clone(),
@@ -11800,7 +10254,6 @@ async fn embed_tokenized(
     model: Arc<EmbeddingModel>,
     ids: Vec<String>,
     tokenized: TokenizedBatch,
-    alias_table: AliasTable,
     use_bulk_quanta: bool,
     budget: InlineWorkBudget,
 ) -> HandlerOutcome {
@@ -11862,7 +10315,7 @@ async fn embed_tokenized(
     }
     let reply_started = Instant::now();
     let dims = vectors.first().map(Vec::len).unwrap_or(0) as u32;
-    let equivalent_to = equivalent_fingerprints(&alias_table, &model);
+    let equivalent_to = Vec::new();
     let response_vectors = ids
         .into_iter()
         .zip(vectors)
@@ -11882,7 +10335,7 @@ async fn embed_tokenized(
     };
     let envelope = ResponseEnvelope {
         fingerprint: model.fingerprint.clone(),
-        table_epoch: alias_table.table_epoch,
+        table_epoch: FROZEN_TABLE_EPOCH,
         dims,
         provenance: ResponseProvenance {
             engine: model.engine_identity.clone(),
@@ -12718,7 +11171,7 @@ fn compose_catalog_embed(
     model: &EmbeddingModel,
     tokenized: &mut TokenizedBatch,
 ) -> Result<(), WireOperationError> {
-    let Some(id) = model.engine_identity.build_flags.get("profile") else {
+    let Some(id) = release_profile(&model.engine_identity) else {
         return Ok(());
     };
     let catalog =
@@ -12745,11 +11198,8 @@ fn owned_rerank_pairs(
     query: &str,
     candidates: &[String],
 ) -> Result<Option<Vec<Vec<u32>>>, WireOperationError> {
-    let catalog = model
-        .engine_identity
-        .build_flags
-        .get("profile")
-        .map(|id| CatalogProfile::load(id))
+    let catalog = release_profile(&model.engine_identity)
+        .map(CatalogProfile::load)
         .transpose()
         .map_err(|error| artifact_invalid_error(error.to_string()))?;
     if !matches!(&model.backend, EmbedBackend::Owned(_)) && catalog.is_none() {
@@ -12958,67 +11408,33 @@ fn batch_items(
         .collect())
 }
 
+// The alias table was removed, but consumers may have persisted the last epoch they saw.
+const FROZEN_TABLE_EPOCH: u64 = 2;
+
 fn check_fingerprint_constraints(
     model: &EmbeddingModel,
-    alias_table: &AliasTable,
     target_fingerprint: Option<&str>,
     required_fingerprint: Option<&str>,
-    allow_equivalent: bool,
     required_epoch: Option<u64>,
 ) -> Result<(), WireOperationError> {
-    if let Some(required_epoch) = required_epoch {
-        if required_epoch > alias_table.table_epoch {
+    if let Some(required_epoch) = required_epoch.filter(|epoch| *epoch > FROZEN_TABLE_EPOCH) {
+        return Err(WireOperationError::from_stable(
+            StableError::migration_required(),
+            format!("request requires alias table epoch {required_epoch}, but module is at epoch {FROZEN_TABLE_EPOCH}"),
+        ));
+    }
+    if let Some(requested) = required_fingerprint.or(target_fingerprint) {
+        if requested != model.fingerprint.0 {
             return Err(WireOperationError::from_stable(
-                StableError::migration_required(),
+                StableError::substitution_rejected(),
                 format!(
-                    "request requires alias table epoch {required_epoch}, but module is at epoch {}",
-                    alias_table.table_epoch
+                    "requested fingerprint {requested} does not match loaded model fingerprint {}",
+                    model.fingerprint.0
                 ),
             ));
         }
     }
-    let requested = required_fingerprint.or(target_fingerprint);
-    if let Some(requested) = requested {
-        if requested != model.fingerprint.0 {
-            let equivalent = !model.engine_identity.build_flags.contains_key("profile")
-                && allow_equivalent
-                && equivalent_fingerprints(alias_table, model)
-                    .iter()
-                    .any(|fingerprint| fingerprint.0 == requested);
-            if !equivalent {
-                return Err(WireOperationError::from_stable(
-                    StableError::substitution_rejected(),
-                    format!(
-                        "requested fingerprint {requested} does not match loaded model fingerprint {}",
-                        model.fingerprint.0
-                    ),
-                ));
-            }
-        }
-    }
     Ok(())
-}
-
-fn equivalent_fingerprints(alias_table: &AliasTable, model: &EmbeddingModel) -> Vec<Fingerprint> {
-    alias_table
-        .equivalent_fingerprints_at(&model.fingerprint, now_ms())
-        .into_iter()
-        .collect()
-}
-
-// Legacy probes retain their original ordering. A profile's numerical check is
-// deferred until after composed-token validation so an oversized input cannot
-// trigger self-check inference before its sequence_too_long refusal.
-fn ensure_pre_tokenization_certified(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    class: CertificationClass,
-) -> Result<(), WireOperationError> {
-    if model.engine_identity.build_flags.contains_key("profile") {
-        Ok(())
-    } else {
-        ensure_model_certified(state, model, class)
-    }
 }
 
 async fn ensure_profile_request_certified(
@@ -13026,2125 +11442,27 @@ async fn ensure_profile_request_certified(
     model: &EmbeddingModel,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<(), WireOperationError> {
-    if model.engine_identity.build_flags.contains_key("profile") {
+    if release_profile(&model.engine_identity).is_some() {
         ensure_profile_preload_ready(state.clone(), &model.model_id, deadline).await?;
-        ensure_model_certified(
-            &state,
-            model,
-            if model.task == ModelTask::Embed {
-                CertificationClass::Embedding
-            } else {
-                CertificationClass::Rerank
-            },
-        )?;
+        check_profile_preload_certified(&state, model)?;
     }
     Ok(())
 }
 
-fn ensure_model_certified(
+fn check_profile_preload_certified(
     state: &ModuleState,
     model: &EmbeddingModel,
-    certification_class: CertificationClass,
 ) -> Result<(), WireOperationError> {
-    if resolved_catalog_lane(&state.runtime, &model.model_id).is_some() {
-        return Ok(());
-    }
-    if let Some(profile) = model.engine_identity.build_flags.get("profile") {
-        let (id, _) = profile_preload_check_key(state, model, profile)?;
-        return match profile_preload_check_status(state, &id)?.as_str() {
-            "passed" => Ok(()),
-            status => Err(profile_preload_check_error(profile, status)),
-        };
-    }
-    // Owned-CUDA has no declared or inherited certification path. A measured
-    // row must match this exact machine-profile hash before serving.
-    let result = if model.engine_identity.engine == CUDA_WORKER_ENGINE {
-        match state.store.get_cert_row(
-            certification_class,
-            &state.machine_profile_hash,
-            &model.certification_fingerprint,
-        ) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(WireOperationError::from_stable(
-                StableError::not_certified(),
-                format!(
-                    "owned-cuda fingerprint {} is not certified on machine profile {}",
-                    model.certification_fingerprint.0, state.machine_profile_hash
-                ),
-            )),
-            Err(error) => Err(WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("read owned-cuda certification row: {error}"),
-            )),
-        }
-    } else {
-        ensure_fingerprint_certified(
-            &state.store,
-            certification_class,
-            &state.machine_profile_hash,
-            &model.certification_fingerprint,
-        )
-    };
-    if let Err(error) = &result {
-        record_admission_refusal(&state.runtime, &model.model_id, None, &error.code);
-        if error.code == "not_certified"
-            && state
-                .store
-                .has_stale_cert_row(
-                    certification_class,
-                    &state.machine_profile_hash,
-                    &model.certification_fingerprint,
-                )
-                .unwrap_or(false)
-        {
-            let _ = state
-                .store
-                .observe_certification_stale(&state.revisioned_machine_profile_hash, now_ms());
-        }
-    }
-    result
-}
-
-fn ensure_fingerprint_certified(
-    store: &SynapseStore,
-    certification_class: CertificationClass,
-    machine_profile_hash: &str,
-    fingerprint: &Fingerprint,
-) -> Result<(), WireOperationError> {
-    match store.get_cert_row(certification_class, machine_profile_hash, fingerprint) {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(error) => {
-            return Err(WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("read measured certification rows: {error}"),
-            ))
-        }
-    }
-
-    let failed_probe = store
-        .get_probe_row(certification_class, machine_profile_hash, fingerprint)
-        .map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("read probe outcome row: {error}"),
-            )
-        })?
-        .filter(|row| row.status == CertificationStatus::Uncertified);
-    if let Some(row) = failed_probe {
-        let reason = row
-            .evidence
-            .get("blocking_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("probe_failed");
-        return Err(WireOperationError::from_stable(
-            StableError::not_certified(),
-            format!(
-                "fingerprint {} is uncertified on machine profile {}: {}",
-                fingerprint.0, machine_profile_hash, reason
-            ),
-        ));
-    }
-    let stale = store
-        .has_stale_cert_row(certification_class, machine_profile_hash, fingerprint)
-        .unwrap_or(false);
-    let message = if stale {
-        format!(
-            "fingerprint {} has only stale certification rows for a different machine profile",
-            fingerprint.0
-        )
-    } else {
-        format!(
-            "fingerprint {} is not certified on machine profile {}",
-            fingerprint.0, machine_profile_hash
-        )
-    };
-    Err(WireOperationError::from_stable(
-        StableError::not_certified(),
-        message,
-    ))
-}
-
-async fn probe_start(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ProbeStartParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid probe.start params: {error}"),
-            )
-        }
-    };
-    let now = now_ms();
-    if params
-        .models
-        .iter()
-        .any(|id| state.runtime.release_catalog.is_reserved_id(id))
-    {
-        return result_outcome(error_payload(
-            &state,
-            catalog_wire_error(
-                "invalid_request",
-                json!({"models":params.models}),
-                "catalog lanes use self-check, not probe.start",
-            ),
-        ));
-    }
-    let model_filter = params.models;
-    let request_key = params
-        .request_key
-        .filter(|key| !key.trim().is_empty())
-        .unwrap_or_else(|| format!("probe:{}:{now}", state.module_generation));
-    let params_json = json!({
-        "models": model_filter.clone(),
-        "deadline_ms": params.deadline_ms,
-    });
-    let request_digest = compute_request_digest("probe", "management", &params_json, &[]);
-    let admission = match state.store.admit_job(&request_key, &request_digest, "probe", state.module_generation, &params_json, now, state.runtime.jobs.execution_ttl_ms, state.runtime.jobs.result_retention_ttl_ms) {
-        Ok(admission) => admission,
-        Err(SynapseStoreError::IdempotencyConflict { .. }) => {
-            return result_outcome(error_payload(
-                &state,
-                WireOperationError::from_stable(
-                    StableError::idempotency_conflict(),
-                    format!("request_key '{request_key}' was already used for different request content"),
-                ),
-            ))
-        }
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    let record = admission.record().clone();
-    let job_minted = matches!(admission, JobAdmission::Admitted(_));
-    if job_minted {
-        state.runtime.admission_telemetry.record_job_minted();
-        let supervisor_state = Arc::clone(&state);
-        let supervisor_job_id = record.job_id.clone();
-        let task_state = Arc::clone(&state);
-        let task_job_id = record.job_id.clone();
-        let deadline_ms = params.deadline_ms;
-        tokio::spawn(async move {
-            let task = tokio::spawn(async move {
-                execute_probe_job(task_state, task_job_id, model_filter, deadline_ms).await;
-            });
-            if let Err(error) = task.await {
-                fail_job_with_wire_error(
-                    &supervisor_state,
-                    &supervisor_job_id,
-                    true,
-                    WireOperationError::from_stable(
-                        StableError::engine_crashed(Some(100)),
-                        format!("probe execution task failed: {error}"),
-                    ),
-                );
-            }
-        });
-    }
-    result_outcome(json!({
-        "module_generation": state.module_generation,
-        "job_id": record.job_id,
-        "state": record.state,
-    }))
-}
-
-async fn probe_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ProbeStatusParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid probe.status params: {error}"),
-            )
-        }
-    };
-    match state.store.get_job(&params.job_id) {
-        Ok(Some(record)) if record.kind == "probe" => {
-            result_outcome(probe_status_payload(&state, &record))
-        }
-        Ok(Some(_)) => channel_error("invalid_request", "job_id does not refer to a probe job"),
-        Ok(None) => channel_error("invalid_request", "unknown or expired job_id"),
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-async fn execute_probe_job(
-    state: Arc<ModuleState>,
-    job_id: String,
-    model_filter: Vec<String>,
-    deadline_ms: Option<u64>,
-) {
-    if !matches!(
-        state
-            .store
-            .mark_job_running(&job_id, state.module_generation, now_ms()),
-        Ok(true)
-    ) {
-        return;
-    }
-
-    let embed_fixtures = match probe_fixtures() {
-        Ok(fixtures) => fixtures,
-        Err(error) => {
-            fail_job_with_wire_error(&state, &job_id, false, error);
-            return;
-        }
-    };
-    let rerank_fixture = match rerank_probe_fixture() {
-        Ok(fixture) => fixture,
-        Err(error) => {
-            fail_job_with_wire_error(&state, &job_id, false, error);
-            return;
-        }
-    };
-    let generate_fixtures = match generate_probe_fixtures() {
-        Ok(fixtures) => fixtures,
-        Err(error) => {
-            fail_job_with_wire_error(&state, &job_id, false, error);
-            return;
-        }
-    };
-    let selected_model_ids = state
-        .runtime
-        .catalog
-        .lock()
-        .map(|catalog| {
-            catalog
-                .keys()
-                .filter(|model_id| !state.runtime.release_catalog.is_reserved_id(model_id))
-                .filter(|model_id| {
-                    model_filter.is_empty() || model_filter.iter().any(|id| id == *model_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mut selected_models = Vec::new();
-    let mut lane_results = Vec::new();
-    let mut pause_guards = Vec::new();
-    for model_id in selected_model_ids {
-        match lane_pause::admit(&state.runtime, &model_id) {
-            Ok(guard) => pause_guards.push(guard),
-            Err(error) => {
-                fail_job_with_wire_error(&state, &job_id, true, error);
-                return;
-            }
-        }
-        let model = match ensure_model_loaded_for_control(
-            Arc::clone(&state),
-            &model_id,
-            deadline_ms,
-        )
-        .await
-        {
-            Ok(model) => model,
-            Err(error) => {
-                let spec = model_slot_snapshot(&state.runtime, &model_id).map(|slot| slot.spec);
-                let blocking_reason = match error.code.as_str() {
-                    "owned_cuda_unsupported" => "owned_cuda_unsupported",
-                    "artifact_invalid" if error.message.contains("macOS") => "backend_unavailable",
-                    "not_certified" => "not_certified",
-                    _ => "load_failed",
-                };
-                lane_results.push(json!({
-                        "model_id": model_id,
-                        "cell_id": spec.as_ref().map(|spec| format!("{}/{}/{}", spec.engine, spec.owned_family.as_deref().unwrap_or("unknown"), spec.quant)),
-                        "engine": spec.as_ref().map(|spec| spec.engine.clone()),
-                        "backend": spec.as_ref().and_then(|spec| spec.engine_identity.build_flags.get("backend").cloned()),
-                        "fingerprint": spec.as_ref().map(|spec| spec.fingerprint.clone()),
-                        "status": if blocking_reason == "owned_cuda_unsupported" || blocking_reason == "backend_unavailable" { "unsupported" } else { "uncertified" },
-                        "blocking_reason": blocking_reason,
-                        "error": error,
-                    }));
-                continue;
-            }
-        };
-        selected_models.push(model);
-    }
-
-    let mut certified_vectors = Vec::new();
-    for model in selected_models {
-        let probe_result = match model.task {
-            ModelTask::Embed => {
-                execute_embed_probe_for_model(&state, Arc::clone(&model), &embed_fixtures).await
-            }
-            ModelTask::Rerank => {
-                execute_rerank_probe_for_model(&state, Arc::clone(&model), &rerank_fixture).await
-            }
-            ModelTask::Generate => {
-                execute_generate_probe_for_model(&state, Arc::clone(&model), &generate_fixtures)
-                    .await
-            }
-        };
-        let probe_result = match probe_result {
-            Ok(result) => result,
-            Err(error) => {
-                fail_job_with_wire_error(
-                    &state,
-                    &job_id,
-                    error.class == ErrorClass::Transient,
-                    error,
-                );
-                return;
-            }
-        };
-        if let Some(vectors) = probe_result.certified_vectors {
-            certified_vectors.push(ProbeLaneVectors {
-                model: Arc::clone(&model),
-                vectors,
-            });
-        }
-        lane_results.push(probe_result.lane_result);
-    }
-
-    let mut alias_results = Vec::new();
-    for left_index in 0..certified_vectors.len() {
-        for right_index in left_index + 1..certified_vectors.len() {
-            let left = &certified_vectors[left_index];
-            let right = &certified_vectors[right_index];
-            if left.model.fingerprint == right.model.fingerprint {
-                continue;
-            }
-            let evidence = probe_evidence_between(&left.vectors, &right.vectors);
-            let passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
-                && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
-            if !passed {
-                continue;
-            }
-            let evidence_json = json!({
-                "source": "probe",
-                "left_model_id": left.model.model_id,
-                "right_model_id": right.model.model_id,
-                "metrics": evidence,
-            });
-            match state.store.declare_alias_pair(
-                &left.model.fingerprint,
-                &right.model.fingerprint,
-                &evidence_json,
-                now_ms(),
-            ) {
-                Ok((changed, table_epoch)) => alias_results.push(json!({
-                    "fingerprint_a": left.model.fingerprint,
-                    "fingerprint_b": right.model.fingerprint,
-                    "changed": changed,
-                    "table_epoch": table_epoch,
-                })),
-                Err(error) => {
-                    fail_job_with_wire_error(
-                        &state,
-                        &job_id,
-                        true,
-                        WireOperationError::from_stable(
-                            StableError::engine_crashed(Some(100)),
-                            format!("write alias row: {error}"),
-                        ),
-                    );
-                    return;
-                }
+    if let Some(profile) = release_profile(&model.engine_identity) {
+        if resolved_catalog_lane(&state.runtime, &model.model_id).is_none() {
+            let (id, _) = profile_preload_check_key(state, model, profile)?;
+            let status = profile_preload_check_status(state, &id)?;
+            if status != "passed" {
+                return Err(profile_preload_check_error(profile, &status));
             }
         }
     }
-
-    let catalog_model_ids = state
-        .runtime
-        .catalog
-        .lock()
-        .map(|catalog| catalog.keys().cloned().collect::<BTreeSet<_>>())
-        .unwrap_or_default();
-    let perf_rows = match state.store.current_perf_rows(&state.machine_profile_hash) {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|row| catalog_model_ids.contains(&row.model_id))
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            fail_job_with_wire_error(
-                &state,
-                &job_id,
-                true,
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("read performance rows: {error}"),
-                ),
-            );
-            return;
-        }
-    };
-    let mut routable_perf_rows = Vec::with_capacity(perf_rows.len());
-    for row in perf_rows {
-        let certification_required =
-            row.workload != ModelTask::Generate.as_str() || row.engine == "owned-metal";
-        let certification_class = match row.workload.as_str() {
-            "embed" => Some(CertificationClass::Embedding),
-            "rerank" => Some(CertificationClass::Rerank),
-            _ => None,
-        };
-        let certified = if certification_required {
-            match certification_class.map(|class| {
-                state
-                    .store
-                    .get_cert_row(class, &state.machine_profile_hash, &row.fingerprint)
-            }) {
-                Some(Ok(row)) => row.is_some(),
-                Some(Err(error)) => {
-                    fail_job_with_wire_error(
-                        &state,
-                        &job_id,
-                        true,
-                        WireOperationError::from_stable(
-                            StableError::engine_crashed(Some(100)),
-                            format!("read certification rows for knob mapping: {error}"),
-                        ),
-                    );
-                    return;
-                }
-                None => false,
-            }
-        } else {
-            true
-        };
-        if certified {
-            routable_perf_rows.push(row);
-        }
-    }
-    let knob_assignments = compute_knob_assignments(&routable_perf_rows);
-    if let Err(error) = state
-        .store
-        .replace_knob_assignments(&state.machine_profile_hash, &knob_assignments)
-    {
-        fail_job_with_wire_error(
-            &state,
-            &job_id,
-            true,
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("persist knob assignments: {error}"),
-            ),
-        );
-        return;
-    }
-    let active_assignments = knob_assignments
-        .iter()
-        .filter(|assignment| assignment.knob == state.runtime.knob)
-        .cloned()
-        .collect::<Vec<_>>();
-    let result = json!({
-        "module_generation": state.module_generation,
-        "machine_profile_hash": state.machine_profile_hash,
-        "machine_profile_hash_revision": MACHINE_PROFILE_HASH_REVISION,
-        "machine_profile": state.machine_profile,
-        "current_knob": state.runtime.knob,
-        "fixture": {
-            "items": embed_fixtures.first().map_or(0, |fixture| fixture.items.len()),
-            "first_id": embed_fixtures
-                .first()
-                .and_then(|fixture| fixture.items.first())
-                .map(|item| item.id.clone()),
-            "generation_command": embed_fixtures
-                .first()
-                .and_then(|fixture| fixture.generation_command.clone()),
-            "sets": embed_fixtures
-                .iter()
-                .map(probe_fixture_provenance)
-                .collect::<Vec<_>>(),
-        },
-        "fixtures": {
-            "embed": {
-                "items": embed_fixtures.first().map_or(0, |fixture| fixture.items.len()),
-                "first_id": embed_fixtures
-                    .first()
-                    .and_then(|fixture| fixture.items.first())
-                    .map(|item| item.id.clone()),
-                "generation_command": embed_fixtures
-                    .first()
-                    .and_then(|fixture| fixture.generation_command.clone()),
-                "sets": embed_fixtures
-                    .iter()
-                    .map(probe_fixture_provenance)
-                    .collect::<Vec<_>>(),
-            },
-            "rerank": {
-                "items": rerank_fixture.items.len(),
-                "first_id": rerank_fixture.items.first().map(|item| item.id.clone()),
-                "generation_command": rerank_fixture.generation_command,
-            },
-            "generate": generate_fixtures
-                .iter()
-                .map(generate_fixture_provenance)
-                .collect::<Vec<_>>()
-        },
-        "lanes": lane_results,
-        "aliases": alias_results,
-        "knob_assignments": knob_assignments,
-        "active_assignments": active_assignments,
-    });
-    if let Err(error) = state.store.complete_job(&job_id, &result, &[], now_ms()) {
-        fail_job_with_wire_error(
-            &state,
-            &job_id,
-            true,
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("complete probe job: {error}"),
-            ),
-        );
-    } else {
-        state.runtime.admission_telemetry.record_job_completed();
-    }
-}
-
-async fn execute_embed_probe_for_model(
-    state: &ModuleState,
-    model: Arc<EmbeddingModel>,
-    fixtures: &[ProbeFixture],
-) -> Result<ProbeModelResult, WireOperationError> {
-    let reference_key = probe_reference_key(&model);
-    #[cfg(feature = "test-support")]
-    let test_fixtures = test_deterministic_probe_fixtures();
-    #[cfg(feature = "test-support")]
-    let fixtures = if model.engine_identity.engine == test_deterministic::NAME {
-        test_fixtures.as_slice()
-    } else {
-        fixtures
-    };
-    let reference_candidates = fixtures
-        .iter()
-        .filter(|fixture| probe_fixture_matches_key(fixture, &reference_key))
-        .collect::<Vec<_>>();
-    let Some(text_fixture) = reference_candidates.first().copied() else {
-        let evidence = json!({
-            "task": "embed",
-            "gate": "reference_fixture",
-            "blocking_reason": "reference_fixture_missing",
-            "reference": {
-                "family": reference_key.family.clone(),
-                "model": reference_key.model.clone(),
-            },
-        });
-        store_probe_outcome_row(
-            state,
-            &model,
-            CertificationStatus::Uncertified,
-            evidence.clone(),
-        )?;
-        return Ok(ProbeModelResult {
-            lane_result: json!({
-                "model_id": model.model_id,
-                "task": "embed",
-                "fingerprint": model.fingerprint,
-                "numeric_profile_id": model.numeric_profile_id,
-                "status": "uncertified",
-                "blocking_reason": "reference_fixture_missing",
-                "evidence": evidence,
-                "performance": Value::Null,
-            }),
-            certified_vectors: None,
-        });
-    };
-    let texts = text_fixture
-        .items
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect::<Vec<_>>();
-    let mut tokenized = match model.tokenizer.tokenize_batch(texts) {
-        Ok(tokenized) => tokenized,
-        Err(error) => {
-            return Ok(ProbeModelResult {
-                lane_result: json!({
-                    "model_id": model.model_id,
-                    "task": "embed",
-                    "fingerprint": model.fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "error": error.to_string(),
-                }),
-                certified_vectors: None,
-            })
-        }
-    };
-    compose_catalog_embed(&model, &mut tokenized)?;
-    apply_owned_tokenizer_policy(&model, &mut tokenized);
-    let vectors = match execute_embedding(
-        &state.runtime,
-        &model,
-        tokenized.batch.clone(),
-        None,
-        None,
-    )
-    .await
-    {
-        Ok(vectors) => vectors,
-        Err(error) => return Err(error),
-    };
-    let actual_dims = vectors.first().map(Vec::len);
-    let actual_item_count = vectors.len();
-    let vectors_have_one_dimension = vectors
-        .iter()
-        .all(|vector| Some(vector.len()) == actual_dims);
-    let fixture = reference_candidates.into_iter().find(|fixture| {
-        vectors_have_one_dimension
-            && actual_item_count == fixture.items.len()
-            && fixture_reference_dims(fixture) == actual_dims
-    });
-    let Some(fixture) = fixture else {
-        let evidence = json!({
-            "task": "embed",
-            "gate": "reference_fixture",
-            "blocking_reason": "reference_fixture_missing",
-            "reference": {
-                "family": reference_key.family.clone(),
-                "model": reference_key.model.clone(),
-                "available_dims": fixtures
-                    .iter()
-                    .filter(|fixture| probe_fixture_matches_key(fixture, &reference_key))
-                    .filter_map(fixture_reference_dims)
-                    .collect::<Vec<_>>(),
-            },
-            "actual_dims": actual_dims,
-            "actual_items": actual_item_count,
-        });
-        store_probe_outcome_row(
-            state,
-            &model,
-            CertificationStatus::Uncertified,
-            evidence.clone(),
-        )?;
-        return Ok(ProbeModelResult {
-            lane_result: json!({
-                "model_id": model.model_id,
-                "task": "embed",
-                "fingerprint": model.fingerprint,
-                "numeric_profile_id": model.numeric_profile_id,
-                "status": "uncertified",
-                "blocking_reason": "reference_fixture_missing",
-                "evidence": evidence,
-                "performance": Value::Null,
-            }),
-            certified_vectors: None,
-        });
-    };
-    let evidence = probe_evidence(&vectors, &fixture.items);
-    let quality_passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
-        && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
-    let passed = quality_passed;
-    let cuda_evidence = owned_cuda_evidence(state, &model).await?;
-    let certification_evidence = json!({
-        "task": "embed",
-        "metrics": evidence,
-        "cuda": cuda_evidence,
-    });
-    let performance = if passed {
-        let cold_load_ms =
-            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("missing cold-load measurement for '{}'", model.model_id),
-                )
-            })?;
-        let perf = measure_embed_perf(&state.runtime, &model, &tokenized, cold_load_ms).await?;
-        store_probe_cert_row(state, &model, certification_evidence.clone())?;
-        Some(store_probe_perf_row(
-            state,
-            &model,
-            ModelTask::Embed.as_str(),
-            &perf,
-        )?)
-    } else {
-        None
-    };
-    Ok(ProbeModelResult {
-        lane_result: json!({
-            "model_id": model.model_id,
-            "task": "embed",
-            "fingerprint": model.fingerprint,
-            "numeric_profile_id": model.numeric_profile_id,
-            "status": if passed { "certified" } else { "uncertified" },
-            "evidence": evidence,
-            "thresholds": {
-                "mean_cosine": state.runtime.probe.mean_cosine_threshold,
-                "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
-            },
-            "cuda": cuda_evidence,
-            "performance": performance,
-        }),
-        certified_vectors: passed.then_some(vectors),
-    })
-}
-
-async fn execute_rerank_probe_for_model(
-    state: &ModuleState,
-    model: Arc<EmbeddingModel>,
-    fixture: &RerankProbeFixture,
-) -> Result<ProbeModelResult, WireOperationError> {
-    let mut actual = Vec::new();
-    let mut reference = Vec::new();
-    for item in &fixture.items {
-        if item.candidates.len() != item.scores.len() {
-            return Ok(ProbeModelResult {
-                lane_result: json!({
-                    "model_id": model.model_id,
-                    "task": "rerank",
-                    "fingerprint": model.fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "error": format!("rerank fixture '{}' has {} candidates and {} scores", item.id, item.candidates.len(), item.scores.len()),
-                }),
-                certified_vectors: None,
-            });
-        }
-        let mut texts = Vec::with_capacity(item.candidates.len() + 1);
-        texts.push(item.query.as_str());
-        texts.extend(item.candidates.iter().map(String::as_str));
-        let tokenized = match model.tokenizer.tokenize_batch_without_special_tokens(texts) {
-            Ok(tokenized) => tokenized,
-            Err(error) => {
-                return Ok(ProbeModelResult {
-                    lane_result: json!({
-                        "model_id": model.model_id,
-                        "task": "rerank",
-                        "fingerprint": model.fingerprint,
-                        "numeric_profile_id": model.numeric_profile_id,
-                        "status": "uncertified",
-                        "error": error.to_string(),
-                    }),
-                    certified_vectors: None,
-                })
-            }
-        };
-        let mut token_items = tokenized.batch.items;
-        let query = token_items.remove(0);
-        let owned_pairs = owned_rerank_pairs(&model, item.query.as_str(), &item.candidates)?;
-        let scores = match execute_rerank(
-            &state.runtime,
-            &model,
-            RerankRequest {
-                query,
-                candidates: token_items,
-            },
-            owned_pairs,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(scores) => scores,
-            Err(error) => return Err(error),
-        };
-        actual.extend(scores.scores.into_iter().map(f64::from));
-        reference.extend(item.scores.iter().copied().map(f64::from));
-    }
-    let pearson = pearson_correlation(&actual, &reference);
-    let evidence = RerankProbeEvidence {
-        pearson,
-        pairs: actual.len(),
-        requests: fixture.items.len(),
-    };
-    let passed = pearson >= RERANK_PROBE_PEARSON_THRESHOLD;
-    let performance = if passed {
-        let cold_load_ms =
-            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("missing cold-load measurement for '{}'", model.model_id),
-                )
-            })?;
-        let perf = measure_rerank_perf(&state.runtime, &model, fixture, cold_load_ms).await?;
-        store_probe_cert_row(
-            state,
-            &model,
-            json!({ "task": "rerank", "metrics": evidence }),
-        )?;
-        Some(store_probe_perf_row(
-            state,
-            &model,
-            ModelTask::Rerank.as_str(),
-            &perf,
-        )?)
-    } else {
-        None
-    };
-    Ok(ProbeModelResult {
-        lane_result: json!({
-            "model_id": model.model_id,
-            "task": "rerank",
-            "fingerprint": model.fingerprint,
-            "numeric_profile_id": model.numeric_profile_id,
-            "status": if passed { "certified" } else { "uncertified" },
-            "evidence": evidence,
-            "thresholds": { "pearson": RERANK_PROBE_PEARSON_THRESHOLD },
-            "performance": performance,
-        }),
-        certified_vectors: None,
-    })
-}
-
-async fn execute_generate_probe_for_model(
-    state: &ModuleState,
-    model: Arc<EmbeddingModel>,
-    fixtures: &[GenerateProbeFixture],
-) -> Result<ProbeModelResult, WireOperationError> {
-    use owned_decode_routing::lane::LaneKind;
-
-    if !microllm_certification_required(&model) {
-        return Ok(ProbeModelResult {
-            lane_result: json!({
-                "model_id": model.model_id,
-                "task": "generate",
-                "fingerprint": model.fingerprint,
-                "numeric_profile_id": model.numeric_profile_id,
-                "status": "not_required",
-                "certification_required": false,
-                "reason": "worker_lane_uses_existing_dispatch_path",
-            }),
-            certified_vectors: None,
-        });
-    }
-
-    let spec = state
-        .runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| catalog.get(&model.model_id).map(|slot| slot.spec.clone()))
-        .ok_or_else(|| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("missing catalog entry for '{}'", model.model_id),
-            )
-        })?;
-    let entry = owned_decode_catalog_entry(&spec)
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let decode_fingerprint = entry
-        .decode_identity_inputs()
-        .decode_fingerprint()
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let processing_fingerprint = owned_decode_processing_fingerprint(&entry)
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let (runtime_config_digest, _) =
-        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
-    let constrained_runtime_identity =
-        owned_decode_probe_constraint_identity(&model, &decode_fingerprint)?;
-    let probe_snapshot_inputs = OwnedDecodeMatchInputs {
-        revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
-        profile_activation_epoch: state.profile_activation_epoch,
-        model_id: entry.entry_id.clone(),
-        decode_fingerprint: decode_fingerprint.0.clone(),
-        processing_fingerprint: processing_fingerprint.0.clone(),
-        runtime_config_digest,
-        constraint_runtime_identities: vec![constrained_runtime_identity],
-        worker_path_evidence: owned_decode_worker_path_identity(),
-        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
-        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
-    };
-    let probe_snapshot = ProbeSnapshot::capture(&probe_snapshot_inputs)
-        .map_err(|error| artifact_invalid_error(error.as_str()))?;
-    let Some(fixture) = fixtures.iter().find(|fixture| {
-        spec.owned_family.as_deref() == Some(fixture.family.as_str())
-            && spec.owned_dtype.as_deref() == Some(fixture.dtype.as_str())
-            && spec.quant == fixture.quant
-    }) else {
-        let evidence = json!({
-            "task": "generate",
-            "gate": "structural_band",
-            "blocking_reason": "fixture_unavailable",
-            "available_fixtures": fixtures
-                .iter()
-                .map(generate_fixture_provenance)
-                .collect::<Vec<_>>(),
-            "model_family": spec.owned_family,
-            "model_dtype": spec.owned_dtype,
-            "model_quant": spec.quant,
-        });
-        store_owned_probe_outcome(
-            state,
-            &model,
-            &probe_snapshot,
-            CertificationStatus::Uncertified,
-            evidence.clone(),
-        )?;
-        return Ok(ProbeModelResult {
-            lane_result: json!({
-                "model_id": model.model_id,
-                "task": "generate",
-                "fingerprint": decode_fingerprint,
-                "numeric_profile_id": model.numeric_profile_id,
-                "status": "uncertified",
-                "certification_required": true,
-                "blocking_reason": "fixture_unavailable",
-                "evidence": evidence,
-                "performance": Value::Null,
-            }),
-            certified_vectors: None,
-        });
-    };
-
-    if let Some(q8_identity) = entry.q8.as_ref() {
-        let trust_state = state
-            .runtime
-            .owned_decode_q8
-            .lock()
-            .ok()
-            .and_then(|registry| {
-                registry
-                    .entry(
-                        &entry.artifact_source_digest,
-                        &q8_identity.quantizer_revision,
-                    )
-                    .map(|artifact| artifact.trust_state)
-            });
-        if trust_state != Some(owned_decode_routing::q8ingest::TrustState::Trusted) {
-            let blocking_reason =
-                if trust_state == Some(owned_decode_routing::q8ingest::TrustState::Poisoned) {
-                    "artifact_poisoned"
-                } else {
-                    "owned_decode_not_certified"
-                };
-            let evidence = json!({
-                "task": "generate",
-                "gate": "q8_artifact_trust",
-                "blocking_reason": blocking_reason,
-                "fixture": generate_fixture_provenance(fixture),
-            });
-            store_owned_probe_outcome(
-                state,
-                &model,
-                &probe_snapshot,
-                CertificationStatus::Uncertified,
-                evidence.clone(),
-            )?;
-            return Ok(ProbeModelResult {
-                lane_result: json!({
-                    "model_id": model.model_id,
-                    "task": "generate",
-                    "fingerprint": decode_fingerprint,
-                    "numeric_profile_id": model.numeric_profile_id,
-                    "status": "uncertified",
-                    "certification_required": true,
-                    "blocking_reason": blocking_reason,
-                    "evidence": evidence,
-                    "performance": Value::Null,
-                }),
-                certified_vectors: None,
-            });
-        }
-    }
-
-    let mut exact_matches = 0_usize;
-    let mut accepted_structural_forks = Vec::new();
-    let mut tokens_compared = 0_usize;
-    let mut mismatches = Vec::new();
-    let mut chain_shape_mismatches = Vec::new();
-    let mut throughput_samples = Vec::with_capacity(fixture.items.len());
-    let mut latency_samples = Vec::with_capacity(fixture.items.len());
-    let chain_shapes = if state.runtime.decode_chain_k > 1 {
-        vec![1, state.runtime.decode_chain_k]
-    } else {
-        vec![1]
-    };
-    let mut baseline_outputs = Vec::with_capacity(fixture.items.len());
-    let mut last_worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
-
-    for (shape_index, chain_k) in chain_shapes.into_iter().enumerate() {
-        let mut worker_dispatch: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>> = None;
-        for (index, item) in fixture.items.iter().enumerate() {
-            let tokenized = model
-                .tokenizer
-                .tokenize_batch([item.prompt.as_str()])
-                .map_err(|error| {
-                    WireOperationError::from_stable(
-                        StableError::artifact_invalid(),
-                        format!("owned-decode probe tokenization failed: {error}"),
-                    )
-                })?;
-            let prompt = tokenized.batch.items.into_iter().next().unwrap_or_default();
-            let prompt_token_count = prompt.len().min(u32::MAX as usize) as u32;
-            if worker_dispatch.is_none() {
-                worker_dispatch = Some(
-                    cached_supervised_decode_dispatch_for_chain_k(
-                        state,
-                        &spec,
-                        &entry,
-                        prompt.clone(),
-                        None,
-                        OWNED_DECODE_PROBE_TIMEOUT_MS,
-                        chain_k,
-                    )
-                    .map_err(|error| match error {
-                        OwnedDecodeDispatchPreparationError::Refused(refusal) => {
-                            artifact_invalid_error(format!(
-                                "owned-decode certification cannot prepare worker: {}",
-                                refusal.as_str()
-                            ))
-                        }
-                        OwnedDecodeDispatchPreparationError::Wire(error) => error,
-                    })?,
-                );
-            }
-            let dispatch = worker_dispatch
-                .as_ref()
-                .ok_or_else(|| {
-                    WireOperationError::from_stable(
-                        StableError::artifact_invalid(),
-                        "owned-decode certification requires a supervised worker binary",
-                    )
-                })?
-                .clone();
-            let started = std::time::Instant::now();
-            let output = dispatch_supervised_decode(
-                dispatch,
-                prompt,
-                None,
-                OWNED_DECODE_PROBE_TIMEOUT_MS,
-                owned_decode_routing::DispatchedCommand {
-                    lane: LaneKind::OwnedDecode,
-                    decode_fingerprint: decode_fingerprint.clone(),
-                    processing_fingerprint: processing_fingerprint.clone(),
-                    prompt_token_count,
-                    max_tokens: item.max_new_tokens,
-                    generation_id: format!(
-                        "probe-{}-{shape_index}-{index}",
-                        state.module_generation
-                    ),
-                    constrained: false,
-                    chain_k,
-                },
-            )
-            .await?;
-
-            if shape_index == 0 {
-                let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
-                latency_samples.push(elapsed_secs * 1_000.0);
-                throughput_samples.push(output.generated_token_ids.len() as f64 / elapsed_secs);
-                tokens_compared = tokens_compared.saturating_add(item.expected_token_ids.len());
-                baseline_outputs.push(output.generated_token_ids.clone());
-                if output.generated_token_ids == item.expected_token_ids {
-                    exact_matches += 1;
-                } else if accepted_structural_forks.len() < fixture.structural_band.max_forks {
-                    if let Some(fork) = certified_generate_fork(
-                        item,
-                        &output.generated_token_ids,
-                        &fixture.structural_band,
-                    ) {
-                        accepted_structural_forks.push(fork);
-                    } else {
-                        mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
-                    }
-                } else {
-                    mismatches.push(decode_token_mismatch(item, &output.generated_token_ids));
-                }
-            } else if baseline_outputs.get(index) != Some(&output.generated_token_ids) {
-                chain_shape_mismatches.push(json!({
-                    "prompt_index": index,
-                    "configured_chain_k": chain_k,
-                    "baseline_k": 1,
-                    "expected_token_ids": baseline_outputs.get(index),
-                    "actual_token_ids": output.generated_token_ids,
-                }));
-            }
-        }
-        last_worker_dispatch = worker_dispatch;
-    }
-
-    let worker_dispatch = last_worker_dispatch.ok_or_else(|| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            "owned-decode certification requires a supervised worker binary",
-        )
-    })?;
-
-    let vocabulary_digest = owned_decode_vocabulary_digest(&model.tokenizer)?;
-    let constrained_schema = r#"{"type":"null"}"#;
-    let compiled = owned_decode_grammar_scheduler::compile_grammar(
-        constrained_schema,
-        &owned_decode_grammar_scheduler::CompileContext {
-            base_decode_fingerprint: decode_fingerprint.clone(),
-            tokenizer_vocabulary_digest: vocabulary_digest,
-        },
-        &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
-    )
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!(
-                "compile owned-decode certification constraint: {}",
-                error.message
-            ),
-        )
-    })?;
-    let constrained_runtime_identity = compiled.constraint.constraint_runtime_identity.digest();
-    let constrained_prompt = model
-        .tokenizer
-        .tokenize("Respond with exactly the JSON literal null and nothing else:\n")
-        .map_err(|error| artifact_invalid_error(error.to_string()))?
-        .ids;
-    let constrained_dispatch = worker_dispatch;
-    let constrained = dispatch_supervised_decode(
-        constrained_dispatch,
-        constrained_prompt.clone(),
-        Some(worker_constraint(&compiled.constraint)),
-        OWNED_DECODE_PROBE_TIMEOUT_MS,
-        owned_decode_routing::DispatchedCommand {
-            lane: LaneKind::OwnedDecode,
-            decode_fingerprint: decode_fingerprint.clone(),
-            processing_fingerprint,
-            prompt_token_count: constrained_prompt.len().min(u32::MAX as usize) as u32,
-            max_tokens: 64,
-            generation_id: format!("probe-{}-constrained", state.module_generation),
-            constrained: true,
-            chain_k: 1,
-        },
-    )
-    .await;
-    let constrained_schema_valid = constrained
-        .as_ref()
-        .ok()
-        .and_then(|output| model.tokenizer.decode(&output.generated_token_ids).ok())
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .is_some_and(|value| value.is_null());
-
-    let evidence = GenerateProbeEvidence {
-        token_exact_matches: exact_matches,
-        accepted_structural_forks: accepted_structural_forks.len(),
-        max_certified_forks: fixture.structural_band.max_forks,
-        items: fixture.items.len(),
-        tokens_compared,
-    };
-    let fixture_passed = exact_matches + accepted_structural_forks.len() == fixture.items.len()
-        && mismatches.is_empty()
-        && chain_shape_mismatches.is_empty();
-    let passed = fixture_passed && constrained_schema_valid;
-    let mut certification_evidence = json!({
-        "task": "generate",
-        "gate": store::PROBE_GATE_ID,
-        "blocking_reason": if passed {
-            Value::Null
-        } else if !chain_shape_mismatches.is_empty() {
-            json!("configured_chain_shape_diverged_from_k1")
-        } else if !fixture_passed {
-            json!("token_mismatch_outside_structural_band")
-        } else {
-            json!("constrained_worker_path_failed")
-        },
-        "metrics": evidence,
-         "accepted_forks": accepted_structural_forks,
-         "mismatches": mismatches,
-         "chain_shape_mismatches": chain_shape_mismatches,
-         "chain_shapes": if state.runtime.decode_chain_k > 1 {
-             vec![1, state.runtime.decode_chain_k]
-         } else {
-             vec![1]
-         },
-         "fixture": generate_fixture_provenance(fixture),
-        "worker_path": {
-            "transport": worker_catalog_transport(),
-            "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
-            "fixture_battery": "20x64-structural-band",
-            "prompt_count": fixture.items.len(),
-            "constrained_schema_valid": constrained_schema_valid,
-            "constrained_runtime_identities": if constrained_schema_valid {
-                vec![constrained_runtime_identity]
-            } else {
-                Vec::<String>::new()
-            },
-        },
-    });
-    certification_evidence["gates"] = owned_decode_probe_gate_evidence(passed);
-    store_owned_probe_outcome(
-        state,
-        &model,
-        &probe_snapshot,
-        if passed {
-            CertificationStatus::Certified
-        } else {
-            CertificationStatus::Uncertified
-        },
-        certification_evidence.clone(),
-    )?;
-
-    let performance = if passed {
-        let cold_load_ms =
-            model_cold_load_ms(&state.runtime, &model.model_id).ok_or_else(|| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("missing cold-load measurement for '{}'", model.model_id),
-                )
-            })?;
-        let perf = PerfBenchResult {
-            throughput_tok_s: median_value(&mut throughput_samples),
-            cold_load_ms,
-            single_item_latency_p50_ms: median_value(&mut latency_samples),
-            details: json!({
-                "mode": "supervised_worker_socket_single_stream",
-                "statistic": "median_over_fixtures",
-                "fixture_samples": fixture.items.len(),
-                "generated_tokens_per_fixture": fixture.items.first().map(|item| item.expected_token_ids.len()),
-            }),
-        };
-        Some(store_probe_perf_row(
-            state,
-            &model,
-            ModelTask::Generate.as_str(),
-            &perf,
-        )?)
-    } else {
-        None
-    };
-
-    Ok(ProbeModelResult {
-        lane_result: json!({
-            "model_id": model.model_id,
-            "task": "generate",
-            "fingerprint": decode_fingerprint,
-            "numeric_profile_id": model.numeric_profile_id,
-            "status": if passed { "certified" } else { "uncertified" },
-            "certification_required": true,
-            "blocking_reason": certification_evidence["blocking_reason"],
-            "evidence": certification_evidence,
-            "performance": performance,
-        }),
-        certified_vectors: None,
-    })
-}
-
-fn microllm_certification_required(model: &EmbeddingModel) -> bool {
-    engine_requires_microllm_certification(&model.engine_identity.engine)
-}
-
-fn engine_requires_microllm_certification(engine: &str) -> bool {
-    engine == "owned-metal-decode"
-}
-
-fn generate_fixture_provenance(fixture: &GenerateProbeFixture) -> Value {
-    json!({
-        "family": fixture.family,
-        "dtype": fixture.dtype,
-        "quant": fixture.quant,
-        "model": fixture.model,
-        "model_revision": fixture.model_revision,
-        "generation_command": fixture.generation_command,
-        "generation_command_sha256": fixture.generation_command_sha256,
-        "provenance": fixture.provenance,
-        "structural_band": {
-            "max_forks": fixture.structural_band.max_forks,
-            "top2_gap_ceiling": fixture.structural_band.top2_gap_ceiling,
-            "allowed_forks": fixture.structural_band.allowed_forks,
-        },
-        "items": fixture.items.len(),
-    })
-}
-
-fn certified_generate_fork<'a>(
-    item: &GenerateProbeItem,
-    actual: &[u32],
-    structural_band: &'a GenerateStructuralBand,
-) -> Option<&'a GenerateAllowedFork> {
-    let token_index = item
-        .expected_token_ids
-        .iter()
-        .zip(actual)
-        .position(|(expected, actual)| expected != actual)
-        .or_else(|| {
-            (item.expected_token_ids.len() != actual.len())
-                .then(|| actual.len().min(item.expected_token_ids.len()))
-        })?;
-    let oracle_token = *item.expected_token_ids.get(token_index)?;
-    let alternate_token = *actual.get(token_index)?;
-    structural_band.allowed_forks.iter().find(|fork| {
-        fork.id == item.id
-            && fork.token_index == token_index
-            && fork.oracle_token == oracle_token
-            && fork.alternate_token == alternate_token
-            && fork.oracle_top2.contains(&oracle_token)
-            && fork.oracle_top2.contains(&alternate_token)
-            && fork.top2_gap <= structural_band.top2_gap_ceiling
-    })
-}
-
-fn decode_token_mismatch(item: &GenerateProbeItem, actual: &[u32]) -> Value {
-    let divergence_index = item
-        .expected_token_ids
-        .iter()
-        .zip(actual)
-        .position(|(expected, actual)| expected != actual)
-        .unwrap_or_else(|| item.expected_token_ids.len().min(actual.len()));
-    json!({
-        "id": item.id,
-        "prompt": item.prompt,
-        "divergence_token_index": divergence_index,
-        "expected_token_id": item.expected_token_ids.get(divergence_index),
-        "actual_token_id": actual.get(divergence_index),
-        "expected_token_ids": item.expected_token_ids,
-        "actual_token_ids": actual,
-    })
-}
-
-fn store_owned_probe_outcome(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    snapshot: &ProbeSnapshot,
-    status: CertificationStatus,
-    evidence: Value,
-) -> Result<ProbeWriteOutcome, WireOperationError> {
-    let snapshot_inputs = snapshot.to_match_inputs();
-    let profile_state = state.store.profile_state().map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("read terminal probe profile state: {error}"),
-        )
-    })?;
-    let terminal = owned_decode_probe_match_inputs(
-        state,
-        model,
-        profile_state
-            .revisioned_machine_profile_hash
-            .ok_or_else(|| artifact_invalid_error("terminal probe profile hash is missing"))?,
-        profile_state
-            .profile_activation_epoch
-            .ok_or_else(|| artifact_invalid_error("terminal probe profile epoch is missing"))?,
-        snapshot_inputs.constraint_runtime_identities.clone(),
-    )?;
-    let row = OwnedDecodeCertificationRow {
-        status,
-        revisioned_machine_profile_hash: terminal.revisioned_machine_profile_hash.clone(),
-        profile_activation_epoch: terminal.profile_activation_epoch,
-        model_id: terminal.model_id.clone(),
-        decode_fingerprint: terminal.decode_fingerprint.clone(),
-        processing_fingerprint: terminal.processing_fingerprint.clone(),
-        runtime_config_digest: terminal.runtime_config_digest.clone(),
-        constraint_runtime_identities: terminal.constraint_runtime_identities.clone(),
-        worker_path_evidence: terminal.worker_path_evidence.clone(),
-        evidence_schema_revision: terminal.evidence_schema_revision.clone(),
-        g_dec_manifest_revision: terminal.g_dec_manifest_revision.clone(),
-        numeric_profile_id: Some(model.numeric_profile_id.clone()),
-        fingerprint: Fingerprint(terminal.decode_fingerprint.clone()),
-        certified_at_ms: now_ms(),
-        os_build: state.machine_profile.os_build.clone(),
-        module_generation: state.module_generation,
-        evidence,
-    };
-    let mut unconstrained_row = row.clone();
-    unconstrained_row.constraint_runtime_identities.clear();
-    let result = state
-        .store
-        .store_owned_decode_cert_rows_if_current(
-            &snapshot_inputs,
-            &terminal,
-            &[row, unconstrained_row],
-            now_ms(),
-        )
-        .map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("write owned-decode probe evidence: {error}"),
-            )
-        });
-    if result.is_ok() {
-        state.runtime.findings_changed.notify_one();
-    }
-    result
-}
-
-fn store_probe_cert_row(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    evidence: Value,
-) -> Result<(), WireOperationError> {
-    store_probe_outcome_row(state, model, CertificationStatus::Certified, evidence)
-}
-
-fn store_probe_outcome_row(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    status: CertificationStatus,
-    evidence: Value,
-) -> Result<(), WireOperationError> {
-    store_probe_outcome_for_fingerprint(state, model, &model.fingerprint, status, evidence)
-}
-
-fn store_probe_outcome_for_fingerprint(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    fingerprint: &Fingerprint,
-    status: CertificationStatus,
-    evidence: Value,
-) -> Result<(), WireOperationError> {
-    let certification_class = match model.task {
-        ModelTask::Embed => CertificationClass::Embedding,
-        ModelTask::Rerank => CertificationClass::Rerank,
-        ModelTask::Generate => {
-            return Err(WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                "generation probes cannot write embedding or rerank certification rows",
-            ))
-        }
-    };
-    let row = ClassScopedCertificationRow {
-        certification_class,
-        assurance_class: AssuranceClass::Measured,
-        status,
-        key_hash: state.machine_profile_hash.clone(),
-        machine_profile_hash: Some(state.machine_profile_hash.clone()),
-        remote_profile_hash: None,
-        identity_revision: None,
-        numeric_profile_id: Some(model.numeric_profile_id.clone()),
-        fingerprint: fingerprint.clone(),
-        certified_at_ms: now_ms(),
-        os_build: state.machine_profile.os_build.clone(),
-        module_generation: state.module_generation,
-        evidence,
-    };
-    let result = state
-        .store
-        .store_class_scoped_cert_row(&row)
-        .map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::engine_crashed(Some(100)),
-                format!("write certification row: {error}"),
-            )
-        });
-    if result.is_ok() {
-        state.runtime.findings_changed.notify_one();
-    }
-    result
-}
-
-fn store_probe_perf_row(
-    state: &ModuleState,
-    model: &EmbeddingModel,
-    workload: &str,
-    perf: &PerfBenchResult,
-) -> Result<PerfRow, WireOperationError> {
-    let row = PerfRow {
-        machine_profile_hash: state.machine_profile_hash.clone(),
-        model_id: model.model_id.clone(),
-        workload: workload.to_string(),
-        numeric_profile_id: model.numeric_profile_id.clone(),
-        fingerprint: model.fingerprint.clone(),
-        engine: model.engine_identity.engine.clone(),
-        measured_at_ms: now_ms(),
-        os_build: state.machine_profile.os_build.clone(),
-        module_generation: state.module_generation,
-        throughput_tok_s: perf.throughput_tok_s,
-        cold_load_ms: perf.cold_load_ms,
-        single_item_latency_p50_ms: perf.single_item_latency_p50_ms,
-        details: perf.details.clone(),
-    };
-    state.store.store_perf_row(&row).map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            format!("write performance row: {error}"),
-        )
-    })?;
-    Ok(row)
-}
-
-async fn measure_embed_perf(
-    runtime: &RuntimeState,
-    model: &EmbeddingModel,
-    tokenized: &TokenizedBatch,
-    cold_load_ms: f64,
-) -> Result<PerfBenchResult, WireOperationError> {
-    if tokenized.batch.items.is_empty() {
-        return Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("probe fixture has no embed items for '{}'", model.model_id),
-        ));
-    }
-    let mut cursor = 0_usize;
-    let mut total_tokens = 0_u64;
-    let mut batch_samples = 0_usize;
-    let started = std::time::Instant::now();
-    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
-        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
-    {
-        let mut batch_items = Vec::new();
-        let mut batch_tokens = 0_usize;
-        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_items.is_empty() {
-            let index = cursor % tokenized.batch.items.len();
-            let item_tokens = u64::from(
-                tokenized
-                    .real_token_counts
-                    .get(index)
-                    .copied()
-                    .unwrap_or_default(),
-            )
-            .max(1);
-            if !batch_items.is_empty()
-                && batch_tokens.saturating_add(item_tokens as usize) > PROBE_PERF_BATCH_TOKEN_BUDGET
-            {
-                break;
-            }
-            batch_items.push(tokenized.batch.items[index].clone());
-            batch_tokens = batch_tokens.saturating_add(item_tokens as usize);
-            total_tokens = total_tokens.saturating_add(item_tokens);
-            cursor += 1;
-            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
-                break;
-            }
-        }
-        execute_embedding(
-            runtime,
-            model,
-            TokenBatch { items: batch_items },
-            None,
-            None,
-        )
-        .await?;
-        batch_samples += 1;
-    }
-    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
-    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
-    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
-    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
-        let index = sample % tokenized.batch.items.len();
-        let started = std::time::Instant::now();
-        execute_embedding(
-            runtime,
-            model,
-            TokenBatch {
-                items: vec![tokenized.batch.items[index].clone()],
-            },
-            None,
-            None,
-        )
-        .await?;
-        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
-    Ok(PerfBenchResult {
-        throughput_tok_s,
-        cold_load_ms,
-        single_item_latency_p50_ms,
-        details: json!({
-            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
-            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
-            "throughput_total_tokens": total_tokens,
-            "throughput_samples": batch_samples,
-            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
-        }),
-    })
-}
-
-async fn measure_rerank_perf(
-    runtime: &RuntimeState,
-    model: &EmbeddingModel,
-    fixture: &RerankProbeFixture,
-    cold_load_ms: f64,
-) -> Result<PerfBenchResult, WireOperationError> {
-    let mut requests = Vec::new();
-    for item in &fixture.items {
-        let mut texts = Vec::with_capacity(item.candidates.len() + 1);
-        texts.push(item.query.as_str());
-        texts.extend(item.candidates.iter().map(String::as_str));
-        let tokenized = model
-            .tokenizer
-            .tokenize_batch_without_special_tokens(texts)
-            .map_err(|error| {
-                WireOperationError::from_stable(StableError::artifact_invalid(), error.to_string())
-            })?;
-        let mut token_items = tokenized.batch.items;
-        let query = token_items.remove(0);
-        let token_cost = token_items
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .len()
-                    .saturating_add(query.len())
-                    .saturating_add(3) as u64
-            })
-            .sum::<u64>()
-            .max(1);
-        let owned_pairs = owned_rerank_pairs(model, item.query.as_str(), &item.candidates)?;
-        requests.push((
-            RerankRequest {
-                query,
-                candidates: token_items,
-            },
-            token_cost,
-            owned_pairs,
-        ));
-    }
-    if requests.is_empty() {
-        return Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("probe fixture has no rerank items for '{}'", model.model_id),
-        ));
-    }
-    let mut cursor = 0_usize;
-    let mut total_tokens = 0_u64;
-    let mut batch_samples = 0_usize;
-    let started = std::time::Instant::now();
-    while total_tokens < PROBE_PERF_TARGET_TOTAL_TOKENS
-        || batch_samples < PROBE_PERF_MIN_BATCH_SAMPLES
-    {
-        let mut batch_tokens = 0_usize;
-        while batch_tokens < PROBE_PERF_BATCH_TOKEN_BUDGET || batch_tokens == 0 {
-            let (request, token_cost, owned_pairs) = &requests[cursor % requests.len()];
-            execute_rerank(
-                runtime,
-                model,
-                request.clone(),
-                owned_pairs.clone(),
-                None,
-                None,
-            )
-            .await?;
-            batch_tokens = batch_tokens.saturating_add(*token_cost as usize);
-            total_tokens = total_tokens.saturating_add(*token_cost);
-            cursor += 1;
-            if batch_tokens >= PROBE_PERF_BATCH_TOKEN_BUDGET {
-                break;
-            }
-        }
-        batch_samples += 1;
-    }
-    let elapsed_secs = started.elapsed().as_secs_f64().max(f64::EPSILON);
-    let throughput_tok_s = total_tokens as f64 / elapsed_secs;
-    let mut latency_samples = Vec::with_capacity(PROBE_PERF_SINGLE_SAMPLES);
-    for sample in 0..PROBE_PERF_SINGLE_SAMPLES {
-        let (request, _, owned_pairs) = &requests[sample % requests.len()];
-        let started = std::time::Instant::now();
-        execute_rerank(
-            runtime,
-            model,
-            request.clone(),
-            owned_pairs.clone(),
-            None,
-            None,
-        )
-        .await?;
-        latency_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-    let single_item_latency_p50_ms = median_ms(&mut latency_samples);
-    Ok(PerfBenchResult {
-        throughput_tok_s,
-        cold_load_ms,
-        single_item_latency_p50_ms,
-        details: json!({
-            "batch_token_budget": PROBE_PERF_BATCH_TOKEN_BUDGET,
-            "target_total_tokens": PROBE_PERF_TARGET_TOTAL_TOKENS,
-            "throughput_total_tokens": total_tokens,
-            "throughput_samples": batch_samples,
-            "single_samples": PROBE_PERF_SINGLE_SAMPLES,
-        }),
-    })
-}
-
-fn median_ms(samples: &mut [f64]) -> f64 {
-    median_value(samples)
-}
-
-fn median_value(samples: &mut [f64]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    samples.sort_by(f64::total_cmp);
-    let mid = samples.len() / 2;
-    if samples.len() % 2 == 1 {
-        samples[mid]
-    } else {
-        (samples[mid - 1] + samples[mid]) / 2.0
-    }
-}
-
-fn compute_knob_assignments(perf_rows: &[PerfRow]) -> Vec<KnobAssignmentRow> {
-    let mut by_workload = BTreeMap::<String, Vec<&PerfRow>>::new();
-    for row in perf_rows {
-        by_workload
-            .entry(row.workload.clone())
-            .or_default()
-            .push(row);
-    }
-    let mut assignments = Vec::new();
-    for (workload, rows) in by_workload {
-        let Some(performance_pick) = select_performance_row(&rows) else {
-            continue;
-        };
-        let quiet_pick = select_quiet_row(&rows).unwrap_or(performance_pick);
-        let balanced_pick = if quiet_pick.throughput_tok_s
-            >= performance_pick.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO
-        {
-            quiet_pick
-        } else {
-            performance_pick
-        };
-        for (knob, row) in [
-            (PerfKnob::Performance, performance_pick),
-            (PerfKnob::Balanced, balanced_pick),
-            (PerfKnob::Quiet, quiet_pick),
-        ] {
-            assignments.push(KnobAssignmentRow {
-                machine_profile_hash: row.machine_profile_hash.clone(),
-                workload: workload.clone(),
-                knob,
-                model_id: row.model_id.clone(),
-                numeric_profile_id: row.numeric_profile_id.clone(),
-                fingerprint: row.fingerprint.clone(),
-                engine: row.engine.clone(),
-                measured_at_ms: row.measured_at_ms,
-                os_build: row.os_build.clone(),
-                module_generation: row.module_generation,
-                throughput_tok_s: row.throughput_tok_s,
-                single_item_latency_p50_ms: row.single_item_latency_p50_ms,
-            });
-        }
-    }
-    assignments.sort_by(|left, right| {
-        left.workload
-            .cmp(&right.workload)
-            .then_with(|| left.knob.as_str().cmp(right.knob.as_str()))
-            .then_with(|| left.model_id.cmp(&right.model_id))
-    });
-    assignments
-}
-
-fn select_performance_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
-    let mut candidates = rows.to_vec();
-    candidates.sort_by(|left, right| {
-        right
-            .throughput_tok_s
-            .total_cmp(&left.throughput_tok_s)
-            .then_with(|| {
-                left.single_item_latency_p50_ms
-                    .total_cmp(&right.single_item_latency_p50_ms)
-            })
-            .then_with(|| left.model_id.cmp(&right.model_id))
-    });
-    candidates.into_iter().next()
-}
-
-fn select_quiet_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
-    let mut candidates = rows.to_vec();
-    candidates.sort_by(|left, right| {
-        right
-            .throughput_tok_s
-            .total_cmp(&left.throughput_tok_s)
-            .then_with(|| {
-                left.single_item_latency_p50_ms
-                    .total_cmp(&right.single_item_latency_p50_ms)
-            })
-            .then_with(|| left.model_id.cmp(&right.model_id))
-    });
-    candidates.into_iter().next()
-}
-
-fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
-    let mut payload = job_status_payload(state, record);
-    if let Value::Object(map) = &mut payload {
-        if let Some(Value::Object(result)) = record.result_json.clone() {
-            map.extend(result);
-        }
-    }
-    payload
-}
-
-fn probe_fixtures() -> Result<Vec<ProbeFixture>, WireOperationError> {
-    let mut minilm: ProbeFixture = serde_json::from_str(include_str!(
-        "fixtures/probe_corpus_minilm_ort_fp32.json"
-    ))
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("decode built-in MiniLM probe fixture: {error}"),
-        )
-    })?;
-    // Keep the original MiniLM fixture bytes unchanged while assigning its
-    // reference identity at load time for family-safe fixture selection.
-    minilm.family = Some("minilm".to_string());
-    minilm.reference_model = Some("minilm".to_string());
-    minilm.dims = fixture_reference_dims(&minilm);
-
-    let gte: ProbeFixture = serde_json::from_str(include_str!(
-        "fixtures/probe_corpus_gte_modernbert_ort_fp32.json"
-    ))
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("decode built-in GTE ModernBERT probe fixture: {error}"),
-        )
-    })?;
-
-    // Qwen3-Embedding reference vectors for the owned-cuda and owned-metal
-    // Qwen3 lanes: candle-transformers CPU f32, last-token pool/L2, generated
-    // independently of the kernels under test. Without this set, owned-cuda
-    // Qwen3 certification dead-ends at `reference_fixture_missing`.
-    let mut qwen3: ProbeFixture = serde_json::from_str(include_str!(
-        "fixtures/probe_corpus_qwen3_embedding_fp32.json"
-    ))
-    .map_err(|error| {
-        WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("decode built-in Qwen3 embedding probe fixture: {error}"),
-        )
-    })?;
-    qwen3.dims = fixture_reference_dims(&qwen3);
-
-    Ok(vec![minilm, gte, qwen3])
-}
-
-fn probe_reference_key(model: &EmbeddingModel) -> ProbeReferenceKey {
-    #[cfg(feature = "test-support")]
-    if model.engine_identity.engine == test_deterministic::NAME {
-        return ProbeReferenceKey {
-            family: test_deterministic::NAME.into(),
-            model: model.model_id.clone(),
-        };
-    }
-    let model_id = model.model_id.to_ascii_lowercase();
-    let family = model
-        .engine_identity
-        .build_flags
-        .get("family")
-        .cloned()
-        .or_else(|| {
-            if model_id.contains("gte-modernbert") || model_id.contains("modernbert") {
-                Some("gte-modernbert".to_string())
-            } else if model_id.contains("minilm") {
-                Some("minilm".to_string())
-            } else if model_id.contains("qwen3-embedding") {
-                Some("qwen3-0.6b".to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let reference_model = if model_id.contains("gte-modernbert-base") {
-        "gte-modernbert-base".to_string()
-    } else if model_id.contains("minilm") {
-        "minilm".to_string()
-    } else if model_id.contains("qwen3-embedding") {
-        "qwen3-embedding-0.6b".to_string()
-    } else {
-        model.model_id.clone()
-    };
-    ProbeReferenceKey {
-        family,
-        model: reference_model,
-    }
-}
-
-#[cfg(feature = "test-support")]
-fn test_deterministic_probe_fixtures() -> Vec<ProbeFixture> {
-    // Fixed reference values for one and two unknown tokens (ID 0) from
-    // the fixture tokenizer, independent of the engine's inference implementation.
-    let mut one = vec![0.0_f32; test_deterministic::dims()];
-    one[0] = std::f32::consts::FRAC_1_SQRT_2;
-    one[1] = std::f32::consts::FRAC_1_SQRT_2;
-    let mut two = vec![0.0_f32; test_deterministic::dims()];
-    two[0] = 1.0 / 5.0_f32.sqrt();
-    two[1] = 2.0 / 5.0_f32.sqrt();
-    [
-        "test-minilm",
-        "test-minilm-a",
-        "test-minilm-b",
-        "test-minilm-loaded",
-    ]
-    .into_iter()
-    .map(|id| {
-        serde_json::from_value(json!({
-            "family": test_deterministic::NAME, "reference_model": id,
-            "dims": test_deterministic::dims(),
-            "items": [
-                {"id": "one", "text": "probe", "vector": one},
-                {"id": "two", "text": "probe probe", "vector": two}
-            ]
-        }))
-        .expect("static deterministic probe fixture")
-    })
-    .collect()
-}
-
-fn probe_fixture_matches_key(fixture: &ProbeFixture, key: &ProbeReferenceKey) -> bool {
-    fixture.family.as_deref() == Some(key.family.as_str())
-        && fixture.reference_model.as_deref() == Some(key.model.as_str())
-}
-
-fn fixture_reference_dims(fixture: &ProbeFixture) -> Option<usize> {
-    fixture
-        .dims
-        .or_else(|| fixture.items.first().map(|item| item.vector.len()))
-}
-
-fn probe_fixture_provenance(fixture: &ProbeFixture) -> Value {
-    json!({
-        "comment": fixture.comment,
-        "family": fixture.family,
-        "reference_model": fixture.reference_model,
-        "model": fixture.model,
-        "dims": fixture_reference_dims(fixture),
-        "pooling": fixture.pooling,
-        "normalize": fixture.normalize,
-        "ort_version": fixture.ort_version,
-        "model_sha256": fixture.model_sha256,
-        "tokenizer_sha256": fixture.tokenizer_sha256,
-        "items": fixture.items.len(),
-        "first_id": fixture.items.first().map(|item| item.id.clone()),
-        "generation_command": fixture.generation_command,
-    })
-}
-
-fn rerank_probe_fixture() -> Result<RerankProbeFixture, WireOperationError> {
-    serde_json::from_str(include_str!("fixtures/probe_rerank_gte_modernbert_v1.json")).map_err(
-        |error| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("decode built-in rerank probe fixture: {error}"),
-            )
-        },
-    )
-}
-
-fn generate_probe_fixtures() -> Result<Vec<GenerateProbeFixture>, WireOperationError> {
-    [
-        include_str!("fixtures/probe_decode_qwen3_0_6b_f16_v1.json"),
-        include_str!("fixtures/probe_decode_lfm2_1_2b_f16_v1.json"),
-        include_str!("fixtures/probe_decode_qwen3_0_6b_q8_0_v1.json"),
-        include_str!("fixtures/probe_decode_lfm2_1_2b_q8_0_v1.json"),
-    ]
-    .into_iter()
-    .map(|fixture| {
-        serde_json::from_str(fixture).map_err(|error| {
-            WireOperationError::from_stable(
-                StableError::artifact_invalid(),
-                format!("decode built-in generate probe fixture: {error}"),
-            )
-        })
-    })
-    .collect()
-}
-
-fn probe_evidence(vectors: &[Vec<f32>], items: &[ProbeFixtureItem]) -> ProbeEvidence {
-    let reference = items
-        .iter()
-        .map(|item| item.vector.clone())
-        .collect::<Vec<_>>();
-    probe_evidence_between(vectors, &reference)
-}
-
-fn probe_evidence_between(left: &[Vec<f32>], right: &[Vec<f32>]) -> ProbeEvidence {
-    let items = left.len().min(right.len());
-    if items == 0 || left.len() != right.len() {
-        return ProbeEvidence {
-            mean_cosine: 0.0,
-            rank_overlap: 0.0,
-            worst_decile: 0.0,
-            items: 0,
-        };
-    }
-    let mean_cosine = left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| cosine(left, right))
-        .sum::<f64>()
-        / items as f64;
-    let (rank_overlap, worst_decile) = rank_overlap_metrics(left, right);
-    ProbeEvidence {
-        mean_cosine,
-        rank_overlap,
-        worst_decile,
-        items,
-    }
-}
-
-/// Reference similarity margin below which a neighbour swap counts as a near tie.
-///
-/// An f16 lane's similarities can differ from its fp32 reference through
-/// rounding alone. When the reference barely separates two neighbours, their
-/// order can change without a meaningful ranking-quality change. This margin
-/// treats only those near ties as overlap; it does not establish numerical
-/// equivalence or replace a lane's independent parity and certification gates.
-const RANK_OVERLAP_NEAR_TIE_MARGIN: f64 = 5e-4;
-
-/// Mean and worst-decile top-k neighbour overlap of `left` against `right`, the
-/// reference. A neighbour `left` ranks into the top k in place of a reference
-/// neighbour still counts as a hit when the reference separates the two by less
-/// than `RANK_OVERLAP_NEAR_TIE_MARGIN`.
-fn rank_overlap_metrics(left: &[Vec<f32>], right: &[Vec<f32>]) -> (f64, f64) {
-    let n = left.len().min(right.len());
-    if n <= 2 {
-        return (1.0, 1.0);
-    }
-    let k = (n / 10).max(1).min(n - 1);
-    let mut overlaps = Vec::with_capacity(n);
-    for query in 0..n {
-        let top_left = top_k_neighbors(query, left, k);
-        let top_right = top_k_neighbors(query, right, k);
-        let hits = near_tie_tolerant_hits(query, right, &top_left, &top_right);
-        overlaps.push(hits as f64 / k as f64);
-    }
-    overlaps.sort_by(f64::total_cmp);
-    let mean = overlaps.iter().sum::<f64>() / overlaps.len() as f64;
-    let worst_len = overlaps.len().div_ceil(10).max(1);
-    let worst = overlaps[..worst_len].iter().sum::<f64>() / worst_len as f64;
-    (mean, worst)
-}
-
-/// Neighbours of `query` that both top-k sets share, plus swaps the reference
-/// treats as near ties. Each reference neighbour the lane dropped is paired with
-/// a neighbour the lane took instead, weakest dropped with strongest taken, which
-/// pairs the closest reference similarities first; a pair whose reference margin
-/// is below `RANK_OVERLAP_NEAR_TIE_MARGIN` counts as a hit.
-fn near_tie_tolerant_hits(
-    query: usize,
-    reference: &[Vec<f32>],
-    lane_top: &BTreeSet<usize>,
-    reference_top: &BTreeSet<usize>,
-) -> usize {
-    let shared = lane_top.intersection(reference_top).count();
-    let similarity = |index: &usize| cosine(&reference[query], &reference[*index]);
-    let mut dropped = reference_top
-        .difference(lane_top)
-        .map(similarity)
-        .collect::<Vec<_>>();
-    let mut taken = lane_top
-        .difference(reference_top)
-        .map(similarity)
-        .collect::<Vec<_>>();
-    dropped.sort_by(f64::total_cmp);
-    taken.sort_by(|left, right| right.total_cmp(left));
-    let near_ties = dropped
-        .iter()
-        .zip(&taken)
-        .filter(|(dropped, taken)| *dropped - *taken < RANK_OVERLAP_NEAR_TIE_MARGIN)
-        .count();
-    shared + near_ties
-}
-
-fn top_k_neighbors(query: usize, vectors: &[Vec<f32>], k: usize) -> BTreeSet<usize> {
-    let mut scored = vectors
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != query)
-        .map(|(index, vector)| (cosine(&vectors[query], vector), index))
-        .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
-    scored.into_iter().take(k).map(|(_, index)| index).collect()
-}
-
-fn pearson_correlation(left: &[f64], right: &[f64]) -> f64 {
-    if left.len() != right.len() || left.len() < 2 {
-        return 0.0;
-    }
-    let left_mean = left.iter().sum::<f64>() / left.len() as f64;
-    let right_mean = right.iter().sum::<f64>() / right.len() as f64;
-    let mut numerator = 0.0;
-    let mut left_denominator = 0.0;
-    let mut right_denominator = 0.0;
-    for (left, right) in left.iter().zip(right) {
-        let left_delta = left - left_mean;
-        let right_delta = right - right_mean;
-        numerator += left_delta * right_delta;
-        left_denominator += left_delta * left_delta;
-        right_denominator += right_delta * right_delta;
-    }
-    let denominator = left_denominator.sqrt() * right_denominator.sqrt();
-    if denominator <= f64::EPSILON {
-        0.0
-    } else {
-        numerator / denominator
-    }
+    Ok(())
 }
 
 fn cosine(left: &[f32], right: &[f32]) -> f64 {
@@ -15167,34 +11485,6 @@ fn cosine(left: &[f32], right: &[f32]) -> f64 {
         .sum::<f64>()
         .sqrt();
     dot / (left_norm * right_norm + 1e-12)
-}
-
-async fn aliases_check_index(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: AliasesCheckIndexParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid aliases.check_index params: {error}"),
-            )
-        }
-    };
-    let alias_table = match state.store.alias_table() {
-        Ok(alias_table) => alias_table,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    let provenance_set = params
-        .provenance_set
-        .into_iter()
-        .filter(|fingerprint| !fingerprint.trim().is_empty())
-        .map(Fingerprint)
-        .collect::<BTreeSet<_>>();
-    let verdict = alias_table.check_index(&Fingerprint(params.index_fingerprint), &provenance_set);
-    result_outcome(json!({
-        "module_generation": state.module_generation,
-        "table_epoch": alias_table.table_epoch,
-        "verdict": verdict,
-    }))
 }
 
 async fn approvals_migrate_owned_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
@@ -15307,220 +11597,32 @@ async fn approvals_emergency_rollback(state: Arc<ModuleState>, params: Value) ->
     }
 }
 
-async fn alias_retract(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    mutate_alias_pair(state, params, AliasMutation::Retract).await
-}
-
-async fn alias_declare(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    mutate_alias_pair(state, params, AliasMutation::Declare).await
-}
-
-enum AliasMutation {
-    Declare,
-    Retract,
-}
-
-async fn mutate_alias_pair(
-    state: Arc<ModuleState>,
-    params: Value,
-    mutation: AliasMutation,
-) -> HandlerOutcome {
-    if !state.runtime.alias_admin_enabled {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::substitution_rejected(),
-                "alias admin mutations require alias_admin_enabled config",
-            ),
-        ));
-    }
-    let params: AliasPairParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid alias mutation params: {error}"),
-            )
-        }
-    };
-    let (left, right, evidence) = match params.fingerprints() {
-        Ok(pair) => pair,
-        Err(message) => return channel_error("invalid_request", message),
-    };
-    let result = match mutation {
-        AliasMutation::Declare => {
-            state
-                .store
-                .declare_alias_pair(&left, &right, &evidence, now_ms())
-        }
-        AliasMutation::Retract => {
-            state
-                .store
-                .retract_alias_pair(&left, &right, &evidence, now_ms())
-        }
-    };
-    match result {
-        Ok((changed, table_epoch)) => result_outcome(json!({
-            "module_generation": state.module_generation,
-            "changed": changed,
-            "table_epoch": table_epoch,
-        })),
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-fn certification_class_for_task(task: &str) -> Option<CertificationClass> {
-    match task {
-        "embed" => Some(CertificationClass::Embedding),
-        "rerank" => Some(CertificationClass::Rerank),
-        _ => None,
-    }
-}
-
-fn owned_measurement_report_row(row: OwnedDecodeCertificationRow) -> CertificationRow {
-    CertificationRow {
-        assurance_class: AssuranceClass::Measured,
-        status: row.status,
-        key: CertificationKey::Measured {
-            machine_profile_hash: row.revisioned_machine_profile_hash,
-        },
-        numeric_profile_id: row
-            .numeric_profile_id
-            .unwrap_or_else(|| NumericProfileId(String::new())),
-        fingerprint: row.fingerprint,
-        certified_at_ms: row.certified_at_ms,
-        os_build: row.os_build,
-        module_generation: row.module_generation,
-        evidence: row.evidence,
-    }
-}
-
 fn lane_measurement_rows(
     state: &ModuleState,
     model_id: &str,
-    task: &str,
     engine: &str,
     fingerprint: &Fingerprint,
 ) -> LaneMeasurementRows {
-    if resolved_catalog_lane(&state.runtime, model_id).is_some() {
-        return LaneMeasurementRows {
-            current_certification: None,
-            latest_certification: None,
-            current_probe: None,
-            latest_probe: None,
-            current_performance: None,
-            latest_performance: None,
-            certification_stale: false,
-            performance_stale: false,
-        };
-    }
-    let (current_certification, latest_certification, current_probe, latest_probe) =
-        if engine == DECODE_WORKER_ENGINE {
-            let current_probe = state
-                .store
-                .get_owned_decode_measurement_row(
-                    &state.revisioned_machine_profile_hash,
-                    state.profile_activation_epoch,
-                    model_id,
-                    &fingerprint.0,
-                    CERT_EVIDENCE_SCHEMA_REVISION,
-                    &[],
-                )
-                .ok()
-                .flatten()
-                .map(owned_measurement_report_row);
-            let current_certification = current_probe
-                .as_ref()
-                .filter(|row| row.status == CertificationStatus::Certified)
-                .cloned();
-            // `latest` must be a DIFFERENT fact from `current`, or every
-            // staleness reading derived from the pair is unsatisfiable: the
-            // consumers compute `current.is_none() && latest.is_some()`, which
-            // is a constant false when both name the same row. So look the lane
-            // up again without the profile scope -- "was this ever certified"
-            // against "is it certified here" -- which is what separates a lane
-            // whose profile rotated from one that was never probed.
-            let latest = if current_certification.is_some() {
-                current_certification.clone()
-            } else {
-                state
-                    .store
-                    .latest_owned_decode_measurement_row(
-                        model_id,
-                        &fingerprint.0,
-                        CERT_EVIDENCE_SCHEMA_REVISION,
-                        &[],
-                    )
-                    .ok()
-                    .flatten()
-                    .map(owned_measurement_report_row)
-            };
-            (current_certification, latest.clone(), current_probe, latest)
-        } else if let Some(certification_class) = certification_class_for_task(task) {
-            let current_certification = state
-                .store
-                .get_cert_row(
-                    certification_class,
-                    &state.machine_profile_hash,
-                    fingerprint,
-                )
-                .ok()
-                .flatten();
-            let latest_certification = if current_certification.is_some() {
-                current_certification.clone()
-            } else {
-                state
-                    .store
-                    .latest_cert_row(certification_class, fingerprint)
-                    .ok()
-                    .flatten()
-            };
-            let current_probe = state
-                .store
-                .get_probe_row(
-                    certification_class,
-                    &state.machine_profile_hash,
-                    fingerprint,
-                )
-                .ok()
-                .flatten();
-            let latest_probe = if current_probe.is_some() {
-                current_probe.clone()
-            } else {
-                state
-                    .store
-                    .latest_probe_row(certification_class, fingerprint)
-                    .ok()
-                    .flatten()
-            };
-            (
-                current_certification,
-                latest_certification,
-                current_probe,
-                latest_probe,
+    let current_probe = if engine == DECODE_WORKER_ENGINE
+        && resolved_catalog_lane(&state.runtime, model_id).is_none()
+    {
+        state
+            .store
+            .get_owned_decode_measurement_row(
+                &state.revisioned_machine_profile_hash,
+                state.profile_activation_epoch,
+                model_id,
+                &fingerprint.0,
+                CERT_EVIDENCE_SCHEMA_REVISION,
+                &[],
             )
-        } else {
-            (None, None, None, None)
-        };
-    let current_performance = state
-        .store
-        .get_perf_row(&state.machine_profile_hash, fingerprint)
-        .ok()
-        .flatten();
-    let latest_performance = if current_performance.is_some() {
-        current_performance.clone()
+            .ok()
+            .flatten()
     } else {
-        state.store.latest_perf_row(fingerprint).ok().flatten()
+        None
     };
     LaneMeasurementRows {
-        certification_stale: current_certification.is_none() && latest_certification.is_some(),
-        performance_stale: current_performance.is_none() && latest_performance.is_some(),
-        current_certification,
-        latest_certification,
-        current_probe,
-        latest_probe,
-        current_performance,
-        latest_performance,
+        certified: current_probe.is_some_and(|row| row.status == CertificationStatus::Certified),
     }
 }
 
@@ -15566,25 +11668,16 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
             let measurements = lane_measurement_rows(
                 state,
                 &slot.spec.model_id,
-                &slot.spec.task,
                 &slot.spec.engine,
                 &certification_fingerprint,
             );
-            CatalogLaneMeasurements {
-                slot,
-                certification_fingerprint,
-                measurements,
-            }
+            CatalogLaneMeasurements { slot, measurements }
         })
         .collect::<Vec<_>>();
     CatalogMeasurementSummary {
-        certification_stale: lanes
-            .iter()
-            .any(|lane| lane.measurements.certification_stale),
-        performance_stale: lanes.iter().any(|lane| lane.measurements.performance_stale),
         certified_lanes: lanes
             .iter()
-            .filter(|lane| lane.measurements.current_certification.is_some())
+            .filter(|lane| lane.measurements.certified)
             .count(),
         lanes,
     }
@@ -15629,292 +11722,6 @@ fn serving_admission_projection(
         ),
         None => (Some("disabled"), Some("approval_absent".to_string())),
     }
-}
-
-fn worker_health_from_slot(slot: &ModelSlotSnapshot) -> Option<worker_host::WorkerHostHealth> {
-    slot.loaded
-        .as_ref()
-        .and_then(|model| worker_health_for_model(model))
-}
-
-/// Lanes whose previously measured certification no longer permits serving.
-/// Profile-backed lanes use their on-device self-check instead of legacy rows.
-fn lanes_refusing_for_stale_certification(state: &ModuleState) -> Vec<String> {
-    let mut lanes = catalog_measurement_summary(state)
-        .lanes
-        .into_iter()
-        .filter(|lane| {
-            lane.measurements.certification_stale
-                && lane_requires_certification(&lane.slot)
-                && !lane
-                    .slot
-                    .spec
-                    .engine_identity
-                    .build_flags
-                    .contains_key("profile")
-        })
-        .map(|lane| lane.slot.spec.model_id)
-        .collect::<Vec<_>>();
-    lanes.sort();
-    lanes
-}
-
-fn lane_requires_certification(slot: &ModelSlotSnapshot) -> bool {
-    slot.spec.task != ModelTask::Generate.as_str()
-        || matches!(
-            slot.spec.engine.as_str(),
-            "owned-metal" | "owned-metal-decode"
-        )
-}
-
-fn lane_blocking_reason(
-    slot: &ModelSlotSnapshot,
-    measurements: &LaneMeasurementRows,
-    worker_quarantined: bool,
-) -> Option<&'static str> {
-    if !lane_requires_certification(slot) || measurements.current_certification.is_some() {
-        return None;
-    }
-    if let Some(reason) = measurements
-        .current_probe
-        .as_ref()
-        .and_then(|row| row.evidence.get("blocking_reason"))
-        .and_then(Value::as_str)
-    {
-        return Some(match reason {
-            "token_mismatch" => "token_mismatch",
-            "fixture_unavailable" => "fixture_unavailable",
-            "tokenization_failed" => "tokenization_failed",
-            "generation_failed" => "generation_failed",
-            "reference_fixture_missing" => "reference_fixture_missing",
-            "owned_cuda_unsupported" => "owned_cuda_unsupported",
-            "insufficient_vram" => "insufficient_vram",
-            "backend_unavailable" => "backend_unavailable",
-            _ => "probe_failed",
-        });
-    }
-    let failed_cuda_floor = matches!(
-        &slot.state,
-        ModelRuntimeState::Failed(error) if error.message.contains("owned-cuda floor refused")
-    );
-    if failed_cuda_floor {
-        return Some("owned_cuda_unsupported");
-    }
-    let failed_quarantined = matches!(
-        &slot.state,
-        ModelRuntimeState::Failed(error) if error.message.contains("quarantined")
-    );
-    if worker_quarantined || failed_quarantined {
-        Some("quarantined")
-    } else {
-        Some("probe_required")
-    }
-}
-
-fn certification_report_row(state: &ModuleState, row: &CertificationRow, stale: bool) -> Value {
-    let CertificationKey::Measured {
-        machine_profile_hash,
-    } = &row.key;
-    json!({
-        "assurance_class": row.assurance_class,
-        "status": row.status,
-        "machine_profile_hash": machine_profile_hash,
-        "remote_profile_hash": null,
-        "identity_revision": null,
-        "numeric_profile_id": row.numeric_profile_id,
-        "fingerprint": row.fingerprint,
-        "certified_at_ms": row.certified_at_ms,
-        "os_build": row.os_build,
-        "module_generation": row.module_generation,
-        "stale": stale,
-        "stale_os_build": row.os_build != state.machine_profile.os_build,
-        "evidence": row.evidence,
-    })
-}
-
-fn performance_report_row(state: &ModuleState, row: &PerfRow, stale: bool) -> Value {
-    json!({
-        "machine_profile_hash": row.machine_profile_hash,
-        "model_id": row.model_id,
-        "workload": row.workload,
-        "numeric_profile_id": row.numeric_profile_id,
-        "fingerprint": row.fingerprint,
-        "engine": row.engine,
-        "measured_at_ms": row.measured_at_ms,
-        "os_build": row.os_build,
-        "module_generation": row.module_generation,
-        "throughput_tok_s": row.throughput_tok_s,
-        "cold_load_ms": row.cold_load_ms,
-        "single_item_latency_p50_ms": row.single_item_latency_p50_ms,
-        "stale": stale,
-        "stale_os_build": row.os_build != state.machine_profile.os_build,
-        "details": row.details,
-    })
-}
-
-async fn probe_report(state: Arc<ModuleState>) -> HandlerOutcome {
-    let CatalogMeasurementSummary {
-        lanes: catalog_lanes,
-        certification_stale,
-        performance_stale,
-        ..
-    } = catalog_measurement_summary(&state);
-    let knob_assignments = match state.store.knob_assignments(&state.machine_profile_hash) {
-        Ok(assignments) => assignments,
-        Err(error) => return channel_error("store_failure", error.to_string()),
-    };
-    let active_assignments = knob_assignments
-        .iter()
-        .filter(|assignment| assignment.knob == state.runtime.knob)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut lanes = Vec::with_capacity(catalog_lanes.len());
-    let mut omission_records = Vec::new();
-    for catalog_lane in catalog_lanes {
-        let CatalogLaneMeasurements {
-            slot,
-            certification_fingerprint,
-            measurements,
-        } = catalog_lane;
-        if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, &slot.spec.model_id) {
-            let mut row = json!({"model_id":slot.spec.model_id,"task":entry.task,"engine":slot.spec.engine,"backend":backend.backend,"fingerprint":backend.fingerprint,"state":model_runtime_state_name(&slot.state),"certification_required":false,"certification_status":"not_required","certification_stale":false,"performance_stale":false});
-            if let Err(e) = catalog_list_row(&state, &mut row) {
-                return result_outcome(error_payload(&state, e));
-            }
-            lanes.push(row);
-            continue;
-        }
-        let worker = worker_health_from_slot(&slot);
-        let worker_quarantined = worker
-            .as_ref()
-            .map(|health| health.quarantined_models > 0)
-            .unwrap_or(false);
-        let certification_required = lane_requires_certification(&slot);
-        let blocking_reason = lane_blocking_reason(&slot, &measurements, worker_quarantined);
-        let probe_stale =
-            measurements.current_probe.is_none() && measurements.latest_probe.is_some();
-        let certification = measurements
-            .current_probe
-            .as_ref()
-            .or(measurements.latest_probe.as_ref())
-            .or(measurements.current_certification.as_ref())
-            .or(measurements.latest_certification.as_ref())
-            .map(|row| certification_report_row(&state, row, probe_stale));
-        let certification_status = lane_certification_status(
-            certification_required,
-            measurements.current_certification.is_some(),
-        );
-        let (serving_admission, serving_admission_reason) =
-            if slot.spec.engine != DECODE_WORKER_ENGINE {
-                (None, None)
-            } else {
-                match state
-                    .store
-                    .get_approval(&slot.spec.model_id, &certification_fingerprint.0)
-                {
-                    Ok(approval) => serving_admission_projection(
-                        true,
-                        measurements.current_certification.is_some(),
-                        approval.map(|approval| (approval.enabled, approval.disabled_reason)),
-                    ),
-                    Err(_) => (Some("disabled"), Some("approval_unavailable".to_string())),
-                }
-            };
-        let performance = measurements
-            .current_performance
-            .as_ref()
-            .or(measurements.latest_performance.as_ref())
-            .map(|row| performance_report_row(&state, row, measurements.performance_stale));
-        let error = match &slot.state {
-            ModelRuntimeState::Failed(error) => Some(
-                serde_json::to_value(error).expect("model error should serialize in probe.report"),
-            ),
-            _ => None,
-        };
-        let backend = slot
-            .spec
-            .engine_identity
-            .build_flags
-            .get("backend")
-            .cloned();
-        let support_state = if blocking_reason.is_some_and(|reason| {
-            matches!(
-                reason,
-                "owned_cuda_unsupported" | "backend_unavailable" | "insufficient_vram"
-            )
-        }) {
-            "unsupported"
-        } else if measurements.current_certification.is_some() {
-            "certified"
-        } else {
-            "uncertified"
-        };
-        let selected = active_assignments
-            .iter()
-            .any(|assignment| assignment.model_id == slot.spec.model_id);
-        let recommendation = json!({
-            "selected": selected,
-            "policy": "nonmac-lane-order-v1",
-            "reason": if selected { "active_machine_profile_assignment" } else { "not_selected" },
-            "machine_profile_hash": state.machine_profile_hash,
-        });
-        let omission = blocking_reason.filter(|reason| *reason != "probe_required").map(|reason| {
-            let record = json!({
-                "model_id": slot.spec.model_id,
-                "cell_id": format!("{}/{}/{}", slot.spec.engine, slot.spec.owned_family.as_deref().unwrap_or("unknown"), slot.spec.quant),
-                "reason": reason,
-                "machine_profile_hash": state.machine_profile_hash,
-            });
-            omission_records.push(record.clone());
-            record
-        });
-        lanes.push(json!({
-            "model_id": slot.spec.model_id,
-            "cell_id": format!("{}/{}/{}", slot.spec.engine, slot.spec.owned_family.as_deref().unwrap_or("unknown"), slot.spec.quant),
-            "task": slot.spec.task,
-            "engine": slot.spec.engine,
-            "backend": backend,
-            "fingerprint": certification_fingerprint,
-            "numeric_profile_id": slot.spec.numeric_profile_id,
-            "state": model_runtime_state_name(&slot.state),
-            "support_state": support_state,
-            "certification_required": certification_required,
-            "certification_status": certification_status,
-            "serving_admission": serving_admission,
-            "serving_admission_reason": serving_admission_reason,
-            "certified": measurements.current_certification.is_some(),
-            "certification_stale": measurements.certification_stale,
-            "performance_stale": measurements.performance_stale,
-            "blocking_reason": blocking_reason,
-            "compatibility": {
-                "task": slot.spec.task,
-                "family": slot.spec.owned_family,
-                "fingerprint": certification_fingerprint,
-                "dtype_or_quantization": slot.spec.quant,
-            },
-            "workload_eligibility": { "eligible": support_state != "unsupported" },
-            "recommendation": recommendation,
-            "omission": omission,
-            "certification": certification,
-            "performance": performance,
-            "error": error,
-            "worker": worker,
-        }));
-    }
-    result_outcome(json!({
-        "module_generation": state.module_generation,
-        "machine_profile_hash": state.machine_profile_hash,
-        "machine_profile_hash_revision": MACHINE_PROFILE_HASH_REVISION,
-        "machine_profile": state.machine_profile,
-        "current_knob": state.runtime.knob,
-        "certification_stale": certification_stale,
-        "performance_stale": performance_stale,
-        "knob_assignments": knob_assignments,
-        "active_assignments": active_assignments,
-        "omission_records": omission_records,
-        "recommendation_policy": "nonmac-lane-order-v1",
-        "lanes": lanes,
-    }))
 }
 
 /// Report admission capacity plus process-local `{ refusals: { reason: { count,
@@ -15964,7 +11771,6 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
             let measurements = lane_measurement_rows(
                 &state,
                 &model.model_id,
-                model.task.as_str(),
                 &model.engine_identity.engine,
                 &model.certification_fingerprint,
             );
@@ -15977,9 +11783,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
                 "inline_in_flight_executions": execution_in_flight,
                 "execution_wait_p50_ms": execution_wait_p50_ms,
                 "execution_wait_p95_ms": execution_wait_p95_ms,
-                "certified": measurements.current_certification.is_some(),
-                "certification_stale": measurements.certification_stale,
-                "performance_stale": measurements.performance_stale,
+                "certified": measurements.certified,
             })
         })
         .collect::<Vec<_>>();
@@ -16012,8 +11816,6 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "lanes": lanes,
         "catalog_lanes": catalog_measurements.lanes.len(),
         "certified_lanes": catalog_measurements.certified_lanes,
-        "certification_stale": catalog_measurements.certification_stale,
-        "performance_stale": catalog_measurements.performance_stale,
     }))
 }
 
@@ -16031,10 +11833,7 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
     }
 }
 
-fn certification_health(
-    state: &ModuleState,
-    persisted_stale_since_ms: Option<u64>,
-) -> CertificationHealth {
+fn certification_health(state: &ModuleState) -> CertificationHealth {
     let slots = state
         .runtime
         .catalog
@@ -16051,7 +11850,6 @@ fn certification_health(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut certification_stale = false;
     let lanes = slots
         .into_iter()
         .map(|slot| {
@@ -16069,25 +11867,17 @@ fn certification_health(
             let measurements = lane_measurement_rows(
                 state,
                 &slot.spec.model_id,
-                &slot.spec.task,
                 &slot.spec.engine,
                 &certification_fingerprint,
             );
-            certification_stale |= measurements.certification_stale;
             CertificationHealthLane {
                 model_id: slot.spec.model_id,
                 workload: slot.spec.task,
-                certified: measurements.current_certification.is_some(),
+                certified: measurements.certified,
             }
         })
         .collect();
-    CertificationHealth {
-        certification_stale,
-        stale_since_ms: certification_stale
-            .then_some(persisted_stale_since_ms)
-            .flatten(),
-        lanes,
-    }
+    CertificationHealth { lanes }
 }
 
 fn module_health(state: &ModuleState) -> ModuleHealth {
@@ -16099,16 +11889,13 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
             let measurements = lane_measurement_rows(
                 state,
                 &model.model_id,
-                model.task.as_str(),
                 &model.engine_identity.engine,
                 &model.certification_fingerprint,
             );
             LaneHealth {
                 model_id: model.model_id.clone(),
                 fingerprint: model.fingerprint.clone(),
-                certified: measurements.current_certification.is_some(),
-                certification_stale: measurements.certification_stale,
-                performance_stale: measurements.performance_stale,
+                certified: measurements.certified,
                 worker: worker_health_for_model(&model),
             }
         })
@@ -16121,7 +11908,6 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
                 state.revisioned_machine_profile_hash.clone(),
             ),
             profile_activation_epoch: Some(state.profile_activation_epoch),
-            certification_stale_since_ms: None,
             last_rotation_at_ms: None,
             last_rotation_reason: Some("unknown_previous_snapshot".to_string()),
             rotation_event_count: 0,
@@ -16130,15 +11916,13 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
             approval_certification_outcomes: Vec::new(),
         }
     });
-    let certification = certification_health(state, storage.certification_stale_since_ms);
+    let certification = certification_health(state);
     ModuleHealth {
         status: "ok".to_string(),
         module_generation: state.module_generation,
         loaded_models: state.runtime.loaded_model_count(),
         machine_profile_hash: state.legacy_machine_profile_hash.clone(),
-        certification_stale: certification.certification_stale,
         certification,
-        performance_stale: lanes.iter().any(|lane| lane.performance_stale),
         lanes,
         previous_revisioned_machine_profile_hash: storage.previous_revisioned_machine_profile_hash,
         current_revisioned_machine_profile_hash: storage
@@ -16360,7 +12144,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
 
             let (max_tokens, max_tokens_source) = if spec.task == "transcribe" {
                 (None, None)
-            } else if spec.engine_identity.build_flags.contains_key("profile") {
+            } else if release_profile(&spec.engine_identity).is_some() {
                 (Some(8192), Some("manifest".to_string()))
             } else if let Some(ref buckets) = bucket_ladder {
                 if let Some(&largest_bucket) = buckets.last() {
@@ -16429,29 +12213,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                         .flatten()
                         .is_some_and(|row| row.status == CertificationStatus::Certified);
                     Some(has_cert)
-                } else if let Some(class) = certification_class_for_task(&spec.task) {
-                    let has_cert = state
-                        .store
-                        .get_cert_row(
-                            class,
-                            &state.machine_profile_hash,
-                            &certification_fingerprint,
-                        )
-                        // Same fail-closed swallow as the decode arm above, and
-                        // the same remedy: report it rather than encode it.
-                        .inspect_err(|error| {
-                            tracing::warn!(
-                                target: "synapse.catalog",
-                                model_id = %spec.model_id,
-                                %error,
-                                "certification row unreadable; reporting certified=false"
-                            );
-                        })
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    Some(has_cert)
-                } else if spec.engine == "owned-metal" && spec.task == "generate" {
+                } else if matches!(spec.task.as_str(), "embed" | "rerank") {
                     Some(false)
                 } else {
                     // Lane classes with no certification concept (such as worker-backed llama generate)
@@ -16459,10 +12221,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                     None
                 };
 
-            // The same projection probe.report uses, so the two surfaces cannot
-            // disagree about a lane in the same second. `certified` above is
-            // evidence-for-this-machine; this is approved-to-serve, and a lane
-            // holding the first without the second refuses.
+            // Certification is evidence for this machine; serving also requires approval.
             let (serving_admission, serving_admission_reason) =
                 if spec.engine != DECODE_WORKER_ENGINE {
                     (None, None)
@@ -16480,17 +12239,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                     }
                 };
 
-            let warm_load_cost_hint_ms = last_cold_load_ms.or_else(|| {
-                if resolved_catalog_lane(&state.runtime, &spec.model_id).is_some() {
-                    return None;
-                }
-                state
-                    .store
-                    .get_perf_row(&state.machine_profile_hash, &spec.fingerprint)
-                    .ok()
-                    .flatten()
-                    .map(|perf| perf.cold_load_ms)
-            });
+            let warm_load_cost_hint_ms = last_cold_load_ms;
 
             let recommended_batch = recommended_batch_for_model(&spec, max_tokens);
 
@@ -16514,7 +12263,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
         .collect()
 }
 
-fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value {
+fn models_list_payload(state: &ModuleState) -> Value {
     // The durable download can become committed before its executor refreshes
     // the in-memory registry. Project catalog rows from current install records.
     if let Err(error) = sync_installed_catalog_slots(state) {
@@ -16560,9 +12309,9 @@ fn models_list_payload(state: &ModuleState, snapshot: CatalogSnapshot) -> Value 
     models.sort_by(|left, right| left["model_id"].as_str().cmp(&right["model_id"].as_str()));
     json!({
         "module_generation": state.module_generation,
-        "table_epoch": snapshot.table_epoch,
+        "table_epoch": FROZEN_TABLE_EPOCH,
         "models": models,
-        "alias_rows": snapshot.alias_rows,
+        "alias_rows": [],
     })
 }
 
@@ -16677,7 +12426,6 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("owned_decode.session_status", Query),
         op("owned_decode.disable", Mutate),
         op("owned_decode.revoke", Mutate),
-        op("model.load", Mutate),
         op("model.status", Query),
         op("model.unload", Mutate),
         op("models.list", Query),
@@ -16685,12 +12433,6 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("models.download", Mutate),
         op("models.download.cancel", Mutate),
         op("models.remove", Mutate),
-        op("probe.start", Mutate),
-        op("probe.status", Query),
-        op("probe.report", Query),
-        op("aliases.check_index", Query),
-        op("alias.retract", Mutate),
-        op("alias.declare", Mutate),
         op("cache.pin", Mutate),
         op("cache.gc", Mutate),
         op("admission.status", Query),
@@ -16870,6 +12612,21 @@ fn parse_module_config_json(
             "remote_providers were removed; modules should call providers directly".to_string(),
         ));
     }
+    const ALIAS_ADMIN_KEYS: [&str; 3] = [
+        "alias_admin_enabled",
+        "dev_alias_admin",
+        "enable_alias_admin",
+    ];
+    for object in [&value, &value["dev"]] {
+        if let Some(key) = ALIAS_ADMIN_KEYS
+            .iter()
+            .find(|key| object.get(**key).is_some())
+        {
+            return Err(ModuleError::Config(format!(
+                "alias_admin_enabled was removed (found '{key}'); aliases are no longer supported"
+            )));
+        }
+    }
     if matches!(tier, ConfigTier::Project)
         && value
             .as_object()
@@ -16896,6 +12653,20 @@ fn parse_module_config_json(
             ModuleError::Json(error)
         }
     })?;
+    for (index, preload) in config.preload_models.iter().enumerate() {
+        let engine = canonical_engine_name(&preload.engine);
+        if preload.profile.is_none() && engine != "owned-metal-decode" {
+            let model_id = preload
+                .model_id
+                .clone()
+                .unwrap_or_else(|| format!("{}-{index}", preload.engine));
+            if matches!(parse_model_task(preload.task.as_deref(), &engine, &model_id)?, ModelTask::Embed | ModelTask::Rerank) {
+                return Err(ModuleError::Config(format!(
+                    "preload model_id '{model_id}': free-form preloads for embed and rerank were removed; specify a profile"
+                )));
+            }
+        }
+    }
     validate_decode_chain_k(config.decode_chain_k)?;
     Ok(config)
 }
@@ -17091,9 +12862,6 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     mod retired_engine_tests;
-    mod owned_metal_readout_tests {
-        include!("owned_metal_readout_tests.rs");
-    }
     #[cfg(unix)]
     mod lane_pause_tests {
         include!("lane_pause_tests.rs");
@@ -17246,20 +13014,6 @@ mod tests {
             "self-check must not reacquire its own serving-gate guard"
         );
     }
-    #[tokio::test]
-    async fn profile_less_preload_keeps_probe_required() {
-        let (root, descriptor) = test_storage_descriptor("legacy-preload-gate");
-        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
-        let profile = test_machine_profile("legacy-preload-os");
-        store.observe_profile(&profile, 10, 1).unwrap();
-        let state = test_module_state(store, profile);
-        let error = resolve_model_for_request(state, None, ModelTask::Embed)
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.code, "probe_required");
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[cfg(unix)]
     #[test]
@@ -17269,8 +13023,7 @@ mod tests {
         let profile = "gte-modernbert-base.owned-vulkan";
         let state = catalog_test_state(&root, &descriptor, profile);
         let model = state.runtime.loaded_models().into_iter().next().unwrap();
-        let error =
-            ensure_model_certified(&state, &model, CertificationClass::Embedding).unwrap_err();
+        let error = check_profile_preload_certified(&state, &model).unwrap_err();
         assert_eq!(error.code, "self_check_failed");
         let refs = synapse_certify::self_check::load(profile).unwrap();
         let mut outputs = refs
@@ -17300,7 +13053,7 @@ mod tests {
         let (id, key) = profile_preload_check_key(&state, &model, profile).unwrap();
         let generation = catalog_check_generation(&state, &id, &key).unwrap();
         complete_profile_preload_check(&state, profile, &id, generation, &evaluation).unwrap();
-        assert!(ensure_model_certified(&state, &model, CertificationClass::Embedding).is_ok());
+        assert!(check_profile_preload_certified(&state, &model).is_ok());
         let Output::Embedding(vector) = &mut outputs.get_mut("short-0").unwrap().output else {
             unreachable!()
         };
@@ -17323,7 +13076,7 @@ mod tests {
         );
         assert_eq!(profile_preload_check_status(&state, &id).unwrap(), "failed");
         assert_eq!(
-            ensure_model_certified(&state, &model, CertificationClass::Embedding)
+            check_profile_preload_certified(&state, &model)
                 .unwrap_err()
                 .code,
             "self_check_failed"
@@ -20366,19 +16119,19 @@ mod tests {
         let handler = SynapseHandler::new("synapse".into());
         let flow = bind_with_scope(3, Some("flow-9"));
         handler.inner.record_bind_scope(&flow);
-        match handler.inner.flow_refusal(&flow.handle, "model.load") {
+        match handler.inner.flow_refusal(&flow.handle, "model.unload") {
             Some(HandlerOutcome::Error { code, message }) => {
                 assert_eq!(code, "flow_scope_refused");
-                assert!(message.contains("model.load"), "{message}");
+                assert!(message.contains("model.unload"), "{message}");
                 assert!(message.contains("flow-9"), "{message}");
             }
-            _ => panic!("model.load on a flow route must be refused"),
+            _ => panic!("model.unload on a flow route must be refused"),
         }
         // A rebind of the same handle without flow_id clears the record.
         handler.inner.record_bind_scope(&bind_with_scope(3, None));
         assert!(handler
             .inner
-            .flow_refusal(&flow.handle, "model.load")
+            .flow_refusal(&flow.handle, "model.unload")
             .is_none());
     }
 
@@ -20581,45 +16334,23 @@ mod tests {
     }
 
     #[test]
-    fn probe_report_separates_certification_from_serving_admission() {
-        let (serving_admission, serving_admission_reason) = serving_admission_projection(
-            true,
-            true,
-            Some((false, Some("held for operator review".to_string()))),
-        );
-        let lfm2_lane = json!({
-            "certification_status": lane_certification_status(true, true),
-            "serving_admission": serving_admission,
-            "serving_admission_reason": serving_admission_reason,
-        });
-        assert_eq!(lfm2_lane["certification_status"], "certified");
-        assert_eq!(lfm2_lane["serving_admission"], "disabled");
+    fn owned_decode_serving_admission_requires_approval_and_certification() {
         assert_eq!(
-            lfm2_lane["serving_admission_reason"],
-            "held for operator review"
+            serving_admission_projection(
+                true,
+                true,
+                Some((false, Some("held for operator review".into())))
+            ),
+            (Some("disabled"), Some("held for operator review".into()))
         );
-
-        let (serving_admission, serving_admission_reason) =
-            serving_admission_projection(true, false, Some((true, None)));
-        let uncertified_lane = json!({
-            "certification_status": lane_certification_status(true, false),
-            "serving_admission": serving_admission,
-            "serving_admission_reason": serving_admission_reason,
-        });
-        assert_eq!(uncertified_lane["certification_status"], "uncertified");
-
-        let (serving_admission, serving_admission_reason) =
-            serving_admission_projection(true, true, Some((true, None)));
-        let enabled_lane = json!({
-            "certification_status": lane_certification_status(true, true),
-            "serving_admission": serving_admission,
-            "serving_admission_reason": serving_admission_reason,
-        });
-        // Residency is no longer an input by construction: enabled-and-certified
-        // renders enabled whether or not a worker has spawned yet (the shape every
-        // decode lane is in right after a restart).
-        assert_eq!(enabled_lane["certification_status"], "certified");
-        assert_eq!(enabled_lane["serving_admission"], "enabled");
+        assert_eq!(
+            serving_admission_projection(true, false, Some((true, None))),
+            (Some("disabled"), Some("not_certified".into()))
+        );
+        assert_eq!(
+            serving_admission_projection(true, true, Some((true, None))),
+            (Some("enabled"), None)
+        );
     }
 
     #[test]
@@ -20822,7 +16553,7 @@ mod tests {
                 version: "test".to_string(),
                 build_flags: BTreeMap::new(),
             },
-            numeric_profile_id: NumericProfileId("test-profile".to_string()),
+            numeric_profile_id: synapse_core::NumericProfileId("test-profile".to_string()),
             fingerprint: Fingerprint("test-fingerprint".to_string()),
             worker_bin: None,
             worker_runtime_dir: None,
@@ -21734,93 +17465,6 @@ mod tests {
         fs::remove_dir_all(enabled_root).expect("remove enabled sampler state");
     }
 
-    #[tokio::test]
-    async fn health_reports_certification_staleness_for_rotated_profiles() {
-        let (root, descriptor) = test_storage_descriptor("health-certification-staleness");
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("test store opens"));
-        let profile_a = test_machine_profile("test-os-a");
-        store
-            .observe_profile(&profile_a, 10, 1)
-            .expect("first profile activates");
-        let fingerprint = Fingerprint("test-fingerprint".to_string());
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: profile_a.hash(),
-                machine_profile_hash: Some(profile_a.hash()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("test-profile".to_string())),
-                fingerprint: fingerprint.clone(),
-                certified_at_ms: 11,
-                os_build: profile_a.os_build.clone(),
-                module_generation: 1,
-                evidence: json!({}),
-            })
-            .expect("current certification stores");
-
-        let healthy_handler = SynapseHandler::new("synapse-test".to_string());
-        assert!(healthy_handler
-            .inner
-            .state
-            .set(test_module_state(Arc::clone(&store), profile_a.clone()))
-            .is_ok());
-        let healthy = healthy_handler.health().await;
-        assert!(matches!(healthy.status, subc_client_rs::HealthStatus::Ok));
-        let healthy_metrics = healthy.metrics.expect("health has metrics");
-        assert_eq!(
-            healthy_metrics["certification"]["certification_stale"],
-            Value::Bool(false)
-        );
-        assert_eq!(
-            healthy_metrics["certification"]["lanes"],
-            json!([{"model_id": "stuck-model", "workload": "embed", "certified": true}])
-        );
-
-        let profile_b = test_machine_profile("test-os-b");
-        store
-            .observe_profile(&profile_b, 12, 1)
-            .expect("rotated profile activates");
-        assert_eq!(
-            store
-                .observe_certification_stale(&profile_b.revisioned_hash(), 13)
-                .expect("staleness records"),
-            Some(13)
-        );
-        let stale_handler = SynapseHandler::new("synapse-test".to_string());
-        assert!(stale_handler
-            .inner
-            .state
-            .set(test_module_state(Arc::clone(&store), profile_b))
-            .is_ok());
-        let stale = stale_handler.health().await;
-        assert!(matches!(
-            stale.status,
-            subc_client_rs::HealthStatus::Degraded
-        ));
-        assert_eq!(
-            stale.detail.as_deref(),
-            Some("1 lane(s) (stuck-model) refuse requests: certification is stale after a machine profile change, such as a macOS update. Re-certify with: ck-synapse-opctl probe run")
-        );
-        let stale_metrics = stale.metrics.expect("health has metrics");
-        assert_eq!(
-            stale_metrics["certification"]["certification_stale"],
-            Value::Bool(true)
-        );
-        assert_eq!(stale_metrics["certification"]["stale_since_ms"], 13);
-        assert_eq!(
-            stale_metrics["certification"]["lanes"],
-            json!([{"model_id": "stuck-model", "workload": "embed", "certified": false}])
-        );
-
-        drop(stale_handler);
-        drop(healthy_handler);
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     #[test]
     fn a_held_cache_lease_is_reported_as_retryable_not_invalid() {
         // pin and gc serialize on one digest lease, so a pin refused for
@@ -21959,102 +17603,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_status_reports_catalog_certification_health_without_resident_lanes() {
-        let (root, descriptor) = test_storage_descriptor("admission-catalog-certification-health");
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("test store opens"));
-        let profile_a = test_machine_profile("test-os-a");
-        store
-            .observe_profile(&profile_a, 10, 1)
-            .expect("first profile activates");
-        let fingerprint = Fingerprint("test-fingerprint".to_string());
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: profile_a.hash(),
-                machine_profile_hash: Some(profile_a.hash()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("test-profile".to_string())),
-                fingerprint: fingerprint.clone(),
-                certified_at_ms: 11,
-                os_build: profile_a.os_build.clone(),
-                module_generation: 1,
-                evidence: json!({}),
-            })
-            .expect("current certification stores");
-        store
-            .store_perf_row(&PerfRow {
-                machine_profile_hash: profile_a.hash(),
-                model_id: "stuck-model".to_string(),
-                workload: "embed".to_string(),
-                numeric_profile_id: NumericProfileId("test-profile".to_string()),
-                fingerprint,
-                engine: LLAMA_ENGINE.to_string(),
-                measured_at_ms: 11,
-                os_build: profile_a.os_build.clone(),
-                module_generation: 1,
-                throughput_tok_s: 1.0,
-                cold_load_ms: 1.0,
-                single_item_latency_p50_ms: 1.0,
-                details: json!({}),
-            })
-            .expect("current performance row stores");
-
-        let healthy_state = test_module_state(Arc::clone(&store), profile_a);
-        assert!(healthy_state.runtime.loaded_models().is_empty());
-        let healthy_admission = response_result(
-            admission_status(Arc::clone(&healthy_state)).await,
-            "admission.status",
-        );
-        let healthy_probe = response_result(
-            probe_report(Arc::clone(&healthy_state)).await,
-            "probe.report",
-        );
-        assert_eq!(healthy_admission["lanes"], json!([]));
-        assert_eq!(healthy_admission["catalog_lanes"], 1);
-        assert_eq!(healthy_admission["certified_lanes"], 1);
-        assert_eq!(healthy_admission["certification_stale"], json!(false));
-        assert_eq!(
-            healthy_admission["certification_stale"],
-            healthy_probe["certification_stale"]
-        );
-        assert_eq!(
-            healthy_admission["performance_stale"],
-            healthy_probe["performance_stale"]
-        );
-
-        let profile_b = test_machine_profile("test-os-b");
-        store
-            .observe_profile(&profile_b, 12, 1)
-            .expect("rotated profile activates");
-        let stale_state = test_module_state(Arc::clone(&store), profile_b);
-        assert!(stale_state.runtime.loaded_models().is_empty());
-        let stale_admission = response_result(
-            admission_status(Arc::clone(&stale_state)).await,
-            "admission.status",
-        );
-        let stale_probe =
-            response_result(probe_report(Arc::clone(&stale_state)).await, "probe.report");
-        assert_eq!(stale_admission["lanes"], json!([]));
-        assert_eq!(stale_admission["catalog_lanes"], 1);
-        assert_eq!(stale_admission["certified_lanes"], 0);
-        assert_eq!(stale_admission["certification_stale"], json!(true));
-        assert_eq!(stale_admission["performance_stale"], json!(true));
-        assert_eq!(
-            stale_admission["certification_stale"],
-            stale_probe["certification_stale"]
-        );
-        assert_eq!(
-            stale_admission["performance_stale"],
-            stale_probe["performance_stale"]
-        );
-
-        drop(stale_state);
-        drop(healthy_state);
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
+    async fn admission_status_counts_registered_but_nonresident_profile_lanes() {
+        let (root, descriptor) = test_storage_descriptor("admission-catalog-lanes");
+        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
+        let state = test_module_state(store, test_machine_profile("test-os"));
+        state
+            .runtime
+            .catalog
+            .lock()
+            .unwrap()
+            .get_mut("stuck-model")
+            .unwrap()
+            .spec = {
+            let mut spec = catalog_fixture_config("gte-modernbert-base.owned-metal");
+            spec.model_id = "stuck-model".into();
+            spec
+        };
+        assert!(state.runtime.loaded_models().is_empty());
+        let reply = response_result(admission_status(state).await, "admission.status");
+        assert_eq!(reply["lanes"], json!([]));
+        assert_eq!(reply["catalog_lanes"], 1);
+        assert_eq!(reply["certified_lanes"], 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -22523,176 +18093,6 @@ mod tests {
     }
 
     #[test]
-    fn embed_probe_fixtures_cover_every_owned_family_with_reference_identity() {
-        let fixtures = probe_fixtures().expect("shipped embed fixtures should parse");
-        assert_eq!(fixtures.len(), 3);
-        let identities = fixtures
-            .iter()
-            .map(|fixture| {
-                (
-                    fixture.family.clone().unwrap_or_default(),
-                    fixture.reference_model.clone().unwrap_or_default(),
-                    fixture_reference_dims(fixture),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            identities,
-            BTreeSet::from([
-                ("minilm".to_string(), "minilm".to_string(), Some(384)),
-                (
-                    "gte-modernbert".to_string(),
-                    "gte-modernbert-base".to_string(),
-                    Some(768)
-                ),
-                (
-                    "qwen3-0.6b".to_string(),
-                    "qwen3-embedding-0.6b".to_string(),
-                    Some(1024)
-                ),
-            ])
-        );
-        // The owned-CUDA Qwen3 identity resolves to the Qwen3 fixture set; a
-        // missing set here is exactly the `reference_fixture_missing`
-        // certification dead-end this fixture closes.
-        let qwen3 = fixtures
-            .iter()
-            .find(|fixture| fixture.family.as_deref() == Some("qwen3-0.6b"))
-            .expect("qwen3 fixture present");
-        assert_eq!(qwen3.items.len(), 64);
-        assert!(qwen3.items.iter().all(|item| item.vector.len() == 1024));
-    }
-
-    #[test]
-    fn decode_certification_fixtures_are_the_pinned_twenty_by_sixty_four_oracles() {
-        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
-        assert_eq!(fixtures.len(), 4);
-        let lanes = fixtures
-            .iter()
-            .map(|fixture| (fixture.family.as_str(), fixture.quant.as_str()))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            lanes,
-            BTreeSet::from([
-                ("qwen3-0.6b", "f16"),
-                ("qwen3-0.6b", "q8_0"),
-                ("lfm2-1.2b", "f16"),
-                ("lfm2-1.2b", "q8_0"),
-            ])
-        );
-        for fixture in &fixtures {
-            assert_eq!(fixture.dtype, "f16");
-            assert_eq!(fixture.items.len(), 20);
-            assert!(fixture
-                .items
-                .iter()
-                .all(|item| { item.max_new_tokens == 64 && item.expected_token_ids.len() <= 64 }));
-            let command = fixture.generation_command.as_deref().unwrap();
-            assert_eq!(
-                fixture.generation_command_sha256,
-                sha256_hex(command.as_bytes())
-            );
-            assert_eq!(
-                fixture.provenance["generation_command_sha256"],
-                fixture.generation_command_sha256
-            );
-        }
-        assert_eq!(
-            fixtures
-                .iter()
-                .find(|fixture| fixture.family == "qwen3-0.6b" && fixture.quant == "f16")
-                .unwrap()
-                .provenance["source_tokens_sha256"],
-            "c3080813c45c364a73cbb6dce122afbba20e761b2189a31d0055ecf435232af1"
-        );
-        assert_eq!(
-            fixtures
-                .iter()
-                .find(|fixture| fixture.family == "lfm2-1.2b" && fixture.quant == "f16")
-                .unwrap()
-                .structural_band
-                .max_forks,
-            2
-        );
-        assert!(fixtures
-            .iter()
-            .filter(|fixture| fixture.quant == "q8_0")
-            .all(|fixture| fixture.structural_band.max_forks == 0));
-    }
-
-    #[test]
-    fn structural_band_accepts_only_a_pinned_top_two_fork() {
-        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
-        let fixture = fixtures
-            .iter()
-            .find(|fixture| fixture.family == "lfm2-1.2b" && fixture.quant == "f16")
-            .unwrap();
-        let item = fixture
-            .items
-            .iter()
-            .find(|item| item.id == "completion-15")
-            .unwrap();
-        let mut accepted = item.expected_token_ids.clone();
-        accepted[17] = 523;
-        assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_some());
-        accepted[17] = 524;
-        assert!(certified_generate_fork(item, &accepted, &fixture.structural_band).is_none());
-    }
-
-    /// A generate probe makes one measurement. Its certification evidence must
-    /// name that one gate with the probe's own verdict, and nothing about the
-    /// twelve G-DEC acceptance gates the probe does not run.
-    #[test]
-    fn generate_probe_records_only_its_own_gate() {
-        let passed = owned_decode_probe_gate_evidence(true);
-        assert_eq!(
-            passed,
-            json!([{
-                "id": "structural_band",
-                "status": "passed",
-                "manifest_revision": "owned-decode-probe-gates-v1",
-                "measures": [
-                    "fixture_tokens_within_structural_band",
-                    "configured_chain_shape_matches_k1",
-                    "constrained_worker_path_emits_null",
-                ],
-            }])
-        );
-        assert!(
-            !passed.to_string().contains("G-DEC"),
-            "the probe must not record any G-DEC gate: {passed}"
-        );
-        assert!(store::probe_gate_evidence_passed(
-            &json!({ "gates": passed }),
-            store::G_DEC_MANIFEST_REVISION
-        ));
-
-        let failed = owned_decode_probe_gate_evidence(false);
-        assert_eq!(failed[0]["id"], "structural_band");
-        assert_eq!(failed[0]["status"], "failed");
-        assert_eq!(failed.as_array().map(Vec::len), Some(1));
-        assert!(!store::probe_gate_evidence_passed(
-            &json!({ "gates": failed }),
-            store::G_DEC_MANIFEST_REVISION
-        ));
-    }
-
-    #[test]
-    fn corrupted_decode_fixture_records_the_first_diverging_prompt_and_token() {
-        let fixtures = generate_probe_fixtures().expect("shipped decode fixtures should parse");
-        let item = &fixtures[0].items[0];
-        let mut corrupted = item.expected_token_ids.clone();
-        corrupted[7] = corrupted[7].wrapping_add(1);
-
-        let mismatch = decode_token_mismatch(item, &corrupted);
-        assert_eq!(mismatch["id"], item.id);
-        assert_eq!(mismatch["prompt"], item.prompt);
-        assert_eq!(mismatch["divergence_token_index"], 7);
-        assert_eq!(mismatch["expected_token_id"], item.expected_token_ids[7]);
-        assert_eq!(mismatch["actual_token_id"], corrupted[7]);
-    }
-
-    #[test]
     fn worker_path_certification_accepts_exact_and_structural_batteries() {
         let evidence = |battery| {
             json!({
@@ -22708,13 +18108,6 @@ mod tests {
             "20x64-structural-band"
         )));
         assert!(!worker_path_certification(&evidence("unverified")));
-    }
-
-    #[test]
-    fn only_owned_microllm_lanes_require_decode_certification() {
-        assert!(engine_requires_microllm_certification("owned-metal-decode"));
-        assert!(!engine_requires_microllm_certification("owned-metal"));
-        assert!(!engine_requires_microllm_certification("llama"));
     }
 
     #[test]
@@ -22744,7 +18137,7 @@ mod tests {
             sampling: SamplingMode::GreedyTop1,
             grammar: None,
             required_fingerprint: None,
-            allow_equivalent: false,
+            _allow_equivalent: false,
             target_fingerprint: None,
             required_processing_fingerprint: None,
             owned_only: false,
@@ -22786,33 +18179,8 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_model_load_jobs_use_distinct_scratch_paths() {
-        assert_ne!(
-            model_load_scratch_path("job_first"),
-            model_load_scratch_path("job_second")
-        );
-    }
-
-    #[test]
     fn second_decode_request_extends_the_absolute_session_boundary() {
         assert_eq!(absolute_serving_boundary(11, 4), 15);
-    }
-
-    #[test]
-    fn model_load_scratch_removes_downloads_when_scope_exits() {
-        let path = env::temp_dir().join(format!(
-            "synapse-model-load-scratch-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        {
-            let scratch =
-                ModelLoadScratch::create(path.clone()).expect("create model-load scratch");
-            fs::write(scratch.path().join("model.bin"), b"downloaded model")
-                .expect("write scratch download");
-        }
-
-        assert!(!path.exists(), "scratch directory survived guard drop");
     }
 
     #[test]
@@ -23110,6 +18478,52 @@ mod tests {
                     error.to_string(),
                     "config: remote_providers were removed; modules should call providers directly"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn free_form_preloads_removed_from_all_config_tiers() {
+        for tier in [ConfigTier::User, ConfigTier::Project] {
+            for task in ["embed", "rerank"] {
+                let contents = format!(
+                    r#"{{"preload_models":[{{"model_id":"removed-{task}","engine":"owned-metal","task":"{task}","model_path":"model","tokenizer_path":"tokenizer"}}]}}"#
+                );
+                let error = parse_module_config_json(&contents, "test", tier)
+                    .expect_err("a free-form preload must fail closed");
+                assert_eq!(error.to_string(), format!(
+                    "config: preload model_id 'removed-{task}': free-form preloads for embed and rerank were removed; specify a profile"
+                ));
+            }
+            parse_module_config_json(r#"{"preload_models":[{"model_id":"llama-generation","engine":"llama","task":"generate","model_path":"model","tokenizer_path":"tokenizer"}]}"#, "test", tier).expect("llama generation preload parses");
+            for (engine, profile) in [
+                ("owned-metal-decode", "null"),
+                ("owned-metal", "\"kept-profile\""),
+            ] {
+                let contents = format!(
+                    r#"{{"preload_models":[{{"engine":"{engine}","profile":{profile},"model_path":"model","tokenizer_path":"tokenizer"}}]}}"#
+                );
+                parse_module_config_json(&contents, "test", tier).expect("kept preload parses");
+            }
+        }
+    }
+
+    #[test]
+    fn alias_admin_removed_from_all_config_tiers() {
+        for tier in [ConfigTier::User, ConfigTier::Project] {
+            for key in [
+                "alias_admin_enabled",
+                "dev_alias_admin",
+                "enable_alias_admin",
+            ] {
+                let setting = format!(r#"{{"{key}":false}}"#);
+                for contents in [setting.clone(), format!(r#"{{"dev":{setting}}}"#)] {
+                    let error = parse_module_config_json(&contents, "test", tier)
+                        .expect_err("even a disabled retired key must fail closed");
+                    assert_eq!(error.to_string(), format!(
+                        "config: alias_admin_enabled was removed (found '{key}'); aliases are no longer supported"
+                    ));
+                }
             }
         }
     }
@@ -23524,7 +18938,7 @@ mod tests {
         manifest["models"][model]["operation"] == "transcribe"
     }
 
-    fn catalog_fixture_config(id: &str) -> StoredModelConfig {
+    pub(super) fn catalog_fixture_config(id: &str) -> StoredModelConfig {
         let catalog = CatalogProfile::load(id).unwrap();
         let preload: PreloadModelConfig = serde_json::from_value(json!({
             "engine": catalog.profile()["lane"], "model_path": "package.safetensors", "tokenizer_path": "tokenizer.json"
@@ -24041,45 +19455,6 @@ mod tests {
     }
 
     #[test]
-    fn rank_overlap_ignores_near_ties_but_catches_clear_swaps() {
-        // 64 items, so k = 6. Queries 0-5 have items 6 and 7 at the edge of
-        // their top 6, and every other adjacent pair is 3e-3 apart.
-        let spaced = (0..64).map(|i| 0.9 - 0.003 * i as f64).collect::<Vec<_>>();
-        let swapped = |mut scale: Vec<f64>| {
-            scale.swap(6, 7);
-            scale
-        };
-
-        // Near tie: the reference separates items 6 and 7 by at most 1.8e-4 for
-        // any query, under RANK_OVERLAP_NEAR_TIE_MARGIN, so a lane that swaps
-        // them keeps full overlap even though its top-6 sets differ.
-        let mut near = spaced.clone();
-        near[7] = near[6] - 2e-4;
-        let reference = rank_fixture(&near);
-        let lane = rank_fixture(&swapped(near.clone()));
-        assert_ne!(
-            top_k_neighbors(0, &lane, 6),
-            top_k_neighbors(0, &reference, 6),
-            "the near-tie lane must really change a top-6 set"
-        );
-        let tied = probe_evidence_between(&lane, &reference);
-        assert_eq!((tied.rank_overlap, tied.worst_decile), (1.0, 1.0));
-
-        // Planted defect: the reference separates items 6 and 7 by at least
-        // 2.1e-3, so the same swap is a real ordering error and must fail the
-        // probe's 0.999 rank-overlap bar.
-        let reference = rank_fixture(&spaced);
-        let lane = rank_fixture(&swapped(spaced.clone()));
-        let defect = probe_evidence_between(&lane, &reference);
-        assert!(
-            defect.rank_overlap < 0.999,
-            "a clear-margin neighbour swap passed the rank-overlap bar: {}",
-            defect.rank_overlap
-        );
-        assert!(defect.mean_cosine > 0.999_99, "{}", defect.mean_cosine);
-    }
-
-    #[test]
     fn preload_profile_key_builds_every_catalog_lane_without_config_json() {
         let (dir, _) = test_storage_descriptor("catalog-preload");
         let manifest: Value =
@@ -24230,7 +19605,6 @@ mod tests {
                 },
             )
             .unwrap(),
-            numeric_profile_id: spec.numeric_profile_id.clone(),
             fingerprint: spec.fingerprint.clone(),
             certification_fingerprint: spec.fingerprint.clone(),
             engine_identity: spec.engine_identity.clone(),
@@ -24254,27 +19628,6 @@ mod tests {
         let mut spec = catalog_fixture_config(id);
         spec.model_id = "catalog-sequence-test".into();
         let model = catalog_test_model(dir, &spec);
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: if spec.task == "embed" {
-                    CertificationClass::Embedding
-                } else {
-                    CertificationClass::Rerank
-                },
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: state.machine_profile_hash.clone(),
-                machine_profile_hash: Some(state.machine_profile_hash.clone()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(spec.numeric_profile_id.clone()),
-                fingerprint: spec.fingerprint.clone(),
-                certified_at_ms: 11,
-                os_build: profile.os_build,
-                module_generation: 1,
-                evidence: json!({}),
-            })
-            .unwrap();
         state.runtime.catalog.lock().unwrap().insert(
             spec.model_id.clone(),
             ModelSlot {
@@ -24760,8 +20113,7 @@ mod tests {
                 .contains("worker load requires runtime_config"),
             "8192-token input must reach the worker host: {result}"
         );
-        let snapshot = state.store.catalog_snapshot().unwrap();
-        let listed = models_list_payload(&state, snapshot);
+        let listed = models_list_payload(&state);
         let row = listed["models"]
             .as_array()
             .unwrap()
@@ -24838,46 +20190,23 @@ mod tests {
     }
 
     #[test]
-    fn catalog_aliases_cannot_substitute_another_backend() {
-        let (dir, _) = test_storage_descriptor("catalog-aliases");
-        for (profile, foreign) in [
-            (
-                "gte-modernbert-base.ane-direct-worker",
-                "other-backend-fingerprint",
-            ),
-            ("gte-modernbert-base.owned-cuda", "metal-fingerprint"),
-        ] {
-            let spec = catalog_fixture_config(profile);
-            let model = catalog_test_model(&dir, &spec);
-            let alias = AliasTable {
-                table_epoch: 1,
-                rows: vec![synapse_core::AliasRow::with_evidence(
-                    spec.fingerprint.clone(),
-                    Fingerprint(foreign.into()),
-                    0,
-                    None,
-                    json!({}),
-                )],
-            };
-            assert!(equivalent_fingerprints(&alias, &model)
-                .iter()
-                .any(|fp| fp.0 == foreign));
-            assert_eq!(
-                check_fingerprint_constraints(&model, &alias, Some(foreign), None, true, None)
-                    .unwrap_err()
-                    .code,
-                "substitution_rejected"
-            );
-            check_fingerprint_constraints(
-                &model,
-                &alias,
-                Some(&spec.fingerprint.0),
-                None,
-                true,
-                None,
-            )
-            .unwrap();
-        }
+    fn catalog_fingerprint_constraints_reject_substitution_and_newer_epochs() {
+        let (dir, _) = test_storage_descriptor("catalog-fingerprint-constraints");
+        let spec = catalog_fixture_config("gte-modernbert-base.owned-cuda");
+        let model = catalog_test_model(&dir, &spec);
+        assert_eq!(
+            check_fingerprint_constraints(&model, Some("metal-fingerprint"), None, Some(2))
+                .unwrap_err()
+                .code,
+            "substitution_rejected"
+        );
+        assert_eq!(
+            check_fingerprint_constraints(&model, None, None, Some(3))
+                .unwrap_err()
+                .code,
+            "migration_required"
+        );
+        check_fingerprint_constraints(&model, Some(&spec.fingerprint.0), None, Some(2)).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -24966,75 +20295,6 @@ mod tests {
             .expect("load test tokenizer")
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn cuda_certification_evidence_uses_model_worker_without_blocking() {
-        let (storage_dir, descriptor) = test_storage_descriptor("cuda-evidence");
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
-        let profile = test_machine_profile("test-os");
-        store
-            .activate_profile(&profile, 1, 1000)
-            .expect("activate profile");
-        let state = test_module_state(store, profile);
-        let output = r#"{"status":"ok","code":null,"required":{},"observed":{"driver_api":13030,"compute_capability":{"major":8,"minor":9}}}"#;
-        let script = if cfg!(windows) {
-            format!("@echo off\r\nping -n 3 127.0.0.1 >nul\r\necho {output}\r\n")
-        } else {
-            format!("#!/bin/sh\nsleep 2\nprintf '%s\\n' '{output}'\n")
-        };
-        let probe_name = if cfg!(windows) {
-            "ck-probe.cmd"
-        } else {
-            "ck-probe.sh"
-        };
-        let worker = synapse_core::dev_binary::ckdev_script(probe_name, script.as_bytes())
-            .expect("publish test probe");
-        let mut spec = stuck_model_spec();
-        spec.engine_identity.engine = CUDA_WORKER_ENGINE.to_string();
-        spec.worker_bin = Some(worker);
-        state
-            .runtime
-            .catalog
-            .lock()
-            .unwrap()
-            .get_mut(&spec.model_id)
-            .unwrap()
-            .spec = spec.clone();
-        // This test exercises evidence collection only; no engine inference occurs.
-        let mut engine = OwnedMetalEmbedEngine::new(OwnedFamily::MiniLm, OwnedDType::F16);
-        let loaded_model = engine.insert_test_model("evidence-test".to_string(), 384, vec![128]);
-        let model = EmbeddingModel {
-            model_id: spec.model_id,
-            task: ModelTask::Embed,
-            loaded_model,
-            backend: EmbedBackend::Owned(Arc::new(Mutex::new(engine))),
-            tokenizer: make_test_tokenizer(&storage_dir, 128),
-            numeric_profile_id: spec.numeric_profile_id,
-            fingerprint: spec.fingerprint.clone(),
-            certification_fingerprint: spec.fingerprint,
-            engine_identity: spec.engine_identity,
-            owned_tokenizer_policy: None,
-            owned_decode_resolution_refusal: None,
-        };
-        let evidence = owned_cuda_evidence(&state, &model);
-        tokio::pin!(evidence);
-        // A blocking probe on this single-thread executor would complete before
-        // the timer can run. The model-specific probe must instead remain pending.
-        tokio::select! {
-            biased;
-            result = &mut evidence => panic!("probe completed before executor progressed: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        let evidence = evidence
-            .await
-            .expect("evidence task")
-            .expect("CUDA evidence");
-        assert_eq!(evidence["floor_state"], "supported");
-        assert_eq!(evidence["observed"]["driver_api"], 13030);
-        // Windows keeps the tokenizer file mapped while the process runs, so
-        // scratch removal is best effort here; assertions above are the contract.
-        let _ = fs::remove_dir_all(storage_dir);
-    }
-
     #[test]
     fn models_list_rows_carry_all_contract_fields_matching_enforced_sources() {
         use crate::worker_host::{WorkerEngine, WorkerHostConfig};
@@ -25070,7 +20330,6 @@ mod tests {
             loaded_model: metal_loaded,
             backend: EmbedBackend::Owned(Arc::new(Mutex::new(metal_engine))),
             tokenizer: make_test_tokenizer(&storage_dir, 512),
-            numeric_profile_id: metal_spec.numeric_profile_id.clone(),
             fingerprint: metal_spec.fingerprint.clone(),
             certification_fingerprint: metal_spec.fingerprint.clone(),
             engine_identity: metal_spec.engine_identity.clone(),
@@ -25124,7 +20383,6 @@ mod tests {
             loaded_model: ane_loaded,
             backend: EmbedBackend::Worker(Arc::new(Mutex::new(worker_engine))),
             tokenizer: make_test_tokenizer(&storage_dir, 512),
-            numeric_profile_id: ane_spec.numeric_profile_id.clone(),
             fingerprint: ane_spec.fingerprint.clone(),
             certification_fingerprint: ane_spec.fingerprint.clone(),
             engine_identity: ane_spec.engine_identity.clone(),
@@ -25173,11 +20431,7 @@ mod tests {
             );
         }
 
-        let snapshot = state
-            .store
-            .catalog_snapshot()
-            .expect("catalog snapshot reads");
-        let payload = models_list_payload(&state, snapshot);
+        let payload = models_list_payload(&state);
         let models = payload["models"]
             .as_array()
             .expect("models array in payload");
@@ -25308,12 +20562,8 @@ mod tests {
         assert_eq!(unloaded_row["certified"], false);
     }
 
-    /// Regresses the native CUDA model.load path: a source=file owned-cuda load
-    /// with family=qwen3/dtype=f16/execution=supervised must persist a complete
-    /// owned profile, survive the restart normalization round-trip, and reach a
-    /// package directory whose config.json the CUDA engine resolves.
     #[test]
-    fn owned_cuda_model_load_persists_owned_profile_and_assembles_package() {
+    fn owned_cuda_catalog_profile_survives_restore_and_assembles_package() {
         let scratch = std::env::temp_dir().join(format!(
             "synapse-owned-cuda-load-{}-{}",
             std::process::id(),
@@ -25331,92 +20581,12 @@ mod tests {
         std::fs::write(&model_src, &model_bytes).expect("write model");
         std::fs::write(&tokenizer_src, b"{}").expect("write tokenizer");
         std::fs::write(&config_src, b"{}").expect("write config");
-        // model.load construction: the same params execute_model_load_job
-        // parses, and the same owned profile it must now build for owned-cuda.
-        // source=file joins the top-level path with each file locator.
-        let params: ModelLoadParams = serde_json::from_value(json!({
-            "source": "file",
-            "path": scratch.to_string_lossy(),
-            "engine": CUDA_WORKER_ENGINE,
-            "task": "embed",
-            "model_id": "native-qwen3-load",
-            "family": "qwen3",
-            "dtype": "f16",
-            "execution": "supervised",
-            "max_tokens": 512,
-            "files": {
-                "model": "model.safetensors",
-                "tokenizer": "tokenizer.json",
-                "config": "config.json"
-            }
-        }))
-        .expect("model.load params must parse");
-        let engine_name = canonical_engine_name(&params.engine);
-        assert_eq!(engine_name, CUDA_WORKER_ENGINE);
-
-        let sources = resolve_model_load_sources(&params).expect("sources must resolve");
         let model_digest = format!("sha256:{}", sha256_hex(&model_bytes));
-        let tokenizer_digest = format!(
-            "sha256:{}",
-            sha256_hex(&std::fs::read(&tokenizer_src).expect("read tokenizer"))
-        );
-        let config_digest = format!(
-            "sha256:{}",
-            sha256_hex(&std::fs::read(&config_src).expect("read config"))
-        );
-
-        let meta = |digest: String,
-                    source_url: String,
-                    format: String,
-                    tokenizer_digest: Option<String>| ModelCacheMeta {
-            digest,
-            source_url,
-            format,
-            sanitized_tokenizer_digest: tokenizer_digest,
-            validation_state: synapse_core::CacheValidationState::Valid,
-            pins: Vec::new(),
-            tombstone: None,
-        };
-        let model_meta = meta(
-            model_digest.clone(),
-            local_file_url(&model_src),
-            default_artifact_format(&engine_name),
-            Some(tokenizer_digest.clone()),
-        );
-        let tokenizer_meta = meta(
-            tokenizer_digest.clone(),
-            local_file_url(&tokenizer_src),
-            "tokenizer_json".to_string(),
-            None,
-        );
-        let config_meta = meta(
-            config_digest.clone(),
-            local_file_url(&config_src),
-            "json".to_string(),
-            None,
-        );
-
-        let owned_profile =
-            model_load_owned_profile(&engine_name, &scratch, &params, Some(&config_meta), &[])
-                .expect("load profile must build")
-                .expect("CUDA load must retain its profile");
-
-        let package_digest = package_digest(&model_meta, &tokenizer_meta, Some(&config_meta), &[]);
-        let spec = build_loaded_catalog_model(
-            &params,
-            &engine_name,
-            &sources,
-            &model_meta,
-            &tokenizer_meta,
-            package_digest,
-            Vec::new(),
-            Some(owned_profile),
-            &InlineConfig::default(),
-            &JobConfig::default(),
-        )
-        .expect("catalog model must build");
-        // The persisted row is the defect: pre-fix these were all None because
-        // no owned profile reached build_stored_model_config.
+        let config_digest = format!("sha256:{}", sha256_hex(b"{}"));
+        let mut spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
+        spec.config_locator = Some(ModelAssetLocator::CacheDigest {
+            digest: config_digest.clone(),
+        });
         assert_eq!(spec.engine, CUDA_WORKER_ENGINE);
         assert_eq!(spec.owned_family.as_deref(), Some("qwen3-0.6b"));
         assert_eq!(spec.owned_dtype.as_deref(), Some("f16"));
@@ -25458,7 +20628,7 @@ mod tests {
         // budget must become 511 through the owned profile.
         assert_eq!(
             owned_tokenizer_max_tokens(spec.max_tokens, Some(&rehydrated)),
-            511
+            spec.max_tokens - 1
         );
 
         // The package the CUDA worker loads: assemble from the cache so the
@@ -25630,11 +20800,7 @@ mod tests {
             .expect("activate profile");
         let state = test_module_state(store, profile);
 
-        let snapshot = state
-            .store
-            .catalog_snapshot()
-            .expect("catalog snapshot reads");
-        let payload = models_list_payload(&state, snapshot);
+        let payload = models_list_payload(&state);
         let models = payload["models"]
             .as_array()
             .expect("models array in payload");
@@ -25705,11 +20871,7 @@ mod tests {
             );
         }
 
-        let snapshot = state
-            .store
-            .catalog_snapshot()
-            .expect("catalog snapshot reads");
-        let payload = models_list_payload(&state, snapshot);
+        let payload = models_list_payload(&state);
         let models = payload["models"]
             .as_array()
             .expect("models array in payload");
@@ -25741,102 +20903,6 @@ mod tests {
             decode_row["certified"], false,
             "uncertified decode lane must report certified=false"
         );
-    }
-
-    #[tokio::test]
-    async fn admission_telemetry_tracks_in_process_job_completion() {
-        let (root, descriptor) = test_storage_descriptor("telemetry-job-complete");
-        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
-        let profile = test_machine_profile("telemetry-complete-os");
-        store.observe_profile(&profile, 10, 1).unwrap();
-        let state = test_module_state(store, profile);
-
-        let outcome = probe_start(
-            Arc::clone(&state),
-            json!({"request_key": "probe-complete-1"}),
-        )
-        .await;
-        let result = response_result(outcome, "probe.start");
-        let job_id = result["job_id"].as_str().expect("job_id in result");
-
-        let mut done = false;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            let status_outcome = probe_status(Arc::clone(&state), json!({"job_id": job_id})).await;
-            let status_result = response_result(status_outcome, "probe.status");
-            if status_result["state"] == "done" {
-                done = true;
-                break;
-            }
-        }
-        assert!(done, "probe job did not finish in time");
-
-        let status_outcome = admission_status(Arc::clone(&state)).await;
-        let status = response_result(status_outcome, "admission.status");
-        assert_eq!(status["jobs_open"], 0, "jobs_open == 1");
-        assert_eq!(status["jobs_completed"], 1);
-        assert_eq!(status["jobs_minted"], 1);
-
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn admission_telemetry_tracks_in_process_job_failure() {
-        let (root, descriptor) = test_storage_descriptor("telemetry-job-fail");
-        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
-        let profile = test_machine_profile("telemetry-fail-os");
-        store.observe_profile(&profile, 10, 1).unwrap();
-        let state = test_module_state(store, profile);
-
-        let outcome = model_load(
-            Arc::clone(&state),
-            json!({
-                "request_key": "load-fail-1",
-                "model_id": "nonexistent-model",
-                "source": "file",
-                "path": "/tmp/nonexistent-model-dir-12345",
-                "files": {
-                    "model": {
-                        "url": "model.safetensors",
-                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-                    },
-                    "tokenizer": {
-                        "url": "tokenizer.json",
-                        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-                    }
-                },
-                "engine": "owned-metal"
-            }),
-        )
-        .await;
-        let result = response_result(outcome, "model.load");
-        let job_id = result["job_id"].as_str().expect("job_id in result");
-
-        let mut failed = false;
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            if let Ok(Some(record)) = state.store.get_job(job_id) {
-                if record.state == "failed_transient" || record.state == "failed_permanent" {
-                    failed = true;
-                    break;
-                }
-            }
-        }
-        if !failed {
-            let record = state.store.get_job(job_id).unwrap();
-            panic!("job state was: {record:?}");
-        }
-
-        let status_outcome = admission_status(Arc::clone(&state)).await;
-        let status = response_result(status_outcome, "admission.status");
-        assert_eq!(status["jobs_minted"], 1);
-        assert_eq!(status["jobs_failed"], 1);
-        assert_eq!(status["jobs_completed"], 0);
-        assert_eq!(status["jobs_open"], 0);
-
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -26646,26 +21712,6 @@ mod catalog_runtime_tests {
         );
     }
 
-    #[test]
-    fn model_load_uses_each_resolved_asset_scheme_for_digest_guards() {
-        let mut params: ModelLoadParams = serde_json::from_value(json!({"source":"file","path":"/tmp","engine":"owned-metal","task":"embed","files":{"model":{"url":"https://cdn.example.org/model","sha256":""},"tokenizer":"tokenizer.json"}})).unwrap();
-        assert!(resolve_model_load_sources(&params).is_err());
-        params.files.model = ModelLoadFileSpec::Detailed {
-            url: "https://cdn.example.org/model".into(),
-            sha256: "a".repeat(64),
-        };
-        assert!(resolve_model_load_sources(&params).is_ok());
-        params.expected_digest = Some("a".repeat(64));
-        params.files.tokenizer = ModelLoadFileSpec::Detailed {
-            url: "https://cdn.example.org/tokenizer".into(),
-            sha256: String::new(),
-        };
-        assert!(resolve_model_load_sources(&params).is_err());
-        params.files.tokenizer = ModelLoadFileSpec::Legacy("tokenizer.json".into());
-        params.engine = "llama".into();
-        assert!(validate_model_load_request(&params).is_err());
-    }
-
     #[tokio::test]
     async fn catalog_default_resolution_refuses_before_loading_and_ignores_knobs() {
         let (root, state) = isolated_catalog_state("default-resolution", true);
@@ -26926,8 +21972,6 @@ mod catalog_runtime_tests {
             "models.remove",
         );
         assert_eq!(result["error"]["code"], "unknown_model");
-        let result = response_result(model_load(state.clone(),json!({"source":"file","path":"/missing","engine":"owned-metal","model_id":"gte-modernbert-base-ane","files":{"model":"m","tokenizer":"t"}})).await,"model.load");
-        assert_eq!(result["error"]["code"], "invalid_request");
         drop(state);
         fs::remove_dir_all(root).unwrap();
     }
@@ -28661,9 +23705,7 @@ fn catalog_holders(
             }
             if matches!(
                 slot.state,
-                ModelRuntimeState::Loading
-                    | ModelRuntimeState::Resolving
-                    | ModelRuntimeState::Validating
+                ModelRuntimeState::Loading | ModelRuntimeState::Validating
             ) {
                 holders.push(json!({"kind":"request","lease_id":format!("catalog-load:{id}")}));
             }
@@ -31584,13 +26626,10 @@ async fn run_catalog_embed_job(
             .iter()
             .map(|n| u64::from(*n))
             .sum();
-        let alias_table = state.store.alias_table().map_err(catalog_store_error)?;
         check_fingerprint_constraints(
             &model,
-            &alias_table,
             parsed.target_fingerprint.as_deref(),
             parsed.required_fingerprint.as_deref(),
-            false,
             parsed.required_epoch,
         )?;
         Ok::<_, WireOperationError>(EmbedBatchJobWork {
@@ -31598,7 +26637,6 @@ async fn run_catalog_embed_job(
             request_digest: digest,
             ids: items.into_iter().map(|i| i.id).collect(),
             tokenized,
-            alias_table,
             request_bytes,
             total_tokens,
         })

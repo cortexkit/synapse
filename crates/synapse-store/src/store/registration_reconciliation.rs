@@ -3,8 +3,8 @@ use super::*;
 impl SynapseStore {
     /// Restore supported registrations without reviving retired engines.
     ///
-    /// Core ML rows stay in the table until the legacy-model migration removes
-    /// them. Other disallowed embed/rerank rows are deleted and their blob pins
+    /// Core ML and profile-less owned embed/rerank rows stay in the table until
+    /// the legacy-model migration removes them. Other disallowed rows are deleted and their blob pins
     /// released unless a remaining registration still uses the blob. Reserved
     /// catalog ids stay in the table but are not registered by this path.
     pub fn reconcile_persisted_registrations(
@@ -56,9 +56,13 @@ impl SynapseStore {
                 } else if is_reserved(&model_id) {
                     reconciliation.skipped_reserved.push(model_id);
                 } else {
-                    reconciliation
-                        .registrable
-                        .push(decode_model_config(config_json)?);
+                    let model = decode_model_config(config_json)?;
+                    if embed_or_rerank && !model.engine_identity.build_flags.contains_key("profile")
+                    {
+                        reconciliation.skipped_retired.push((model_id, engine));
+                    } else {
+                        reconciliation.registrable.push(model);
+                    }
                 }
             }
             for digest in released {

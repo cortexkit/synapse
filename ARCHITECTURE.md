@@ -21,9 +21,8 @@ Models come from two places:
   transcription, each pinned per backend with its fingerprint. Installs are
   explicit (`models.download`); a catalog lane checks itself on the device at first
   load and needs no probe or approval.
-- **Legacy lanes**, loaded from config preloads or `model.load`. They keep their
-  existing ids, fingerprints and probe/approval gates, because stored vectors depend
-  on them.
+- **Profile preloads**, configured with a manifest `profile`. These also check
+  themselves on-device. Parked owned-decode preloads still use their existing gates.
 
 ## Major pieces
 
@@ -157,8 +156,8 @@ rerank quality scoring.
    idempotent.
 4. The lane is made ready. Serving never downloads: a catalog model that isn't
    installed is refused with `model_not_installed`. The module verifies the installed
-   files, loads the lane and runs its self-check on first use. Legacy lanes need
-   current certification; owned generation also needs an enabled approval.
+   files, loads the lane and runs its self-check on first use. Parked owned
+   generation still needs current certification and an enabled approval.
 5. The work runs on the chosen lane: an in-process engine, or a worker over the
    worker protocol.
 6. Results are committed in pages as the job runs. Callers read them with
@@ -178,11 +177,6 @@ rerank quality scoring.
   revision. A failed check persists and the lane refuses. After an OS update, startup
   re-runs the checks of lanes that passed before. Catalog lanes never answer
   `probe_required` or `not_certified`.
-- **Legacy lanes need certification and approval.** Certification is keyed by the
-  machine profile hash (OS build, arch, chip, RAM class, ANE subtype and engine
-  identities), so an OS update rotates it and the lane refuses until an operator
-  re-probes (`ck-synapse-opctl probe run`). Health reports degraded meanwhile.
-  Probes never run on their own. Owned generation also needs an enabled approval row.
 - **The module owns tokenization.** Engines and workers receive token ids
   (`TokenBatch`), never text. Do not add a tokenizer inside an engine or worker.
 - **Workers are processes, not threads.** They connect back over a UNIX socket or a

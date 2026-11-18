@@ -185,15 +185,13 @@ fn add_unaffected_metal(fixture: &AneLaneFixture, rerank: bool) -> String {
     };
     let mut spec = catalog_fixture_config(profile);
     spec.model_id = if rerank {
-        "legacy-metal-rerank"
+        "profile-metal-rerank"
     } else {
-        "legacy-metal-embed"
+        "profile-metal-embed"
     }
     .into();
     let mut model = catalog_test_model(&fixture.root.join(&spec.model_id), &spec);
     let model_mut = Arc::get_mut(&mut model).unwrap();
-    model_mut.engine_identity.build_flags.remove("profile");
-    spec.engine_identity.build_flags.remove("profile");
     let EmbedBackend::Worker(engine) = &model_mut.backend else {
         unreachable!()
     };
@@ -201,29 +199,7 @@ fn add_unaffected_metal(fixture: &AneLaneFixture, rerank: bool) -> String {
         .lock()
         .unwrap()
         .attach_mock_worker_for_test(catalog_boundary_worker);
-    fixture
-        .state
-        .store
-        .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-            certification_class: if rerank {
-                CertificationClass::Rerank
-            } else {
-                CertificationClass::Embedding
-            },
-            assurance_class: AssuranceClass::Measured,
-            status: CertificationStatus::Certified,
-            key_hash: fixture.state.machine_profile_hash.clone(),
-            machine_profile_hash: Some(fixture.state.machine_profile_hash.clone()),
-            remote_profile_hash: None,
-            identity_revision: None,
-            numeric_profile_id: Some(spec.numeric_profile_id.clone()),
-            fingerprint: spec.fingerprint.clone(),
-            certified_at_ms: 11,
-            os_build: fixture.state.machine_profile.os_build.clone(),
-            module_generation: 1,
-            evidence: json!({}),
-        })
-        .unwrap();
+    *fixture.state.runtime.profile_check_passes_for_test.lock().unwrap() = true;
     let id = spec.model_id.clone();
     fixture.state.runtime.catalog.lock().unwrap().insert(
         id.clone(),

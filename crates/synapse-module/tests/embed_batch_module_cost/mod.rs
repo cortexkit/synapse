@@ -278,7 +278,6 @@ async fn embed_batch_module_cost_profile() {
     );
     let (_daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, module).await;
-    certify_preloaded_models(&mut consumer, route, 70_000).await;
 
     let body = serde_json::json!({
         "method": "embed.batch",

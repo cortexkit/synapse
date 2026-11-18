@@ -132,7 +132,7 @@ async fn catalog_transcribe_list_and_catalog_publish_duration_not_token_advice()
     let entry = state.runtime.release_catalog.entry(SPEECH).unwrap();
     install_record(&state, entry, "metal");
     install_record(&state, entry, "ane");
-    let listed = models_list_payload(&state, state.store.catalog_snapshot().unwrap());
+    let listed = models_list_payload(&state);
     let row = listed["models"]
         .as_array()
         .unwrap()
@@ -274,7 +274,7 @@ async fn catalog_transcribe_vulkan_floor_refuses_download_and_hides_installed_la
         .unwrap();
     assert_eq!(backend["runnable"], false);
     assert_eq!(backend["reason"], "device_below_floor");
-    let listed = models_list_payload(&state, state.store.catalog_snapshot().unwrap());
+    let listed = models_list_payload(&state);
     assert!(listed["models"]
         .as_array()
         .unwrap()

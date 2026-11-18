@@ -55,7 +55,9 @@ Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal dec
 kernels and `owned-decode-worker/` the supervisor and protocol.
 
 The model catalog is `crates/synapse-module/src/catalog/models.json`, validated by
-`catalog/mod.rs`. Worker supervision is in `crates/synapse-worker-host/src/worker_host/`:
+`catalog/mod.rs`. Catalog lanes and manifest profile preloads share sealed
+reference fixtures for on-device self-checks. Worker supervision is in
+`crates/synapse-worker-host/src/worker_host/`:
 `mod.rs` (spawn, handshake, requests, quarantine), `liveness.rs` (no-progress limits)
 and `ane_residency/` (the direct Neural Engine compile scheduler and executable budget).
 

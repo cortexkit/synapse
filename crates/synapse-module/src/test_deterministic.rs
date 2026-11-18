@@ -12,6 +12,12 @@ use synapse_core::{
 };
 
 pub const NAME: &str = "test-deterministic";
+// Keeps portable process-level tests on a profile preload without accelerator assets.
+pub const PROFILE: &str = "test-deterministic.fixture";
+
+pub fn is_profile(engine: &str, profile: &str) -> bool {
+    engine == NAME && profile == PROFILE
+}
 /// Vector width when no override is set.
 pub const DEFAULT_DIMS: usize = 384;
 
@@ -123,7 +129,7 @@ impl EmbedEngine for TestDeterministic {
     }
     fn embed_batch(&self, _: &LoadedModel, batch: TokenBatch) -> Result<Vectors, EngineError> {
         // The e2e harness arms this cross-process gate only after model setup, so
-        // it can hold one real execution permit without delaying probe batches.
+        // it can hold one real execution permit without delaying model setup.
         wait_on_test_embed_batch_gate();
 
         // An instant engine can finish before tests observe queued or running

@@ -453,13 +453,6 @@ async fn catalog_redirect_commit_reuse_projections_and_removal() {
     assert_eq!(again["state"], "committed");
     assert_eq!(again["job_id"], job);
     assert_eq!(h.server.paths().len(), 2);
-    let probe = h
-        .call(
-            "probe.start",
-            serde_json::json!({"models":["gte-modernbert-base-metal"]}),
-        )
-        .await;
-    assert_eq!(probe["error"]["code"], "invalid_request");
     let removed = h
         .call(
             "models.remove",
@@ -877,23 +870,10 @@ async fn catalog_conflicting_legacy_rows_do_not_change_catalog_projections() {
     let after = h.call("models.list", serde_json::json!({})).await;
     assert_eq!(before["models"], after["models"]);
     let after_admission = h.call("admission.status", serde_json::json!({})).await;
-    for field in [
-        "catalog_lanes",
-        "certified_lanes",
-        "certification_stale",
-        "performance_stale",
-    ] {
+    for field in ["catalog_lanes", "certified_lanes"] {
         assert_eq!(admission[field], after_admission[field], "{field}");
     }
-    let report = h.call("probe.report", serde_json::json!({})).await;
-    let row = report["lanes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["model_id"] == "gte-modernbert-base-metal")
-        .unwrap();
-    assert_eq!(row["certification_status"], "not_required");
-    assert_eq!(row["self_check"]["state"], "pending");
+    assert_eq!(after["models"][0]["self_check"]["state"], "pending");
 }
 
 #[tokio::test]
@@ -1732,50 +1712,14 @@ async fn catalog_endpoint_with_path_refuses_module_start_by_name() {
 }
 
 #[tokio::test]
-async fn catalog_free_form_load_refusals_happen_before_network_io() {
+async fn retired_management_operations_are_unknown_methods() {
     let mut h = CatalogHarness::start("ok", None).await;
-    let base = serde_json::json!({"source":"hf","repo":"fixture/model","files":{"model":"model.safetensors","tokenizer":"tokenizer.json"},"engine":"owned-metal","task":"embed","model_id":"free-form","family":"gte-modernbert","dtype":"f16","execution":"explicit","pooling":"cls"});
-    let mut requests = vec![base.clone()];
-    let mut main = base.clone();
-    main["revision"] = "main".into();
-    requests.push(main);
-    let mut llama = base.clone();
-    llama["engine"] = "llama".into();
-    llama["revision"] = "a".repeat(40).into();
-    requests.push(llama);
-    let mut reserved = base.clone();
-    reserved["model_id"] = "gte-modernbert-base".into();
-    reserved["revision"] = "a".repeat(40).into();
-    requests.push(reserved);
-    let mut main_url = base.clone();
-    main_url["revision"] = "a".repeat(40).into();
-    main_url["files"]["model"] = serde_json::json!({"url":format!("{}/fixture/model/resolve/main/model.safetensors", h.server.endpoint), "sha256":catalog_sha256(BODY)});
-    requests.push(main_url);
-    let mut unpinned_url = base.clone();
-    unpinned_url["source"] = "file".into();
-    unpinned_url["path"] = h.fixture_root.to_str().unwrap().into();
-    unpinned_url["files"]["model"] =
-        serde_json::json!({"url":format!("{}/file",h.server.endpoint)});
-    requests.push(unpinned_url);
-    for params in requests {
+    for method in ["model.load", "probe.start", "probe.status", "probe.report", "aliases.check_index", "alias.declare", "alias.retract"] {
         h.next_id += 1;
-        let frame = raw_route_frame(
-            &mut h.consumer,
-            h.route,
-            h.next_id,
-            serde_json::json!({"method":"model.load","params":params}),
-        )
-        .await;
+        let frame = raw_route_frame(&mut h.consumer, h.route, h.next_id, serde_json::json!({"method":method})).await;
+        assert_eq!(frame.frame_type, FrameType::Error);
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        let error = if body["result"]["error"].is_object() {
-            &body["result"]["error"]
-        } else if body["error"].is_object() {
-            &body["error"]
-        } else {
-            &body
-        };
-        assert_eq!(error["code"], "invalid_request", "{body}");
-        assert!(error["message"].is_string());
+        assert_eq!(body["code"], "unknown_method", "{method}: {body}");
     }
     assert!(h.server.paths().is_empty());
 }

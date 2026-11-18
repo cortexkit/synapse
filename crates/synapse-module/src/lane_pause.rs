@@ -152,16 +152,6 @@ fn admit_ane(
     ))
 }
 
-pub(super) fn admit_load(
-    runtime: &RuntimeState,
-    params: &ModelLoadParams,
-) -> Result<Option<OwnedRwLockReadGuard<()>>, WireOperationError> {
-    if !uses_ane(&canonical_engine_name(&params.engine)) {
-        return Ok(None);
-    }
-    admit_ane(runtime, params.model_id.as_deref().unwrap_or("model.load"))
-}
-
 /// Resolve identity only: do not load a model, validate a self-check, or choose
 /// a different backend because the requested lane is paused.
 pub(super) fn admit_request(

@@ -8,6 +8,12 @@ no project file exists. Only one module instance may hold the singleton lease on
 a machine. `remote_providers` is rejected: remote providers were removed; modules
 should call providers directly.
 
+`alias_admin_enabled` and its old spellings (`dev_alias_admin` and
+`enable_alias_admin`) are rejected at startup, even when set to `false`.
+Each `preload_models` entry must specify a manifest `profile`; a free-form
+entry fails startup with its `model_id`. Parked `owned-metal-decode` preloads
+are exempt and retain their existing certification and approval gates.
+
 Create a new example file rather than overwriting an existing configuration:
 
 ```sh
@@ -19,7 +25,6 @@ cat > "$config" <<'JSON'
   "grammar_enabled": false,
   "decode_chain_k": 1,
   "cache_max_bytes": 34359738368,
-  "alias_admin_enabled": false,
   "worker": { "load_timeout_ms": 180000 },
   "preload_models": [],
   "inline": {
@@ -31,8 +36,7 @@ cat > "$config" <<'JSON'
     "estimated_execution_ms": 25,
     "max_concurrent_workers": 2
   },
-  "jobs": { "ttl_ms": 86400000, "result_page_bytes": 524288, "bulk_quantum_tokens": 3072 },
-  "probe": { "mean_cosine_threshold": 0.999, "worst_decile_rank_overlap_threshold": 0.9, "ane_placement_threshold": 0.9 }
+  "jobs": { "execution_ttl_ms": 86400000, "result_page_bytes": 524288, "bulk_quantum_tokens": 3072 }
 }
 JSON
 python3 -m json.tool "$config" >/dev/null

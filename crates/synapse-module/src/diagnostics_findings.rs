@@ -74,7 +74,6 @@ fn finding(
 }
 
 struct Inputs {
-    stale: Vec<(u64, Value)>,
     failed_checks: Vec<(u64, Value)>,
     quarantined: Vec<(u64, Value)>,
 }
@@ -82,20 +81,6 @@ struct Inputs {
 fn inputs(state: &ModuleState, generated_at_ms: u64) -> Result<Inputs, ()> {
     // Unlike a diagnosis, an unreadable store is a failed query, not healthy evidence.
     state.store.storage_health_inputs().map_err(|_| ())?;
-    let health = module_health(state);
-    let stale_since_ms = health.certification.stale_since_ms;
-    let first_stale_evidence = stale_since_ms
-        .or(health.last_rotation_at_ms)
-        .unwrap_or(generated_at_ms);
-    let stale = lanes_refusing_for_stale_certification(state)
-        .into_iter()
-        .map(|lane_id| {
-            (
-                first_stale_evidence,
-                json!({"lane_id": lane_id, "stale_since_ms": stale_since_ms}),
-            )
-        })
-        .collect();
     let mut failed_checks = Vec::new();
     let mut quarantined = Vec::new();
     let mut lanes = catalog_measurement_summary(state).lanes;
@@ -137,7 +122,6 @@ fn inputs(state: &ModuleState, generated_at_ms: u64) -> Result<Inputs, ()> {
         }
     }
     Ok(Inputs {
-        stale,
         failed_checks,
         quarantined,
     })
@@ -145,23 +129,17 @@ fn inputs(state: &ModuleState, generated_at_ms: u64) -> Result<Inputs, ()> {
 
 fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Value, ()> {
     let Inputs {
-        stale,
         failed_checks,
         quarantined,
     } = inputs(state, generated_at_ms)?;
     let mut findings = Vec::new();
     findings.extend(finding(
-        "certification_stale",
-        "error",
-        stale,
+        "catalog_self_check_failed",
+        "warn",
+        failed_checks,
         generated_at_ms,
-        "certification-required lanes refuse requests because certification is stale.",
-        "Re-certify with: ck-synapse-opctl probe run",
-    ));
-    findings.extend(finding(
-        "catalog_self_check_failed", "warn", failed_checks, generated_at_ms,
         "catalog lanes have a failed on-device self-check.",
-        "Inspect probe.report and models.catalog for the failed lanes before retrying their self-checks.",
+        "Inspect models.catalog for the failed lanes before retrying their self-checks.",
     ));
     findings.extend(finding(
         "worker_quarantined",
@@ -169,7 +147,7 @@ fn reply(state: &ModuleState, window_ms: u64, generated_at_ms: u64) -> Result<Va
         quarantined,
         generated_at_ms,
         "lanes have worker-crash quarantine evidence (cached samples may outlive the fence).",
-        "Inspect probe.report for the affected lanes and worker health before retrying requests.",
+        "Inspect models.catalog for the affected lanes and worker health before retrying requests.",
     ));
     let mut body = json!({"result": {"generated_at_ms": generated_at_ms, "window_ms": window_ms, "findings": findings}});
     // Keep aggregate counts when large identifiers force evidence trimming.
@@ -196,20 +174,16 @@ pub(super) fn refresh(state: &ModuleState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let result = (|| {
         let Inputs {
-            stale,
             failed_checks,
             quarantined,
         } = inputs(state, now_ms())?;
-        let worst = if !stale.is_empty() {
-            "error"
-        } else if !failed_checks.is_empty() || !quarantined.is_empty() {
+        let worst = if !failed_checks.is_empty() || !quarantined.is_empty() {
             "warn"
         } else {
             "ok"
         };
         let mut findings = Vec::new();
         for (code, lanes) in [
-            ("certification_stale", stale),
             ("catalog_self_check_failed", failed_checks),
             ("worker_quarantined", quarantined),
         ] {
@@ -396,28 +370,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostics_findings_stale_certification_and_healthy_reply() {
+    async fn diagnostics_findings_remain_healthy_after_os_rotation_and_bound_samples() {
         let (root, descriptor) = test_storage_descriptor("diagnostics-findings");
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
         let profile_a = test_machine_profile("test-os-a");
         store.observe_profile(&profile_a, 10, 1).unwrap();
-        store
-            .store_class_scoped_cert_row(&ClassScopedCertificationRow {
-                certification_class: CertificationClass::Embedding,
-                assurance_class: AssuranceClass::Measured,
-                status: CertificationStatus::Certified,
-                key_hash: profile_a.hash(),
-                machine_profile_hash: Some(profile_a.hash()),
-                remote_profile_hash: None,
-                identity_revision: None,
-                numeric_profile_id: Some(NumericProfileId("test-profile".into())),
-                fingerprint: Fingerprint("test-fingerprint".into()),
-                certified_at_ms: 11,
-                os_build: profile_a.os_build.clone(),
-                module_generation: 1,
-                evidence: json!({"private": "not exposed"}),
-            })
-            .unwrap();
         let healthy = test_module_state(Arc::clone(&store), profile_a);
         refresh(&healthy);
         let generation = || {
@@ -437,18 +394,9 @@ mod tests {
         );
         let profile_b = test_machine_profile("test-os-b");
         store.observe_profile(&profile_b, 12, 1).unwrap();
-        store
-            .observe_certification_stale(&profile_b.revisioned_hash(), 13)
-            .unwrap();
         let stale = test_module_state(Arc::clone(&store), profile_b);
         refresh(&stale);
-        assert_eq!(
-            generation(),
-            1,
-            "stale certification advances the generation once"
-        );
-        refresh(&stale);
-        assert_eq!(generation(), 1, "an unchanged digest is silent");
+        assert_eq!(generation(), 0, "OS rotation alone is healthy");
         let result = response_result(
             dispatch_request(
                 Arc::clone(&stale),
@@ -463,27 +411,7 @@ mod tests {
         );
         assert_eq!(result["window_ms"], 1);
         assert!(result["generated_at_ms"].as_u64().is_some());
-        assert_eq!(
-            result["findings"],
-            json!([{
-                "check": "certification_stale", "key": "certification_stale", "severity": "error",
-                "count": 1, "first_seen_ms": 13, "last_seen_ms": result["generated_at_ms"],
-                "summary": "1 certification-required lanes refuse requests because certification is stale.",
-                "samples": [{"lane_id": "stuck-model", "stale_since_ms": 13}],
-                "hint": "Re-certify with: ck-synapse-opctl probe run",
-            }])
-        );
-        println!(
-            "STALE_DIAGNOSTICS_REPLY={}",
-            serde_json::to_string(&json!({"result": result})).unwrap()
-        );
-        assert_eq!(
-            store
-                .storage_health_inputs()
-                .unwrap()
-                .certification_stale_since_ms,
-            Some(13)
-        );
+        assert_eq!(result["findings"], json!([]));
         assert_eq!(
             stale.runtime.loaded_model_count(),
             0,
@@ -492,26 +420,24 @@ mod tests {
         let base = stale.runtime.catalog.lock().unwrap()["stuck-model"]
             .spec
             .clone();
-        let mut profile_spec = base.clone();
+        let quarantined = || {
+            ModelRuntimeState::Failed(WireOperationError::from_stable(
+                StableError::engine_crashed(Some(100)),
+                "worker quarantined",
+            ))
+        };
+        let mut profile_spec =
+            crate::tests::catalog_fixture_config("gte-modernbert-base.owned-metal");
         profile_spec.model_id = "profile-lane".into();
-        profile_spec
-            .engine_identity
-            .build_flags
-            .insert("profile".into(), "self-checked".into());
         stale.runtime.catalog.lock().unwrap().insert(
             profile_spec.model_id.clone(),
             ModelSlot {
                 spec: profile_spec,
                 loaded: None,
-                state: ModelRuntimeState::Unloaded,
+                state: quarantined(),
                 last_cold_load_ms: None,
                 notify: Arc::new(Notify::new()),
             },
-        );
-        assert_eq!(
-            reply(&stale, 1, 100).unwrap()["findings"][0]["count"],
-            1,
-            "profile self-check lanes must not count as stale legacy certification"
         );
         for index in 0..6 {
             let mut spec = base.clone();
@@ -521,7 +447,7 @@ mod tests {
                 ModelSlot {
                     spec,
                     loaded: None,
-                    state: ModelRuntimeState::Unloaded,
+                    state: quarantined(),
                     last_cold_load_ms: None,
                     notify: Arc::new(Notify::new()),
                 },
@@ -540,7 +466,7 @@ mod tests {
             ModelSlot {
                 spec: oversized,
                 loaded: None,
-                state: ModelRuntimeState::Unloaded,
+                state: quarantined(),
                 last_cold_load_ms: None,
                 notify: Arc::new(Notify::new()),
             },

@@ -18,7 +18,7 @@ use common::{
     raw_route_frame, route_open, route_request, unique_temp_dir, wait_for_catalog, TestRoute,
     MODULE_ID, SETUP_TIMEOUT,
 };
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde_json::Value;
 use subc_daemon::{
     daemon_config::StorageConfig, serve_listener, ControlHandler, Registry, Router, ServerAuth,
@@ -406,7 +406,6 @@ async fn event_publisher_attempts_delivery_after_daemon_boot() {
     };
     let (daemon, _module, mut consumer, route) =
         open_route_for_started_module(daemon, module).await;
-    certify_preloaded_models(&mut consumer, route, 60).await;
 
     // Exceed the inline limit to commit a durable result page and its outbox event.
     let accepted = route_request(
@@ -537,7 +536,7 @@ async fn spawned_module_ignores_operator_config() {
         &mut consumer,
         route,
         2,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
+        serde_json::json!({ "method": "admission.status", "params": {} }),
     )
     .await;
 
@@ -545,128 +544,8 @@ async fn spawned_module_ignores_operator_config() {
     assert_eq!(report["result"]["lanes"], Value::Array(Vec::new()));
 }
 
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn probe_worker_death_fails_the_durable_job_with_engine_crashed() {
-    let root = unique_temp_dir("synapse-probe-worker-crash");
-    let config = timeout_ane_probe_config(&root);
-    let daemon = start_daemon().await;
-    let module = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        None,
-        Some(&config),
-        &[("SYNAPSE_TIMEOUT_WORKER_ABORT_ON_EMBED", "1")],
-    );
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, module).await;
 
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        3_000,
-        serde_json::json!({
-            "method": "probe.start",
-            "params": {
-                "request_key": "probe-worker-crash",
-                "models": ["minilm-ane-timeout"]
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let started = Instant::now();
-    let body = poll_probe_status(&mut consumer, route, 3_001, &job_id).await;
 
-    assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "worker death must settle within the short request timeout: {body:?}"
-    );
-    assert_eq!(
-        body["result"]["state"], "failed_transient",
-        "probe worker crash response: {body:?}"
-    );
-    assert_eq!(body["result"]["error"]["code"], "engine_crashed");
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn ane_probe_placement_ping_runs_outside_the_module_runtime() {
-    let root = unique_temp_dir("synapse-probe-placement-ping");
-    let config = timeout_ane_probe_config(&root);
-    let daemon = start_daemon().await;
-    let module = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        None,
-        Some(&config),
-        &[
-            ("SYNAPSE_TIMEOUT_WORKER_EMBED_DIMS", "384"),
-            ("SYNAPSE_TIMEOUT_WORKER_EMBED_N", "64"),
-        ],
-    );
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, module).await;
-
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        3_100,
-        serde_json::json!({
-            "method": "probe.start",
-            "params": {
-                "request_key": "probe-placement-ping",
-                "models": ["minilm-ane-timeout"]
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let body = poll_probe_status(&mut consumer, route, 3_101, &job_id).await;
-
-    assert_eq!(body["result"]["state"], "done");
-    assert_eq!(body["result"]["lanes"][0]["status"], "uncertified");
-}
-
-#[cfg(target_os = "macos")]
-fn timeout_ane_probe_config(root: &Path) -> String {
-    std::fs::create_dir_all(root).unwrap();
-    let model_path = root.join("model.mock");
-    let tokenizer_path = root.join("tokenizer.json");
-    std::fs::write(&model_path, b"timeout-worker-model").unwrap();
-    std::fs::write(
-        &tokenizer_path,
-        r#"{
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [],
-            "normalizer": null,
-            "pre_tokenizer": {"type": "Whitespace"},
-            "post_processor": null,
-            "decoder": null,
-            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
-        }"#,
-    )
-    .unwrap();
-    let worker_runtime_dir = PathBuf::from(format!(
-        "/tmp/synp-{}",
-        root.file_name().unwrap().to_string_lossy()
-    ));
-    serde_json::json!({
-        "preload_models": [{
-            "model_id": "minilm-ane-timeout",
-            "engine": "ane",
-            "task": "embed",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "format": "mock",
-            "pooling": "mean",
-            "normalize": true,
-            "worker_bin": synapse_core::dev_binary::ckdev_binary(env!("CARGO_BIN_EXE_synapse-worker-timeout-mock"), &worker_runtime_dir).unwrap(),
-            "worker_runtime_dir": worker_runtime_dir
-        }]
-    })
-    .to_string()
-}
 
 #[tokio::test]
 async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
@@ -713,7 +592,6 @@ async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
 async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 40).await;
 
     let first = route_request(
         &mut consumer,
@@ -721,7 +599,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         4,
         serde_json::json!({
             "method": "embed.query",
-            "params": { "model": "test-minilm", "id": "q1", "text": "hello world" }
+            "params": { "model": "test-minilm", "id": "q1", "text": "hello world", "allow_equivalent": true, "required_epoch": 2 }
         }),
     )
     .await;
@@ -738,7 +616,7 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
 
     let result = &first["result"];
     assert_eq!(result["module_generation"].as_u64(), Some(1));
-    assert_eq!(result["table_epoch"].as_u64(), Some(0));
+    assert_eq!(result["table_epoch"].as_u64(), Some(2));
     assert_eq!(result["dims"].as_u64(), Some(384));
     assert_eq!(result["equivalent_to"], Value::Array(Vec::new()));
     assert_eq!(result["vectors"].as_array().unwrap().len(), 1);
@@ -770,538 +648,21 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
         second["result"]["vectors"][0]["vector"]
     );
     assert_eq!(result["fingerprint"], second["result"]["fingerprint"]);
+
+    let future_epoch = route_request(&mut consumer, route, 6, serde_json::json!({
+        "method": "embed.query", "params": {"model":"test-minilm", "text":"hello world", "required_epoch":3}
+    })).await;
+    assert_eq!(future_epoch["result"]["error"]["code"], "migration_required");
 }
 
-#[tokio::test]
-async fn probe_refuses_lane_without_matching_reference_fixture() {
-    let preloads = deterministic_preload_config();
-    let mut models: Value = serde_json::from_str(&preloads).expect("preload config is json");
-    models[0]["model_id"] = Value::String("unreferenced-embed-model".to_string());
-    let config = serde_json::json!({ "preload_models": models }).to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
 
-    let body = poll_probe_job(
-        &mut consumer,
-        route,
-        30,
-        serde_json::json!({ "models": ["unreferenced-embed-model"] }),
-    )
-    .await;
-    let lane = body["result"]["lanes"]
-        .as_array()
-        .and_then(|lanes| lanes.first())
-        .expect("probe returns the selected lane");
-    assert_eq!(lane["status"], "uncertified");
-    assert_eq!(lane["blocking_reason"], "reference_fixture_missing");
-    assert_eq!(
-        lane["evidence"]["blocking_reason"],
-        "reference_fixture_missing"
-    );
-    assert!(lane["evidence"].get("metrics").is_none());
-    assert!(lane["evidence"].get("mean_cosine").is_none());
 
-    let report = route_request(
-        &mut consumer,
-        route,
-        31,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    assert_eq!(
-        report["result"]["lanes"][0]["blocking_reason"],
-        "reference_fixture_missing"
-    );
-}
 
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn embed_query_loaded_owned_metal_carries_distinct_provenance_and_content_hash() {
-    let snapshot = minilm_safetensors_snapshot()
-        .expect("owned-metal MiniLM e2e needs the local safetensors snapshot");
-    let owned_preloads = minilm_preload_config()
-        .expect("owned-metal cross-dtype e2e needs the local safetensors snapshot");
-    let _lock = acquire_minilm_e2e_lock();
-    let daemon = start_daemon().await;
-    let cache = unique_temp_dir("synapse-owned-model-cache");
-    let module = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        Some(&owned_preloads),
-        None,
-        &[("CORTEXKIT_MODEL_CACHE", cache.to_string_lossy().as_ref())],
-    );
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, module).await;
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        46,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": snapshot,
-                "files": {
-                    "model": {
-                        "url": "model.safetensors",
-                        "sha256": test_sha256(snapshot.join("model.safetensors"))
-                    },
-                    "tokenizer": {
-                        "url": "tokenizer.json",
-                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
-                    },
-                    "config": {
-                        "url": "config.json",
-                        "sha256": test_sha256(snapshot.join("config.json"))
-                    }
-                },
-                "engine": "owned-metal",
-                "family": "minilm",
-                "dtype": "f16",
-                "execution": "explicit",
-                "model_id": "minilm-owned",
-                "task": "embed",
-                "max_tokens": 512,
-                "pin": true,
-                "request_key": "owned-metal-model-load-e2e"
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap();
-    let ready = poll_model_load_job(&mut consumer, route, 47, job_id).await;
-    assert_eq!(
-        ready["result"]["state"], "ready",
-        "owned load failed: {ready:?}"
-    );
-    run_probe_job(
-        &mut consumer,
-        route,
-        60,
-        serde_json::json!({ "models": ["minilm", "minilm-owned"] }),
-    )
-    .await;
-
-    let body = route_request(
-        &mut consumer,
-        route,
-        2_000,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": {
-                "model": "minilm-owned",
-                "id": "owned-q1",
-                "text": "hello world"
-            }
-        }),
-    )
-    .await;
-    let result = &body["result"];
-    assert_eq!(result["dims"], 384);
-    assert_eq!(result["vectors"][0]["id"], "owned-q1");
-    assert_eq!(
-        result["vectors"][0]["content_sha256"],
-        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-    );
-    assert_eq!(
-        result["vectors"][0]["submitted_sha256"],
-        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-    );
-    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
-    assert_eq!(
-        result["provenance"]["engine"]["build_flags"]["family"],
-        "minilm"
-    );
-    assert_eq!(
-        result["provenance"]["engine"]["build_flags"]["dtype"],
-        "f16"
-    );
-    assert_eq!(
-        result["provenance"]["engine"]["build_flags"]["graph_revision"],
-        "4"
-    );
-    assert_eq!(
-        result["provenance"]["engine"]["build_flags"]["bucket_policy"],
-        "v2"
-    );
-    assert_eq!(result["fingerprint"].as_str().unwrap().len(), 64);
-    let spike_golden: Value =
-        serde_json::from_str(include_str!("fixtures/minilm_owned_spike_f16.jsonl"))
-            .expect("decode frozen spike handoff vector");
-    assert_vector_cosine_at_least(
-        &result["vectors"][0]["vector"],
-        &spike_golden["vec"],
-        0.999_999,
-    );
-
-    let ort = route_request(
-        &mut consumer,
-        route,
-        2_001,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": "minilm", "text": "hello world" }
-        }),
-    )
-    .await;
-    let ort_fingerprint = ort["result"]["fingerprint"].as_str().unwrap();
-    assert_ne!(ort_fingerprint, result["fingerprint"].as_str().unwrap());
-    let rejected = route_request(
-        &mut consumer,
-        route,
-        2_002,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": {
-                "model": "minilm-owned",
-                "text": "hello world",
-                "target_fingerprint": ort_fingerprint
-            }
-        }),
-    )
-    .await;
-    assert_eq!(rejected["result"]["error"]["code"], "substitution_rejected");
-    let _ = std::fs::remove_dir_all(cache);
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn probe_owned_gte_modernbert_certifies_against_family_reference() {
-    let snapshot =
-        gte_safetensors_snapshot().expect("owned-metal GTE probe e2e needs the local HF snapshot");
-    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
-        assert!(
-            snapshot.join(required).exists(),
-            "owned-metal GTE probe e2e needs {required} in {}",
-            snapshot.display()
-        );
-    }
-    let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route) = open_route().await;
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        80,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": snapshot,
-                "files": {
-                    "model": {
-                        "url": "model.safetensors",
-                        "sha256": test_sha256(snapshot.join("model.safetensors"))
-                    },
-                    "tokenizer": {
-                        "url": "tokenizer.json",
-                        "sha256": test_sha256(snapshot.join("tokenizer.json"))
-                    },
-                    "config": {
-                        "url": "config.json",
-                        "sha256": test_sha256(snapshot.join("config.json"))
-                    }
-                },
-                "engine": "owned-metal",
-                "family": "gte-modernbert",
-                "dtype": "f16",
-                "execution": "explicit",
-                "model_id": "gte-modernbert-base-f16",
-                "task": "embed",
-                "pooling": "cls",
-                "normalize": true,
-                "max_tokens": 512,
-                "pin": true,
-                "request_key": "owned-gte-probe-e2e"
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"]
-        .as_str()
-        .expect("owned GTE model.load returns job id");
-    let ready = poll_model_load_job(&mut consumer, route, 81, job_id).await;
-    assert_eq!(
-        ready["result"]["state"], "ready",
-        "GTE load failed: {ready:?}"
-    );
-
-    let body = run_probe_job(
-        &mut consumer,
-        route,
-        90,
-        serde_json::json!({ "models": ["gte-modernbert-base-f16"] }),
-    )
-    .await;
-    let lane = body["result"]["lanes"]
-        .as_array()
-        .and_then(|lanes| lanes.first())
-        .expect("GTE probe returns a lane");
-    assert_eq!(lane["status"], "certified", "GTE probe failed: {lane:?}");
-    eprintln!("owned GTE probe evidence: {}", lane["evidence"]);
-    assert_eq!(lane["evidence"]["items"], 64);
-    assert!(
-        lane["evidence"]["mean_cosine"]
-            .as_f64()
-            .expect("mean cosine is numeric")
-            >= 0.999
-    );
-    assert!(
-        lane["evidence"]["rank_overlap"]
-            .as_f64()
-            .expect("rank overlap is numeric")
-            >= 0.999
-    );
-
-    let listed = route_request(
-        &mut consumer,
-        route,
-        91,
-        serde_json::json!({ "method": "models.list", "params": {} }),
-    )
-    .await;
-    let owned = listed["result"]["models"]
-        .as_array()
-        .and_then(|models| {
-            models
-                .iter()
-                .find(|model| model["model_id"] == "gte-modernbert-base-f16")
-        })
-        .expect("certified owned-metal model appears in catalog");
-    assert_eq!(
-        owned["recommended_batch"],
-        serde_json::json!({ "rows": 8, "token_budget": 3_072 })
-    );
-
-    let rerank_refused = route_request(
-        &mut consumer,
-        route,
-        92,
-        serde_json::json!({
-            "method": "rerank.score",
-            "params": {
-                "model": "gte-modernbert-base-f16",
-                "query": "query",
-                "candidates": ["candidate"]
-            }
-        }),
-    )
-    .await;
-    assert_eq!(
-        rerank_refused["result"]["error"]["code"],
-        "artifact_invalid"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn owned_gte_rerank_loads_certifies_and_serves_deterministically() {
-    let snapshot = gte_reranker_safetensors_snapshot()
-        .expect("owned-metal rerank e2e needs the local GTE reranker snapshot");
-    for required in ["model.safetensors", "tokenizer.json", "config.json"] {
-        assert!(
-            snapshot.join(required).is_file(),
-            "GTE reranker snapshot is missing {required}"
-        );
-    }
-    let _lock = acquire_minilm_e2e_lock();
-    let (_daemon, _module, mut consumer, route) = open_route().await;
-    let load_params = serde_json::json!({
-        "source": "file",
-        "path": snapshot,
-        "files": {
-            "model": {
-                "url": "model.safetensors",
-                "sha256": test_sha256(snapshot.join("model.safetensors"))
-            },
-            "tokenizer": {
-                "url": "tokenizer.json",
-                "sha256": test_sha256(snapshot.join("tokenizer.json"))
-            },
-            "config": {
-                "url": "config.json",
-                "sha256": test_sha256(snapshot.join("config.json"))
-            }
-        },
-        "engine": "owned-metal",
-        "family": "gte-modernbert",
-        "dtype": "f32",
-        "execution": "explicit",
-        "model_id": "gte-reranker-modernbert-base-f32",
-        "task": "rerank",
-        "max_tokens": 8192,
-        "attention_units": 67108864,
-        "pin": true,
-        "request_key": "owned-metal-rerank-e2e"
-    });
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        72_000,
-        serde_json::json!({ "method": "model.load", "params": load_params }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"]
-        .as_str()
-        .expect("owned rerank model.load returns job id")
-        .to_string();
-    let ready = poll_model_load_job(&mut consumer, route, 72_001, &job_id).await;
-    assert_eq!(ready["result"]["state"], "ready", "rerank load: {ready:?}");
-
-    let probe = run_probe_job(
-        &mut consumer,
-        route,
-        72_010,
-        serde_json::json!({ "models": ["gte-reranker-modernbert-base-f32"] }),
-    )
-    .await;
-    let lane = probe["result"]["lanes"]
-        .as_array()
-        .and_then(|lanes| {
-            lanes.iter().find(|lane| {
-                lane["model_id"] == "gte-reranker-modernbert-base-f32" && lane["task"] == "rerank"
-            })
-        })
-        .expect("rerank probe returns the owned lane");
-    assert_eq!(lane["status"], "certified", "rerank probe: {lane:?}");
-    assert!(lane["evidence"]["pearson"].as_f64().unwrap() >= 0.999);
-
-    let listed = route_request(
-        &mut consumer,
-        route,
-        72_011,
-        serde_json::json!({ "method": "models.list", "params": {} }),
-    )
-    .await;
-    let model = listed["result"]["models"]
-        .as_array()
-        .and_then(|models| {
-            models
-                .iter()
-                .find(|model| model["model_id"] == "gte-reranker-modernbert-base-f32")
-        })
-        .expect("owned reranker appears in models.list");
-    let fingerprint = model["fingerprints"]
-        .as_array()
-        .and_then(|fingerprints| fingerprints.first())
-        .and_then(Value::as_str)
-        .expect("reranker fingerprint")
-        .to_string();
-    assert_eq!(fingerprint.len(), 64);
-    assert_eq!(model["max_tokens"], 8192);
-    assert_eq!(model["max_tokens_source"], "runtime_bucket");
-    assert_eq!(model["device_class"], "metal");
-    assert_eq!(model["dtype"], "f32");
-    assert_eq!(model["dims"], 768);
-    assert_eq!(model["certified"], true);
-    assert!(model.get("bucket_ladder").is_some());
-    assert!(model.get("warm_load_cost_hint_ms").is_some());
-
-    let params = serde_json::json!({
-        "method": "rerank.score",
-        "params": {
-            "model": "gte-reranker-modernbert-base-f32",
-            "query": "Which document is about a cat sitting on a mat?",
-            "candidates": [
-                "A small cat sits on a woven mat near the window.",
-                "The spacecraft entered orbit after a six month flight.",
-                "A dog chased a tennis ball across the park."
-            ]
-        }
-    });
-    let first = route_request(&mut consumer, route, 72_020, params.clone()).await;
-    let second = route_request(&mut consumer, route, 72_021, params).await;
-    assert_eq!(
-        serde_json::to_vec(&first["result"]).unwrap(),
-        serde_json::to_vec(&second["result"]).unwrap(),
-        "identical rerank requests must produce byte-identical results"
-    );
-    let result = &first["result"];
-    assert_eq!(result["dims"], 1);
-    assert_eq!(result["fingerprint"], fingerprint);
-    assert_eq!(result["provenance"]["engine"]["engine"], "owned-metal");
-    let scores = result["scores"].as_array().expect("rerank envelope scores");
-    assert_eq!(scores.len(), 3);
-    assert!(scores
-        .iter()
-        .all(|score| score.as_f64().is_some_and(f64::is_finite)));
-    assert!(scores.windows(2).any(|window| window[0] != window[1]));
-
-    let f16_accepted = route_request(
-        &mut consumer,
-        route,
-        72_030,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": snapshot,
-                "files": {
-                    "model": {"url": "model.safetensors", "sha256": test_sha256(snapshot.join("model.safetensors"))},
-                    "tokenizer": {"url": "tokenizer.json", "sha256": test_sha256(snapshot.join("tokenizer.json"))},
-                    "config": {"url": "config.json", "sha256": test_sha256(snapshot.join("config.json"))}
-                },
-                "engine": "owned-metal",
-                "family": "gte-modernbert",
-                "dtype": "f16",
-                "model_id": "gte-reranker-modernbert-base-f16",
-                "task": "rerank",
-                "max_tokens": 512,
-                "request_key": "owned-metal-rerank-f16-refusal"
-            }
-        }),
-    )
-    .await;
-    let f16_job = f16_accepted["result"]["job_id"].as_str().unwrap();
-    let f16_failed = poll_model_load_job(&mut consumer, route, 72_031, f16_job).await;
-    assert_eq!(f16_failed["result"]["state"], "failed");
-    assert_eq!(f16_failed["result"]["error"]["code"], "artifact_invalid");
-    assert!(f16_failed["result"]["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("fp32-only"));
-
-    let Some(minilm_snapshot) = minilm_safetensors_snapshot() else {
-        return;
-    };
-    let minilm_accepted = route_request(
-        &mut consumer,
-        route,
-        72_040,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": minilm_snapshot,
-                "files": {
-                    "model": {"url": "model.safetensors", "sha256": test_sha256(minilm_snapshot.join("model.safetensors"))},
-                    "tokenizer": {"url": "tokenizer.json", "sha256": test_sha256(minilm_snapshot.join("tokenizer.json"))},
-                    "config": {"url": "config.json", "sha256": test_sha256(minilm_snapshot.join("config.json"))}
-                },
-                "engine": "owned-metal",
-                "family": "minilm",
-                "dtype": "f32",
-                "model_id": "minilm-reranker-no-head",
-                "task": "rerank",
-                "max_tokens": 512,
-                "request_key": "owned-metal-rerank-no-head-refusal"
-            }
-        }),
-    )
-    .await;
-    let minilm_job = minilm_accepted["result"]["job_id"].as_str().unwrap();
-    let minilm_failed = poll_model_load_job(&mut consumer, route, 72_041, minilm_job).await;
-    assert_eq!(minilm_failed["result"]["state"], "failed");
-    assert_eq!(minilm_failed["result"]["error"]["code"], "artifact_invalid");
-    assert!(minilm_failed["result"]["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("sequence-classification head"));
-}
 
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 60).await;
     let items = (0..16)
         .map(|index| {
             serde_json::json!({
@@ -1355,7 +716,6 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
     })
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route, 80).await;
     let texts = [
         "job tier first text",
         "job tier second text",
@@ -1496,7 +856,6 @@ async fn over_budget_embed_batch_returns_job_and_pages_results() {
 async fn embed_rows_report_submitted_and_content_hashes_around_the_ceiling() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 40).await;
 
     let over_cap_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
     for (correlation, id, text, truncated) in [
@@ -1599,7 +958,6 @@ async fn job_tier_paged_results_replays_truncated_row_from_storage() {
     })
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route, 80).await;
 
     let over_cap_text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
     let short_text = "job tier short";
@@ -1709,7 +1067,6 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
     );
     let (daemon, _module, mut first_consumer, first_route) =
         open_route_for_started_module(daemon, module).await;
-    certify_preloaded_models(&mut first_consumer, first_route, 400).await;
     std::fs::write(Path::new(gate_dir).join("armed"), b"")
         .expect("arm deterministic embed gate after model setup");
 
@@ -1803,385 +1160,46 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
     let _ = second_task.await.unwrap();
 }
 
-#[tokio::test]
-async fn alias_surface_certifies_declares_retracts_and_preserves_old_job_pages() {
-    let preloads = deterministic_alias_preload_config();
-    let config = serde_json::json!({
-        "preload_models": preloads,
-        "inline": { "max_items": 1 },
-        "jobs": { "execution_ttl_ms": 60_000, "result_page_bytes": 4096, "bulk_quantum_tokens": 2048 },
-        "alias_admin_enabled": true
-    })
-    .to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    let probe = certify_preloaded_models(&mut consumer, route, 120).await;
-    let lanes = probe["result"]["lanes"].as_array().expect("probe lanes");
-    let fingerprint_a = lanes
-        .iter()
-        .find(|lane| lane["model_id"] == "test-minilm-a")
-        .and_then(|lane| lane["fingerprint"].as_str())
-        .expect("minilm-a fingerprint")
-        .to_string();
-    let fingerprint_b = lanes
-        .iter()
-        .find(|lane| lane["model_id"] == "test-minilm-b")
-        .and_then(|lane| lane["fingerprint"].as_str())
-        .expect("minilm-b fingerprint")
-        .to_string();
-    assert_ne!(fingerprint_a, fingerprint_b);
 
-    let before = route_request(
-        &mut consumer,
-        route,
-        500,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": "test-minilm-a", "text": "alias before retract" }
-        }),
-    )
-    .await;
-    assert_eq!(before["result"]["equivalent_to"][0], fingerprint_b);
-
-    let valid = route_request(
-        &mut consumer,
-        route,
-        501,
-        serde_json::json!({
-            "method": "aliases.check_index",
-            "params": {
-                "index_fingerprint": fingerprint_a,
-                "provenance_set": [fingerprint_a, fingerprint_b]
-            }
-        }),
-    )
-    .await;
-    assert_eq!(valid["result"]["verdict"]["status"], "valid");
-
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        502,
-        serde_json::json!({
-            "method": "embed.batch",
-            "params": {
-                "model": "test-minilm-a",
-                "request_key": "alias-retroactive-e2e",
-                "items": [
-                    {"id": "a", "text": "alias job page one"},
-                    {"id": "b", "text": "alias job page two"}
-                ]
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let done = poll_embed_result(&mut consumer, route, 503, &job_id).await;
-    assert_eq!(done["result"]["equivalent_to"][0], fingerprint_b);
-
-    let retracted = route_request(
-        &mut consumer,
-        route,
-        600,
-        serde_json::json!({
-            "method": "alias.retract",
-            "params": {
-                "fingerprint_a": fingerprint_a,
-                "fingerprint_b": fingerprint_b,
-                "evidence": {"reason": "e2e"}
-            }
-        }),
-    )
-    .await;
-    assert_eq!(retracted["result"]["changed"], Value::Bool(true));
-
-    let migration = route_request(
-        &mut consumer,
-        route,
-        601,
-        serde_json::json!({
-            "method": "aliases.check_index",
-            "params": {
-                "index_fingerprint": fingerprint_a,
-                "provenance_set": [fingerprint_a, fingerprint_b]
-            }
-        }),
-    )
-    .await;
-    assert_eq!(
-        migration["result"]["verdict"]["status"],
-        "migration_required"
-    );
-    let pair_a = migration["result"]["verdict"]["retracted_pair"]["fingerprint_a"]
-        .as_str()
-        .unwrap();
-    let pair_b = migration["result"]["verdict"]["retracted_pair"]["fingerprint_b"]
-        .as_str()
-        .unwrap();
-    assert!(
-        (pair_a == fingerprint_a && pair_b == fingerprint_b)
-            || (pair_a == fingerprint_b && pair_b == fingerprint_a),
-        "unexpected retracted pair: {migration:?}"
-    );
-
-    let old_page = route_request(
-        &mut consumer,
-        route,
-        602,
-        serde_json::json!({
-            "method": "embed.result",
-            "params": { "job_id": job_id, "page": 0 }
-        }),
-    )
-    .await;
-    assert_eq!(old_page["result"]["equivalent_to"][0], fingerprint_b);
-
-    let after = route_request(
-        &mut consumer,
-        route,
-        603,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": "test-minilm-a", "text": "alias after retract" }
-        }),
-    )
-    .await;
-    assert_eq!(after["result"]["equivalent_to"], Value::Array(Vec::new()));
-}
-
-#[tokio::test]
-async fn probe_report_exposes_blocking_reasons_perf_rows_and_default_assignments() {
-    let preloads = deterministic_preload_config();
-    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-
-    let before = route_request(
-        &mut consumer,
-        route,
-        85,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    assert_eq!(before["result"]["current_knob"], "balanced");
-    assert_eq!(before["result"]["lanes"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        before["result"]["lanes"][0]["blocking_reason"],
-        "probe_required"
-    );
-    assert_eq!(before["result"]["lanes"][0]["certification_required"], true);
-    assert_eq!(
-        before["result"]["lanes"][0]["certification_status"],
-        "uncertified"
-    );
-    assert_eq!(before["result"]["lanes"][0]["performance"], Value::Null);
-
-    let probed = certify_preloaded_models(&mut consumer, route, 86).await;
-    assert_eq!(probed["result"]["current_knob"], "balanced");
-    assert_eq!(
-        probed["result"]["knob_assignments"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    let perf = &probed["result"]["lanes"][0]["performance"];
-    assert!(perf["throughput_tok_s"].as_f64().unwrap() > 0.0);
-    assert!(perf["cold_load_ms"].as_f64().unwrap() >= 0.0);
-    assert!(perf["single_item_latency_p50_ms"].as_f64().unwrap() >= 0.0);
-
-    let report = route_request(
-        &mut consumer,
-        route,
-        87,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    let result = &report["result"];
-    assert_eq!(result["current_knob"], "balanced");
-    assert_eq!(result["knob_assignments"].as_array().unwrap().len(), 3);
-    assert_eq!(result["active_assignments"].as_array().unwrap().len(), 1);
-    assert_eq!(result["active_assignments"][0]["model_id"], "test-minilm");
-    assert_eq!(result["lanes"][0]["blocking_reason"], Value::Null);
-    assert_eq!(result["lanes"][0]["certification_required"], true);
-    assert_eq!(result["lanes"][0]["certification_status"], "certified");
-    assert_eq!(result["lanes"][0]["certification"]["status"], "certified");
-    assert_eq!(result["lanes"][0]["certification_stale"], false);
-    assert_eq!(result["lanes"][0]["performance_stale"], false);
-    assert_eq!(result["lanes"][0]["performance"]["stale"], false);
-}
 
 #[tokio::test]
 async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_default() {
-    let preloads = deterministic_alias_preload_config();
+    let preloads: Value = serde_json::from_str(&deterministic_preload_config()).unwrap();
     let config = module_config_with_preloads(preloads.clone(), "balanced");
     let (daemon, mut module, mut consumer, route) = open_route_with_config(&config).await;
-    certify_preloaded_models(&mut consumer, route, 120).await;
-
-    let report = route_request(
-        &mut consumer,
-        route,
-        121,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    let lanes = report["result"]["lanes"].as_array().unwrap();
-    assert_eq!(
-        lanes.len(),
-        2,
-        "unexpected probe lanes (model_id/engine/fingerprint): {lanes:?}"
-    );
-    let current_model_id = report["result"]["active_assignments"][0]["model_id"]
-        .as_str()
-        .unwrap();
-    let quiet_target = lanes
-        .iter()
-        .find(|lane| lane["model_id"].as_str().unwrap() != current_model_id)
-        .cloned()
-        .expect("alternate lane for quiet assignment");
-    let quiet_model_id = quiet_target["model_id"].as_str().unwrap().to_string();
-    let quiet_fingerprint = quiet_target["fingerprint"].as_str().unwrap().to_string();
-    overwrite_knob_assignment(
-        &expected_store_path(&daemon.data_home),
-        report["result"]["machine_profile_hash"].as_str().unwrap(),
-        "embed",
-        "quiet",
-        &quiet_target,
-    );
-
-    let _ = module.child.start_kill();
-    let status = module.child.wait().await.expect("wait for stopped module");
-    assert!(
-        !status.success(),
-        "stopping the module should terminate it: {}",
-        describe_exit_status(&status)
-    );
+    let status = route_request(&mut consumer, route, 121, serde_json::json!({"method":"admission.status"})).await;
+    let hash = status["result"]["machine_profile_hash"].as_str().unwrap();
+    let path = expected_store_path(&daemon.data_home);
+    let conn = Connection::open(&path).unwrap();
+    let inserted = conn.execute("INSERT INTO knob_assignments
+        (machine_profile_hash, workload, knob, model_id, numeric_profile_id, fingerprint, engine, measured_at_ms, os_build, module_generation, throughput_tok_s, single_item_latency_p50_ms)
+        SELECT ?1, 'embed', 'quiet', model_id, 'test-profile', fingerprint, engine, 1, 'test-os', 1, 1, 1 FROM models WHERE model_id = 'test-minilm'", [hash]).unwrap();
+    assert_eq!(inserted, 1);
+    drop(conn);
+    module.child.start_kill().unwrap();
+    assert!(!module.child.wait().await.unwrap().success());
     drop(consumer);
-
-    // An omitted model routes to the catalog default, which this test expects to
-    // report model_not_installed. A host with no runnable backend for that model
-    // reports backend_unavailable instead, which is right for a GPU-less CI
-    // runner but not what this test is about, so declare Metal runnable.
-    let restarted = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        None,
+    let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None,
         Some(&module_config_with_preloads(preloads, "quiet")),
-        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")],
-    );
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, restarted).await;
-
-    let quiet_report = route_request(
-        &mut consumer,
-        route,
-        122,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    assert_eq!(quiet_report["result"]["current_knob"], "quiet");
-    assert_eq!(
-        quiet_report["result"]["active_assignments"][0]["model_id"],
-        quiet_model_id
-    );
-
-    let first = route_request(
-        &mut consumer,
-        route,
-        123,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "id": "quiet-knob", "text": "omitted model ignores the persisted preference" }
-        }),
-    )
-    .await;
-    let routed = route_request(
-        &mut consumer,
-        route,
-        125,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "id": "quiet-knob-2", "text": "catalog default remains selected after restart" }
-        }),
-    )
-    .await;
-    assert_eq!(first["result"]["error"]["code"], "model_not_installed");
-    assert_eq!(
-        first["result"]["error"]["details"]["catalog_id"],
-        "gte-modernbert-base"
-    );
-    assert_eq!(routed["result"]["error"]["code"], "model_not_installed");
-    let explicit = route_request(&mut consumer,route,126,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
-    if explicit["result"]["error"]["code"] == "model_loading" {
-        poll_model_ready(&mut consumer, route, 127, &quiet_model_id).await;
-    }
-    let explicit = route_request(&mut consumer,route,128,serde_json::json!({"method":"embed.query","params":{"model":quiet_model_id,"text":"explicit free-form selection remains available"}})).await;
-    assert_eq!(explicit["result"]["fingerprint"], quiet_fingerprint);
+        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")]);
+    let (_daemon, _module, mut consumer, route) = open_route_for_started_module(daemon, restarted).await;
+    let status = route_request(&mut consumer, route, 122, serde_json::json!({"method":"admission.status"})).await;
+    assert_eq!(status["result"]["current_knob"], "quiet");
+    let stored: String = Connection::open(path).unwrap().query_row(
+        "SELECT model_id FROM knob_assignments WHERE workload = 'embed' AND knob = 'quiet'", [], |row| row.get(0)).unwrap();
+    assert_eq!(stored, "test-minilm");
+    let omitted = route_request(&mut consumer, route, 123, serde_json::json!({"method":"embed.query", "params":{"text":"hello world"}})).await;
+    assert_eq!(omitted["result"]["error"]["code"], "model_not_installed");
+    assert_eq!(omitted["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
+    let explicit = route_request(&mut consumer, route, 124, serde_json::json!({"method":"embed.query", "params":{"model":stored,"text":"hello world"}})).await;
+    assert_eq!(explicit["result"]["dims"], 384);
 }
 
-#[tokio::test]
-async fn os_build_override_marks_probe_rows_stale_in_report_and_status() {
-    let preloads = deterministic_preload_config();
-    let (daemon, mut module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 130).await;
-
-    let _ = module.child.start_kill();
-    let status = module.child.wait().await.expect("wait for stopped module");
-    assert!(
-        !status.success(),
-        "stopping the module should terminate it: {}",
-        describe_exit_status(&status)
-    );
-    drop(consumer);
-
-    let restarted = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        Some(&preloads),
-        None,
-        &[("SYNAPSE_OS_BUILD_OVERRIDE", "synthetic-stale-build")],
-    );
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, restarted).await;
-
-    let report = route_request(
-        &mut consumer,
-        route,
-        131,
-        serde_json::json!({ "method": "probe.report", "params": {} }),
-    )
-    .await;
-    assert_eq!(report["result"]["certification_stale"], true);
-    assert_eq!(report["result"]["performance_stale"], true);
-    assert_eq!(
-        report["result"]["lanes"][0]["blocking_reason"],
-        "probe_required"
-    );
-    assert_eq!(report["result"]["lanes"][0]["certification"]["stale"], true);
-    assert_eq!(report["result"]["lanes"][0]["performance"]["stale"], true);
-    assert_eq!(
-        report["result"]["lanes"][0]["certification"]["stale_os_build"],
-        true
-    );
-    assert_eq!(
-        report["result"]["lanes"][0]["performance"]["stale_os_build"],
-        true
-    );
-
-    ensure_model_loaded_by_query(&mut consumer, route, 132, "test-minilm").await;
-    let status = route_request(
-        &mut consumer,
-        route,
-        135,
-        serde_json::json!({ "method": "admission.status", "params": {} }),
-    )
-    .await;
-    assert_eq!(status["result"]["certification_stale"], true);
-    assert_eq!(status["result"]["performance_stale"], true);
-    assert_eq!(status["result"]["lanes"][0]["certification_stale"], true);
-    assert_eq!(status["result"]["lanes"][0]["performance_stale"], true);
-}
 
 #[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 90).await;
 
     let body = route_request(
         &mut consumer,
@@ -2205,7 +1223,6 @@ async fn embed_query_deadline_one_returns_typed_rejection() {
 async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
-    certify_preloaded_models(&mut consumer, route, 110).await;
     let start_corr = 10_000_u64;
     let count = 32_u64;
     for offset in 0..count {
@@ -2247,251 +1264,30 @@ async fn concurrent_embed_burst_finishes_with_vectors_or_typed_rejections() {
 }
 
 #[tokio::test]
-async fn model_load_file_source_reaches_ready_and_lazy_reload_after_unload() {
-    let source_dir = deterministic_source_dir("synapse-model-load-file");
-    let (_daemon, _module, mut consumer, route) = open_route().await;
-
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        20_000,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": source_dir,
-                "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
-                "engine": "test-deterministic",
-                "family": "test-minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-                "pooling": "mean",
-                "task": "embed",
-                "model_id": "test-minilm-loaded",
-                "pin": true,
-                "request_key": "model-load-file-e2e"
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let ready = poll_model_load_job(&mut consumer, route, 20_001, &job_id).await;
-    assert_eq!(ready["result"]["state"], "ready", "{ready}");
-    let model_id = ready["result"]["model_id"].as_str().unwrap().to_string();
-
-    let uncertified = route_request(
-        &mut consumer,
-        route,
-        20_100,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": &model_id, "text": "uncertified should fail" }
-        }),
-    )
-    .await;
-    assert!(
-        uncertified["result"]["error"]["code"] == "probe_required"
-            || uncertified["result"]["error"]["code"] == "not_certified"
-    );
-
-    run_probe_job(
-        &mut consumer,
-        route,
-        20_200,
-        serde_json::json!({ "models": [model_id.clone()] }),
-    )
-    .await;
-
-    let first = route_request(
-        &mut consumer,
-        route,
-        20_300,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": &model_id, "id": "first", "text": "hello from model.load" }
-        }),
-    )
-    .await;
-    assert_eq!(first["result"]["dims"].as_u64(), Some(384));
-
-    let unloaded = route_request(
-        &mut consumer,
-        route,
-        20_400,
-        serde_json::json!({
-            "method": "model.unload",
-            "params": { "model_id": &model_id }
-        }),
-    )
-    .await;
+async fn profile_preload_lazily_reloads_after_unload() {
+    let preloads = deterministic_preload_config();
+    let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    let call = |method, params| serde_json::json!({"method": method, "params": params});
+    let query = call("embed.query", serde_json::json!({"model": "test-minilm", "text": "hello world"}));
+    let first = route_request(&mut consumer, route, 1, query.clone()).await;
+    assert_eq!(first["result"]["dims"], 384);
+    let model = serde_json::json!({"model_id": "test-minilm"});
+    let unloaded = route_request(&mut consumer, route, 2, call("model.unload", model.clone())).await;
     assert_eq!(unloaded["result"]["state"], "unloaded");
-
-    let loading = route_request(
-        &mut consumer,
-        route,
-        20_500,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": &model_id, "text": "reload after unload" }
-        }),
-    )
-    .await;
-    assert_eq!(loading["result"]["error"]["code"], "model_loading");
-
-    let ready_again = poll_model_ready(&mut consumer, route, 20_600, &model_id).await;
-    assert_eq!(ready_again["result"]["state"], "ready");
-
-    let second = route_request(
-        &mut consumer,
-        route,
-        20_700,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": { "model": &model_id, "id": "second", "text": "reload succeeded" }
-        }),
-    )
-    .await;
-    assert_eq!(second["result"]["dims"].as_u64(), Some(384));
+    let status = route_request(&mut consumer, route, 3, call("model.status", model.clone())).await;
+    assert_eq!(status["result"]["state"], "unloaded");
+    let reloaded = route_request(&mut consumer, route, 4, query).await;
+    assert_eq!(reloaded["result"]["vectors"], first["result"]["vectors"]);
+    let status = route_request(&mut consumer, route, 5, call("model.status", model)).await;
+    assert_eq!(status["result"]["state"], "ready");
 }
 
-#[tokio::test]
-async fn model_load_digest_mismatch_fails_with_artifact_invalid() {
-    let source_dir = deterministic_source_dir("synapse-model-load-digest-mismatch");
-    let (_daemon, _module, mut consumer, route) = open_route().await;
 
-    let accepted = route_request(
-        &mut consumer,
-        route,
-        21_000,
-        serde_json::json!({
-            "method": "model.load",
-            "params": {
-                "source": "file",
-                "path": source_dir,
-                "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
-                "expected_digest": format!("sha256:{}", "0".repeat(64)),
-                "engine": "test-deterministic",
-                "family": "test-minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-                "pooling": "mean",
-                "task": "embed",
-                "request_key": "model-load-digest-mismatch"
-            }
-        }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-    let failed = poll_model_load_job(&mut consumer, route, 21_001, &job_id).await;
-    assert_eq!(failed["result"]["state"], "failed");
-    assert_eq!(failed["result"]["error"]["code"], "artifact_invalid");
-    assert_eq!(failed["result"]["error"]["class"], "permanent");
-}
-
-#[tokio::test]
-async fn model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds() {
-    let source_dir = deterministic_source_dir("synapse-model-load-restart");
-    let daemon = start_daemon().await;
-    let module = spawn_synapse_module_with_env(
-        &daemon.connection_file_path,
-        None,
-        None,
-        &[("SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS", "25")],
-    );
-    let (daemon, mut module, mut consumer, route) =
-        open_route_for_started_module(daemon, module).await;
-
-    let request = serde_json::json!({
-        "method": "model.load",
-        "params": {
-            "source": "file",
-            "path": source_dir,
-            "files": { "model": "model.safetensors", "tokenizer": "tokenizer.json", "config": "config.json" },
-            "engine": "test-deterministic",
-                "family": "test-minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-            "pooling": "mean",
-            "task": "embed",
-            "request_key": "model-load-restart"
-        }
-    });
-    let accepted = route_request(&mut consumer, route, 22_000, request.clone()).await;
-    let job_id = accepted["result"]["job_id"].as_str().unwrap().to_string();
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut corr = 22_001;
-    loop {
-        let body = route_request(
-            &mut consumer,
-            route,
-            corr,
-            serde_json::json!({
-                "method": "model.status",
-                "params": { "job_id": &job_id }
-            }),
-        )
-        .await;
-        match body["result"]["state"].as_str() {
-            Some("downloading") => break,
-            Some("resolving" | "validating" | "loading") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "model.load never reached downloading: {body:?}"
-                );
-                corr += 1;
-                sleep(Duration::from_millis(50)).await;
-            }
-            other => panic!("unexpected model.load state before restart {other:?}: {body:?}"),
-        }
-    }
-
-    let _ = module.child.start_kill();
-    let status = module.child.wait().await.expect("wait for stopped module");
-    assert!(
-        !status.success(),
-        "stopping the module should terminate it: {}",
-        describe_exit_status(&status)
-    );
-    drop(consumer);
-
-    let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None, None, &[]);
-    let (_daemon, _module, mut consumer, route) =
-        open_route_for_started_module(daemon, restarted).await;
-
-    let restarted_status = route_request(
-        &mut consumer,
-        route,
-        22_100,
-        serde_json::json!({
-            "method": "model.status",
-            "params": { "job_id": &job_id }
-        }),
-    )
-    .await;
-    assert_eq!(restarted_status["result"]["state"], "failed");
-    assert_eq!(
-        restarted_status["result"]["error"]["code"],
-        "module_restarted"
-    );
-
-    let retried = route_request(&mut consumer, route, 22_200, request).await;
-    let retried_job_id = retried["result"]["job_id"].as_str().unwrap().to_string();
-    assert_ne!(retried_job_id, job_id);
-    let ready = poll_model_load_job(&mut consumer, route, 22_201, &retried_job_id).await;
-    assert_eq!(ready["result"]["state"], "ready", "{ready}");
-}
 
 fn deterministic_source_dir(label: &str) -> PathBuf {
     let root = unique_temp_dir(label);
     std::fs::create_dir_all(&root).unwrap();
-    // model.load copies the file in chunks, and the test-only
-    // SYNAPSE_TEST_MODEL_LOAD_CHUNK_DELAY_MS pauses between chunks. 2 MiB spans
-    // several chunks, so model_load_restart_mid_download_marks_job_restarted_and_resubmit_succeeds
-    // can kill the module while the copy is still in progress.
-    let mut artifact = vec![42_u8; 2 * 1024 * 1024];
-    artifact[..8].copy_from_slice(b"SYNTEST1");
-    std::fs::write(root.join("model.safetensors"), artifact).unwrap();
+    std::fs::write(root.join("model.safetensors"), b"SYNTEST1").unwrap();
     let mut vocab: std::collections::HashMap<String, u32> = [
         ("[UNK]".to_string(), 0),
         ("hello".to_string(), 1),
@@ -2529,6 +1325,7 @@ fn deterministic_preload_config_with_max_tokens(max_tokens: usize) -> String {
     let root = deterministic_source_dir("synapse-deterministic-preload");
     serde_json::json!([{
         "model_id": "test-minilm", "engine": "test-deterministic", "task": "embed",
+        "profile": "test-deterministic.fixture",
         "model_path": root.join("model.safetensors"), "tokenizer_path": root.join("tokenizer.json"),
         "format": "test-deterministic", "pooling": "mean", "normalize": true,
         "max_tokens": max_tokens, "quant": "fp32"
@@ -2536,153 +1333,11 @@ fn deterministic_preload_config_with_max_tokens(max_tokens: usize) -> String {
     .to_string()
 }
 
-fn deterministic_alias_preload_config() -> Value {
-    let mut models: Value = serde_json::from_str(&deterministic_preload_config()).unwrap();
-    models[0]["model_id"] = serde_json::json!("test-minilm-a");
-    let mut second = models[0].clone();
-    second["model_id"] = serde_json::json!("test-minilm-b");
-    second["quant"] = serde_json::json!("fp32-alias");
-    models.as_array_mut().unwrap().push(second);
-    models
-}
 
-async fn certify_preloaded_models(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-) -> Value {
-    run_probe_job(consumer, route, start_corr, serde_json::json!({})).await
-}
 
-#[cfg(target_os = "macos")]
-async fn poll_probe_status(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    job_id: &str,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(1_800);
-    let mut corr = start_corr;
-    loop {
-        let body = route_request(
-            consumer,
-            route,
-            corr,
-            serde_json::json!({
-                "method": "probe.status",
-                "params": { "job_id": job_id }
-            }),
-        )
-        .await;
-        match body["result"]["state"].as_str() {
-            Some("done" | "failed_transient" | "failed_permanent") => return body,
-            Some("queued" | "running") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "probe did not complete before timeout: {body:?}"
-                );
-                corr += 1;
-                sleep(Duration::from_millis(100)).await;
-            }
-            other => panic!("unexpected probe.status state {other:?}: {body:?}"),
-        }
-    }
-}
 
-async fn poll_probe_job(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    params: Value,
-) -> Value {
-    let accepted = route_request(
-        consumer,
-        route,
-        start_corr,
-        serde_json::json!({ "method": "probe.start", "params": params }),
-    )
-    .await;
-    let job_id = accepted["result"]["job_id"]
-        .as_str()
-        .expect("probe.start returns job_id")
-        .to_string();
-    let deadline = Instant::now() + Duration::from_secs(1_800);
-    let mut corr = start_corr + 1;
-    loop {
-        let body = route_request(
-            consumer,
-            route,
-            corr,
-            serde_json::json!({
-                "method": "probe.status",
-                "params": { "job_id": &job_id }
-            }),
-        )
-        .await;
-        match body["result"]["state"].as_str() {
-            Some("done") => return body,
-            Some("failed_transient" | "failed_permanent") => panic!("probe failed: {body:?}"),
-            Some("queued" | "running") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "probe did not complete before timeout: {body:?}"
-                );
-                corr += 1;
-                sleep(Duration::from_millis(100)).await;
-            }
-            other => panic!("unexpected probe.status state {other:?}: {body:?}"),
-        }
-    }
-}
 
-async fn run_probe_job(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    params: Value,
-) -> Value {
-    let body = poll_probe_job(consumer, route, start_corr, params).await;
-    let lanes = body["result"]["lanes"].as_array().expect("probe lanes");
-    assert!(!lanes.is_empty(), "probe should certify at least one lane");
-    for lane in lanes {
-        assert_eq!(lane["status"], "certified", "probe lane failed: {lane:?}");
-    }
-    body
-}
 
-async fn poll_model_load_job(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    job_id: &str,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let mut corr = start_corr;
-    loop {
-        let body = route_request(
-            consumer,
-            route,
-            corr,
-            serde_json::json!({
-                "method": "model.status",
-                "params": { "job_id": job_id }
-            }),
-        )
-        .await;
-        match body["result"]["state"].as_str() {
-            Some("ready" | "failed") => return body,
-            Some("resolving" | "downloading" | "validating" | "loading") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "model.load did not reach a terminal state before timeout: {body:?}"
-                );
-                corr += 1;
-                sleep(Duration::from_millis(100)).await;
-            }
-            other => panic!("unexpected model.status state {other:?}: {body:?}"),
-        }
-    }
-}
 
 async fn poll_model_ready(
     consumer: &mut tokio::net::TcpStream,
@@ -2790,75 +1445,7 @@ fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     .to_string()
 }
 
-fn overwrite_knob_assignment(
-    store_path: &Path,
-    machine_profile_hash: &str,
-    workload: &str,
-    knob: &str,
-    lane: &Value,
-) {
-    let performance = lane["performance"]
-        .as_object()
-        .expect("lane performance row");
-    let conn = Connection::open(store_path).expect("open synapse store");
-    let changed = conn
-        .execute(
-            "UPDATE knob_assignments
-             SET model_id = ?1,
-                 numeric_profile_id = ?2,
-                 fingerprint = ?3,
-                 engine = ?4,
-                 measured_at_ms = ?5,
-                 os_build = ?6,
-                 module_generation = ?7,
-                 throughput_tok_s = ?8,
-                 single_item_latency_p50_ms = ?9
-             WHERE machine_profile_hash = ?10 AND workload = ?11 AND knob = ?12",
-            params![
-                lane["model_id"].as_str().unwrap(),
-                lane["numeric_profile_id"].as_str().unwrap(),
-                lane["fingerprint"].as_str().unwrap(),
-                performance["engine"].as_str().unwrap(),
-                performance["measured_at_ms"].as_u64().unwrap() as i64,
-                performance["os_build"].as_str().unwrap(),
-                performance["module_generation"].as_u64().unwrap() as i64,
-                performance["throughput_tok_s"].as_f64().unwrap(),
-                performance["single_item_latency_p50_ms"].as_f64().unwrap(),
-                machine_profile_hash,
-                workload,
-                knob,
-            ],
-        )
-        .expect("rewrite knob assignment");
-    assert_eq!(changed, 1, "expected one knob assignment row to update");
-}
 
-#[cfg(target_os = "macos")]
-fn assert_vector_cosine_at_least(actual: &Value, expected: &Value, minimum: f64) {
-    let actual = actual.as_array().expect("actual vector is an array");
-    let expected = expected.as_array().expect("expected vector is an array");
-    assert_eq!(actual.len(), expected.len());
-    let dot = actual
-        .iter()
-        .zip(expected)
-        .map(|(left, right)| left.as_f64().unwrap() * right.as_f64().unwrap())
-        .sum::<f64>();
-    let actual_norm = actual
-        .iter()
-        .map(|value| value.as_f64().unwrap().powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let expected_norm = expected
-        .iter()
-        .map(|value| value.as_f64().unwrap().powi(2))
-        .sum::<f64>()
-        .sqrt();
-    let cosine = dot / (actual_norm * expected_norm + 1e-12);
-    assert!(
-        cosine >= minimum,
-        "vector cosine {cosine:.9} is below {minimum:.9}"
-    );
-}
 
 fn assert_vectors_close(actual: &Value, expected: &Value) {
     let actual = actual.as_array().expect("actual vector is an array");
@@ -2879,96 +1466,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
-#[cfg(target_os = "macos")]
-fn minilm_preload_config() -> Option<String> {
-    minilm_preload_config_with_max_tokens(512)
-}
 
-#[cfg(target_os = "macos")]
-fn minilm_preload_config_with_max_tokens(max_tokens: usize) -> Option<String> {
-    let snapshot = minilm_safetensors_snapshot()?;
-    let model_path = snapshot.join("model.safetensors");
-    let tokenizer_path = snapshot.join("tokenizer.json");
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return None;
-    }
-    Some(
-        serde_json::json!([{
-            "model_id": "minilm",
-            "engine": "owned-metal",
-                "family": "minilm",
-                "dtype": "f32",
-                "execution": "explicit",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "pooling": "mean",
-            "normalize": true,
-            "max_tokens": max_tokens,
-            "quant": "fp32"
-        }])
-        .to_string(),
-    )
-}
 
-#[cfg(target_os = "macos")]
-fn test_sha256(path: PathBuf) -> String {
-    use sha2::{Digest, Sha256};
 
-    format!(
-        "sha256:{}",
-        hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
-    )
-}
 
-#[cfg(target_os = "macos")]
-fn minilm_safetensors_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_MINILM_SAFETENSORS_SNAPSHOT") {
-        return Some(PathBuf::from(path));
-    }
-    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots");
-    first_snapshot_with(&snapshots, "model.safetensors")
-}
 
-#[cfg(target_os = "macos")]
-fn gte_safetensors_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT") {
-        return Some(PathBuf::from(path));
-    }
-    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-modernbert-base/snapshots");
-    first_snapshot_with(&snapshots, "model.safetensors")
-}
 
-#[cfg(target_os = "macos")]
-fn gte_reranker_safetensors_snapshot() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SYNAPSE_GTE_RERANKER_MODERNBERT_SAFETENSORS_SNAPSHOT") {
-        return Some(PathBuf::from(path));
-    }
-    let snapshots = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".cache/huggingface/hub/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots");
-    first_snapshot_with(&snapshots, "model.safetensors")
-}
-
-#[cfg(target_os = "macos")]
-fn first_snapshot_with(snapshots: &Path, file_name: &str) -> Option<PathBuf> {
-    std::fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.join(file_name).exists())
-}
-
-#[cfg(target_os = "macos")]
-/// Serialises the MiniLM e2e tests across every test process on the box.
-/// The handle is an OS advisory lock (flock on unix, LockFileEx on Windows)
-/// through the same lease store the module uses for its singleton lease, so
-/// a holder that is killed mid-test releases it in the kernel: there is no
-/// stale-file case for a later waiter to diagnose by hand.
-struct MinilmE2eLock {
-    #[allow(dead_code)]
-    handle: Box<dyn cortexkit_lease::LeaseHandle>,
-}
 
 #[tokio::test]
 async fn singleton_lease_blocks_second_module_on_same_daemon() {
@@ -3231,232 +1734,8 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     let _ = std::fs::remove_dir_all(fixture_dir);
 }
 
-#[cfg(target_os = "macos")]
-fn migration_seed_decode_fingerprint(model_id: &str) -> &'static str {
-    match model_id {
-        "qwen3-0.6b-decode-f16" => {
-            "8bcb6dfc1bd55a38a56b5a6931132f428687e064104d106c2cc5efb898f80feb"
-        }
-        "lfm2-1.2b-decode-f16" => {
-            "741e56178506918edd7ff91b7bf88214f97df974c3b5567196d0ce0cc594a8dd"
-        }
-        "qwen3-0.6b-decode-q8_0" => {
-            "4d0a846b33fdbbbc9032ead51e5d9c72af48e145f425cc5802b1205e44dc9e00"
-        }
-        "lfm2-1.2b-decode-q8_0" => {
-            "c4f0884cfa99e0c3e7c2403626e5363cb46645b6b51840d720e98539f9577f2f"
-        }
-        other => panic!("missing migration-seed fingerprint for {other}"),
-    }
-}
 
-#[cfg(target_os = "macos")]
-async fn certified_owned_checkpoint_lane(
-    checkpoint_env: &str,
-    model_id: &str,
-    family: &str,
-    quant: &str,
-    derived_digest: Option<&str>,
-    constrained_serve: bool,
-) {
-    let snapshot = std::env::var_os(checkpoint_env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("certified owned wire e2e needs {checkpoint_env}"));
-    let worker_bin = std::env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN")
-        .map(PathBuf::from)
-        .expect("certified owned wire e2e needs SYNAPSE_OWNED_DECODE_WORKER_BIN");
-    let model_path = snapshot.join("model.safetensors");
-    let tokenizer_path = snapshot.join("tokenizer.json");
-    assert!(
-        model_path.is_file() && tokenizer_path.is_file() && worker_bin.is_file(),
-        "certified owned wire e2e needs {}, {} and {}",
-        model_path.display(),
-        tokenizer_path.display(),
-        worker_bin.display()
-    );
-    let worker_runtime = std::env::temp_dir().join(format!(
-        "sod-{}-{}-{}",
-        &family[..1],
-        &quant[..1],
-        process::id()
-    ));
-    let artifact_digest = match family {
-        "qwen3-0.6b" => "sha256:0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
-        "lfm2-1.2b" => "sha256:60fef6ef4481c533ce7427793bed50200b55b3c68d0d00c52bc56f207a9acecd",
-        _ => panic!("unsupported checkpoint family {family}"),
-    };
-    let mut preload = serde_json::json!({
-        "model_id": model_id,
-        "engine": DECODE_WORKER_ENGINE,
-        "task": "generate",
-        "model_path": model_path,
-        "tokenizer_path": tokenizer_path,
-        "format": "owned-safetensors",
-        "artifact_digest": artifact_digest,
-        "max_tokens": 512,
-        "quant": quant,
-        "family": family,
-        "dtype": "f16",
-        "execution": "supervised",
-        "worker_bin": synapse_core::dev_binary::ckdev_binary(&worker_bin, &worker_runtime).unwrap(),
-        "worker_runtime_dir": worker_runtime
-    });
-    if let Some(derived_digest) = derived_digest {
-        preload["quantizer_revision"] = Value::String("q8-ingest-v1".to_string());
-        preload["derived_digest"] = Value::String(derived_digest.to_string());
-    }
-    let config = serde_json::json!({
-        "grammar_enabled": true,
-        "preload_models": [preload]
-    })
-    .to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-    let decode_fingerprint = migration_seed_decode_fingerprint(model_id);
-    // Use the production operation so this test records the operator's approval
-    // through the real store-backed enablement path instead of test-only setup.
-    let approval = route_request(
-        &mut consumer,
-        route,
-        90_900,
-        serde_json::json!({
-            "method": "approvals.enable",
-            "params": {
-                "model_id": model_id,
-                "decode_fingerprint": decode_fingerprint,
-                "grammar_enabled": true,
-            },
-        }),
-    )
-    .await;
-    assert_eq!(approval["result"]["enabled"], true);
-    assert_eq!(approval["result"]["grammar_enabled"], true);
 
-    let probe = certify_preloaded_models(&mut consumer, route, 91_000).await;
-    let lane = &probe["result"]["lanes"][0];
-    assert_eq!(lane["model_id"], model_id);
-    assert_eq!(lane["fingerprint"], decode_fingerprint);
-    let exact = lane["evidence"]["metrics"]["token_exact_matches"]
-        .as_u64()
-        .expect("probe exact-match count");
-    let accepted = lane["evidence"]["metrics"]["accepted_structural_forks"]
-        .as_u64()
-        .expect("probe structural-fork count");
-    assert_eq!(exact + accepted, 20, "checkpoint prompt battery failed");
-
-    let owned = route_request(
-        &mut consumer,
-        route,
-        91_001,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": model_id,
-                "prompt": "The capital of France is",
-                "max_tokens": 64
-            }
-        }),
-    )
-    .await;
-    let result = &owned["result"];
-    assert_eq!(
-        result["provenance"]["engine"]["engine"],
-        DECODE_WORKER_ENGINE
-    );
-    assert_eq!(result["provenance"]["lane"], "decode");
-    assert_eq!(result["provenance"]["worker"], "supervised");
-    assert_eq!(
-        result["provenance"]["decode_fingerprint"], lane["fingerprint"],
-        "served envelope must carry the certified lane fingerprint"
-    );
-    assert!(result["provenance"]["processing_fingerprint"].is_string());
-    assert!(result["provenance"]["worker_generation"].as_u64().is_some());
-    assert_eq!(result["n_gen"], 64);
-
-    if !constrained_serve {
-        return;
-    }
-    let constrained = route_request(
-        &mut consumer,
-        route,
-        91_002,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": model_id,
-                "prompt": "Respond with exactly the JSON literal null and nothing else:\n",
-                "max_tokens": 64,
-                "grammar": r#"{"type":"null"}"#
-            }
-        }),
-    )
-    .await;
-    let constrained_result = &constrained["result"];
-    let value: Value = serde_json::from_str(
-        constrained_result["text"]
-            .as_str()
-            .expect("constrained response text"),
-    )
-    .expect("constrained response is JSON");
-    assert!(value.is_null());
-    assert!(constrained_result["provenance"]["constraint_runtime_identity"].is_string());
-    assert!(constrained_result["provenance"]["constraint_fingerprint"].is_string());
-}
-
-/// Each certified owned decode lane probes through the real worker, then
-/// serves exact tokens; the Qwen3 f16 lane also serves a constrained request.
-/// Needs both checkpoints and the decode worker binary.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore]
-async fn checkpoint_certified_owned_lanes_serve_exact_tokens() {
-    // (checkpoint variable, model id, family, quantisation, derived digest,
-    // serve a constrained request)
-    let lanes = [
-        (
-            "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
-            "qwen3-0.6b-decode-f16",
-            "qwen3-0.6b",
-            "f16",
-            None,
-            true,
-        ),
-        (
-            "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
-            "lfm2-1.2b-decode-f16",
-            "lfm2-1.2b",
-            "f16",
-            None,
-            false,
-        ),
-        (
-            "SYNAPSE_OWNED_DECODE_QWEN3_0_6B",
-            "qwen3-0.6b-decode-q8_0",
-            "qwen3-0.6b",
-            "q8_0",
-            Some("17d2fbfeff90269190287f324ed93bab3bb1b4fa4aad98c3fbba1868c01cb0f2"),
-            false,
-        ),
-        (
-            "SYNAPSE_OWNED_DECODE_LFM2_1_2B",
-            "lfm2-1.2b-decode-q8_0",
-            "lfm2-1.2b",
-            "q8_0",
-            Some("5874faabdce2567dcc0e7339e9547d79421ba312c71e3442c9cc3c4ed3cb47d0"),
-            false,
-        ),
-    ];
-    for (checkpoint_env, model_id, family, quant, derived_digest, constrained_serve) in lanes {
-        certified_owned_checkpoint_lane(
-            checkpoint_env,
-            model_id,
-            family,
-            quant,
-            derived_digest,
-            constrained_serve,
-        )
-        .await;
-    }
-}
 
 #[test]
 fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_literal() {
@@ -3496,38 +1775,7 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
     );
 }
 
-#[cfg(target_os = "macos")]
-/// Upper bound on waiting for a LIVE holder. Twenty-two tests queue on this
-/// lock and each holds it for one daemon lifetime, so on a loaded shared
-/// workstation the last waiter can legitimately sit here for many minutes;
-/// a 180 s bound calibrated on a single test failed thirteen of them at
-/// once. Since a dead holder releases the lock in the kernel, the only thing
-/// this bound catches is a holder that is alive and hung, which is a defect
-/// worth a named failure rather than a silent CI timeout.
-const MINILM_E2E_LOCK_WAIT: Duration = Duration::from_secs(1800);
 
-#[cfg(target_os = "macos")]
-fn acquire_minilm_e2e_lock() -> MinilmE2eLock {
-    use cortexkit_lease::{FileLeaseStore, LeaseError, LeaseKey, LeaseStore};
-    let store = FileLeaseStore::new(std::env::temp_dir());
-    let key = LeaseKey::new("synapse", "e2e", "minilm-fixture");
-    let deadline = Instant::now() + MINILM_E2E_LOCK_WAIT;
-    loop {
-        match store.acquire(&key) {
-            Ok(handle) => return MinilmE2eLock { handle },
-            Err(LeaseError::Held { .. }) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "MiniLM e2e fixture lease {key:?} was held by a live process for over \
-                     {}s; a holder that stays alive this long is hung, not queued",
-                    MINILM_E2E_LOCK_WAIT.as_secs()
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(LeaseError::Io(error)) => panic!("failed to acquire MiniLM e2e lease: {error}"),
-        }
-    }
-}
 
 #[tokio::test]
 async fn admission_status_tracks_job_counters_over_wire() {
@@ -3538,15 +1786,6 @@ async fn admission_status_tracks_job_counters_over_wire() {
     })
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-
-    // Certify the local fixture before exercising durable admission counters.
-    run_probe_job(
-        &mut consumer,
-        route,
-        1,
-        serde_json::json!({"models": ["test-minilm"], "request_key": "telemetry-probe"}),
-    )
-    .await;
 
     // Snapshot before batch job
     let before_status = route_request(
