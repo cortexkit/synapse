@@ -438,8 +438,6 @@ class ReleaseChecks(unittest.TestCase):
         report_dir = self.root / 'docs/evidence/benchmark' / ('a' * 40)
         report_dir.mkdir(parents=True)
         (report_dir / 'report.json').write_text(json.dumps(self.report()))
-        transition = dict(session_id='same-session', coreml=[100] * 23, direct=[105] * 23, machine_load=[0.1] * 23, coreml_median=100, direct_median=105, bar_met=True)
-        (report_dir / 'ane-transition.json').write_text(json.dumps(transition))
         return entries, records, assets, cert, report_dir
 
     def test_raw_hardware_uuid_refused(self):
@@ -480,7 +478,7 @@ class ReleaseChecks(unittest.TestCase):
         (cert / ROWS[0] / (MODELS[0] + '.json')).unlink()
         self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
 
-    def test_stress_transition_and_release_notes_required(self):
+    def test_stress_required_without_retired_transition(self):
         entries, _, assets, cert, report_dir = self.evidence_fixture()
         stress_path = cert / 'ane-direct-stress.json'
         stress = check.load(stress_path)
@@ -491,17 +489,7 @@ class ReleaseChecks(unittest.TestCase):
         self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
         stress['leased_evict_count'] = 0
         stress_path.write_text(json.dumps(stress))
-        transition_path = report_dir / 'ane-transition.json'
-        transition = check.load(transition_path)
-        transition['direct'] = [106] * 23
-        transition['direct_median'] = 106
-        transition_path.write_text(json.dumps(transition))
-        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
-        transition['bar_met'] = False
-        transition_path.write_text(json.dumps(transition))
         check.evidence(self.root, 'a' * 40, assets, entries)
-        transition_path.unlink()
-        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
 
     def test_feature_disabled_and_loader_abort_smokes_fail(self):
         binary = self.root / 'ck-synapse-worker-cuda'
@@ -564,10 +552,6 @@ class ReleaseChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'missing release notes'):
             check.evidence(self.root, 'a' * 40, assets, entries)
 
-    def test_transition_boundary(self):
-        self.assertTrue(check.median([105] * 23) <= 1.05 * check.median([100] * 23))
-        self.assertFalse(check.median([106] * 23) <= 1.05 * check.median([100] * 23))
-        self.assertEqual(check.median([10000] * 3 + list(range(1, 21))), 10.5)
 
 
 if __name__ == '__main__':

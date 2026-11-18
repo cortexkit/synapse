@@ -8,8 +8,6 @@
 pub const LLAMA_ENGINE: &str = "llama";
 /// The HELLO identity announced by the llama.cpp worker.
 pub const LLAMA_WORKER_ENGINE: &str = "llama.cpp-worker";
-/// The HELLO identity announced by the Core ML/ANE worker.
-pub const ANE_WORKER_ENGINE: &str = "ane-coreml-worker";
 /// The HELLO identity announced by the owned Metal decode worker.
 pub const DECODE_WORKER_ENGINE: &str = "owned-metal-decode";
 /// The HELLO identity announced by the owned CUDA worker.
@@ -26,7 +24,6 @@ pub const ANE_DIRECT_WORKER_ENGINE: &str = "ane-direct-worker";
 pub fn worker_binary_file_name(engine: &str) -> Option<&'static str> {
     match engine {
         LLAMA_ENGINE => Some("ck-synapse-worker-llama"),
-        "ane" => Some("ck-synapse-worker-ane"),
         CUDA_WORKER_ENGINE => Some("ck-synapse-worker-cuda"),
         DECODE_WORKER_ENGINE => Some("ck-synapse-worker-decode"),
         VULKAN_WORKER_ENGINE => Some("ck-synapse-worker-vulkan"),
@@ -68,7 +65,6 @@ mod tests {
             });
             for (engine, binary) in [
                 (LLAMA_ENGINE, "ck-synapse-worker-llama"),
-                ("ane", "ck-synapse-worker-ane"),
                 (CUDA_WORKER_ENGINE, "ck-synapse-worker-cuda"),
                 (DECODE_WORKER_ENGINE, "ck-synapse-worker-decode"),
                 (VULKAN_WORKER_ENGINE, "ck-synapse-worker-vulkan"),
@@ -89,7 +85,6 @@ mod tests {
                 assert_eq!(sibling, Path::new("install").join(expected));
             }
             assert_eq!(worker_binary_file_name(LLAMA_WORKER_ENGINE), None);
-            assert_eq!(worker_binary_file_name(ANE_WORKER_ENGINE), None);
         }
     }
 }

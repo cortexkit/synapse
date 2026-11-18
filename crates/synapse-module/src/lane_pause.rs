@@ -37,7 +37,7 @@ struct PauseParams {
 }
 
 fn uses_ane(engine: &str) -> bool {
-    matches!(engine, "ane" | "ane-coreml-worker" | "ane-direct-worker")
+    engine == "ane-direct-worker"
 }
 
 pub(super) fn uses_ane_model(model: &EmbeddingModel) -> bool {

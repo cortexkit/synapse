@@ -20,7 +20,7 @@ pub const DEFAULT_MAX_FRAME_BYTES: u32 = 64 * 1024 * 1024;
 
 /// HELLO engine identities of the owned embed/rerank workers (CUDA, Vulkan and
 /// direct ANE). Only these are bound to a model manifest and kernel revision;
-/// llama, owned decode and Core ML workers omit both HELLO fields.
+/// llama and owned decode workers omit both HELLO fields.
 pub const OWNED_WORKER_HELLO_ENGINES: [&str; 3] = [
     CUDA_WORKER_ENGINE,
     VULKAN_WORKER_ENGINE,
@@ -614,12 +614,12 @@ pub enum WorkerResponse {
         req_id: String,
         rss_mb: u64,
         models_loaded: usize,
+        /// Retained for wire compatibility; no current worker sets this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placement_share: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         buckets: Option<Vec<usize>>,
-        /// Direct ANE only: resident shapes per model ref. Distinct from the
-        /// Core ML `buckets` ladder.
+        /// Direct ANE only: resident shapes per model ref.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ane_resident_shapes: Option<BTreeMap<String, Vec<usize>>>,
     },
@@ -1400,11 +1400,7 @@ mod tests {
                 Ok(())
             );
         }
-        for engine in [
-            "owned-metal-decode",
-            "llama.cpp-worker",
-            "ane-coreml-worker",
-        ] {
+        for engine in ["owned-metal-decode", "llama.cpp-worker"] {
             assert_eq!(
                 check_hello_binding(&hello(engine, None, None), Some(&binding())),
                 Ok(())
@@ -1706,22 +1702,16 @@ mod tests {
         let llama_pong = serde_json::json!({
             "type": "PONG", "req_id": "ping-1", "rss_mb": 0, "models_loaded": 1,
         });
-        let coreml_pong = serde_json::json!({
-            "type": "PONG", "req_id": "ping-2", "rss_mb": 12, "models_loaded": 1,
-            "placement_share": 0.98, "buckets": [128, 256, 512],
-        });
-        for fixture in [llama_pong, coreml_pong] {
-            let decoded: WorkerResponse = serde_json::from_value(fixture.clone()).unwrap();
-            let WorkerResponse::Pong {
-                ane_resident_shapes,
-                ..
-            } = &decoded
-            else {
-                panic!("fixture decodes as PONG");
-            };
-            assert_eq!(*ane_resident_shapes, None);
-            assert_eq!(serde_json::to_value(&decoded).unwrap(), fixture);
-        }
+        let decoded: WorkerResponse = serde_json::from_value(llama_pong.clone()).unwrap();
+        let WorkerResponse::Pong {
+            ane_resident_shapes,
+            ..
+        } = &decoded
+        else {
+            panic!("fixture decodes as PONG");
+        };
+        assert_eq!(*ane_resident_shapes, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), llama_pong);
 
         let direct = WorkerResponse::Pong {
             req_id: "ping-3".to_string(),

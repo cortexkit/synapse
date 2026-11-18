@@ -146,7 +146,6 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
         .unwrap();
     for engine in [
         "llama",
-        "ane",
         "owned-cuda",
         "owned-metal-decode",
         "owned-vulkan",
@@ -161,18 +160,6 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
             .map(PathBuf::from)
             .unwrap_or(source);
         if source.is_file() {
-            if engine == "ane" {
-                // Without SYNAPSE_ANE_SWIFT_WORKER the launcher would exec the
-                // Swift worker at the path baked in when it was compiled,
-                // under its `ck-` name, so point it at a `ckdev-` link.
-                let swift = swift_worker(source.parent().unwrap())
-                    .or_else(|| swift_worker(built_dir))
-                    .expect("ANE launcher requires a development Swift companion");
-                command.env(
-                    "SYNAPSE_ANE_SWIFT_WORKER",
-                    synapse_core::dev_binary::ckdev_binary(swift, &test_root).unwrap(),
-                );
-            }
             command.env(
                 variable,
                 synapse_core::dev_binary::ckdev_binary(source, &test_root).unwrap(),
@@ -196,29 +183,6 @@ pub fn configure_test_module_command(command: &mut Command, config_json: Option<
     } else {
         command.env_remove(variable);
     }
-}
-
-pub fn swift_worker(built_dir: &Path) -> Option<PathBuf> {
-    let explicit = std::env::var_os("SYNAPSE_ANE_SWIFT_WORKER").map(PathBuf::from);
-    explicit
-        .filter(|path| path.is_file())
-        .or_else(|| {
-            let sibling = built_dir.join("ck-synapse-worker-ane-swift");
-            sibling.is_file().then_some(sibling)
-        })
-        .or_else(|| {
-            std::fs::read_dir(built_dir.join("build"))
-                .ok()?
-                .flatten()
-                .filter(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("synapse-worker-ane-")
-                })
-                .map(|entry| entry.path().join("out/ck-synapse-worker-ane-swift"))
-                .find(|path| path.is_file())
-        })
 }
 
 pub async fn connect_consumer(connection_file_path: &Path) -> TcpStream {

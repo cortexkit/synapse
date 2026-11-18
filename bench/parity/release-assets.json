@@ -34,20 +34,6 @@
       "reason": "llama.cpp worker; not an embed or rerank lane for the four models"
     },
     {
-      "asset": "ck-synapse-worker-ane-darwin-arm64.zip",
-      "binary": "ck-synapse-worker-ane",
-      "binding": "exempt",
-      "os_arch": "darwin-arm64",
-      "reason": "Core ML ANE launcher; Core ML is not a certification lane"
-    },
-    {
-      "asset": "ck-synapse-worker-ane-swift-darwin-arm64.zip",
-      "binary": "ck-synapse-worker-ane-swift",
-      "binding": "exempt",
-      "os_arch": "darwin-arm64",
-      "reason": "Core ML Swift worker; Core ML is not a certification lane"
-    },
-    {
       "asset": "ck-synapse-worker-decode-darwin-arm64.zip",
       "binary": "ck-synapse-worker-decode",
       "binding": "exempt",

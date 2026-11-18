@@ -168,7 +168,7 @@ class PreflightPlanTests(unittest.TestCase):
         native = PREFLIGHT["macos_commands"]()
         self.assertIn(["xcrun", "--find", "metal"], native)
         self.assertIn(["cargo", "clippy", "--locked", "-p", "synapse-module", "-p", "synapse-engine-owned",
-                       "-p", "synapse-worker-ane", "--all-targets", "--", "-D", "warnings"], native)
+                       "--all-targets", "--", "-D", "warnings"], native)
         self.assertIn(["cargo", "test", "--locked", "-p", "synapse-engine-owned", "--lib"], native)
 
 

@@ -364,7 +364,7 @@ fn legacy_metal_engine_keeps_master_logit_bytes() {
         .take(64)
         .map(|case| serde_json::from_value(case["input_ids"].clone()).unwrap())
         .collect();
-    let mut config = model_runtime_config(&spec, &model_path, &[], &root.join("cache"), 8192, None);
+    let mut config = model_runtime_config(&spec, &model_path, &root.join("cache"), 8192);
     // The frozen identity omits the deployment's attention budget. Supply enough
     // to admit its 8192-token context; this replay still uses only short inputs.
     config

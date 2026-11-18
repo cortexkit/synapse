@@ -1653,7 +1653,7 @@ impl WorkerEngine {
                 crash_key: "test-crash-key".to_string(),
                 artifact: ValidatedArtifact {
                     digest: "sha256:test".to_string(),
-                    format: "coreml".to_string(),
+                    format: "test-artifact".to_string(),
                 },
                 runtime_config: RuntimeConfig::default(),
                 worker_model_ref: Some("worker-ref-0".to_string()),
@@ -2696,65 +2696,6 @@ mod tests {
     #[cfg(unix)]
     use super::test_support::*;
     use super::*;
-    #[test]
-    #[cfg(unix)]
-    fn pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock() {
-        const PROBE: &str = "SYNAPSE_PAUSE_SHUTDOWN_LOCK_PROBE";
-        if std::env::var_os(PROBE).is_none() {
-            // Isolate the file descriptor from concurrent test threads that fork.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "worker_host::tests::pause_shutdown_reaps_coreml_worker_before_releasing_inherited_lock", "--test-threads=1"])
-                .env(PROBE, "1").output().unwrap();
-            if !output.status.success() {
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                // Lead with the child's own panic message: the full libtest output
-                // starts with "running 1 test", which hides why the child failed.
-                let reason = combined
-                    .lines()
-                    .skip_while(|line| !line.contains("panicked at"))
-                    .nth(1)
-                    .unwrap_or("isolated child failed without a panic message");
-                panic!("{reason}\n{combined}");
-            }
-            return;
-        }
-        use ane_residency::{inheritable_lock_stdio, AneDirectLaneLock};
-        let root = std::env::temp_dir().join(format!("synapse-pause-shutdown-{}", nonce_hex16()));
-        let path = root.join("ane.lock");
-        let holder = AneDirectLaneLock::acquire(&path).unwrap();
-        let mut config = WorkerHostConfig::new("unused-worker", &root);
-        config.inherited_lane_lock = Some(holder.inheritable());
-        let engine = WorkerEngine::new(config).unwrap();
-        let peer = engine.runtime().block_on(async {
-            let (stream, peer) = tokio::net::UnixStream::pair().unwrap();
-            let child = Command::new("sleep")
-                .arg("30")
-                .kill_on_drop(true)
-                .stdin(inheritable_lock_stdio(&holder.inheritable()).unwrap())
-                .spawn()
-                .unwrap();
-            engine.lock_host().unwrap().connection = Some(WorkerConnection {
-                stream,
-                child,
-                logs: LogRing::new(),
-                worker_generation: 1,
-                packed: None,
-                unusable: false,
-            });
-            peer
-        });
-        drop(holder);
-        assert!(AneDirectLaneLock::acquire(&path).is_err());
-        engine.shutdown_for_pause().unwrap();
-        let replacement = AneDirectLaneLock::acquire(&path)
-            .expect("confirmed exit must free the inherited descriptor");
-        drop((peer, engine, replacement));
-        std::fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn nonce_is_hex16() {
@@ -5312,18 +5253,6 @@ pub mod ane_residency {
                 }
             }
             Ok(lock.as_ref().map(AneDirectLaneLock::inheritable))
-        }
-
-        /// Core ML can borrow an owned descriptor without depending on direct-ANE
-        /// ownership. An absent or released lock is not a Core ML load refusal.
-        #[cfg(unix)]
-        pub fn held_lane_lock(&self) -> Option<Arc<std::fs::File>> {
-            self.inner
-                .lane_lock
-                .lock()
-                .expect("lane lock")
-                .as_ref()
-                .map(AneDirectLaneLock::inheritable)
         }
 
         /// Release only after every owner has confirmed shutdown. A retained

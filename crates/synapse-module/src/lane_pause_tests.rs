@@ -640,63 +640,6 @@ async fn pause_reacquire_contention_keeps_refusing_instead_of_serving() {
     finish_ane_lane_fixture(fixture).await;
 }
 
-#[tokio::test]
-async fn pause_covers_cold_coreml_and_omits_unknown_legacy_fingerprint() {
-    let fixture = installed_ready_ane_fixture().await;
-    assert!(fixture
-        .state
-        .runtime
-        .ane_supervisor
-        .lock()
-        .unwrap()
-        .is_none());
-    let path = fixture_lock_path(&fixture);
-    let mut spec = model_slot_snapshot(&fixture.state.runtime, ANE_TEST_LANE)
-        .unwrap()
-        .spec;
-    spec.model_id = "legacy-coreml".into();
-    spec.engine = "ane".into();
-    spec.engine_identity.engine = "ane-coreml-worker".into();
-    spec.fingerprint = Fingerprint(String::new());
-    fixture.state.runtime.catalog.lock().unwrap().insert(
-        spec.model_id.clone(),
-        ModelSlot {
-            spec,
-            loaded: None,
-            state: ModelRuntimeState::Unloaded,
-            notify: Arc::new(Notify::new()),
-            last_cold_load_ms: None,
-        },
-    );
-    let pause = start_pause(&fixture.state).await;
-    assert!(pause["lane_ids"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("legacy-coreml")));
-    let refused = call(
-        &fixture.state,
-        "embed.query",
-        json!({"model":"legacy-coreml","text":"a"}),
-    )
-    .await;
-    assert_eq!(refused["error"]["code"], "lane_paused");
-    assert_eq!(refused["error"]["details"]["lane_id"], "legacy-coreml");
-    assert!(refused["error"]["details"].get("fingerprint").is_none());
-    assert_eq!(
-        fixture
-            .state
-            .runtime
-            .model_load_tasks
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    end_pause(&fixture.state).await;
-    assert!(
-        AneDirectLaneLock::acquire(&path).is_err(),
-        "cold resume must hold the fixture's lane lock"
-    );
-    finish_ane_lane_fixture(fixture).await;
-}
 
 #[tokio::test]
 async fn queued_catalog_batch_gets_retryable_pause_without_loading() {

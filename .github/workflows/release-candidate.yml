@@ -74,9 +74,9 @@ jobs:
             packaging: scripts/package-owned-cuda.ps1 for CUDA; archive-root zip otherwise
           - os_arch: darwin-arm64
             runner: macos-15
-            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-ane -p synapse-worker-decode -p synapse-worker-ane-direct
+            packages: -p synapse-module -p synapse-opctl -p synapse-worker-llama -p synapse-worker-decode -p synapse-worker-ane-direct
             features: ''
-            binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-ane ck-synapse-worker-ane-swift ck-synapse-worker-decode ck-synapse-worker-ane-direct
+            binaries: ck-synapse ck-synapse-opctl ck-synapse-worker-llama ck-synapse-worker-decode ck-synapse-worker-ane-direct
             toolkits: full Xcode; no CUDA toolkit or Vulkan SDK
             packaging: archive-root zip
     runs-on: ${{ matrix.runner }}
@@ -182,26 +182,11 @@ jobs:
           set -euo pipefail
           bins=()
           for bin in ${{ matrix.binaries }}; do
-            # Swift is emitted by the ANE build script, not a Cargo bin target.
-            if [ "$bin" != ck-synapse-worker-ane-swift ]; then
-              bins+=(--bin "$bin")
-            fi
+            bins+=(--bin "$bin")
           done
           # Package selection alone also builds local exercisers and mocks.
           # Select shipped targets without hiding tools operators build locally.
           cargo build --release --locked ${{ matrix.packages }} ${{ matrix.features }} "${bins[@]}"
-      - name: Stage Swift Core ML worker
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          import shutil
-          workers = list(Path('target/release/build').glob('**/ck-synapse-worker-ane-swift'))
-          assert len(workers) == 1, workers
-          shutil.copy2(workers[0], 'target/release/ck-synapse-worker-ane-swift')
-          PY
       - name: Check SPIR-V set digest against synapse-core
         if: runner.os != 'macOS'
         shell: bash

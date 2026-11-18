@@ -133,7 +133,7 @@ class ReleaseTargetsTests(unittest.TestCase):
                 self.assertIn("ck-synapse", selected)
                 self.assertIn("--release", args)
                 self.assertIn("--locked", args)
-                self.assertEqual(selected, set(matrix["binaries"].split()) - {"ck-synapse-worker-ane-swift"})
+                self.assertEqual(selected, set(matrix["binaries"].split()))
                 self.assertTrue(all(name.startswith("ck-") for name in selected))
                 self.assertTrue(selected.isdisjoint({"inline_embed_throughput", "subc_call",
                                                       "synapse-worker-timeout-mock"}))

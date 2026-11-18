@@ -13,7 +13,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-mod ane_artifact;
 mod catalog;
 mod catalog_migration;
 mod catalog_probe;
@@ -111,9 +110,7 @@ use subc_protocol::{
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
     worker_binary_file_name,
-    worker_engine_names::{
-        ANE_WORKER_ENGINE, DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE,
-    },
+    worker_engine_names::{DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE},
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, AliasTable, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
     EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
@@ -176,7 +173,6 @@ const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
 const MAX_ENGINE_BATCH_ITEMS: usize = 8;
 const DEFAULT_PROBE_MEAN_COSINE_THRESHOLD: f64 = 0.999;
 const DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD: f64 = 0.9;
-const DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD: f64 = 0.9;
 const DEFAULT_DECODE_CHAIN_K: u32 = 1;
 const MAX_DECODE_CHAIN_K: u32 = 16;
 const RERANK_PROBE_PEARSON_THRESHOLD: f64 = 0.999;
@@ -1113,8 +1109,6 @@ struct ProbeConfig {
     mean_cosine_threshold: f64,
     #[serde(default = "default_probe_worst_decile_rank_overlap_threshold")]
     worst_decile_rank_overlap_threshold: f64,
-    #[serde(default = "default_probe_ane_placement_threshold")]
-    ane_placement_threshold: f64,
 }
 
 impl Default for ProbeConfig {
@@ -1123,7 +1117,6 @@ impl Default for ProbeConfig {
             mean_cosine_threshold: default_probe_mean_cosine_threshold(),
             worst_decile_rank_overlap_threshold: default_probe_worst_decile_rank_overlap_threshold(
             ),
-            ane_placement_threshold: default_probe_ane_placement_threshold(),
         }
     }
 }
@@ -1185,10 +1178,6 @@ fn default_probe_mean_cosine_threshold() -> f64 {
 
 fn default_probe_worst_decile_rank_overlap_threshold() -> f64 {
     DEFAULT_PROBE_WORST_DECILE_RANK_OVERLAP_THRESHOLD
-}
-
-fn default_probe_ane_placement_threshold() -> f64 {
-    DEFAULT_PROBE_ANE_PLACEMENT_THRESHOLD
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1274,17 +1263,6 @@ impl AdmissionTelemetry {
     }
 }
 
-#[cfg(all(test, unix))]
-// Portable Core ML tests replace only process creation. The ordinary load path
-// still selects the supervisor and exchanges LOAD frames with a real host.
-type CoreMlTestWorkerFactory = Arc<
-    dyn Fn(
-            worker_host::WorkerHostConfig,
-        ) -> Result<worker_host::WorkerEngine, worker_host::WorkerHostError>
-        + Send
-        + Sync,
->;
-
 struct RuntimeState {
     findings_changed: Arc<Notify>,
     findings_recompute: Mutex<()>,
@@ -1336,8 +1314,6 @@ struct RuntimeState {
     execution_stats: Arc<Mutex<InlineExecutionStats>>,
     control_loads: Arc<Semaphore>,
     ane_supervisor: Mutex<Option<worker_host::ane_residency::AneResidencySupervisor>>,
-    #[cfg(all(test, unix))]
-    coreml_test_worker_factory: Mutex<Option<CoreMlTestWorkerFactory>>,
     /// Captured at startup for production; unit tests must configure a path in
     /// their store fixture instead of falling back to the machine-wide lock.
     #[cfg(unix)]
@@ -1710,7 +1686,6 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
         return Some(owned_dtype.clone());
     }
     match spec.engine.as_str() {
-        "ane" | ANE_WORKER_ENGINE => Some("f16".to_string()),
         CUDA_WORKER_ENGINE => Some("f16".to_string()),
         _ => None,
     }
@@ -1719,7 +1694,6 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
 fn device_class_for_engine(engine: &str) -> Option<String> {
     match engine {
         "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
-        "ane" | ANE_WORKER_ENGINE => Some("ane".to_string()),
         CUDA_WORKER_ENGINE | "cuda" => Some("cuda".to_string()),
         LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
         _ => None,
@@ -1751,7 +1725,6 @@ fn execution_lane(model: &EmbeddingModel) -> &'static str {
 fn execution_lane_for_engine(engine: &str) -> &'static str {
     match engine {
         "owned-metal" => "metal",
-        "ane" | ANE_WORKER_ENGINE => "ane",
         synapse_core::ANE_DIRECT_WORKER_ENGINE => "ane-direct",
         CUDA_WORKER_ENGINE => "cuda",
         synapse_core::VULKAN_WORKER_ENGINE => "vulkan",
@@ -2335,11 +2308,7 @@ struct PerfBenchResult {
 
 struct SystemClock;
 
-/// Fixed-row ANE advice bounds the caller's batch size independently of token
-/// length. With fixed sequence buckets, its token budget is the row count
-/// multiplied by the model's maximum sequence length. This is scheduling advice,
-/// not a promise that a batch executes as one hardware pass.
-fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<RecommendedBatch> {
+fn recommended_batch_for_engine(engine: &str, _max_tokens: usize) -> Option<RecommendedBatch> {
     match engine {
         // Every owned embed/rerank engine shares the module's batch planner,
         // which clamps a batch to these limits; clients size their calls from
@@ -2351,13 +2320,6 @@ fn recommended_batch_for_engine(engine: &str, max_tokens: usize) -> Option<Recom
             rows: MAX_ENGINE_BATCH_ITEMS,
             token_budget: DEFAULT_ENGINE_BATCH_TOKEN_BUDGET,
         }),
-        "ane" | ANE_WORKER_ENGINE => {
-            let rows = MAX_ENGINE_BATCH_ITEMS;
-            Some(RecommendedBatch {
-                rows,
-                token_budget: (max_tokens.max(1) as u64).saturating_mul(rows as u64),
-            })
-        }
         _ => None,
     }
 }
@@ -2577,8 +2539,6 @@ impl RuntimeState {
             execution,
             execution_stats,
             ane_supervisor: Mutex::new(None),
-            #[cfg(all(test, unix))]
-            coreml_test_worker_factory: Mutex::new(None),
             #[cfg(all(unix, not(test)))]
             ane_lane_lock_path: worker_host::ane_residency::AneDirectLaneLock::default_path(),
             #[cfg(all(test, unix))]
@@ -2852,6 +2812,9 @@ fn sync_and_load_catalog_models(
     }
     for id in &reconciled.skipped_reserved {
         tracing::warn!(model_id=%id,"skipping persisted catalog-reserved registration");
+    }
+    for (id, engine) in &reconciled.skipped_retired {
+        tracing::warn!(model_id=%id,%engine,"skipping persisted registration with retired engine");
     }
     for model in reconciled.registrable {
         let refreshed = normalize_catalog_model(model.clone(), &config.inline, &config.jobs)?;
@@ -3717,7 +3680,7 @@ fn build_stored_model_config(
             Some(OwnedDType::F16) => NumericDType::F16,
             Some(OwnedDType::F32) => NumericDType::F32,
             None => match engine_name {
-                LLAMA_ENGINE | "ane" => NumericDType::F16,
+                LLAMA_ENGINE => NumericDType::F16,
                 _ => NumericDType::F32,
             },
         },
@@ -3972,7 +3935,6 @@ fn owned_cuda_catalog_config(
 fn canonical_engine_name(engine: &str) -> String {
     match engine.trim().to_ascii_lowercase().as_str() {
         "llama.cpp" | LLAMA_WORKER_ENGINE => "llama".to_string(),
-        "coreml" | "neural_engine" | ANE_WORKER_ENGINE => "ane".to_string(),
         // Catalog entries select this engine explicitly. Future hardware probes can
         // populate the same catalog value without changing request dispatch.
         "owned" | "metal" | "owned_metal" => "owned-metal".to_string(),
@@ -3989,7 +3951,6 @@ fn default_artifact_format(engine_name: &str) -> String {
         #[cfg(feature = "test-support")]
         test_deterministic::NAME => test_deterministic::NAME.into(),
         LLAMA_ENGINE => "gguf".to_string(),
-        "ane" => "mlmodelc".to_string(),
         // Every owned engine loads a converted safetensors profile package.
         "owned-metal" | "owned-cuda" | "owned-vulkan" | synapse_core::ANE_DIRECT_WORKER_ENGINE => {
             "safetensors-package".to_string()
@@ -4002,7 +3963,6 @@ fn default_artifact_format(engine_name: &str) -> String {
 fn default_quant(engine_name: &str) -> String {
     match engine_name {
         LLAMA_ENGINE => "f16".to_string(),
-        "ane" => "fp16".to_string(),
         "owned-metal" | "owned-cuda" | "owned-metal-decode" => "f16".to_string(),
         _ => "fp32".to_string(),
     }
@@ -4019,19 +3979,11 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             "protocol-v1",
             &[("transport", worker_catalog_transport())],
         )),
-        "ane" => Ok(worker_catalog_identity(
-            ANE_WORKER_ENGINE,
-            "protocol-v1",
-            &[
-                ("transport", worker_catalog_transport()),
-                ("placement_gate", "neural-engine"),
-            ],
-        )),
         // These two lanes exist only as catalog lanes, whose fingerprints are pinned
         // in the release manifest and must be identical on every platform that
         // runs them (Vulkan runs on Linux and Windows). The IPC transport differs
         // by OS and does not affect the vectors, so it stays out of the identity.
-        // The legacy arms above keep it, because live fingerprints depend on it.
+        // The legacy llama arm above keeps it, because live fingerprints depend on it.
         //
         // The version strings in this function ("protocol-v1", "protocol-v2") are
         // frozen fingerprint inputs, not the worker wire protocol: the workers now
@@ -6751,16 +6703,6 @@ async fn load_catalog_model_task(
         findings_changed: Some(state.runtime.findings_changed.clone()),
         ..WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec)
     };
-    #[cfg(all(test, unix))]
-    let worker_load_context = WorkerLoadContext {
-        coreml_worker_factory: state
-            .runtime
-            .coreml_test_worker_factory
-            .lock()
-            .unwrap()
-            .clone(),
-        ..worker_load_context
-    };
     let ane_supervisor = direct_ane_supervisor(&state.runtime, &spec.engine);
     let is_catalog = state.runtime.release_catalog.is_reserved_id(&model_id);
     let fault_lane = model_id.clone();
@@ -6987,8 +6929,6 @@ struct WorkerLoadContext {
     findings_changed: Option<Arc<Notify>>,
     timeout: Duration,
     forward_lines_per_sec: u32,
-    #[cfg(all(test, unix))]
-    coreml_worker_factory: Option<CoreMlTestWorkerFactory>,
 }
 
 impl WorkerLoadContext {
@@ -6997,8 +6937,6 @@ impl WorkerLoadContext {
             timeout,
             findings_changed: None,
             forward_lines_per_sec,
-            #[cfg(all(test, unix))]
-            coreml_worker_factory: None,
         }
     }
 }
@@ -7037,31 +6975,13 @@ fn load_catalog_model_blocking(
     let model_path = locator_path(&spec.model_locator, &model_cache)?;
     let tokenizer_path = locator_path(&spec.tokenizer_locator, &model_cache)?;
     let owned_profile = stored_owned_profile(&spec)?;
-    let extra_assets = spec
+    // Keep every package member leased until the worker finishes loading it.
+    let _extra_assets = spec
         .extra_locators
         .iter()
         .map(|locator| locator_path(locator, &model_cache))
         .collect::<Result<Vec<_>, _>>()?;
-    let ane_artifacts = if spec.engine == "ane"
-        && cfg!(target_os = "macos")
-        && matches!(spec.artifact_format.as_str(), "mlmodelc" | "coreml")
-    {
-        Some(materialize_ane_artifacts(
-            &spec,
-            &model_path,
-            &extra_assets,
-            model_cache.root(),
-        )?)
-    } else {
-        None
-    };
-    let effective_model_path = if let Some(artifacts) = ane_artifacts.as_ref() {
-        artifacts
-            .first()
-            .expect("ANE artifact set always contains the primary model")
-            .path
-            .clone()
-    } else if spec.engine_identity.build_flags.contains_key("profile") {
+    let effective_model_path = if spec.engine_identity.build_flags.contains_key("profile") {
         model_path.path.clone()
     } else if let Some(profile) = owned_profile.as_ref() {
         assemble_owned_model_package(&spec, &model_path.path, &model_cache, profile)?
@@ -7104,10 +7024,8 @@ fn load_catalog_model_blocking(
     let runtime_config = model_runtime_config(
         &spec,
         &effective_model_path,
-        &extra_assets,
         model_cache.root(),
         microllm_max_tokens,
-        ane_artifacts.as_deref(),
     );
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),
@@ -7179,7 +7097,7 @@ fn load_catalog_model_blocking(
             },
             None,
         ),
-        LLAMA_ENGINE | "ane" | "owned-vulkan" | "ane-direct-worker" => {
+        LLAMA_ENGINE | "owned-vulkan" | "ane-direct-worker" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
                 &artifact,
@@ -7390,15 +7308,6 @@ fn direct_ane_supervisor(
     runtime: &RuntimeState,
     engine: &str,
 ) -> Result<Option<worker_host::ane_residency::AneResidencySupervisor>, WireOperationError> {
-    // Core ML may inherit an already-held descriptor, but a model load must
-    // never acquire or re-acquire the direct-ANE lock on its behalf.
-    if matches!(engine, "ane" | "ane-coreml-worker") {
-        return runtime
-            .ane_supervisor
-            .lock()
-            .map(|shared| shared.clone())
-            .map_err(|_| artifact_invalid_error("direct-ANE supervisor mutex poisoned"));
-    }
     if engine != "ane-direct-worker" {
         return Ok(None);
     }
@@ -7492,14 +7401,8 @@ fn load_worker_backend_blocking(
 ) -> Result<(EmbedBackend, LoadedModel), WireOperationError> {
     use worker_host::{WorkerEngine, WorkerHostConfig};
 
-    #[cfg(all(test, unix))]
-    let coreml_test_worker_factory = worker_load_context
-        .coreml_worker_factory
-        .filter(|_| spec.engine == "ane");
     let macos_available = cfg!(target_os = "macos");
-    #[cfg(all(test, unix))]
-    let macos_available = macos_available || coreml_test_worker_factory.is_some();
-    if matches!(spec.engine.as_str(), "ane" | "ane-direct-worker") && !macos_available {
+    if spec.engine == "ane-direct-worker" && !macos_available {
         return Err(artifact_invalid_error(format!(
             "{} model '{}' is only supported on macOS",
             spec.engine, spec.model_id
@@ -7557,16 +7460,6 @@ fn load_worker_backend_blocking(
     }
     #[cfg(not(unix))]
     let _ = ane_supervisor;
-    #[cfg(unix)]
-    if matches!(spec.engine.as_str(), "ane" | "ane-coreml-worker") {
-        config.inherited_lane_lock = ane_supervisor.as_ref().and_then(|s| s.held_lane_lock());
-    }
-    #[cfg(all(test, unix))]
-    let engine = match coreml_test_worker_factory {
-        Some(factory) => factory(config),
-        None => WorkerEngine::new(config),
-    };
-    #[cfg(not(all(test, unix)))]
     let engine = WorkerEngine::new(config);
     let mut engine = engine.map_err(|error| {
         WireOperationError::from_stable(
@@ -7583,38 +7476,6 @@ fn load_worker_backend_blocking(
         EmbedBackend::Worker(Arc::new(Mutex::new(engine))),
         loaded_model,
     ))
-}
-
-fn materialize_ane_artifacts(
-    spec: &StoredModelConfig,
-    model: &LocatedAsset,
-    extra_assets: &[LocatedAsset],
-    cache_root: &Path,
-) -> Result<Vec<ane_artifact::MaterializedCoreMlArtifact>, WireOperationError> {
-    let assets = std::iter::once((&spec.model_locator, model))
-        .chain(spec.extra_locators.iter().zip(extra_assets.iter()));
-    let mut materialized = Vec::with_capacity(1 + extra_assets.len());
-    for (locator, asset) in assets {
-        let source_digest = model_asset_digest(locator, &spec.artifact_digest);
-        let artifact =
-            ane_artifact::materialize_core_ml_artifact(&asset.path, &source_digest, cache_root)
-                .map_err(|error| {
-                    artifact_invalid_error(format!(
-                        "materialize ANE Core ML artifact {}: {error:#}",
-                        asset.path.display()
-                    ))
-                })?;
-        tracing::debug!(
-            target: "maintenance",
-            source = %asset.path.display(),
-            materialized = %artifact.path.display(),
-            source_digest,
-            reused = artifact.reused,
-            "ANE Core ML artifact ready"
-        );
-        materialized.push(artifact);
-    }
-    Ok(materialized)
 }
 
 fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), WireOperationError> {
@@ -7650,10 +7511,8 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
 fn model_runtime_config(
     spec: &StoredModelConfig,
     model_path: &Path,
-    extra_assets: &[LocatedAsset],
     model_cache_root: &Path,
     microllm_max_tokens: u32,
-    ane_artifacts: Option<&[ane_artifact::MaterializedCoreMlArtifact]>,
 ) -> RuntimeConfig {
     let mut runtime_config = RuntimeConfig::default();
     if let Some(profile) = spec.engine_identity.build_flags.get("profile") {
@@ -7672,45 +7531,6 @@ fn model_runtime_config(
         "artifact_path".to_string(),
         model_path.to_string_lossy().to_string(),
     );
-    if spec.engine == "ane" {
-        let (paths, digests) = if let Some(artifacts) = ane_artifacts {
-            (
-                artifacts
-                    .iter()
-                    .map(|artifact| artifact.path.to_string_lossy().to_string())
-                    .collect(),
-                artifacts
-                    .iter()
-                    .map(|artifact| artifact.digest.clone())
-                    .collect(),
-            )
-        } else {
-            let mut paths = vec![model_path.to_string_lossy().to_string()];
-            paths.extend(
-                extra_assets
-                    .iter()
-                    .map(|asset| asset.path.to_string_lossy().to_string()),
-            );
-            let mut digests = vec![model_asset_digest(
-                &spec.model_locator,
-                &spec.artifact_digest,
-            )];
-            digests.extend(
-                spec.extra_locators
-                    .iter()
-                    .map(|locator| model_asset_digest(locator, &spec.artifact_digest)),
-            );
-            (paths, digests)
-        };
-        runtime_config.values.insert(
-            "artifact_paths".to_string(),
-            serde_json::to_string(&paths).expect("ANE artifact paths serialize"),
-        );
-        runtime_config.values.insert(
-            "artifact_digests".to_string(),
-            serde_json::to_string(&digests).expect("ANE artifact digests serialize"),
-        );
-    }
     runtime_config
         .values
         .insert("pooling".to_string(), spec.pooling.clone());
@@ -7856,23 +7676,14 @@ pub fn llama_backend_contract_runtime_config(
     Ok(model_runtime_config(
         &spec,
         model_path,
-        &[],
         Path::new("/tmp/synapse-backend-contract-cache"),
         DEFAULT_MICROLLM_MAX_TOKENS,
-        None,
     ))
 }
 
 struct LocatedAsset {
     path: PathBuf,
     _guard: Option<synapse_core::ModelCacheReadGuard>,
-}
-
-fn model_asset_digest(locator: &ModelAssetLocator, fallback: &str) -> String {
-    match locator {
-        ModelAssetLocator::CacheDigest { digest } => digest.clone(),
-        ModelAssetLocator::LocalPath { .. } => fallback.to_string(),
-    }
 }
 
 fn locator_path(
@@ -8658,7 +8469,7 @@ fn build_loaded_catalog_model(
         model_id,
         engine_name,
         task,
-        if owned.is_some() || engine_name == "ane" {
+        if owned.is_some() {
             package_digest
         } else {
             model_meta.digest.clone()
@@ -8763,11 +8574,6 @@ fn validate_artifact_file(path: &Path, engine_name: &str) -> Result<(), WireOper
                 )))
             }
         }
-        "mlmodelc" if read >= 4 && &header[..4] == b"PK\x03\x04" => Ok(()),
-        "mlmodelc" => Err(artifact_invalid_error(format!(
-            "expected a zipped .mlmodelc bundle at {}",
-            path.display()
-        ))),
         other => Err(artifact_invalid_error(format!(
             "unsupported artifact format '{other}' for {}",
             path.display()
@@ -10261,10 +10067,8 @@ fn build_supervised_decode_dispatch_for_chain_k(
     let mut runtime_config = model_runtime_config(
         spec,
         &model_path.path,
-        &[],
         state.model_cache.root(),
         state.runtime.microllm_max_tokens,
-        None,
     );
     let decode_fingerprint = entry
         .decode_identity_inputs()
@@ -13917,20 +13721,13 @@ async fn execute_embed_probe_for_model(
         });
     };
     let evidence = probe_evidence(&vectors, &fixture.items);
-    let placement_share = ane_placement_share_for_model(&model).await?;
     let quality_passed = evidence.mean_cosine >= state.runtime.probe.mean_cosine_threshold
         && evidence.worst_decile >= state.runtime.probe.worst_decile_rank_overlap_threshold;
-    let placement_passed = if model.engine_identity.engine == "ane-coreml-worker" {
-        placement_share.is_some_and(|share| share >= state.runtime.probe.ane_placement_threshold)
-    } else {
-        true
-    };
-    let passed = quality_passed && placement_passed;
+    let passed = quality_passed;
     let cuda_evidence = owned_cuda_evidence(state, &model).await?;
     let certification_evidence = json!({
         "task": "embed",
         "metrics": evidence,
-        "ane_placement_share": placement_share,
         "cuda": cuda_evidence,
     });
     let performance = if passed {
@@ -13960,56 +13757,15 @@ async fn execute_embed_probe_for_model(
             "numeric_profile_id": model.numeric_profile_id,
             "status": if passed { "certified" } else { "uncertified" },
             "evidence": evidence,
-            "ane_placement_share": placement_share,
             "thresholds": {
                 "mean_cosine": state.runtime.probe.mean_cosine_threshold,
                 "worst_decile": state.runtime.probe.worst_decile_rank_overlap_threshold,
-                "ane_placement_share": state.runtime.probe.ane_placement_threshold,
             },
             "cuda": cuda_evidence,
             "performance": performance,
         }),
         certified_vectors: passed.then_some(vectors),
     })
-}
-
-async fn ane_placement_share_for_model(
-    model: &EmbeddingModel,
-) -> Result<Option<f64>, WireOperationError> {
-    if model.engine_identity.engine != "ane-coreml-worker" {
-        return Ok(None);
-    }
-    match &model.backend {
-        EmbedBackend::Worker(engine) => {
-            // WorkerEngine::ping bridges to its private runtime with block_on;
-            // keep that synchronous bridge off the module's async runtime.
-            let engine = Arc::clone(engine);
-            let ping = tokio::task::spawn_blocking(move || {
-                let engine = engine.lock().map_err(|_| {
-                    worker_host::WorkerHostError::Protocol(
-                        "worker engine mutex was poisoned during ANE placement ping".to_string(),
-                    )
-                })?;
-                engine.ping()
-            })
-            .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("ANE placement ping join failed: {error}"),
-                )
-            })?
-            .map_err(|error| {
-                engine_error_to_wire(error.to_engine_error(EngineErrorStage::Inference))
-            })?;
-            Ok(ping.placement_share)
-        }
-        #[cfg(unix)]
-        EmbedBackend::DirectAne(_) => Ok(None),
-        #[cfg(feature = "test-support")]
-        EmbedBackend::TestDeterministic(_) => Ok(None),
-        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Ok(None),
-    }
 }
 
 async fn execute_rerank_probe_for_model(
@@ -15056,13 +14812,10 @@ fn select_performance_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
 
 fn select_quiet_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
     let mut candidates = rows.to_vec();
-    if candidates.iter().any(|row| is_ane_engine(&row.engine)) {
-        candidates.retain(|row| is_ane_engine(&row.engine));
-    }
     candidates.sort_by(|left, right| {
-        engine_power_rank(&left.engine)
-            .cmp(&engine_power_rank(&right.engine))
-            .then_with(|| right.throughput_tok_s.total_cmp(&left.throughput_tok_s))
+        right
+            .throughput_tok_s
+            .total_cmp(&left.throughput_tok_s)
             .then_with(|| {
                 left.single_item_latency_p50_ms
                     .total_cmp(&right.single_item_latency_p50_ms)
@@ -15070,21 +14823,6 @@ fn select_quiet_row<'a>(rows: &[&'a PerfRow]) -> Option<&'a PerfRow> {
             .then_with(|| left.model_id.cmp(&right.model_id))
     });
     candidates.into_iter().next()
-}
-
-fn is_ane_engine(engine: &str) -> bool {
-    engine == "ane-coreml-worker"
-}
-
-/// Rank engines by expected power use for quiet mode: ANE first, every other
-/// engine after it. Synapse uses this static ordering in v1 because the module
-/// does not yet have direct per-lane power measurements.
-fn engine_power_rank(engine: &str) -> u8 {
-    if is_ane_engine(engine) {
-        0
-    } else {
-        1
-    }
 }
 
 fn probe_status_payload(state: &ModuleState, record: &JobRecord) -> Value {
@@ -15968,8 +15706,6 @@ fn lane_blocking_reason(
     );
     if worker_quarantined || failed_quarantined {
         Some("quarantined")
-    } else if !cfg!(target_os = "macos") && slot.spec.engine.as_str() == "ane" {
-        Some("unsupported_platform")
     } else {
         Some("probe_required")
     }
@@ -16493,8 +16229,6 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     };
     let result: Result<Vec<CacheGcOutcome>, ModelCacheError> = (|| {
         let sweep_started = SystemTime::now();
-        ane_artifact::cleanup_abandoned_temps(state.model_cache.root(), sweep_started)
-            .map_err(ane_materialization_cache_error)?;
         // Partial downloads left by a crashed ingest; files younger than the
         // 24-hour floor may belong to an ingest still in progress and stay.
         state
@@ -16505,7 +16239,7 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
                 .model_cache
                 .gc_digest(&digest, &state.module_id, now, grace_ms)?]
         } else {
-            // Materialized bundles and derived Q8 decode weights consume the same
+            // Derived Q8 decode weights consume the same
             // cache budget as their source blobs. Lowering the blob watermark by
             // their current size makes the existing mark/delete pass run whenever
             // the combined cache is over budget; source deletion below reclaims
@@ -16523,8 +16257,6 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         };
         for outcome in &outcomes {
             if let CacheGcOutcome::Deleted { digest } = outcome {
-                ane_artifact::remove_for_source_digest(state.model_cache.root(), digest)
-                    .map_err(ane_materialization_cache_error)?;
                 owned_decode_routing::q8artifact::remove_for_source_digest(
                     state.model_cache.root(),
                     digest,
@@ -16557,22 +16289,14 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
     }
 }
 
-fn ane_materialization_cache_error(error: anyhow::Error) -> ModelCacheError {
-    ModelCacheError::ArtifactInvalid(format!("ANE materialization cache: {error:#}"))
-}
-
 fn q8_artifact_cache_error(error: anyhow::Error) -> ModelCacheError {
     ModelCacheError::ArtifactInvalid(format!("owned-decode Q8 cache: {error:#}"))
 }
 
-/// Bytes of every artifact derived from a cached source blob and stored below
-/// the model cache root: Core ML bundles and owned-decode Q8 weights.
+/// Bytes of owned-decode Q8 weights derived from cached source blobs.
 fn derived_artifact_bytes(cache_root: &Path) -> Result<u64, ModelCacheError> {
-    let ane_bytes = ane_artifact::total_materialized_bytes(cache_root)
-        .map_err(ane_materialization_cache_error)?;
-    let q8_bytes = owned_decode_routing::q8artifact::total_cached_bytes(cache_root)
-        .map_err(q8_artifact_cache_error)?;
-    Ok(ane_bytes.saturating_add(q8_bytes))
+    owned_decode_routing::q8artifact::total_cached_bytes(cache_root)
+        .map_err(q8_artifact_cache_error)
 }
 
 fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
@@ -17366,12 +17090,9 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    mod retired_engine_tests;
     mod owned_metal_readout_tests {
         include!("owned_metal_readout_tests.rs");
-    }
-    #[cfg(unix)]
-    mod coreml_load_tests {
-        include!("coreml_load_tests.rs");
     }
     #[cfg(unix)]
     mod lane_pause_tests {
@@ -21057,7 +20778,6 @@ mod tests {
     fn catalog_identity_names_match_worker_hello_constants() {
         let expected = [
             ("llama", LLAMA_WORKER_ENGINE),
-            ("ane", ANE_WORKER_ENGINE),
             ("owned-metal-decode", DECODE_WORKER_ENGINE),
             ("owned-cuda", CUDA_WORKER_ENGINE),
         ];
@@ -22424,14 +22144,7 @@ mod tests {
                 pin_module_id: None,
             })
             .expect("ingest test artifact into model cache");
-        let materialized =
-            ane_artifact::materialized_entry_path(&cache_root, &meta.digest).unwrap();
-        std::fs::create_dir_all(materialized.join("artifact")).unwrap();
-        std::fs::write(
-            materialized.join("artifact/weights.bin"),
-            b"derived Core ML bytes",
-        )
-        .unwrap();
+        let materialized = write_q8_artifact(&cache_root, "gc-reclaim", &meta.digest, 32);
 
         let (machine_profile_hash, revisioned_machine_profile_hash) =
             module_state_machine_profile_hashes(&profile);
@@ -22479,7 +22192,7 @@ mod tests {
         assert_eq!(payload1["result"]["outcomes"][0]["state"], "marked");
         assert!(
             materialized.is_dir(),
-            "marking a source must retain its Core ML derivative during grace"
+            "marking a source must retain its Q8 derivative during grace"
         );
         // No delete occurred, so store freelist remains un-vacuumed.
         assert_eq!(store.freelist_count().unwrap(), freelist_before);
@@ -22505,7 +22218,7 @@ mod tests {
         assert_eq!(payload2["result"]["outcomes"][0]["state"], "deleted");
         assert!(
             !materialized.exists(),
-            "deleting a source must reclaim its Core ML derivative"
+            "deleting a source must reclaim its Q8 derivative"
         );
 
         // The GC sweep actually deleted tombstoned blobs, triggering guarded freelist reclaim!
@@ -23628,16 +23341,6 @@ mod tests {
     }
 
     #[test]
-    fn ane_catalog_identity_carries_the_neural_engine_placement_gate() {
-        let ane = catalog_model_engine_identity("ane").unwrap();
-        assert_eq!(ane.engine, "ane-coreml-worker");
-        assert_eq!(
-            ane.build_flags.get("placement_gate").map(String::as_str),
-            Some("neural-engine")
-        );
-    }
-
-    #[test]
     fn recommended_batch_policy_uses_engine_constants_and_omits_unknown_advice() {
         let owned = recommended_batch_for_engine("owned-metal", 512).unwrap();
         assert_eq!(owned.rows, MAX_ENGINE_BATCH_ITEMS);
@@ -23658,10 +23361,6 @@ mod tests {
                 "{engine}"
             );
         }
-
-        let ane = recommended_batch_for_engine("ane", 512).unwrap();
-        assert_eq!(ane.rows, MAX_ENGINE_BATCH_ITEMS);
-        assert_eq!(ane.token_budget, 512 * MAX_ENGINE_BATCH_ITEMS as u64);
 
         assert!(recommended_batch_for_engine(LLAMA_ENGINE, 512).is_none());
     }
@@ -23780,64 +23479,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("embedding and rerank models only"));
-    }
-
-    #[test]
-    fn knob_assignments_prefer_throughput_but_allow_quiet_when_within_ratio() {
-        let rows = vec![
-            PerfRow {
-                machine_profile_hash: "machine-a".to_string(),
-                model_id: "metal-fast".to_string(),
-                workload: "embed".to_string(),
-                numeric_profile_id: NumericProfileId("np-fast".to_string()),
-                fingerprint: Fingerprint("fp-fast".to_string()),
-                engine: "owned-metal".to_string(),
-                measured_at_ms: 10,
-                os_build: "24A1".to_string(),
-                module_generation: 1,
-                throughput_tok_s: 200.0,
-                cold_load_ms: 20.0,
-                single_item_latency_p50_ms: 9.0,
-                details: json!({}),
-            },
-            PerfRow {
-                machine_profile_hash: "machine-a".to_string(),
-                model_id: "ane-quiet".to_string(),
-                workload: "embed".to_string(),
-                numeric_profile_id: NumericProfileId("np-quiet".to_string()),
-                fingerprint: Fingerprint("fp-quiet".to_string()),
-                engine: ANE_WORKER_ENGINE.to_string(),
-                measured_at_ms: 11,
-                os_build: "24A1".to_string(),
-                module_generation: 1,
-                throughput_tok_s: 120.0,
-                cold_load_ms: 22.0,
-                single_item_latency_p50_ms: 11.0,
-                details: json!({}),
-            },
-        ];
-
-        let assignments = compute_knob_assignments(&rows);
-        let performance = assignments
-            .iter()
-            .find(|row| row.knob == PerfKnob::Performance)
-            .expect("performance assignment");
-        let balanced = assignments
-            .iter()
-            .find(|row| row.knob == PerfKnob::Balanced)
-            .expect("balanced assignment");
-        let quiet = assignments
-            .iter()
-            .find(|row| row.knob == PerfKnob::Quiet)
-            .expect("quiet assignment");
-
-        assert_eq!(performance.model_id, "metal-fast");
-        assert_eq!(quiet.model_id, "ane-quiet");
-        assert_eq!(balanced.model_id, "ane-quiet");
-        assert!(
-            quiet.throughput_tok_s
-                >= performance.throughput_tok_s * BALANCED_QUIET_MIN_THROUGHPUT_RATIO
-        );
     }
 
     #[test]
@@ -24118,10 +23759,8 @@ mod tests {
             let config = model_runtime_config(
                 &spec,
                 Path::new("package.safetensors"),
-                &[],
                 Path::new("cache"),
                 64,
-                None,
             );
             assert_eq!(config.values["profile"], *id);
             assert_eq!(config.values["operation"], spec.task);
@@ -24358,7 +23997,7 @@ mod tests {
             .unwrap()
         };
         let runtime = |spec: &StoredModelConfig| {
-            model_runtime_config(spec, Path::new("model"), &[], Path::new("cache"), 0, None)
+            model_runtime_config(spec, Path::new("model"), Path::new("cache"), 0)
         };
         let opted_in = spec(ProjectionDtype::F16);
         assert_eq!(
@@ -25204,7 +24843,7 @@ mod tests {
         for (profile, foreign) in [
             (
                 "gte-modernbert-base.ane-direct-worker",
-                "coreml-fingerprint",
+                "other-backend-fingerprint",
             ),
             ("gte-modernbert-base.owned-cuda", "metal-fingerprint"),
         ] {
@@ -25458,7 +25097,7 @@ mod tests {
 
         let mut ane_spec = stuck_model_spec();
         ane_spec.model_id = "test-ane-lane".to_string();
-        ane_spec.engine = "ane".to_string();
+        ane_spec.engine = CUDA_WORKER_ENGINE.to_string();
         ane_spec.task = "embed".to_string();
         // Catalog config carries 4096 (the batch budget drift defect) to verify
         // the published ceiling prefers the worker's real loaded ceiling (512).
@@ -25495,7 +25134,7 @@ mod tests {
 
         let mut unloaded_spec = stuck_model_spec();
         unloaded_spec.model_id = "test-unloaded-lane".to_string();
-        unloaded_spec.engine = "ane".to_string();
+        unloaded_spec.engine = CUDA_WORKER_ENGINE.to_string();
         unloaded_spec.task = "embed".to_string();
         unloaded_spec.max_tokens = 256;
 
@@ -25606,14 +25245,17 @@ mod tests {
         assert_eq!(ane_row["bucket_ladder"], json!([128, 256, 512]));
         assert_eq!(ane_row["dims"], 384);
         assert_eq!(ane_row["dtype"], "f16");
-        assert_eq!(ane_row["device_class"], "ane");
+        assert_eq!(ane_row["device_class"], "cuda");
         assert_eq!(
             ane_row["certified"], false,
-            "uncertified ANE lane cannot advertise certified=true"
+            "uncertified worker lane cannot advertise certified=true"
         );
         assert_eq!(ane_row["warm_load_cost_hint_ms"], 32.0);
         assert_eq!(ane_row["recommended_batch"]["rows"], 8);
-        assert_eq!(ane_row["recommended_batch"]["token_budget"], 4096);
+        assert_eq!(
+            ane_row["recommended_batch"]["token_budget"],
+            DEFAULT_ENGINE_BATCH_TOKEN_BUDGET
+        );
 
         // Enforced ceiling invariant: verify that the advertised ceiling (512) would
         // never permit a row length that the ANE worker refuses.
@@ -25662,7 +25304,7 @@ mod tests {
             unloaded_row.get("dims").is_none(),
             "unloaded lane must omit unknown dims"
         );
-        assert_eq!(unloaded_row["device_class"], "ane");
+        assert_eq!(unloaded_row["device_class"], "cuda");
         assert_eq!(unloaded_row["certified"], false);
     }
 
@@ -25848,10 +25490,8 @@ mod tests {
         let runtime_config = model_runtime_config(
             &restored,
             &package,
-            &[],
             model_cache.root(),
             DEFAULT_MICROLLM_MAX_TOKENS,
-            None,
         );
         assert_eq!(
             runtime_config.values["model_path"],

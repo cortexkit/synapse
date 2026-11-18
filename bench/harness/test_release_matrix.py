@@ -91,20 +91,6 @@ class ProducerTests(unittest.TestCase):
         self.assertEqual(cell['metrics'], dict.fromkeys(matrix.METRICS))
         self.assertEqual(cell['probe']['stderr'], 'model rejected\n')
 
-    def test_transition_boundary_and_both_load_series(self):
-        for direct, expected in ((105, True), (106, False)):
-            cfg = {'transition': {'inputs': {'text': 'same', 'composed_length': 512},
-                                  'ane-coreml-worker': {'latency': 100}, 'ane-direct-worker': {'latency': direct}}}
-            with tempfile.TemporaryDirectory() as directory, patch.object(matrix, 'Adapter', FakeAdapter):
-                result = matrix.transition(cfg, 'manifest', 'same-session', Path(directory))
-                self.assertEqual(result['bar_met'], expected)
-                self.assertEqual(result['coreml_median'], 100)
-                self.assertEqual(result['direct_median'], direct)
-                self.assertEqual(len(result['coreml']), 23)
-                self.assertEqual(len(result['direct']), 23)
-                self.assertEqual(set(result['machine_load'][0]), {'coreml', 'direct'})
-                self.assertEqual(len(result['machine_load']), 23)
-                self.assertTrue((Path(directory) / 'ane-transition.json').is_file())
 
     def matrix_fixture(self):
         temporary = tempfile.TemporaryDirectory()

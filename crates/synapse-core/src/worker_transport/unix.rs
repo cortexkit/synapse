@@ -442,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_owned_workers_pass_a_bound_host_with_both_fields_absent() {
-        for engine in ["llama.cpp-worker", "ane-coreml-worker"] {
+        for engine in ["llama.cpp-worker", "owned-metal-decode"] {
             handshake(
                 hello_json(engine, None, None),
                 Some(engine),

@@ -363,22 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_coreml_bytes_and_hash_derivation_are_unchanged() {
-        // Artifact digests here are sentinels, not a capture of the deployed Core ML package.
-        // The ANE preload builder hashes these JSON bytes. Preserve their field order
-        // and omit absent catalog fields so existing Core ML vectors keep their identity.
-        let legacy = r#"{"model_digest":"sha256:model","quant":"fp16","engine":{"engine":"ane-coreml-worker","version":"protocol-v1","build_flags":{"placement_gate":"neural-engine","risk_class":"abort_capable","transport":"unix-socket-worker"}},"sanitized_tokenizer_digest":"sha256:tok","pooling":"mean","normalization":"l2","dtype":"f16","flash_attention":"disabled","certified_shape":{"max_context_tokens":512,"max_batch_tokens":8192,"max_micro_batch_tokens":3072,"max_sequences":64},"thread_policy":"balanced"}"#;
-        let profile: NumericProfile = serde_json::from_str(legacy).unwrap();
-        assert_eq!(profile.stable_bytes(), legacy.as_bytes());
-        let legacy_id = sha256_hex(legacy.as_bytes());
-        assert_eq!(profile.numeric_profile_id().0, legacy_id);
-        let legacy_fingerprint = sha256_hex(
-            &serde_json::to_vec(&serde_json::json!(["sha256:model", "fp16", legacy_id])).unwrap(),
-        );
-        assert_eq!(profile.fingerprint().0, legacy_fingerprint);
-    }
-
-    #[test]
     fn every_fingerprint_input_changes_identity_independently() {
         let original = sample_profile();
         type Mutation = (&'static str, fn(&mut NumericProfile));
@@ -447,15 +431,6 @@ mod tests {
         let before = profile.fingerprint();
         profile.manifest_profile_digest = Some(sha256_hex(br#"{"gelu_lowering":"exact"}"#));
         assert_ne!(before, profile.fingerprint());
-    }
-
-    #[test]
-    fn coreml_and_direct_ane_have_distinct_fingerprints() {
-        let mut profile = sample_profile();
-        profile.engine.engine = crate::worker_engine_names::ANE_WORKER_ENGINE.into();
-        let coreml = profile.fingerprint();
-        profile.engine.engine = crate::worker_engine_names::ANE_DIRECT_WORKER_ENGINE.into();
-        assert_ne!(coreml, profile.fingerprint());
     }
 
     #[test]

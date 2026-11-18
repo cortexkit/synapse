@@ -213,7 +213,7 @@ and compares it with `bound = min(request deadline, queue entry time + 600 s)`.
 - The wire contract's codes, fields and schema (but see the text question in
   section 3), and the worker protocol: `ANE_ADMIT_SHAPE`, `ANE_EVICT_SHAPE`,
   progress frames.
-- The Core ML lane, the direct-ANE worker and its vendored compiler crate.
+- The direct-ANE worker and its vendored compiler crate.
 - The 100-executable budget, the per-model and total shape limits, the 250 ms
   handoff, eviction preference and quarantine.
 - The 600 s setup-idle liveness window (`SETUP_IDLE`).

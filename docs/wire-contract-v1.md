@@ -525,7 +525,7 @@ deleted with the job and remain private to its route principal.
   not refuse serving and must not wake an owner as a certification failure.
 
 - **lanes.pause** {scope: "neural_engine", duration_ms, reason} — mutate. Starts
-  a volatile pause of every direct-ANE and Core ML ANE lane, including cold lanes.
+  a volatile pause of every direct-ANE lane, including cold lanes.
   `duration_ms` must be positive and at most 7,200,000 (120 minutes); a blank
   reason, unknown scope, or a second active pause is `invalid_request`.
   Returns `{paused_until_ms, reason, lane_ids, phase, hardware_free}` immediately.
@@ -849,22 +849,6 @@ same ids, config, fingerprints and probe gates, with no implicit catalog mapping
 Moving to a catalog id is deliberate and requires re-embedding. Owned decode
 routing, certification, probes and approvals are unchanged.
 
-### Fixed-bucket ANE package sets
-
-An ANE `model.load` manifest may put the primary compiled Core ML package in
-`files.model` and additional fixed-sequence packages in ordered `files.extra`
-entries. Each entry is a detailed `{url, sha256}` file specification. The
-module caches every file separately, then derives one composite artifact digest
-from the ordered role set before minting the model fingerprint. The ANE worker
-loads all packages and selects the smallest bucket that can hold the longest
-item in an `embed.batch`; it never silently truncates an item to a smaller
-bucket. `files.tokenizer` remains required because Synapse owns tokenization.
-
-The production worker accepts a zipped `.mlmodelc` bundle for each package.
-The archive is only a transport/cache representation; the worker verifies its
-per-file digest, materializes it into a temporary compiled-model directory,
-and loads it with `CPU_AND_NE`. A package set's placement gate is the minimum
-reported Neural Engine share across its buckets.
 - **aliases.check_index** {index_fingerprint, provenance_set[]} → valid |
   migration_required {retracted_pair, rebuild_target} + table_epoch. Call at
   write-commit when your index holds mixed provenance. Revocation is never

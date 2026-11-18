@@ -29,7 +29,6 @@ async fn candidate_hosted_protocol_matrix() {
     if cfg!(target_os = "macos") {
         workers.extend([
             ("decode", "owned-metal-decode", false),
-            ("ane", "ane-coreml-worker", false),
             ("ane-direct", "ane-direct-worker", true),
         ]);
     } else {
@@ -57,16 +56,6 @@ async fn candidate_hosted_protocol_matrix() {
             )
             .unwrap(),
         );
-        if worker == "ane" {
-            command.env(
-                "SYNAPSE_ANE_SWIFT_WORKER",
-                synapse_core::dev_binary::ckdev_binary(
-                    root.join("ck-synapse-worker-ane-swift"),
-                    &runtime,
-                )
-                .unwrap(),
-            );
-        }
         command
             .arg(if cfg!(windows) { "--pipe" } else { "--socket" })
             .arg(endpoint)

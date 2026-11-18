@@ -31,7 +31,6 @@ crates/                     production Rust crates
   synapse-speech/           WAV/log-mel front end, Token-and-Duration Transducer (TDT) loop, word timing
   synapse-store/            SQLite persistence, migrations and event-outbox rows
   synapse-worker-host/      Supervised workers, transcription exchange and ANE residency
-  synapse-worker-ane/       Core ML Neural Engine embedding worker (Rust launcher + Swift)
   synapse-worker-ane-direct/ direct Neural Engine worker for the -ane catalog lanes
   synapse-worker-cuda/      CUDA embedding and reranking worker
   synapse-worker-decode/    owned Metal generation worker (macOS)
@@ -115,4 +114,4 @@ attribution scripts that cannot run under `cargo test` go in the top-level `test
   module id (`synapse`) carry no prefix.
 - Catalog lane ids are `<catalog_id>-<backend>` (`qwen3-embedding-0.6b-ane`).
 - Directories and crate names are kebab-case (`synapse-worker-decode`, `ort-embed`).
-- Rust source files are snake_case (`worker_engine_names.rs`, `ane_artifact.rs`).
+- Rust source files are snake_case (`worker_engine_names.rs`, `lane_pause.rs`).

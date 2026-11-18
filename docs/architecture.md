@@ -58,8 +58,6 @@ caller deadlines and detached drain have separate roles, described in the
 The direct Neural Engine lane has shared admission and residency ownership.
 Leases prevent eviction during an exchange; resources are refunded only after
 acknowledged release or confirmed process exit. See [ANE serving](ane-serving.md).
-Core ML materialization uses digest-keyed stable paths so compiled specialization
-can be reused rather than extracted to a new path on every load.
 
 
 ## Documentation and evidence

@@ -17,6 +17,8 @@ use thiserror::Error;
 
 use synapse_owned_decode::{owned_decode_certification::CertificationRecord, owned_decode_routing};
 
+mod registration_reconciliation;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerfKnob {
@@ -2649,14 +2651,12 @@ impl SynapseStore {
                     .owned_dtype
                     .clone()
                     .or_else(|| match model.engine.as_str() {
-                        "ane" => Some("f16".to_string()),
                         "owned-cuda" => Some("f16".to_string()),
                         "ort" => Some("f32".to_string()),
                         _ => None,
                     });
                 let device_class = match model.engine.as_str() {
                     "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
-                    "ane" => Some("ane".to_string()),
                     "owned-cuda" => Some("cuda".to_string()),
                     "ort" | "llama" => Some("cpu".to_string()),
                     _ => None,
@@ -6561,7 +6561,6 @@ const DOWNLOAD_NON_TERMINAL_SQL: &str = "('queued', 'downloading', 'verifying')"
 #[cfg_attr(not(test), allow(dead_code))]
 pub const OWNED_EMBED_RERANK_ENGINES: &[&str] = &[
     "owned-metal",
-    "ane",
     synapse_core::ANE_DIRECT_WORKER_ENGINE,
     "owned-cuda",
     "owned-vulkan",
@@ -6788,6 +6787,8 @@ pub struct RegistrationReconciliation {
     /// Rows kept in the table but not registered because their `model_id` is
     /// catalog-reserved.
     pub skipped_reserved: Vec<String>,
+    /// Retired engine rows left for the legacy-model migration, not registered.
+    pub skipped_retired: Vec<(String, String)>,
 }
 
 // The module's download, serving and startup paths call these; until they are
@@ -7230,77 +7231,6 @@ impl SynapseStore {
             Ok(report)
         })?;
         Ok(report)
-    }
-
-    /// Decide at startup what to do with each persisted `models` row, which
-    /// the runtime restores without `model.load` validation.
-    ///
-    /// An embed or rerank row whose engine is outside
-    /// [`OWNED_EMBED_RERANK_ENGINES`] is deleted, and the `cache.pin` on each
-    /// blob it named is dropped unless a remaining row also names that blob,
-    /// so `cache.gc` can reclaim it. A row whose `model_id` is catalog-reserved
-    /// (`is_reserved`) stays in the table but is not returned as registrable.
-    /// Every other row is registrable.
-    pub fn reconcile_persisted_registrations(
-        &self,
-        is_reserved: &dyn Fn(&str) -> bool,
-        cache: &dyn CatalogBlobCache,
-    ) -> Result<RegistrationReconciliation, SynapseStoreError> {
-        let reconciliation = self.store.with_conn_fenced(|tx| {
-            tx.execute(
-                "DELETE FROM catalog_file_verifications WHERE NOT EXISTS (
-                SELECT 1 FROM catalog_install_members m WHERE
-                m.catalog_id=catalog_file_verifications.catalog_id AND
-                m.manifest_digest=catalog_file_verifications.manifest_digest AND
-                m.backend=catalog_file_verifications.backend AND
-                m.path=catalog_file_verifications.path AND
-                m.digest=catalog_file_verifications.expected_sha256)",
-                [],
-            )?;
-            let mut stmt = tx.prepare(
-                "SELECT model_id, engine, task, config_json FROM models
-                 ORDER BY created_ms ASC, model_id ASC",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-
-            let mut reconciliation = RegistrationReconciliation::default();
-            let mut released = BTreeSet::new();
-            for (model_id, engine, task, config_json) in rows {
-                let embed_or_rerank = task == "embed" || task == "rerank";
-                if embed_or_rerank && !OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str()) {
-                    tx.execute("DELETE FROM models WHERE model_id = ?1", params![model_id])?;
-                    released.extend(registration_blob_digests(&config_json));
-                    reconciliation.deleted.push((model_id, engine));
-                } else if is_reserved(&model_id) {
-                    reconciliation.skipped_reserved.push(model_id);
-                } else {
-                    reconciliation
-                        .registrable
-                        .push(decode_model_config(config_json)?);
-                }
-            }
-            for digest in released {
-                if free_form_references_digest_tx(tx, &digest)? {
-                    continue;
-                }
-                cache
-                    .remove_pins(&digest)
-                    .map_err(|error| cache_error("remove pins of", &digest, error))?;
-                reconciliation.unpinned_digests.push(digest);
-            }
-            Ok(reconciliation)
-        })?;
-        Ok(reconciliation)
     }
 
     /// Match derived verification against the expected digest and current file identity.

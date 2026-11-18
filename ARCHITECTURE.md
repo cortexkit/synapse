@@ -75,9 +75,6 @@ supervises. Which ones a release ships is decided by the release workflow:
 - `ck-synapse-worker-ane-direct` (`crates/synapse-worker-ane-direct`): ModernBERT and
   Qwen3 on the Neural Engine through Apple's private framework, compiling one
   program per transformer layer per padded length. Serves the `-ane` catalog lanes.
-- `ck-synapse-worker-ane` (`crates/synapse-worker-ane`): a small Rust launcher that
-  execs a Swift Core ML worker built by `build.rs`; embeds on the Neural Engine with
-  fixed-bucket compiled models. Serves legacy Core ML lanes.
 - `ck-synapse-worker-vulkan` (`crates/synapse-worker-vulkan`): owned Vulkan compute
   shaders for embedding and reranking; it loads the Vulkan loader at runtime and
   refuses software rasterizers.
@@ -131,7 +128,6 @@ rerank quality scoring.
 | Diagnostics | `crates/synapse-module/src/diagnostics_findings.rs` | `diagnostics.findings` |
 | Engram descriptor | `crates/synapse-module/src/engram_catalog.rs` | backup catalog written at startup |
 | Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
-| Core ML materialization | `crates/synapse-module/src/ane_artifact.rs` | digest-keyed extraction of Core ML bundles |
 | Owned decode | `crates/synapse-owned-decode/` | contracts, sidecar, routing, grammar scheduler, pure certification |
 | Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TranscribeEngine`, `TokenBatch` |
 | Shared speech core | `crates/synapse-speech/src/` | WAV front end, TDT loop, detokenization and word timing |
@@ -202,10 +198,6 @@ rerank quality scoring.
   compile at a time. Compiled programs are reused across restarts only because the
   worker gives each program a stable identifier. Never let test or profiling daemons
   bypass the lock, and never redirect `TMPDIR` for a process that compiles.
-- **Core ML bundles are materialized once, at a digest-keyed stable path.** Use
-  `materialize_core_ml_artifact`; never extract to a per-load temp directory. Core ML
-  caches its compiled specialization by path, so a new path pays the full compile
-  again.
 - **Flow-scoped routes are read-only diagnostics.** A route stamped with a `flow_id`
   may call only `diagnostics.findings`; every other method answers
   `flow_scope_refused`.
@@ -238,4 +230,3 @@ rerank quality scoring.
   records in [`docs/evidence/certification/`](docs/evidence/certification/)
 - Decisions log and founding constraints: [`DECISIONS.md`](DECISIONS.md), [`FOUNDING.md`](FOUNDING.md)
 - Bench rig: [`bench/rig/RIG.md`](bench/rig/RIG.md); campaigns: [`bench/campaign/README.md`](bench/campaign/README.md)
-- Core ML worker packaging: [`crates/synapse-worker-ane/README.md`](crates/synapse-worker-ane/README.md)

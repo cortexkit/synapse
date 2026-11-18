@@ -113,7 +113,7 @@ def changed_paths(base):
 def split_commands(commands, system):
     # These package targets include macOS-gated cases. Linux omits those cases
     # and cannot verify the macOS-specific paths; ignored tests remain disabled.
-    mac_packages = {"synapse-engine-owned", "synapse-worker-ane", "synapse-worker-ane-direct",
+    mac_packages = {"synapse-engine-owned", "synapse-worker-ane-direct",
                     "synapse-worker-decode", "synapse-worker-llama"}
     portable, native = [], []
     for command in commands:

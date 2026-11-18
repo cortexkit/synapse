@@ -37,7 +37,7 @@ def macos_commands():
         ["cargo", "clippy", "--version"],
         ["xcrun", "--find", "metal"],
         ["cargo", "clippy", "--locked", "-p", "synapse-module", "-p", "synapse-engine-owned",
-         "-p", "synapse-worker-ane", "--all-targets", "--", "-D", "warnings"],
+         "--all-targets", "--", "-D", "warnings"],
         ["cargo", "test", "--locked", "-p", "synapse-engine-owned", "--lib"],
     ]
 

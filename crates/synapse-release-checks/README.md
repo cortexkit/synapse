@@ -28,8 +28,6 @@ The separate evidence formats are JSON objects with the following fields:
   combination. Hugging Face Text Embeddings Inference (TEI) may report hardware
   unavailable on AMD when its probe cannot run there, or measured on CUDA when
   its probe succeeds. These observations do not block release.
-- Transition: `session_id`, 23-element `coreml` and `direct` series,
-  23-element `machine_load`, `coreml_median`, `direct_median`, `bar_met`.
 
 `RELEASE-NOTES.md` must exist in the candidate's certification directory.
 Certification directories keyed by other source commits are

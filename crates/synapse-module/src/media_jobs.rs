@@ -616,10 +616,8 @@ fn load_host(
     let config = model_runtime_config(
         &spec,
         &path.path,
-        &[],
         state.model_cache.root(),
         state.runtime.microllm_max_tokens,
-        None,
     );
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),

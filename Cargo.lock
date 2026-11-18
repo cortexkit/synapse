@@ -7437,14 +7437,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "synapse-worker-ane"
-version = "0.1.0-alpha.2"
-dependencies = [
- "anyhow",
- "synapse-core",
-]
-
-[[package]]
 name = "synapse-worker-ane-direct"
 version = "0.1.0"
 dependencies = [

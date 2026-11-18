@@ -196,28 +196,6 @@ def measure(adapter, base, config, row_fixture, memory_kind):
     return cell
 
 
-def transition(config, manifest_digest, session, output):
-    inputs = config['transition']['inputs']
-    require(inputs['composed_length'] == 512, 'transition input must contain exactly 512 composed tokens')
-    runs = {}
-    for lane in ('ane-coreml-worker', 'ane-direct-worker'):
-        cfg = config['transition'][lane]
-        adapter = Adapter(cfg, output / 'raw' / 'transition' / lane)
-        base = {'session_id': session, 'model': 'gte-modernbert-base', 'manifest_digest': manifest_digest,
-                'operation': 'embed', 'lane': lane, 'inputs': inputs, 'batch_size': 1, 'request_path': 'inline'}
-        _, prepared = adapter.call(dict(base, action='prepare_transition'))
-        if prepared is None:
-            raise ValueError('transition preparation failed')
-        require(prepared.get('composed_length') == 512 and prepared.get('lane') == lane, 'transition lane/shape mismatch')
-        runs[lane] = series(adapter, base, 'footprint')
-    core, direct = (runs[k] for k in ('ane-coreml-worker', 'ane-direct-worker'))
-    value = {'session_id': session, 'model': 'gte-modernbert-base', 'batch_size': 1, 'composed_length': 512,
-             'coreml': core['raw_series'], 'direct': direct['raw_series'],
-             'coreml_median': core['median'], 'direct_median': direct['median'],
-             'machine_load': [{'coreml': c, 'direct': d} for c, d in zip(core['machine_load'], direct['machine_load'])],
-             'bar_met': direct['median'] <= 1.05 * core['median']}
-    save(output / 'ane-transition.json', value)
-    return value
 
 
 def run_row(config, root, output):
@@ -265,8 +243,6 @@ def run_row(config, root, output):
     report = {'schema': 1, 'source_commit': config['source_commit'], 'manifest_digest': digest,
               'session_id': session, 'machine': config['machine'], 'cells': cells}
     save(output / f'{row}.json', report)
-    if (row, 'gte-modernbert-base') in expected_cells and row == 'ane-m5':
-        transition(config, digest, session, output)
     return report
 
 

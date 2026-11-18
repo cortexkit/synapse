@@ -150,24 +150,7 @@ and scores/vector counts, and includes job completion/delivery in elapsed time.
 The controller handles load/cache/parity/telemetry as above. Its `load` response
 uses the same binding fields; owned profiles need not have competitor cap fields.
 
-## ANE transition
-
-The `ane-m5` row config additionally has a `transition` object:
-
-```json
-{
-  "inputs": {"text":"<text verified to compose to exactly 512 tokens>", "composed_length":512},
-  "ane-coreml-worker": {"command":["python3","bench/harness/synapse_adapter.py","<coreml-config.json>"]},
-  "ane-direct-worker": {"command":["python3","bench/harness/synapse_adapter.py","<direct-config.json>"]}
-}
-```
-
-Each controller's `prepare_transition` loads the exact lane and verifies the
-composed input length, returning `lane` and `composed_length: 512`. The two configs
-must pin distinct served fingerprints. Both 23-sample series execute in one row
-session on the same machine. `ane-transition.json` records both raw series,
-paired per-index machine load records, both medians and `bar_met` using the exact
-`direct <= 1.05 * coreml` inequality. Dropped Qwen3 cells copy `drop_cause` from the model's
+Dropped Qwen3 cells copy `drop_cause` from the model's
 configured `certification_record` and, for a
 latency drop, both raw series; their metrics remain null.
 

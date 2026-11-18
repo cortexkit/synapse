@@ -30,7 +30,6 @@ matrix determine supported backends and published assets.
 | `synapse-worker-host` | Supervised worker processes, transcription exchange and ANE residency. |
 | `synapse-opctl` | Operator client; `ck-synapse-opctl`. |
 | `synapse-worker-llama` | Supervised GGUF worker. |
-| `synapse-worker-ane` | Rust launcher and Swift Core ML worker. |
 | `synapse-worker-ane-direct` | Direct Neural Engine compilation, admission and inference worker. |
 | `synapse-worker-decode` | Supervised owned-generation worker. |
 | `synapse-worker-cuda` | Owned CUDA worker. |

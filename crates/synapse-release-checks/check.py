@@ -200,10 +200,6 @@ def inventory(entries, assets, records, cells):
                     require(recorded == dlls, 'record DLL set differs from manifest')
 
 
-def median(series):
-    require(len(series) == 23 and all(isinstance(n, (int, float)) and math.isfinite(n) and n > 0 for n in series), 'invalid raw series')
-    s = sorted(series[3:])
-    return (s[9] + s[10]) / 2
 
 
 def benchmark(report, expected_cells):
@@ -283,10 +279,6 @@ def evidence(root, s, assets, entries):
     require((cert / 'RELEASE-NOTES.md').is_file(), 'missing release notes')
     report_dir = root / 'docs/evidence/benchmark' / s
     benchmark(load(report_dir / 'report.json'), benchmark_cells(root))
-    if any(r['row_id'] == 'ane-m5' and r['model'] == 'gte-modernbert-base' and r['status'] == 'passed' for r in records):
-        t = load(report_dir / 'ane-transition.json')
-        core, direct = median(t['coreml']), median(t['direct'])
-        require(bool(t['session_id']) and len(t['machine_load']) == 23 and t['coreml_median'] == core and t['direct_median'] == direct and t['bar_met'] is (direct <= 1.05 * core), 'invalid ANE transition')
 
 
 def main():

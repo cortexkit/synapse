@@ -110,7 +110,7 @@ class LandingSelectionTests(unittest.TestCase):
     def test_only_apple_test_commands_stay_on_the_mac(self):
         portable = HELPERS["static_gates"]() + HELPERS["full_gates"]() + HELPERS["contract_tests"]()
         apple = [HELPERS["cargo_test"](package, "--lib") for package in (
-            "synapse-engine-owned", "synapse-worker-ane", "synapse-worker-ane-direct",
+            "synapse-engine-owned", "synapse-worker-ane-direct",
             "synapse-worker-decode", "synapse-worker-llama")]
         remote, native = HELPERS["split_commands"]([tuple(c) for c in portable + apple], "Darwin")
         self.assertEqual(remote, [tuple(c) for c in portable])
