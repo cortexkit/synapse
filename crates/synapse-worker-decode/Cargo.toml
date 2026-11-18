@@ -13,17 +13,20 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 clap = { workspace = true }
 hex = { workspace = true }
+libc = "0.2"
 owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
+ring = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 synapse-core = { path = "../synapse-core" }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-ring = "0.17"
 synapse-engine-owned = { path = "../synapse-engine-owned" }
-synapse-module = { path = "../synapse-module" }
+synapse-owned-decode = { path = "../synapse-owned-decode" }
 tokenizers = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+synapse-worker-host = { path = "../synapse-worker-host" }

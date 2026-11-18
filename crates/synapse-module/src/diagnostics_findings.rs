@@ -83,10 +83,9 @@ fn inputs(state: &ModuleState, generated_at_ms: u64) -> Result<Inputs, ()> {
     state.store.storage_health_inputs().map_err(|_| ())?;
     let mut failed_checks = Vec::new();
     let mut quarantined = Vec::new();
-    let mut lanes = catalog_measurement_summary(state).lanes;
-    lanes.sort_by(|a, b| a.slot.spec.model_id.cmp(&b.slot.spec.model_id));
-    for lane in lanes {
-        let slot = lane.slot;
+    let mut lanes = registered_model_slots(state);
+    lanes.sort_by(|a, b| a.spec.model_id.cmp(&b.spec.model_id));
+    for slot in lanes {
         let lane_id = &slot.spec.model_id;
         if let Some((entry, backend)) = resolved_catalog_lane(&state.runtime, lane_id) {
             let check = catalog_self_check_projection(state, entry, backend).map_err(|_| ())?;
@@ -404,7 +403,6 @@ mod tests {
                     method: "diagnostics.findings".into(),
                     params: json!({"window_ms": 1}),
                 },
-                None,
             )
             .await,
             "diagnostics.findings",

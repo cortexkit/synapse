@@ -106,10 +106,8 @@ fn fixture(lane: &str, assets: &Path) -> (PathBuf, Arc<ModuleState>, Capture) {
         backend: engine_backend,
         tokenizer,
         fingerprint: spec.fingerprint.clone(),
-        certification_fingerprint: spec.fingerprint.clone(),
         engine_identity: spec.engine_identity.clone(),
         owned_tokenizer_policy: policy,
-        owned_decode_resolution_refusal: None,
     });
     let job = state
         .store
@@ -207,7 +205,6 @@ fn capture_cases(assets: &Path) -> Vec<Value> {
                         method: method.into(),
                         params: params.clone(),
                     },
-                    None,
                 )),
                 method,
             );

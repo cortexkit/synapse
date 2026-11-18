@@ -30,7 +30,7 @@ use synapse_core::{
     Fingerprint, SidecarHintBank,
 };
 use synapse_engine_owned::owned_decode_engine::TokenVocabulary;
-use synapse_module::owned_decode_grammar_scheduler::{
+use synapse_owned_decode::owned_decode_grammar_scheduler::{
     compile_grammar, grammar_automaton::Automaton, CompileContext, GrammarSubsetManifest,
     TokenIdJsonConstraintV1,
 };

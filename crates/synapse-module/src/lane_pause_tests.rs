@@ -9,7 +9,6 @@ async fn call(state: &Arc<ModuleState>, method: &str, params: Value) -> Value {
                 method: method.into(),
                 params,
             },
-            None,
         )
         .await,
         method,
@@ -558,7 +557,6 @@ async fn pause_rejects_121_minutes() {
             method: "lanes.pause".into(),
             params: json!({"scope":"neural_engine","duration_ms":121*60_000,"reason":"too long"}),
         },
-        None,
     )
     .await;
     assert_eq!(

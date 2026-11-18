@@ -22,6 +22,7 @@ half = "2"
 safetensors = "0.6.2"
 
 [dev-dependencies]
+owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
 synapse-parity = { path = "../../bench/parity" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

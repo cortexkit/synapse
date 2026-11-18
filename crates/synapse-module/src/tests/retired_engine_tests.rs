@@ -1,88 +1,80 @@
 use super::*;
 
-#[derive(Clone)]
-struct Writer(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Writer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
-fn startup_skips_retired_coreml_and_free_form_rows_with_one_named_warning_each() {
-    let (root, descriptor) = test_storage_descriptor("retired-engine-startup");
-    let store = SynapseStore::open(&descriptor).unwrap();
+fn populated_v18_store_migrates_and_registers_only_kept_models() {
+    let (root, descriptor) = test_storage_descriptor("retired-lanes-v18");
     let config = ModuleConfig::default();
     let catalog = runtime_release_catalog().unwrap();
     let cache = ModelCache::new(root.join("cache"));
-    let mut kept = catalog_fixture_config("gte-modernbert-base.owned-metal");
-    kept.model_id = "kept-metal".into();
-    let kept = normalize_catalog_model(kept, &config.inline, &config.jobs).unwrap();
-    store.upsert_model(&kept, 1).unwrap();
-
-    // Both persisted spellings must be ignored before normalization tries to
-    // construct an identity for an engine that no longer exists.
-    for engine in ["ane", "ane-coreml-worker"] {
-        let mut retired = stuck_model_spec();
+    let mut metal = catalog_fixture_config("gte-modernbert-base.owned-metal");
+    metal.model_id = "kept-metal".into();
+    let metal = normalize_catalog_model(metal, &config.inline, &config.jobs).unwrap();
+    let mut llama = stuck_model_spec();
+    llama.model_id = "kept-llama".into();
+    llama.engine = LLAMA_ENGINE.into();
+    llama.task = "generate".into();
+    let llama = normalize_catalog_model(llama, &config.inline, &config.jobs).unwrap();
+    let mut models = vec![llama.clone(), metal.clone()];
+    for engine in ["ane", "ane-coreml-worker", "coreml", "neural_engine"] {
+        let mut retired = metal.clone();
         retired.model_id = format!("retired-{engine}");
         retired.engine = engine.into();
-        retired.engine_identity.engine = "ane-coreml-worker".into();
-        store.upsert_model(&retired, 2).unwrap();
+        models.push(retired);
     }
-    for (id, task) in [
-        ("gte-modernbert-base-f16", "embed"),
-        ("gte-reranker-modernbert-base-f32", "rerank"),
-    ] {
-        let mut retired = kept.clone();
-        retired.model_id = id.into();
+    for task in ["embed", "rerank"] {
+        let mut retired = metal.clone();
+        retired.model_id = format!("free-form-{task}");
         retired.task = task.into();
         retired.engine_identity.build_flags.remove("profile");
-        store.upsert_model(&retired, 2).unwrap();
+        models.push(retired);
     }
+    let mut decode = llama.clone();
+    decode.model_id = "qwen-decode".into();
+    decode.engine = "owned-metal-decode".into();
+    models.push(decode);
+    let profile = test_machine_profile("v18-os");
+    SynapseStore::seed_v18_retirement_fixture(&descriptor, &models, &profile).unwrap();
 
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let writer = Writer(bytes.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(move || writer.clone())
-        .finish();
-    let restored = tracing::subscriber::with_default(subscriber, || {
-        sync_and_load_catalog_models(&store, &config, &catalog, &cache).unwrap()
-    });
-    assert_eq!(restored, vec![kept]);
+    let store = SynapseStore::open(&descriptor).unwrap();
     assert_eq!(
-        store.catalog_models().unwrap().len(),
-        5,
-        "migration owns deletion"
+        store.catalog_models().unwrap(),
+        [llama.clone(), metal.clone()]
     );
-    let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-    let warnings: Vec<_> = logs.lines().filter(|line| line.contains("WARN")).collect();
-    assert_eq!(warnings.len(), 4, "{logs}");
-    for id in [
-        "retired-ane",
-        "retired-ane-coreml-worker",
-        "gte-modernbert-base-f16",
-        "gte-reranker-modernbert-base-f32",
-    ] {
-        assert_eq!(
-            warnings
-                .iter()
-                .filter(|line| line.contains(&format!("model_id={id} ")))
-                .count(),
-            1,
-            "{logs}"
-        );
-    }
-    assert!(warnings
-        .iter()
-        .all(|line| line.contains("skipping retired persisted registration")));
+    let startup = sync_and_load_catalog_models(&store, &config, &catalog, &cache).unwrap();
+    assert_eq!(startup, [llama, metal]);
+    let runtime = RuntimeState::from_catalog(config, startup).unwrap();
+    assert_eq!(runtime.catalog.lock().unwrap().len(), 2);
+    assert_eq!(store.profile_state().unwrap().snapshot, Some(profile));
+    assert_eq!(
+        store
+            .knob_assignment("machine", "embed", PerfKnob::Balanced)
+            .unwrap()
+            .unwrap()
+            .model_id,
+        "kept-metal"
+    );
+    assert!(store
+        .knob_assignment("machine", "generate", PerfKnob::Balanced)
+        .unwrap()
+        .is_none());
+    store.pub_connection_for_test(|conn| {
+        for retired in [
+            "alias_rows", "approvals", "approval_digest_corruption_events", "approval_migration_markers",
+            "cert_rows", "cert_row_rebuild_events", "perf_rows", "profile_rotation_certification_outcomes",
+            "serving_artifacts", "serving_certification_records", "serving_approvals", "serving_sessions",
+            "serving_retained_states",
+        ] {
+            let count: u32 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name=?1", [retired], |row| row.get(0))?;
+            assert_eq!(count, 0, "{retired} was not dropped");
+        }
+        let stale: u32 = conn.query_row("SELECT count(*) FROM pragma_table_info('profile_state') WHERE name='certification_stale_since_ms'", [], |row| row.get(0))?;
+        assert_eq!(stale, 0);
+        for (table, key) in [("catalog_self_checks", "check_id = 'check'"), ("jobs", "job_id = 'kept-job'"), ("profile_rotation_events", "event_id = 'rotation'")] {
+            let count: u32 = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE {key}"), [], |row| row.get(0))?;
+            assert_eq!(count, 1, "{table} lost a kept row");
+        }
+        Ok(())
+    }).unwrap();
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }

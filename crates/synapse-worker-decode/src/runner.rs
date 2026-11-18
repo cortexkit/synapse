@@ -58,7 +58,7 @@ use synapse_engine_owned::{
     },
     Precision,
 };
-use synapse_module::{
+use synapse_owned_decode::{
     owned_decode_grammar_scheduler::{
         grammar_automaton::{Automaton, State},
         grammar_compile::{TokenIdJsonConstraintV1, INITIAL_STATE_ENCODING},
@@ -5248,7 +5248,7 @@ mod fast_path_tests {
         WorkerFrame,
     };
     use synapse_core::{Fingerprint, SidecarHintBank};
-    use synapse_module::owned_decode_grammar_scheduler::{
+    use synapse_owned_decode::owned_decode_grammar_scheduler::{
         compile_grammar, grammar_automaton::Automaton, grammar_limits::GrammarLimits,
         grammar_schema::parse_schema, CompileContext, GrammarSubsetManifest,
         TokenIdJsonConstraintV1,

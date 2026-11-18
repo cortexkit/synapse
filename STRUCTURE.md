@@ -33,7 +33,7 @@ crates/                     production Rust crates
   synapse-worker-host/      Supervised workers, transcription exchange and ANE residency
   synapse-worker-ane-direct/ direct Neural Engine worker for the -ane catalog lanes
   synapse-worker-cuda/      CUDA embedding and reranking worker
-  synapse-worker-decode/    owned Metal generation worker (macOS)
+  synapse-worker-decode/    parked owned Metal generation worker (macOS; not shipped)
   synapse-worker-llama/     llama.cpp generation worker for GGUF models
   synapse-worker-vulkan/    Vulkan embedding and reranking worker
 docs/                       public architecture, contracts and operator guides
@@ -50,9 +50,10 @@ workers/                    non-Rust worker processes: ane-prefill-sidecar (Swif
                             release.yml, design-gate.yml
 ```
 
-`crates/synapse-module/owned-decode-manifests/` retains the checked-in decode records.
 Inside `crates/synapse-engine-owned`, `owned-decode-engine/` holds the Metal decode
-kernels and `owned-decode-worker/` the supervisor and protocol.
+kernels and `owned-decode-worker/` the supervisor and protocol. They remain in the
+workspace with `synapse-owned-decode` and `synapse-worker-decode`, but do not serve
+module traffic. Releases do not ship the decode worker.
 
 The model catalog is `crates/synapse-module/src/catalog/models.json`, validated by
 `catalog/mod.rs`. Catalog lanes and manifest profile preloads use digest-checked

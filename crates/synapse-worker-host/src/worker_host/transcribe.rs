@@ -219,6 +219,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use synapse_core::TranscribeRevision;
+    use synapse_core::{read_json, write_json};
     use synapse_core::{write_raw, DecodeTraceRecord, WorkerProgressPhase};
 
     fn request(observe: bool) -> WorkerRequest {

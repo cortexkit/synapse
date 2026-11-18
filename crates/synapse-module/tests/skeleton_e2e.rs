@@ -30,7 +30,7 @@ use subc_transport::write_frame;
 use subc_transport::{
     generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
 };
-use synapse_core::worker_engine_names::{DECODE_WORKER_ENGINE, LLAMA_WORKER_ENGINE};
+use synapse_core::worker_engine_names::LLAMA_WORKER_ENGINE;
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, Tokenizer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -491,7 +491,7 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
     );
 
     let conn = Connection::open(&store_path).expect("open migrated synapse store");
-    for table in ["module_meta", "jobs", "alias_rows", "cert_rows", "models"] {
+    for table in ["module_meta", "jobs", "catalog_self_checks", "models"] {
         let found: Option<String> = conn
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1449,136 +1449,37 @@ async fn singleton_lease_blocks_second_module_on_same_daemon() {
     drop(first);
 }
 
-/// A grammar request is refused as `grammar_disabled` both when the module
-/// gate is off and when the gate is on but no certified owned-decode lane
-/// exists; the message names which of the two applies.
 #[tokio::test]
-async fn microllm_grammar_disabled_when_gate_is_off_or_no_certified_owned_lane() {
-    for (grammar_enabled, correlation, reason) in [
-        (false, 90_001, "disabled in module config"),
-        (true, 90_002, "certified and enabled owned-decode"),
-    ] {
-        let config = serde_json::json!({ "grammar_enabled": grammar_enabled }).to_string();
-        let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-        let frame = raw_route_frame(
-            &mut consumer,
-            route,
-            correlation,
-            serde_json::json!({
-                "method": "microllm.oneshot",
-                "params": {
-                    "model": "missing",
-                    "prompt": "yes or no",
-                    "max_tokens": 4,
-                    "grammar": "root ::= \"yes\" | \"no\""
-                }
-            }),
-        )
-        .await;
-        assert_eq!(frame.header.ty, FrameType::Error, "{reason}");
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body["code"], "grammar_disabled", "{reason}: {body}");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(reason),
-            "{reason}: {body}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn uncertified_owned_target_refuses_and_maps_grammar_over_the_wire() {
-    let fixture_dir = unique_temp_dir("owned-decode-preflight");
-    std::fs::create_dir_all(&fixture_dir).unwrap();
-    let model_path = fixture_dir.join("model.safetensors");
-    std::fs::write(&model_path, b"owned decode preflight fixture").unwrap();
-    let tokenizer_path = fixture_dir.join("tokenizer.json");
-    let vocabulary = [("[UNK]".to_string(), 0), ("hello".to_string(), 1)]
-        .into_iter()
-        .collect();
-    let word_level = WordLevel::builder()
-        .vocab(vocabulary)
-        .unk_token("[UNK]".to_string())
-        .build()
-        .unwrap();
-    let mut tokenizer = Tokenizer::new(word_level);
-    tokenizer.with_pre_tokenizer(Some(Whitespace));
-    tokenizer.save(&tokenizer_path, false).unwrap();
-    let config = serde_json::json!({
-        "grammar_enabled": true,
-        "preload_models": [{
-            "model_id": "owned-qwen",
-            "engine": DECODE_WORKER_ENGINE,
-            "task": "generate",
-            "model_path": model_path,
-            "tokenizer_path": tokenizer_path,
-            "format": "owned-safetensors",
-            "max_tokens": 512,
-            "quant": "f16",
-            "family": "qwen3-0.6b",
-            "dtype": "f16",
-            "execution": "supervised"
-        }]
-    })
-    .to_string();
-    let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
-
-    let refusal = raw_route_frame(
+async fn microllm_refuses_nonempty_grammar_before_resolving_the_model() {
+    let (_daemon, _module, mut consumer, route) = open_route_with_config("{}").await;
+    let frame = raw_route_frame(
         &mut consumer,
         route,
-        90_003,
+        90_001,
         serde_json::json!({
             "method": "microllm.oneshot",
             "params": {
-                "model": "owned-qwen",
-                "prompt": "hello",
-                "max_tokens": 4
-            }
-        }),
-    )
-    .await;
-    assert_eq!(refusal.header.ty, FrameType::Error);
-    let body: Value = serde_json::from_slice(&refusal.body).unwrap();
-    // On macOS the fresh fixture store has no approval row. Absence is an
-    // operator-disabled cutover state, so its refusal is cutover_disabled rather
-    // than owned_decode_not_certified; elsewhere platform resolution wins first.
-    let expected_refusal = if cfg!(target_os = "macos") {
-        "cutover_disabled"
-    } else {
-        "owned_decode_unsupported"
-    };
-    assert_eq!(body["code"], expected_refusal);
-
-    let grammar_refusal = raw_route_frame(
-        &mut consumer,
-        route,
-        90_004,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": "owned-qwen",
-                "prompt": "hello",
+                "model": "missing",
+                "prompt": "yes or no",
                 "max_tokens": 4,
-                "grammar": r#"{"type":"string"}"#
+                "grammar": "root ::= \"yes\" | \"no\""
             }
         }),
     )
     .await;
-    assert_eq!(grammar_refusal.header.ty, FrameType::Error);
-    let body: Value = serde_json::from_slice(&grammar_refusal.body).unwrap();
+    assert_eq!(frame.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
     assert_eq!(body["code"], "grammar_disabled");
-    let _ = std::fs::remove_dir_all(fixture_dir);
+    assert_eq!(
+        body["message"],
+        "microllm.oneshot constrained decoding is disabled in module config"
+    );
 }
-
 #[tokio::test]
-async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() {
-    let fixture_dir = unique_temp_dir("owned-decode-fallback");
+async fn llama_generate_preload_serves_oneshot_without_decode_provenance() {
+    let fixture_dir = unique_temp_dir("llama-oneshot");
     std::fs::create_dir_all(&fixture_dir).unwrap();
-    let owned_model = fixture_dir.join("owned.safetensors");
     let llama_model = fixture_dir.join("fallback.gguf");
-    std::fs::write(&owned_model, b"owned decode fallback fixture").unwrap();
     std::fs::write(&llama_model, b"llama fallback fixture").unwrap();
     let tokenizer_path = fixture_dir.join("tokenizer.json");
     let vocabulary = [
@@ -1600,19 +1501,6 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     let config = serde_json::json!({
         "preload_models": [
             {
-                "model_id": "owned-qwen",
-                "engine": DECODE_WORKER_ENGINE,
-                "task": "generate",
-                "model_path": owned_model,
-                "tokenizer_path": tokenizer_path,
-                "format": "owned-safetensors",
-                "max_tokens": 512,
-                "quant": "f16",
-                "family": "qwen3-0.6b",
-                "dtype": "f16",
-                "execution": "supervised"
-            },
-            {
                 "model_id": "llama-fallback",
                 "engine": LLAMA_WORKER_ENGINE,
                 "task": "generate",
@@ -1628,101 +1516,35 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     .to_string();
     let (_daemon, _module, mut consumer, route) = open_route_with_config(&config).await;
 
-    let fallback = route_request(
-        &mut consumer,
-        route,
-        90_005,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": "owned-qwen",
-                "prompt": "hello",
-                "max_tokens": 4
-            }
-        }),
-    )
-    .await;
-    let result = &fallback["result"];
-    assert_eq!(result["text"], "fallback");
-    assert_eq!(result["provenance"]["lane"], "llama");
-    assert_eq!(
-        result["provenance"]["fallback_reason"],
-        if !cfg!(target_os = "macos") {
-            // The platform refusal fires at resolution, before certification
-            // or the serving predicate are consulted, regardless of profile.
-            "owned_decode_unsupported"
-        } else {
-            // Approval rows live in the module store now; this test's fresh
-            // store has none, so the serving predicate refuses as disabled
-            // before evidence is consulted — the same reason in debug and
-            // release, since the build type no longer carries a record set.
-            "cutover_disabled"
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut correlation = 90_006;
+    let llama_only = loop {
+        let reply = route_request(
+            &mut consumer,
+            route,
+            correlation,
+            serde_json::json!({
+                "method": "microllm.oneshot",
+                "params": {"model": "llama-fallback", "prompt": "hello", "max_tokens": 4}
+            }),
+        )
+        .await;
+        if reply["result"]["error"]["code"] != "model_loading" {
+            break reply;
         }
-    );
-    assert!(result["provenance"]["decode_fingerprint"].is_string());
-    assert!(result["provenance"]["processing_fingerprint"].is_string());
-    assert_ne!(
-        result["provenance"]["decode_fingerprint"],
-        Value::String(String::new())
-    );
-
-    let llama_only = route_request(
-        &mut consumer,
-        route,
-        90_006,
-        serde_json::json!({
-            "method": "microllm.oneshot",
-            "params": {
-                "model": "llama-fallback",
-                "prompt": "hello",
-                "max_tokens": 4
-            }
-        }),
-    )
-    .await;
+        assert!(
+            Instant::now() < deadline,
+            "llama preload did not load: {reply}"
+        );
+        correlation += 1;
+        sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(llama_only["result"]["text"], "fallback", "{llama_only}");
     let llama_provenance = &llama_only["result"]["provenance"];
     assert!(llama_provenance.get("fallback_reason").is_none());
     assert!(llama_provenance.get("decode_fingerprint").is_none());
     assert!(llama_provenance.get("processing_fingerprint").is_none());
     let _ = std::fs::remove_dir_all(fixture_dir);
-}
-
-#[test]
-fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_literal() {
-    let binary = std::fs::read(env!("CARGO_BIN_EXE_ck-synapse")).unwrap();
-    let contains = |literal: &[u8]| {
-        binary
-            .windows(literal.len())
-            .any(|window| window == literal)
-    };
-    assert!(contains(b"grammar_disabled"));
-    assert!(contains(b"owned_decode_not_certified"));
-    // The legacy literal may appear ONLY as retirement-changelog data. Before
-    // the runtime-bound records epic the compiled cutover path baked the
-    // wire-error-bindings manifest (and with it the changelog's occurrences of
-    // the retired literal) into the binary; retiring that path removed the
-    // baked copy, so the binary now carries ZERO occurrences. The manifest
-    // file must still record the retirement, and any occurrence in the binary
-    // means an emittable legacy error string came back (or the manifest was
-    // baked in again — either way a deliberate decision this pin must force).
-    let count = |haystack: &[u8], literal: &[u8]| {
-        haystack
-            .windows(literal.len())
-            .filter(|window| *window == literal)
-            .count()
-    };
-    let legacy = b"grammar_unavailable_in_build";
-    let manifest =
-        include_bytes!("../owned-decode-manifests/owned-decode-wire-error-bindings-v1.json");
-    assert!(
-        count(manifest, legacy) > 0,
-        "manifest no longer records the retirement"
-    );
-    let in_binary = count(&binary, legacy);
-    assert!(
-        in_binary == 0,
-        "legacy grammar literal is compiled into the binary again: {in_binary} occurrences (the retirement changelog lives only in the on-disk manifest since the compiled cutover path was deleted)"
-    );
 }
 
 #[tokio::test]

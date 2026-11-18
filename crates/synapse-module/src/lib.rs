@@ -23,21 +23,12 @@ mod lane_pause;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
-/// Pure certification APIs plus the module's store-backed probe write seam.
-pub mod owned_decode_certification;
-pub use synapse_owned_decode::{
-    owned_decode_contracts, owned_decode_grammar_scheduler, owned_decode_routing,
-    owned_decode_sidecar,
-};
-#[cfg(test)]
-mod owned_decode_routing_store_tests;
 #[cfg(test)]
 mod rerank_readout_tests;
-mod rollback;
 #[cfg(all(test, unix))]
 mod store_integration_tests;
 pub use synapse_store as store;
-use synapse_store::{owned_decode_catalog_entry, PerfKnob};
+use synapse_store::PerfKnob;
 #[cfg(test)]
 mod test_binaries;
 pub use store::{
@@ -86,12 +77,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use store::{
-    ApprovalCertificationHealth, CertificationStatus, CheckpointItem,
-    EvidenceRequirementsDivergence, JobAdmission, JobAttemptClaim, JobRecord, ModelAssetLocator,
-    ModelCatalogEntry, OwnedDecodeAdmissionEvaluation, OwnedDecodeAdmissionRefusal,
-    OwnedDecodeMatchInputs, RecommendedBatch, StorageHealthInputs, StoredModelConfig,
-    CERT_EVIDENCE_SCHEMA_REVISION, JOB_STATE_DONE, JOB_STATE_FAILED_PERMANENT,
-    JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
+    CheckpointItem, JobAdmission, JobAttemptClaim, JobRecord, ModelAssetLocator, ModelCatalogEntry,
+    RecommendedBatch, StorageHealthInputs, StoredModelConfig, JOB_STATE_DONE,
+    JOB_STATE_FAILED_PERMANENT, JOB_STATE_FAILED_TRANSIENT, JOB_STATE_QUEUED, JOB_STATE_RUNNING,
 };
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandler,
@@ -107,15 +95,15 @@ use subc_protocol::{
 use synapse_core::{
     evaluate_cuda_floor, owned_cuda_engine_identity, worker_binary_env_var,
     worker_binary_file_name,
-    worker_engine_names::{DECODE_WORKER_ENGINE, LLAMA_ENGINE, LLAMA_WORKER_ENGINE},
+    worker_engine_names::{LLAMA_ENGINE, LLAMA_WORKER_ENGINE},
     worker_runtime_dir_env_var, AdmissionDecision, AdmissionRequest, CacheGcOutcome,
     CertifiedShapeEnvelope, Clock, CudaFloorDecision, EmbedEngine, EngineError, EngineErrorStage,
-    EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateEngine, GenerateOutput,
+    EngineIdentity, ErrorClass, Fingerprint, FlashAttentionSetting, GenerateOutput,
     GenerateRequest, LaneBudgetSnapshot, LaneScheduler, LoadedModel, MachineProfile, ModelCache,
     ModelCacheError, ModelCacheIngest, ModelCacheMeta, NormalizationMode, NumericDType,
     NumericProfile, PoolingStrategy, QueueClass, RerankRequest, ResponseEnvelope,
-    ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, SidecarSpec,
-    StableError, SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
+    ResponseProvenance, RuntimeConfig, SanitizedTokenizer, SchedulerConfig, StableError,
+    SystemMachineProfileCollector, ThreadPolicyClass, TokenBatch, TokenizationError,
     TokenizedBatch, TokenizerConfig, TruncationDisclosure, ValidatedArtifact, Vectors, WorkRequest,
     WorkerPooling, CUDA_WORKER_ENGINE, OWNED_CUDA_MINIMUM_DEVICE_CC, OWNED_CUDA_MINIMUM_DRIVER_API,
     OWNED_CUDA_PTX_VIRTUAL_ARCH,
@@ -167,8 +155,6 @@ const DEFAULT_JOB_RESULT_PAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_JOB_BULK_QUANTUM_TOKENS: u64 = 3_072;
 const DEFAULT_ENGINE_BATCH_TOKEN_BUDGET: u64 = 3_072;
 const MAX_ENGINE_BATCH_ITEMS: usize = 8;
-const DEFAULT_DECODE_CHAIN_K: u32 = 1;
-const MAX_DECODE_CHAIN_K: u32 = 16;
 const SYNAPSE_OS_BUILD_OVERRIDE_ENV: &str = "SYNAPSE_OS_BUILD_OVERRIDE";
 const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
 const SYNAPSE_EMBED_PROFILE_ENV: &str = "SYNAPSE_EMBED_PROFILE";
@@ -185,8 +171,6 @@ struct SynapseSingletonLease {
 /// An explicit directory supports isolated drills. Production callers omit it
 /// so the target is resolved by the same storage path function used when a
 /// daemon acknowledgment does not provide a descriptor at module boot.
-/// Restored approvals are imported disabled and require operator re-enable
-/// before serving resumes.
 pub fn restore_import(
     capture_path: &Path,
     store_directory: Option<&Path>,
@@ -446,7 +430,6 @@ struct SynapseHandlerInner {
     initialization: OnceLock<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
     #[cfg(feature = "test-support")]
     initialize_count: std::sync::atomic::AtomicUsize,
-    approval_operators: Mutex<HashMap<RouteHandle, String>>,
     media_principals: Mutex<HashMap<RouteHandle, String>>,
     /// The `flow_id` from each bound route's scope, for routes the daemon
     /// opened on behalf of a flow (an automation acting for its owner).
@@ -525,11 +508,10 @@ struct ModuleState {
     store: Arc<SynapseStore>,
     module_generation: u64,
     machine_profile: MachineProfile,
-    /// Existing profile hash used by legacy certification and performance rows.
     machine_profile_hash: String,
     /// Legacy MachineProfile::hash() retained for the existing health field.
     legacy_machine_profile_hash: String,
-    /// Revisioned hash used by owned-decode admission and evidence identity.
+    /// Revisioned hash used by catalog self-checks and rotation health.
     revisioned_machine_profile_hash: String,
     profile_activation_epoch: u64,
     runtime: Arc<RuntimeState>,
@@ -542,35 +524,18 @@ struct ModuleHealth {
     module_generation: u64,
     loaded_models: usize,
     machine_profile_hash: String,
-    certification: CertificationHealth,
     lanes: Vec<LaneHealth>,
     previous_revisioned_machine_profile_hash: Option<String>,
     current_revisioned_machine_profile_hash: String,
     profile_activation_epoch: u64,
     last_rotation_at_ms: Option<u64>,
     last_rotation_reason: Option<String>,
-    re_certification_state: String,
-    evidence_requirements_divergence: Vec<EvidenceRequirementsDivergence>,
-    approval_certification_outcomes: Vec<ApprovalCertificationHealth>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-struct CertificationHealth {
-    lanes: Vec<CertificationHealthLane>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-struct CertificationHealthLane {
-    model_id: String,
-    workload: String,
-    certified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct LaneHealth {
     model_id: String,
     fingerprint: Fingerprint,
-    certified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker: Option<worker_host::WorkerHostHealth>,
 }
@@ -580,199 +545,6 @@ struct MethodEnvelope {
     method: String,
     #[serde(default)]
     params: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalMigrationParams {
-    seed_revision: String,
-    schema_revision: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalEnableParams {
-    model_id: String,
-    decode_fingerprint: String,
-    grammar_enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalDisableParams {
-    model_id: String,
-    decode_fingerprint: String,
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalEmergencyRollbackParams {
-    reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionAdmissionParams {
-    catalog_fingerprint: String,
-    caller_id: String,
-    context_ceiling_tokens: u32,
-    generation: synapse_core::GenerationConfiguration,
-    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionDecodeParams {
-    session_id: String,
-    req_id: String,
-    prompt: String,
-    max_tokens: u32,
-    #[serde(default)]
-    grammar: Option<String>,
-    #[serde(default)]
-    deadline_ms: Option<u64>,
-    #[serde(default)]
-    max_queue_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionSnapshotParams {
-    session_id: String,
-    position_tokens: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionContinueParams {
-    session_id: String,
-    retained_kv_session_id: String,
-    /// Present when an aborted stream left a retained token prefix; `req_id`
-    /// lets the supervisor continue from that prefix without replaying or
-    /// skipping committed tokens.
-    #[serde(default)]
-    req_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionAbortParams {
-    session_id: String,
-    req_id: String,
-    retain_kv: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionCloseParams {
-    session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeSessionStatusParams {
-    session_id: String,
-    req_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OwnedDecodeServingControlParams {
-    catalog_fingerprint: String,
-    reason: String,
-}
-
-#[derive(Clone, Debug)]
-struct OwnedDecodeWireSession {
-    catalog_fingerprint: String,
-    model_id: String,
-    routing_session_id: owned_decode_routing::admission::SessionId,
-    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration,
-    active_request: Option<String>,
-    retained_kv_session_id: Option<String>,
-    retained_position: Option<u32>,
-    /// Wall-clock time (`now_ms`) at which close or an artifact revoke ended the
-    /// session; `None` while it is open. Background maintenance evicts the entry
-    /// once it has been closed for longer than
-    /// [`CLOSED_OWNED_DECODE_SESSION_RETENTION_MS`].
-    closed_at_ms: Option<u64>,
-}
-
-impl OwnedDecodeWireSession {
-    fn is_closed(&self) -> bool {
-        self.closed_at_ms.is_some()
-    }
-}
-
-/// How long a closed decode session stays registered before background
-/// maintenance forgets it. Keeping it for a while is what lets a repeated
-/// `owned_decode.close` stay idempotent and lets `owned_decode.session_status`
-/// report the terminal state to a client that lost the terminal frame. Both of
-/// those recoveries happen within seconds of the close, so 15 minutes is a
-/// generous margin while still stopping the session map from growing by one
-/// entry per admitted session for the life of the module.
-const CLOSED_OWNED_DECODE_SESSION_RETENTION_MS: u64 = 15 * 60 * 1_000;
-
-#[derive(Clone, Copy, Debug)]
-struct PendingSessionAbort {
-    retain_kv: bool,
-}
-
-struct OwnedDecodeWireState {
-    sessions: BTreeMap<String, OwnedDecodeWireSession>,
-    residency: Option<owned_decode_routing::admission::ResidencyRouter>,
-    streams: owned_decode_worker::StreamingSupervisor,
-    scheduler: owned_decode_grammar_scheduler::scheduler::DecodeScheduler,
-    pending_aborts: BTreeMap<(String, String), PendingSessionAbort>,
-    next_session_sequence: u64,
-}
-
-impl Default for OwnedDecodeWireState {
-    fn default() -> Self {
-        Self {
-            sessions: BTreeMap::new(),
-            residency: None,
-            streams: owned_decode_worker::StreamingSupervisor::default(),
-            scheduler:
-                owned_decode_grammar_scheduler::scheduler::DecodeScheduler::shipped_embed_load_v1(),
-            pending_aborts: BTreeMap::new(),
-            next_session_sequence: 0,
-        }
-    }
-}
-
-impl OwnedDecodeWireState {
-    /// Forget sessions that have been closed for longer than the retention
-    /// window, together with their request stream records, and return how many
-    /// sessions were removed. Open sessions are never removed, however long ago
-    /// they were admitted.
-    fn evict_expired_closed_sessions(&mut self, now_ms: u64) -> usize {
-        let expired = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| {
-                session.closed_at_ms.is_some_and(|closed_at_ms| {
-                    now_ms.saturating_sub(closed_at_ms) > CLOSED_OWNED_DECODE_SESSION_RETENTION_MS
-                })
-            })
-            .map(|(session_id, _)| session_id.clone())
-            .collect::<Vec<_>>();
-        for session_id in &expired {
-            self.sessions.remove(session_id);
-            // Status looks the session up first, so once it is gone its stream
-            // records are unreachable and would only accumulate.
-            self.streams.forget_session(session_id);
-        }
-        expired.len()
-    }
-}
-
-struct ServingAdmissionMaterial {
-    machine: owned_decode_routing::admission::MachineTuple,
-    envelope: owned_decode_routing::admission::PlatformEnvelope,
-    artifact: owned_decode_routing::admission::ArtifactReservation,
-    model_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -836,18 +608,6 @@ pub(crate) struct ModuleConfig {
     knob: PerfKnob,
     #[serde(default = "default_microllm_max_tokens")]
     microllm_max_tokens: u32,
-    #[serde(default)]
-    grammar_enabled: bool,
-    /// Dormant semantic sidecar configuration. Launch still requires a compiled,
-    /// identity-matching `synapse-json-schema-v1` constraint.
-    #[serde(default)]
-    sidecar_spec: SidecarSpec,
-    /// Free-text owned decode chain span. Grammar requests always use K=1
-    /// because host-side token masking requires a per-token boundary; values
-    /// above one change free-text execution shape only after certification
-    /// covers the configured span.
-    #[serde(default = "default_decode_chain_k")]
-    decode_chain_k: u32,
     #[serde(default = "default_cache_max_bytes")]
     cache_max_bytes: u64,
 }
@@ -865,9 +625,6 @@ impl Default for ModuleConfig {
             jobs: JobConfig::default(),
             knob: PerfKnob::default(),
             microllm_max_tokens: default_microllm_max_tokens(),
-            grammar_enabled: false,
-            sidecar_spec: SidecarSpec::default(),
-            decode_chain_k: default_decode_chain_k(),
             cache_max_bytes: default_cache_max_bytes(),
         }
     }
@@ -895,20 +652,6 @@ fn default_microllm_max_tokens() -> u32 {
 
 fn default_cache_max_bytes() -> u64 {
     DEFAULT_CACHE_MAX_BYTES
-}
-
-fn default_decode_chain_k() -> u32 {
-    DEFAULT_DECODE_CHAIN_K
-}
-
-fn validate_decode_chain_k(value: u32) -> Result<(), ModuleError> {
-    if (1..=MAX_DECODE_CHAIN_K).contains(&value) {
-        Ok(())
-    } else {
-        Err(ModuleError::Config(format!(
-            "decode_chain_k must be between 1 and {MAX_DECODE_CHAIN_K}, got {value}"
-        )))
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -993,12 +736,6 @@ struct PreloadModelConfig {
     #[serde(default)]
     dtype: Option<String>,
     #[serde(default)]
-    arithmetic_identity_revision: Option<String>,
-    #[serde(default)]
-    metallib_revision: Option<String>,
-    #[serde(default)]
-    quantizer_revision: Option<String>,
-    #[serde(default)]
     kernel_revision: Option<String>,
     #[serde(default)]
     ptx_virtual_arch: Option<String>,
@@ -1006,8 +743,6 @@ struct PreloadModelConfig {
     minimum_device_cc: Option<f32>,
     #[serde(default)]
     minimum_cuda_driver_api: Option<u32>,
-    #[serde(default)]
-    derived_digest: Option<String>,
     #[serde(default)]
     execution: Option<String>,
     #[serde(default)]
@@ -1242,9 +977,6 @@ struct RuntimeState {
     log: LogConfig,
     knob: PerfKnob,
     microllm_max_tokens: u32,
-    grammar_enabled: bool,
-    sidecar_spec: SidecarSpec,
-    decode_chain_k: u32,
     cache_max_bytes: u64,
     scheduler: Arc<Mutex<InlineScheduler>>,
     execution: Arc<Semaphore>,
@@ -1259,12 +991,6 @@ struct RuntimeState {
     ane_lane_test_root: Option<PathBuf>,
     lane_pause: lane_pause::LanePause,
     catalog: Arc<Mutex<BTreeMap<String, ModelSlot>>>,
-    owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
-    owned_decode_dispatches:
-        Arc<Mutex<BTreeMap<String, Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>>>,
-    /// Tracks module-owned decode sessions so serving admission, interrupted-stream
-    /// recovery, and scheduler updates use the same durable session state.
-    owned_decode_sessions: Arc<Mutex<OwnedDecodeWireState>>,
     admission_telemetry: Arc<AdmissionTelemetry>,
     activity_telemetry: Arc<ActivityTelemetry>,
 }
@@ -1547,12 +1273,8 @@ struct EmbeddingModel {
     backend: EmbedBackend,
     tokenizer: SanitizedTokenizer,
     fingerprint: Fingerprint,
-    certification_fingerprint: Fingerprint,
     engine_identity: EngineIdentity,
     owned_tokenizer_policy: Option<OwnedTokenizerPolicy>,
-    /// Platform-gated owned-decode execution refusal discovered while resolving
-    /// the catalog identity. Routing consumes this before lane selection.
-    owned_decode_resolution_refusal: Option<owned_decode_routing::error::OwnedDecodeError>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1603,7 +1325,6 @@ impl EmbeddingModel {
                 dims: Some(test_deterministic::dims()),
                 ..Default::default()
             },
-            EmbedBackend::OwnedDecode => ExecutionModelInfo::default(),
         }
     }
 }
@@ -1623,7 +1344,7 @@ fn dtype_for_slot(spec: &StoredModelConfig, exec_dtype: Option<String>) -> Optio
 
 fn device_class_for_engine(engine: &str) -> Option<String> {
     match engine {
-        "owned-metal" | "owned-metal-decode" => Some("metal".to_string()),
+        "owned-metal" => Some("metal".to_string()),
         CUDA_WORKER_ENGINE | "cuda" => Some("cuda".to_string()),
         LLAMA_ENGINE | LLAMA_WORKER_ENGINE => Some("cpu".to_string()),
         _ => None,
@@ -1659,7 +1380,6 @@ fn execution_lane_for_engine(engine: &str) -> &'static str {
         CUDA_WORKER_ENGINE => "cuda",
         synapse_core::VULKAN_WORKER_ENGINE => "vulkan",
         LLAMA_ENGINE | LLAMA_WORKER_ENGINE => "llama",
-        DECODE_WORKER_ENGINE => "decode",
         _ => "unknown",
     }
 }
@@ -1729,9 +1449,6 @@ enum EmbedBackend {
     #[cfg(unix)]
     DirectAne(Arc<worker_host::ane_residency::DirectAneEngine>),
     Owned(Arc<Mutex<OwnedMetalEmbedEngine>>),
-    /// Owned decode is loaded for each supervised generation so its generation
-    /// supervisor, rather than the generic worker host, enforces the crash limit.
-    OwnedDecode,
     Worker(Arc<Mutex<worker_host::WorkerEngine>>),
 }
 
@@ -1838,11 +1555,6 @@ struct MicroLlmOneshotParams {
     _allow_equivalent: bool,
     #[serde(default)]
     required_epoch: Option<u64>,
-    /// Set only by the session API; once a persistent session reserves
-    /// owned-decode KV state, force the same worker identity instead of switching
-    /// to a separate llama runtime.
-    #[serde(skip)]
-    owned_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1851,15 +1563,7 @@ struct MicroLlmOneshotPayload {
     finish_reason: String,
     n_prompt: usize,
     n_gen: usize,
-    /// Raw committed IDs let the session surface preserve the worker's exact
-    /// progress history instead of retokenizing rendered text.
     generated_token_ids: Vec<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_config_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    derived_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    generation_id: Option<String>,
     real_token_counts: Vec<u32>,
     truncation_disclosures: Vec<TruncationDisclosure>,
 }
@@ -1936,20 +1640,6 @@ struct CacheGcParams {
     grace_ms: Option<u64>,
 }
 
-struct LaneMeasurementRows {
-    certified: bool,
-}
-
-struct CatalogLaneMeasurements {
-    slot: ModelSlotSnapshot,
-    measurements: LaneMeasurementRows,
-}
-
-struct CatalogMeasurementSummary {
-    lanes: Vec<CatalogLaneMeasurements>,
-    certified_lanes: usize,
-}
-
 struct SystemClock;
 
 fn recommended_batch_for_engine(engine: &str, _max_tokens: usize) -> Option<RecommendedBatch> {
@@ -1994,7 +1684,6 @@ impl SynapseHandler {
                 initialization: OnceLock::new(),
                 #[cfg(feature = "test-support")]
                 initialize_count: std::sync::atomic::AtomicUsize::new(0),
-                approval_operators: Mutex::new(HashMap::new()),
                 media_principals: Mutex::new(HashMap::new()),
                 flow_routes: Mutex::new(HashMap::new()),
                 diagnostics_routes: Mutex::new(HashMap::new()),
@@ -2103,14 +1792,6 @@ impl RuntimeState {
         let log = config.log;
         let knob = config.knob;
         let microllm_max_tokens = config.microllm_max_tokens;
-        let grammar_enabled = config.grammar_enabled;
-        config
-            .sidecar_spec
-            .validate()
-            .map_err(|error| ModuleError::Config(error.to_string()))?;
-        let sidecar_spec = config.sidecar_spec;
-        validate_decode_chain_k(config.decode_chain_k)?;
-        let decode_chain_k = config.decode_chain_k;
         let cache_max_bytes = config.cache_max_bytes;
         let scheduler = Arc::new(Mutex::new(InlineScheduler { in_flight_bytes: 0 }));
         let execution = Arc::new(Semaphore::new(inline.max_concurrent_workers.max(1)));
@@ -2171,9 +1852,6 @@ impl RuntimeState {
             log,
             knob,
             microllm_max_tokens,
-            grammar_enabled,
-            sidecar_spec,
-            decode_chain_k,
             cache_max_bytes,
             scheduler,
             execution,
@@ -2188,11 +1866,6 @@ impl RuntimeState {
             lane_pause: lane_pause::LanePause::default(),
             control_loads: Arc::new(Semaphore::new(1)),
             catalog: Arc::new(Mutex::new(catalog)),
-            owned_decode_q8: Arc::new(Mutex::new(
-                owned_decode_routing::q8ingest::Q8IngestRegistry::new(),
-            )),
-            owned_decode_dispatches: Arc::new(Mutex::new(BTreeMap::new())),
-            owned_decode_sessions: Arc::new(Mutex::new(OwnedDecodeWireState::default())),
             admission_telemetry: Arc::new(AdmissionTelemetry::default()),
             activity_telemetry: Arc::new(ActivityTelemetry::default()),
         })
@@ -2368,7 +2041,7 @@ async fn emit_activity_sample(state: &ModuleState, interval_secs: u64) {
             EmbedBackend::DirectAne(_) => None,
             #[cfg(feature = "test-support")]
             EmbedBackend::TestDeterministic(_) => None,
-            EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+            EmbedBackend::Owned(_) => None,
         })
         .collect::<Vec<_>>();
     let worker_rss_mb = tokio::task::spawn_blocking(move || {
@@ -2441,9 +2114,6 @@ fn sync_and_load_catalog_models(
     }
     for id in &reconciled.skipped_reserved {
         tracing::warn!(model_id=%id,"skipping persisted catalog-reserved registration");
-    }
-    for (id, engine) in &reconciled.skipped_retired {
-        tracing::warn!(model_id=%id,%engine,"skipping retired persisted registration");
     }
     for model in reconciled.registrable {
         let refreshed = normalize_catalog_model(model.clone(), &config.inline, &config.jobs)?;
@@ -2591,70 +2261,6 @@ fn build_preload_catalog_model(
             .build_flags
             .insert("backend".to_string(), backend);
     }
-    if engine_name == "owned-metal-decode" {
-        use owned_decode_routing::identity::WeightQuant;
-
-        let family = preload.family.ok_or_else(|| {
-            ModuleError::Config("owned-metal-decode catalog entry is missing family".to_string())
-        })?;
-        owned_decode_routing::family::Family::parse(&family)
-            .map_err(|error| ModuleError::Config(error.as_str().to_string()))?;
-        let dtype = preload.dtype.unwrap_or_else(|| "f16".to_string());
-        if dtype != "f16" {
-            return Err(ModuleError::Config(format!(
-                "owned-metal-decode activation dtype '{dtype}' is unsupported"
-            )));
-        }
-        let weight_quant = WeightQuant::parse(&spec.quant)
-            .map_err(|error| ModuleError::Config(error.as_str().to_string()))?;
-        let q8_identity = match weight_quant {
-            WeightQuant::F16 => {
-                if preload.quantizer_revision.is_some() || preload.derived_digest.is_some() {
-                    return Err(ModuleError::Config(
-                        "owned-metal-decode f16 entry must not declare Q8 identity".to_string(),
-                    ));
-                }
-                None
-            }
-            WeightQuant::Q8_0 => Some((
-                preload.quantizer_revision.ok_or_else(|| {
-                    ModuleError::Config(
-                        "owned-metal-decode q8_0 entry is missing quantizer_revision".to_string(),
-                    )
-                })?,
-                preload.derived_digest.ok_or_else(|| {
-                    ModuleError::Config(
-                        "owned-metal-decode q8_0 entry is missing derived_digest".to_string(),
-                    )
-                })?,
-            )),
-        };
-        spec.owned_family = Some(family);
-        spec.owned_dtype = Some(dtype);
-        spec.owned_execution = Some(
-            preload
-                .execution
-                .unwrap_or_else(|| "supervised".to_string()),
-        );
-        if let Some(revision) = preload.arithmetic_identity_revision {
-            spec.engine_identity
-                .build_flags
-                .insert("arithmetic_identity_revision".to_string(), revision);
-        }
-        if let Some(revision) = preload.metallib_revision {
-            spec.engine_identity
-                .build_flags
-                .insert("metallib_revision".to_string(), revision);
-        }
-        if let Some((quantizer_revision, derived_digest)) = q8_identity {
-            spec.engine_identity
-                .build_flags
-                .insert("quantizer_revision".to_string(), quantizer_revision);
-            spec.engine_identity
-                .build_flags
-                .insert("derived_digest".to_string(), derived_digest);
-        }
-    }
     Ok(spec)
 }
 
@@ -2714,14 +2320,6 @@ fn normalize_catalog_model(
     let engine_name = canonical_engine_name(&model.engine);
     let task = parse_model_task(Some(&model.task), &engine_name, &model.model_id)?;
     let pooling = parse_pooling(&model.pooling)?;
-    let decode_metadata = (engine_name == "owned-metal-decode").then(|| {
-        (
-            model.owned_family.clone(),
-            model.owned_dtype.clone(),
-            model.owned_execution.clone(),
-            model.engine_identity.build_flags.clone(),
-        )
-    });
     let owned = if engine_name == "owned-metal" {
         Some(OwnedCatalogConfig {
             family: OwnedFamily::parse(model.owned_family.as_deref().ok_or_else(|| {
@@ -2809,12 +2407,6 @@ fn normalize_catalog_model(
         spec.engine_identity
             .build_flags
             .insert("backend".to_string(), backend);
-    }
-    if let Some((family, dtype, execution, build_flags)) = decode_metadata {
-        spec.owned_family = family;
-        spec.owned_dtype = dtype.or_else(|| Some("f16".to_string()));
-        spec.owned_execution = execution.or_else(|| Some("supervised".to_string()));
-        spec.engine_identity.build_flags.extend(build_flags);
     }
     Ok(spec)
 }
@@ -3292,11 +2884,6 @@ fn build_stored_model_config(
             "owned-metal supports embedding and rerank models only in wave 1".to_string(),
         ));
     }
-    if engine_name == "owned-metal-decode" && task != ModelTask::Generate {
-        return Err(ModuleError::Config(
-            "owned-metal-decode supports generation models only".to_string(),
-        ));
-    }
     if matches!(
         engine_name,
         CUDA_WORKER_ENGINE | "owned-vulkan" | "ane-direct-worker"
@@ -3582,7 +3169,6 @@ fn default_artifact_format(engine_name: &str) -> String {
         "owned-metal" | "owned-cuda" | "owned-vulkan" | synapse_core::ANE_DIRECT_WORKER_ENGINE => {
             "safetensors-package".to_string()
         }
-        "owned-metal-decode" => "owned-safetensors".to_string(),
         _ => "onnx".to_string(),
     }
 }
@@ -3590,7 +3176,7 @@ fn default_artifact_format(engine_name: &str) -> String {
 fn default_quant(engine_name: &str) -> String {
     match engine_name {
         LLAMA_ENGINE => "f16".to_string(),
-        "owned-metal" | "owned-cuda" | "owned-metal-decode" => "f16".to_string(),
+        "owned-metal" | "owned-cuda" => "f16".to_string(),
         _ => "fp32".to_string(),
     }
 }
@@ -3624,15 +3210,6 @@ fn catalog_model_engine_identity(engine_name: &str) -> Result<EngineIdentity, Mo
             "unknown",
             "f16",
             "cuda-kernel-v1",
-        )),
-        "owned-metal-decode" => Ok(worker_catalog_identity(
-            DECODE_WORKER_ENGINE,
-            "owned-metal-decode-worker-v1",
-            &[
-                ("transport", worker_catalog_transport()),
-                ("lane", "decode"),
-                ("risk_class", "abort_capable"),
-            ],
         )),
         other => Err(ModuleError::Config(format!(
             "unsupported engine '{other}' for catalog model"
@@ -3678,22 +3255,8 @@ fn machine_profile_with_overrides(mut machine_profile: MachineProfile) -> Machin
 /// Run storage maintenance from the host's periodic health cadence. Keeping
 /// this work on an existing heartbeat avoids a second timer loop in the module.
 fn run_background_maintenance(state: &ModuleState) {
-    run_background_maintenance_at(state, now_ms());
-}
-
-/// The maintenance pass with the wall-clock reading supplied by the caller, so
-/// tests can run it at a chosen time instead of waiting for time to pass.
-fn run_background_maintenance_at(state: &ModuleState, now: u64) {
-    if let Err(error) = state.store.purge_expired_jobs(now) {
+    if let Err(error) = state.store.purge_expired_jobs(now_ms()) {
         tracing::warn!(target: "maintenance", error = %error, "job purge sweep failed");
-    }
-    match state.runtime.owned_decode_sessions.lock() {
-        Ok(mut sessions) => {
-            sessions.evict_expired_closed_sessions(now);
-        }
-        Err(_) => {
-            tracing::warn!(target: "maintenance", "closed decode session sweep skipped: session lock poisoned");
-        }
     }
 }
 
@@ -3745,20 +3308,6 @@ impl ModuleHandler for SynapseHandler {
                 "synapse has not completed HELLO_ACK initialization",
             );
         }
-        if let Ok(mut operators) = self.inner.approval_operators.lock() {
-            let approved_by = match req.principal.as_ref() {
-                Some(Principal::Direct) => Some("principal:direct".to_string()),
-                Some(Principal::Reserved { module_id }) => {
-                    Some(format!("principal:reserved:{module_id}"))
-                }
-                Some(Principal::Unverified) | None => None,
-            };
-            if let Some(approved_by) = approved_by {
-                operators.insert(req.handle, approved_by);
-            } else {
-                operators.remove(&req.handle);
-            }
-        }
         if let Some(principal) = req.principal.as_ref() {
             let owner = match principal {
                 Principal::Direct => "principal:direct".to_string(),
@@ -3781,9 +3330,6 @@ impl ModuleHandler for SynapseHandler {
             .lock()
             .expect("media principals")
             .remove(handle);
-        if let Ok(mut operators) = self.inner.approval_operators.lock() {
-            operators.remove(handle);
-        }
         if let Ok(mut flows) = self.inner.flow_routes.lock() {
             flows.remove(handle);
         }
@@ -3894,15 +3440,9 @@ impl ModuleHandler for SynapseHandler {
             )
             .await;
         }
-        let approved_by = self
-            .inner
-            .approval_operators
-            .lock()
-            .ok()
-            .and_then(|operators| operators.get(&ctx.route_handle()).cloned());
         let request_span = tracing::debug_span!("synapse_request", request_id = ctx.corr(),
             method = %envelope.method);
-        let outcome = dispatch_request(state, envelope, approved_by.as_deref())
+        let outcome = dispatch_request(state, envelope)
             .instrument(request_span)
             .await;
         if profiled {
@@ -3973,11 +3513,7 @@ fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
     json!({"inventories": inventories, "worker_requests": requests, "admitted_count": admitted_count, "available": available})
 }
 
-async fn dispatch_request(
-    state: Arc<ModuleState>,
-    request: MethodEnvelope,
-    approved_by: Option<&str>,
-) -> HandlerOutcome {
+async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> HandlerOutcome {
     match request.method.as_str() {
         "diagnostics.findings" => diagnostics_findings::handle(&state, request.params),
         "lanes.pause" => lane_pause::pause(state, request.params).await,
@@ -3995,1522 +3531,16 @@ async fn dispatch_request(
         "embed.result" => embed_result(state, request.params).await,
         "rerank.score" => rerank_score(state, request.params).await,
         "microllm.oneshot" => microllm_oneshot(state, request.params).await,
-        "owned_decode.admit_session" | "admit_session" => {
-            owned_decode_admit_session(state, request.params).await
-        }
-        "owned_decode.decode" | "decode" => {
-            owned_decode_session_decode(state, request.params).await
-        }
-        "owned_decode.snapshot" | "snapshot" => {
-            owned_decode_session_snapshot(state, request.params).await
-        }
-        "owned_decode.continue" | "continue" => {
-            owned_decode_session_continue(state, request.params).await
-        }
-        "owned_decode.abort" | "abort" => owned_decode_session_abort(state, request.params).await,
-        "owned_decode.close" | "close" => owned_decode_session_close(state, request.params).await,
-        "owned_decode.session_status" | "session_status" => {
-            owned_decode_session_status(state, request.params).await
-        }
-        "owned_decode.disable" | "disable" => owned_decode_disable(state, request.params).await,
-        "owned_decode.revoke" | "revoke" => owned_decode_revoke(state, request.params).await,
         "model.unload" => model_unload(state, request.params).await,
         "cache.pin" => cache_pin(state, request.params).await,
         "cache.gc" => cache_gc(state, request.params).await,
         "admission.status" => admission_status(state).await,
-        "approvals.migrate_owned_decode" => {
-            approvals_migrate_owned_decode(state, request.params).await
-        }
-        "approvals.enable" => match approved_by {
-            Some(approved_by) => approval_enable(state, request.params, approved_by).await,
-            None => channel_error(
-                "operator_identity_unavailable",
-                "approvals.enable requires an authenticated operator identity",
-            ),
-        },
-        "approvals.disable" => approval_disable(state, request.params).await,
-        "approvals.emergency_rollback" => approvals_emergency_rollback(state, request.params).await,
         "model.status" => model_status(state, request.params).await,
         other => channel_error(
             "unknown_method",
             format!("unknown method '{other}' for synapse management surface"),
         ),
     }
-}
-
-fn owned_decode_failure(
-    state: &ModuleState,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> HandlerOutcome {
-    result_outcome(json!({
-        "module_generation": state.module_generation,
-        "error": {
-            "code": code.into(),
-            "class": "permanent",
-            "safe_to_retry_same_request": false,
-            "message": message.into(),
-        }
-    }))
-}
-
-fn owned_decode_admission_failure(
-    state: &ModuleState,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> HandlerOutcome {
-    let code = code.into();
-    state.runtime.admission_telemetry.record_refusal(&code);
-    owned_decode_failure(state, code, message)
-}
-
-fn map_serving_refusal(refusal: store::ServingRefusal) -> synapse_core::OwnedDecodeRefusal {
-    match refusal {
-        store::ServingRefusal::ArtifactUnapproved => {
-            synapse_core::OwnedDecodeRefusal::ArtifactUnapproved
-        }
-        store::ServingRefusal::ArtifactDisabled => {
-            synapse_core::OwnedDecodeRefusal::ArtifactDisabled
-        }
-        store::ServingRefusal::ArtifactRevoked => synapse_core::OwnedDecodeRefusal::ArtifactRevoked,
-        store::ServingRefusal::CertificationMismatch => {
-            synapse_core::OwnedDecodeRefusal::ArtifactMismatch
-        }
-        store::ServingRefusal::RetainedStateInvalidated => {
-            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable
-        }
-    }
-}
-
-fn map_admission_refusal(
-    refusal: &owned_decode_routing::admission::AdmissionRefusal,
-) -> synapse_core::OwnedDecodeRefusal {
-    use owned_decode_routing::admission::AdmissionRefusal;
-
-    match refusal {
-        AdmissionRefusal::UnsupportedPlatformTuple => {
-            synapse_core::OwnedDecodeRefusal::UnsupportedMachine
-        }
-        AdmissionRefusal::InvalidContextCeiling { .. } => {
-            synapse_core::OwnedDecodeRefusal::InvalidContextCeiling
-        }
-        AdmissionRefusal::InsufficientReservedLaneMemory { .. } => {
-            synapse_core::OwnedDecodeRefusal::InsufficientMemory
-        }
-        AdmissionRefusal::IncompatibleArtifact
-        | AdmissionRefusal::ArtifactSwapActiveSessions { .. } => {
-            synapse_core::OwnedDecodeRefusal::IncompatibleResidentArtifact
-        }
-        AdmissionRefusal::UnsupportedGenerationConfig => {
-            synapse_core::OwnedDecodeRefusal::SamplingUnsupported
-        }
-        AdmissionRefusal::InvalidKvConfiguration => {
-            synapse_core::OwnedDecodeRefusal::InvalidKvConfiguration
-        }
-        AdmissionRefusal::InvalidKvAlignment { .. } => {
-            synapse_core::OwnedDecodeRefusal::InvalidKvAlignment
-        }
-        AdmissionRefusal::UnknownSession { .. } => {
-            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable
-        }
-    }
-}
-
-fn current_unified_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        synapse_core::without_launch_nonce(std::process::Command::new("sysctl"))
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|value| value.trim().parse().ok())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
-fn serving_admission_material(
-    state: &ModuleState,
-    catalog_fingerprint: &str,
-) -> Result<ServingAdmissionMaterial, (synapse_core::OwnedDecodeRefusal, String)> {
-    use owned_decode_certification::CertificationGateResult;
-    use owned_decode_routing::admission::{ArtifactReservation, MachineTuple, PlatformEnvelope};
-    use store::ServingApprovalState;
-
-    let approval = state
-        .store
-        .serving_approval(catalog_fingerprint)
-        .map_err(|error| {
-            (
-                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-                format!("serving approval is unreadable: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                synapse_core::OwnedDecodeRefusal::ArtifactUnapproved,
-                "no serving approval exists for the catalog fingerprint".to_string(),
-            )
-        })?;
-    match approval.state {
-        ServingApprovalState::Enabled => {}
-        ServingApprovalState::Disabled => {
-            return Err((
-                synapse_core::OwnedDecodeRefusal::ArtifactDisabled,
-                "the catalog fingerprint is disabled".to_string(),
-            ))
-        }
-        ServingApprovalState::Revoked => {
-            return Err((
-                synapse_core::OwnedDecodeRefusal::ArtifactRevoked,
-                "the catalog fingerprint is revoked".to_string(),
-            ))
-        }
-    }
-    let certification = state
-        .store
-        .serving_certification(&approval.certification_record_id)
-        .map_err(|error| {
-            (
-                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-                format!("serving certification is unreadable: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-                "the serving approval references no certification record".to_string(),
-            )
-        })?;
-    let record = certification.record;
-    if record.unit.catalog_fingerprint != catalog_fingerprint {
-        return Err((
-            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-            "the serving certification does not match the requested catalog fingerprint"
-                .to_string(),
-        ));
-    }
-    if record.machine_evidence.machine.machine_profile_hash != state.revisioned_machine_profile_hash
-        || record.machine_evidence.machine.macos_build != state.machine_profile.os_build
-    {
-        return Err((
-            synapse_core::OwnedDecodeRefusal::UnsupportedMachine,
-            "the serving certification was recorded for a different machine tuple".to_string(),
-        ));
-    }
-    let unified_memory_bytes = current_unified_memory_bytes().ok_or_else(|| {
-        (
-            synapse_core::OwnedDecodeRefusal::UnsupportedMachine,
-            "the module cannot read the machine unified-memory capacity".to_string(),
-        )
-    })?;
-    let platform = record
-        .gate_results
-        .iter()
-        .find_map(|result| match result {
-            CertificationGateResult::PlatformEnvelope(result) => Some(result),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            (
-                synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-                "the serving certification has no platform-envelope result".to_string(),
-            )
-        })?;
-    let artifact = ArtifactReservation::new(
-        record.unit.catalog_fingerprint.clone(),
-        platform.artifact_weight_bytes,
-        platform.kv_bytes_per_token,
-    )
-    .map_err(|error| {
-        (
-            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-            format!("certified artifact reservation is invalid: {error}"),
-        )
-    })?;
-    let envelope = PlatformEnvelope::new(
-        platform.machine_profile_hash.clone(),
-        platform.macos_build.clone(),
-        platform.unified_memory_bytes,
-        platform.reserved_embed_rerank_bytes,
-        artifact.clone(),
-    )
-    .map_err(|error| {
-        (
-            synapse_core::OwnedDecodeRefusal::ArtifactMismatch,
-            format!("certified platform envelope is invalid: {error}"),
-        )
-    })?;
-    Ok(ServingAdmissionMaterial {
-        machine: MachineTuple::new(
-            state.revisioned_machine_profile_hash.clone(),
-            state.machine_profile.os_build.clone(),
-            unified_memory_bytes,
-        ),
-        envelope,
-        artifact,
-        model_id: record.artifact_lineage.model_id,
-    })
-}
-
-/// Resolve the model a serving approval's catalog runs, from the certification
-/// record the approval references. Unlike [`serving_admission_material`] this
-/// does not require the approval to be enabled, because `owned_decode.disable`
-/// needs the model after the approval has left the enabled state.
-fn serving_catalog_model_id(
-    state: &ModuleState,
-    approval: &store::ServingApprovalRecord,
-) -> Option<String> {
-    let certification = match state
-        .store
-        .serving_certification(&approval.certification_record_id)
-    {
-        Ok(Some(certification)) => certification,
-        Ok(None) => {
-            tracing::warn!(
-                catalog_fingerprint = %approval.catalog_fingerprint,
-                "serving approval references no certification record; cannot resolve its model"
-            );
-            return None;
-        }
-        Err(error) => {
-            tracing::warn!(
-                catalog_fingerprint = %approval.catalog_fingerprint,
-                error = %error,
-                "serving certification is unreadable; cannot resolve its model"
-            );
-            return None;
-        }
-    };
-    let record = certification.record;
-    if record.unit.catalog_fingerprint != approval.catalog_fingerprint {
-        tracing::warn!(
-            catalog_fingerprint = %approval.catalog_fingerprint,
-            "serving certification does not match its approval's catalog fingerprint"
-        );
-        return None;
-    }
-    Some(record.artifact_lineage.model_id)
-}
-fn session_request_key(session_id: &str, req_id: &str) -> String {
-    format!("{session_id}:{req_id}")
-}
-
-fn absolute_serving_boundary(previous: u64, request_committed: u32) -> u64 {
-    previous.saturating_add(request_committed.into())
-}
-
-async fn owned_decode_admit_session(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionAdmissionParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.admit_session params: {error}"),
-            )
-        }
-    };
-    if let Err(refusal) = synapse_core::validate_greedy_generation(&params.generation) {
-        return owned_decode_admission_failure(
-            &state,
-            refusal.as_str(),
-            "wave-1 sessions require greedy_top1",
-        );
-    }
-    let material = match serving_admission_material(&state, &params.catalog_fingerprint) {
-        Ok(material) => material,
-        Err((refusal, message)) => {
-            return owned_decode_admission_failure(&state, refusal.as_str(), message)
-        }
-    };
-    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_admission_failure(
-                &state,
-                "owned_decode_unavailable",
-                "the decode-session coordinator is unavailable",
-            )
-        }
-    };
-    if sessions
-        .residency
-        .as_ref()
-        .is_none_or(|router| router.active_session_count() == 0)
-    {
-        sessions.residency = Some(owned_decode_routing::admission::ResidencyRouter::new(
-            material.machine.clone(),
-            material.envelope.clone(),
-        ));
-    }
-    let routing_request = owned_decode_routing::admission::AdmissionRequest::new(
-        params.caller_id,
-        material.artifact.clone(),
-        params.context_ceiling_tokens,
-        owned_decode_routing::admission::GenerationConfiguration::greedy_top1(),
-        params.kv_configuration,
-    );
-    let routing_admission = match sessions
-        .residency
-        .as_mut()
-        .expect("decode residency is initialized")
-        .admit_session(routing_request)
-    {
-        Ok(admission) => admission,
-        Err(refusal) => {
-            let wire = map_admission_refusal(&refusal);
-            return owned_decode_admission_failure(&state, wire.as_str(), refusal.to_string());
-        }
-    };
-    let session_id = format!(
-        "owned-decode-{}-{}-{}",
-        state.module_generation,
-        now_ms(),
-        sessions.next_session_sequence
-    );
-    sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
-    let durable_admission =
-        state
-            .store
-            .admit_serving_session(&session_id, &params.catalog_fingerprint, now_ms());
-    let approval_generation = match durable_admission {
-        Ok(store::ServingSessionAdmission::Admitted {
-            approval_generation,
-            ..
-        }) => approval_generation,
-        Ok(store::ServingSessionAdmission::Refused { reason }) => {
-            let _ = sessions
-                .residency
-                .as_mut()
-                .expect("decode residency is initialized")
-                .close_session(routing_admission.session_id);
-            let refusal = map_serving_refusal(reason);
-            return owned_decode_admission_failure(
-                &state,
-                refusal.as_str(),
-                "serving approval refused admission",
-            );
-        }
-        Err(error) => {
-            let _ = sessions
-                .residency
-                .as_mut()
-                .expect("decode residency is initialized")
-                .close_session(routing_admission.session_id);
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                format!("could not persist session admission: {error}"),
-            );
-        }
-    };
-    sessions.sessions.insert(
-        session_id.clone(),
-        OwnedDecodeWireSession {
-            catalog_fingerprint: params.catalog_fingerprint,
-            model_id: material.model_id,
-            routing_session_id: routing_admission.session_id,
-            kv_configuration: params.kv_configuration,
-            active_request: None,
-            retained_kv_session_id: None,
-            retained_position: None,
-            closed_at_ms: None,
-        },
-    );
-    let receipt = routing_admission.receipt;
-    result_outcome(json!({
-        "session_id": session_id,
-        "catalog_fingerprint": receipt.catalog_fingerprint,
-        "approval_generation": approval_generation,
-        "reservation": {
-            "reserved_embed_rerank_bytes": receipt.reserved_embed_rerank_bytes,
-            "reserved_artifact_weight_bytes": receipt.reserved_artifact_weight_bytes,
-            "reserved_session_kv_bytes": receipt.reserved_session_kv_bytes,
-            "context_ceiling_tokens": receipt.context_ceiling_tokens,
-        },
-    }))
-}
-
-async fn owned_decode_session_snapshot(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionSnapshotParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.snapshot params: {error}"),
-            )
-        }
-    };
-    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let Some(session) = sessions.sessions.get(&params.session_id).cloned() else {
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session does not exist",
-        );
-    };
-    if session.is_closed() || session.active_request.is_some() {
-        return owned_decode_failure(
-            &state,
-            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
-            "a session can snapshot only at an idle committed boundary",
-        );
-    }
-    let boundary = synapse_core::KvReuseBoundary {
-        position: params.position_tokens,
-        block_size: session.kv_configuration.block_size_tokens,
-        recurrent_state_grain: session.kv_configuration.recurrent_state_grain_tokens,
-    };
-    if let Err(refusal) = synapse_core::validate_kv_reuse_boundary(boundary) {
-        return owned_decode_failure(
-            &state,
-            refusal.as_str(),
-            "snapshot position is not a valid KV boundary",
-        );
-    }
-    let route = match sessions
-        .residency
-        .as_ref()
-        .expect("admitted decode session has residency")
-        .route_continuation(session.routing_session_id, params.position_tokens)
-    {
-        Ok(route) => route,
-        Err(refusal) => {
-            let wire = map_admission_refusal(&refusal);
-            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
-        }
-    };
-    let retained_kv_session_id = format!(
-        "{}:retained:{}:{}",
-        params.session_id, params.position_tokens, sessions.next_session_sequence
-    );
-    sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
-    match state.store.retain_serving_state(
-        &retained_kv_session_id,
-        &session.catalog_fingerprint,
-        now_ms(),
-    ) {
-        Ok(store::ServingContinuationAdmission::Admitted { .. }) => {}
-        Ok(store::ServingContinuationAdmission::Refused { reason }) => {
-            let refusal = map_serving_refusal(reason);
-            return owned_decode_failure(
-                &state,
-                refusal.as_str(),
-                "serving control refused KV retention",
-            );
-        }
-        Err(error) => {
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                format!("could not persist retained KV state: {error}"),
-            )
-        }
-    }
-    let session = sessions
-        .sessions
-        .get_mut(&params.session_id)
-        .expect("session remains registered while snapshotting");
-    session.retained_kv_session_id = Some(retained_kv_session_id.clone());
-    session.retained_position = Some(params.position_tokens);
-    result_outcome(json!({
-        "session_id": params.session_id,
-        "retained_kv_session_id": retained_kv_session_id,
-        "retained_position": route.retained_prefix_tokens,
-        "reused_blocks": route.reused_blocks,
-    }))
-}
-
-async fn owned_decode_session_continue(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionContinueParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.continue params: {error}"),
-            )
-        }
-    };
-    match state
-        .store
-        .admit_serving_continuation(&params.retained_kv_session_id)
-    {
-        Ok(store::ServingContinuationAdmission::Admitted { .. }) => {}
-        Ok(store::ServingContinuationAdmission::Refused { reason }) => {
-            let refusal = map_serving_refusal(reason);
-            return owned_decode_failure(
-                &state,
-                refusal.as_str(),
-                "serving control refused continuation",
-            );
-        }
-        Err(error) => {
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                format!("could not read retained KV state: {error}"),
-            )
-        }
-    }
-    let sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let Some(session) = sessions.sessions.get(&params.session_id) else {
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session does not exist",
-        );
-    };
-    if session.is_closed() || session.active_request.is_some() {
-        return owned_decode_failure(
-            &state,
-            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
-            "a continuation requires an idle retained session",
-        );
-    }
-    if session.retained_kv_session_id.as_deref() != Some(&params.retained_kv_session_id) {
-        return owned_decode_failure(
-            &state,
-            synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
-            "the retained KV state belongs to a different session",
-        );
-    }
-    let position = session
-        .retained_position
-        .expect("retained session has a position");
-    if let Some(req_id) = params.req_id.as_deref() {
-        let prefix = match sessions.streams.continuation_prefix(
-            &params.session_id,
-            req_id,
-            &params.retained_kv_session_id,
-            synapse_core::ArtifactServingState::Approved,
-        ) {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                return owned_decode_failure(
-                    &state,
-                    synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
-                    error.to_string(),
-                )
-            }
-        };
-        if prefix.retained_position != position {
-            return owned_decode_failure(
-                &state,
-                synapse_core::OwnedDecodeRefusal::RetainedKvUnavailable.as_str(),
-                "the retained stream prefix does not match the session snapshot",
-            );
-        }
-    }
-    let route = match sessions
-        .residency
-        .as_ref()
-        .expect("admitted decode session has residency")
-        .route_continuation(session.routing_session_id, position)
-    {
-        Ok(route) => route,
-        Err(refusal) => {
-            let wire = map_admission_refusal(&refusal);
-            return owned_decode_failure(&state, wire.as_str(), refusal.to_string());
-        }
-    };
-    result_outcome(json!({
-        "session_id": params.session_id,
-        "retained_kv_session_id": params.retained_kv_session_id,
-        "retained_position": route.retained_prefix_tokens,
-        "reused_blocks": route.reused_blocks,
-    }))
-}
-
-async fn owned_decode_session_abort(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionAbortParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.abort params: {error}"),
-            )
-        }
-    };
-    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let Some(session) = sessions.sessions.get(&params.session_id) else {
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session does not exist",
-        );
-    };
-    if session.active_request.as_deref() != Some(&params.req_id) {
-        return owned_decode_failure(
-            &state,
-            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
-            "the request is not an active decode in this session",
-        );
-    }
-    let op_id = session_request_key(&params.session_id, &params.req_id);
-    let cancellation = sessions.scheduler.request_cancel(&op_id, now_ms());
-    sessions.pending_aborts.insert(
-        (params.session_id.clone(), params.req_id.clone()),
-        PendingSessionAbort {
-            retain_kv: params.retain_kv,
-        },
-    );
-    let disposition = match cancellation {
-        owned_decode_grammar_scheduler::scheduler::CancelResult::RemovedQueued => "removed_queued",
-        owned_decode_grammar_scheduler::scheduler::CancelResult::DeferredToBoundary => {
-            "deferred_to_boundary"
-        }
-        owned_decode_grammar_scheduler::scheduler::CancelResult::NotFound => "deferred_to_boundary",
-    };
-    result_outcome(json!({
-        "session_id": params.session_id,
-        "req_id": params.req_id,
-        "abort": "requested",
-        "disposition": disposition,
-    }))
-}
-
-async fn owned_decode_session_status(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionStatusParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.session_status params: {error}"),
-            )
-        }
-    };
-    let sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let Some(session) = sessions.sessions.get(&params.session_id) else {
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session does not exist",
-        );
-    };
-    if let Ok(status) = sessions
-        .streams
-        .session_status(&params.session_id, &params.req_id)
-    {
-        return result_outcome(serde_json::to_value(status).expect("session status serializes"));
-    }
-    if session.active_request.as_deref() == Some(&params.req_id) {
-        return result_outcome(json!({
-            "session_id": params.session_id,
-            "req_id": params.req_id,
-            "committed_token_count": 0,
-            "state": "in_flight",
-        }));
-    }
-    owned_decode_failure(
-        &state,
-        "unknown_request",
-        "the request is not registered for this session",
-    )
-}
-
-#[derive(Debug)]
-struct OwnedDecodeWorkerStream {
-    generated_token_ids: Vec<u32>,
-    identity: synapse_core::OneshotEnvelopeIdentity,
-    generation_id: String,
-}
-
-fn required_string(value: &Value, field: &str) -> Result<String, String> {
-    value
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("owned worker response is missing {field}"))
-}
-
-fn parse_owned_decode_worker_stream(body: &[u8]) -> Result<OwnedDecodeWorkerStream, String> {
-    let body: Value = serde_json::from_slice(body)
-        .map_err(|error| format!("owned worker response is not JSON: {error}"))?;
-    let result = body
-        .get("result")
-        .ok_or_else(|| "owned worker response has no result".to_string())?;
-    let provenance = result
-        .get("provenance")
-        .ok_or_else(|| "owned worker response has no provenance".to_string())?;
-    if required_string(
-        provenance.get("lane").unwrap_or(&Value::Null),
-        "provenance.lane",
-    )? != "decode"
-        || required_string(
-            provenance.get("worker").unwrap_or(&Value::Null),
-            "provenance.worker",
-        )? != "supervised"
-    {
-        return Err(
-            "owned session execution did not stay on the supervised decode lane".to_string(),
-        );
-    }
-    let generated_token_ids = result
-        .get("generated_token_ids")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "owned worker response has no generated token IDs".to_string())?
-        .iter()
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| "owned worker response has an invalid token ID".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let n_gen = result
-        .get("n_gen")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or_else(|| "owned worker response has no generation count".to_string())?;
-    if n_gen != generated_token_ids.len() {
-        return Err("owned worker generation count disagrees with committed token IDs".to_string());
-    }
-    let decode_fingerprint = required_string(
-        provenance.get("decode_fingerprint").unwrap_or(&Value::Null),
-        "provenance.decode_fingerprint",
-    )?;
-    let processing_fingerprint = required_string(
-        provenance
-            .get("processing_fingerprint")
-            .unwrap_or(&Value::Null),
-        "provenance.processing_fingerprint",
-    )?;
-    let runtime_config_digest = required_string(
-        result.get("runtime_config_digest").unwrap_or(&Value::Null),
-        "runtime_config_digest",
-    )?;
-    let worker_generation = provenance
-        .get("worker_generation")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "owned worker response has no worker generation".to_string())?;
-    let generation_id = required_string(
-        result.get("generation_id").unwrap_or(&Value::Null),
-        "generation_id",
-    )?;
-    let derived_digest = result
-        .get("derived_digest")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    Ok(OwnedDecodeWorkerStream {
-        generated_token_ids,
-        identity: synapse_core::OneshotEnvelopeIdentity {
-            decode_fingerprint: synapse_core::Fingerprint(decode_fingerprint),
-            processing_fingerprint: synapse_core::Fingerprint(processing_fingerprint),
-            runtime_config_digest,
-            worker_generation,
-            derived_digest,
-        },
-        generation_id,
-    })
-}
-
-fn clear_owned_decode_request(state: &ModuleState, session_id: &str, req_id: &str) {
-    if let Ok(mut sessions) = state.runtime.owned_decode_sessions.lock() {
-        let op_id = session_request_key(session_id, req_id);
-        sessions.scheduler.remove_op(&op_id);
-        sessions
-            .pending_aborts
-            .remove(&(session_id.to_string(), req_id.to_string()));
-        if let Some(session) = sessions.sessions.get_mut(session_id) {
-            if session.active_request.as_deref() == Some(req_id) {
-                session.active_request = None;
-            }
-        }
-    }
-}
-
-/// Consume an abort at a committed session boundary.
-///
-/// This is called after every progress frame and again after the progress loop because a
-/// zero-token worker result has no frame boundary at which to observe a pending abort.
-fn take_pending_session_abort(
-    state: &ModuleState,
-    sessions: &mut OwnedDecodeWireState,
-    session_id: &str,
-    req_id: &str,
-    committed: u32,
-    op_id: &str,
-    frames: &mut Vec<synapse_core::FrameEnvelope>,
-) -> Option<HandlerOutcome> {
-    let abort = sessions
-        .pending_aborts
-        .remove(&(session_id.to_string(), req_id.to_string()))?;
-    let retention = if abort.retain_kv {
-        let retained_kv_session_id = format!(
-            "{session_id}:retained:{committed}:{}",
-            sessions.next_session_sequence
-        );
-        sessions.next_session_sequence = sessions.next_session_sequence.saturating_add(1);
-        let catalog_fingerprint = sessions
-            .sessions
-            .get(session_id)
-            .expect("active session exists")
-            .catalog_fingerprint
-            .clone();
-        match state.store.retain_serving_state(
-            &retained_kv_session_id,
-            &catalog_fingerprint,
-            now_ms(),
-        ) {
-            Ok(store::ServingContinuationAdmission::Admitted { .. }) => {
-                owned_decode_worker::RetentionPreflight::Ready {
-                    retained_kv_session_id,
-                    retained_position: committed,
-                }
-            }
-            Ok(store::ServingContinuationAdmission::Refused { .. }) | Err(_) => {
-                owned_decode_worker::RetentionPreflight::Refused
-            }
-        }
-    } else {
-        owned_decode_worker::RetentionPreflight::NotRequested
-    };
-    match sessions.streams.abort(session_id, req_id, retention, None) {
-        Ok(outcome) => {
-            if let Some(prefix) = outcome.retained_prefix {
-                if let Some(session) = sessions.sessions.get_mut(session_id) {
-                    session.retained_kv_session_id = Some(prefix.retained_kv_session_id);
-                    session.retained_position = Some(prefix.retained_position);
-                }
-            }
-            frames.push(outcome.terminal);
-            sessions.scheduler.remove_op(op_id);
-            if let Some(session) = sessions.sessions.get_mut(session_id) {
-                session.active_request = None;
-            }
-            Some(result_outcome(json!({
-                "session_id": session_id,
-                "req_id": req_id,
-                "cancelled": outcome.cancellation,
-                "frames": frames,
-            })))
-        }
-        Err(error) => Some(owned_decode_failure(
-            state,
-            "worker_protocol_error",
-            error.to_string(),
-        )),
-    }
-}
-
-async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionDecodeParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.decode params: {error}"),
-            )
-        }
-    };
-    if params.req_id.trim().is_empty() || params.max_tokens == 0 {
-        return channel_error(
-            "invalid_request",
-            "owned_decode.decode requires a non-empty req_id and positive max_tokens",
-        );
-    }
-    let model_id = {
-        let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-            Ok(sessions) => sessions,
-            Err(_) => {
-                return owned_decode_failure(
-                    &state,
-                    "owned_decode_unavailable",
-                    "decode sessions are unavailable",
-                )
-            }
-        };
-        let Some(session) = sessions.sessions.get(&params.session_id) else {
-            return owned_decode_failure(
-                &state,
-                "unknown_session",
-                "the decode session does not exist",
-            );
-        };
-        if session.is_closed() || session.active_request.is_some() {
-            return owned_decode_failure(
-                &state,
-                synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
-                "the decode session is not idle",
-            );
-        }
-        let model_id = session.model_id.clone();
-        let op_id = session_request_key(&params.session_id, &params.req_id);
-        let admitted_at_ms = now_ms();
-        sessions
-            .scheduler
-            .admit_decode(owned_decode_grammar_scheduler::scheduler::DecodeOp {
-                op_id: op_id.clone(),
-                generation_id: params.req_id.clone(),
-                admitted_at_ms,
-                anchor_ms: admitted_at_ms,
-                committed_tokens: 0,
-                max_tokens: params.max_tokens,
-                resident: false,
-                cancelled_at_ms: None,
-                deadline_at_ms: params
-                    .deadline_ms
-                    .and_then(|deadline| admitted_at_ms.checked_add(deadline)),
-            });
-        let selected = sessions.scheduler.arbitrate(admitted_at_ms);
-        if selected
-            .as_ref()
-            .and_then(|selected| selected.op_id.as_deref())
-            != Some(op_id.as_str())
-        {
-            sessions.scheduler.remove_op(&op_id);
-            return owned_decode_failure(
-                &state,
-                "decode_scheduler_busy",
-                "decode work was not selected at a committed scheduler boundary",
-            );
-        }
-        sessions
-            .sessions
-            .get_mut(&params.session_id)
-            .expect("idle session remains registered")
-            .active_request = Some(params.req_id.clone());
-        model_id
-    };
-
-    let route_params = MicroLlmOneshotParams {
-        model: Some(model_id),
-        prompt: params.prompt.clone(),
-        max_tokens: params.max_tokens,
-        grammar: params.grammar.clone(),
-        deadline_ms: params.deadline_ms,
-        max_queue_ms: params.max_queue_ms,
-        target_fingerprint: None,
-        required_fingerprint: None,
-        required_epoch: None,
-        _allow_equivalent: false,
-        owned_only: true,
-    };
-    let worker_stream = match route_owned_decode_wire(
-        Arc::clone(&state),
-        &route_params,
-        route_params.model.as_deref().expect("session model is set"),
-        params.req_id.clone(),
-        Instant::now(),
-    )
-    .await
-    {
-        HandlerOutcome::Response(body) => match parse_owned_decode_worker_stream(&body) {
-            Ok(stream) => stream,
-            Err(error) => {
-                clear_owned_decode_request(&state, &params.session_id, &params.req_id);
-                return owned_decode_failure(&state, "worker_protocol_error", error);
-            }
-        },
-        outcome => {
-            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
-            return outcome;
-        }
-    };
-    if worker_stream.generated_token_ids.len() > params.max_tokens as usize {
-        clear_owned_decode_request(&state, &params.session_id, &params.req_id);
-        return owned_decode_failure(
-            &state,
-            "worker_protocol_error",
-            "worker exceeded the admitted generation limit",
-        );
-    }
-    let committed_before_request = match state.store.serving_session(&params.session_id) {
-        Ok(Some(session)) => session.committed_token_count,
-        Ok(None) => {
-            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                "the durable decode session does not exist",
-            );
-        }
-        Err(error) => {
-            clear_owned_decode_request(&state, &params.session_id, &params.req_id);
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                format!("could not read the decode session boundary: {error}"),
-            );
-        }
-    };
-
-    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let op_id = session_request_key(&params.session_id, &params.req_id);
-    let Some(session) = sessions.sessions.get(&params.session_id) else {
-        sessions.scheduler.remove_op(&op_id);
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session closed before the worker responded",
-        );
-    };
-    if session.active_request.as_deref() != Some(&params.req_id) {
-        sessions.scheduler.remove_op(&op_id);
-        return owned_decode_failure(
-            &state,
-            "request_cancelled",
-            "the decode request was removed before the worker responded",
-        );
-    }
-    let grammar_constrained = params
-        .grammar
-        .as_deref()
-        .is_some_and(|grammar| !grammar.trim().is_empty());
-    let chain_k = if grammar_constrained {
-        1
-    } else {
-        state.runtime.decode_chain_k
-    };
-    let request = owned_decode_worker::StreamRequest {
-        req_id: params.req_id.clone(),
-        session_id: params.session_id.clone(),
-        generation_id: worker_stream.generation_id.clone(),
-        identity: worker_stream.identity.clone(),
-        decode_mode: synapse_core::DecodeMode::Serial,
-        grammar_constrained,
-        chain_k,
-    };
-    if let Err(error) = sessions.streams.begin(request) {
-        sessions.scheduler.remove_op(&op_id);
-        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-            session.active_request = None;
-        }
-        return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
-    }
-
-    let mut frames = Vec::new();
-    let mut committed = 0_u32;
-    let mut sequence = synapse_core::StreamSequence::FIRST.0;
-    let quantum = sessions.scheduler.config().production_n as usize;
-    let chunks = worker_stream
-        .generated_token_ids
-        .chunks(quantum)
-        .collect::<Vec<_>>();
-    for (index, token_ids) in chunks.iter().enumerate() {
-        committed = committed.saturating_add(token_ids.len() as u32);
-        if let Err(error) = sessions
-            .scheduler
-            .try_commit_quantum(&op_id, committed, now_ms())
-        {
-            sessions.scheduler.remove_op(&op_id);
-            if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                session.active_request = None;
-            }
-            return owned_decode_failure(
-                &state,
-                "scheduler_boundary_error",
-                format!("scheduler boundary rejected the committed span: {error:?}"),
-            );
-        }
-        match state.store.commit_serving_session_boundary(
-            &params.session_id,
-            absolute_serving_boundary(committed_before_request, committed),
-            now_ms(),
-        ) {
-            Ok(store::ServingBoundaryOutcome::Continue { .. }) => {}
-            Ok(store::ServingBoundaryOutcome::Terminated {
-                unload_artifact, ..
-            }) => {
-                // Publish this progress before the terminal so status and stream
-                // history agree on every token that crossed the boundary.
-                //
-                // Note what the prefix is, because it is easy to read the wrong
-                // way: the store did NOT commit it before revocation. The same
-                // transaction that observes `Revoked` also writes the new
-                // committed count and then returns `Terminated`
-                // (`store.rs:3905-3933`), so this prefix is the quantum
-                // generated after revocation and committed by the transaction
-                // that saw it. That is the documented boundary behaviour -- a
-                // revoke fences admission and truncates emission at the next
-                // COMMITTED boundary, not mid-quantum -- and publishing it is
-                // correct precisely because the store already counted it.
-                let progress = synapse_core::FrameEnvelope::new(
-                    &params.req_id,
-                    &params.session_id,
-                    synapse_core::StreamSequence(sequence),
-                    synapse_core::WorkerFrame::Progress {
-                        progress: synapse_core::ProgressFrame {
-                            committed_token_ids: token_ids.to_vec(),
-                            committed_token_count: committed,
-                            boundary: synapse_core::ProgressBoundary::Continuing,
-                        },
-                    },
-                );
-                if let Err(error) = sessions.streams.observe_frame(&progress) {
-                    return owned_decode_failure(
-                        &state,
-                        "worker_protocol_error",
-                        error.to_string(),
-                    );
-                }
-                frames.push(progress);
-                sequence = sequence.saturating_add(1);
-                let terminal = synapse_core::TerminalEnvelope {
-                    req_id: params.req_id.clone(),
-                    session_id: params.session_id.clone(),
-                    committed_token_count: committed,
-                    tokens_emitted: committed,
-                    identity: worker_stream.identity.clone(),
-                    terminal_state: synapse_core::TerminalState::ArtifactRevoked,
-                    decode_mode: synapse_core::DecodeMode::Serial,
-                    speculative_telemetry: None,
-                };
-                let frame = synapse_core::FrameEnvelope::new(
-                    &params.req_id,
-                    &params.session_id,
-                    synapse_core::StreamSequence(sequence),
-                    synapse_core::WorkerFrame::Error { terminal },
-                );
-                if let Err(error) = sessions.streams.observe_frame(&frame) {
-                    return owned_decode_failure(
-                        &state,
-                        "worker_protocol_error",
-                        error.to_string(),
-                    );
-                }
-                frames.push(frame);
-                sessions.scheduler.remove_op(&op_id);
-                let routing_session_id = sessions
-                    .sessions
-                    .get(&params.session_id)
-                    .expect("revoked session remains registered")
-                    .routing_session_id;
-                if let Some(router) = sessions.residency.as_mut() {
-                    let _ = router.close_session(routing_session_id);
-                }
-                let model_id = sessions
-                    .sessions
-                    .get(&params.session_id)
-                    .expect("revoked session remains registered")
-                    .model_id
-                    .clone();
-                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                    session.active_request = None;
-                    session.closed_at_ms = Some(now_ms());
-                }
-                if unload_artifact {
-                    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-                        dispatches.remove(&model_id);
-                    }
-                }
-                return result_outcome(json!({
-                    "session_id": params.session_id,
-                    "req_id": params.req_id,
-                    "frames": frames,
-                }));
-            }
-            Err(error) => {
-                sessions.scheduler.remove_op(&op_id);
-                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                    session.active_request = None;
-                }
-                return owned_decode_failure(
-                    &state,
-                    "store_failure",
-                    format!("could not commit the decode boundary: {error}"),
-                );
-            }
-        }
-        let frame = synapse_core::FrameEnvelope::new(
-            &params.req_id,
-            &params.session_id,
-            synapse_core::StreamSequence(sequence),
-            synapse_core::WorkerFrame::Progress {
-                progress: synapse_core::ProgressFrame {
-                    committed_token_ids: token_ids.to_vec(),
-                    committed_token_count: committed,
-                    boundary: synapse_core::ProgressBoundary::Continuing,
-                },
-            },
-        );
-        if let Err(error) = sessions.streams.observe_frame(&frame) {
-            return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
-        }
-        frames.push(frame);
-        sequence = sequence.saturating_add(1);
-
-        if let Some(outcome) = take_pending_session_abort(
-            &state,
-            &mut sessions,
-            &params.session_id,
-            &params.req_id,
-            committed,
-            &op_id,
-            &mut frames,
-        ) {
-            return outcome;
-        }
-        if index + 1 < chunks.len() {
-            sessions.scheduler.requeue_continuation(&op_id);
-            let selected = sessions.scheduler.arbitrate(now_ms());
-            if selected
-                .as_ref()
-                .and_then(|selected| selected.op_id.as_deref())
-                != Some(op_id.as_str())
-            {
-                sessions.scheduler.remove_op(&op_id);
-                if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-                    session.active_request = None;
-                }
-                return owned_decode_failure(
-                    &state,
-                    "decode_scheduler_busy",
-                    "a later decode quantum lost scheduler ownership",
-                );
-            }
-        }
-    }
-    // A zero-token worker result has no progress loop to detect an abort requested
-    // before completion, so apply abort handling at the already-committed boundary.
-    if let Some(outcome) = take_pending_session_abort(
-        &state,
-        &mut sessions,
-        &params.session_id,
-        &params.req_id,
-        committed,
-        &op_id,
-        &mut frames,
-    ) {
-        return outcome;
-    }
-    let terminal = synapse_core::TerminalEnvelope {
-        req_id: params.req_id.clone(),
-        session_id: params.session_id.clone(),
-        committed_token_count: committed,
-        tokens_emitted: committed,
-        identity: worker_stream.identity,
-        terminal_state: synapse_core::TerminalState::Completed,
-        decode_mode: synapse_core::DecodeMode::Serial,
-        speculative_telemetry: None,
-    };
-    let frame = synapse_core::FrameEnvelope::new(
-        &params.req_id,
-        &params.session_id,
-        synapse_core::StreamSequence(sequence),
-        synapse_core::WorkerFrame::Final { terminal },
-    );
-    if let Err(error) = sessions.streams.observe_frame(&frame) {
-        return owned_decode_failure(&state, "worker_protocol_error", error.to_string());
-    }
-    frames.push(frame);
-    sessions.scheduler.remove_op(&op_id);
-    if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-        session.active_request = None;
-    }
-    result_outcome(json!({
-        "session_id": params.session_id,
-        "req_id": params.req_id,
-        "frames": frames,
-    }))
-}
-
-async fn owned_decode_session_close(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeSessionCloseParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.close params: {error}"),
-            )
-        }
-    };
-    let mut sessions = match state.runtime.owned_decode_sessions.lock() {
-        Ok(sessions) => sessions,
-        Err(_) => {
-            return owned_decode_failure(
-                &state,
-                "owned_decode_unavailable",
-                "decode sessions are unavailable",
-            )
-        }
-    };
-    let Some(session) = sessions.sessions.get(&params.session_id).cloned() else {
-        return owned_decode_failure(
-            &state,
-            "unknown_session",
-            "the decode session does not exist",
-        );
-    };
-    if session.active_request.is_some() {
-        return owned_decode_failure(
-            &state,
-            synapse_core::OwnedDecodeRefusal::SessionStillInFlight.as_str(),
-            "an active decode must stop at a boundary before close",
-        );
-    }
-    let mut unload_artifact = false;
-    if !session.is_closed() {
-        match state
-            .store
-            .complete_serving_session(&params.session_id, now_ms())
-        {
-            Ok(completion) => unload_artifact = completion.unload_artifact,
-            Err(error) => {
-                return owned_decode_failure(
-                    &state,
-                    "store_failure",
-                    format!("could not complete serving session: {error}"),
-                );
-            }
-        }
-        if let Some(router) = sessions.residency.as_mut() {
-            if let Err(error) = router.close_session(session.routing_session_id) {
-                return owned_decode_failure(&state, "routing_error", error.to_string());
-            }
-        }
-        if let Some(session) = sessions.sessions.get_mut(&params.session_id) {
-            session.closed_at_ms = Some(now_ms());
-        }
-    }
-    drop(sessions);
-    if unload_artifact {
-        if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-            dispatches.remove(&session.model_id);
-        }
-    }
-    result_outcome(json!({
-        "session_id": params.session_id,
-        "closed": true,
-        "unload_artifact": unload_artifact,
-    }))
-}
-
-async fn owned_decode_disable(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeServingControlParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.disable params: {error}"),
-            )
-        }
-    };
-    match state
-        .store
-        .disable_serving_catalog(&params.catalog_fingerprint, &params.reason, now_ms())
-    {
-        Ok(outcome) => {
-            // The store's certification record is the authority for which model
-            // a catalog serves. The in-memory session map is not: closed
-            // sessions are evicted after a retention window, the map starts
-            // empty after a module restart, and certification can load a worker
-            // before any session is admitted.
-            if outcome.unload_artifact {
-                if let Some(model_id) = serving_catalog_model_id(&state, &outcome.approval) {
-                    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-                        dispatches.remove(&model_id);
-                    }
-                }
-            }
-            result_outcome(
-                serde_json::to_value(outcome).expect("serving disable outcome serializes"),
-            )
-        }
-        Err(error) => owned_decode_failure(
-            &state,
-            "store_failure",
-            format!("could not disable serving artifact: {error}"),
-        ),
-    }
-}
-
-async fn owned_decode_revoke(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: OwnedDecodeServingControlParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid owned_decode.revoke params: {error}"),
-            )
-        }
-    };
-    let outcome = match state.store.revoke_serving_catalog(
-        &params.catalog_fingerprint,
-        &params.reason,
-        now_ms(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return owned_decode_failure(
-                &state,
-                "store_failure",
-                format!("could not revoke serving artifact: {error}"),
-            )
-        }
-    };
-    if let Ok(mut sessions) = state.runtime.owned_decode_sessions.lock() {
-        let active_ops = sessions
-            .sessions
-            .iter()
-            .filter_map(|(session_id, session)| {
-                (session.catalog_fingerprint == params.catalog_fingerprint)
-                    .then_some((session_id.clone(), session.active_request.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (session_id, req_id) in active_ops {
-            if let Some(req_id) = req_id {
-                sessions
-                    .scheduler
-                    .request_revoke(&session_request_key(&session_id, &req_id), now_ms());
-            }
-        }
-    }
-    if outcome.unload_artifact {
-        if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-            dispatches.clear();
-        }
-    }
-    result_outcome(serde_json::to_value(outcome).expect("serving revoke outcome serializes"))
 }
 
 fn model_runtime_state_name(state: &ModelRuntimeState) -> &'static str {
@@ -5794,9 +3824,6 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             }
         }
     }
-    if let Ok(mut dispatches) = state.runtime.owned_decode_dispatches.lock() {
-        dispatches.remove(&params.model_id);
-    }
     if !catalog_lane {
         set_model_slot_state(
             &state.runtime,
@@ -5943,20 +3970,6 @@ fn begin_background_catalog_load(state: Arc<ModuleState>, model_id: String) {
     }
 }
 
-/// Timeout ceiling for control-path model-load waits. Matches the worker
-/// load timeout (DEFAULT_WORKER_LOAD_TIMEOUT_MS) as the ANE precedent.
-const MODEL_LOAD_CONTROL_TIMEOUT_MS: u64 = DEFAULT_WORKER_LOAD_TIMEOUT_MS;
-
-async fn ensure_model_loaded_for_control(
-    state: Arc<ModuleState>,
-    model_id: &str,
-    request_deadline_ms: Option<u64>,
-) -> Result<Arc<EmbeddingModel>, WireOperationError> {
-    let timeout_ms = request_deadline_ms.unwrap_or(MODEL_LOAD_CONTROL_TIMEOUT_MS);
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-    ensure_model_loaded_until(state, model_id, deadline, timeout_ms).await
-}
-
 async fn ensure_model_loaded_until(
     state: Arc<ModuleState>,
     model_id: &str,
@@ -6057,7 +4070,6 @@ async fn load_catalog_model_task(
     let microllm_max_tokens = state.runtime.microllm_max_tokens;
     let worker_load_timeout = state.runtime.worker_load_timeout;
     let worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
-    let owned_decode_q8 = Arc::clone(&state.runtime.owned_decode_q8);
     let worker_load_context = WorkerLoadContext {
         findings_changed: Some(state.runtime.findings_changed.clone()),
         ..WorkerLoadContext::new(worker_load_timeout, worker_forward_lines_per_sec)
@@ -6077,7 +4089,6 @@ async fn load_catalog_model_task(
             },
             model_cache,
             microllm_max_tokens,
-            owned_decode_q8,
             ane_supervisor?,
         )
     })
@@ -6312,7 +4323,6 @@ fn load_catalog_model_blocking(
     spec: CatalogAwareModelSpec,
     model_cache: Arc<ModelCache>,
     microllm_max_tokens: u32,
-    owned_decode_q8: Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
     ane_supervisor: Option<worker_host::ane_residency::AneResidencySupervisor>,
 ) -> Result<EmbeddingModel, WireOperationError> {
     let CatalogAwareModelSpec {
@@ -6369,16 +4379,6 @@ fn load_catalog_model_blocking(
             "tokenizer digest mismatch for '{}': expected {}, got {}",
             spec.model_id, spec.tokenizer_sanitized_digest, actual_tokenizer_digest
         )));
-    }
-    if spec.engine == "owned-metal-decode" {
-        let entry = owned_decode_catalog_entry(&spec)
-            .map_err(|error| artifact_invalid_error(error.as_str()))?;
-        ingest_owned_decode_q8(
-            &entry,
-            &model_path.path,
-            model_cache.root(),
-            &owned_decode_q8,
-        )?;
     }
     let runtime_config = model_runtime_config(
         &spec,
@@ -6446,16 +4446,6 @@ fn load_catalog_model_blocking(
                 Some(policy),
             )
         }
-        // An owned-decode catalog entry has platform-independent identity data.
-        // Resolve that identity on every target; the platform gate is a typed
-        // routing refusal so a substitutable request can select llama instead.
-        "owned-metal-decode" => (
-            EmbedBackend::OwnedDecode,
-            LoadedModel {
-                model_id: format!("owned-decode:{}", spec.model_id),
-            },
-            None,
-        ),
         LLAMA_ENGINE | "owned-vulkan" | "ane-direct-worker" => {
             let (backend, loaded) = load_worker_backend_blocking(
                 &spec,
@@ -6474,13 +4464,6 @@ fn load_catalog_model_blocking(
             )))
         }
     };
-    let certification_fingerprint = if spec.engine == "owned-metal-decode" {
-        owned_decode_catalog_entry(&spec)
-            .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint())
-            .map_err(|error| artifact_invalid_error(error.as_str()))?
-    } else {
-        spec.fingerprint.clone()
-    };
     Ok(EmbeddingModel {
         model_id: spec.model_id.clone(),
         task,
@@ -6488,59 +4471,9 @@ fn load_catalog_model_blocking(
         backend,
         tokenizer,
         fingerprint: spec.fingerprint.clone(),
-        certification_fingerprint,
         engine_identity: spec.engine_identity.clone(),
         owned_tokenizer_policy,
-        owned_decode_resolution_refusal: owned_decode_resolution_refusal(&spec),
     })
-}
-
-fn ingest_owned_decode_q8(
-    entry: &owned_decode_routing::CatalogEntry,
-    source_path: &Path,
-    cache_root: &Path,
-    registry: &Arc<Mutex<owned_decode_routing::q8ingest::Q8IngestRegistry>>,
-) -> Result<(), WireOperationError> {
-    use owned_decode_routing::{error::OwnedDecodeError, q8artifact::derive_and_cache_q8_blocks};
-
-    let Some(identity) = entry.q8.as_ref() else {
-        return Ok(());
-    };
-    let configured_cache_root = env::var_os("SYNAPSE_OWNED_DECODE_Q8_CACHE_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cache_root.to_path_buf());
-    let artifact = derive_and_cache_q8_blocks(
-        source_path,
-        &configured_cache_root,
-        entry.family,
-        &entry.artifact_source_digest,
-        &identity.quantizer_revision,
-    )
-    .map_err(|error| artifact_invalid_error(format!("derive Q8 artifact: {error:#}")))?;
-    let mut registry = registry.lock().map_err(|_| {
-        WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            "owned-decode Q8 ingest registry mutex was poisoned",
-        )
-    })?;
-    registry.register_expected_digest(
-        &entry.artifact_source_digest,
-        &identity.quantizer_revision,
-        &identity.derived_digest,
-    );
-    match registry.load_or_ingest(
-        &entry.artifact_source_digest,
-        &identity.quantizer_revision,
-        "q8_0",
-        &[],
-        |_| artifact.derived_digest,
-    ) {
-        Ok(_) | Err(OwnedDecodeError::ArtifactPoisoned | OwnedDecodeError::NotCertified) => Ok(()),
-        Err(error) => Err(artifact_invalid_error(format!(
-            "Q8 ingest failed: {}",
-            error.as_str()
-        ))),
-    }
 }
 
 /// Resolve a supervised worker binary when the spec and the engine-specific
@@ -6852,7 +4785,6 @@ fn unload_embedding_model_blocking(model: Arc<EmbeddingModel>) -> Result<(), Wir
         }
         #[cfg(unix)]
         EmbedBackend::DirectAne(engine) => engine.unload().map_err(ane_residency_error_to_wire),
-        EmbedBackend::OwnedDecode => Ok(()),
         EmbedBackend::Worker(engine) => {
             let mut engine = engine.lock().map_err(|_| {
                 WireOperationError::from_stable(
@@ -7923,47 +5855,15 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
             ),
         );
     }
-    if let Some(model_id) = params.model.as_deref() {
-        let owned_decode = state.runtime.catalog.lock().ok().is_some_and(|catalog| {
-            catalog.get(model_id).is_some_and(|slot| {
-                slot.spec.engine == "owned-metal-decode"
-                    || slot.spec.engine_identity.engine == "owned-metal-decode"
-            })
-        });
-        if owned_decode {
-            let job_id = state
-                .runtime
-                .activity_telemetry
-                .next_inline_job_id(state.module_generation);
-            return route_owned_decode_wire(
-                Arc::clone(&state),
-                &params,
-                model_id,
-                job_id,
-                Instant::now(),
-            )
-            .await;
-        }
-    }
-    match params.grammar.as_deref() {
-        None | Some("") => {}
-        Some(raw) if raw.trim().is_empty() => {}
-        Some(_) if !state.runtime.grammar_enabled => {
-            return channel_error(
-                "grammar_disabled",
-                "microllm.oneshot constrained decoding is disabled in module config",
-            );
-        }
-        Some(_) => {
-            // Constrained requests are owned-decode-only because the legacy
-            // llama worker must never receive raw grammar. Until this machine
-            // has a certified and explicitly enabled owned-decode grammar lane,
-            // fail closed with the routing contract's stable error ID.
-            return channel_error(
-                "grammar_disabled",
-                "no certified and enabled owned-decode grammar lane is available",
-            );
-        }
+    if params
+        .grammar
+        .as_deref()
+        .is_some_and(|grammar| !grammar.trim().is_empty())
+    {
+        return channel_error(
+            "grammar_disabled",
+            "microllm.oneshot constrained decoding is disabled in module config",
+        );
     }
 
     let request_deadline = request_started
@@ -8077,9 +5977,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         n_prompt: output.n_prompt,
         n_gen: output.n_gen,
         generated_token_ids: output.generated_token_ids,
-        runtime_config_digest: None,
-        derived_digest: None,
-        generation_id: None,
         real_token_counts: tokenized.real_token_counts,
         truncation_disclosures: tokenized.disclosures,
     };
@@ -8100,1420 +5997,6 @@ async fn microllm_oneshot(state: Arc<ModuleState>, params: Value) -> HandlerOutc
         &job_id,
         execution_lane(&model),
         completed_tokens,
-        started,
-    );
-    result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
-}
-
-#[derive(Clone)]
-struct PersistentDecodeCertification {
-    store: Arc<SynapseStore>,
-    match_inputs: OwnedDecodeMatchInputs,
-}
-
-impl owned_decode_routing::certification::CertificationAccess for PersistentDecodeCertification {
-    fn is_unconstrained_certified(
-        &self,
-        key: &owned_decode_routing::certification::UnconstrainedCertKey,
-    ) -> bool {
-        if key.machine_profile_hash != self.match_inputs.revisioned_machine_profile_hash {
-            return false;
-        }
-        let mut inputs = self.match_inputs.clone();
-        inputs.decode_fingerprint = key.decode_fingerprint.0.clone();
-        inputs.constraint_runtime_identities.clear();
-        self.store
-            .get_owned_decode_cert_row_matching(&inputs)
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
-    fn is_constrained_certified(
-        &self,
-        key: &owned_decode_routing::certification::ConstrainedCertKey,
-    ) -> bool {
-        if key.machine_profile_hash != self.match_inputs.revisioned_machine_profile_hash {
-            return false;
-        }
-        let mut inputs = self.match_inputs.clone();
-        inputs.decode_fingerprint = key.decode_fingerprint.0.clone();
-        inputs.constraint_runtime_identities = vec![key.constraint_runtime_identity.clone()];
-        self.store
-            .get_owned_decode_cert_row_matching(&inputs)
-            .ok()
-            .flatten()
-            .is_some()
-    }
-}
-
-// Staged certification evidence helper retained for migration/fleet reporting; remove this allow when that slice consumes it.
-#[allow(dead_code)]
-fn worker_path_certification(evidence: &Value) -> bool {
-    let battery = evidence["worker_path"]["fixture_battery"].as_str();
-    evidence["worker_path"]["transport"].as_str() == Some(worker_catalog_transport())
-        && evidence["worker_path"]["protocol"].as_str()
-            == Some(owned_decode_worker::identity::WORKER_PROTOCOL_ID)
-        && matches!(battery, Some("20x64-token-exact" | "20x64-structural-band"))
-}
-
-fn sidecar_hint_bank_source(
-    state: Arc<ModuleState>,
-    target_prompt: &str,
-    grammar: Option<&str>,
-    target_tokenizer: &SanitizedTokenizer,
-    compiled: Option<&owned_decode_grammar_scheduler::grammar_compile::CompiledConstraint>,
-    worker_constraint: Option<&owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-) -> Option<Box<dyn owned_decode_worker::worker::HintBankSource + Send>> {
-    let sidecar_spec = state.runtime.sidecar_spec.clone();
-    let compiled = compiled?;
-    let worker_constraint = worker_constraint?;
-    if !sidecar_spec.enabled
-        || sidecar_spec.strategy != synapse_core::SidecarStrategy::WholeObject
-        || compiled.constraint.canonical_schema_digest != worker_constraint.canonical_schema_digest
-    {
-        return None;
-    }
-    let grammar = grammar?.trim();
-    if grammar.is_empty() {
-        return None;
-    }
-    let schema = frozen_sidecar_object_schema(
-        compiled.automaton.schema(),
-        compiled.constraint.canonical_schema_digest.clone(),
-    );
-    let sidecar_prompt = format!(
-        "Return exactly one JSON object that satisfies this JSON Schema. Return no prose.\nSchema:\n{grammar}\n\nRequest:\n{target_prompt}"
-    );
-    let policy = owned_decode_sidecar::RenderPolicy::compact();
-    let render_policy_digest = policy.digest();
-    let schema_identity = compiled.constraint.canonical_schema_digest.clone();
-    let target_tokenizer = target_tokenizer.clone();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let _sidecar_job = tokio::spawn(async move {
-        let Ok(model) = ensure_model_loaded_for_control(
-            Arc::clone(&state),
-            &sidecar_spec.model_id,
-            Some(deadline_ms),
-        )
-        .await
-        else {
-            return;
-        };
-        if model.task != ModelTask::Generate {
-            return;
-        }
-        let Ok(tokenized) = model.tokenizer.tokenize_batch([sidecar_prompt.as_str()]) else {
-            return;
-        };
-        let Some(prompt) = tokenized.batch.items.first().cloned() else {
-            return;
-        };
-        let Ok(output) = execute_generate(
-            &state.runtime,
-            &model,
-            GenerateRequest {
-                prompt,
-                max_tokens: sidecar_spec.max_new_tokens,
-                grammar: None,
-            },
-            Some(tokio::time::Instant::now() + Duration::from_millis(deadline_ms)),
-            None,
-        )
-        .await
-        else {
-            return;
-        };
-        // The frozen whole-object result contract has no scalar-root rendering
-        // variant. Such a valid grammar still launches the configured sidecar,
-        // but its completion cannot publish a bank until that contract grows a
-        // matching root representation.
-        let Some(schema) = schema else {
-            return;
-        };
-        let Ok(prepared) =
-            owned_decode_sidecar::prepare_whole_object(&schema, output.text.as_bytes(), &policy)
-        else {
-            return;
-        };
-        let Ok(bank) = owned_decode_sidecar::build_default_hint_bank(
-            &target_tokenizer,
-            schema_identity,
-            render_policy_digest,
-            &prepared,
-            owned_decode_sidecar::SidecarWorkBounds::default(),
-            now_ms(),
-        ) else {
-            return;
-        };
-        let _ = sender.try_send(bank);
-    });
-    Some(Box::new(
-        owned_decode_worker::worker::SidecarHintBankPickup::pending(receiver),
-    ))
-}
-
-fn frozen_sidecar_object_schema(
-    schema: &owned_decode_grammar_scheduler::grammar_schema::Schema,
-    schema_identity: String,
-) -> Option<owned_decode_sidecar::FrozenObjectSchema> {
-    let owned_decode_sidecar::FrozenSchema::Object { properties } =
-        frozen_sidecar_schema_node(schema, 0)?
-    else {
-        return None;
-    };
-    Some(owned_decode_sidecar::FrozenObjectSchema {
-        schema_identity,
-        properties,
-    })
-}
-
-fn frozen_sidecar_schema_node(
-    schema: &owned_decode_grammar_scheduler::grammar_schema::Schema,
-    index: usize,
-) -> Option<owned_decode_sidecar::FrozenSchema> {
-    use owned_decode_grammar_scheduler::grammar_schema::{NodeKind, SchemaType};
-    use owned_decode_sidecar::{FrozenProperty, FrozenScalarType};
-
-    let node = schema.node(index);
-    match (&node.ty, &node.kind) {
-        (
-            SchemaType::Object,
-            NodeKind::Object {
-                properties,
-                required,
-            },
-        ) => Some(owned_decode_sidecar::FrozenSchema::Object {
-            properties: properties
-                .iter()
-                .map(|(name, child)| {
-                    Some(FrozenProperty {
-                        name: name.clone(),
-                        required: required.contains(name),
-                        schema: frozen_sidecar_schema_node(schema, *child)?,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-        }),
-        (SchemaType::Array, NodeKind::Array { items }) => {
-            Some(owned_decode_sidecar::FrozenSchema::Array {
-                items: Box::new(frozen_sidecar_schema_node(schema, *items)?),
-            })
-        }
-        (schema_type, NodeKind::Scalar { enumeration }) => {
-            let scalar_type = match schema_type {
-                SchemaType::String => FrozenScalarType::String,
-                SchemaType::Number => FrozenScalarType::Number,
-                SchemaType::Integer => FrozenScalarType::Integer,
-                SchemaType::Boolean => FrozenScalarType::Boolean,
-                SchemaType::Null => FrozenScalarType::Null,
-                SchemaType::Object | SchemaType::Array => return None,
-            };
-            let enumeration = match enumeration {
-                Some(values) => Some(
-                    values
-                        .iter()
-                        .map(|value| serde_json::from_str(&value.json_text()).ok())
-                        .collect::<Option<Vec<Value>>>()?,
-                ),
-                None => None,
-            };
-            Some(owned_decode_sidecar::FrozenSchema::Scalar {
-                scalar_type,
-                enumeration,
-            })
-        }
-        _ => None,
-    }
-}
-
-struct WireDecodeDispatch {
-    owned: Option<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>>,
-    prompt: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    /// Present only for an enabled request whose compiled constraint and
-    /// sidecar schema share the canonical identity.
-    sidecar_hint_bank_source: Option<Box<dyn owned_decode_worker::worker::HintBankSource + Send>>,
-    deadline_ms: u64,
-    llama: Option<Arc<EmbeddingModel>>,
-    llama_output: Option<GenerateOutput>,
-}
-
-impl owned_decode_routing::DecodeDispatch for WireDecodeDispatch {
-    fn dispatch(
-        &mut self,
-        command: &owned_decode_routing::DispatchedCommand,
-    ) -> Result<owned_decode_routing::ExecutionSuccess, owned_decode_routing::error::OwnedDecodeError>
-    {
-        use owned_decode_routing::lane::LaneKind;
-        use owned_decode_routing::provenance::FinishReason;
-
-        if command.lane == LaneKind::OwnedDecode {
-            let mut dispatch = self
-                .owned
-                .as_ref()
-                .ok_or(owned_decode_routing::error::OwnedDecodeError::Unavailable)?
-                .lock()
-                .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
-            dispatch.set_request(
-                self.prompt.clone(),
-                self.constraint.clone(),
-                self.deadline_ms,
-            );
-            // Request-level routing installs the request-scoped source only
-            // after successful compilation and identity validation. Polling the
-            // source remains non-blocking while a sidecar job is pending.
-            dispatch.set_hint_bank_source(
-                self.sidecar_hint_bank_source
-                    .take()
-                    .unwrap_or_else(|| Box::new(owned_decode_worker::worker::NoHintBankSource)),
-            );
-            return owned_decode_routing::DecodeDispatch::dispatch(&mut *dispatch, command);
-        }
-
-        let model = self
-            .llama
-            .as_ref()
-            .ok_or(owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
-        let EmbedBackend::Worker(engine) = &model.backend else {
-            return Err(owned_decode_routing::error::OwnedDecodeError::Unsupported);
-        };
-        let engine = engine
-            .lock()
-            .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
-        let output = engine
-            .generate(
-                &model.loaded_model,
-                GenerateRequest {
-                    prompt: self.prompt.clone(),
-                    max_tokens: command.max_tokens,
-                    grammar: None,
-                },
-            )
-            .map_err(|_| owned_decode_routing::error::OwnedDecodeError::Unavailable)?;
-        let (finish_reason, lane_finish_reason) = match output.finish_reason.as_str() {
-            "stop" | "stop_token" => (FinishReason::StopToken, None),
-            "length" | "max_tokens" => (FinishReason::MaxTokens, None),
-            "cancelled" => (FinishReason::Cancelled, None),
-            other => (FinishReason::StopToken, Some(other.to_string())),
-        };
-        let success = owned_decode_routing::ExecutionSuccess {
-            generated_token_ids: output.generated_token_ids.clone(),
-            finish_reason,
-            lane_finish_reason,
-            worker_generation: 0,
-            last_completed_quantum_sequence: 0,
-            crash_retry_count: 0,
-            failure_classifications: Vec::new(),
-        };
-        self.llama_output = Some(output);
-        Ok(success)
-    }
-}
-
-/// Classify an owned-decode resolution refusal without discarding the catalog
-/// identity. Metal execution is unavailable off macOS, but its catalog row and
-/// fingerprints remain valid routing data everywhere.
-fn owned_decode_resolution_refusal_for_platform(
-    engine: &str,
-    platform_supports_owned_decode: bool,
-) -> Option<owned_decode_routing::error::OwnedDecodeError> {
-    (engine == "owned-metal-decode" && !platform_supports_owned_decode)
-        .then_some(owned_decode_routing::error::OwnedDecodeError::Unsupported)
-}
-
-fn owned_decode_resolution_refusal(
-    spec: &StoredModelConfig,
-) -> Option<owned_decode_routing::error::OwnedDecodeError> {
-    owned_decode_resolution_refusal_for_platform(&spec.engine, cfg!(target_os = "macos"))
-}
-
-fn owned_decode_processing_fingerprint(
-    entry: &owned_decode_routing::CatalogEntry,
-) -> Result<Fingerprint, owned_decode_routing::error::OwnedDecodeError> {
-    use owned_decode_routing::identity::{PrefillEngineClass, ProcessingIdentityInputs};
-
-    let decode_fingerprint = entry.decode_identity_inputs().decode_fingerprint()?;
-    let families = owned_decode_routing::family::FamilyRegistry::production();
-    let registration = families.get(entry.family)?;
-    Ok(ProcessingIdentityInputs {
-        decode_fingerprint,
-        prefill_engine_class: PrefillEngineClass::Gpu,
-        tokenizer_sanitized_digest: registration.tokenizer_sanitized_digest.clone(),
-        prompt_template_revision: registration.prompt_template_revision.clone(),
-        special_token_policy_revision: registration.special_token_policy_revision.clone(),
-        stop_token_policy_revision: registration.stop_token_policy_revision.clone(),
-        detokenizer_revision: registration.detokenizer_revision.clone(),
-    }
-    .processing_fingerprint())
-}
-
-fn owned_decode_runtime_identity(
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    decode_chain_k: u32,
-) -> (String, u32) {
-    use owned_decode_routing::identity::RuntimeConfigManifest;
-
-    let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(include_str!(
-        "../owned-decode-manifests/decode-sched-manifest-v1.json"
-    ))
-    .expect("checked-in decode scheduler manifest parses");
-    let flag = |name: &str| spec.engine_identity.build_flags.get(name);
-    let manifest = RuntimeConfigManifest {
-        worker_revision: spec.engine_identity.version.clone(),
-        protocol_revision: owned_decode_worker::identity::WORKER_PROTOCOL_ID.to_string(),
-        metallib_revision: entry.metallib_revision.clone(),
-        chain_k: decode_chain_k,
-        batched_verification: flag("batched_verification").is_some_and(|value| value == "true"),
-        resident_limit: 1,
-        attention_kv_reservation_units: spec
-            .owned_attention_units
-            .unwrap_or(entry.max_context_tokens as usize)
-            as u64,
-        lfm2_conv_cache_reservation_bytes: flag("lfm2_conv_cache_reservation_bytes")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
-        context_manifest_revision: "decode-context-buckets-v1".to_string(),
-        crash_policy_revision: "two-strike-crash-budget-v1".to_string(),
-        quarantine_duration_ms: owned_decode_worker::budget::BudgetPolicy::default()
-            .quarantine_duration_ms,
-        scheduler: scheduler.runtime.clone(),
-    };
-    let manifest_digest = manifest.digest();
-    let runtime_config_digest = if entry.family == owned_decode_routing::family::Family::Qwen3_0_6b
-        && entry.weight_quant == owned_decode_routing::identity::WeightQuant::F16
-    {
-        // Reuse the existing runtime manifest digest for the Qwen3 0.6B F16
-        // lane so its established runtime identity does not change. Other
-        // family/quant combinations include those values in the digest so
-        // every expanded lane has a distinct runtime identity.
-        manifest_digest
-    } else {
-        sha256_hex(
-            &serde_json::to_vec(&json!({
-                "runtime_manifest_digest": manifest_digest,
-                "family": entry.family.as_str(),
-                "activation_dtype": entry.activation_dtype.as_str(),
-                "weight_quant": entry.weight_quant.as_str(),
-            }))
-            .expect("owned-decode lane runtime identity serializes"),
-        )
-    };
-    (runtime_config_digest, scheduler.runtime.production_n)
-}
-
-fn owned_decode_worker_runtime_dir(spec: &StoredModelConfig) -> PathBuf {
-    spec.worker_runtime_dir
-        .clone()
-        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_RUNTIME_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| env::temp_dir().join("synapse-owned-decode-workers"))
-}
-
-fn owned_decode_budget_store_path(spec: &StoredModelConfig) -> PathBuf {
-    owned_decode_worker_runtime_dir(spec).join(format!("{}-crash-budget.json", spec.model_id))
-}
-
-fn owned_decode_quarantined(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    decode_fingerprint: &Fingerprint,
-    runtime_config_digest: &str,
-) -> bool {
-    use owned_decode_worker::budget::{CrashBudget as OwnedCrashBudget, FileBudgetStore};
-    use owned_decode_worker::identity::QuarantineKey;
-
-    let Ok(store) = FileBudgetStore::open(owned_decode_budget_store_path(spec)) else {
-        return true;
-    };
-    let budget = OwnedCrashBudget::new(store, owned_decode_worker::budget::BudgetPolicy::default());
-    let key = QuarantineKey::new(
-        &state.machine_profile_hash,
-        &decode_fingerprint.0,
-        runtime_config_digest,
-    );
-    // The clock is load-bearing: `is_quarantined` answers `now < until`, so a
-    // zero here makes any positive expiry true forever and the routing gate can
-    // never clear, while the dispatch path in worker_host asks the same
-    // predicate with a real clock and sees the quarantine expire. Two call
-    // sites of one predicate must not disagree about time.
-    budget.is_quarantined(&key, now_ms())
-}
-
-#[cfg(target_os = "macos")]
-fn owned_decode_vocabulary_digest(
-    tokenizer: &SanitizedTokenizer,
-) -> Result<String, WireOperationError> {
-    use synapse_engine_owned::owned_decode_engine::TokenVocabulary;
-
-    let vocabulary = TokenVocabulary::from_tokenizer(tokenizer.tokenizer())
-        .map_err(|error| artifact_invalid_error(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    for token_id in 0..vocabulary.len() {
-        if let Some(piece) = vocabulary.token_piece(token_id as u32) {
-            hasher.update(piece);
-        }
-        hasher.update([0]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// The owned decode engines are Metal-only; on other platforms the owned lane
-/// refuses before any grammar compilation, so this path is unreachable in
-/// practice — it exists so the wire handler compiles on every target and fails
-/// closed if ever reached.
-#[cfg(not(target_os = "macos"))]
-fn owned_decode_vocabulary_digest(
-    _tokenizer: &SanitizedTokenizer,
-) -> Result<String, WireOperationError> {
-    Err(WireOperationError::from_stable(
-        StableError::artifact_invalid(),
-        "owned decode is unsupported on this platform (owned_decode_unsupported)",
-    ))
-}
-
-fn worker_constraint(
-    compiled: &owned_decode_grammar_scheduler::TokenIdJsonConstraintV1,
-) -> owned_decode_worker::protocol::TokenIdJsonConstraint {
-    owned_decode_worker::protocol::TokenIdJsonConstraint {
-        encoding_id: compiled.representation_revision.clone(),
-        constraint_runtime_identity: compiled.constraint_runtime_identity.digest(),
-        constraint_fingerprint: compiled.constraint_fingerprint.0.clone(),
-        grammar_subset_revision: compiled
-            .constraint_runtime_identity
-            .grammar_subset_revision
-            .clone(),
-        grammar_compiler_revision: compiled
-            .constraint_runtime_identity
-            .grammar_compiler_revision
-            .clone(),
-        tokenizer_vocabulary_digest: compiled.tokenizer_vocabulary_digest.clone(),
-        limits_manifest_id: compiled.limits_manifest_id.clone(),
-        worker_constraint_runtime_revision: compiled
-            .constraint_runtime_identity
-            .worker_constraint_runtime_revision
-            .clone(),
-        canonical_schema_digest: compiled.canonical_schema_digest.clone(),
-        initial_state_encoding: compiled.initial_state_encoding.clone(),
-        initial_state_digest: compiled.initial_state_digest.clone(),
-        compiled_automaton_digest: compiled.compiled_automaton_digest.clone(),
-        automaton_bytes: compiled.automaton_bytes.clone(),
-    }
-}
-
-/// A worker-setup outcome before `DecodeDispatch::dispatch` runs. Typed
-/// owned-lane refusals must return through `OwnedDecodeRouter`, while unrelated
-/// setup faults keep their existing wire error.
-#[derive(Debug)]
-enum OwnedDecodeDispatchPreparationError {
-    Refused(owned_decode_routing::error::OwnedDecodeError),
-    Wire(WireOperationError),
-}
-
-fn build_supervised_decode_dispatch_for_chain_k(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    prompt_ids: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-    decode_chain_k: u32,
-) -> Result<worker_host::SupervisedDecodeDispatch, OwnedDecodeDispatchPreparationError> {
-    use owned_decode_routing::error::OwnedDecodeError;
-    use owned_decode_worker::{
-        budget::BudgetPolicy,
-        identity::QuarantineKey,
-        protocol::{GenerateStart, Sampling},
-        supervisor::TerminalControl,
-        validation::WorkerStartContext,
-    };
-    use worker_host::{OwnedDecodeWorkerFactory, SupervisedDecodeDispatch, WorkerHostConfig};
-
-    // The supervised owned worker is a Metal executable. Classify a non-macOS
-    // setup as an owned-lane refusal before dispatch so selection can choose the
-    // configured llama lane instead of treating its startup failure as terminal.
-    if !cfg!(target_os = "macos") {
-        return Err(OwnedDecodeDispatchPreparationError::Refused(
-            OwnedDecodeError::Unsupported,
-        ));
-    }
-
-    let worker_bin = spec
-        .worker_bin
-        .clone()
-        .or_else(|| env::var_os("SYNAPSE_OWNED_DECODE_WORKER_BIN").map(PathBuf::from))
-        .ok_or(OwnedDecodeDispatchPreparationError::Refused(
-            OwnedDecodeError::Unavailable,
-        ))?;
-    if !worker_bin.is_file() {
-        return Err(OwnedDecodeDispatchPreparationError::Refused(
-            OwnedDecodeError::Unavailable,
-        ));
-    }
-    let model_path = locator_path(&spec.model_locator, &state.model_cache)
-        .map_err(OwnedDecodeDispatchPreparationError::Wire)?;
-    let tokenizer_path = locator_path(&spec.tokenizer_locator, &state.model_cache)
-        .map_err(OwnedDecodeDispatchPreparationError::Wire)?;
-    let mut runtime_config = model_runtime_config(
-        spec,
-        &model_path.path,
-        state.model_cache.root(),
-        state.runtime.microllm_max_tokens,
-    );
-    let decode_fingerprint = entry
-        .decode_identity_inputs()
-        .decode_fingerprint()
-        .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
-    let processing_fingerprint = owned_decode_processing_fingerprint(entry)
-        .map_err(OwnedDecodeDispatchPreparationError::Refused)?;
-    let (runtime_config_digest, production_n) =
-        owned_decode_runtime_identity(spec, entry, decode_chain_k);
-    for (key, value) in [
-        ("family", entry.family.as_str().to_string()),
-        ("weight_quant", entry.weight_quant.as_str().to_string()),
-        ("context_bucket", entry.max_context_tokens.to_string()),
-        ("production_n", production_n.to_string()),
-        ("decode_chain_k", decode_chain_k.to_string()),
-        (
-            "tokenizer_path",
-            tokenizer_path.path.to_string_lossy().to_string(),
-        ),
-        ("decode_fingerprint", decode_fingerprint.0.clone()),
-        ("processing_fingerprint", processing_fingerprint.0),
-        ("runtime_config_digest", runtime_config_digest.clone()),
-    ] {
-        runtime_config.values.insert(key.to_string(), value);
-    }
-    let artifact = ValidatedArtifact {
-        digest: spec
-            .artifact_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&spec.artifact_digest)
-            .to_string(),
-        format: spec.artifact_format.clone(),
-    };
-    let runtime_dir = owned_decode_worker_runtime_dir(spec);
-    let mut host_config = WorkerHostConfig::new(worker_bin, runtime_dir);
-    host_config.worker_id = format!("synapse-owned-decode-{}", spec.model_id);
-    host_config.model_id = Some(spec.model_id.clone());
-    host_config.worker_forward_lines_per_sec = state.runtime.log.worker_forward_lines_per_sec;
-
-    host_config.request_timeout = Duration::from_millis(deadline_ms.max(1));
-    let factory = OwnedDecodeWorkerFactory::new(host_config, artifact, runtime_config);
-    let key = QuarantineKey::new(
-        &state.machine_profile_hash,
-        &decode_fingerprint.0,
-        &runtime_config_digest,
-    );
-    let start = GenerateStart {
-        generation_id: String::new(),
-        loaded_model_ref: String::new(),
-        decode_fingerprint: decode_fingerprint.0.clone(),
-        runtime_config_digest: runtime_config_digest.clone(),
-        prompt_ids,
-        stop_ids: Vec::new(),
-        max_tokens: 1,
-        sampling: Sampling::greedy_top1(),
-        constraint: constraint.clone(),
-    };
-    let context = WorkerStartContext {
-        loaded_model_ref: String::new(),
-        decode_fingerprint: decode_fingerprint.0,
-        runtime_config_digest,
-        expected_constraint: constraint,
-    };
-    SupervisedDecodeDispatch::new(
-        factory,
-        owned_decode_budget_store_path(spec),
-        BudgetPolicy::default(),
-        production_n,
-        key,
-        start,
-        context,
-        TerminalControl {
-            deadline_at: Some(deadline_ms),
-            cancel_at: None,
-        },
-    )
-    .map_err(|_| OwnedDecodeDispatchPreparationError::Refused(OwnedDecodeError::Unavailable))
-}
-
-fn build_supervised_decode_dispatch(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    prompt_ids: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-) -> Result<worker_host::SupervisedDecodeDispatch, OwnedDecodeDispatchPreparationError> {
-    build_supervised_decode_dispatch_for_chain_k(
-        state,
-        spec,
-        entry,
-        prompt_ids,
-        constraint,
-        deadline_ms,
-        state.runtime.decode_chain_k,
-    )
-}
-
-fn cached_supervised_decode_dispatch(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    prompt: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-) -> Result<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>, OwnedDecodeDispatchPreparationError>
-{
-    cached_supervised_decode_dispatch_for_chain_k(
-        state,
-        spec,
-        entry,
-        prompt,
-        constraint,
-        deadline_ms,
-        state.runtime.decode_chain_k,
-    )
-}
-
-fn cached_supervised_decode_dispatch_for_chain_k(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    prompt: Vec<u32>,
-    constraint: Option<owned_decode_worker::protocol::TokenIdJsonConstraint>,
-    deadline_ms: u64,
-    decode_chain_k: u32,
-) -> Result<Arc<Mutex<worker_host::SupervisedDecodeDispatch>>, OwnedDecodeDispatchPreparationError>
-{
-    // The shared cache represents the configured production request shape, so
-    // the worker loaded by certification is also available to the first served
-    // request. The K=1 comparison shape for a configured K>1 probe is private:
-    // it has a distinct runtime identity and must not replace production cache.
-    let cache_configured_shape = decode_chain_k == state.runtime.decode_chain_k;
-    if cache_configured_shape {
-        if let Some(dispatch) = state
-            .runtime
-            .owned_decode_dispatches
-            .lock()
-            .map_err(|_| {
-                OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    "owned-decode dispatch cache is unavailable",
-                ))
-            })?
-            .get(&spec.model_id)
-            .cloned()
-        {
-            return Ok(dispatch);
-        }
-    }
-    let created = if cache_configured_shape {
-        build_supervised_decode_dispatch(state, spec, entry, prompt, constraint, deadline_ms)?
-    } else {
-        build_supervised_decode_dispatch_for_chain_k(
-            state,
-            spec,
-            entry,
-            prompt,
-            constraint,
-            deadline_ms,
-            decode_chain_k,
-        )?
-    };
-    let created = Arc::new(Mutex::new(created));
-    if !cache_configured_shape {
-        return Ok(created);
-    }
-    let mut dispatches = state.runtime.owned_decode_dispatches.lock().map_err(|_| {
-        OwnedDecodeDispatchPreparationError::Wire(WireOperationError::from_stable(
-            StableError::engine_crashed(Some(100)),
-            "owned-decode dispatch cache is unavailable",
-        ))
-    })?;
-    Ok(dispatches
-        .entry(spec.model_id.clone())
-        .or_insert_with(|| created.clone())
-        .clone())
-}
-
-struct OwnedDecodeEnvironmentInputs {
-    processing_fingerprint: Fingerprint,
-    runtime_config_digest: String,
-    constraint_runtime_identity: Option<String>,
-    llama: Option<owned_decode_routing::lane::LlamaLane>,
-    equivalent_fingerprints: BTreeSet<Fingerprint>,
-}
-
-fn owned_decode_environment(
-    state: &ModuleState,
-    spec: &StoredModelConfig,
-    entry: &owned_decode_routing::CatalogEntry,
-    decode_fingerprint: &Fingerprint,
-    inputs: OwnedDecodeEnvironmentInputs,
-) -> owned_decode_routing::RoutingEnvironment {
-    use owned_decode_routing::certification::{
-        CertificationAccess, ConstrainedCertKey, UnconstrainedCertKey,
-    };
-
-    let OwnedDecodeEnvironmentInputs {
-        processing_fingerprint,
-        runtime_config_digest,
-        constraint_runtime_identity,
-        llama,
-        equivalent_fingerprints,
-    } = inputs;
-    let constraint_runtime_identities = constraint_runtime_identity
-        .clone()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let worker_path_evidence = owned_decode_worker_path_identity();
-    let match_inputs = OwnedDecodeMatchInputs {
-        revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
-        profile_activation_epoch: state.profile_activation_epoch,
-        model_id: entry.entry_id.clone(),
-        decode_fingerprint: decode_fingerprint.0.clone(),
-        processing_fingerprint: processing_fingerprint.0,
-        runtime_config_digest,
-        constraint_runtime_identities,
-        worker_path_evidence,
-        evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
-        g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
-    };
-    let certification = PersistentDecodeCertification {
-        store: Arc::clone(&state.store),
-        match_inputs: match_inputs.clone(),
-    };
-    let unconstrained_certified = CertificationAccess::is_unconstrained_certified(
-        &certification,
-        &UnconstrainedCertKey {
-            machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
-            decode_fingerprint: decode_fingerprint.clone(),
-        },
-    );
-    let constrained_certified = constraint_runtime_identity.as_ref().is_none_or(|identity| {
-        CertificationAccess::is_constrained_certified(
-            &certification,
-            &ConstrainedCertKey {
-                machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
-                decode_fingerprint: decode_fingerprint.clone(),
-                constraint_runtime_identity: identity.clone(),
-            },
-        )
-    });
-    let quarantined = owned_decode_quarantined(
-        state,
-        spec,
-        decode_fingerprint,
-        &match_inputs.runtime_config_digest,
-    );
-    let artifacts_trusted = if entry.weight_quant.is_q8() {
-        entry.q8.as_ref().is_some_and(|q8| {
-            state
-                .runtime
-                .owned_decode_q8
-                .lock()
-                .ok()
-                .is_some_and(|registry| {
-                    registry
-                        .entry(&entry.artifact_source_digest, &q8.quantizer_revision)
-                        .is_some_and(|artifact| {
-                            artifact.trust_state
-                                == owned_decode_routing::q8ingest::TrustState::Trusted
-                        })
-                })
-        })
-    } else {
-        true
-    };
-    let scheduler: owned_decode_contracts::SchedulerManifest = serde_json::from_str(include_str!(
-        "../owned-decode-manifests/decode-sched-manifest-v1.json"
-    ))
-    .expect("checked-in scheduler manifest parses");
-    let scheduler_status = owned_decode_certification::ingest_scheduler_evidence(&scheduler);
-    let scheduler_evidence_committed =
-        owned_decode_certification::scheduler_evidence_committed(&scheduler_status);
-    let wire_bindings = owned_decode_contracts::WireErrorBindingsManifest {
-        manifest_revision: "owned-decode-wire-error-bindings-v1".to_string(),
-        schema_revision: "owned-decode-contracts-v1".to_string(),
-        request_contract_revision: "wire-contract-v1".to_string(),
-        deadline_error_id: "deadline_exceeded".to_string(),
-        cancellation_error_id: "cancelled".to_string(),
-        wire_changelog: Vec::new(),
-    };
-    let admission_evaluation = state
-        .store
-        .owned_decode_admission_evaluation(&match_inputs)
-        .unwrap_or(OwnedDecodeAdmissionEvaluation::Refused {
-            approval: Box::new(None),
-            refusal: OwnedDecodeAdmissionRefusal::NotCertified,
-        });
-    let admission = admission_evaluation.admission().cloned();
-    let approval = admission_evaluation.approval();
-    let approval_grammar_enabled = approval.is_some_and(|approval| approval.grammar_enabled);
-    let disabled_reason = match admission_evaluation.refusal() {
-        Some(OwnedDecodeAdmissionRefusal::ApprovalDisabled { disabled_reason }) => {
-            Some(disabled_reason.clone())
-        }
-        _ => None,
-    };
-    let serving_inputs = owned_decode_routing::lane::ServingPredicateInputs {
-        approval_present: approval.is_some(),
-        approval_enabled: approval.is_some_and(|approval| approval.enabled),
-        approval_identity_matches: approval.is_some_and(|approval| {
-            approval.model_id == match_inputs.model_id
-                && approval.decode_fingerprint == match_inputs.decode_fingerprint
-        }),
-        current_profile_matches: admission.is_some(),
-        current_epoch_valid: state.profile_activation_epoch > 0,
-        certification_matches: admission.is_some()
-            && unconstrained_certified
-            && constrained_certified,
-        evidence_revisions_compatible: admission.is_some(),
-        gates_complete: admission.is_some(),
-        processing_fingerprint_matches: admission.is_some(),
-        runtime_config_digest_matches: admission.is_some(),
-        worker_path_matches: admission.is_some(),
-        constrained_identities_match: admission.is_some(),
-        artifacts_trusted,
-        // Subsumed rather than unchecked, which is not obvious from the
-        // literal. This arm's contract is "the exact runtime and processing
-        // identities are installed", and `admission` is the fenced
-        // certification match, which compares processing_fingerprint,
-        // runtime_config_digest, constraint_runtime_identities and
-        // worker_path_evidence against the stored row before it resolves
-        // (`store.rs:7636-7648`). A row that disagrees on any of them does
-        // not match, so `admission.is_some()` -- already required by the
-        // four arms above -- is the identity check. Passing `admission`
-        // here too would add a fifth reading of one fact rather than a
-        // check; the honest value is the constant, with the reason stated.
-        identities_installed: true,
-        quarantined,
-        wire_bindings_literal: owned_decode_certification::wire_bindings_are_literal(
-            &wire_bindings,
-        ),
-        scheduler_evidence_committed,
-    };
-    let serving = owned_decode_routing::lane::serving_predicate(&serving_inputs);
-    let mut environment = owned_decode_routing::RoutingEnvironment::with_serving_evaluated(
-        state.revisioned_machine_profile_hash.clone(),
-        state.runtime.grammar_enabled,
-        approval_grammar_enabled,
-        serving,
-        quarantined,
-        llama,
-        equivalent_fingerprints,
-        constraint_runtime_identity,
-    );
-    if let Some(disabled_reason) = disabled_reason {
-        environment = environment.with_serving_refusal_message(disabled_reason);
-    }
-    if let Some(admission) = admission {
-        let boundary_reader: Arc<dyn owned_decode_routing::lane::AdmissionBoundaryReader> =
-            state.store.clone();
-        environment = environment.with_admission_boundary(
-            owned_decode_routing::lane::AdmissionBoundarySnapshot {
-                profile_activation_epoch: admission.profile_activation_epoch,
-                model_id: admission.approval.model_id,
-                decode_fingerprint: admission.approval.decode_fingerprint,
-                approval_semantic_digest: admission.approval.semantic_digest,
-                approval_generation: admission.approval.generation,
-            },
-            boundary_reader,
-        );
-    }
-    environment
-}
-
-fn owned_decode_worker_path_identity() -> Value {
-    json!({
-        "transport": worker_catalog_transport(),
-        "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
-        "fixture_battery": "20x64-structural-band",
-    })
-}
-
-async fn route_owned_decode_wire(
-    state: Arc<ModuleState>,
-    params: &MicroLlmOneshotParams,
-    model_id: &str,
-    job_id: String,
-    started: Instant,
-) -> HandlerOutcome {
-    use owned_decode_routing::lane::{LaneKind, LlamaLane};
-    use owned_decode_routing::request::{OneshotRequest, SamplingMode};
-
-    let spec = match state
-        .runtime
-        .catalog
-        .lock()
-        .ok()
-        .and_then(|catalog| catalog.get(model_id).map(|slot| slot.spec.clone()))
-    {
-        Some(spec) => spec,
-        None => return channel_error("invalid_request", format!("unknown model '{model_id}'")),
-    };
-    let entry = match owned_decode_catalog_entry(&spec) {
-        Ok(entry) => entry,
-        Err(error) => {
-            return channel_error(
-                error.as_str(),
-                format!("owned-decode catalog entry '{model_id}' is unsupported"),
-            )
-        }
-    };
-    let owned_model =
-        match ensure_model_loaded_for_control(Arc::clone(&state), model_id, params.deadline_ms)
-            .await
-        {
-            Ok(model) => model,
-            Err(error) => return result_outcome(error_payload(&state, error)),
-        };
-    let resolution_owned_refusal = owned_model.owned_decode_resolution_refusal;
-    if params
-        .required_epoch
-        .is_some_and(|required| required > FROZEN_TABLE_EPOCH)
-    {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::migration_required(),
-                "requested alias table epoch is newer than the module table",
-            ),
-        ));
-    }
-    let tokenizer_path = match locator_path(&spec.tokenizer_locator, &state.model_cache) {
-        Ok(path) => path,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let tokenizer = match SanitizedTokenizer::from_file(
-        &tokenizer_path.path,
-        TokenizerConfig {
-            max_tokens: spec.max_tokens,
-        },
-    ) {
-        Ok(tokenizer) => tokenizer,
-        Err(error) => return channel_error("artifact_invalid", error.to_string()),
-    };
-    let tokenized = match tokenizer.tokenize_batch([params.prompt.as_str()]) {
-        Ok(tokenized) => tokenized,
-        Err(error) => return channel_error("invalid_request", error.to_string()),
-    };
-    let prompt = tokenized.batch.items.first().cloned().unwrap_or_default();
-    let decode_fingerprint = match entry.decode_identity_inputs().decode_fingerprint() {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => return channel_error(error.as_str(), "invalid decode identity"),
-    };
-    let processing_fingerprint = match owned_decode_processing_fingerprint(&entry) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => return channel_error(error.as_str(), "invalid processing identity"),
-    };
-    let constrained = params
-        .grammar
-        .as_deref()
-        .is_some_and(|grammar| !grammar.trim().is_empty());
-    let approval_grammar_enabled = state
-        .store
-        .get_approval(&entry.entry_id, &decode_fingerprint.0)
-        .ok()
-        .flatten()
-        .is_some_and(|approval| approval.grammar_enabled);
-    if constrained && (!state.runtime.grammar_enabled || !approval_grammar_enabled) {
-        record_admission_refusal(&state.runtime, model_id, Some(&job_id), "grammar_disabled");
-        return channel_error(
-            "grammar_disabled",
-            "constrained owned-decode requests require both runtime and approval grammar enablement",
-        );
-    }
-    let compiled_constraint = if resolution_owned_refusal.is_some() {
-        // The platform refusal must reach lane selection before Metal-only
-        // grammar setup, which cannot construct a tokenizer vocabulary here.
-        None
-    } else {
-        match params
-            .grammar
-            .as_deref()
-            .filter(|grammar| !grammar.trim().is_empty())
-        {
-            Some(grammar) => {
-                let vocabulary_digest = match owned_decode_vocabulary_digest(&tokenizer) {
-                    Ok(digest) => digest,
-                    Err(error) => return result_outcome(error_payload(&state, error)),
-                };
-                match owned_decode_grammar_scheduler::compile_grammar(
-                    grammar,
-                    &owned_decode_grammar_scheduler::CompileContext {
-                        base_decode_fingerprint: decode_fingerprint.clone(),
-                        tokenizer_vocabulary_digest: vocabulary_digest,
-                    },
-                    &owned_decode_grammar_scheduler::GrammarSubsetManifest::default(),
-                ) {
-                    Ok(compiled) => Some(compiled),
-                    Err(error) => return channel_error(error.wire_error().as_str(), error.message),
-                }
-            }
-            None => None,
-        }
-    };
-    let constraint_runtime_identity = compiled_constraint
-        .as_ref()
-        .map(|compiled| compiled.constraint.constraint_runtime_identity.digest());
-    let worker_constraint = compiled_constraint
-        .as_ref()
-        .map(|compiled| worker_constraint(&compiled.constraint));
-    let (runtime_config_digest, _) =
-        owned_decode_runtime_identity(&spec, &entry, state.runtime.decode_chain_k);
-
-    let llama_spec = if !constrained {
-        state.runtime.catalog.lock().ok().and_then(|catalog| {
-            catalog
-                .values()
-                .map(|slot| &slot.spec)
-                .find(|candidate| {
-                    candidate.model_id != model_id
-                        && candidate.engine == LLAMA_ENGINE
-                        && candidate.task == ModelTask::Generate.as_str()
-                })
-                .cloned()
-        })
-    } else {
-        None
-    };
-    let llama_model = if let Some(fallback) = llama_spec.as_ref() {
-        match ensure_model_loaded_for_control(
-            Arc::clone(&state),
-            &fallback.model_id,
-            params.deadline_ms,
-        )
-        .await
-        {
-            Ok(model) => Some(model),
-            Err(error) => return result_outcome(error_payload(&state, error)),
-        }
-    } else {
-        None
-    };
-    let llama_lane = llama_spec.as_ref().map(|fallback| LlamaLane {
-        decode_fingerprint: fallback.fingerprint.clone(),
-        processing_fingerprint: fallback.fingerprint.clone(),
-    });
-    let equivalent_fingerprints = BTreeSet::new();
-    let environment = owned_decode_environment(
-        &state,
-        &spec,
-        &entry,
-        &decode_fingerprint,
-        OwnedDecodeEnvironmentInputs {
-            processing_fingerprint: processing_fingerprint.clone(),
-            runtime_config_digest: runtime_config_digest.clone(),
-            constraint_runtime_identity: constraint_runtime_identity.clone(),
-            llama: llama_lane,
-            equivalent_fingerprints,
-        },
-    )
-    .with_decode_chain_k(state.runtime.decode_chain_k);
-    let environment = match resolution_owned_refusal {
-        Some(refusal) => environment.with_resolution_owned_refusal(refusal),
-        None => environment,
-    };
-
-    let certification = PersistentDecodeCertification {
-        store: Arc::clone(&state.store),
-        match_inputs: OwnedDecodeMatchInputs {
-            revisioned_machine_profile_hash: state.revisioned_machine_profile_hash.clone(),
-            profile_activation_epoch: state.profile_activation_epoch,
-            model_id: entry.entry_id.clone(),
-            decode_fingerprint: decode_fingerprint.0.clone(),
-            processing_fingerprint: processing_fingerprint.0.clone(),
-            runtime_config_digest: runtime_config_digest.clone(),
-            constraint_runtime_identities: constraint_runtime_identity
-                .clone()
-                .into_iter()
-                .collect(),
-            worker_path_evidence: owned_decode_worker_path_identity(),
-            evidence_schema_revision: store::CERT_EVIDENCE_SCHEMA_REVISION.to_string(),
-            g_dec_manifest_revision: store::G_DEC_MANIFEST_REVISION.to_string(),
-        },
-    };
-    let q8 = match state.runtime.owned_decode_q8.lock() {
-        Ok(registry) => registry.clone(),
-        Err(_) => {
-            return channel_error(
-                "owned_decode_unavailable",
-                "owned-decode Q8 ingest registry is unavailable",
-            )
-        }
-    };
-    let context_buckets: owned_decode_contracts::ContextBucketsManifest = serde_json::from_str(
-        include_str!("../owned-decode-manifests/decode-context-buckets-v1.json"),
-    )
-    .expect("checked-in decode context buckets parse");
-    let router = owned_decode_routing::OwnedDecodeRouter::new(
-        owned_decode_routing::family::FamilyRegistry::production(),
-        context_buckets,
-        q8,
-        Box::new(certification),
-    );
-    let request = OneshotRequest {
-        family: entry.family,
-        weight_quant: entry.weight_quant,
-        prompt_token_count: prompt.len().min(u32::MAX as usize) as u32,
-        max_tokens: params.max_tokens,
-        sampling: SamplingMode::GreedyTop1,
-        grammar: if resolution_owned_refusal.is_some() && constrained {
-            // Preserve owned-only request shape while the platform refusal is
-            // routed. Grammar compilation above is intentionally skipped.
-            Some(Value::Null)
-        } else {
-            params
-                .grammar
-                .as_deref()
-                .filter(|grammar| !grammar.trim().is_empty())
-                .and_then(|grammar| serde_json::from_str(grammar).ok())
-        },
-        required_fingerprint: params.required_fingerprint.clone().map(Fingerprint),
-        allow_equivalent: false,
-        target_fingerprint: params.target_fingerprint.clone().map(Fingerprint),
-        required_processing_fingerprint: None,
-        owned_only: params.owned_only,
-    };
-    let total_tokens = u64::from(request.prompt_token_count) + u64::from(params.max_tokens);
-    if total_tokens > state.runtime.inline.max_tokens {
-        return result_outcome(error_payload(
-            &state,
-            WireOperationError::from_stable(
-                StableError::queue_full(Some(state.runtime.inline.max_queue_ms)),
-                format!(
-                    "microllm.oneshot token budget {total_tokens} exceeds inline budget {}",
-                    state.runtime.inline.max_tokens
-                ),
-            ),
-        ));
-    }
-    let admission = match state.runtime.admit_inline(
-        model_id,
-        Some(&job_id),
-        QueueClass::Interactive,
-        request_bytes_for_texts([params.prompt.as_str()]),
-        params.deadline_ms,
-        params.max_queue_ms,
-    ) {
-        Ok(admission) => admission,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let permit = match acquire_execution_permit(&state.runtime, Some(admission.deadline())).await {
-        Ok(permit) => permit,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let _activity = state.runtime.activity_telemetry.begin(model_id);
-    let deadline_ms = params
-        .deadline_ms
-        .unwrap_or(state.runtime.inline.deadline_ms)
-        .max(1);
-    let (owned, pre_dispatch_owned_refusal) = if resolution_owned_refusal.is_some() {
-        // Resolution already classified this platform's owned lane as unavailable;
-        // do not attempt to construct a Metal worker before lane selection.
-        (None, None)
-    } else {
-        match cached_supervised_decode_dispatch(
-            &state,
-            &spec,
-            &entry,
-            prompt.clone(),
-            worker_constraint.clone(),
-            deadline_ms,
-        ) {
-            Ok(dispatch) => (Some(dispatch), None),
-            Err(OwnedDecodeDispatchPreparationError::Refused(refusal)) => (None, Some(refusal)),
-            Err(OwnedDecodeDispatchPreparationError::Wire(error)) => {
-                return result_outcome(error_payload(&state, error));
-            }
-        }
-    };
-    let environment = match pre_dispatch_owned_refusal {
-        Some(refusal) => environment.with_pre_dispatch_owned_refusal(refusal),
-        None => environment,
-    };
-    let sidecar_hint_bank_source = sidecar_hint_bank_source(
-        Arc::clone(&state),
-        &params.prompt,
-        params.grammar.as_deref(),
-        &tokenizer,
-        compiled_constraint.as_ref(),
-        worker_constraint.as_ref(),
-        deadline_ms,
-    );
-    let dispatch = WireDecodeDispatch {
-        owned,
-        prompt,
-        constraint: worker_constraint,
-        sidecar_hint_bank_source,
-        deadline_ms,
-        llama: llama_model.clone(),
-        llama_output: None,
-    };
-    let generation_id = format!("{}-{}", state.module_generation, now_ms());
-    // The worker and the terminal envelope must use the same generation identity.
-    // Keep a copy because the routing closure owns the dispatch-side value.
-    let generation_id_for_payload = generation_id.clone();
-    let n_prompt = request.prompt_token_count as usize;
-    let routed = tokio::task::spawn_blocking(move || {
-        let mut dispatch = dispatch;
-        let routed = router.route_oneshot(
-            &environment,
-            &entry,
-            &request,
-            &generation_id,
-            &mut dispatch,
-        );
-        (routed, dispatch)
-    })
-    .await;
-    drop(permit);
-    drop(admission);
-    let (routed, dispatch) = match routed {
-        Ok(result) => result,
-        Err(error) => {
-            return result_outcome(error_payload(
-                &state,
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("owned-decode dispatch join failed: {error}"),
-                ),
-            ))
-        }
-    };
-    let mut routed = match routed {
-        Ok(response) => response,
-        Err(failure) => {
-            record_admission_refusal(&state.runtime, model_id, Some(&job_id), failure.wire_id());
-            let detail = failure.message.as_deref();
-            return channel_error(
-                failure.wire_id(),
-                match (failure.underlying_owned_decode_refusal_id, detail) {
-                    (Some(underlying), Some(detail)) => format!(
-                        "owned-decode request refused: {} (underlying {}; {detail})",
-                        failure.wire_id(),
-                        underlying.as_str()
-                    ),
-                    (Some(underlying), None) => format!(
-                        "owned-decode request refused: {} (underlying {})",
-                        failure.wire_id(),
-                        underlying.as_str()
-                    ),
-                    (None, Some(detail)) => {
-                        format!(
-                            "owned-decode request refused: {} ({detail})",
-                            failure.wire_id()
-                        )
-                    }
-                    (None, None) => format!("owned-decode request refused: {}", failure.wire_id()),
-                },
-            );
-        }
-    };
-    if let Some(compiled) = compiled_constraint.as_ref() {
-        routed.provenance = routed.provenance.clone().with_constraint(
-            compiled.constraint.constraint_runtime_identity.digest(),
-            compiled.constraint.constraint_fingerprint.clone(),
-            compiled
-                .constraint
-                .constraint_runtime_identity
-                .grammar_compiler_revision
-                .clone(),
-        );
-    }
-    let text = if routed.lane == LaneKind::Llama {
-        dispatch
-            .llama_output
-            .as_ref()
-            .map(|output| output.text.clone())
-            .unwrap_or_default()
-    } else {
-        match tokenizer.decode(&routed.generated_token_ids) {
-            Ok(text) => text,
-            Err(error) => return channel_error("artifact_invalid", error.to_string()),
-        }
-    };
-    let completion_lane = match routed.lane {
-        LaneKind::OwnedDecode => "decode",
-        LaneKind::Llama => "llama",
-    };
-    let completion_tokens =
-        (n_prompt as u64).saturating_add(routed.generated_token_ids.len() as u64);
-    let selected_model = if routed.lane == LaneKind::Llama {
-        llama_model.as_deref()
-    } else {
-        None
-    };
-    let fingerprint = selected_model
-        .map(|model| model.fingerprint.clone())
-        .unwrap_or_else(|| spec.fingerprint.clone());
-    let engine = selected_model
-        .map(|model| model.engine_identity.clone())
-        .unwrap_or_else(|| spec.engine_identity.clone());
-    let equivalent_to = Vec::new();
-    let provenance = &routed.provenance;
-    let payload = MicroLlmOneshotPayload {
-        text,
-        finish_reason: routed.finish_reason.as_str().to_string(),
-        n_prompt,
-        n_gen: routed.generated_token_ids.len(),
-        generated_token_ids: routed.generated_token_ids.clone(),
-        runtime_config_digest: Some(runtime_config_digest),
-        derived_digest: spec
-            .engine_identity
-            .build_flags
-            .get("derived_digest")
-            .cloned(),
-        generation_id: Some(generation_id_for_payload),
-        real_token_counts: tokenized.real_token_counts,
-        truncation_disclosures: tokenized.disclosures,
-    };
-    let envelope = ResponseEnvelope {
-        fingerprint,
-        table_epoch: FROZEN_TABLE_EPOCH,
-        dims: 0,
-        provenance: ResponseProvenance {
-            engine,
-            owned_decode: synapse_core::OwnedDecodeResponseProvenance {
-                lane: Some(provenance.lane.clone()),
-                worker: Some(provenance.worker.clone()),
-                risk_class: Some(provenance.risk_class.clone()),
-                decode_fingerprint: Some(provenance.decode_fingerprint.clone()),
-                processing_fingerprint: Some(provenance.processing_fingerprint.clone()),
-                fallback_reason: provenance.fallback_reason.clone(),
-                lane_finish_reason: provenance.lane_finish_reason.clone(),
-                worker_generation: (provenance.worker_generation != 0)
-                    .then_some(provenance.worker_generation),
-                last_completed_quantum_sequence: (provenance.last_completed_quantum_sequence != 0)
-                    .then_some(provenance.last_completed_quantum_sequence),
-                crash_retry_count: provenance.crash_retry_count,
-                failure_classifications: provenance.failure_classifications.clone(),
-                constraint_runtime_identity: provenance.constraint_runtime_identity.clone(),
-                constraint_fingerprint: provenance.constraint_fingerprint.clone(),
-                grammar_compiler_revision: provenance.grammar_compiler_revision.clone(),
-                chain_k: provenance.chain_k,
-                underlying_owned_decode_refusal_id: provenance
-                    .underlying_owned_decode_refusal_id
-                    .clone(),
-            },
-        },
-        module_generation: state.module_generation,
-        equivalent_to,
-        payload,
-    };
-    state
-        .runtime
-        .activity_telemetry
-        .record_completed_tokens(completion_tokens);
-    log_job_done(
-        model_id,
-        &job_id,
-        completion_lane,
-        completion_tokens,
         started,
     );
     result_outcome(serde_json::to_value(envelope).expect("microllm envelope should serialize"))
@@ -10774,10 +7257,6 @@ async fn execute_embedding_with_catalog_guard(
             );
             result.map_err(|error| ane_lane_error_to_wire(error, &model.model_id))
         }
-        EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("model '{}' does not support embedding", model.model_id),
-        )),
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
@@ -10939,10 +7418,6 @@ async fn execute_rerank_with_catalog_guard(
                 scores: values.into_iter().map(|v| v[0]).collect(),
             })
         }
-        EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
-            StableError::artifact_invalid(),
-            format!("model '{}' does not support rerank.score", model.model_id),
-        )),
         EmbedBackend::Owned(engine) => {
             let pairs = owned_pairs.ok_or_else(|| {
                 WireOperationError::from_stable(
@@ -11308,7 +7783,7 @@ async fn execute_generate(
         EmbedBackend::TestDeterministic(_) => Err(artifact_invalid_error(
             "test-deterministic does not generate",
         )),
-        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => Err(WireOperationError::from_stable(
+        EmbedBackend::Owned(_) => Err(WireOperationError::from_stable(
             StableError::artifact_invalid(),
             format!(
                 "model '{}' does not support the legacy microllm.oneshot path",
@@ -11494,147 +7969,8 @@ fn cosine(left: &[f32], right: &[f32]) -> f64 {
     dot / (left_norm * right_norm + 1e-12)
 }
 
-async fn approvals_migrate_owned_decode(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ApprovalMigrationParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid approval migration params: {error}"),
-            )
-        }
-    };
-    match state
-        .store
-        .migrate_owned_decode_approvals(&params.seed_revision, &params.schema_revision)
-    {
-        Ok(result) => result_outcome(json!({
-            "outcome": result.outcome,
-            "seed_revision": result.seed_revision,
-            "rows": result.rows,
-            "marker": result.marker,
-            "rendering": result.rendering(),
-        })),
-        Err(SynapseStoreError::ApprovalMigrationStateCorrupt(reason)) => {
-            channel_error("approval_migration_state_corrupt", reason)
-        }
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-async fn approval_enable(
-    state: Arc<ModuleState>,
-    params: Value,
-    approved_by: &str,
-) -> HandlerOutcome {
-    let params: ApprovalEnableParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid approval enable params: {error}"),
-            )
-        }
-    };
-    match state.store.enable_or_create_approval(
-        &params.model_id,
-        &params.decode_fingerprint,
-        params.grammar_enabled,
-        approved_by,
-        now_ms(),
-    ) {
-        Ok(row) => result_outcome(json!({
-            "model_id": row.model_id,
-            "decode_fingerprint": row.decode_fingerprint,
-            "enabled": row.enabled,
-            "grammar_enabled": row.grammar_enabled,
-            "approved_by": row.approved_by,
-            "approved_at_ms": row.approved_at_ms,
-            "semantic_digest": row.semantic_digest,
-            "generation": row.generation,
-        })),
-        Err(SynapseStoreError::Decode(reason)) => channel_error("invalid_request", reason),
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-async fn approval_disable(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ApprovalDisableParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid approval disable params: {error}"),
-            )
-        }
-    };
-    match rollback::disable_exact_approval(
-        &state.store,
-        &params.model_id,
-        &params.decode_fingerprint,
-        &params.reason,
-        now_ms(),
-    ) {
-        Ok(row) => result_outcome(json!({
-            "model_id": row.model_id,
-            "decode_fingerprint": row.decode_fingerprint,
-            "enabled": row.enabled,
-            "disabled_reason": row.disabled_reason,
-        })),
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-async fn approvals_emergency_rollback(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    let params: ApprovalEmergencyRollbackParams = match serde_json::from_value(params) {
-        Ok(params) => params,
-        Err(error) => {
-            return channel_error(
-                "invalid_request",
-                format!("invalid emergency rollback params: {error}"),
-            )
-        }
-    };
-    match rollback::disable_all_approvals(&state.store, &params.reason, now_ms()) {
-        Ok(disabled) => result_outcome(json!({
-            "disabled": disabled,
-            "reason": params.reason,
-        })),
-        Err(error) => channel_error("store_failure", error.to_string()),
-    }
-}
-
-fn lane_measurement_rows(
-    state: &ModuleState,
-    model_id: &str,
-    engine: &str,
-    fingerprint: &Fingerprint,
-) -> LaneMeasurementRows {
-    let current_probe = if engine == DECODE_WORKER_ENGINE
-        && resolved_catalog_lane(&state.runtime, model_id).is_none()
-    {
-        state
-            .store
-            .get_owned_decode_measurement_row(
-                &state.revisioned_machine_profile_hash,
-                state.profile_activation_epoch,
-                model_id,
-                &fingerprint.0,
-                CERT_EVIDENCE_SCHEMA_REVISION,
-                &[],
-            )
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    LaneMeasurementRows {
-        certified: current_probe.is_some_and(|row| row.status == CertificationStatus::Certified),
-    }
-}
-
-fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary {
-    let slots = state
+fn registered_model_slots(state: &ModuleState) -> Vec<ModelSlotSnapshot> {
+    state
         .runtime
         .catalog
         .lock()
@@ -11649,8 +7985,7 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    let lanes = slots
+        .unwrap_or_default()
         .into_iter()
         .filter(|slot| {
             resolved_catalog_lane(&state.runtime, &slot.spec.model_id).is_none_or(|(e, b)| {
@@ -11660,62 +7995,7 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
                     .is_some()
             })
         })
-        .map(|slot| {
-            let certification_fingerprint = slot
-                .loaded
-                .as_ref()
-                .map(|model| model.certification_fingerprint.clone())
-                .or_else(|| {
-                    (slot.spec.engine == "owned-metal-decode")
-                        .then(|| owned_decode_catalog_entry(&slot.spec).ok())
-                        .flatten()
-                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
-                })
-                .unwrap_or_else(|| slot.spec.fingerprint.clone());
-            let measurements = lane_measurement_rows(
-                state,
-                &slot.spec.model_id,
-                &slot.spec.engine,
-                &certification_fingerprint,
-            );
-            CatalogLaneMeasurements { slot, measurements }
-        })
-        .collect::<Vec<_>>();
-    CatalogMeasurementSummary {
-        certified_lanes: lanes
-            .iter()
-            .filter(|lane| lane.measurements.certified)
-            .count(),
-        lanes,
-    }
-}
-
-/// Projects approval + certification state into the lane summary's
-/// `serving_admission` field.
-///
-/// Deliberately independent of worker residency: decode workers spawn lazily,
-/// so "is a worker currently loaded" is a liveness fact (already visible in
-/// the summary's worker block), not an admission fact. Folding it in here made
-/// enabled-and-certified lanes render "disabled" after every restart until
-/// their first request arrived - the same conflation this projection exists to
-/// remove, in the opposite direction.
-fn serving_admission_projection(
-    owned_decode_lane: bool,
-    evidence_certified: bool,
-    approval: Option<(bool, Option<String>)>,
-) -> (Option<&'static str>, Option<String>) {
-    if !owned_decode_lane {
-        return (None, None);
-    }
-    match approval {
-        Some((true, _)) if evidence_certified => (Some("enabled"), None),
-        Some((true, _)) => (Some("disabled"), Some("not_certified".to_string())),
-        Some((false, disabled_reason)) => (
-            Some("disabled"),
-            disabled_reason.or_else(|| Some("approval_disabled".to_string())),
-        ),
-        None => (Some("disabled"), Some("approval_absent".to_string())),
-    }
+        .collect()
 }
 
 /// Report admission capacity plus process-local `{ refusals: { reason: { count,
@@ -11756,18 +8036,11 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
     let execution_in_flight = execution_stats.in_flight;
     let execution_wait_p50_ms = execution_wait_percentile(&execution_stats, 0.50);
     let execution_wait_p95_ms = execution_wait_percentile(&execution_stats, 0.95);
-    let catalog_measurements = catalog_measurement_summary(&state);
     let mut lanes = state
         .runtime
         .loaded_models()
         .into_iter()
         .map(|model| {
-            let measurements = lane_measurement_rows(
-                &state,
-                &model.model_id,
-                &model.engine_identity.engine,
-                &model.certification_fingerprint,
-            );
             json!({
                 "model_id": model.model_id,
                 "fingerprint": model.fingerprint,
@@ -11777,7 +8050,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
                 "inline_in_flight_executions": execution_in_flight,
                 "execution_wait_p50_ms": execution_wait_p50_ms,
                 "execution_wait_p95_ms": execution_wait_p95_ms,
-                "certified": measurements.certified,
+                "certified": false,
             })
         })
         .collect::<Vec<_>>();
@@ -11808,8 +8081,8 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
         "jobs_inherited": telemetry.jobs_inherited,
         "jobs_open": telemetry.jobs_open,
         "lanes": lanes,
-        "catalog_lanes": catalog_measurements.lanes.len(),
-        "certified_lanes": catalog_measurements.certified_lanes,
+        "catalog_lanes": registered_model_slots(&state).len(),
+        "certified_lanes": 0,
     }))
 }
 
@@ -11823,55 +8096,8 @@ fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::Worker
         EmbedBackend::DirectAne(_) => None,
         #[cfg(feature = "test-support")]
         EmbedBackend::TestDeterministic(_) => None,
-        EmbedBackend::Owned(_) | EmbedBackend::OwnedDecode => None,
+        EmbedBackend::Owned(_) => None,
     }
-}
-
-fn certification_health(state: &ModuleState) -> CertificationHealth {
-    let slots = state
-        .runtime
-        .catalog
-        .lock()
-        .map(|catalog| {
-            catalog
-                .values()
-                .map(|slot| ModelSlotSnapshot {
-                    spec: slot.spec.clone(),
-                    loaded: slot.loaded.clone(),
-                    state: slot.state.clone(),
-                    notify: Arc::clone(&slot.notify),
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let lanes = slots
-        .into_iter()
-        .map(|slot| {
-            let certification_fingerprint = slot
-                .loaded
-                .as_ref()
-                .map(|model| model.certification_fingerprint.clone())
-                .or_else(|| {
-                    (slot.spec.engine == "owned-metal-decode")
-                        .then(|| owned_decode_catalog_entry(&slot.spec).ok())
-                        .flatten()
-                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
-                })
-                .unwrap_or_else(|| slot.spec.fingerprint.clone());
-            let measurements = lane_measurement_rows(
-                state,
-                &slot.spec.model_id,
-                &slot.spec.engine,
-                &certification_fingerprint,
-            );
-            CertificationHealthLane {
-                model_id: slot.spec.model_id,
-                workload: slot.spec.task,
-                certified: measurements.certified,
-            }
-        })
-        .collect();
-    CertificationHealth { lanes }
 }
 
 fn module_health(state: &ModuleState) -> ModuleHealth {
@@ -11879,19 +8105,10 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
         .runtime
         .loaded_models()
         .into_iter()
-        .map(|model| {
-            let measurements = lane_measurement_rows(
-                state,
-                &model.model_id,
-                &model.engine_identity.engine,
-                &model.certification_fingerprint,
-            );
-            LaneHealth {
-                model_id: model.model_id.clone(),
-                fingerprint: model.fingerprint.clone(),
-                certified: measurements.certified,
-                worker: worker_health_for_model(&model),
-            }
+        .map(|model| LaneHealth {
+            model_id: model.model_id.clone(),
+            fingerprint: model.fingerprint.clone(),
+            worker: worker_health_for_model(&model),
         })
         .collect::<Vec<_>>();
     let storage = state.store.storage_health_inputs().unwrap_or_else(|error| {
@@ -11905,18 +8122,13 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
             last_rotation_at_ms: None,
             last_rotation_reason: Some("unknown_previous_snapshot".to_string()),
             rotation_event_count: 0,
-            re_certification_state: "failed".to_string(),
-            evidence_requirements_divergence: Vec::new(),
-            approval_certification_outcomes: Vec::new(),
         }
     });
-    let certification = certification_health(state);
     ModuleHealth {
         status: "ok".to_string(),
         module_generation: state.module_generation,
         loaded_models: state.runtime.loaded_model_count(),
         machine_profile_hash: state.legacy_machine_profile_hash.clone(),
-        certification,
         lanes,
         previous_revisioned_machine_profile_hash: storage.previous_revisioned_machine_profile_hash,
         current_revisioned_machine_profile_hash: storage
@@ -11927,9 +8139,6 @@ fn module_health(state: &ModuleState) -> ModuleHealth {
             .unwrap_or(state.profile_activation_epoch),
         last_rotation_at_ms: storage.last_rotation_at_ms,
         last_rotation_reason: storage.last_rotation_reason,
-        re_certification_state: storage.re_certification_state,
-        evidence_requirements_divergence: storage.evidence_requirements_divergence,
-        approval_certification_outcomes: storage.approval_certification_outcomes,
     }
 }
 
@@ -12012,37 +8221,21 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         state
             .model_cache
             .cleanup_abandoned_ingest_temps(sweep_started)?;
-        let outcomes = if let Some(digest) = params.digest {
-            vec![state
-                .model_cache
-                .gc_digest(&digest, &state.module_id, now, grace_ms)?]
+        if let Some(digest) = params.digest {
+            Ok(vec![state.model_cache.gc_digest(
+                &digest,
+                &state.module_id,
+                now,
+                grace_ms,
+            )?])
         } else {
-            // Derived Q8 decode weights consume the same
-            // cache budget as their source blobs. Lowering the blob watermark by
-            // their current size makes the existing mark/delete pass run whenever
-            // the combined cache is over budget; source deletion below reclaims
-            // the matching derivatives.
-            let materialized_bytes = derived_artifact_bytes(state.model_cache.root())?;
             state.model_cache.gc_to_watermark(
                 &state.module_id,
                 now,
                 grace_ms,
-                state
-                    .runtime
-                    .cache_max_bytes
-                    .saturating_sub(materialized_bytes),
-            )?
-        };
-        for outcome in &outcomes {
-            if let CacheGcOutcome::Deleted { digest } = outcome {
-                owned_decode_routing::q8artifact::remove_for_source_digest(
-                    state.model_cache.root(),
-                    digest,
-                )
-                .map_err(q8_artifact_cache_error)?;
-            }
+                state.runtime.cache_max_bytes,
+            )
         }
-        Ok(outcomes)
     })();
     match result {
         Ok(outcomes) => {
@@ -12065,16 +8258,6 @@ async fn cache_gc(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         }
         Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
     }
-}
-
-fn q8_artifact_cache_error(error: anyhow::Error) -> ModelCacheError {
-    ModelCacheError::ArtifactInvalid(format!("owned-decode Q8 cache: {error:#}"))
-}
-
-/// Bytes of owned-decode Q8 weights derived from cached source blobs.
-fn derived_artifact_bytes(cache_root: &Path) -> Result<u64, ModelCacheError> {
-    owned_decode_routing::q8artifact::total_cached_bytes(cache_root)
-        .map_err(q8_artifact_cache_error)
 }
 
 fn cache_error_to_wire(error: ModelCacheError) -> WireOperationError {
@@ -12161,77 +8344,7 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
             let dtype = dtype_for_slot(&spec, exec_info.dtype);
             let device_class = device_class_for_engine(&spec.engine);
 
-            let certification_fingerprint = loaded
-                .as_ref()
-                .map(|model| model.certification_fingerprint.clone())
-                .or_else(|| {
-                    (spec.engine == "owned-metal-decode")
-                        .then(|| owned_decode_catalog_entry(&spec).ok())
-                        .flatten()
-                        .and_then(|entry| entry.decode_identity_inputs().decode_fingerprint().ok())
-                })
-                .unwrap_or_else(|| spec.fingerprint.clone());
-
-            let certified =
-                if spec.engine == DECODE_WORKER_ENGINE || spec.engine == "owned-metal-decode" {
-                    let has_cert = state
-                        .store
-                        .get_owned_decode_measurement_row(
-                            &state.revisioned_machine_profile_hash,
-                            state.profile_activation_epoch,
-                            &spec.model_id,
-                            &certification_fingerprint.0,
-                            CERT_EVIDENCE_SCHEMA_REVISION,
-                            &[],
-                        )
-                        // A store error renders identically to "no certified
-                        // row": both become false. That direction is
-                        // deliberate and fail-closed -- an unreadable store
-                        // must never publish `certified: true`. What it costs
-                        // is an operator who cannot tell "not certified" from
-                        // "database unreadable", so make the error OBSERVABLE
-                        // rather than changing what the flag means. Absence is
-                        // already spoken for by lane classes with no
-                        // certification concept; giving it a second producer
-                        // here would trade a silent error for an ambiguous
-                        // field.
-                        .inspect_err(|error| {
-                            tracing::warn!(
-                                target: "synapse.catalog",
-                                model_id = %spec.model_id,
-                                %error,
-                                "certification row unreadable; reporting certified=false"
-                            );
-                        })
-                        .ok()
-                        .flatten()
-                        .is_some_and(|row| row.status == CertificationStatus::Certified);
-                    Some(has_cert)
-                } else if matches!(spec.task.as_str(), "embed" | "rerank") {
-                    Some(false)
-                } else {
-                    // Lane classes with no certification concept (such as worker-backed llama generate)
-                    // omit the field rather than fabricating true or false.
-                    None
-                };
-
-            // Certification is evidence for this machine; serving also requires approval.
-            let (serving_admission, serving_admission_reason) =
-                if spec.engine != DECODE_WORKER_ENGINE {
-                    (None, None)
-                } else {
-                    match state
-                        .store
-                        .get_approval(&spec.model_id, &certification_fingerprint.0)
-                    {
-                        Ok(approval) => serving_admission_projection(
-                            true,
-                            certified.unwrap_or(false),
-                            approval.map(|approval| (approval.enabled, approval.disabled_reason)),
-                        ),
-                        Err(_) => (Some("disabled"), Some("approval_unavailable".to_string())),
-                    }
-                };
+            let certified = matches!(spec.task.as_str(), "embed" | "rerank").then_some(false);
 
             let warm_load_cost_hint_ms = last_cold_load_ms;
 
@@ -12249,8 +8362,6 @@ fn module_catalog_entries(state: &ModuleState) -> Vec<ModelCatalogEntry> {
                 dtype,
                 device_class,
                 certified,
-                serving_admission: serving_admission.map(str::to_string),
-                serving_admission_reason,
                 warm_load_cost_hint_ms,
             }
         })
@@ -12411,15 +8522,6 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("embed.result", Query),
         op("rerank.score", Query),
         op("microllm.oneshot", Query),
-        op("owned_decode.admit_session", Mutate),
-        op("owned_decode.decode", Mutate),
-        op("owned_decode.snapshot", Mutate),
-        op("owned_decode.continue", Mutate),
-        op("owned_decode.abort", Mutate),
-        op("owned_decode.close", Mutate),
-        op("owned_decode.session_status", Query),
-        op("owned_decode.disable", Mutate),
-        op("owned_decode.revoke", Mutate),
         op("model.status", Query),
         op("model.unload", Mutate),
         op("models.list", Query),
@@ -12430,10 +8532,6 @@ fn management_operations() -> Vec<ManagementOperation> {
         op("cache.pin", Mutate),
         op("cache.gc", Mutate),
         op("admission.status", Query),
-        op("approvals.migrate_owned_decode", Mutate),
-        op("approvals.enable", Mutate),
-        op("approvals.disable", Mutate),
-        op("approvals.emergency_rollback", Mutate),
     ]
 }
 
@@ -12594,7 +8692,7 @@ fn load_module_config_file(path: &Path, tier: ConfigTier) -> Result<ModuleConfig
 fn parse_module_config_json(
     contents: &str,
     source: &str,
-    tier: ConfigTier,
+    _tier: ConfigTier,
 ) -> Result<ModuleConfig, ModuleError> {
     let stripped = strip_json_comments(contents);
     let value: Value = serde_json::from_str(&stripped).map_err(ModuleError::Json)?;
@@ -12621,15 +8719,28 @@ fn parse_module_config_json(
             )));
         }
     }
-    if matches!(tier, ConfigTier::Project)
-        && value
-            .as_object()
-            .is_some_and(|object| object.contains_key("decode_chain_k"))
-    {
-        return Err(ModuleError::Config(
-            "decode_chain_k is user-tier only and may not appear in project-tier config"
-                .to_string(),
-        ));
+    for key in ["grammar_enabled", "sidecar_spec", "decode_chain_k"] {
+        if value.get(key).is_some() {
+            return Err(ModuleError::Config(format!(
+                "{key} was removed; owned decode serving was retired"
+            )));
+        }
+    }
+    if let Some(preloads) = value.get("preload_models").and_then(Value::as_array) {
+        for (index, preload) in preloads.iter().enumerate() {
+            let Some(engine) = preload.get("engine").and_then(Value::as_str) else {
+                continue;
+            };
+            if canonical_engine_name(engine) == "owned-metal-decode" {
+                let model_id = preload
+                    .get("model_id")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("{engine}-{index}"), str::to_owned);
+                return Err(ModuleError::Config(format!(
+                    "preload model_id '{model_id}': owned decode serving was retired"
+                )));
+            }
+        }
     }
     let config: ModuleConfig = serde_json::from_value(value).map_err(|error| {
         if let Some(field) = unknown_field_from_json_error(&error) {
@@ -12649,22 +8760,21 @@ fn parse_module_config_json(
     })?;
     for (index, preload) in config.preload_models.iter().enumerate() {
         let engine = canonical_engine_name(&preload.engine);
-        if preload.profile.is_none() && engine != "owned-metal-decode" {
-            let model_id = preload
-                .model_id
-                .clone()
-                .unwrap_or_else(|| format!("{}-{index}", preload.engine));
-            if matches!(
+        let model_id = preload
+            .model_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{index}", preload.engine));
+        if preload.profile.is_none()
+            && matches!(
                 parse_model_task(preload.task.as_deref(), &engine, &model_id)?,
                 ModelTask::Embed | ModelTask::Rerank
-            ) {
-                return Err(ModuleError::Config(format!(
-                    "preload model_id '{model_id}': free-form preloads for embed and rerank were removed; specify a profile"
-                )));
-            }
+            )
+        {
+            return Err(ModuleError::Config(format!(
+                "preload model_id '{model_id}': free-form preloads for embed and rerank were removed; specify a profile"
+            )));
         }
     }
-    validate_decode_chain_k(config.decode_chain_k)?;
     Ok(config)
 }
 
@@ -12858,6 +8968,7 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-support")]
     mod retired_engine_tests;
     #[cfg(unix)]
     mod lane_pause_tests {
@@ -12927,7 +9038,6 @@ mod tests {
                     method: method.into(),
                     params,
                 },
-                None,
             )
             .with_subscriber(subscriber)
             .await;
@@ -16097,7 +12207,6 @@ mod tests {
                     method: "events_get".into(),
                     params: json!({"event_key":key,"event_name":"findings_changed","version":1}),
                 },
-                None,
             )
             .await,
             "events_get",
@@ -16331,26 +12440,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_decode_serving_admission_requires_approval_and_certification() {
-        assert_eq!(
-            serving_admission_projection(
-                true,
-                true,
-                Some((false, Some("held for operator review".into())))
-            ),
-            (Some("disabled"), Some("held for operator review".into()))
-        );
-        assert_eq!(
-            serving_admission_projection(true, false, Some((true, None))),
-            (Some("disabled"), Some("not_certified".into()))
-        );
-        assert_eq!(
-            serving_admission_projection(true, true, Some((true, None))),
-            (Some("enabled"), None)
-        );
-    }
-
-    #[test]
     fn wire_contract_documents_every_management_operation() {
         const CONTRACT: &str = include_str!("../../../docs/wire-contract-v1.md");
         // The contract lists the registry as one backticked paragraph that
@@ -16476,37 +12565,9 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_config_is_default_off() {
-        assert!(!ModuleConfig::default().sidecar_spec.enabled);
-    }
-
-    #[test]
-    fn frozen_sidecar_schema_preserves_canonical_property_order() {
-        let schema = owned_decode_grammar_scheduler::grammar_schema::parse_schema(
-            r#"{"type":"object","properties":{"second":{"type":"integer"},"first":{"type":"string","enum":["ok"]}},"required":["first"],"additionalProperties":false}"#,
-            &owned_decode_grammar_scheduler::grammar_limits::GrammarLimits::default(),
-        )
-        .expect("schema parses");
-        let frozen = frozen_sidecar_object_schema(&schema, "schema-v1".to_string())
-            .expect("object schema is sidecar-renderable");
-        assert_eq!(frozen.schema_identity, "schema-v1");
-        assert_eq!(
-            frozen
-                .properties
-                .iter()
-                .map(|property| property.name.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
-        assert!(frozen.properties[0].required);
-        assert!(!frozen.properties[1].required);
-    }
-
-    #[test]
     fn catalog_identity_names_match_worker_hello_constants() {
         let expected = [
             ("llama", LLAMA_WORKER_ENGINE),
-            ("owned-metal-decode", DECODE_WORKER_ENGINE),
             ("owned-cuda", CUDA_WORKER_ENGINE),
         ];
         for (engine_name, expected_engine) in expected {
@@ -16653,737 +12714,6 @@ mod tests {
             )),
         })
     }
-
-    const PENDING_ABORT_SESSION_ID: &str = "pending-abort-session";
-    const PENDING_ABORT_REQ_ID: &str = "pending-abort-request";
-    const PENDING_ABORT_COMMITTED: u32 = 2;
-    const PENDING_ABORT_SEQUENCE: u64 = 11;
-
-    fn pending_abort_identity() -> synapse_core::OneshotEnvelopeIdentity {
-        synapse_core::OneshotEnvelopeIdentity {
-            decode_fingerprint: Fingerprint("decode-fingerprint".to_string()),
-            processing_fingerprint: Fingerprint("processing-fingerprint".to_string()),
-            runtime_config_digest: "runtime-digest".to_string(),
-            worker_generation: 7,
-            derived_digest: Some("derived-digest".to_string()),
-        }
-    }
-
-    fn pending_abort_test_state(
-        label: &str,
-        approved_catalog: bool,
-    ) -> (PathBuf, Arc<ModuleState>, String) {
-        let (root, descriptor) = test_storage_descriptor(label);
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("pending-abort store opens"));
-        let profile = test_machine_profile(label);
-        store
-            .observe_profile(&profile, 10, 1)
-            .expect("pending-abort profile activates");
-        let catalog_fingerprint = if approved_catalog {
-            store::configure_serving_catalog_for_test(&store)
-        } else {
-            "d".repeat(64)
-        };
-        let state = test_module_state(store, profile);
-        let op_id = session_request_key(PENDING_ABORT_SESSION_ID, PENDING_ABORT_REQ_ID);
-        {
-            let mut sessions = state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock");
-            sessions.next_session_sequence = PENDING_ABORT_SEQUENCE;
-            sessions.sessions.insert(
-                PENDING_ABORT_SESSION_ID.to_string(),
-                OwnedDecodeWireSession {
-                    catalog_fingerprint,
-                    model_id: "test-model".to_string(),
-                    routing_session_id: owned_decode_routing::admission::SessionId(1),
-                    kv_configuration: owned_decode_routing::admission::SessionKvConfiguration::new(
-                        256, 256,
-                    )
-                    .expect("test KV configuration is valid"),
-                    active_request: Some(PENDING_ABORT_REQ_ID.to_string()),
-                    retained_kv_session_id: None,
-                    retained_position: None,
-                    closed_at_ms: None,
-                },
-            );
-            sessions
-                .streams
-                .begin(owned_decode_worker::StreamRequest {
-                    req_id: PENDING_ABORT_REQ_ID.to_string(),
-                    session_id: PENDING_ABORT_SESSION_ID.to_string(),
-                    generation_id: "generation-1".to_string(),
-                    identity: pending_abort_identity(),
-                    decode_mode: synapse_core::DecodeMode::Serial,
-                    grammar_constrained: false,
-                    chain_k: 1,
-                })
-                .expect("pending-abort stream begins");
-            sessions
-                .streams
-                .observe_frame(&synapse_core::FrameEnvelope::new(
-                    PENDING_ABORT_REQ_ID,
-                    PENDING_ABORT_SESSION_ID,
-                    synapse_core::StreamSequence::FIRST,
-                    synapse_core::WorkerFrame::Progress {
-                        progress: synapse_core::ProgressFrame {
-                            committed_token_ids: vec![17, 23],
-                            committed_token_count: PENDING_ABORT_COMMITTED,
-                            boundary: synapse_core::ProgressBoundary::Continuing,
-                        },
-                    },
-                ))
-                .expect("pending-abort progress is observed");
-            sessions
-                .scheduler
-                .admit_decode(owned_decode_grammar_scheduler::scheduler::DecodeOp {
-                    op_id: op_id.clone(),
-                    generation_id: PENDING_ABORT_REQ_ID.to_string(),
-                    admitted_at_ms: 1,
-                    anchor_ms: 1,
-                    committed_tokens: PENDING_ABORT_COMMITTED,
-                    max_tokens: 16,
-                    resident: true,
-                    cancelled_at_ms: None,
-                    deadline_at_ms: None,
-                });
-            assert_eq!(
-                sessions
-                    .scheduler
-                    .arbitrate(1)
-                    .and_then(|selected| selected.op_id),
-                Some(op_id.clone())
-            );
-        }
-        (root, state, op_id)
-    }
-
-    fn assert_abort_terminal(frame: &synapse_core::FrameEnvelope) {
-        let synapse_core::WorkerFrame::Error { terminal } = &frame.frame else {
-            panic!("pending abort should push an error terminal")
-        };
-        assert_eq!(
-            terminal.terminal_state,
-            synapse_core::TerminalState::Aborted
-        );
-        assert_eq!(terminal.committed_token_count, PENDING_ABORT_COMMITTED);
-    }
-
-    #[test]
-    fn pending_session_abort_retains_approved_kv_prefix() {
-        let (root, state, op_id) = pending_abort_test_state("abort-retained", true);
-        let retained_id = format!(
-            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
-        );
-        let mut frames = Vec::new();
-        let result = {
-            let mut sessions = state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock");
-            sessions.pending_aborts.insert(
-                (
-                    PENDING_ABORT_SESSION_ID.to_string(),
-                    PENDING_ABORT_REQ_ID.to_string(),
-                ),
-                PendingSessionAbort { retain_kv: true },
-            );
-            let outcome = take_pending_session_abort(
-                &state,
-                &mut sessions,
-                PENDING_ABORT_SESSION_ID,
-                PENDING_ABORT_REQ_ID,
-                PENDING_ABORT_COMMITTED,
-                &op_id,
-                &mut frames,
-            )
-            .expect("pending abort diverts decode");
-            let session = sessions
-                .sessions
-                .get(PENDING_ABORT_SESSION_ID)
-                .expect("session remains registered");
-            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE + 1);
-            assert_eq!(
-                session.retained_kv_session_id.as_deref(),
-                Some(retained_id.as_str())
-            );
-            assert_eq!(session.retained_position, Some(PENDING_ABORT_COMMITTED));
-            assert_eq!(session.active_request, None);
-            assert!(sessions.scheduler.op(&op_id).is_none());
-            response_result(outcome, "take pending retained abort")
-        };
-
-        assert_eq!(result["cancelled"]["committed_token_count"], 2);
-        assert_eq!(frames.len(), 1);
-        assert_abort_terminal(&frames[0]);
-        let retained = state
-            .store
-            .retained_serving_state(&retained_id)
-            .expect("retained state reads")
-            .expect("approved retention writes a store row");
-        assert_eq!(retained.state_id, retained_id);
-        assert!(retained.valid);
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove pending-abort state");
-    }
-
-    #[test]
-    fn pending_session_abort_refused_retention_aborts_without_prefix() {
-        let (root, state, op_id) = pending_abort_test_state("abort-refused", false);
-        let refused_id = format!(
-            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
-        );
-        let mut frames = Vec::new();
-        {
-            let mut sessions = state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock");
-            sessions.pending_aborts.insert(
-                (
-                    PENDING_ABORT_SESSION_ID.to_string(),
-                    PENDING_ABORT_REQ_ID.to_string(),
-                ),
-                PendingSessionAbort { retain_kv: true },
-            );
-            let outcome = take_pending_session_abort(
-                &state,
-                &mut sessions,
-                PENDING_ABORT_SESSION_ID,
-                PENDING_ABORT_REQ_ID,
-                PENDING_ABORT_COMMITTED,
-                &op_id,
-                &mut frames,
-            )
-            .expect("pending abort diverts decode");
-            let result = response_result(outcome, "take pending refused abort");
-            assert_eq!(result["cancelled"]["committed_token_count"], 2);
-            let session = sessions
-                .sessions
-                .get(PENDING_ABORT_SESSION_ID)
-                .expect("session remains registered");
-            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE + 1);
-            assert_eq!(session.retained_kv_session_id, None);
-            assert_eq!(session.retained_position, None);
-            assert_eq!(session.active_request, None);
-            assert!(sessions.scheduler.op(&op_id).is_none());
-        }
-
-        assert_eq!(frames.len(), 1);
-        assert_abort_terminal(&frames[0]);
-        assert!(state
-            .store
-            .retained_serving_state(&refused_id)
-            .expect("retained state reads")
-            .is_none());
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove pending-abort state");
-    }
-
-    #[test]
-    fn pending_session_abort_without_retention_aborts_cleanly() {
-        let (root, state, op_id) = pending_abort_test_state("abort-not-requested", false);
-        let unrequested_id = format!(
-            "{PENDING_ABORT_SESSION_ID}:retained:{PENDING_ABORT_COMMITTED}:{PENDING_ABORT_SEQUENCE}"
-        );
-        let mut frames = Vec::new();
-        {
-            let mut sessions = state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock");
-            sessions.pending_aborts.insert(
-                (
-                    PENDING_ABORT_SESSION_ID.to_string(),
-                    PENDING_ABORT_REQ_ID.to_string(),
-                ),
-                PendingSessionAbort { retain_kv: false },
-            );
-            let outcome = take_pending_session_abort(
-                &state,
-                &mut sessions,
-                PENDING_ABORT_SESSION_ID,
-                PENDING_ABORT_REQ_ID,
-                PENDING_ABORT_COMMITTED,
-                &op_id,
-                &mut frames,
-            )
-            .expect("pending abort diverts decode");
-            let result = response_result(outcome, "take pending unretained abort");
-            assert_eq!(result["cancelled"]["committed_token_count"], 2);
-            let session = sessions
-                .sessions
-                .get(PENDING_ABORT_SESSION_ID)
-                .expect("session remains registered");
-            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE);
-            assert_eq!(session.retained_kv_session_id, None);
-            assert_eq!(session.retained_position, None);
-            assert_eq!(session.active_request, None);
-            assert!(sessions.scheduler.op(&op_id).is_none());
-        }
-
-        assert_eq!(frames.len(), 1);
-        assert_abort_terminal(&frames[0]);
-        assert!(state
-            .store
-            .retained_serving_state(&unrequested_id)
-            .expect("retained state reads")
-            .is_none());
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove pending-abort state");
-    }
-
-    #[test]
-    fn missing_pending_session_abort_does_not_divert_decode() {
-        let (root, state, op_id) = pending_abort_test_state("abort-missing", false);
-        let mut frames = Vec::new();
-        {
-            let mut sessions = state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock");
-            assert!(take_pending_session_abort(
-                &state,
-                &mut sessions,
-                PENDING_ABORT_SESSION_ID,
-                PENDING_ABORT_REQ_ID,
-                PENDING_ABORT_COMMITTED,
-                &op_id,
-                &mut frames,
-            )
-            .is_none());
-            let session = sessions
-                .sessions
-                .get(PENDING_ABORT_SESSION_ID)
-                .expect("session remains registered");
-            assert_eq!(sessions.next_session_sequence, PENDING_ABORT_SEQUENCE);
-            assert_eq!(
-                session.active_request.as_deref(),
-                Some(PENDING_ABORT_REQ_ID)
-            );
-            assert!(sessions.scheduler.op(&op_id).is_some());
-        }
-        assert!(frames.is_empty());
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove pending-abort state");
-    }
-
-    const RETAINED_SESSION_ID: &str = "retained-closed-session";
-    const RETAINED_REQ_ID: &str = "retained-closed-request";
-
-    /// A module state whose store holds one approved, certified serving catalog.
-    fn owned_decode_serving_test_state(label: &str) -> (PathBuf, Arc<ModuleState>, String) {
-        let (root, descriptor) = test_storage_descriptor(label);
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("serving store opens"));
-        let profile = test_machine_profile(label);
-        store
-            .observe_profile(&profile, 10, 1)
-            .expect("serving profile activates");
-        let catalog_fingerprint = store::configure_serving_catalog_for_test(&store);
-        let state = test_module_state(store, profile);
-        (root, state, catalog_fingerprint)
-    }
-
-    /// The model the test catalog's certification record names, read straight
-    /// from the stored certification.
-    fn certified_model_id(state: &ModuleState, catalog_fingerprint: &str) -> String {
-        let approval = state
-            .store
-            .serving_approval(catalog_fingerprint)
-            .expect("serving approval reads")
-            .expect("test catalog is approved");
-        state
-            .store
-            .serving_certification(&approval.certification_record_id)
-            .expect("serving certification reads")
-            .expect("approval references a certification")
-            .record
-            .artifact_lineage
-            .model_id
-    }
-
-    /// Register an open session in both the durable ledger and the in-memory
-    /// map, with a completed request stream so `session_status` has a terminal
-    /// state to report.
-    fn register_completed_session(
-        state: &ModuleState,
-        catalog_fingerprint: &str,
-        model_id: &str,
-        admitted_at_ms: u64,
-    ) {
-        assert!(matches!(
-            state
-                .store
-                .admit_serving_session(RETAINED_SESSION_ID, catalog_fingerprint, admitted_at_ms)
-                .expect("serving session admission persists"),
-            store::ServingSessionAdmission::Admitted { .. }
-        ));
-        let mut sessions = state
-            .runtime
-            .owned_decode_sessions
-            .lock()
-            .expect("decode sessions lock");
-        sessions.sessions.insert(
-            RETAINED_SESSION_ID.to_string(),
-            OwnedDecodeWireSession {
-                catalog_fingerprint: catalog_fingerprint.to_string(),
-                model_id: model_id.to_string(),
-                routing_session_id: owned_decode_routing::admission::SessionId(1),
-                kv_configuration: owned_decode_routing::admission::SessionKvConfiguration::new(
-                    256, 256,
-                )
-                .expect("test KV configuration is valid"),
-                active_request: None,
-                retained_kv_session_id: None,
-                retained_position: None,
-                closed_at_ms: None,
-            },
-        );
-        sessions
-            .streams
-            .begin(owned_decode_worker::StreamRequest {
-                req_id: RETAINED_REQ_ID.to_string(),
-                session_id: RETAINED_SESSION_ID.to_string(),
-                generation_id: "generation-1".to_string(),
-                identity: pending_abort_identity(),
-                decode_mode: synapse_core::DecodeMode::Serial,
-                grammar_constrained: false,
-                chain_k: 1,
-            })
-            .expect("request stream begins");
-        sessions
-            .streams
-            .observe_frame(&synapse_core::FrameEnvelope::new(
-                RETAINED_REQ_ID,
-                RETAINED_SESSION_ID,
-                synapse_core::StreamSequence::FIRST,
-                synapse_core::WorkerFrame::Final {
-                    terminal: synapse_core::TerminalEnvelope {
-                        req_id: RETAINED_REQ_ID.to_string(),
-                        session_id: RETAINED_SESSION_ID.to_string(),
-                        committed_token_count: 0,
-                        tokens_emitted: 0,
-                        identity: pending_abort_identity(),
-                        terminal_state: synapse_core::TerminalState::Completed,
-                        decode_mode: synapse_core::DecodeMode::Serial,
-                        speculative_telemetry: None,
-                    },
-                },
-            ))
-            .expect("terminal frame is observed");
-    }
-
-    async fn close_retained_session(state: &Arc<ModuleState>) -> Value {
-        response_result(
-            owned_decode_session_close(
-                Arc::clone(state),
-                json!({ "session_id": RETAINED_SESSION_ID }),
-            )
-            .await,
-            "owned_decode.close",
-        )
-    }
-
-    async fn retained_session_status(state: &Arc<ModuleState>) -> Value {
-        response_result(
-            owned_decode_session_status(
-                Arc::clone(state),
-                json!({ "session_id": RETAINED_SESSION_ID, "req_id": RETAINED_REQ_ID }),
-            )
-            .await,
-            "owned_decode.session_status",
-        )
-    }
-
-    fn retained_session_closed_at_ms(state: &ModuleState) -> u64 {
-        state
-            .runtime
-            .owned_decode_sessions
-            .lock()
-            .expect("decode sessions lock")
-            .sessions
-            .get(RETAINED_SESSION_ID)
-            .expect("closed session is still registered")
-            .closed_at_ms
-            .expect("close records when the session closed")
-    }
-
-    fn retained_session_registered(state: &ModuleState) -> bool {
-        state
-            .runtime
-            .owned_decode_sessions
-            .lock()
-            .expect("decode sessions lock")
-            .sessions
-            .contains_key(RETAINED_SESSION_ID)
-    }
-
-    /// A dispatch that never starts a worker; the tests only check whether the
-    /// dispatch cache still holds it.
-    fn idle_decode_dispatch(
-        root: &Path,
-        name: &str,
-    ) -> Arc<Mutex<worker_host::SupervisedDecodeDispatch>> {
-        use owned_decode_worker::{
-            budget::BudgetPolicy,
-            identity::QuarantineKey,
-            protocol::{GenerateStart, Sampling},
-            supervisor::TerminalControl,
-            validation::WorkerStartContext,
-        };
-        let factory = worker_host::OwnedDecodeWorkerFactory::new(
-            worker_host::WorkerHostConfig::new("missing-owned-decode-worker", root),
-            ValidatedArtifact {
-                digest: "idle-digest".to_string(),
-                format: "owned-safetensors".to_string(),
-            },
-            RuntimeConfig {
-                values: BTreeMap::new(),
-            },
-        );
-        let dispatch = worker_host::SupervisedDecodeDispatch::new(
-            factory,
-            root.join(format!("{name}-budget.json")),
-            BudgetPolicy::default(),
-            16,
-            QuarantineKey::new("idle-machine", "idle-fingerprint", "idle-runtime"),
-            GenerateStart {
-                generation_id: String::new(),
-                loaded_model_ref: String::new(),
-                decode_fingerprint: "idle-fingerprint".to_string(),
-                runtime_config_digest: "idle-runtime".to_string(),
-                prompt_ids: vec![1],
-                stop_ids: Vec::new(),
-                max_tokens: 1,
-                sampling: Sampling::greedy_top1(),
-                constraint: None,
-            },
-            WorkerStartContext {
-                loaded_model_ref: String::new(),
-                decode_fingerprint: "idle-fingerprint".to_string(),
-                runtime_config_digest: "idle-runtime".to_string(),
-                expected_constraint: None,
-            },
-            TerminalControl::default(),
-        )
-        .expect("idle dispatch opens its budget store");
-        Arc::new(Mutex::new(dispatch))
-    }
-
-    /// Cache a dispatch for the certified model and one for an unrelated model,
-    /// so a test can tell a targeted unload from clearing the whole cache.
-    fn cache_certified_and_unrelated_dispatches(
-        state: &ModuleState,
-        root: &Path,
-        certified_model_id: &str,
-    ) {
-        let mut dispatches = state
-            .runtime
-            .owned_decode_dispatches
-            .lock()
-            .expect("dispatch cache lock");
-        dispatches.insert(
-            certified_model_id.to_string(),
-            idle_decode_dispatch(root, "certified"),
-        );
-        dispatches.insert(
-            "unrelated-model".to_string(),
-            idle_decode_dispatch(root, "unrelated"),
-        );
-    }
-
-    fn cached_dispatch_models(state: &ModuleState) -> Vec<String> {
-        state
-            .runtime
-            .owned_decode_dispatches
-            .lock()
-            .expect("dispatch cache lock")
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    async fn disable_catalog(state: &Arc<ModuleState>, catalog_fingerprint: &str) -> Value {
-        response_result(
-            owned_decode_disable(
-                Arc::clone(state),
-                json!({
-                    "catalog_fingerprint": catalog_fingerprint,
-                    "reason": "operator disable",
-                }),
-            )
-            .await,
-            "owned_decode.disable",
-        )
-    }
-
-    #[tokio::test]
-    async fn maintenance_evicts_session_closed_longer_than_retention() {
-        let (root, state, catalog) = owned_decode_serving_test_state("evict-expired-closed");
-        let model_id = certified_model_id(&state, &catalog);
-        register_completed_session(&state, &catalog, &model_id, now_ms());
-        assert_eq!(close_retained_session(&state).await["closed"], true);
-        let closed_at_ms = retained_session_closed_at_ms(&state);
-
-        run_background_maintenance_at(
-            &state,
-            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS + 1,
-        );
-
-        assert!(!retained_session_registered(&state));
-        assert!(
-            state
-                .runtime
-                .owned_decode_sessions
-                .lock()
-                .expect("decode sessions lock")
-                .streams
-                .session_status(RETAINED_SESSION_ID, RETAINED_REQ_ID)
-                .is_err(),
-            "an evicted session's request stream record must be dropped with it"
-        );
-        assert_eq!(
-            retained_session_status(&state).await["error"]["code"],
-            "unknown_session"
-        );
-        assert_eq!(
-            close_retained_session(&state).await["error"]["code"],
-            "unknown_session"
-        );
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove eviction state");
-    }
-
-    #[tokio::test]
-    async fn maintenance_keeps_session_closed_within_retention() {
-        let (root, state, catalog) = owned_decode_serving_test_state("keep-recent-closed");
-        let model_id = certified_model_id(&state, &catalog);
-        register_completed_session(&state, &catalog, &model_id, now_ms());
-        assert_eq!(close_retained_session(&state).await["closed"], true);
-        let closed_at_ms = retained_session_closed_at_ms(&state);
-
-        // Exactly at the retention boundary the session is still kept.
-        run_background_maintenance_at(
-            &state,
-            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS,
-        );
-
-        assert!(retained_session_registered(&state));
-        let status = retained_session_status(&state).await;
-        assert!(status.get("error").is_none(), "status failed: {status}");
-        assert_eq!(status["session_id"], RETAINED_SESSION_ID);
-        assert_eq!(
-            status["state"],
-            json!({ "state": "terminal", "terminal_state": "completed" })
-        );
-        let repeated_close = close_retained_session(&state).await;
-        assert_eq!(
-            repeated_close["closed"], true,
-            "repeated close: {repeated_close}"
-        );
-        assert_eq!(
-            retained_session_closed_at_ms(&state),
-            closed_at_ms,
-            "a repeated close must not restart the retention window"
-        );
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove retention state");
-    }
-
-    #[tokio::test]
-    async fn maintenance_never_evicts_open_session() {
-        let (root, state, catalog) = owned_decode_serving_test_state("keep-open");
-        let model_id = certified_model_id(&state, &catalog);
-        // Admitted at the very start of the clock and swept at its very end.
-        register_completed_session(&state, &catalog, &model_id, 1);
-
-        run_background_maintenance_at(&state, u64::MAX);
-
-        assert!(retained_session_registered(&state));
-        let status = retained_session_status(&state).await;
-        assert!(status.get("error").is_none(), "status failed: {status}");
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove open-session state");
-    }
-
-    #[tokio::test]
-    async fn disable_unloads_model_after_its_closed_session_was_evicted() {
-        let (root, state, catalog) = owned_decode_serving_test_state("disable-after-evict");
-        let model_id = certified_model_id(&state, &catalog);
-        register_completed_session(&state, &catalog, &model_id, now_ms());
-        assert_eq!(close_retained_session(&state).await["closed"], true);
-        let closed_at_ms = retained_session_closed_at_ms(&state);
-        run_background_maintenance_at(
-            &state,
-            closed_at_ms + CLOSED_OWNED_DECODE_SESSION_RETENTION_MS + 1,
-        );
-        assert!(!retained_session_registered(&state));
-        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
-
-        let outcome = disable_catalog(&state, &catalog).await;
-
-        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
-        assert_eq!(
-            cached_dispatch_models(&state),
-            vec!["unrelated-model".to_string()]
-        );
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove disable-after-evict state");
-    }
-
-    #[tokio::test]
-    async fn disable_unloads_model_no_session_ever_used() {
-        let (root, state, catalog) = owned_decode_serving_test_state("disable-no-session");
-        let model_id = certified_model_id(&state, &catalog);
-        // A dispatch cached by certification before any session was admitted.
-        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
-
-        let outcome = disable_catalog(&state, &catalog).await;
-
-        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
-        assert_eq!(
-            cached_dispatch_models(&state),
-            vec!["unrelated-model".to_string()]
-        );
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove disable-no-session state");
-    }
-
-    #[tokio::test]
-    async fn disable_unloads_model_of_recently_closed_session() {
-        let (root, state, catalog) = owned_decode_serving_test_state("disable-recent-closed");
-        let model_id = certified_model_id(&state, &catalog);
-        register_completed_session(&state, &catalog, &model_id, now_ms());
-        assert_eq!(close_retained_session(&state).await["closed"], true);
-        cache_certified_and_unrelated_dispatches(&state, &root, &model_id);
-
-        let outcome = disable_catalog(&state, &catalog).await;
-
-        assert_eq!(outcome["unload_artifact"], true, "disable: {outcome}");
-        assert_eq!(
-            cached_dispatch_models(&state),
-            vec!["unrelated-model".to_string()]
-        );
-        assert!(retained_session_registered(&state));
-
-        drop(state);
-        fs::remove_dir_all(root).expect("remove disable-recent-closed state");
-    }
     #[tokio::test]
     async fn perf_sampler_disabled_is_silent_and_enabled_names_active_model() {
         let log_root = std::env::temp_dir().join(format!(
@@ -17486,117 +12816,6 @@ mod tests {
             ErrorClass::Permanent,
             "non-lease cache errors keep the permanent classification"
         );
-    }
-
-    #[test]
-    fn owned_decode_quarantine_precheck_honours_the_wall_clock() {
-        // The routing precheck and the dispatch path in worker_host ask the
-        // same predicate. `is_quarantined` answers `now < until`, so a zero
-        // clock in the precheck reports every past expiry as still blocking
-        // while dispatch sees it cleared. This pins the precheck to a real
-        // clock by asserting the two answers agree for an expired record.
-        use owned_decode_worker::budget::{
-            BudgetPolicy, CrashBudget as OwnedCrashBudget, FileBudgetStore,
-        };
-        use owned_decode_worker::error::FailureClassification;
-        use owned_decode_worker::identity::QuarantineKey;
-
-        let root = std::env::temp_dir().join(format!(
-            "synapse-quarantine-clock-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir_all(&root).expect("budget directory");
-        let store = FileBudgetStore::open(root.join("budget.json")).expect("budget store opens");
-        let policy = BudgetPolicy::default();
-        let mut budget = OwnedCrashBudget::new(store, policy);
-        let key = QuarantineKey::new("profile-hash", "decode-fingerprint", "config-digest");
-
-        // Charge far enough in the past that the quarantine window has closed.
-        let charged_at = now_ms()
-            .saturating_sub(policy.quarantine_duration_ms)
-            .saturating_sub(60_000);
-        let mut outcome = None;
-        for _ in 0..policy.max_strikes {
-            outcome = Some(
-                budget
-                    .charge(&key, FailureClassification::Crash, charged_at)
-                    .expect("charge persists"),
-            );
-        }
-        assert!(
-            outcome.expect("at least one charge").quarantined,
-            "the budget must be exhausted for this fixture to mean anything"
-        );
-
-        assert!(
-            !budget.is_quarantined(&key, now_ms()),
-            "an expired quarantine must not block under the real clock"
-        );
-        assert!(
-            budget.is_quarantined(&key, 0),
-            "a zero clock reports the same expired quarantine as blocking; this \
-             is why the precheck must not pass zero"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    // Test the check that routing runs before using a decode lane
-    // (`owned_decode_quarantined`), not only `CrashBudget::is_quarantined`:
-    // if routing passed a constant time instead of the wall clock, an expired
-    // quarantine would keep blocking the lane forever.
-    #[test]
-    fn owned_decode_quarantine_routing_precheck_reads_wall_clock() {
-        use owned_decode_worker::budget::{BudgetPolicy, CrashBudget, FileBudgetStore};
-        use owned_decode_worker::error::FailureClassification;
-        use owned_decode_worker::identity::QuarantineKey;
-
-        let (root, descriptor) = test_storage_descriptor("quarantine-routing-clock");
-        let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
-        let profile = test_machine_profile("quarantine-test");
-        store.activate_profile(&profile, 1, 1000).unwrap();
-        let state = test_module_state(store, profile);
-        let mut spec = stuck_model_spec();
-        spec.worker_runtime_dir = Some(root.clone());
-        let fingerprint = Fingerprint("decode-fingerprint".into());
-        let config_digest = "config-digest";
-        let key = QuarantineKey::new(&state.machine_profile_hash, &fingerprint.0, config_digest);
-        let policy = BudgetPolicy::default();
-        let mut budget = CrashBudget::new(
-            FileBudgetStore::open(owned_decode_budget_store_path(&spec)).unwrap(),
-            policy,
-        );
-        let expired_at = now_ms()
-            .saturating_sub(policy.quarantine_duration_ms)
-            .saturating_sub(60_000);
-        for _ in 0..policy.max_strikes {
-            budget
-                .charge(&key, FailureClassification::Crash, expired_at)
-                .unwrap();
-        }
-        drop(budget);
-        assert!(
-            !owned_decode_quarantined(&state, &spec, &fingerprint, config_digest),
-            "routing must release an expired quarantine"
-        );
-
-        let mut budget = CrashBudget::new(
-            FileBudgetStore::open(owned_decode_budget_store_path(&spec)).unwrap(),
-            policy,
-        );
-        for _ in 0..policy.max_strikes {
-            budget
-                .charge(&key, FailureClassification::Crash, now_ms())
-                .unwrap();
-        }
-        drop(budget);
-        assert!(
-            owned_decode_quarantined(&state, &spec, &fingerprint, config_digest),
-            "routing must retain an active quarantine"
-        );
-        drop(state);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -17704,7 +12923,7 @@ mod tests {
         std::fs::create_dir_all(&cache_root).unwrap();
         let blob_source = cache_root.join("test-blob.bin");
         std::fs::write(&blob_source, b"test-model-artifact-payload").unwrap();
-        let meta = model_cache
+        model_cache
             .ingest(synapse_core::ModelCacheIngest {
                 source_url: format!("file://{}", blob_source.display()),
                 expected_digest: None,
@@ -17713,7 +12932,6 @@ mod tests {
                 pin_module_id: None,
             })
             .expect("ingest test artifact into model cache");
-        let materialized = write_q8_artifact(&cache_root, "gc-reclaim", &meta.digest, 32);
 
         let (machine_profile_hash, revisioned_machine_profile_hash) =
             module_state_machine_profile_hashes(&profile);
@@ -17723,9 +12941,7 @@ mod tests {
             .profile_activation_epoch
             .expect("test profile is activated");
         let module_config = ModuleConfig {
-            cache_max_bytes: std::fs::metadata(model_cache.blob_path(&meta.digest))
-                .unwrap()
-                .len(),
+            cache_max_bytes: 0,
             ..ModuleConfig::default()
         };
         let runtime = Arc::new(
@@ -17745,8 +12961,6 @@ mod tests {
             model_cache,
         });
 
-        // The source blob alone is exactly at the watermark, so this sweep runs
-        // only when the derivative is included in the cache budget.
         let outcome1 = cache_gc(
             Arc::clone(&state),
             json!({
@@ -17759,10 +12973,6 @@ mod tests {
         };
         let payload1: Value = serde_json::from_slice(&body1).expect("json response");
         assert_eq!(payload1["result"]["outcomes"][0]["state"], "marked");
-        assert!(
-            materialized.is_dir(),
-            "marking a source must retain its Q8 derivative during grace"
-        );
         // No delete occurred, so store freelist remains un-vacuumed.
         assert_eq!(store.freelist_count().unwrap(), freelist_before);
 
@@ -17785,10 +12995,6 @@ mod tests {
         };
         let payload2: Value = serde_json::from_slice(&body2).expect("json response");
         assert_eq!(payload2["result"]["outcomes"][0]["state"], "deleted");
-        assert!(
-            !materialized.exists(),
-            "deleting a source must reclaim its Q8 derivative"
-        );
 
         // The GC sweep actually deleted tombstoned blobs, triggering guarded freelist reclaim!
         let freelist_after = store.freelist_count().unwrap();
@@ -17856,42 +13062,6 @@ mod tests {
         (state, model_cache, root, cache_root)
     }
 
-    fn ingest_cache_gc_blob(model_cache: &ModelCache, name: &str, payload: &[u8]) -> String {
-        let source = model_cache.root().join(name);
-        std::fs::write(&source, payload).unwrap();
-        model_cache
-            .ingest(synapse_core::ModelCacheIngest {
-                source_url: format!("file://{}", source.display()),
-                expected_digest: None,
-                format: "bin".to_string(),
-                tokenizer_path: None,
-                pin_module_id: None,
-            })
-            .expect("ingest test artifact into model cache")
-            .digest
-    }
-
-    /// A published Q8 artifact directory as `derive_and_cache_q8_blocks` leaves
-    /// it: an object file and a lineage sidecar naming its source digest.
-    fn write_q8_artifact(
-        cache_root: &Path,
-        key: &str,
-        source_digest: &str,
-        bytes: usize,
-    ) -> PathBuf {
-        let dir = cache_root
-            .join(owned_decode_routing::q8artifact::CACHE_DIRECTORY)
-            .join(key);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("weights.q8_0"), vec![7_u8; bytes]).unwrap();
-        std::fs::write(
-            dir.join("lineage.json"),
-            serde_json::to_vec(&json!({ "source_manifest_digest": source_digest })).unwrap(),
-        )
-        .unwrap();
-        dir
-    }
-
     async fn run_cache_gc(state: &Arc<ModuleState>, params: Value) -> Value {
         let HandlerOutcome::Response(body) = cache_gc(Arc::clone(state), params).await else {
             panic!("expected Response outcome from cache_gc");
@@ -17900,56 +13070,6 @@ mod tests {
         assert!(payload.get("error").is_none(), "cache_gc failed: {payload}");
         payload["result"].clone()
     }
-
-    #[tokio::test]
-    async fn cache_gc_source_deletion_reclaims_its_q8_artifact_only() {
-        let (state, model_cache, root, cache_root) = cache_gc_test_state("gc-q8-source", u64::MAX);
-        let deleted = ingest_cache_gc_blob(&model_cache, "deleted.bin", b"deleted source");
-        let kept = ingest_cache_gc_blob(&model_cache, "kept.bin", b"kept source");
-        let deleted_q8 = write_q8_artifact(&cache_root, &"1".repeat(64), &deleted, 16);
-        let kept_q8 = write_q8_artifact(&cache_root, &"2".repeat(64), &kept, 16);
-
-        for grace_ms in [60_000, 0] {
-            run_cache_gc(&state, json!({ "digest": deleted, "grace_ms": grace_ms })).await;
-        }
-
-        assert!(!model_cache.blob_path(&deleted).exists());
-        assert!(
-            !deleted_q8.exists(),
-            "deleting a source must reclaim its Q8 derivative"
-        );
-        assert!(
-            kept_q8.join("weights.q8_0").is_file(),
-            "a Q8 artifact of another source must survive"
-        );
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(cache_root);
-    }
-
-    #[tokio::test]
-    async fn cache_gc_watermark_counts_q8_artifact_bytes() {
-        // The blob alone is exactly at the budget; only the Q8 derivative
-        // pushes the combined cache over it.
-        let payload = b"q8 watermark source blob";
-        let (state, model_cache, root, cache_root) =
-            cache_gc_test_state("gc-q8-watermark", payload.len() as u64);
-        let digest = ingest_cache_gc_blob(&model_cache, "source.bin", payload);
-        let q8 = write_q8_artifact(&cache_root, &"3".repeat(64), &digest, 64);
-
-        let first = run_cache_gc(&state, json!({ "grace_ms": 60_000 })).await;
-        assert_eq!(
-            first["outcomes"][0]["state"], "marked",
-            "Q8 bytes must count toward the cache budget: {first}"
-        );
-        let second = run_cache_gc(&state, json!({ "grace_ms": 0 })).await;
-        assert_eq!(second["outcomes"][0]["state"], "deleted");
-        assert!(!q8.exists());
-        drop(state);
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(cache_root);
-    }
-
     #[tokio::test]
     async fn cache_gc_removes_ingest_temps_older_than_a_day_only() {
         let (state, _model_cache, root, cache_root) =
@@ -18084,81 +13204,7 @@ mod tests {
             worker_binary_file_name("owned-cuda"),
             Some("ck-synapse-worker-cuda")
         );
-        assert_eq!(
-            worker_binary_file_name("owned-metal-decode"),
-            Some("ck-synapse-worker-decode")
-        );
         assert_eq!(worker_binary_file_name("unknown-engine"), None);
-    }
-
-    #[test]
-    fn worker_path_certification_accepts_exact_and_structural_batteries() {
-        let evidence = |battery| {
-            json!({
-                "worker_path": {
-                    "transport": worker_catalog_transport(),
-                    "protocol": owned_decode_worker::identity::WORKER_PROTOCOL_ID,
-                    "fixture_battery": battery,
-                }
-            })
-        };
-        assert!(worker_path_certification(&evidence("20x64-token-exact")));
-        assert!(worker_path_certification(&evidence(
-            "20x64-structural-band"
-        )));
-        assert!(!worker_path_certification(&evidence("unverified")));
-    }
-
-    #[test]
-    fn simulated_non_macos_owned_decode_resolution_routes_through_lane_selection() {
-        use owned_decode_routing::{
-            error::OwnedDecodeError,
-            family::Family,
-            identity::WeightQuant,
-            lane::{
-                select_lane, FallbackReason, LaneOutcome, LaneSelectionContext, LlamaLane,
-                OwnedEvaluation,
-            },
-            request::{OneshotRequest, SamplingMode},
-        };
-
-        let refusal = owned_decode_resolution_refusal_for_platform("owned-metal-decode", false);
-        assert_eq!(refusal, Some(OwnedDecodeError::Unsupported));
-        assert_eq!(
-            owned_decode_resolution_refusal_for_platform("owned-metal-decode", true),
-            None
-        );
-        let request = OneshotRequest {
-            family: Family::Qwen3_0_6b,
-            weight_quant: WeightQuant::F16,
-            prompt_token_count: 1,
-            max_tokens: 1,
-            sampling: SamplingMode::GreedyTop1,
-            grammar: None,
-            required_fingerprint: None,
-            allow_equivalent: false,
-            target_fingerprint: None,
-            required_processing_fingerprint: None,
-            owned_only: false,
-        };
-        let outcome = select_lane(&LaneSelectionContext {
-            request: &request,
-            owned_decode_fingerprint: Fingerprint("owned-decode".to_string()),
-            owned_processing_fingerprint: Fingerprint("owned-processing".to_string()),
-            owned: OwnedEvaluation::Refused(refusal.expect("unsupported platform refusal")),
-            llama: Some(LlamaLane {
-                decode_fingerprint: Fingerprint("llama-decode".to_string()),
-                processing_fingerprint: Fingerprint("llama-processing".to_string()),
-            }),
-            equivalent_fingerprints: BTreeSet::new(),
-        });
-
-        assert_eq!(
-            outcome,
-            LaneOutcome::Llama {
-                fallback_reason: FallbackReason::OwnedRefusal(OwnedDecodeError::Unsupported),
-            }
-        );
     }
 
     #[test]
@@ -18175,11 +13221,6 @@ mod tests {
         assert_eq!(error.class, ErrorClass::Permanent);
         assert_eq!(error.retry_after_ms, None);
         assert!(!error.safe_to_retry_same_request);
-    }
-
-    #[test]
-    fn second_decode_request_extends_the_absolute_session_boundary() {
-        assert_eq!(absolute_serving_boundary(11, 4), 15);
     }
 
     #[test]
@@ -18453,17 +13494,6 @@ mod tests {
     }
 
     #[test]
-    fn project_tier_rejects_decode_chain_k_with_security_boundary_error() {
-        let error =
-            parse_module_config_json(r#"{"decode_chain_k": 8}"#, "project", ConfigTier::Project)
-                .expect_err("project tier must not control machine decode shape");
-        assert_eq!(
-            error.to_string(),
-            "config: decode_chain_k is user-tier only and may not appear in project-tier config"
-        );
-    }
-
-    #[test]
     fn remote_providers_removed_from_all_config_tiers() {
         for tier in [ConfigTier::User, ConfigTier::Project] {
             for providers in ["[]", "null", "[{}]"] {
@@ -18495,14 +13525,40 @@ mod tests {
                 ));
             }
             parse_module_config_json(r#"{"preload_models":[{"model_id":"llama-generation","engine":"llama","task":"generate","model_path":"model","tokenizer_path":"tokenizer"}]}"#, "test", tier).expect("llama generation preload parses");
-            for (engine, profile) in [
-                ("owned-metal-decode", "null"),
-                ("owned-metal", "\"kept-profile\""),
-            ] {
-                let contents = format!(
-                    r#"{{"preload_models":[{{"engine":"{engine}","profile":{profile},"model_path":"model","tokenizer_path":"tokenizer"}}]}}"#
+            let profiled = r#"{"preload_models":[{"engine":"owned-metal","profile":"kept-profile","model_path":"model","tokenizer_path":"tokenizer"}]}"#;
+            parse_module_config_json(profiled, "test", tier).expect("kept preload parses");
+        }
+    }
+
+    #[test]
+    fn owned_decode_generate_preloads_are_refused_by_model_id() {
+        let config = json!({"preload_models": [{
+            "model_id": "qwen3-0.6b-decode-q8",
+            "engine": "owned-metal-decode",
+            "task": "generate",
+            "model_path": "missing.safetensors",
+            "tokenizer_path": "missing.json",
+            "quantizer_revision": "retired-setting"
+        }]});
+        for tier in [ConfigTier::User, ConfigTier::Project] {
+            let err = parse_module_config_json(&config.to_string(), "test", tier).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "config: preload model_id 'qwen3-0.6b-decode-q8': owned decode serving was retired"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_owned_decode_keys_are_refused_by_name() {
+        for key in ["grammar_enabled", "sidecar_spec", "decode_chain_k"] {
+            let config = format!(r#"{{"{key}":null}}"#);
+            for tier in [ConfigTier::User, ConfigTier::Project] {
+                let err = parse_module_config_json(&config, "test", tier).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("config: {key} was removed; owned decode serving was retired")
                 );
-                parse_module_config_json(&contents, "test", tier).expect("kept preload parses");
             }
         }
     }
@@ -18610,33 +13666,10 @@ mod tests {
     }
 
     #[test]
-    fn module_config_parses_decode_chain_k_with_safe_default_and_bounds() {
-        let default = parse_module_config_json(r#"{}"#, "test", ConfigTier::User)
-            .expect("default chain span should parse");
-        assert_eq!(default.decode_chain_k, DEFAULT_DECODE_CHAIN_K);
-
-        let configured =
-            parse_module_config_json(r#"{"decode_chain_k": 16}"#, "test", ConfigTier::User)
-                .expect("maximum chain span should parse");
-        assert_eq!(configured.decode_chain_k, 16);
-
-        for value in [0, 17] {
-            let error = parse_module_config_json(
-                &format!(r#"{{"decode_chain_k": {value}}}"#),
-                "test",
-                ConfigTier::User,
-            )
-            .expect_err("chain span outside 1..=16 must fail");
-            assert!(error.to_string().contains("decode_chain_k"));
-        }
-    }
-
-    #[test]
     fn module_config_parses_microllm_and_cache_fields() {
         let config = parse_module_config_json(
             r#"{
                 "microllm_max_tokens": 128,
-                "grammar_enabled": true,
                 "cache_max_bytes": 4096
             }"#,
             "test",
@@ -18644,7 +13677,6 @@ mod tests {
         )
         .expect("valid config");
         assert_eq!(config.microllm_max_tokens, 128);
-        assert!(config.grammar_enabled);
         assert_eq!(config.cache_max_bytes, 4096);
     }
 
@@ -18892,44 +13924,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("embedding and rerank models only"));
-    }
-
-    #[test]
-    fn owned_decode_worker_result_preserves_raw_ids_and_terminal_identity() {
-        let response = json!({
-            "result": {
-                "provenance": {
-                    "lane": "decode",
-                    "worker": "supervised",
-                    "decode_fingerprint": "decode-fingerprint",
-                    "processing_fingerprint": "processing-fingerprint",
-                    "worker_generation": 9,
-                },
-                "generated_token_ids": [17, 23],
-                "n_gen": 2,
-                "runtime_config_digest": "runtime-digest",
-                "derived_digest": "derived-digest",
-                "generation_id": "generation-9",
-            }
-        });
-        let stream = parse_owned_decode_worker_stream(
-            &serde_json::to_vec(&response).expect("test response serializes"),
-        )
-        .expect("supervised owned response should map to a stream identity");
-
-        assert_eq!(stream.generated_token_ids, vec![17, 23]);
-        assert_eq!(stream.identity.decode_fingerprint.0, "decode-fingerprint");
-        assert_eq!(
-            stream.identity.processing_fingerprint.0,
-            "processing-fingerprint"
-        );
-        assert_eq!(stream.identity.runtime_config_digest, "runtime-digest");
-        assert_eq!(stream.identity.worker_generation, 9);
-        assert_eq!(
-            stream.identity.derived_digest.as_deref(),
-            Some("derived-digest")
-        );
-        assert_eq!(stream.generation_id, "generation-9");
     }
 
     fn is_transcribe_profile(manifest: &Value, profile: &Value) -> bool {
@@ -19486,10 +14480,8 @@ mod tests {
             )
             .unwrap(),
             fingerprint: spec.fingerprint.clone(),
-            certification_fingerprint: spec.fingerprint.clone(),
             engine_identity: spec.engine_identity.clone(),
             owned_tokenizer_policy: None,
-            owned_decode_resolution_refusal: None,
         })
     }
 
@@ -19614,7 +14606,6 @@ mod tests {
         inner.model_id = spec.model_id.clone();
         inner.engine_identity = spec.engine_identity.clone();
         inner.fingerprint = spec.fingerprint.clone();
-        inner.certification_fingerprint = spec.fingerprint.clone();
         let owned = stored_owned_profile(&spec).unwrap();
         inner.tokenizer = SanitizedTokenizer::from_file(
             &tokenizer_path,
@@ -19711,7 +14702,6 @@ mod tests {
                     method: method.into(),
                     params,
                 },
-                None,
             )),
             method,
         )
@@ -20210,10 +15200,8 @@ mod tests {
             backend: EmbedBackend::Owned(Arc::new(Mutex::new(metal_engine))),
             tokenizer: make_test_tokenizer(&storage_dir, 512),
             fingerprint: metal_spec.fingerprint.clone(),
-            certification_fingerprint: metal_spec.fingerprint.clone(),
             engine_identity: metal_spec.engine_identity.clone(),
             owned_tokenizer_policy: None,
-            owned_decode_resolution_refusal: None,
         });
 
         let mut ane_spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
@@ -20245,10 +15233,8 @@ mod tests {
             backend: EmbedBackend::Worker(Arc::new(Mutex::new(worker_engine))),
             tokenizer: make_test_tokenizer(&storage_dir, 512),
             fingerprint: ane_spec.fingerprint.clone(),
-            certification_fingerprint: ane_spec.fingerprint.clone(),
             engine_identity: ane_spec.engine_identity.clone(),
             owned_tokenizer_policy: None,
-            owned_decode_resolution_refusal: None,
         });
 
         let mut unloaded_spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
@@ -20493,120 +15479,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// The projection must actually reach the descriptor. The unit test above
-    /// pins the projection and the serialization; neither notices if
-    /// `module_catalog_entries` stops wiring them together, which is the one
-    /// edit that would silently restore the original defect.
-    #[test]
-    fn module_catalog_entries_wire_serving_admission_for_decode_lanes() {
-        let (storage_dir, descriptor) = test_storage_descriptor("catalog-serving-admission");
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("store opens"));
-        let profile = test_machine_profile("test-os");
-        store
-            .activate_profile(&profile, 1, 1000)
-            .expect("activate profile");
-        let state = test_module_state(store, profile);
-        let _ = &storage_dir;
-
-        let mut decode_spec = stuck_model_spec();
-        decode_spec.model_id = "test-decode-lane".to_string();
-        decode_spec.engine = DECODE_WORKER_ENGINE.to_string();
-        decode_spec.task = "generate".to_string();
-        decode_spec.fingerprint = Fingerprint("d".repeat(64));
-
-        {
-            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
-            catalog.clear();
-            catalog.insert(
-                decode_spec.model_id.clone(),
-                ModelSlot {
-                    spec: decode_spec.clone(),
-                    loaded: None,
-                    state: ModelRuntimeState::Unloaded,
-                    notify: Arc::new(Notify::new()),
-                    last_cold_load_ms: None,
-                },
-            );
-        }
-
-        let entries = module_catalog_entries(&state);
-        let row = entries
-            .iter()
-            .find(|entry| entry.model_id == "test-decode-lane")
-            .expect("the decode lane appears in the catalog");
-
-        // No approval row was written, so the lane refuses; the descriptor must
-        // say so rather than leaving a consumer with `certified` alone.
-        assert_eq!(
-            row.serving_admission.as_deref(),
-            Some("disabled"),
-            "a decode lane with no approval must report disabled: {row:?}"
-        );
-        assert_eq!(
-            row.serving_admission_reason.as_deref(),
-            Some("approval_absent")
-        );
-    }
-
-    /// `models.list` must carry the approval fact, not only the certification
-    /// fact. A decode lane can be certified for this machine and still refuse
-    /// every request because no operator approved it, and before this field the
-    /// only thing the descriptor said about that lane was `certified: true` --
-    /// so a consumer picking a lane read a lane that refuses as ready.
-    ///
-    /// Asserts BOTH rows rather than one: the disabled lane must say disabled
-    /// while still reporting `certified: true` (otherwise the fix would be
-    /// indistinguishable from making `certified` mean serving), and the enabled
-    /// lane must say enabled (otherwise a field stuck at "disabled" would pass).
-    #[test]
-    fn models_list_reports_serving_admission_beside_certified() {
-        let approved = serving_admission_projection(true, true, Some((true, None)));
-        assert_eq!(approved, (Some("enabled"), None));
-
-        let certified_but_unapproved = serving_admission_projection(true, true, None);
-        assert_eq!(
-            certified_but_unapproved,
-            (Some("disabled"), Some("approval_absent".to_string())),
-            "a certified lane with no approval row must read disabled, because it refuses"
-        );
-
-        let approved_but_uncertified =
-            serving_admission_projection(true, false, Some((true, None)));
-        assert_eq!(
-            approved_but_uncertified,
-            (Some("disabled"), Some("not_certified".to_string()))
-        );
-
-        // A lane class with no approval concept omits the field rather than
-        // defaulting it, so absence can never be read as "enabled".
-        assert_eq!(
-            serving_admission_projection(false, true, Some((true, None))),
-            (None, None)
-        );
-
-        // And the descriptor must actually serialize what the projection says.
-        let entry = ModelCatalogEntry {
-            model_id: "owned-model".to_string(),
-            state: "unloaded".to_string(),
-            fingerprints: vec![Fingerprint("f".repeat(64))],
-            recommended_batch: None,
-            max_tokens: Some(512),
-            max_tokens_source: Some("catalog".to_string()),
-            bucket_ladder: None,
-            dims: None,
-            dtype: None,
-            device_class: None,
-            certified: Some(true),
-            serving_admission: certified_but_unapproved.0.map(str::to_string),
-            serving_admission_reason: certified_but_unapproved.1.clone(),
-            warm_load_cost_hint_ms: None,
-        };
-        let value = serde_json::to_value(&entry).expect("entry serializes");
-        assert_eq!(value["certified"], json!(true));
-        assert_eq!(value["serving_admission"], json!("disabled"));
-        assert_eq!(value["serving_admission_reason"], json!("approval_absent"));
-    }
-
     #[test]
     fn models_list_every_row_carries_max_tokens_and_matches_enforced_source() {
         let (_storage_dir, descriptor) = test_storage_descriptor("models-list-source-match");
@@ -20641,85 +15513,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn models_list_generate_lane_without_evidence_does_not_report_certified_true() {
-        let (_storage_dir, descriptor) = test_storage_descriptor("models-list-generate-uncert");
-        let store = Arc::new(SynapseStore::open(&descriptor).expect("open test store"));
-        let profile = test_machine_profile("test-os");
-        store
-            .activate_profile(&profile, 1, 1000)
-            .expect("activate profile");
-        let state = test_module_state(store, profile);
-
-        let mut llama_spec = stuck_model_spec();
-        llama_spec.model_id = "test-llama-generate".to_string();
-        llama_spec.engine = "llama".to_string();
-        llama_spec.task = "generate".to_string();
-
-        let mut decode_spec = stuck_model_spec();
-        decode_spec.model_id = "test-decode-generate".to_string();
-        decode_spec.engine = DECODE_WORKER_ENGINE.to_string();
-        decode_spec.task = "generate".to_string();
-
-        {
-            let mut catalog = state.runtime.catalog.lock().expect("catalog locks");
-            catalog.clear();
-            catalog.insert(
-                llama_spec.model_id.clone(),
-                ModelSlot {
-                    spec: llama_spec.clone(),
-                    loaded: None,
-                    state: ModelRuntimeState::Ready,
-                    notify: Arc::new(Notify::new()),
-                    last_cold_load_ms: None,
-                },
-            );
-            catalog.insert(
-                decode_spec.model_id.clone(),
-                ModelSlot {
-                    spec: decode_spec.clone(),
-                    loaded: None,
-                    state: ModelRuntimeState::Ready,
-                    notify: Arc::new(Notify::new()),
-                    last_cold_load_ms: None,
-                },
-            );
-        }
-
-        let payload = models_list_payload(&state);
-        let models = payload["models"]
-            .as_array()
-            .expect("models array in payload");
-
-        let llama_row = models
-            .iter()
-            .find(|r| r["model_id"] == "test-llama-generate")
-            .expect("llama row exists");
-        assert_ne!(
-            llama_row.get("certified"),
-            Some(&json!(true)),
-            "generate lane without evidence must not report certified=true"
-        );
-        assert!(
-            llama_row.get("certified").is_none(),
-            "legacy generate lane without certification concept must omit certified field"
-        );
-
-        let decode_row = models
-            .iter()
-            .find(|r| r["model_id"] == "test-decode-generate")
-            .expect("decode row exists");
-        assert_ne!(
-            decode_row.get("certified"),
-            Some(&json!(true)),
-            "uncertified decode lane must not report certified=true"
-        );
-        assert_eq!(
-            decode_row["certified"], false,
-            "uncertified decode lane must report certified=false"
-        );
     }
 
     #[tokio::test]
@@ -21151,9 +15944,6 @@ mod catalog_runtime_tests {
                     },
                     state.model_cache.clone(),
                     8192,
-                    Arc::new(Mutex::new(
-                        owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
-                    )),
                     None,
                 )
                 .err()
@@ -21451,9 +16241,6 @@ mod catalog_runtime_tests {
             },
             state.model_cache.clone(),
             8192,
-            Arc::new(Mutex::new(
-                owned_decode_routing::q8ingest::Q8IngestRegistry::default(),
-            )),
             None,
         )
         .unwrap();

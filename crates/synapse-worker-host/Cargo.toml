@@ -13,9 +13,7 @@ test-support = []
 
 [dependencies]
 synapse-core = { path = "../synapse-core" }
-synapse-owned-decode = { path = "../synapse-owned-decode" }
 synapse-speech = { path = "../synapse-speech" }
-owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

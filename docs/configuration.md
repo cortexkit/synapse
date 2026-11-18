@@ -12,8 +12,11 @@ should call providers directly.
 `enable_alias_admin`) are rejected at startup, even when set to `false`.
 Each embed or rerank entry in `preload_models` must specify a manifest
 `profile`; a free-form entry fails startup with its `model_id`. Llama generation
-preloads may still omit `profile`. Parked `owned-metal-decode` preloads retain
-their existing certification and approval gates.
+preloads may still omit `profile`. `owned-metal-decode` preloads are rejected at
+startup with their `model_id` because owned decode serving was retired. Before
+upgrading, remove those entries from `preload_models` and remove the top-level
+`grammar_enabled`, `sidecar_spec`, and `decode_chain_k` keys. Each retired key
+is rejected by name, even when set to its former default.
 
 Create a new example file rather than overwriting an existing configuration:
 
@@ -23,8 +26,6 @@ cat > "$config" <<'JSON'
 {
   "knob": "balanced",
   "microllm_max_tokens": 512,
-  "grammar_enabled": false,
-  "decode_chain_k": 1,
   "cache_max_bytes": 34359738368,
   "worker": { "load_timeout_ms": 180000 },
   "preload_models": [],
@@ -47,9 +48,6 @@ This preparation does not launch or reconfigure a module. When using a reviewed
 configuration, pass `SYNAPSE_CONFIG_PATH="$config"` through the normal supervised
 launch configuration. Do not start a second instance to change a running module.
 The example has no preloads or credentials and is not a certified model installation.
-`decode_chain_k` is user-tier only, ranges from 1 through 16, and remains one under
-grammar; larger free-text spans require matching certification coverage.
-Project configurations must omit that user-only setting.
 
 ## Verify the behavior, not only the file syntax
 
@@ -57,7 +55,7 @@ The JSON check above verifies syntax only. The module validates configuration at
 startup; use its management surface to inspect the active model catalog, health
 and admission status. [The wire contract](wire-contract-v1.md) defines those
 operations and typed refusals. A backend advertised in configuration is not
-permission to bypass hardware, self-check or approval gates.
+permission to bypass hardware or self-check gates.
 
 ## Reverse the example
 
@@ -68,6 +66,6 @@ rm "$config"
 unset config
 ```
 
-Do not delete installed model data, leases, approvals or an existing user config
+Do not delete installed model data, leases or an existing user config
 to reverse this example. Changes to numerical policy need identity and
 certification handling, not just a configuration edit.

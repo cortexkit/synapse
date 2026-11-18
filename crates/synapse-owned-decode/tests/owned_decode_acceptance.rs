@@ -16,7 +16,7 @@ use synapse_core::{
     OneshotEnvelopeIdentity, OwnedDecodeRefusal, ProgressFrame, SessionStatusState,
     StreamFrameDisposition, StreamSequence, TerminalEnvelope, TerminalState, WorkerFrame,
 };
-use synapse_module::{
+use synapse_owned_decode::{
     owned_decode_certification::{
         certification_unit::CertificationGateResult, compare_streams, ArtifactLineage,
         CertificationError, CertificationGate, CertificationRecord, CertificationRegistry,

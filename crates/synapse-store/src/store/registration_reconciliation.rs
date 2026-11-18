@@ -1,12 +1,11 @@
 use super::*;
 
 impl SynapseStore {
-    /// Restore supported registrations without reviving retired engines.
+    /// Restore supported registrations and release orphaned pins.
     ///
-    /// Core ML and profile-less owned embed/rerank rows stay in the table until
-    /// the legacy-model migration removes them. Other disallowed rows are deleted
-    /// and their blob pins released unless a remaining registration still uses the blob. Reserved
-    /// catalog ids stay in the table but are not registered by this path.
+    /// Disallowed embed/rerank engines are deleted and their blob pins are
+    /// released unless a remaining registration still uses the blob. Reserved
+    /// catalog IDs stay in the table but are not registered by this path.
     pub fn reconcile_persisted_registrations(
         &self,
         is_reserved: &dyn Fn(&str) -> bool,
@@ -43,26 +42,16 @@ impl SynapseStore {
             let mut released = BTreeSet::new();
             for (model_id, engine, task, config_json) in rows {
                 let embed_or_rerank = task == "embed" || task == "rerank";
-                if matches!(
-                    engine.as_str(),
-                    "ane" | "ane-coreml-worker" | "coreml" | "neural_engine"
-                ) {
-                    reconciliation.skipped_retired.push((model_id, engine));
-                } else if embed_or_rerank && !OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str())
-                {
+                if embed_or_rerank && !OWNED_EMBED_RERANK_ENGINES.contains(&engine.as_str()) {
                     tx.execute("DELETE FROM models WHERE model_id = ?1", params![model_id])?;
                     released.extend(registration_blob_digests(&config_json));
                     reconciliation.deleted.push((model_id, engine));
                 } else if is_reserved(&model_id) {
                     reconciliation.skipped_reserved.push(model_id);
                 } else {
-                    let model = decode_model_config(config_json)?;
-                    if embed_or_rerank && !model.engine_identity.build_flags.contains_key("profile")
-                    {
-                        reconciliation.skipped_retired.push((model_id, engine));
-                    } else {
-                        reconciliation.registrable.push(model);
-                    }
+                    reconciliation
+                        .registrable
+                        .push(decode_model_config(config_json)?);
                 }
             }
             for digest in released {

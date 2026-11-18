@@ -16,7 +16,7 @@ mod real {
     use sha2::{Digest, Sha256};
     use synapse_core::Fingerprint;
     use synapse_engine_owned::owned_decode_engine::TokenVocabulary;
-    use synapse_module::owned_decode_grammar_scheduler::{
+    use synapse_owned_decode::owned_decode_grammar_scheduler::{
         compile_grammar, CompileContext, GrammarSubsetManifest,
     };
     use tokenizers::Tokenizer;

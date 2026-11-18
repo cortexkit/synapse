@@ -31,7 +31,7 @@ matrix determine supported backends and published assets.
 | `synapse-opctl` | Operator client; `ck-synapse-opctl`. |
 | `synapse-worker-llama` | Supervised GGUF worker. |
 | `synapse-worker-ane-direct` | Direct Neural Engine compilation, admission and inference worker. |
-| `synapse-worker-decode` | Supervised owned-generation worker. |
+| `synapse-worker-decode` | Parked owned Metal generation worker, built in CI but not shipped. |
 | `synapse-worker-cuda` | Owned CUDA worker. |
 | `synapse-worker-vulkan` | Owned Vulkan embedding/reranking worker. |
 

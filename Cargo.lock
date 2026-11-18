@@ -7301,7 +7301,6 @@ dependencies = [
  "half",
  "hex",
  "metal",
- "owned-decode-worker",
  "reqwest",
  "rusqlite",
  "safetensors 0.6.2",
@@ -7319,7 +7318,6 @@ dependencies = [
  "synapse-core",
  "synapse-engine-owned",
  "synapse-module",
- "synapse-owned-decode",
  "synapse-parity",
  "synapse-speech",
  "synapse-store",
@@ -7362,6 +7360,7 @@ dependencies = [
  "anyhow",
  "half",
  "hex",
+ "owned-decode-worker",
  "safetensors 0.6.2",
  "serde",
  "serde_json",
@@ -7430,7 +7429,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "synapse-core",
- "synapse-owned-decode",
  "synapse-store",
  "thiserror 1.0.69",
  "tracing",
@@ -7489,7 +7487,8 @@ dependencies = [
  "sha2",
  "synapse-core",
  "synapse-engine-owned",
- "synapse-module",
+ "synapse-owned-decode",
+ "synapse-worker-host",
  "tokenizers 0.21.4",
 ]
 
@@ -7497,12 +7496,10 @@ dependencies = [
 name = "synapse-worker-host"
 version = "0.1.0-alpha.2"
 dependencies = [
- "owned-decode-worker",
  "serde",
  "serde_json",
  "synapse-certify",
  "synapse-core",
- "synapse-owned-decode",
  "synapse-speech",
  "thiserror 1.0.69",
  "tokio",

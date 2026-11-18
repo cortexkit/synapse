@@ -47,14 +47,11 @@ Transient errors may carry retry_after_ms. Never poll-hammer
 a permanent code.
 
 Error-code vocabularies are surface-specific. Core `StableErrorCode` supplies
-`queue_full`, `deadline_exceeded`, `model_loading`, `not_certified`,
+`queue_full`, `deadline_exceeded`, `model_loading`,
 `substitution_rejected`, `artifact_invalid`, `engine_crashed`,
 `probe_required`, `migration_required`, and `module_restarted` here.
-Owned-decode refusals use a separate vocabulary:
-`grammar_disabled` is not a `StableErrorCode`; it is emitted for constrained
-`microllm.oneshot` requests when grammar is disabled by module or approval
-configuration, or when no certified enabled owned-decode grammar lane is
-available.
+`grammar_disabled` is a channel error for `microllm.oneshot` requests that
+supply nonempty grammar; llama.cpp generation accepts free text only.
 
 The [local transcription surface](#local-batch-transcription-media-providerv1)
 uses the `media-provider/v1` envelope and refusal vocabulary, not the catalog
@@ -200,8 +197,8 @@ Checks: `embed_query_deadline_one_returns_typed_rejection` (skeleton e2e) and
 deadline_ms (absolute budget), max_queue_ms (fast-fail bound — admission is
 atomic accept-or-reject against it), required_fingerprint,
  allow_equivalent (accepted and ignored),
-required_epoch, target_fingerprint (embed.query: route only to a matching or
-certified-equivalent profile, else substitution_rejected/not_certified).
+required_epoch, target_fingerprint (route only to an exact fingerprint match,
+else `substitution_rejected`).
 
 ## 4. Flow-scoped routes
 
@@ -232,14 +229,9 @@ not prove numerical execution.
 
 The management registry in this snapshot is `embed.query`, `embed.batch`,
 `embed.result`, `rerank.score`, `microllm.oneshot`,
-`owned_decode.admit_session`, `owned_decode.decode`, `owned_decode.snapshot`,
-`owned_decode.continue`, `owned_decode.abort`, `owned_decode.close`,
-`owned_decode.session_status`, `owned_decode.disable`, `owned_decode.revoke`,
 `model.status`, `model.unload`, `models.list`, `models.catalog`,
 `models.download`, `models.download.cancel`, `models.remove`,
-`cache.pin`, `cache.gc`, `admission.status`,
-`approvals.migrate_owned_decode`, `approvals.enable`, `approvals.disable`,
-`approvals.emergency_rollback`, `certify.observations`, `lanes.pause`,
+`cache.pin`, `cache.gc`, `admission.status`, `certify.observations`, `lanes.pause`,
 `lanes.resume`, `lanes.status`, `diagnostics.findings`, `events_get`, `role.describe`,
 `media.submit`, `media.status`, `media.result`, `media.cancel`,
 `media.upload_begin`, `media.upload_append`, `media.upload_status`,
@@ -610,17 +602,12 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
 - **rerank.score** {model, query, candidates[], …} — RAW per-candidate
   scores (no server-side ordering opinions); interactive ≤20 candidates,
   bulk beyond. Catalog `qwen3-reranker-0.6b` declares ANE, CUDA and Vulkan lanes,
-  but no Metal lane. Free-form local reranking accepts
-  owned engines only, never llama.cpp.
-- **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy.
+  but no Metal lane.
+- **microllm.oneshot** {model, prompt, max_tokens, grammar?, …} — greedy llama.cpp generation.
   `max_tokens` is capped by module config `microllm_max_tokens` (default 512);
   requests above the ceiling are rejected with both numbers in the error.
-  `grammar` (GBNF): unset or empty = free-text. When set, constrained
-  decoding is permitted only if module config `grammar_enabled` is true (default
-  false); otherwise grammar requests fail closed with typed `grammar_disabled`.
-  When the constrained runtime is unavailable or not certified, grammar requests
-  fail closed with the same reason; the retired `grammar_unavailable_in_build` code
-  is not emitted.
+  Omit `grammar` or pass an empty string for free-text generation. Nonempty
+  grammar is refused with `grammar_disabled` before worker dispatch.
 - **`models.catalog`** (query) `{query?, task?, runnable_here?, installed?}` →
   `{catalog_revision, models[]}`. Unknown params are rejected. Filters intersect;
   query is trimmed, case-insensitive substring search over id, name and description;
@@ -708,22 +695,8 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     reported by the loaded model; omitted when unknown.
   - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
   - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
-  - `certified` (boolean, optional) — for parked owned-decode lanes, whether matching
-    certification evidence exists under the current machine profile. Profile preloads
-    use self-checks instead of certification evidence. Llama generation omits the field.
-    **`certified: true` does not mean the lane will serve.** Certification and serving approval
-    are separate facts recorded by separate writes: a lane that is certified but not approved
-    refuses every request (or, for a substitutable unconstrained request, is answered by a
-    different lane). A consumer deciding where to send traffic wants `serving_admission` below.
-  - `serving_admission` (`"enabled"` | `"disabled"`, optional) — whether this lane is approved
-     to take traffic.
-    `"enabled"` requires both an enabled approval row and current certification evidence.
-    Omitted for lane classes with no approval concept — absence means "not applicable", never
-    "enabled".
-  - `serving_admission_reason` (string, optional) — why `serving_admission` is `"disabled"`,
-    one of `approval_absent`, `approval_disabled`, `not_certified`, `approval_unavailable`,
-    `self_check_failed`, or
-    a recorded operator reason. Absent when the lane is enabled or has no approval concept.
+  - Llama generation omits `certified`, `serving_admission` and
+    `serving_admission_reason`. Embed/rerank preloads use their profile self-check.
   - `warm_load_cost_hint_ms` (float) — observed load duration hint in milliseconds,
      sourced from observed load duration. This is an advisory hint, not a
      performance guarantee or upper bound; actual
@@ -732,17 +705,15 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
 
   Local embed/rerank rows never report `device_class: cpu`; the current catalog
   reports `metal` only. Other device classes may appear for profile preloads.
-  Catalog rows are an exception to approval-based fields above. They add
-  `self_check` (`state: pending | passed | failed`, with identity/evidence when
-  available).
-  For one release catalog `certified` mirrors `self_check.state == passed` and
-  `serving_admission` is enabled unless self-check failed, then disabled with
-  reason `self_check_failed`. No approval row is consulted. Next release removes
-  these two compatibility fields from catalog rows in favor of `self_check`.
+  Catalog rows add `self_check` (`state: pending | passed | failed`, with
+  identity and evidence when available). For compatibility, `certified` mirrors
+  `self_check.state == passed` and `serving_admission` is enabled unless the
+  self-check failed, then disabled with `serving_admission_reason: self_check_failed`.
+  Prefer `self_check` over these compatibility fields.
   Catalog rows exist for runnable, current-manifest installed backends only,
   have lane id `<catalog_id>-<backend>`, one fingerprint, and initial state
   `unloaded` with `max_tokens_source: catalog_unloaded`. Unload keeps the row;
-  remove deletes it. Owned-decode approval gates are unchanged.
+  remove deletes it.
   Transcribe rows instead carry `max_duration_ms` and omit `max_tokens`,
   `max_tokens_source`, `recommended_batch`, `bucket_ladder`, `dims`, `pooling`,
   `normalize` and `attention_units`; their envelope counts audio duration and
@@ -772,12 +743,12 @@ A catalog id selects the first runnable backend in catalog order; a declared
 lane id or fingerprint pins a backend. The selected lane never falls back to
 another backend when loading, failed or uninstalled. Serving uses cached local
 files only, lazily loads and runs self-check, never network I/O. Catalog lanes
-never read knob assignments or require probes/approvals. The self-check key is
+never read stored model assignments for a performance knob. The self-check key is
 catalog id, manifest digest, backend, fingerprint, engine identity, OS build and
 fixture revision. Key changes reset it to pending; persisted numerical failure
 refuses without rerunning. Remove and redownload also permits a new check.
 
-Worker quarantine is also a catalog serving error, not a probe/approval gate:
+Worker quarantine is a catalog serving error:
 it returns transient `engine_crashed` with `{lane_id, quarantined: true}` and a
 positive `retry_after_ms` equal to the remaining fixed ten-minute cool-down.
 The lane stays selected; no other backend is substituted. On expiry the next
@@ -813,8 +784,12 @@ direct-ANE compile-blocked deadline waits retain `shape_compiling`.
    `unknown_model` for serving/status/unload, but `invalid_request` for
    download/remove; use a declared lane or catalog id.
 - `model.unload` with a catalog id is rejected: unload a declared lane id from
-  `details.lane_ids`, then use `models.remove` to delete installation files.
+   `details.lane_ids`, then use `models.remove` to delete installation files.
 
+Schema 19 deletes retired Core ML, free-form embed/rerank, and owned-decode
+registrations and their legacy gate tables. Back up the SQLite store before
+upgrading. Older binaries refuse newer schemas; to roll back, stop Synapse and
+restore the pre-upgrade store backup before restarting the older binary.
 - **admission.status** — advisory snapshot: queue depths, current knob,
    registered lane counts, and job outcome counters.
   Job counters are per-process since start:
@@ -830,9 +805,9 @@ direct-ANE compile-blocked deadline waits retain `shape_compiling`.
   Download jobs count as minted; `committed` counts completed, and `failed`
   or `cancelled` counts failed, preserving the identity above.
    `catalog_lanes` counts registered lanes, including unloaded ones.
-   `certified_lanes` counts lanes with current owned-decode evidence, not
-   catalog self-check passes. Catalog lanes report `certification_required: false`,
-   `certification_status: not_required`, and their `self_check`.
+    `certified_lanes` is retained for compatibility and is always zero; it does
+    not count self-check passes. Catalog lanes report `certification_required: false`,
+    `certification_status: not_required`, and their `self_check`.
   The `lanes` array remains resident-only because its
   `meeting_deadlines`, rolling start-delay, waiter, and in-flight values describe
   live execution state. The contract lives in per-request budgets, not this
@@ -840,179 +815,6 @@ direct-ANE compile-blocked deadline waits retain `shape_compiling`.
 - **cache.pin / cache.gc** — model cache management (content-addressed,
   shared-lease readers, two-phase GC; GC never deletes under a live reader
   or a foreign pin).
-
-### Owned-decode lane certification
-
-Parked owned-decode lanes serve only with matching persisted certification and
-an enabled approval. `models.list` projects evidence as `certified` and projects
-serving permission separately as `serving_admission` and
-`serving_admission_reason`. No on-device operation writes new certification
-rows. The llama.cpp worker path does not require this certification or approval.
-### Owned-decode session operations (envelope v2)
-
-Every successful operation below has the management response envelope
-`{"result": <payload>}`. Malformed parameters are channel errors with
-`invalid_request`; the owned-decode domain refusals below instead use
-`{"result":{"module_generation": <u64>, "error": {"code", "class":
-"permanent", "safe_to_retry_same_request": false, "message"}}}`. The domain
-refusal list is exhaustive for the checks in these handlers; a worker dispatch
-can additionally return the normal owned-route errors described by its route.
-
-#### `owned_decode.admit_session`
-
-- Params: `{catalog_fingerprint, caller_id, context_ceiling_tokens,
-  generation: {mode: "greedy_top1"}, kv_configuration:
-  {block_size_tokens, recurrent_state_grain_tokens}}`. All fields are required
-  and unknown fields are rejected. The only accepted generation mode is
-  `greedy_top1`; KV block size is one of 256, 512, or 1024 tokens and the
-  recurrent-state grain must be nonzero.
-- Result payload: `{session_id, catalog_fingerprint, approval_generation,
-  reservation: {reserved_embed_rerank_bytes, reserved_artifact_weight_bytes,
-  reserved_session_kv_bytes, context_ceiling_tokens}}`.
-- Errors: `invalid_request`, `sampling_unsupported`, `artifact_unapproved`,
-  `artifact_disabled`, `artifact_revoked`, `artifact_mismatch`,
-  `unsupported_machine`, `invalid_context_ceiling`, `insufficient_memory`,
-  `incompatible_resident_artifact`, `invalid_kv_configuration`,
-  `owned_decode_unavailable`, and `store_failure`.
-- Semantics: admission reserves the certified artifact and session KV budget,
-  records the serving-session approval generation, and writes no session on a
-  refusal. A session can only be admitted against the requested catalog
-  fingerprint's current serving approval and matching certification.
-
-#### `owned_decode.decode`
-
-- Params: `{session_id, req_id, prompt, max_tokens, grammar?, deadline_ms?,
-  max_queue_ms?}`. All fields before `?` are required; `req_id` is nonempty and
-  `max_tokens` is positive. `grammar` is free text when absent or empty.
-- Result payload: `{session_id, req_id, frames: [FrameEnvelope...]}`. Each
-  frame is envelope-v2: `{protocol: "owned-decode-envelope-v2",
-  protocol_version: 2, req_id, session_id, stream_seq, kind, ...}`. `stream_seq`
-  starts at 1 and is monotonic. A progress frame has
-  `{kind: "progress", progress: {committed_token_ids: [u32...],
-  committed_token_count}}`; the IDs are newly committed, while the count is
-  cumulative. The terminal is `{kind: "final"|"error", terminal: {req_id,
-  session_id, committed_token_count, tokens_emitted, decode_fingerprint,
-  processing_fingerprint, runtime_config_digest, worker_generation,
-  derived_digest?, terminal_state, decode_mode, speculative_telemetry?}}`.
-  The session handler emits serial terminals; `speculative_telemetry` is absent.
-- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
-  `decode_scheduler_busy`, `request_cancelled`, `worker_protocol_error`,
-  `scheduler_boundary_error`, `store_failure`, `owned_decode_unavailable`, and
-  normal owned-route errors such as `grammar_disabled`, `queue_full`,
-  `deadline_exceeded`, `model_loading`, `artifact_invalid`, and
-  `engine_crashed`.
-- Semantics: the response carries every frame produced by this invocation. A
-  token becomes visible only after its scheduler and durable serving-session
-  boundary both commit. The terminal accounts for exactly that committed prefix;
-  an emergency revoke returns an `artifact_revoked` error terminal after the
-  last committed progress frame rather than retracting tokens.
-
-#### `owned_decode.snapshot`
-
-- Params: `{session_id, position_tokens}`; both fields are required and unknown
-  fields are rejected.
-- Result payload: `{session_id, retained_kv_session_id, retained_position,
-  reused_blocks}`.
-- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
-  `invalid_kv_configuration`, `invalid_kv_alignment`, `artifact_unapproved`,
-  `artifact_disabled`, `artifact_revoked`, `artifact_mismatch`,
-  `incompatible_resident_artifact`, `store_failure`, and
-  `owned_decode_unavailable`.
-- Semantics: snapshots are accepted only while the session is idle, at the LCM
-  boundary of its KV block size and recurrent-state grain. The retained state
-  is durable and belongs to that session and catalog fingerprint.
-
-#### `owned_decode.continue`
-
-- Params: `{session_id, retained_kv_session_id, req_id?}`; unknown fields are
-  rejected.
-- Result payload: `{session_id, retained_kv_session_id, retained_position,
-  reused_blocks}`.
-- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
-  `retained_kv_unavailable`, `artifact_unapproved`, `artifact_disabled`,
-  `artifact_revoked`, `artifact_mismatch`, `incompatible_resident_artifact`,
-  `store_failure`, and `owned_decode_unavailable`.
-- Semantics: continuation is only for the matching session's retained state at
-  an idle boundary. When `req_id` is supplied, its retained stream prefix must
-  match the snapshot position, so continuation neither replays nor skips an
-  already committed token.
-
-#### `owned_decode.abort`
-
-- Params: `{session_id, req_id, retain_kv}`; all fields are required and
-  unknown fields are rejected.
-- Result payload: `{session_id, req_id, abort: "requested", disposition:
-  "removed_queued"|"deferred_to_boundary"}`.
-- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`, and
-  `owned_decode_unavailable`.
-- Semantics: abort is an acknowledgement, not a terminal. The active decode
-  observes it at its next committed boundary. If retained, its decode result
-  carries `cancelled: {req_id, generation_id, committed_token_count}` beside
-  the final error frame; status recovery uses that same committed count.
-
-#### `owned_decode.close`
-
-- Params: `{session_id}`; unknown fields are rejected.
-- Result payload: `{session_id, closed: true, unload_artifact}`.
-- Errors: `invalid_request`, `unknown_session`, `session_still_in_flight`,
-  `routing_error`, `store_failure`, and `owned_decode_unavailable`.
-- Semantics: close is idempotent after a successful close, but cannot close an
-  active decode. It completes durable serving state and may release the
-  artifact only when no active sessions still require it.
-- Retention: a closed session (closed by `owned_decode.close` or by an
-  `artifact_revoked` terminal) stays known for 15 minutes after it closed, so a
-  retried close and a status query after a lost frame both still see it. After
-  that window the module forgets the session: `owned_decode.close`,
-  `owned_decode.session_status`, `owned_decode.snapshot`,
-  `owned_decode.continue`, and `owned_decode.decode` all return
-  `unknown_session` for it. A repeated close does not restart the window. Open
-  sessions are never forgotten, however long ago they were admitted.
-
-#### `owned_decode.session_status`
-
-- Params: `{session_id, req_id}`; both fields are required and unknown fields
-  are rejected.
-- Result payload: `{session_id, req_id, committed_token_count, state,
-  retained_kv_session_id?}`. `state` is either `"in_flight"` or
-  `{state: "terminal", terminal_state: "completed"|"aborted"|
-  "artifact_disabled"|"artifact_revoked"|"failed"}`.
-- Errors: `invalid_request`, `unknown_session`, `unknown_request`, and
-  `owned_decode_unavailable`.
-- Semantics: use this result after a lost or gapped envelope-v2 frame. It is
-  authoritative for the monotonic committed-token count and never revises
-  history already committed by a progress frame. A closed session's terminal
-  state stays available for 15 minutes after it closed; after that window the
-  session is no longer known and status returns `unknown_session` (see the
-  retention rule under `owned_decode.close`).
-
-#### `owned_decode.disable`
-
-- Params: `{catalog_fingerprint, reason}`; both fields are required and
-  unknown fields are rejected.
-- Result payload: `{approval: {schema_revision, catalog_fingerprint,
-  certification_record_id, artifact_id, state: "disabled"|"revoked",
-  reason, approved_by, approved_at_ms, updated_at_ms, generation,
-  semantic_digest}, invalidated_retained_states, active_sessions,
-  termination_requested_sessions, unload_artifact}`.
-- Errors: `invalid_request` and `store_failure`.
-- Semantics: disable fences new session admissions and invalidates retained KV
-  states for that catalog fingerprint, but lets an already active decode finish
-  normally. A previously revoked serving approval remains revoked. When
-  `unload_artifact` is true, the module also unloads the resident decode worker
-  for the model named by the catalog's certification record, whether or not any
-  session for that catalog is still known.
-
-#### `owned_decode.revoke`
-
-- Params: `{catalog_fingerprint, reason}`; both fields are required and
-  unknown fields are rejected.
-- Result payload: the same `ServingControlOutcome` shape as
-  `owned_decode.disable`, with `approval.state: "revoked"`.
-- Errors: `invalid_request` and `store_failure`.
-- Semantics: revoke fences new admissions, invalidates retained state, and
-  marks active sessions for `artifact_revoked` terminal accounting at their
-  next committed boundary. It also requests the in-memory scheduler revoke and
-  can unload the artifact when no active session remains.
 
 ### Model unload
 
@@ -1025,67 +827,8 @@ can additionally return the normal owned-route errors described by its route.
 - Errors: `invalid_request`, `unknown_model`, `model_in_use`, `model_loading`,
   and `engine_crashed`. A catalog id carries `{catalog_id, lane_ids[]}`; use a
   declared lane id. An undeclared derived lane is `unknown_model`.
-- Semantics: unloading a ready model removes its loaded engine and owned-decode
-  dispatch cache, but keeps the catalog model registered and its cached artifact
-  available for later lazy reload.
-
-### Owned-decode approval administration
-
-Approval rows are identified by the pair `(model_id, decode_fingerprint)`, not
-by model ID alone. The approval mutation path is a fenced store transaction:
-each changed identity receives a monotonic `generation`, and migration compares
-its single pinned seed marker before writing (the store epoch/CAS boundary).
-These wire operations do not accept a caller-supplied expected epoch. The
-server recomputes the row's semantic digest in the same transaction.
-
-#### `approvals.migrate_owned_decode`
-
-- Params: `{seed_revision, schema_revision}`; both fields are required and
-  unknown fields are rejected.
-- Result payload: `{outcome, seed_revision, rows, marker, rendering}`. Outcomes
-  include `applied`, `already_applied`, `invalid_seed`, `unmappable_identity`,
-  `duplicate_identity`, and `transaction_failed`; non-applied outcomes leave
-  approval rows and the migration marker unchanged.
-- Errors: `invalid_request`, `approval_migration_state_corrupt`, and
-  `store_failure`.
-- Semantics: the one-shot migration validates the pinned seed, resolves every
-  seed identity to exactly one eligible catalog model, compares its marker under
-  the fence, then writes all approval rows and the marker atomically.
-
-#### `approvals.enable`
-
-- Params: `{model_id, decode_fingerprint, grammar_enabled}`; all fields are
-  required and unknown fields are rejected.
-- Result payload: `{model_id, decode_fingerprint, enabled, grammar_enabled,
-  approved_by, approved_at_ms, semantic_digest, generation}`.
-- Errors: `invalid_request`, `operator_identity_unavailable`, and
-  `store_failure`.
-- Semantics: an authenticated operator identity supplies `approved_by`. Enable
-  creates or re-enables exactly the requested identity; a new row starts at
-  generation 0 and a re-enable increments its generation. The model ID must
-  resolve to exactly one owned-metal-decode generate catalog entry.
-
-#### `approvals.disable`
-
-- Params: `{model_id, decode_fingerprint, reason}`; all fields are required and
-  unknown fields are rejected.
-- Result payload: `{model_id, decode_fingerprint, enabled: false,
-  disabled_reason}`.
-- Errors: `invalid_request` and `store_failure`.
-- Semantics: disable changes exactly one approval identity. The reason must be
-  nonempty; disabling a missing identity or a storage validation failure is
-  reported as `store_failure` by this handler.
-
-#### `approvals.emergency_rollback`
-
-- Params: `{reason}`; `reason` is required and unknown fields are rejected.
-- Result payload: `{disabled, reason}`.
-- Errors: `invalid_request` and `store_failure`.
-- Semantics: the reason must be nonempty. One fenced transaction disables every
-  owned-decode approval identity across the approval lanes, writes that reason,
-  recomputes each changed row digest, and increments each changed row generation.
-  This approvals-table rollback does not itself invoke `owned_decode.revoke` or
-  terminate already active serving sessions.
+- Semantics: unloading a ready model releases its loaded engine, but keeps the
+  catalog model registered and its cached artifact available for lazy reload.
 
 ## 6. Divergence detector (content_sha256 and submitted_sha256)
 
@@ -1149,26 +892,11 @@ committed item IDs.
 `accept_declared` and `allow_equivalent`. `microllm.oneshot` remains strict:
 it accepts but ignores `allow_equivalent`, and does not accept `accept_declared`.
 
-Owned-decode responses may add optional `chain_k` provenance. Legacy readers must
-ignore additive provenance fields; this introduces no request field.
-
 ## 10. Compatibility and load-time verification
 
 Checks: `tests::wire_contract_documents_every_management_operation` (module
 library), `all_sixteen_profiles_have_sealed_model_specific_subsets` and
 `tampered_subset_digest_refuses_and_names_profile` (certification self-checks).
-
-### Grammar refusal retirement
-
-`grammar_unavailable_in_build` is retired in favor of `grammar_disabled`. For a
-constrained `microllm.oneshot` request on a platform or machine without a
-certified owned-decode lane, the stable `grammar_disabled` refusal is returned;
-when applicable, the original owned-decode refusal remains available as additive
-`underlying_owned_decode_refusal_id` provenance. Constrained requests remain
-owned-only: they never fall back to llama GBNF or retry unconstrained.
-
-**Consumer notice:** callers matching the legacy `grammar_unavailable_in_build`
-string must switch to `grammar_disabled`; the legacy code is no longer emitted.
 
 ### Profile preload load-time checks
 
@@ -1181,7 +909,7 @@ invalid seal, or numerical mismatch refuses with `self_check_failed`, naming
 the profile. Failed checks stay failed for the same model fingerprint, engine,
 OS build, manifest and reference subset digest. Free-form embed and rerank
 preloads are rejected at startup; llama generation preloads are unaffected.
-Parked `owned-metal-decode` preloads retain their certification and approval gates.
+`owned-metal-decode` preloads are rejected at startup with their `model_id`.
 
 The fixed subset is `short-0`, `boundary-127`, `boundary-128`, `boundary-129`,
 plus `pool10-000`, `pool10-001`, `pool10-002` for rerankers. It covers short input,

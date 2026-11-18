@@ -39,20 +39,18 @@ required-features = ["e2e"]
 
 [features]
 default = []
-test-support = ["synapse-engine-owned/test-support", "synapse-owned-decode/test-support", "synapse-store/test-support", "synapse-worker-host/test-support"]
+test-support = ["synapse-engine-owned/test-support", "synapse-store/test-support", "synapse-worker-host/test-support"]
 e2e = ["test-support"]
 
 [dependencies]
 anyhow = { workspace = true }
 synapse-core = { path = "../synapse-core" }
-synapse-owned-decode = { path = "../synapse-owned-decode" }
 synapse-store = { path = "../synapse-store" }
 synapse-worker-host = { path = "../synapse-worker-host" }
 synapse-speech = { path = "../synapse-speech" }
 synapse-certify = { path = "../synapse-certify" }
 synapse-parity = { path = "../../bench/parity" }
 synapse-engine-owned = { path = "../synapse-engine-owned" }
-owned-decode-worker = { path = "../synapse-engine-owned/owned-decode-worker" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

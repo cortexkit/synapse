@@ -2,10 +2,7 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
-/// Usage string for restore-import CLI command. Restored approvals are imported
-/// disabled and require operator re-enable.
-const RESTORE_USAGE: &str =
-    "usage: ck-synapse restore-import <scratch-db> [--into <store-dir>] (restored approvals are disabled and require operator re-enable)";
+const RESTORE_USAGE: &str = "usage: ck-synapse restore-import <scratch-db> [--into <store-dir>]";
 
 #[tokio::main]
 async fn main() {

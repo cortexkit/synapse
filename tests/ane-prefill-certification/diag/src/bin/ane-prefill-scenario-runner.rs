@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use serde_json::{json, Value};
 use synapse_core::Fingerprint;
-use synapse_module::owned_decode_routing::ane_prefill::{
+use synapse_owned_decode::owned_decode_routing::ane_prefill::{
     AneGuard, AnePlatform, AnePrefillFault, AnePrefillRouter, AneSplitAttempt,
     AneSplitAttemptResult, AneSplitCompletion, AneSplitRequest, AneSplitRouteDecision,
     AneSplitRoutingConfig, CertifiedArtifactIdentity, DecodePrefill, GuardAcquisition,
@@ -12,8 +12,8 @@ use synapse_module::owned_decode_routing::ane_prefill::{
     PrefillFallbackReason, RuntimeArtifactIdentity, SplitArmCertification, SplitArmHealth,
     SplitArmKey, SplitArmState, SplitDecodeConfig, SplitHealthPolicy, SplitTimingBudgets,
 };
-use synapse_module::owned_decode_routing::family::Family;
-use synapse_module::owned_decode_routing::request::SamplingMode;
+use synapse_owned_decode::owned_decode_routing::family::Family;
+use synapse_owned_decode::owned_decode_routing::request::SamplingMode;
 
 const PROFILE: &str = "ane-prefill-certification-scenario";
 const SOURCE_DIGEST: &str = "source-a";

@@ -14,7 +14,7 @@ inside the module process; the rest run in supervised worker processes that the
 module spawns and talks to over local IPC. The
 repository also holds a benchmark and research tree (`bench/`).
 
-Models come from two places:
+Models come from the catalog or preloads:
 - **The catalog**, compiled into the binary (`crates/synapse-module/src/catalog/models.json`):
   ModernBERT (gte-modernbert-base, gte-reranker-modernbert-base) and Qwen3 0.6B
   (Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B), plus Parakeet TDT 0.6B v3 for
@@ -22,7 +22,8 @@ Models come from two places:
   explicit (`models.download`); a catalog lane checks itself on the device at first
   load and needs no probe or approval.
 - **Profile preloads**, configured with a manifest `profile`. These also check
-  themselves on-device. Parked owned-decode preloads still use their existing gates.
+  themselves on-device. Llama.cpp generation also uses preloads and needs no
+  numerical self-check.
 
 ## Major pieces
 
@@ -31,13 +32,11 @@ consumers talk to. It registers the wire operations, loads config
 (`SYNAPSE_CONFIG_PATH`, else `.cortexkit/synapse.jsonc` in the working directory,
 else `cortexkit/synapse.jsonc` in the user config dir), tokenizes requests, admits
 jobs through the scheduler, owns the SQLite store (catalog installs and self-checks,
-durable jobs and result pages, owned-decode certification and approval rows), and
+durable jobs and result pages), and
 dispatches work to an in-process engine or a
 worker. It also answers `diagnostics.findings` for unattended health checks, runs
 the timed Neural Engine pause (`lanes.pause`), and writes its backup descriptor for
-Engram at startup. Owned-generation logic lives in sibling directories of `src/`:
-`owned-decode-routing`, `owned-decode-grammar-scheduler`,
-`owned-decode-certification`, `owned-decode-sidecar` and `owned-decode-manifests`.
+Engram, the backup service, at startup.
 
 **`synapse-core`** (`crates/synapse-core`). Shared vocabulary for the module and the
 workers: engine traits (`EmbedEngine`, `RerankEngine`, `GenerateEngine`,
@@ -63,7 +62,9 @@ calls the machine profile needs on Windows, kept out of `synapse-core`.
 and reranking on Apple GPUs through MPSGraph (ModernBERT, Qwen3, MiniLM) with a
 bounded sequence-bucket ladder. It also holds the direct Metal decode kernels for
 Qwen3 and LFM2 (`owned-decode-engine`) and the owned-decode supervisor, protocol and
-crash budget (`owned-decode-worker`) used by the decode worker and the module.
+crash budget (`owned-decode-worker`). These decode crates, `synapse-owned-decode`
+and `synapse-worker-decode` stay in the workspace for development; the module
+does not serve owned decode and releases do not ship its worker.
 
 **CUDA engine** (`crates/synapse-engine-cuda`). Embedding and reranking on NVIDIA
 GPUs (MiniLM, ModernBERT, Qwen3) from ported PTX kernels, with a hardware-floor
@@ -79,14 +80,8 @@ supervises. Which ones a release ships is decided by the release workflow:
   refuses software rasterizers.
 - `ck-synapse-worker-cuda` (`crates/synapse-worker-cuda`): wraps the CUDA engine;
   `--probe-floor` reports hardware readings before the module commits to it.
-- `ck-synapse-worker-decode` (`crates/synapse-worker-decode`): owned Metal token
-  generation for Qwen3 and LFM2, driven quantum by quantum by the owned-decode
-  supervisor.
 - `ck-synapse-worker-llama` (`crates/synapse-worker-llama`): llama.cpp generation for
   GGUF models. The serving allow-list never routes embedding or reranking to it.
-- `ane-prefill-sidecar` (`workers/ane-prefill-sidecar`): a Swift package that runs
-  fixed-window Qwen3 prefill on the Neural Engine and hands the KV cache to the decode
-  worker.
 
 **Certification.** `crates/synapse-certify` holds the release record format and its
 validator; `ck-synapse` exposes only `certify validate` and `certify source`. The
@@ -97,7 +92,7 @@ prebuilt release assets.
 
 **`synapse-opctl`** (`crates/synapse-opctl`, binary `ck-synapse-opctl`). Operator CLI
 over the module's operations: lanes (pause, resume, status), models,
-admission stats, approvals and rollback, batch submission and paged results.
+admission stats, batch submission and paged results.
 `crates/synapse-module/src/bin/subc_call.rs` sends one raw method call to any module.
 
 **Bench tree** (`bench/`). `bench/parity` (`synapse-parity`, its own workspace) holds
@@ -118,7 +113,7 @@ rerank quality scoring.
 | Module entry and ops | `crates/synapse-module/src/lib.rs` | `dispatch_request`, `management_operations`, handlers, config |
 | Model catalog | `crates/synapse-module/src/catalog/` | `models.json` pins, backend declarations, manifest digests |
 | Batch transcription | `crates/synapse-module/src/media_jobs.rs`, `transcribe_host.rs` | local media jobs, audio retention, catalog transcribe hosts and observation paging |
-| Store | `crates/synapse-store/` | SQLite schema, migrations, engine allow-list, jobs, certification, approvals, event-outbox persistence; publisher stays in the module |
+| Store | `crates/synapse-store/` | SQLite schema, migrations, engine allow-list, jobs, and event-outbox persistence; publisher stays in the module |
 | Worker host crate | `crates/synapse-worker-host/` | Supervised worker processes, transcription exchange, liveness and ANE residency |
 | Worker host | `crates/synapse-worker-host/src/worker_host/mod.rs` | spawn, handshake, requests, restarts, quarantine |
 | Worker liveness | `crates/synapse-worker-host/src/worker_host/liveness.rs` | no-progress limits |
@@ -126,8 +121,7 @@ rerank quality scoring.
 | Neural Engine pause | `crates/synapse-module/src/lane_pause.rs` | timed pause of the ANE lanes |
 | Diagnostics | `crates/synapse-module/src/diagnostics_findings.rs` | `diagnostics.findings` |
 | Engram descriptor | `crates/synapse-module/src/engram_catalog.rs` | backup catalog written at startup |
-| Approvals rollback | `crates/synapse-module/src/rollback.rs` | disable and emergency rollback |
-| Owned decode | `crates/synapse-owned-decode/` | contracts, sidecar, routing, grammar scheduler, pure certification |
+| Parked owned decode | `crates/synapse-owned-decode/` | contracts, sidecar, routing, grammar scheduler, pure certification |
 | Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TranscribeEngine`, `TokenBatch` |
 | Shared speech core | `crates/synapse-speech/src/` | WAV front end, TDT loop, detokenization and word timing |
 | Tokenizer | `crates/synapse-core/src/tokenizer.rs` | sanitized tokenization, digests, truncation disclosure |

@@ -849,7 +849,7 @@ async fn catalog_shared_blob_survives_removal_of_one_entry() {
 }
 
 #[tokio::test]
-async fn catalog_conflicting_legacy_rows_do_not_change_catalog_projections() {
+async fn catalog_ignores_conflicting_knob_assignments_in_its_projections() {
     let mut h = CatalogHarness::start("ok", None).await;
     let accepted = h.download("gte-modernbert-base", "first").await;
     let done = h
@@ -864,10 +864,7 @@ async fn catalog_conflicting_legacy_rows_do_not_change_catalog_projections() {
     let conn = Connection::open(expected_store_path(&h.daemon.data_home)).unwrap();
     let fingerprint = before["models"][0]["fingerprints"][0].as_str().unwrap();
     let machine = admission["machine_profile_hash"].as_str().unwrap();
-    conn.execute("INSERT INTO cert_rows (certification_class,assurance_class,key_hash,machine_profile_hash,numeric_profile_id,fingerprint,certified_at_ms,os_build,module_generation,evidence_json,status) VALUES ('embedding','measured',?2,?2,'conflict',?1,1,'other-os',1,'{}','uncertified')", params![fingerprint, machine]).unwrap();
-    conn.execute("INSERT INTO perf_rows VALUES (?2,'gte-modernbert-base-metal','embed','conflict',?1,'ort',1,'other-os',1,1,1,1,'{}')", params![fingerprint, machine]).unwrap();
     conn.execute("INSERT INTO knob_assignments VALUES (?2,'embed','balanced','gte-modernbert-base-metal','conflict',?1,'ort',1,'other-os',1,1,1)", params![fingerprint, machine]).unwrap();
-    conn.execute("INSERT INTO approvals (schema_revision,model_id,decode_fingerprint,enabled,grammar_enabled,disabled_reason,updated_at_ms,evidence_requirements_revision,semantic_digest) VALUES ('conflict','gte-modernbert-base-metal',?1,0,0,'conflicting denial',1,'conflict','conflict')", [fingerprint]).unwrap();
     let after = h.call("models.list", serde_json::json!({})).await;
     assert_eq!(before["models"], after["models"]);
     let after_admission = h.call("admission.status", serde_json::json!({})).await;

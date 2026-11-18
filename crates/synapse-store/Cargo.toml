@@ -20,7 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 synapse-core = { path = "../synapse-core" }
-synapse-owned-decode = { path = "../synapse-owned-decode" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -52,10 +52,6 @@ enum Command {
         #[command(subcommand)]
         command: AdmissionCommand,
     },
-    Approvals {
-        #[command(subcommand)]
-        command: ApprovalsCommand,
-    },
     Embed {
         #[command(subcommand)]
         command: EmbedCommand,
@@ -152,38 +148,6 @@ mod lane_command_tests {
 enum AdmissionCommand {
     /// Show the advisory scheduler snapshot.
     Status,
-}
-
-#[derive(Debug, Subcommand)]
-enum ApprovalsCommand {
-    /// Copy the checked-in retired owned-decode approval records into the
-    /// approval table once; the migration is idempotent and preserves the
-    /// records as the initial approval state.
-    MigrateOwnedDecode,
-    /// Create or explicitly re-enable one exact approval identity.
-    Enable {
-        #[arg(long)]
-        model_id: String,
-        #[arg(long)]
-        decode_fingerprint: String,
-        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-        grammar_enabled: bool,
-    },
-    /// Disable one exact (model_id, decode_fingerprint) approval.
-    Disable {
-        #[arg(long)]
-        model_id: String,
-        #[arg(long)]
-        decode_fingerprint: String,
-        #[arg(long)]
-        reason: String,
-    },
-    /// Disable every owned-decode approval atomically in a single transaction
-    /// so a rollback cannot expose a partially updated approval set.
-    EmergencyRollback {
-        #[arg(long)]
-        reason: String,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -288,63 +252,6 @@ async fn execute(
         Command::Admission {
             command: AdmissionCommand::Status,
         } => call(consumer, identity, "admission.status", json!({})).await,
-        Command::Approvals { command } => match command {
-            ApprovalsCommand::MigrateOwnedDecode => {
-                call(
-                    consumer,
-                    identity,
-                    "approvals.migrate_owned_decode",
-                    json!({
-                        "seed_revision": "owned-decode-approval-migration-v1",
-                        "schema_revision": "runtime-bound-records-contracts-v1",
-                    }),
-                )
-                .await
-            }
-            ApprovalsCommand::Enable {
-                model_id,
-                decode_fingerprint,
-                grammar_enabled,
-            } => {
-                call(
-                    consumer,
-                    identity,
-                    "approvals.enable",
-                    json!({
-                        "model_id": model_id,
-                        "decode_fingerprint": decode_fingerprint,
-                        "grammar_enabled": grammar_enabled,
-                    }),
-                )
-                .await
-            }
-            ApprovalsCommand::Disable {
-                model_id,
-                decode_fingerprint,
-                reason,
-            } => {
-                call(
-                    consumer,
-                    identity,
-                    "approvals.disable",
-                    json!({
-                        "model_id": model_id,
-                        "decode_fingerprint": decode_fingerprint,
-                        "reason": reason,
-                    }),
-                )
-                .await
-            }
-            ApprovalsCommand::EmergencyRollback { reason } => {
-                call(
-                    consumer,
-                    identity,
-                    "approvals.emergency_rollback",
-                    json!({ "reason": reason }),
-                )
-                .await
-            }
-        },
         Command::Embed {
             command: EmbedCommand::Batch(args),
         } => {
