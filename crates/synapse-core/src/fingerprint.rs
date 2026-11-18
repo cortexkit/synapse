@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::engine::EngineIdentity;
@@ -117,129 +114,6 @@ impl NumericProfile {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AliasRow {
-    #[serde(rename = "fingerprint_a", alias = "left", alias = "left_fingerprint")]
-    pub fingerprint_a: Fingerprint,
-    #[serde(rename = "fingerprint_b", alias = "right", alias = "right_fingerprint")]
-    pub fingerprint_b: Fingerprint,
-    #[serde(rename = "valid_from_ms", alias = "valid_from_epoch")]
-    pub valid_from_ms: u64,
-    #[serde(
-        default,
-        rename = "valid_to_ms",
-        alias = "valid_to_epoch_exclusive",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub valid_to_ms: Option<u64>,
-    #[serde(default = "empty_evidence")]
-    pub evidence: Value,
-}
-
-impl AliasRow {
-    pub fn with_evidence(
-        fingerprint_a: Fingerprint,
-        fingerprint_b: Fingerprint,
-        valid_from_ms: u64,
-        valid_to_ms: Option<u64>,
-        evidence: Value,
-    ) -> Self {
-        let (fingerprint_a, fingerprint_b) = canonical_pair(fingerprint_a, fingerprint_b);
-        Self {
-            fingerprint_a,
-            fingerprint_b,
-            valid_from_ms,
-            valid_to_ms,
-            evidence,
-        }
-    }
-
-    pub fn is_active_at(&self, at_ms: u64) -> bool {
-        self.valid_from_ms <= at_ms && self.valid_to_ms.map(|until| at_ms < until).unwrap_or(true)
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct AliasTable {
-    pub table_epoch: u64,
-    #[serde(default)]
-    pub rows: Vec<AliasRow>,
-}
-
-impl AliasTable {
-    pub fn equivalent_fingerprints_at(
-        &self,
-        fingerprint: &Fingerprint,
-        at_epoch: u64,
-    ) -> BTreeSet<Fingerprint> {
-        self.rows
-            .iter()
-            .filter(|row| row.is_active_at(at_epoch))
-            .filter_map(|row| {
-                if &row.fingerprint_a == fingerprint {
-                    Some(row.fingerprint_b.clone())
-                } else if &row.fingerprint_b == fingerprint {
-                    Some(row.fingerprint_a.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn check_index(
-        &self,
-        index_fingerprint: &Fingerprint,
-        provenance_set: &BTreeSet<Fingerprint>,
-    ) -> AliasCheckVerdict {
-        for row in &self.rows {
-            if provenance_set.contains(&row.fingerprint_a)
-                && provenance_set.contains(&row.fingerprint_b)
-                && row.valid_to_ms.is_some()
-            {
-                return AliasCheckVerdict::MigrationRequired {
-                    retracted_pair: RetractedAliasPair {
-                        fingerprint_a: row.fingerprint_a.clone(),
-                        fingerprint_b: row.fingerprint_b.clone(),
-                    },
-                    rebuild_target: index_fingerprint.clone(),
-                };
-            }
-        }
-        AliasCheckVerdict::Valid
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetractedAliasPair {
-    #[serde(rename = "fingerprint_a", alias = "left")]
-    pub fingerprint_a: Fingerprint,
-    #[serde(rename = "fingerprint_b", alias = "right")]
-    pub fingerprint_b: Fingerprint,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
-pub enum AliasCheckVerdict {
-    Valid,
-    MigrationRequired {
-        retracted_pair: RetractedAliasPair,
-        rebuild_target: Fingerprint,
-    },
-}
-
-fn empty_evidence() -> Value {
-    Value::Object(Default::default())
-}
-
-fn canonical_pair(left: Fingerprint, right: Fingerprint) -> (Fingerprint, Fingerprint) {
-    if left <= right {
-        (left, right)
-    } else {
-        (right, left)
-    }
-}
-
 /// Formats the digest of an already canonicalized manifest grammar entry.
 pub fn input_grammar_identity(canonical_entry: &[u8]) -> String {
     format!("synapse-input-grammar-v1:{}", sha256_hex(canonical_entry))
@@ -253,7 +127,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use super::*;
     use crate::engine::EngineIdentity;
@@ -431,54 +305,5 @@ mod tests {
         let before = profile.fingerprint();
         profile.manifest_profile_digest = Some(sha256_hex(br#"{"gelu_lowering":"exact"}"#));
         assert_ne!(before, profile.fingerprint());
-    }
-
-    #[test]
-    fn alias_validity_queries_detect_mid_flight_retractions() {
-        let a = Fingerprint("fp-a".to_string());
-        let b = Fingerprint("fp-b".to_string());
-        let active = AliasTable {
-            table_epoch: 4,
-            rows: vec![AliasRow::with_evidence(
-                a.clone(),
-                b.clone(),
-                1,
-                None,
-                empty_evidence(),
-            )],
-        };
-        assert_eq!(
-            active.equivalent_fingerprints_at(&a, 4),
-            BTreeSet::from([b.clone()])
-        );
-        assert_eq!(
-            active.check_index(&a, &BTreeSet::from([a.clone(), b.clone()])),
-            AliasCheckVerdict::Valid
-        );
-
-        let retracted = AliasTable {
-            table_epoch: 5,
-            rows: vec![AliasRow::with_evidence(
-                a.clone(),
-                b.clone(),
-                1,
-                Some(5),
-                empty_evidence(),
-            )],
-        };
-        assert_eq!(
-            retracted.check_index(&a, &BTreeSet::from([a.clone(), b.clone()])),
-            AliasCheckVerdict::MigrationRequired {
-                retracted_pair: RetractedAliasPair {
-                    fingerprint_a: a.clone(),
-                    fingerprint_b: b.clone(),
-                },
-                rebuild_target: a.clone(),
-            }
-        );
-        assert_eq!(
-            retracted.check_index(&a, &BTreeSet::from([a.clone()])),
-            AliasCheckVerdict::Valid
-        );
     }
 }

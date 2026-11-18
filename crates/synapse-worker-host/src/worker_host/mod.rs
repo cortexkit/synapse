@@ -46,8 +46,7 @@ const STDERR_RING_BYTES: usize = 8 * 1024;
 #[cfg(all(test, unix))]
 mod quarantine_tests;
 
-// Catalog users cannot manually probe and approve a worker to restore serving.
-// A finite ten-minute cool-down lets a desktop lane recover without that step.
+// A finite cool-down lets a quarantined catalog lane recover unattended.
 pub const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
 mod liveness;
 #[cfg(all(unix, any(test, feature = "test-support")))]
@@ -871,9 +870,7 @@ impl WorkerHost {
         let (response, _) = match response {
             Ok(response) => response,
             Err(error @ WorkerHostError::EngineCrashed { .. }) => {
-                // A placement ping is part of ANE probe execution. Treat a
-                // dead worker like any other supervised request so its crash
-                // budget and lazy restart state stay consistent.
+                // Charge a dead worker to the same crash budget as serving requests.
                 let crash_keys = self
                     .loaded_models
                     .values()

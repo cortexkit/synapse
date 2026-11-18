@@ -5630,16 +5630,8 @@ fn model_status_payload(module_generation: u64, slot: &ModelSlotSnapshot) -> Val
         "engine": slot.spec.engine,
         "task": slot.spec.task,
     });
-    if let Value::Object(map) = &mut payload {
-        match &slot.state {
-            ModelRuntimeState::Failed(error) => {
-                map.insert(
-                    "error".to_string(),
-                    serde_json::to_value(error).expect("model error serializes"),
-                );
-            }
-            _ => {}
-        }
+    if let ModelRuntimeState::Failed(error) = &slot.state {
+        payload["error"] = serde_json::to_value(error).expect("model error serializes");
     }
     payload
 }
@@ -17611,7 +17603,9 @@ mod tests {
     async fn admission_status_counts_registered_but_nonresident_profile_lanes() {
         let (root, descriptor) = test_storage_descriptor("admission-catalog-lanes");
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
-        let state = test_module_state(store, test_machine_profile("test-os"));
+        let profile = test_machine_profile("test-os");
+        store.activate_profile(&profile, 1, 1000).unwrap();
+        let state = test_module_state(store, profile);
         state
             .runtime
             .catalog
@@ -19250,117 +19244,6 @@ mod tests {
     }
 
     #[test]
-    fn preload_fingerprints_rebuild_from_committed_inputs() {
-        // Existing production lanes must keep their fingerprints: a preload
-        // lane is built exactly as the module builds it, with no projection
-        // opt-in, and must reproduce the captured production identity and
-        // fingerprint byte for byte.
-        for (bytes, pinned) in [
-            (
-                include_bytes!("../../../bench/parity/preload/gte-modernbert-base-f16.json")
-                    .as_slice(),
-                "24cc5271f42dbc2d154f963e2d67d1adef322cbdfbb541b3eddfaa8ae8859dfb",
-            ),
-            (
-                include_bytes!(
-                    "../../../bench/parity/preload/gte-reranker-modernbert-base-f32.json"
-                )
-                .as_slice(),
-                "2fa5f24c0208f30c6db4bf18eb66bc0b2c46f765882cb744fcc58cd080b2b92d",
-            ),
-        ] {
-            let fixture: Value = serde_json::from_slice(bytes).unwrap();
-            let inline: InlineConfig = serde_json::from_value(fixture["inline"].clone()).unwrap();
-            let jobs: JobConfig = serde_json::from_value(fixture["jobs"].clone()).unwrap();
-            // A preload without a catalog profile goes through owned_catalog_config,
-            // which detects the family from config.json beside the weights.
-            let model_dir = std::env::temp_dir().join(format!(
-                "synapse-preload-identity-{}-{}",
-                std::process::id(),
-                fixture["model_id"].as_str().unwrap()
-            ));
-            std::fs::create_dir_all(&model_dir).unwrap();
-            std::fs::write(
-                model_dir.join("config.json"),
-                br#"{"model_type":"modernbert"}"#,
-            )
-            .unwrap();
-            let owned = owned_catalog_config(
-                &model_dir,
-                fixture["owned_family"].as_str(),
-                fixture["owned_dtype"].as_str(),
-                Some("explicit"),
-                None,
-                None,
-                Vec::new(),
-            )
-            .unwrap();
-            let _ = std::fs::remove_dir_all(&model_dir);
-            let spec = build_stored_model_config(
-                fixture["model_id"].as_str().unwrap().into(),
-                "owned-metal",
-                parse_model_task(fixture["task"].as_str(), "owned-metal", "fixture").unwrap(),
-                fixture["artifact_digest"].as_str().unwrap().into(),
-                "safetensors".into(),
-                fixture["sanitized_tokenizer_digest"]
-                    .as_str()
-                    .unwrap()
-                    .into(),
-                ModelAssetLocator::LocalPath {
-                    path: "unused".into(),
-                },
-                ModelAssetLocator::LocalPath {
-                    path: "unused".into(),
-                },
-                String::new(),
-                String::new(),
-                parse_pooling(fixture["pooling"].as_str().unwrap()).unwrap(),
-                fixture["normalize"].as_bool().unwrap(),
-                fixture["max_tokens"].as_u64().unwrap() as usize,
-                fixture["quant"].as_str().unwrap().into(),
-                false,
-                None,
-                None,
-                Vec::new(),
-                Some(owned),
-                &inline,
-                &jobs,
-            )
-            .unwrap();
-            let captured: EngineIdentity =
-                serde_json::from_value(fixture["captured"]["engine_identity"].clone()).unwrap();
-            assert_eq!(fixture["expected_fingerprint"], pinned);
-            assert_eq!(spec.engine_identity, captured);
-            assert_eq!(spec.engine_identity.build_flags["graph_revision"], "4");
-            assert!(!spec
-                .engine_identity
-                .build_flags
-                .contains_key(PROJECTION_DTYPE_CONFIG_KEY));
-            assert!(!spec.engine_identity.build_flags.contains_key("profile"));
-            assert_eq!(spec.fingerprint.0, pinned);
-            let (root, descriptor) = test_storage_descriptor("persisted-metal-pin");
-            let store = SynapseStore::open(&descriptor).unwrap();
-            store.upsert_model(&spec, 1).unwrap();
-            let config = ModuleConfig {
-                inline,
-                jobs,
-                ..ModuleConfig::default()
-            };
-            let restored = sync_and_load_catalog_models(
-                &store,
-                &config,
-                &runtime_release_catalog().unwrap(),
-                &ModelCache::new(root.join("cache")),
-            )
-            .unwrap();
-            assert_eq!(restored, vec![spec]);
-            assert_eq!(restored[0].fingerprint.0, pinned);
-            drop(store);
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    #[test]
     fn only_catalog_f16_modernbert_lanes_opt_in_and_the_engine_is_told() {
         assert_eq!(
             catalog_projection_dtype(OwnedFamily::GteModernBert, OwnedDType::F16),
@@ -19443,22 +19326,6 @@ mod tests {
         assert_ne!(opted_in.fingerprint, default.fingerprint);
     }
 
-    /// Unit vectors whose similarity to every other item is ordered by `scale`:
-    /// item i is `scale[i] * e0 + sqrt(1 - scale[i]^2) * e(i+1)`, so the cosine of
-    /// items i and j is `scale[i] * scale[j]`.
-    fn rank_fixture(scale: &[f64]) -> Vec<Vec<f32>> {
-        scale
-            .iter()
-            .enumerate()
-            .map(|(index, &value)| {
-                let mut vector = vec![0.0_f32; scale.len() + 1];
-                vector[0] = value as f32;
-                vector[index + 1] = (1.0 - value * value).sqrt() as f32;
-                vector
-            })
-            .collect()
-    }
-
     #[test]
     fn preload_profile_key_builds_every_catalog_lane_without_config_json() {
         let (dir, _) = test_storage_descriptor("catalog-preload");
@@ -19488,6 +19355,14 @@ mod tests {
             assert_eq!(stored.engine_identity.build_flags["profile"], *id);
             assert_eq!(stored.artifact_digest, fixture.artifact_digest);
             assert_eq!(model.tokenizer.max_tokens(), usize::MAX);
+            let restored = normalize_catalog_model(
+                stored.clone(),
+                &InlineConfig::default(),
+                &JobConfig::default(),
+            )
+            .unwrap();
+            assert_eq!(restored.fingerprint, stored.fingerprint, "{id}");
+            assert_eq!(restored.engine_identity, stored.engine_identity, "{id}");
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -20311,7 +20186,7 @@ mod tests {
             .expect("activate profile");
         let state = test_module_state(store, profile);
 
-        let mut metal_spec = stuck_model_spec();
+        let mut metal_spec = catalog_fixture_config("gte-modernbert-base.owned-metal");
         metal_spec.model_id = "test-metal-lane".to_string();
         metal_spec.engine = "owned-metal".to_string();
         metal_spec.task = "embed".to_string();
@@ -20341,29 +20216,11 @@ mod tests {
             owned_decode_resolution_refusal: None,
         });
 
-        state
-            .store
-            .sqlite()
-            .with_conn(|conn| {
-                conn.execute(
-                    "INSERT INTO cert_rows (
-                        certification_class, assurance_class, status, key_hash,
-                        machine_profile_hash, remote_profile_hash, identity_revision,
-                        numeric_profile_id, fingerprint, certified_at_ms, os_build,
-                        module_generation, evidence_json
-                     ) VALUES (?1, 'measured', 'certified', ?2, ?2, NULL, NULL, 'test-profile', ?3, 1000, 'test-os', 1, '{}')",
-                    rusqlite::params!["embedding", state.machine_profile_hash, &metal_spec.fingerprint.0],
-                )?;
-                Ok(())
-            })
-            .expect("insert cert row for metal lane");
-
-        let mut ane_spec = stuck_model_spec();
+        let mut ane_spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
         ane_spec.model_id = "test-ane-lane".to_string();
         ane_spec.engine = CUDA_WORKER_ENGINE.to_string();
         ane_spec.task = "embed".to_string();
-        // Catalog config carries 4096 (the batch budget drift defect) to verify
-        // the published ceiling prefers the worker's real loaded ceiling (512).
+        // A stale stored budget must not override the manifest's ceiling.
         ane_spec.max_tokens = 4096;
         ane_spec.fingerprint = Fingerprint(
             "ane-fingerprint-0000000000000000000000000000000000000000000000000000000000000000"
@@ -20379,7 +20236,7 @@ mod tests {
             "ane-host-model-0".to_string(),
             384,
             32,
-            Some(vec![128, 256, 512]),
+            Some(vec![128, 256, 8192]),
         );
         let ane_model = Arc::new(EmbeddingModel {
             model_id: ane_spec.model_id.clone(),
@@ -20394,7 +20251,7 @@ mod tests {
             owned_decode_resolution_refusal: None,
         });
 
-        let mut unloaded_spec = stuck_model_spec();
+        let mut unloaded_spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
         unloaded_spec.model_id = "test-unloaded-lane".to_string();
         unloaded_spec.engine = CUDA_WORKER_ENGINE.to_string();
         unloaded_spec.task = "embed".to_string();
@@ -20474,20 +20331,16 @@ mod tests {
             .expect("metal row exists");
         assert_eq!(metal_row["dtype"], "f16");
         assert_eq!(metal_row["device_class"], "metal");
-        assert_eq!(metal_row["certified"], true);
+        assert_eq!(metal_row["certified"], false);
         assert_eq!(metal_row["warm_load_cost_hint_ms"], 18.5);
         assert_eq!(metal_row["recommended_batch"]["rows"], 8);
-        // The Metal engine only reports live shapes where it exists. Off macOS
-        // it holds no model, so the row falls back to catalog config: asserting
-        // the bucket-derived values everywhere would assert a fiction.
+        assert_eq!(metal_row["max_tokens"], 8192);
+        assert_eq!(metal_row["max_tokens_source"], "manifest");
+        // Metal only reports live buckets and dimensions on macOS.
         if cfg!(target_os = "macos") {
-            assert_eq!(metal_row["max_tokens"], 512);
-            assert_eq!(metal_row["max_tokens_source"], "runtime_bucket");
             assert_eq!(metal_row["bucket_ladder"], json!([128, 256, 384, 512]));
             assert_eq!(metal_row["dims"], 384);
         } else {
-            assert_eq!(metal_row["max_tokens"], 512);
-            assert_eq!(metal_row["max_tokens_source"], "catalog");
             assert!(metal_row.get("bucket_ladder").is_none());
         }
 
@@ -20495,12 +20348,10 @@ mod tests {
             .iter()
             .find(|r| r["model_id"] == "test-ane-lane")
             .expect("ane row exists");
-        assert_eq!(
-            ane_row["max_tokens"], 512,
-            "ANE ceiling must come from worker's largest bucket, not misleading catalog budget"
-        );
-        assert_eq!(ane_row["max_tokens_source"], "worker_bucket");
-        assert_eq!(ane_row["bucket_ladder"], json!([128, 256, 512]));
+        assert_eq!(ane_row["max_tokens"], 8192);
+        assert_eq!(ane_row["max_tokens_source"], "manifest");
+        assert_eq!(ane_row["bucket_ladder"], json!([128, 256, 8192]));
+        assert_eq!(ane_row["max_tokens"], ane_row["bucket_ladder"][2]);
         assert_eq!(ane_row["dims"], 384);
         assert_eq!(ane_row["dtype"], "f16");
         assert_eq!(ane_row["device_class"], "cuda");
@@ -20515,45 +20366,12 @@ mod tests {
             DEFAULT_ENGINE_BATCH_TOKEN_BUDGET
         );
 
-        // Enforced ceiling invariant: verify that the advertised ceiling (512) would
-        // never permit a row length that the ANE worker refuses.
-        let ladder = ane_row["bucket_ladder"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap())
-            .collect::<Vec<_>>();
-        let advertised_ceiling = ane_row["max_tokens"].as_u64().unwrap();
-
-        // Any length up to the ceiling finds a covering bucket in the ladder:
-        for length in [1, 100, 128, 200, 256, 400, 512] {
-            assert!(
-                length <= advertised_ceiling,
-                "length should be within ceiling"
-            );
-            assert!(
-                ladder.iter().any(|&bucket| bucket >= length),
-                "ANE worker will accept length {length} because covering bucket exists"
-            );
-        }
-        // Any length exceeding the ceiling has no covering bucket:
-        for length in [513, 600, 1024, 4096] {
-            assert!(
-                length > advertised_ceiling,
-                "length exceeds advertised ceiling"
-            );
-            assert!(
-                !ladder.iter().any(|&bucket| bucket >= length),
-                "ANE worker would refuse length {length} as no covering bucket exists"
-            );
-        }
-
         let unloaded_row = models
             .iter()
             .find(|r| r["model_id"] == "test-unloaded-lane")
             .expect("unloaded row exists");
-        assert_eq!(unloaded_row["max_tokens"], 256);
-        assert_eq!(unloaded_row["max_tokens_source"], "catalog_unloaded");
+        assert_eq!(unloaded_row["max_tokens"], 8192);
+        assert_eq!(unloaded_row["max_tokens_source"], "manifest");
         assert!(
             unloaded_row.get("bucket_ladder").is_none(),
             "unloaded lane must omit unknown bucket ladder"
@@ -20588,24 +20406,15 @@ mod tests {
         let model_digest = format!("sha256:{}", sha256_hex(&model_bytes));
         let config_digest = format!("sha256:{}", sha256_hex(b"{}"));
         let mut spec = catalog_fixture_config("qwen3-embedding-0.6b.owned-cuda");
-        spec.config_locator = Some(ModelAssetLocator::CacheDigest {
-            digest: config_digest.clone(),
-        });
+        spec.artifact_format = "safetensors-package".into();
         assert_eq!(spec.engine, CUDA_WORKER_ENGINE);
         assert_eq!(spec.owned_family.as_deref(), Some("qwen3-0.6b"));
         assert_eq!(spec.owned_dtype.as_deref(), Some("f16"));
         assert_eq!(spec.owned_execution.as_deref(), Some("supervised"));
-        assert_eq!(
-            spec.config_locator,
-            Some(ModelAssetLocator::CacheDigest {
-                digest: config_digest.clone()
-            })
-        );
-        assert_eq!(spec.artifact_format, "safetensors-package");
 
         // Restart round-trip: the stored row is re-read through
         // normalize_catalog_model and must rehydrate the same owned profile.
-        let restored = normalize_catalog_model(
+        let mut restored = normalize_catalog_model(
             spec.clone(),
             &InlineConfig::default(),
             &JobConfig::default(),
@@ -20614,8 +20423,13 @@ mod tests {
         assert_eq!(restored.owned_family, spec.owned_family);
         assert_eq!(restored.owned_dtype, spec.owned_dtype);
         assert_eq!(restored.config_locator, spec.config_locator);
+        assert_eq!(restored.artifact_format, "safetensors-package");
         assert_eq!(restored.fingerprint, spec.fingerprint);
 
+        // An installed lane supplies the separate cached config file.
+        restored.config_locator = Some(ModelAssetLocator::CacheDigest {
+            digest: config_digest.clone(),
+        });
         let rehydrated = stored_owned_profile(&restored)
             .expect("stored owned-cuda profile must rehydrate")
             .expect("owned-cuda row must yield a profile");
@@ -20628,8 +20442,7 @@ mod tests {
                 digest: config_digest.clone()
             })
         );
-        // Terminal token policy: qwen3 reserves one token, so a 512-token
-        // budget must become 511 through the owned profile.
+        // Terminal token policy: Qwen3 reserves one token.
         assert_eq!(
             owned_tokenizer_max_tokens(spec.max_tokens, Some(&rehydrated)),
             spec.max_tokens - 1

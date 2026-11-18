@@ -12687,6 +12687,12 @@ mod tests {
             config.model_id = model_id.to_string();
             config.engine = engine.to_string();
             config.task = task.to_string();
+            if matches!(model_id, "owned-embed" | "direct-ane-embed") {
+                config
+                    .engine_identity
+                    .build_flags
+                    .insert("profile".into(), format!("{model_id}-profile"));
+            }
             config.artifact_digest = format!("sha256:{}", digests[0]);
             config.model_locator = ModelAssetLocator::CacheDigest {
                 digest: format!("sha256:{}", digests[0]),

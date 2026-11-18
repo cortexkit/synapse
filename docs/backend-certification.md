@@ -53,7 +53,7 @@ The mirror layout is `<hf_repo>/resolve/<revision>/<file>`. The runner downloads
 through the candidate's catalog surface, waits for committed installation, and
 requires its self-check and fingerprint before grading the original fixtures.
 Release certification runs on reference hardware. On user devices, catalog
-lanes and profile preloads run quiet self-checks using sealed reference fixtures;
+lanes and profile preloads run quiet self-checks using digest-checked reference fixtures;
 no manual probe is needed after an OS update.
 Failed parity, admission, hardware or placement gates must not write a passing
 record. Non-Apple collection uses `SYNAPSE_CERTIFY_INSTANCE_ID` as private run

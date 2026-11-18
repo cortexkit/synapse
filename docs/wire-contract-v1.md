@@ -151,8 +151,8 @@ message. A failed download carries `error` beside `state` in its flat status.
   `retry_after_ms` is the remaining time in its fixed ten-minute cool-down and
   `details` is `{lane_id, quarantined: true}`. The next serving request after
   expiry starts a fresh worker with zero strikes. Unload/reload or a module
-  restart clears catalog quarantine immediately. Legacy/free-form workers keep
-  permanent `probe_required` and their existing recovery contract.
+  restart clears catalog quarantine immediately. Non-catalog worker quarantine
+  still reports permanent `probe_required`.
   Worker crash, protocol fault and no-progress hang each add one consecutive
   strike; two strikes quarantine. Only fully drained successful serving work
   (embed, rerank/score or generation) clears strikes. LOAD/reload, PING,
@@ -561,7 +561,7 @@ pause duration, with a minimum of 1000 (also used while waiting for the global
 lock after expiry). Details are `{lane_id, fingerprint, paused_until_ms, reason}`.
 `lane_id` is the exact serving model/lane id, not a backend label or worker id.
 For catalog lanes `fingerprint` is the pinned catalog fingerprint, the same value
-as a successful reply, readable without loading. For legacy lanes it is omitted
+as a successful reply, readable without loading. For other lanes it is omitted
 if not known while paused; absence means **not known while paused**, not null or
 a different identity. Callers may use `lane_id` plus `fingerprint` to confirm the
 pause is for their lane. Semantic refusals use the normal result error envelope.
@@ -708,11 +708,9 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     reported by the loaded model; omitted when unknown.
   - `dtype` (string, e.g. `"f16"`, `"f32"`, `"bf16"`) — numeric precision of the lane.
   - `device_class` (`"metal"` | `"ane"` | `"cpu"` | `"cuda"`) — execution device class.
-  - `certified` (boolean, optional) — whether verified certification evidence exists for this
-    lane under the machine profile the module is currently running. For lane classes that have
-    a certification concept (owned engines, embed and rerank lanes) this is `true` or `false`;
-    it is omitted for lane classes that have no certification concept (such as legacy
-    worker-backed generate lanes).
+  - `certified` (boolean, optional) — for parked owned-decode lanes, whether matching
+    certification evidence exists under the current machine profile. Profile preloads
+    use self-checks instead of certification evidence. Llama generation omits the field.
     **`certified: true` does not mean the lane will serve.** Certification and serving approval
     are separate facts recorded by separate writes: a lane that is certified but not approved
     refuses every request (or, for a substitutable unconstrained request, is answered by a
@@ -733,10 +731,10 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
     system load. Omitted if no measurement has been recorded for the model.
 
   Local embed/rerank rows never report `device_class: cpu`; the current catalog
-  reports `metal` only. Other device classes describe legacy or future lanes.
+  reports `metal` only. Other device classes may appear for profile preloads.
   Catalog rows are an exception to approval-based fields above. They add
   `self_check` (`state: pending | passed | failed`, with identity/evidence when
-  available); free-form embed/rerank rows use `state: not_applicable`.
+  available).
   For one release catalog `certified` mirrors `self_check.state == passed` and
   `serving_admission` is enabled unless self-check failed, then disabled with
   reason `self_check_failed`. No approval row is consulted. Next release removes
@@ -1125,9 +1123,8 @@ Checks: `embed_query_row_over_ceiling_reports_submitted_and_content_hashes`
 Checks: `serving_admission_channel_fault_restarts_exactly_once` (worker host).
 
 - Crash domain: llama.cpp runs in supervised single-lane workers; engine
-  crashes are typed (engine_crashed, transient with budget → quarantine as
-  permanent probe_required on probe-gated lanes). ORT is not shipped;
-  catalog lanes use self-check instead. Every request ends in result, typed error,
+  crashes return typed errors and the supervisor enforces a crash budget.
+  Every request ends in result, typed error,
   or transport closure.
 - Health and diagnostics read existing state. Failed catalog self-checks and
   worker quarantine are visible through the catalog and diagnostics surfaces.
@@ -1182,9 +1179,9 @@ runs a quiet, persisted self-check using a compact sealed subset derived from
 the existing catalog-install references are unchanged. An absent reference,
 invalid seal, or numerical mismatch refuses with `self_check_failed`, naming
 the profile. Failed checks stay failed for the same model fingerprint, engine,
-OS build, manifest and subset seal. Free-form preloads are rejected at startup;
-parked `owned-metal-decode` preloads are exempt and retain their existing
-certification and approval gates.
+OS build, manifest and reference subset digest. Free-form embed and rerank
+preloads are rejected at startup; llama generation preloads are unaffected.
+Parked `owned-metal-decode` preloads retain their certification and approval gates.
 
 The fixed subset is `short-0`, `boundary-127`, `boundary-128`, `boundary-129`,
 plus `pool10-000`, `pool10-001`, `pool10-002` for rerankers. It covers short input,

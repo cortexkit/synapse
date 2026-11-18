@@ -1204,24 +1204,20 @@ fn real_catalog_fixture(id: &str) -> (Value, BTreeMap<String, PathBuf>) {
             .unwrap()
             .replace('/', "--")
     ));
-    let (snapshot, searched) = match id {
-        "gte-modernbert-base" => (
-            gte_safetensors_snapshot(),
-            std::env::var("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT")
-                .map(PathBuf::from)
-                .unwrap_or(searched),
-        ),
-        "gte-reranker-modernbert-base" => (
-            gte_reranker_safetensors_snapshot(),
-            std::env::var("SYNAPSE_GTE_RERANKER_MODERNBERT_SAFETENSORS_SNAPSHOT")
-                .map(PathBuf::from)
-                .unwrap_or(searched),
-        ),
-        _ => (
-            first_snapshot_with(&searched, "model.safetensors"),
-            searched,
-        ),
+    let override_path = match id {
+        "gte-modernbert-base" => std::env::var_os("SYNAPSE_GTE_MODERNBERT_SAFETENSORS_SNAPSHOT"),
+        "gte-reranker-modernbert-base" => {
+            std::env::var_os("SYNAPSE_GTE_RERANKER_MODERNBERT_SAFETENSORS_SNAPSHOT")
+        }
+        _ => None,
     };
+    let snapshot = override_path.map(PathBuf::from).or_else(|| {
+        std::fs::read_dir(&searched)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("model.safetensors").exists())
+    });
     let snapshot = snapshot.unwrap_or_else(|| {
         panic!(
             "Metal catalog serve needs a safetensors snapshot under {}",

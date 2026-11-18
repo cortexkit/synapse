@@ -17,18 +17,17 @@ Engines receive composed token IDs rather than re-tokenizing text. Numeric
 profiles bind model and tokenizer digests, engine identity, readout, normalization,
 precision and shape limits. Changing vector-space semantics changes the
 fingerprint; callers must not treat different fingerprints as interchangeable.
-An alias changes routing, not the underlying fingerprint.
 
-## Catalog and legacy lanes
+## Catalog and profile preloads
 
 Catalog installation is explicit through `models.download`; serving does not
 fetch missing files. Catalog lanes verify cached members, load lazily and perform
 sealed self-checks. A failed check stays failed for its identity key. Catalog lane
-IDs use `<catalog-id>-<backend>` and are separate from legacy preload IDs.
+IDs use `<catalog-id>-<backend>` and are separate from profile preload IDs.
 Moving an index between them requires deliberate identity handling.
 
-Legacy probe-gated lanes retain their certification requirements. Owned-generation
-serving additionally needs an enabled approval row. Backend source code existing
+Owned-decode serving still requires matching certification evidence and an enabled
+approval row. Backend source code existing
 in the workspace does not mean that backend is runnable on a host or published
 in a release; consult `models.catalog` and the release matrix.
 

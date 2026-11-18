@@ -479,7 +479,7 @@ async fn models_list_round_trips_and_opens_the_daemon_delivered_store() {
     .await;
 
     assert_eq!(body["result"]["module_generation"].as_u64(), Some(1));
-    assert_eq!(body["result"]["table_epoch"].as_u64(), Some(0));
+    assert_eq!(body["result"]["table_epoch"].as_u64(), Some(2));
     assert_eq!(body["result"]["models"], Value::Array(Vec::new()));
     assert_eq!(body["result"]["alias_rows"], Value::Array(Vec::new()));
 
@@ -1365,40 +1365,6 @@ fn deterministic_preload_config_with_max_tokens(max_tokens: usize) -> String {
     .to_string()
 }
 
-async fn poll_model_ready(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    model_id: &str,
-) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let mut corr = start_corr;
-    loop {
-        let body = route_request(
-            consumer,
-            route,
-            corr,
-            serde_json::json!({
-                "method": "model.status",
-                "params": { "model_id": model_id }
-            }),
-        )
-        .await;
-        match body["result"]["state"].as_str() {
-            Some("ready" | "failed") => return body,
-            Some("unloaded" | "loading") => {
-                assert!(
-                    Instant::now() < deadline,
-                    "model.status(model_id) did not become ready before timeout: {body:?}"
-                );
-                corr += 1;
-                sleep(Duration::from_millis(100)).await;
-            }
-            other => panic!("unexpected model.status(model_id) state {other:?}: {body:?}"),
-        }
-    }
-}
-
 async fn poll_embed_result(
     consumer: &mut tokio::net::TcpStream,
     route: TestRoute,
@@ -1430,36 +1396,6 @@ async fn poll_embed_result(
             }
             other => panic!("unexpected embed.result state {other:?}: {body:?}"),
         }
-    }
-}
-
-async fn ensure_model_loaded_by_query(
-    consumer: &mut tokio::net::TcpStream,
-    route: TestRoute,
-    start_corr: u64,
-    model_id: &str,
-) {
-    let body = route_request(
-        consumer,
-        route,
-        start_corr,
-        serde_json::json!({
-            "method": "embed.query",
-            "params": {
-                "model": model_id,
-                "id": "stale-load",
-                "text": "load the model so admission.status can report stale probe rows"
-            }
-        }),
-    )
-    .await;
-    match body["result"]["error"]["code"].as_str() {
-        Some("model_loading") => {
-            let ready = poll_model_ready(consumer, route, start_corr + 1, model_id).await;
-            assert_eq!(ready["result"]["state"], "ready", "{ready}");
-        }
-        Some("not_certified" | "probe_required") | None => {}
-        other => panic!("unexpected model load kick response {other:?}: {body:?}"),
     }
 }
 

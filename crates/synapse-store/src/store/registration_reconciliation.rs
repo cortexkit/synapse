@@ -4,8 +4,8 @@ impl SynapseStore {
     /// Restore supported registrations without reviving retired engines.
     ///
     /// Core ML and profile-less owned embed/rerank rows stay in the table until
-    /// the legacy-model migration removes them. Other disallowed rows are deleted and their blob pins
-    /// released unless a remaining registration still uses the blob. Reserved
+    /// the legacy-model migration removes them. Other disallowed rows are deleted
+    /// and their blob pins released unless a remaining registration still uses the blob. Reserved
     /// catalog ids stay in the table but are not registered by this path.
     pub fn reconcile_persisted_registrations(
         &self,

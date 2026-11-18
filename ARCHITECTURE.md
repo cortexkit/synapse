@@ -31,8 +31,8 @@ consumers talk to. It registers the wire operations, loads config
 (`SYNAPSE_CONFIG_PATH`, else `.cortexkit/synapse.jsonc` in the working directory,
 else `cortexkit/synapse.jsonc` in the user config dir), tokenizes requests, admits
 jobs through the scheduler, owns the SQLite store (catalog installs and self-checks,
-durable jobs and result pages, certification and approval rows, aliases), runs
-legacy certification probes, and dispatches work to an in-process engine or a
+durable jobs and result pages, owned-decode certification and approval rows), and
+dispatches work to an in-process engine or a
 worker. It also answers `diagnostics.findings` for unattended health checks, runs
 the timed Neural Engine pause (`lanes.pause`), and writes its backup descriptor for
 Engram at startup. Owned-generation logic lives in sibling directories of `src/`:
@@ -96,7 +96,7 @@ development binary that is never shipped, because it links the subc daemon.
 prebuilt release assets.
 
 **`synapse-opctl`** (`crates/synapse-opctl`, binary `ck-synapse-opctl`). Operator CLI
-over the module's operations: lanes (pause, resume, status), models, probes,
+over the module's operations: lanes (pause, resume, status), models,
 admission stats, approvals and rollback, batch submission and paged results.
 `crates/synapse-module/src/bin/subc_call.rs` sends one raw method call to any module.
 
@@ -131,7 +131,7 @@ rerank quality scoring.
 | Engine traits | `crates/synapse-core/src/engine.rs` | `EmbedEngine`, `RerankEngine`, `GenerateEngine`, `TranscribeEngine`, `TokenBatch` |
 | Shared speech core | `crates/synapse-speech/src/` | WAV front end, TDT loop, detokenization and word timing |
 | Tokenizer | `crates/synapse-core/src/tokenizer.rs` | sanitized tokenization, digests, truncation disclosure |
-| Fingerprints | `crates/synapse-core/src/fingerprint.rs` | `NumericProfile`, `Fingerprint`, aliases |
+| Fingerprints | `crates/synapse-core/src/fingerprint.rs` | `NumericProfile`, `Fingerprint` |
 | Machine profile | `crates/synapse-core/src/machine_profile.rs` | profile fields and hash |
 | Scheduler | `crates/synapse-core/src/scheduler.rs` | `QueueClass`, aging arbitration |
 | Error codes | `crates/synapse-core/src/error_contract.rs` | `StableErrorCode` |
@@ -146,7 +146,7 @@ rerank quality scoring.
 
 1. A consumer calls an operation on the `synapse` route. `dispatch_request` in
    `crates/synapse-module/src/lib.rs` matches the method name.
-2. The module resolves the model or alias (an omitted embed or rerank model uses the
+2. The module resolves the model (an omitted embed or rerank model uses the
    task's catalog default), tokenizes the input with the sanitized tokenizer, and
    refuses rows over a catalog lane's 8,192-token limit with `sequence_too_long`
    before admission.

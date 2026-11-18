@@ -1,7 +1,6 @@
 use super::*;
 use crate::store::*;
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-#[cfg(unix)]
 use rusqlite::params;
 #[cfg(unix)]
 use std::collections::BTreeSet;

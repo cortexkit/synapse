@@ -10,9 +10,10 @@ should call providers directly.
 
 `alias_admin_enabled` and its old spellings (`dev_alias_admin` and
 `enable_alias_admin`) are rejected at startup, even when set to `false`.
-Each `preload_models` entry must specify a manifest `profile`; a free-form
-entry fails startup with its `model_id`. Parked `owned-metal-decode` preloads
-are exempt and retain their existing certification and approval gates.
+Each embed or rerank entry in `preload_models` must specify a manifest
+`profile`; a free-form entry fails startup with its `model_id`. Llama generation
+preloads may still omit `profile`. Parked `owned-metal-decode` preloads retain
+their existing certification and approval gates.
 
 Create a new example file rather than overwriting an existing configuration:
 
