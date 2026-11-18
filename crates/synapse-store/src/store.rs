@@ -10,9 +10,7 @@ use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use synapse_core::{
-    EngineIdentity, Fingerprint, MachineProfile, NumericProfileId,
-};
+use synapse_core::{EngineIdentity, Fingerprint, MachineProfile, NumericProfileId};
 use thiserror::Error;
 
 use synapse_owned_decode::{owned_decode_certification::CertificationRecord, owned_decode_routing};
@@ -1270,18 +1268,6 @@ impl CertificationClass {
             Self::LegacyOwnedDecode => "legacy_owned_decode",
         }
     }
-
-    fn parse(value: &str) -> Result<Self, SynapseStoreError> {
-        match value {
-            "measured_owned_decode" => Ok(Self::MeasuredOwnedDecode),
-            "embedding" => Ok(Self::Embedding),
-            "rerank" => Ok(Self::Rerank),
-            "legacy_owned_decode" => Ok(Self::LegacyOwnedDecode),
-            other => Err(SynapseStoreError::Decode(format!(
-                "unknown certification class '{other}'"
-            ))),
-        }
-    }
 }
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
@@ -2068,7 +2054,6 @@ pub struct CertificationRow {
     pub evidence: Value,
 }
 
-
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KnobAssignmentRow {
     pub machine_profile_hash: String,
@@ -2693,7 +2678,6 @@ impl SynapseStore {
         })?;
         Ok(())
     }
-
 
     /// Insert an approval row only through this explicit administrative path,
     /// after validation; serving and certification code never call it.
@@ -5560,11 +5544,6 @@ impl SynapseStore {
         })
     }
 
-
-
-
-
-
     pub fn knob_assignment(
         &self,
         machine_profile_hash: &str,
@@ -5585,9 +5564,6 @@ impl SynapseStore {
         })?;
         raw.map(decode_knob_assignment_row).transpose()
     }
-
-
-
 
     #[allow(clippy::too_many_arguments)]
     pub fn admit_job(
@@ -7261,7 +7237,6 @@ struct RawOwnedDecodeCertificationRow {
     evidence_json: String,
 }
 
-
 struct RawKnobAssignmentRow {
     machine_profile_hash: String,
     workload: String,
@@ -7276,7 +7251,6 @@ struct RawKnobAssignmentRow {
     throughput_tok_s: f64,
     single_item_latency_p50_ms: f64,
 }
-
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 
@@ -7306,7 +7280,6 @@ fn owned_decode_cert_row_from_row(
     })
 }
 
-
 fn knob_assignment_from_row(row: &Row<'_>) -> rusqlite::Result<RawKnobAssignmentRow> {
     Ok(RawKnobAssignmentRow {
         machine_profile_hash: row.get(0)?,
@@ -7323,7 +7296,6 @@ fn knob_assignment_from_row(row: &Row<'_>) -> rusqlite::Result<RawKnobAssignment
         single_item_latency_p50_ms: row.get(11)?,
     })
 }
-
 
 // Staged storage API consumed by the epic's runtime slice; remove this allow there.
 #[allow(dead_code)]
@@ -8108,7 +8080,6 @@ fn decode_owned_decode_cert_row(
     })
 }
 
-
 fn decode_knob_assignment_row(
     row: RawKnobAssignmentRow,
 ) -> Result<KnobAssignmentRow, SynapseStoreError> {
@@ -8425,8 +8396,6 @@ fn upsert_owned_decode_cert_row_tx(
         ],
     )
 }
-
-
 
 fn row_to_job(row: &Row<'_>) -> rusqlite::Result<JobRecord> {
     Ok(JobRecord {

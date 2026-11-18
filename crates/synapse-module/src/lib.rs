@@ -2577,8 +2577,14 @@ fn build_preload_catalog_model(
         jobs,
     )?;
     #[cfg(feature = "test-support")]
-    if preload.profile.as_deref().is_some_and(|profile| test_deterministic::is_profile(&engine_name, profile)) {
-        spec.engine_identity.build_flags.insert("profile".into(), test_deterministic::PROFILE.into());
+    if preload
+        .profile
+        .as_deref()
+        .is_some_and(|profile| test_deterministic::is_profile(&engine_name, profile))
+    {
+        spec.engine_identity
+            .build_flags
+            .insert("profile".into(), test_deterministic::PROFILE.into());
     }
     if let Some(backend) = declared_llama_backend {
         spec.engine_identity
@@ -2658,7 +2664,12 @@ fn normalize_catalog_model(
     jobs: &JobConfig,
 ) -> Result<StoredModelConfig, ModuleError> {
     #[cfg(feature = "test-support")]
-    if model.engine_identity.build_flags.get("profile").is_some_and(|profile| test_deterministic::is_profile(&model.engine, profile)) {
+    if model
+        .engine_identity
+        .build_flags
+        .get("profile")
+        .is_some_and(|profile| test_deterministic::is_profile(&model.engine, profile))
+    {
         return Ok(model);
     }
     if model.engine_identity.build_flags.contains_key("profile") {
@@ -2823,7 +2834,10 @@ fn is_test_preload_profile(_engine: &str, _profile: &str) -> bool {
 }
 
 fn release_profile(identity: &EngineIdentity) -> Option<&str> {
-    identity.build_flags.get("profile").map(String::as_str)
+    identity
+        .build_flags
+        .get("profile")
+        .map(String::as_str)
         .filter(|profile| !is_test_preload_profile(&identity.engine, profile))
 }
 
@@ -5009,6 +5023,7 @@ async fn owned_decode_session_decode(state: Arc<ModuleState>, params: Value) -> 
         target_fingerprint: None,
         required_fingerprint: None,
         required_epoch: None,
+        _allow_equivalent: false,
         owned_only: true,
     };
     let worker_stream = match route_owned_decode_wire(
@@ -11683,19 +11698,6 @@ fn catalog_measurement_summary(state: &ModuleState) -> CatalogMeasurementSummary
     }
 }
 
-fn lane_certification_status(
-    certification_required: bool,
-    evidence_certified: bool,
-) -> &'static str {
-    if !certification_required {
-        "not_required"
-    } else if evidence_certified {
-        "certified"
-    } else {
-        "uncertified"
-    }
-}
-
 /// Projects approval + certification state into the lane summary's
 /// `serving_admission` field.
 ///
@@ -12660,7 +12662,10 @@ fn parse_module_config_json(
                 .model_id
                 .clone()
                 .unwrap_or_else(|| format!("{}-{index}", preload.engine));
-            if matches!(parse_model_task(preload.task.as_deref(), &engine, &model_id)?, ModelTask::Embed | ModelTask::Rerank) {
+            if matches!(
+                parse_model_task(preload.task.as_deref(), &engine, &model_id)?,
+                ModelTask::Embed | ModelTask::Rerank
+            ) {
                 return Err(ModuleError::Config(format!(
                     "preload model_id '{model_id}': free-form preloads for embed and rerank were removed; specify a profile"
                 )));
@@ -18137,7 +18142,7 @@ mod tests {
             sampling: SamplingMode::GreedyTop1,
             grammar: None,
             required_fingerprint: None,
-            _allow_equivalent: false,
+            allow_equivalent: false,
             target_fingerprint: None,
             required_processing_fingerprint: None,
             owned_only: false,
@@ -19735,7 +19740,6 @@ mod tests {
         inner.engine_identity = spec.engine_identity.clone();
         inner.fingerprint = spec.fingerprint.clone();
         inner.certification_fingerprint = spec.fingerprint.clone();
-        inner.numeric_profile_id = spec.numeric_profile_id.clone();
         let owned = stored_owned_profile(&spec).unwrap();
         inner.tokenizer = SanitizedTokenizer::from_file(
             &tokenizer_path,

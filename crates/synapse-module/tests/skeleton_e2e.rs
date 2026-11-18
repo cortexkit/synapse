@@ -544,9 +544,6 @@ async fn spawned_module_ignores_operator_config() {
     assert_eq!(report["result"]["lanes"], Value::Array(Vec::new()));
 }
 
-
-
-
 #[tokio::test]
 async fn embed_query_default_catalog_returns_typed_model_not_installed_error() {
     let daemon = start_daemon().await;
@@ -652,12 +649,11 @@ async fn embed_query_preloaded_minilm_returns_vectors_and_envelope() {
     let future_epoch = route_request(&mut consumer, route, 6, serde_json::json!({
         "method": "embed.query", "params": {"model":"test-minilm", "text":"hello world", "required_epoch":3}
     })).await;
-    assert_eq!(future_epoch["result"]["error"]["code"], "migration_required");
+    assert_eq!(
+        future_epoch["result"]["error"]["code"],
+        "migration_required"
+    );
 }
-
-
-
-
 
 #[tokio::test]
 async fn embed_batch_preloaded_minilm_preserves_order_and_envelope() {
@@ -1160,14 +1156,18 @@ async fn admission_status_reports_execution_waiters_during_concurrent_batches() 
     let _ = second_task.await.unwrap();
 }
 
-
-
 #[tokio::test]
 async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_default() {
     let preloads: Value = serde_json::from_str(&deterministic_preload_config()).unwrap();
     let config = module_config_with_preloads(preloads.clone(), "balanced");
     let (daemon, mut module, mut consumer, route) = open_route_with_config(&config).await;
-    let status = route_request(&mut consumer, route, 121, serde_json::json!({"method":"admission.status"})).await;
+    let status = route_request(
+        &mut consumer,
+        route,
+        121,
+        serde_json::json!({"method":"admission.status"}),
+    )
+    .await;
     let hash = status["result"]["machine_profile_hash"].as_str().unwrap();
     let path = expected_store_path(&daemon.data_home);
     let conn = Connection::open(&path).unwrap();
@@ -1179,22 +1179,52 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
     module.child.start_kill().unwrap();
     assert!(!module.child.wait().await.unwrap().success());
     drop(consumer);
-    let restarted = spawn_synapse_module_with_env(&daemon.connection_file_path, None,
+    let restarted = spawn_synapse_module_with_env(
+        &daemon.connection_file_path,
+        None,
         Some(&module_config_with_preloads(preloads, "quiet")),
-        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")]);
-    let (_daemon, _module, mut consumer, route) = open_route_for_started_module(daemon, restarted).await;
-    let status = route_request(&mut consumer, route, 122, serde_json::json!({"method":"admission.status"})).await;
+        &[("SYNAPSE_TEST_RUNNABLE_BACKENDS", "metal")],
+    );
+    let (_daemon, _module, mut consumer, route) =
+        open_route_for_started_module(daemon, restarted).await;
+    let status = route_request(
+        &mut consumer,
+        route,
+        122,
+        serde_json::json!({"method":"admission.status"}),
+    )
+    .await;
     assert_eq!(status["result"]["current_knob"], "quiet");
-    let stored: String = Connection::open(path).unwrap().query_row(
-        "SELECT model_id FROM knob_assignments WHERE workload = 'embed' AND knob = 'quiet'", [], |row| row.get(0)).unwrap();
+    let stored: String = Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT model_id FROM knob_assignments WHERE workload = 'embed' AND knob = 'quiet'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(stored, "test-minilm");
-    let omitted = route_request(&mut consumer, route, 123, serde_json::json!({"method":"embed.query", "params":{"text":"hello world"}})).await;
+    let omitted = route_request(
+        &mut consumer,
+        route,
+        123,
+        serde_json::json!({"method":"embed.query", "params":{"text":"hello world"}}),
+    )
+    .await;
     assert_eq!(omitted["result"]["error"]["code"], "model_not_installed");
-    assert_eq!(omitted["result"]["error"]["details"]["catalog_id"], "gte-modernbert-base");
-    let explicit = route_request(&mut consumer, route, 124, serde_json::json!({"method":"embed.query", "params":{"model":stored,"text":"hello world"}})).await;
+    assert_eq!(
+        omitted["result"]["error"]["details"]["catalog_id"],
+        "gte-modernbert-base"
+    );
+    let explicit = route_request(
+        &mut consumer,
+        route,
+        124,
+        serde_json::json!({"method":"embed.query", "params":{"model":stored,"text":"hello world"}}),
+    )
+    .await;
     assert_eq!(explicit["result"]["dims"], 384);
 }
-
 
 #[tokio::test]
 async fn embed_query_deadline_one_returns_typed_rejection() {
@@ -1268,11 +1298,15 @@ async fn profile_preload_lazily_reloads_after_unload() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
     let call = |method, params| serde_json::json!({"method": method, "params": params});
-    let query = call("embed.query", serde_json::json!({"model": "test-minilm", "text": "hello world"}));
+    let query = call(
+        "embed.query",
+        serde_json::json!({"model": "test-minilm", "text": "hello world"}),
+    );
     let first = route_request(&mut consumer, route, 1, query.clone()).await;
     assert_eq!(first["result"]["dims"], 384);
     let model = serde_json::json!({"model_id": "test-minilm"});
-    let unloaded = route_request(&mut consumer, route, 2, call("model.unload", model.clone())).await;
+    let unloaded =
+        route_request(&mut consumer, route, 2, call("model.unload", model.clone())).await;
     assert_eq!(unloaded["result"]["state"], "unloaded");
     let status = route_request(&mut consumer, route, 3, call("model.status", model.clone())).await;
     assert_eq!(status["result"]["state"], "unloaded");
@@ -1281,8 +1315,6 @@ async fn profile_preload_lazily_reloads_after_unload() {
     let status = route_request(&mut consumer, route, 5, call("model.status", model)).await;
     assert_eq!(status["result"]["state"], "ready");
 }
-
-
 
 fn deterministic_source_dir(label: &str) -> PathBuf {
     let root = unique_temp_dir(label);
@@ -1332,12 +1364,6 @@ fn deterministic_preload_config_with_max_tokens(max_tokens: usize) -> String {
     }])
     .to_string()
 }
-
-
-
-
-
-
 
 async fn poll_model_ready(
     consumer: &mut tokio::net::TcpStream,
@@ -1445,8 +1471,6 @@ fn module_config_with_preloads(preloads: Value, knob: &str) -> String {
     .to_string()
 }
 
-
-
 fn assert_vectors_close(actual: &Value, expected: &Value) {
     let actual = actual.as_array().expect("actual vector is an array");
     let expected = expected.as_array().expect("expected vector is an array");
@@ -1465,13 +1489,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
 }
-
-
-
-
-
-
-
 
 #[tokio::test]
 async fn singleton_lease_blocks_second_module_on_same_daemon() {
@@ -1734,9 +1751,6 @@ async fn substitutable_owned_refusal_falls_back_to_llama_with_lane_provenance() 
     let _ = std::fs::remove_dir_all(fixture_dir);
 }
 
-
-
-
 #[test]
 fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_literal() {
     let binary = std::fs::read(env!("CARGO_BIN_EXE_ck-synapse")).unwrap();
@@ -1774,8 +1788,6 @@ fn production_binary_carries_owned_decode_errors_and_retires_legacy_grammar_lite
         "legacy grammar literal is compiled into the binary again: {in_binary} occurrences (the retirement changelog lives only in the on-disk manifest since the compiled cutover path was deleted)"
     );
 }
-
-
 
 #[tokio::test]
 async fn admission_status_tracks_job_counters_over_wire() {

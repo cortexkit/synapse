@@ -210,7 +210,7 @@ impl InputType {
 
 #[derive(Debug, Args)]
 struct EmbedBatchArgs {
-    /// Model id, alias, or fingerprint to require.
+    /// Model id or fingerprint to require.
     #[arg(long)]
     model: String,
 

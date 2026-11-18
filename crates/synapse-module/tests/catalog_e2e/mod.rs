@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::params;
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::Notify;
 
@@ -1714,10 +1715,24 @@ async fn catalog_endpoint_with_path_refuses_module_start_by_name() {
 #[tokio::test]
 async fn retired_management_operations_are_unknown_methods() {
     let mut h = CatalogHarness::start("ok", None).await;
-    for method in ["model.load", "probe.start", "probe.status", "probe.report", "aliases.check_index", "alias.declare", "alias.retract"] {
+    for method in [
+        "model.load",
+        "probe.start",
+        "probe.status",
+        "probe.report",
+        "aliases.check_index",
+        "alias.declare",
+        "alias.retract",
+    ] {
         h.next_id += 1;
-        let frame = raw_route_frame(&mut h.consumer, h.route, h.next_id, serde_json::json!({"method":method})).await;
-        assert_eq!(frame.frame_type, FrameType::Error);
+        let frame = raw_route_frame(
+            &mut h.consumer,
+            h.route,
+            h.next_id,
+            serde_json::json!({"method":method}),
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Error);
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "unknown_method", "{method}: {body}");
     }
