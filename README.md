@@ -35,6 +35,26 @@ matrix determine supported backends and published assets.
 | `synapse-worker-cuda` | Owned CUDA worker. |
 | `synapse-worker-vulkan` | Owned Vulkan embedding/reranking worker. |
 
+## Manage local models
+
+With Synapse running, use `ck-synapse-opctl` on Linux, macOS, or Windows:
+
+```sh
+ck-synapse-opctl models list
+ck-synapse-opctl models download CATALOG_ID
+ck-synapse-opctl models remove CATALOG_ID
+```
+
+`models list` shows the registered model lanes and their states. Use a catalog
+ID, not a lane ID, with `download` and `remove`. Synapse downloads models only
+on request. `download` shows progress and reports the installed lanes on
+success, including when the model was already installed. Ctrl-C stops watching
+without cancelling the download. Rerun the same command against the same daemon
+to resume watching. Use `--json` to get only the final reply on standard output.
+
+`remove` uninstalls the catalog model and reports the bytes freed. Synapse
+refuses removal while the model is in use.
+
 ## Build and test
 
 Use the committed `Cargo.lock`. The workspace requires Rust 1.89 or newer and

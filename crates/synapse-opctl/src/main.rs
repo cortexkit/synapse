@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use subc_client_rs::{discover, CallError, CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod model_download;
+
 const MODULE_ID: &str = "synapse";
 const DEFAULT_COMPONENTS: usize = 8;
 
@@ -66,6 +68,10 @@ enum Command {
 enum ModelsCommand {
     /// List the catalog and current model states.
     List,
+    /// Download a catalog model and watch until it is installed.
+    Download { catalog_id: String },
+    /// Remove an installed catalog model.
+    Remove { catalog_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,26 +235,37 @@ async fn run(cli: Cli) -> Result<()> {
         .with_context(|| format!("connect to subc through {}", subc.display()))?;
     let identity = BindIdentity::new("opctl", format!("opctl-{}", std::process::id()));
 
-    let result = execute(&consumer, &identity, &cli.command).await;
+    let result = execute(&consumer, &identity, &cli.command, cli.json).await;
     consumer.close().await;
-    let output = result?;
-    emit_output(&output, cli.json)?;
-    ensure_no_error_envelope(&output)
+    result
 }
 
 async fn execute(
     consumer: &SubcConsumer,
     identity: &BindIdentity,
     command: &Command,
-) -> Result<CommandOutput> {
-    match command {
+    raw_json: bool,
+) -> Result<()> {
+    let output = match command {
         Command::Lanes { command } => {
             let (method, params) = lane_request(command);
             call(consumer, identity, method, params).await
         }
-        Command::Models {
-            command: ModelsCommand::List,
-        } => call(consumer, identity, "models.list", json!({})).await,
+        Command::Models { command } => match command {
+            ModelsCommand::List => call(consumer, identity, "models.list", json!({})).await,
+            ModelsCommand::Download { catalog_id } => {
+                return model_download::run(consumer, identity, catalog_id, raw_json).await;
+            }
+            ModelsCommand::Remove { catalog_id } => {
+                call(
+                    consumer,
+                    identity,
+                    "models.remove",
+                    json!({ "catalog_id": catalog_id }),
+                )
+                .await
+            }
+        },
         Command::Admission {
             command: AdmissionCommand::Status,
         } => call(consumer, identity, "admission.status", json!({})).await,
@@ -283,7 +300,9 @@ async fn execute(
             }
             JobCommand::Pages { id } => job_pages(consumer, identity, id).await,
         },
-    }
+    }?;
+    emit_output(&output, raw_json)?;
+    ensure_no_error_envelope(&output)
 }
 
 #[derive(Debug)]
@@ -707,6 +726,28 @@ fn verify_content_echo(text: &str, echoed: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_models_download_with_global_json_flag() {
+        let cli =
+            Cli::try_parse_from(["opctl", "models", "download", "embedding", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Models { command: ModelsCommand::Download { catalog_id } }
+                if catalog_id == "embedding"
+        ));
+    }
+
+    #[test]
+    fn parses_models_remove() {
+        let cli = Cli::try_parse_from(["opctl", "models", "remove", "embedding"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Models { command: ModelsCommand::Remove { catalog_id } }
+                if catalog_id == "embedding"
+        ));
+    }
 
     #[test]
     fn verify_embedding_response_accepts_truncated_row_with_disclosure() {
