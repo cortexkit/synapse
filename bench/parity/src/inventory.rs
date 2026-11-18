@@ -310,7 +310,6 @@ pub fn candidate_binaries(os_arch: &str) -> &'static [&'static str] {
             "ck-synapse",
             "ck-synapse-opctl",
             "ck-synapse-worker-llama",
-            "ck-synapse-worker-decode",
             "ck-synapse-worker-ane-direct",
         ],
         "linux-x64" | "windows-x64" => &[
