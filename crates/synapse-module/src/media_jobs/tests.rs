@@ -280,6 +280,8 @@ async fn media_ane_certified_duration_refuses_before_host_or_shape_admission() {
     assert_eq!(status["failure"]["detail"]["limit"], "max_duration_ms");
     assert_eq!(status["failure"]["detail"]["duration_ms"], 81_860);
     assert_eq!(status["failure"]["detail"]["max_duration_ms"], 81_850);
+    // The frame limit belongs to the same capped duration, not the profile's 600 s.
+    assert_eq!(status["failure"]["detail"]["max_encoder_frames"], 1024);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(lane_cache(&state.runtime, &format!("{MODEL}-ane"))
         .lock()

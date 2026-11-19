@@ -393,18 +393,21 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
         {
             return Err(input_limit("max_duration_ms"));
         }
-        let duration_failure = if decoded.duration_ms() > max_duration_ms
-            || frames > profile.max_encoder_frames as u64
-        {
-            let mut e = input_limit("max_duration_ms");
-            e.0["detail"]["duration_ms"] = json!(decoded.duration_ms());
-            e.0["detail"]["max_duration_ms"] = json!(max_duration_ms);
-            e.0["detail"]["valid_encoder_frames"] = json!(frames);
-            e.0["detail"]["max_encoder_frames"] = json!(profile.max_encoder_frames);
-            Some(e)
-        } else {
-            None
-        };
+        // A lane certified below its profile's duration serves only up to that
+        // cap, so its frame limit is the cap's frame count, not the profile's.
+        let max_encoder_frames = synapse_speech::valid_encoder_frames(max_duration_ms * 16)
+            .min(profile.max_encoder_frames as u64);
+        let duration_failure =
+            if decoded.duration_ms() > max_duration_ms || frames > max_encoder_frames {
+                let mut e = input_limit("max_duration_ms");
+                e.0["detail"]["duration_ms"] = json!(decoded.duration_ms());
+                e.0["detail"]["max_duration_ms"] = json!(max_duration_ms);
+                e.0["detail"]["valid_encoder_frames"] = json!(frames);
+                e.0["detail"]["max_encoder_frames"] = json!(max_encoder_frames);
+                Some(e)
+            } else {
+                None
+            };
         let id = persistence::admit(&state, owner, &request, &binding, &lane, &audio, &bytes)?;
         (id, entry, backend, guard, duration_failure)
     };

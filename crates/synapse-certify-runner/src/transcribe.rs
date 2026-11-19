@@ -436,7 +436,15 @@ async fn refusal(
         }),
         engine_calls != 0 || shape_admissions != 0,
     )
-    .map_err(err)?;
+    // Name what was observed: a bare refusal gives the operator nothing to
+    // compare against the fixture's sealed duration and the lane's limit.
+    .map_err(|e| {
+        refuse(format!(
+            "{e}: fixture {} ({} ms, {} samples) against limit {} ms; refusal {code} {details:?}; \
+             engine calls {engine_calls}, shape admissions {shape_admissions}",
+            fixture.id, fixture.duration_ms, fixture.sample_count, profile.max_duration_ms
+        ))
+    })?;
     if detail["field"] != "input.audio" || detail["limit"] != "max_duration_ms" {
         return Err(refuse("duration refusal field or limit mismatch"));
     }
