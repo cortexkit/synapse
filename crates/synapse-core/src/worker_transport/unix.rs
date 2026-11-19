@@ -42,7 +42,33 @@ pub fn prepare_listener(
     Ok((socket_path, listener))
 }
 
+/// Size of `sockaddr_un.sun_path`; a socket path must be shorter, leaving room
+/// for its terminating NUL.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SUN_PATH_BYTES: usize = 108;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SUN_PATH_BYTES: usize = 104;
+
+/// Refuses a socket path the kernel cannot bind, naming the path, its length
+/// and the limit, so an overlong runtime directory is reported as a
+/// configuration problem rather than a bind failure.
+fn check_socket_path_len(socket_path: &std::path::Path) -> Result<(), TransportError> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = socket_path.as_os_str().as_bytes().len();
+    if len >= SUN_PATH_BYTES {
+        return Err(TransportError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "worker socket path {} is {len} bytes; Unix socket paths must be under {SUN_PATH_BYTES} bytes, so set a shorter worker runtime directory",
+                socket_path.display()
+            ),
+        )));
+    }
+    Ok(())
+}
+
 pub fn bind_listener(socket_path: &std::path::Path) -> Result<UnixListener, TransportError> {
+    check_socket_path_len(socket_path)?;
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -314,6 +340,27 @@ mod tests {
     use crate::EngineIdentity;
 
     const NONCE: &str = "0123456789abcdef";
+
+    #[test]
+    fn overlong_socket_path_is_refused_with_its_length_and_limit() {
+        let dir = std::env::temp_dir().join("d".repeat(SUN_PATH_BYTES));
+        let path = crate::worker_transport::worker_socket_path(&dir, "worker");
+        let error = bind_listener(&path).unwrap_err().to_string();
+        let len = path.as_os_str().len();
+        assert!(error.contains(&format!("is {len} bytes")), "{error}");
+        assert!(
+            error.contains(&format!("under {SUN_PATH_BYTES} bytes")),
+            "{error}"
+        );
+        assert!(
+            error.contains("shorter worker runtime directory"),
+            "{error}"
+        );
+        assert!(
+            !dir.exists(),
+            "nothing is created for a path that cannot bind"
+        );
+    }
 
     fn binding() -> ExpectedHelloBinding {
         ExpectedHelloBinding {
