@@ -173,7 +173,7 @@ async fn transcribe_missing_measurements_name_the_surface_and_field() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn transcribe_above_limit_requires_c4_details_and_no_engine_or_shape_work() {
     let manifest = synapse_certify::self_check::manifest().unwrap();
     let mut profile = manifest.profiles["parakeet-tdt-0.6b-v3.ane-direct-worker"]
@@ -199,10 +199,19 @@ async fn transcribe_above_limit_requires_c4_details_and_no_engine_or_shape_work(
     };
     let good = json!({"error":{"code":"input_too_large","detail":{"field":"input.audio","limit":"max_duration_ms","duration_ms":81930,"max_duration_ms":81850,"valid_encoder_frames":1025,"max_encoder_frames":1024}}});
     let counters = json!({"available":true,"worker_requests":{"lane":5},"admitted_count":3});
+    let source = CounterSource::Worker;
     let mut client = stub(vec![counters.clone()]);
-    let got = refusal(&mut client, &fixture, &good, &profile, (5, 3), deadline())
-        .await
-        .unwrap();
+    let got = refusal(
+        &mut client,
+        &fixture,
+        &good,
+        &profile,
+        source,
+        (5, 3),
+        deadline(),
+    )
+    .await
+    .unwrap();
     assert_eq!(got.worker_requests, 0);
     assert_eq!(got.shape_admissions, 0);
     for field in [
@@ -216,32 +225,81 @@ async fn transcribe_above_limit_requires_c4_details_and_no_engine_or_shape_work(
         let mut bad = good.clone();
         bad["error"]["detail"][field] = json!(0);
         let mut client = stub(vec![counters.clone()]);
-        assert!(
-            refusal(&mut client, &fixture, &bad, &profile, (5, 3), deadline())
-                .await
-                .is_err()
-        );
+        assert!(refusal(
+            &mut client,
+            &fixture,
+            &bad,
+            &profile,
+            source,
+            (5, 3),
+            deadline()
+        )
+        .await
+        .is_err());
     }
     for (worker, shape) in [(6, 3), (5, 4)] {
         let mut changed = counters.clone();
         changed["worker_requests"]["lane"] = json!(worker);
         changed["admitted_count"] = json!(shape);
         let mut client = stub(vec![changed]);
-        assert!(
-            refusal(&mut client, &fixture, &good, &profile, (5, 3), deadline())
-                .await
-                .is_err()
-        );
+        assert!(refusal(
+            &mut client,
+            &fixture,
+            &good,
+            &profile,
+            source,
+            (5, 3),
+            deadline()
+        )
+        .await
+        .is_err());
     }
-    let mut client = stub(vec![counters]);
+    let mut client = stub(vec![json!({"status":"done"})]);
     assert!(refusal(
         &mut client,
         &fixture,
         &json!({"job_id":"silently-accepted"}),
         &profile,
+        source,
         (5, 3),
         deadline()
     )
     .await
     .is_err());
+
+    let submitted = json!({"job_id":"limit-refusal"});
+    let failed = json!({"status":"failed","failure":good["error"]});
+    let source = CounterSource::InProcess("metal-lane");
+    for (count, passes) in [(Some(7), true), (Some(8), false), (None, false)] {
+        let mut after = json!({"available":true,"worker_requests":{},"admitted_count":0});
+        if let Some(count) = count {
+            after["in_process_transcribe_engine_invocations"] = json!({"metal-lane":count});
+        }
+        let mut client = stub(vec![json!({"status":"running"}), failed.clone(), after]);
+        let result = refusal(
+            &mut client,
+            &fixture,
+            &submitted,
+            &profile,
+            source,
+            (7, 0),
+            deadline(),
+        )
+        .await;
+        if passes {
+            let got = result.unwrap();
+            assert_eq!(got.worker_requests, 0);
+            assert_eq!(got.shape_admissions, 0);
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(
+            client.calls,
+            [
+                ("media.status".into(), submitted.clone()),
+                ("media.status".into(), submitted.clone()),
+                ("certify.observations".into(), json!({})),
+            ]
+        );
+    }
 }

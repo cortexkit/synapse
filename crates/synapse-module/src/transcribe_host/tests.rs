@@ -183,11 +183,7 @@ fn transcribe_host_self_check_keeps_observe_off_and_refuses_audio_before_worker_
     });
     let mut profile = TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-cuda").unwrap();
     profile.max_duration_ms = 100;
-    let host = TranscribeHost {
-        profile,
-        mode: ObservationMode::Certification,
-        backend: Backend::Worker(engine, model),
-    };
+    let host = TranscribeHost::worker_for_test(profile, engine, model);
     let result = host
         .transcribe_self_check(&audio, |_| panic!("not a Metal lane"))
         .unwrap();

@@ -159,14 +159,20 @@ async fn submit(
     }
 }
 
-async fn result(client: &mut impl Client, job: &str, deadline: Instant) -> Result<Value> {
+async fn terminal_status(client: &mut impl Client, job: &str, deadline: Instant) -> Result<Value> {
     loop {
         let status = call(client, "media.status", json!({"job_id":job}), deadline).await?;
         match status["status"].as_str() {
-            Some("done") => break,
             Some("queued" | "running") => pause(deadline).await?,
-            _ => return Err(refuse(format!("transcribe job failed: {status}"))),
+            _ => return Ok(status),
         }
+    }
+}
+
+async fn result(client: &mut impl Client, job: &str, deadline: Instant) -> Result<Value> {
+    let status = terminal_status(client, job, deadline).await?;
+    if status["status"] != "done" {
+        return Err(refuse(format!("transcribe job failed: {status}")));
     }
     let value = call(client, "media.result", json!({"job_id":job}), deadline).await?;
     if value.get("output_object").is_none() {
@@ -303,17 +309,32 @@ pub(crate) async fn measurements(
     serde_json::from_value(value).map_err(|e| refuse(format!("invalid {surface}: {e}")))
 }
 
-async fn counters(client: &mut impl Client, deadline: Instant) -> Result<(u64, u64)> {
+#[derive(Clone, Copy)]
+enum CounterSource<'a> {
+    Worker,
+    InProcess(&'a str),
+}
+
+async fn counters(
+    client: &mut impl Client,
+    source: CounterSource<'_>,
+    deadline: Instant,
+) -> Result<(u64, u64)> {
     let value = call(client, "certify.observations", json!({}), deadline).await?;
     if value["available"] != true {
         return Err(refuse("certify.observations unavailable"));
     }
-    let sent = value["worker_requests"]
-        .as_object()
-        .ok_or_else(|| refuse("worker request counters missing"))?
-        .values()
-        .try_fold(0u64, |sum, v| sum.checked_add(v.as_u64()?).or(None))
-        .ok_or_else(|| refuse("invalid worker counters"))?;
+    let sent = match source {
+        CounterSource::InProcess(lane) => {
+            number(&value["in_process_transcribe_engine_invocations"], lane)?
+        }
+        CounterSource::Worker => value["worker_requests"]
+            .as_object()
+            .ok_or_else(|| refuse("worker request counters missing"))?
+            .values()
+            .try_fold(0u64, |sum, v| sum.checked_add(v.as_u64()?).or(None))
+            .ok_or_else(|| refuse("invalid worker counters"))?,
+    };
     Ok((sent, number(&value, "admitted_count")?))
 }
 
@@ -322,11 +343,24 @@ async fn refusal(
     fixture: &SpeechFixture,
     response: &Value,
     profile: &SpeechProfile,
+    source: CounterSource<'_>,
     before: (u64, u64),
     deadline: Instant,
 ) -> Result<ExpectedRefusal> {
-    let after = counters(client, deadline).await?;
-    let fault = &response["error"];
+    // A duration limit discovered from the audio itself is a terminal job failure.
+    let status;
+    let fault = if let Some(job) = response["job_id"].as_str() {
+        status = terminal_status(client, job, deadline).await?;
+        if status["status"] != "failed" {
+            return Err(refuse(format!(
+                "over-limit transcribe job did not fail: {status}"
+            )));
+        }
+        &status["failure"]
+    } else {
+        &response["error"]
+    };
+    let after = counters(client, source, deadline).await?;
     let detail = &fault["detail"];
     let details = [
         number(detail, "duration_ms")?,
@@ -335,10 +369,10 @@ async fn refusal(
         number(detail, "max_encoder_frames")?,
     ];
     let code = text(fault, "code")?;
-    let worker_requests = after
-        .0
-        .checked_sub(before.0)
-        .ok_or_else(|| refuse("worker counter regressed"))?;
+    let engine_calls = after.0.checked_sub(before.0).ok_or_else(|| match source {
+        CounterSource::Worker => refuse("worker counter regressed"),
+        CounterSource::InProcess(_) => refuse("in-process transcribe engine counter regressed"),
+    })?;
     let shape_admissions = after
         .1
         .checked_sub(before.1)
@@ -353,7 +387,7 @@ async fn refusal(
             code: code.into(),
             details,
         }),
-        worker_requests != 0 || shape_admissions != 0,
+        engine_calls != 0 || shape_admissions != 0,
     )
     .map_err(err)?;
     if detail["field"] != "input.audio" || detail["limit"] != "max_duration_ms" {
@@ -368,7 +402,10 @@ async fn refusal(
         max_duration_ms: details[1],
         valid_encoder_frames: details[2],
         max_encoder_frames: details[3],
-        worker_requests,
+        worker_requests: match source {
+            CounterSource::Worker => engine_calls,
+            CounterSource::InProcess(_) => 0,
+        },
         shape_admissions,
     })
 }
@@ -406,6 +443,11 @@ async fn collect(
         .rsplit('-')
         .next()
         .ok_or_else(|| refuse("lane backend missing"))?;
+    let counter_source = if backend == "metal" {
+        CounterSource::InProcess(&pin.lane_id)
+    } else {
+        CounterSource::Worker
+    };
     for fixture in fixtures {
         let input = &inputs[&fixture.id];
         let file = text(input, "path")?;
@@ -422,7 +464,7 @@ async fn collect(
         let audio = upload(client, &wav, deadline).await?;
         let above = fixture.duration_ms > profile.max_duration_ms;
         let before = if above {
-            Some(counters(client, deadline).await?)
+            Some(counters(client, counter_source, deadline).await?)
         } else {
             None
         };
@@ -434,6 +476,7 @@ async fn collect(
                     fixture,
                     &submitted,
                     profile,
+                    counter_source,
                     before.unwrap(),
                     deadline,
                 )

@@ -39,6 +39,7 @@ pub use store::{
     RestoreImportReport, SynapseStore, SynapseStoreError, RECLAIM_FREELIST_MIN_BYTES,
     RECLAIM_FREELIST_PAGE_RATIO_DIVISOR,
 };
+mod certify_observations;
 mod media_jobs;
 pub mod transcribe_host;
 pub use synapse_worker_host::worker_host;
@@ -3444,61 +3445,6 @@ fn attach_certify_observation(response: &mut Value, observation: Option<Value>) 
     }
 }
 
-fn certify_observations(state: Arc<ModuleState>) -> HandlerOutcome {
-    if !state.runtime.certify_observation {
-        return channel_error(
-            "certify_observation_disabled",
-            "certification observation mode is disabled",
-        );
-    }
-    result_outcome(certify_worker_snapshot(&state.runtime))
-}
-
-// Direct ANE placement evidence comes from the shared residency supervisor;
-// transport counters alone cannot certify where its admitted layers execute.
-fn certify_worker_snapshot(runtime: &RuntimeState) -> Value {
-    let models = runtime.loaded_models();
-    let mut available = !models.is_empty();
-    let mut requests = BTreeMap::new();
-    for model in models {
-        match &model.backend {
-            EmbedBackend::Owned(_) => {}
-            #[cfg(unix)]
-            EmbedBackend::DirectAne(engine) => {
-                requests.insert(
-                    worker_host::ane_residency::AneShapeWorker::worker_id(
-                        engine.serving.channel.as_ref(),
-                    )
-                    .to_owned(),
-                    engine.serving.channel.request_count(),
-                );
-            }
-            EmbedBackend::Worker(engine) => {
-                let count = engine.lock().ok().and_then(|engine| {
-                    let identity = EmbedEngine::identity(&*engine);
-                    if identity.engine == "ane-direct-worker" {
-                        return None;
-                    }
-                    engine.request_count().ok()
-                });
-                if let Some((worker_id, count)) = count {
-                    requests.insert(worker_id, count);
-                } else {
-                    available = false;
-                }
-            }
-            _ => available = false,
-        }
-    }
-    let observations = runtime
-        .ane_supervisor
-        .lock()
-        .ok()
-        .and_then(|s| s.as_ref().and_then(|s| s.observations()));
-    let (inventories, admitted_count) = observations.unwrap_or_default();
-    json!({"inventories": inventories, "worker_requests": requests, "admitted_count": admitted_count, "available": available})
-}
-
 async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> HandlerOutcome {
     match request.method.as_str() {
         "diagnostics.findings" => diagnostics_findings::handle(&state, request.params),
@@ -3511,7 +3457,7 @@ async fn dispatch_request(state: Arc<ModuleState>, request: MethodEnvelope) -> H
         "models.remove" => models_remove(state, request.params).await,
         "models.list" => result_outcome(models_list_payload(&state)),
         "events_get" => event_outbox::events_get(&state, request.params),
-        "certify.observations" => certify_observations(state),
+        "certify.observations" => certify_observations::handle(state).await,
         "embed.query" => embed_query(state, request.params).await,
         "embed.batch" => embed_batch(state, request.params).await,
         "embed.result" => embed_result(state, request.params).await,
@@ -8733,6 +8679,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::settings::{load_legacy_config, parse_module_config_json, SYNAPSE_CONFIG_PATH_ENV};
+    #[cfg(unix)]
+    use crate::certify_observations::snapshot as certify_worker_snapshot;
     #[cfg(feature = "test-support")]
     mod retired_engine_tests;
     #[cfg(unix)]
@@ -11689,9 +11637,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(target_os = "macos")]
-    fn direct_ane_models_reuse_one_runtime_supervisor() {
+    async fn direct_ane_models_reuse_one_runtime_supervisor() {
         let runtime = RuntimeState::from_catalog(ModuleConfig::default(), vec![]).unwrap();
         *runtime.ane_supervisor.lock().unwrap() = Some(
             worker_host::ane_residency::AneResidencySupervisor::new(Default::default()),
@@ -11708,7 +11656,7 @@ mod tests {
         assert!(second.observations().is_none());
         first.enable_observations();
         assert_eq!(second.observations(), Some((vec![], 0)));
-        assert_eq!(certify_worker_snapshot(&runtime)["admitted_count"], 0);
+        assert_eq!(certify_worker_snapshot(&runtime).await["admitted_count"], 0);
     }
 
     /// Every owned engine's worker loads a converted safetensors profile
@@ -11748,14 +11696,14 @@ mod tests {
         assert!(!wire.safe_to_retry_same_request);
     }
 
-    #[test]
-    fn certify_observation_query_refuses_when_disabled() {
+    #[tokio::test]
+    async fn certify_observation_query_refuses_when_disabled() {
         let (root, descriptor) = test_storage_descriptor("certify-disabled");
         let store = Arc::new(SynapseStore::open(&descriptor).unwrap());
         let profile = test_machine_profile("certify-disabled-os");
         store.observe_profile(&profile, 10, 1).unwrap();
         let state = test_module_state(store, profile);
-        let HandlerOutcome::Error { code, .. } = certify_observations(state) else {
+        let HandlerOutcome::Error { code, .. } = certify_observations::handle(state).await else {
             panic!("disabled observation must refuse");
         };
         assert_eq!(code, "certify_observation_disabled");
@@ -14422,13 +14370,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn boundary_snapshot(runtime: &RuntimeState) -> Value {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(certify_worker_snapshot(runtime))
+    }
+
+    #[cfg(unix)]
     fn assert_catalog_boundary_refusal(
         state: &Arc<ModuleState>,
         method: &str,
         params: Value,
         item: &str,
     ) {
-        let before = certify_worker_snapshot(&state.runtime);
+        let before = boundary_snapshot(&state.runtime);
         let result = boundary_call(state, method, params);
         assert_eq!(
             result["error"]["code"], "sequence_too_long",
@@ -14443,7 +14398,7 @@ mod tests {
         );
         assert!(result.get("job_id").is_none());
         assert!(result.get("truncation_disclosures").is_none());
-        assert_eq!(certify_worker_snapshot(&state.runtime), before);
+        assert_eq!(boundary_snapshot(&state.runtime), before);
     }
 
     #[cfg(unix)]
@@ -14498,7 +14453,7 @@ mod tests {
                     json!({"model":lane,"id":"query-8193","text":boundary_text(8193-overhead)}),
                     "query-8193",
                 );
-                let before = certify_worker_snapshot(&state.runtime);
+                let before = boundary_snapshot(&state.runtime);
                 let result = boundary_call(
                     &state,
                     "embed.query",
@@ -14511,7 +14466,7 @@ mod tests {
                 );
                 assert_eq!(result["real_token_counts"], json!([8192]));
                 assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
-                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_ne!(boundary_snapshot(&state.runtime), before);
                 assert_catalog_cold_boundary_refusal(
                     &state,
                     &lane,
@@ -14552,7 +14507,7 @@ mod tests {
                     json!({"model":lane,"items":items}),
                     "row-8193",
                 );
-                let before = certify_worker_snapshot(&state.runtime);
+                let before = boundary_snapshot(&state.runtime);
                 let result = boundary_call(
                     &state,
                     "embed.batch",
@@ -14565,7 +14520,7 @@ mod tests {
                 );
                 assert_eq!(result["real_token_counts"], json!([8192]));
                 assert_eq!(result["truncation_disclosures"][0]["truncated"], false);
-                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_ne!(boundary_snapshot(&state.runtime), before);
                 assert_catalog_cold_boundary_refusal(
                     &state,
                     &lane,
@@ -14613,7 +14568,7 @@ mod tests {
                     json!({"model":lane,"query":"a a","candidates":[boundary_text(8193-overhead)]}),
                     "0",
                 );
-                let before = certify_worker_snapshot(&state.runtime);
+                let before = boundary_snapshot(&state.runtime);
                 let result = boundary_call(
                     &state,
                     "rerank.score",
@@ -14628,7 +14583,7 @@ mod tests {
                     json!([0.5])
                 };
                 assert_eq!(result["scores"], expected, "{id}/{name}: {result}");
-                assert_ne!(certify_worker_snapshot(&state.runtime), before);
+                assert_ne!(boundary_snapshot(&state.runtime), before);
                 assert_catalog_cold_boundary_refusal(
                     &state,
                     &lane,
@@ -14647,7 +14602,7 @@ mod tests {
     async fn catalog_embed_ceiling_precedes_job_diversion_and_worker_call() {
         let (dir, descriptor) = test_storage_descriptor("catalog-embed-ceiling");
         let state = catalog_test_state(&dir, &descriptor, "gte-modernbert-base.owned-vulkan");
-        let before = certify_worker_snapshot(&state.runtime);
+        let before = certify_worker_snapshot(&state.runtime).await;
         assert_eq!(before["available"], true);
         assert_eq!(before["worker_requests"].as_object().unwrap().len(), 1);
         assert_eq!(
@@ -14676,7 +14631,7 @@ mod tests {
         );
         assert!(result.get("job_id").is_none());
         assert!(result.get("truncation_disclosures").is_none());
-        assert_eq!(certify_worker_snapshot(&state.runtime), before);
+        assert_eq!(certify_worker_snapshot(&state.runtime).await, before);
         assert!(!dir.join("worker-called").exists());
         let text = std::iter::repeat_n("a", 8192).collect::<Vec<_>>().join(" ");
         let result = response_result(

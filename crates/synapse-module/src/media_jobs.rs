@@ -710,6 +710,21 @@ fn lane_cache(runtime: &RuntimeState, lane: &str) -> Arc<tokio::sync::Mutex<Lane
         .or_default()
         .clone()
 }
+
+pub(super) async fn certify_counters(
+    runtime: &RuntimeState,
+) -> Vec<(String, Option<transcribe_host::CertifyCounter>)> {
+    let lanes = runtime.media.lanes.lock().expect("media lanes").clone();
+    let mut counters = Vec::new();
+    for (id, lane) in lanes {
+        // Job status may become terminal just before the task releases its lane.
+        if let Some(host) = &lane.lock().await.host {
+            counters.push((id, host.certify_counter()));
+        }
+    }
+    counters
+}
+
 fn quarantined(lane: &str, retry: u64) -> Fault {
     let mut e = fault("engine_crashed", None);
     e.0["detail"]["lane_id"] = json!(lane);

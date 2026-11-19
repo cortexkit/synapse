@@ -1,6 +1,8 @@
 //! Audio admission and serving seam shared by catalog self-checks and media jobs.
 //! Workers only see normalized features; container bytes and text stay here.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use synapse_core::{
     worker_engine_names::*, LoadedModel, RuntimeConfig, TranscribeEngine, TranscribeOutput,
     TranscribeRequest, ValidatedArtifact, WorkerResponse,
@@ -95,6 +97,11 @@ enum Backend {
     InProcessTest(Box<dyn Fn(TranscribeRequest) -> Result<TranscribeOutput, EngineError> + Send>),
 }
 
+pub(crate) enum CertifyCounter {
+    WorkerRequests(String, u64),
+    InProcessEngineInvocations(u64),
+}
+
 /// A normal, temporary shape lease. It is released after checking, never pinned
 /// for the model's lifetime. Keeping it alive keeps compilation out of the timed check.
 pub struct SelfCheckAdmission<'a> {
@@ -142,6 +149,7 @@ pub struct TranscribeHost {
     profile: TranscribeProfile,
     mode: ObservationMode,
     backend: Backend,
+    in_process_engine_invocations: Option<AtomicU64>,
 }
 
 impl TranscribeHost {
@@ -179,6 +187,7 @@ impl TranscribeHost {
             profile,
             mode: ObservationMode::Certification,
             backend: Backend::InProcessTest(Box::new(run)),
+            in_process_engine_invocations: Some(AtomicU64::new(0)),
         }
     }
 
@@ -192,6 +201,7 @@ impl TranscribeHost {
             profile,
             mode: ObservationMode::Certification,
             backend: Backend::Worker(engine, model),
+            in_process_engine_invocations: None,
         }
     }
 
@@ -214,6 +224,8 @@ impl TranscribeHost {
             profile,
             mode,
             backend: Backend::Metal(engine, model),
+            in_process_engine_invocations: (mode == ObservationMode::Certification)
+                .then(|| AtomicU64::new(1)), // This host's successful load is its first invocation.
         })
     }
 
@@ -246,6 +258,7 @@ impl TranscribeHost {
             profile,
             mode,
             backend: Backend::Worker(engine, model),
+            in_process_engine_invocations: None,
         })
     }
 
@@ -280,7 +293,29 @@ impl TranscribeHost {
             profile,
             mode,
             backend: Backend::Ane(engine),
+            in_process_engine_invocations: None,
         })
+    }
+
+    pub(crate) fn certify_counter(&self) -> Option<CertifyCounter> {
+        match &self.backend {
+            Backend::Worker(engine, _) => engine
+                .request_count()
+                .ok()
+                .map(|(id, count)| CertifyCounter::WorkerRequests(id, count)),
+            #[cfg(unix)]
+            Backend::Ane(engine) => {
+                use crate::worker_host::ane_residency::AneShapeWorker;
+                let channel = &engine.serving.channel;
+                Some(CertifyCounter::WorkerRequests(
+                    channel.worker_id().to_owned(),
+                    channel.request_count(),
+                ))
+            }
+            _ => self.in_process_engine_invocations.as_ref().map(|count| {
+                CertifyCounter::InProcessEngineInvocations(count.load(Ordering::Relaxed))
+            }),
+        }
     }
 
     pub(crate) fn quarantine_retry_after_ms(&self) -> Option<u64> {
@@ -362,6 +397,9 @@ impl TranscribeHost {
         let mut peak_device_memory_bytes = None;
         let mut peak_storage_buffer_bytes = None;
         let mut last = std::time::Instant::now();
+        if let Some(count) = &self.in_process_engine_invocations {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         let (output, transcript_frame, observation, progress) = match &self.backend {
             #[cfg(test)]
             Backend::InProcessTest(run) => (

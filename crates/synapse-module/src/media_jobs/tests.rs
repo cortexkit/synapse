@@ -163,6 +163,48 @@ fn first(state: &ModuleState) -> String {
     select(state, MODEL).unwrap().1.backend
 }
 
+#[tokio::test]
+async fn certify_snapshot_includes_a_loaded_transcribe_only_lane() {
+    use transcribe_host::{ObservationMode, TranscribeHost, TranscribeProfile};
+
+    let runtime = RuntimeState::from_catalog(
+        ModuleConfig {
+            certify_observation: true,
+            ..Default::default()
+        },
+        vec![],
+    )
+    .unwrap();
+    let lane = catalog::lane_id(MODEL, "metal");
+    let cache = lane_cache(&runtime, &lane);
+    assert_eq!(
+        certify_observations::snapshot(&runtime).await["available"],
+        false
+    );
+
+    let profile = TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-metal").unwrap();
+    let wav = audio();
+    let frames = transcribe_host::prepare_wav(&profile, &wav, ObservationMode::Certification)
+        .unwrap()
+        .valid_encoder_frames;
+    let host = TranscribeHost::in_process_for_test(profile, move |_| {
+        Ok(synapse_core::TranscribeOutput {
+            valid_encoder_frames: frames,
+            ..Default::default()
+        })
+    });
+    host.transcribe(&wav, |_| {}).unwrap();
+    cache.lock().await.host = Some(host);
+
+    let snapshot = certify_observations::snapshot(&runtime).await;
+    assert_eq!(snapshot["available"], true);
+    assert_eq!(snapshot["worker_requests"], json!({}));
+    assert_eq!(
+        snapshot["in_process_transcribe_engine_invocations"],
+        json!({lane: 1})
+    );
+}
+
 fn ane_fixture(label: &str) -> (PathBuf, Arc<ModuleState>) {
     let (root, mut state) = fixture(label, true);
     Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime)
