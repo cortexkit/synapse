@@ -8,11 +8,12 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use synapse_certify::{transcribe::*, Catalog, Result};
 use synapse_parity::{
-    canonical::sha256_hex,
+    canonical::{sha256_file, sha256_hex},
     speech::{self, SpeechFixture, SpeechObservation, SpeechProfile},
 };
 use tokio::time::Instant;
 
+mod shards;
 #[cfg(test)]
 mod tests;
 
@@ -35,12 +36,59 @@ async fn call(
     params: Value,
     deadline: Instant,
 ) -> Result<Value> {
-    let value = bounded(client, method, params, deadline).await?;
+    let value = request_with_retry(client, method, params, deadline).await?;
     if value.get("error").is_some() {
         return Err(refuse(format!("{method} refused: {value}")));
     }
     Ok(value)
 }
+
+async fn request_with_retry(
+    client: &mut impl Client,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value> {
+    const MAX_RETRIES: u32 = 3;
+    let mut retries = 0;
+    loop {
+        let response = bounded(client, method, params.clone(), deadline).await?;
+        let error = &response["error"];
+        let code = error["code"].as_str();
+        let detail = &error["detail"];
+        // A rerun that starts consumes its upload, even on failure. Retry only
+        // refusals that occur before the candidate takes ownership of the object.
+        if method == "certify.transcribe_observe_rerun"
+            && !matches!(code, Some("queue_full" | "model_loading" | "lane_paused"))
+        {
+            return Ok(response);
+        }
+        let cold = method == "media.submit" && code == Some("model_loading");
+        let hint = detail["retry_after_ms"].as_u64();
+        let delay = if cold {
+            // Loading may take longer than a few retries, but shares the row deadline.
+            hint.or_else(|| error["retry_after_ms"].as_u64())
+                .unwrap_or(100)
+        } else if let Some(hint) =
+            hint.filter(|_| detail["class"] == "transient" && retries < MAX_RETRIES)
+        {
+            retries += 1;
+            hint
+        } else {
+            return Ok(response);
+        };
+        let delay = Duration::from_millis(delay.max(1));
+        if delay >= deadline.saturating_duration_since(Instant::now()) {
+            return Err(refuse(format!(
+                "{method} retry would exceed runner deadline: {response}"
+            )));
+        }
+        tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+            .await
+            .map_err(|_| refuse("runner deadline exceeded"))?;
+    }
+}
+
 async fn pause(deadline: Instant) -> Result<()> {
     tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(100)))
         .await
@@ -150,13 +198,7 @@ async fn submit(
     deadline: Instant,
 ) -> Result<Value> {
     let params = json!({"client_job_id":format!("certify-{fixture}"),"kind":"transcribe","model":pin.lane_id,"input":{"audio":audio},"deadline_ms":3600000});
-    loop {
-        let got = bounded(client, "media.submit", params.clone(), deadline).await?;
-        if got["error"]["code"] != "model_loading" {
-            return Ok(got);
-        }
-        pause(deadline).await?;
-    }
+    request_with_retry(client, "media.submit", params, deadline).await
 }
 
 async fn terminal_status(client: &mut impl Client, job: &str, deadline: Instant) -> Result<Value> {
@@ -169,7 +211,12 @@ async fn terminal_status(client: &mut impl Client, job: &str, deadline: Instant)
     }
 }
 
-async fn result(client: &mut impl Client, job: &str, deadline: Instant) -> Result<Value> {
+async fn result(
+    client: &mut impl Client,
+    job: &str,
+    object_budget: u64,
+    deadline: Instant,
+) -> Result<Value> {
     let status = terminal_status(client, job, deadline).await?;
     if status["status"] != "done" {
         return Err(refuse(format!("transcribe job failed: {status}")));
@@ -181,8 +228,8 @@ async fn result(client: &mut impl Client, job: &str, deadline: Instant) -> Resul
     let object = &value["output_object"];
     let mut raw = Vec::new();
     let bytes = number(object, "bytes")?;
-    if bytes > 64 * 1024 * 1024 {
-        return Err(refuse("media result too large"));
+    if bytes > object_budget {
+        return Err(refuse("media result exceeds fixture's storage budget"));
     }
     while (raw.len() as u64) < bytes {
         let length = (bytes - raw.len() as u64).min(2 * 1024 * 1024);
@@ -413,31 +460,68 @@ async fn refusal(
 struct FixturePaths<'a> {
     parity: &'a Path,
     mirror: &'a Path,
-    audio: &'a Path,
+}
+
+#[derive(Default)]
+struct Collected {
+    graded: Vec<GradedFixture>,
+    refusals: Vec<ExpectedRefusal>,
+    reruns: Vec<String>,
+    self_check: Option<SelfCheck>,
+    measurements: Option<Measurements>,
+    ran_maximum: bool,
+}
+
+impl Collected {
+    fn merge_measurements(&mut self, measured: Measurements) {
+        if let Some(all) = &mut self.measurements {
+            all.longest_progress_interval_ms = all
+                .longest_progress_interval_ms
+                .max(measured.longest_progress_interval_ms);
+            all.peak_device_memory_bytes = all
+                .peak_device_memory_bytes
+                .max(measured.peak_device_memory_bytes);
+            all.peak_storage_buffer_bytes = all
+                .peak_storage_buffer_bytes
+                .max(measured.peak_storage_buffer_bytes);
+            for shape in measured.ane_shapes {
+                if !all
+                    .ane_shapes
+                    .iter()
+                    .any(|s| s.encoder_frames == shape.encoder_frames)
+                {
+                    all.ane_shapes.push(shape);
+                }
+            }
+        } else {
+            // Keep the first load's self-check time rather than replacing it
+            // with later loads' timings when combining shards.
+            self.measurements = Some(measured);
+        }
+    }
+
+    fn merge(&mut self, shard: Self) {
+        self.graded.extend(shard.graded);
+        self.refusals.extend(shard.refusals);
+        self.reruns.extend(shard.reruns);
+        self.self_check = self.self_check.take().or(shard.self_check);
+        self.ran_maximum |= shard.ran_maximum;
+        if let Some(measured) = shard.measurements {
+            self.merge_measurements(measured);
+        }
+    }
 }
 
 async fn collect(
     client: &mut impl Client,
     pin: &Pin,
     profile: &SpeechProfile,
-    fixtures: &[SpeechFixture],
+    inputs: &[shards::Input<'_>],
     paths: FixturePaths<'_>,
+    sharded: bool,
     deadline: Instant,
-) -> Result<(
-    Vec<GradedFixture>,
-    Vec<ExpectedRefusal>,
-    Measurements,
-    ObserveRerun,
-    SelfCheck,
-)> {
-    let inputs: Value =
-        serde_json::from_slice(&std::fs::read(paths.audio.join("inputs.json")).map_err(err)?)
-            .map_err(err)?;
-    let mut graded = vec![];
-    let mut refusals = vec![];
-    let mut maximum_measurements = None;
-    let mut rerun = vec![];
-    let mut checked = None;
+) -> Result<Collected> {
+    let mut collected = Collected::default();
     let backend = pin
         .lane_id
         .rsplit('-')
@@ -448,18 +532,11 @@ async fn collect(
     } else {
         CounterSource::Worker
     };
-    for fixture in fixtures {
-        let input = &inputs[&fixture.id];
-        let file = text(input, "path")?;
-        if Path::new(file)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return Err(refuse("invalid audio cache path"));
-        }
-        let wav = std::fs::read(paths.audio.join(file)).map_err(err)?;
-        if sha256_hex(&wav) != text(input, "sha256")? {
-            return Err(refuse("cached audio digest mismatch"));
+    for input in inputs {
+        let fixture = input.fixture;
+        let wav = std::fs::read(&input.path).map_err(err)?;
+        if wav.len() as u64 != input.audio_bytes || sha256_hex(&wav) != input.digest {
+            return Err(refuse("cached audio size or digest mismatch"));
         }
         let audio = upload(client, &wav, deadline).await?;
         let above = fixture.duration_ms > profile.max_duration_ms;
@@ -470,7 +547,7 @@ async fn collect(
         };
         let submitted = submit(client, pin, &fixture.id, audio, deadline).await?;
         if above {
-            refusals.push(
+            collected.refusals.push(
                 refusal(
                     client,
                     fixture,
@@ -488,11 +565,11 @@ async fn collect(
             return Err(refuse(format!("in-limit fixture refused: {submitted}")));
         }
         let job = text(&submitted, "job_id")?;
-        let response = result(client, job, deadline).await?;
+        let response = result(client, job, input.result_bytes, deadline).await?;
         let (observed, encoder_output, decode_trace) =
             observation(client, pin, job, &response, deadline).await?;
-        if checked.is_none() {
-            checked = Some(self_check(client, pin, deadline).await?);
+        if collected.self_check.is_none() {
+            collected.self_check = Some(self_check(client, pin, deadline).await?);
         }
         // Score numerical gates one fixture at a time to avoid retaining gigabytes
         // of encoder tensors. Split WER is aggregated after every fixture ran.
@@ -527,12 +604,19 @@ async fn collect(
             {
                 return Err(refuse("observe on/off emitted triples or frames differ"));
             }
-            rerun.push(fixture.id.clone());
+            collected.reruns.push(fixture.id.clone());
         }
-        if fixture.id.starts_with("ladder-") && fixture.duration_ms == profile.max_duration_ms {
-            maximum_measurements = Some(measurements(client, job, backend, deadline).await?);
+        let is_maximum =
+            fixture.id.starts_with("ladder-") && fixture.duration_ms == profile.max_duration_ms;
+        collected.ran_maximum |= is_maximum;
+        if sharded || is_maximum {
+            let measured = measurements(client, job, backend, deadline).await?;
+            if measured.self_check_wall_ms >= 2000 {
+                return Err(refuse("speech self-check time gate failed"));
+            }
+            collected.merge_measurements(measured);
         }
-        graded.push(GradedFixture {
+        collected.graded.push(GradedFixture {
             id: fixture.id.clone(),
             lane_id: pin.lane_id.clone(),
             fingerprint: pin.fingerprint.clone(),
@@ -548,15 +632,118 @@ async fn collect(
             trace_error: diagnostics.trace_error.clone(),
         });
     }
+    if collected.self_check.is_none() {
+        return Err(refuse("self-check not observed in speech shard"));
+    }
+    Ok(collected)
+}
+
+fn verify_shard_binaries(
+    layout: &crate::assets::Layout,
+    artifacts: &[synapse_certify::Artifact],
+) -> Result<()> {
+    for artifact in artifacts {
+        let path = match artifact.role.as_str() {
+            "ck-synapse" => layout.candidate.clone(),
+            role if role.starts_with("cuda-runtime:") => {
+                layout.root.join(role.trim_start_matches("cuda-runtime:"))
+            }
+            _ => layout
+                .worker
+                .clone()
+                .ok_or_else(|| refuse("candidate worker alias missing"))?,
+        };
+        if sha256_file(&path).map_err(err)? != artifact.sha256 {
+            return Err(refuse(format!(
+                "speech shard binary digest differs: {}",
+                artifact.role
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn collect_shards(
+    options: &crate::live::Options,
+    layout: &crate::assets::Layout,
+    row: &str,
+    profile: &mut SpeechProfile,
+    inputs: &[shards::Input<'_>],
+    executed_artifacts: &[synapse_certify::Artifact],
+) -> Result<(Pin, Collected)> {
+    let shards = shards::partition(inputs)?;
+    let is_sharded = shards.len() > 1;
+    let mirror = crate::mirror::Mirror::start(&options.mirror).await?;
+    let deadline = Instant::now() + crate::catalog::RUN_BUDGET;
+    let mut first_pin: Option<Pin> = None;
+    let mut all = Collected::default();
+    let parity = options.checkout.join("bench/parity");
+    for (index, shard) in shards.into_iter().enumerate() {
+        let root = if index == 0 {
+            layout.root.clone()
+        } else {
+            let root = layout.root.join(format!("s{index}"));
+            std::fs::create_dir(&root).map_err(err)?;
+            root
+        };
+        verify_shard_binaries(layout, executed_artifacts)?;
+        let mut client = tokio::time::timeout_at(
+            deadline,
+            crate::live::start_in(layout, &root, &mirror.endpoint),
+        )
+        .await
+        .map_err(|_| refuse("runner deadline exceeded starting speech shard"))??;
+        let outcome = async {
+            let pin = crate::catalog::install(&mut client, row, speech::MODEL, deadline).await?;
+            if pin.task != "transcribe" {
+                return Err(refuse("catalog task differs from transcribe"));
+            }
+            let describe = call(&mut client, "role.describe", json!({}), deadline).await?;
+            let engine = describe["engines"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["model"] == pin.lane_id))
+                .ok_or_else(|| refuse("role.describe omitted pinned speech engine"))?;
+            let certified = number(engine, "max_duration_ms")?;
+            if let Some(first) = &first_pin {
+                if first.lane_id != pin.lane_id
+                    || first.fingerprint != pin.fingerprint
+                    || certified != profile.max_duration_ms
+                {
+                    return Err(refuse("speech shard catalog pin or duration differs"));
+                }
+            } else {
+                if certified == 0 || certified > profile.max_duration_ms {
+                    return Err(refuse("role.describe exceeds profile duration"));
+                }
+                profile.max_duration_ms = certified;
+            }
+            let collected = collect(
+                &mut client,
+                &pin,
+                profile,
+                &inputs[shard],
+                FixturePaths {
+                    parity: &parity,
+                    mirror: &options.mirror,
+                },
+                is_sharded,
+                deadline,
+            )
+            .await?;
+            Ok((pin, collected))
+        }
+        .await;
+        client.shutdown().await?;
+        let (pin, collected) = outcome?;
+        first_pin.get_or_insert(pin);
+        all.merge(collected);
+    }
+    if !all.ran_maximum {
+        return Err(refuse("maximum-duration ladder was not executed"));
+    }
     Ok((
-        graded,
-        refusals,
-        maximum_measurements.ok_or_else(|| refuse("maximum-duration ladder was not executed"))?,
-        ObserveRerun {
-            fixture_ids: rerun,
-            bit_identical: true,
-        },
-        checked.ok_or_else(|| refuse("self-check not observed"))?,
+        first_pin.ok_or_else(|| refuse("no speech shards executed"))?,
+        all,
     ))
 }
 
@@ -600,38 +787,30 @@ pub(crate) async fn run(
             "speech audio preparation failed; install the pinned reference environment",
         ));
     }
-    let mirror = crate::mirror::Mirror::start(&options.mirror).await?;
-    let mut client = crate::live::start(layout, &mirror.endpoint).await?;
-    let deadline = Instant::now() + crate::catalog::RUN_BUDGET;
+    let inputs = shards::inputs(&audio_root, &fixtures, profile.max_duration_ms)?;
+    let executed_artifacts = layout
+        .artifacts
+        .iter()
+        .map(|a| {
+            Ok(synapse_certify::Artifact {
+                role: a.role.clone(),
+                file: a.file.clone(),
+                sha256: synapse_certify::digest(&options.assets, &a.file)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let outcome = async {
-        let pin = crate::catalog::install(&mut client, row, speech::MODEL, deadline).await?;
-        if pin.task != "transcribe" {
-            return Err(refuse("catalog task differs from transcribe"));
-        }
-        let describe = call(&mut client, "role.describe", json!({}), deadline).await?;
-        let engine = describe["engines"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|r| r["model"] == pin.lane_id))
-            .ok_or_else(|| refuse("role.describe omitted pinned speech engine"))?;
-        let certified = number(engine, "max_duration_ms")?;
-        if certified == 0 || certified > profile.max_duration_ms {
-            return Err(refuse("role.describe exceeds profile duration"));
-        }
-        profile.max_duration_ms = certified;
-        let (graded_fixtures, expected_refusals, measurements, observe_rerun, self_check) =
-            collect(
-                &mut client,
-                &pin,
-                &profile,
-                &fixtures,
-                FixturePaths {
-                    parity: &options.checkout.join("bench/parity"),
-                    mirror: &options.mirror,
-                    audio: &audio_root,
-                },
-                deadline,
-            )
-            .await?;
+        let (pin, collected) = collect_shards(
+            options,
+            layout,
+            row,
+            &mut profile,
+            &inputs,
+            &executed_artifacts,
+        )
+        .await?;
+        let certified = profile.max_duration_ms;
+        let graded_fixtures = collected.graded;
         let by_id: BTreeMap<_, _> = graded_fixtures.iter().map(|g| (g.id.as_str(), g)).collect();
         let split_wer = speech::grade_wer(fixtures.iter().filter_map(|f| {
             Some((
@@ -642,17 +821,6 @@ pub(crate) async fn run(
             ))
         }))
         .map_err(err)?;
-        let executed_artifacts = layout
-            .artifacts
-            .iter()
-            .map(|a| {
-                Ok(synapse_certify::Artifact {
-                    role: a.role.clone(),
-                    file: a.file.clone(),
-                    sha256: synapse_certify::digest(&options.assets, &a.file)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         let catalog = Catalog {
             lanes: vec![(
                 speech::MODEL.into(),
@@ -682,19 +850,25 @@ pub(crate) async fn run(
             max_duration_ms: certified,
             max_encoder_frames: speech::frame_counts(certified * 16).2,
             graded_fixtures,
-            expected_refusals,
+            expected_refusals: collected.refusals,
             executed_ladder,
             split_wer,
-            self_check,
-            measurements,
-            observe_rerun,
+            self_check: collected
+                .self_check
+                .ok_or_else(|| refuse("self-check not observed"))?,
+            measurements: collected
+                .measurements
+                .ok_or_else(|| refuse("speech measurements not observed"))?,
+            observe_rerun: ObserveRerun {
+                fixture_ids: collected.reruns,
+                bit_identical: true,
+            },
             status: "passed".into(),
         };
         validate_record(&record, &options.checkout, &options.assets, &catalog)?;
         Ok((record, catalog))
     }
     .await;
-    client.shutdown().await?;
     let (record, catalog) = outcome.map_err(|e: synapse_certify::Error| refuse(format!(
         "transcribe certification incomplete for {row}; real hardware run required on {required}: {e}"
     )))?;

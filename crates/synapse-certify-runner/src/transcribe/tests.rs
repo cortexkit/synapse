@@ -31,6 +31,58 @@ fn descriptor(raw: &[u8]) -> Value {
     json!({"bytes":raw.len(),"sha256":sha256_hex(raw),"pages":raw.len().div_ceil(524288)})
 }
 
+#[test]
+fn transcribe_shards_preserve_fixtures_and_bound_peak_storage() {
+    const MIB: u64 = 1024 * 1024;
+    let template = synapse_certify::transcribe::fixtures(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.."
+    )))
+    .unwrap()
+    .remove(0);
+    let fixtures: Vec<_> = (0..6)
+        .map(|id| SpeechFixture {
+            id: id.to_string(),
+            ..template.clone()
+        })
+        .collect();
+    let mut inputs: Vec<_> = [
+        (210, 12, 0),
+        (200, 18, 200),
+        (170, 0, 170),
+        (170, 20, 0),
+        (190, 20, 190),
+        (200, 10, 0),
+    ]
+    .into_iter()
+    .zip(&fixtures)
+    .map(|((audio, result, rerun), fixture)| shards::Input {
+        fixture,
+        path: Default::default(),
+        digest: String::new(),
+        audio_bytes: audio * MIB,
+        result_bytes: result * MIB,
+        rerun_bytes: rerun * MIB,
+    })
+    .collect();
+    assert!(inputs.iter().map(|i| i.audio_bytes).sum::<u64>() > 1024 * MIB);
+    let plan = shards::partition(&inputs).unwrap();
+    assert_eq!(plan, [0..2, 2..5, 5..6]);
+    let mut executed = Vec::new();
+    for shard in plan {
+        let mut retained = 0;
+        for input in &inputs[shard] {
+            executed.push(input.fixture.id.as_str());
+            retained += input.audio_bytes + input.result_bytes;
+            assert!(retained + input.rerun_bytes < shards::SHARD_BYTES);
+        }
+    }
+    assert_eq!(executed, ["0", "1", "2", "3", "4", "5"]);
+    inputs[5].audio_bytes = shards::SHARD_BYTES;
+    let error = shards::partition(&inputs).unwrap_err().to_string();
+    assert!(error.contains("speech fixture 5 needs"), "{error}");
+}
+
 #[tokio::test]
 async fn transcribe_pages_reassemble_every_page_and_verify_both_seals() {
     let raw = vec![7; 528384];

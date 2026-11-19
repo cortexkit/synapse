@@ -243,6 +243,7 @@ impl crate::catalog::Client for Session {
 fn candidate_command(
     candidate: &Path,
     root: &Path,
+    model_cache: &Path,
     environment: impl IntoIterator<Item = (String, Option<PathBuf>)>,
     conn_path: &Path,
     config: &Path,
@@ -257,7 +258,6 @@ fn candidate_command(
         }
     }
     let data_home = root.join("data");
-    let model_cache = root.join("model-cache");
     command
         .current_dir(root)
         .arg("--subc")
@@ -265,8 +265,8 @@ fn candidate_command(
         .env("SUBC_MODULE_ID", "synapse")
         .env("SYNAPSE_CONFIG_PATH", config)
         .env("XDG_DATA_HOME", &data_home)
-        .env("CORTEXKIT_MODEL_CACHE", &model_cache)
-        .env("SYNAPSE_MODEL_CACHE_DIR", &model_cache)
+        .env("CORTEXKIT_MODEL_CACHE", model_cache)
+        .env("SYNAPSE_MODEL_CACHE_DIR", model_cache)
         .env("CORTEXKIT_LEASE_ROOT", root.join("leases"))
         .env("CORTEXKIT_STORE_ROOT", root.join("store"));
     if platform == synapse_core::Platform::Windows {
@@ -278,8 +278,17 @@ fn candidate_command(
 }
 
 pub(crate) async fn start(layout: &crate::assets::Layout, endpoint: &str) -> Result<Session> {
-    let root = &layout.root;
+    start_in(layout, &layout.root, endpoint).await
+}
+
+pub(crate) async fn start_in(
+    layout: &crate::assets::Layout,
+    root: &Path,
+    endpoint: &str,
+) -> Result<Session> {
     std::fs::create_dir_all(root.join("data")).map_err(err)?;
+    std::fs::create_dir_all(root.join(layout.runtime.file_name().expect("IPC directory")))
+        .map_err(err)?;
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(err)?;
     let conn = ConnectionInfo {
         schema: SCHEMA_VERSION,
@@ -313,6 +322,7 @@ pub(crate) async fn start(layout: &crate::assets::Layout, endpoint: &str) -> Res
     let child = candidate_command(
         &layout.candidate,
         root,
+        &layout.root.join("model-cache"),
         layout.environment(),
         &conn_path,
         &config,
@@ -1051,6 +1061,7 @@ mod tests {
             let command = candidate_command(
                 &candidate,
                 &scratch,
+                &scratch.join("model-cache"),
                 std::iter::empty(),
                 &connection,
                 &config,
