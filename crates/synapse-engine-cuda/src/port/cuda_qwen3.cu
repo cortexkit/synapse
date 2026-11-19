@@ -315,6 +315,10 @@ struct QwenContext {
             copy_weight<half>(target.down_weight, source.down_weight, static_cast<size_t>(h) * inter);
         }
         copy_float(final_norm, host_final_norm, h);
+        // Load-bearing: the copies above are cudaMemcpy calls from pageable
+        // memory on the legacy stream and may return before their DMA lands.
+        // Forwards run on this context's non-blocking stream, which does not
+        // wait for that stream, so wait for the whole device here.
         FAMILY_CUDA_CHECK(cudaDeviceSynchronize());
         weights_loaded = true;
         std::fprintf(stderr, "CUDA Qwen3 persistent weights: layers=%d dtype=f16 accum=fp32 norm_params=fp32\n", count);
