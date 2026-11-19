@@ -595,6 +595,38 @@ fn checked_output(output: Value) -> Answer<Value> {
     Ok(output)
 }
 
+struct TranscribeRuntimeConfig {
+    runtime: RuntimeConfig,
+    _model: LocatedAsset,
+    _config: Option<LocatedAsset>,
+}
+
+fn transcribe_runtime_config(
+    spec: &StoredModelConfig,
+    cache: &ModelCache,
+    microllm_max_tokens: u32,
+) -> Result<TranscribeRuntimeConfig, WireOperationError> {
+    let model = locator_path(&spec.model_locator, cache)?;
+    let config = spec
+        .config_locator
+        .as_ref()
+        .map(|locator| locator_path(locator, cache))
+        .transpose()?;
+    let mut runtime = model_runtime_config(spec, &model.path, cache.root(), microllm_max_tokens);
+    if let Some(config) = &config {
+        runtime.values.insert(
+            "config_path".into(),
+            config.path.to_string_lossy().into_owned(),
+        );
+    }
+    // Hold both cache leases until the engine has opened the files.
+    Ok(TranscribeRuntimeConfig {
+        runtime,
+        _model: model,
+        _config: config,
+    })
+}
+
 fn load_host(
     state: &ModuleState,
     entry: &catalog::CatalogEntry,
@@ -612,13 +644,9 @@ fn load_host(
         true,
     )
     .map_err(err)?;
-    let path = locator_path(&spec.model_locator, &state.model_cache).map_err(err)?;
-    let config = model_runtime_config(
-        &spec,
-        &path.path,
-        state.model_cache.root(),
-        state.runtime.microllm_max_tokens,
-    );
+    let config =
+        transcribe_runtime_config(&spec, &state.model_cache, state.runtime.microllm_max_tokens)
+            .map_err(err)?;
     let artifact = ValidatedArtifact {
         digest: spec.artifact_digest.clone(),
         format: spec.artifact_format.clone(),
@@ -630,7 +658,7 @@ fn load_host(
         ObservationMode::Serving
     };
     if backend.backend == "metal" {
-        return TranscribeHost::load_metal(profile, &artifact, &config, mode);
+        return TranscribeHost::load_metal(profile, &artifact, &config.runtime, mode);
     }
     let binary = spec
         .worker_bin
@@ -652,9 +680,16 @@ fn load_host(
         let supervisor = direct_ane_supervisor(&state.runtime, &spec.engine)
             .map_err(err)?
             .ok_or_else(|| TranscribeHostError::Profile("ANE supervisor unavailable".into()))?;
-        return TranscribeHost::load_ane(profile, worker, supervisor, &artifact, &config, mode);
+        return TranscribeHost::load_ane(
+            profile,
+            worker,
+            supervisor,
+            &artifact,
+            &config.runtime,
+            mode,
+        );
     }
-    TranscribeHost::load_worker(profile, worker, &artifact, &config, mode)
+    TranscribeHost::load_worker(profile, worker, &artifact, &config.runtime, mode)
 }
 
 fn lane_cache(runtime: &RuntimeState, lane: &str) -> Arc<tokio::sync::Mutex<Lane>> {

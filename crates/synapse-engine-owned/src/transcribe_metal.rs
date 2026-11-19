@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Context as _, Result};
 use std::{
     collections::HashMap,
     ffi::{c_char, c_void, CStr, CString},
-    path::Path,
+    path::{Path, PathBuf},
     ptr::NonNull,
 };
 use synapse_core::{RuntimeConfig, TranscribeOutput, TranscribeRequest};
@@ -38,13 +38,18 @@ impl Model {
             "max_encoder_frames exceeds certified Metal envelope"
         );
         let path = Path::new(cfg.values.get("model_path").context("missing model_path")?);
-        let root = if path.is_file() {
-            path.parent().context("model root")?
-        } else {
-            path
-        };
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("config.json"))?)?;
+        // A package directory has named members. A weight file can instead be
+        // a digest-named cache blob, so its config must be named separately.
+        let config_path = cfg
+            .values
+            .get("config_path")
+            .map(PathBuf::from)
+            .or_else(|| path.is_dir().then(|| path.join("config.json")))
+            .context("missing config_path for Parakeet weights")?;
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&config_path)
+                .with_context(|| format!("read Parakeet config {}", config_path.display()))?,
+        )?;
         ensure!(
             config["model_type"] == "parakeet_tdt"
                 && config["encoder_config"]["hidden_size"] == 1024
@@ -52,7 +57,7 @@ impl Model {
                 && config["decoder_hidden_size"] == 640,
             "unsupported Parakeet architecture"
         );
-        let loaded = load_weights(root, path)?;
+        let loaded = load_weights(path)?;
         let gpu = Gpu::new()?;
         let weights = upload_weights(loaded, |name, tensor| {
             let c_name = CString::new(name)?;
@@ -184,9 +189,14 @@ impl Drop for MappedWeights {
 /// used to be alive at once. A read-only mapping is backed by the file itself,
 /// so the OS can drop its pages instead of holding a second private copy, and
 /// each mapping is released once its tensors are converted.
-fn load_weights(root: &Path, original: &Path) -> Result<HashMap<String, Tensor>> {
+fn load_weights(path: &Path) -> Result<HashMap<String, Tensor>> {
+    let files = if path.is_dir() {
+        safetensor_files(path, path)?
+    } else {
+        vec![path.to_path_buf()]
+    };
     let mut host = HashMap::new();
-    for file in safetensor_files(root, original)? {
+    for file in files {
         let mapping = MappedWeights::open(&file)?;
         host.extend(tensors_from_safetensors_bytes(&file, mapping.bytes())?);
     }
@@ -437,7 +447,7 @@ mod tests {
         std::fs::write(fixture.0.join("model.safetensors.index.json"),
             br#"{"weight_map":{"encoder.weight":"encoder.safetensors","decoder.weight":"host.safetensors"}}"#).unwrap();
         let mut uploads = 0;
-        let loaded = load_weights(&fixture.0, &fixture.0).unwrap();
+        let loaded = load_weights(&fixture.0).unwrap();
         let host = upload_weights(loaded, |name, tensor| {
             assert_eq!(name, "encoder.weight");
             assert_eq!(tensor.shape, [4]);
@@ -478,32 +488,28 @@ mod tests {
             .unwrap()
             .write_all(&[0])
             .unwrap();
-        let error = load_weights(&fixture.0, &fixture.0).unwrap_err();
+        let error = load_weights(&fixture.0).unwrap_err();
         assert!(format!("{error:#}").contains("load safetensors"));
     }
 
     #[test]
     fn mapped_weights_preserve_half_conversion_and_reject_nonfinite() {
         let fixture = Fixture::new();
+        let blob = "weights-blob";
+        let path = fixture.0.join(blob);
         for (dtype, bits) in [(Dtype::F16, 0x3c00_u16), (Dtype::BF16, 0x3f80)] {
-            fixture.write(
-                "model.safetensors",
-                "encoder.weight",
-                dtype,
-                &bits.to_le_bytes(),
-                1,
-            );
-            let loaded = load_weights(&fixture.0, &fixture.0).unwrap();
+            fixture.write(blob, "encoder.weight", dtype, &bits.to_le_bytes(), 1);
+            let loaded = load_weights(&path).unwrap();
             assert_eq!(loaded["encoder.weight"].data[0].to_bits(), 1_f32.to_bits());
         }
         fixture.write(
-            "model.safetensors",
+            blob,
             "encoder.weight",
             Dtype::F32,
             &f32::NAN.to_le_bytes(),
             1,
         );
-        let error = load_weights(&fixture.0, &fixture.0).unwrap_err();
+        let error = load_weights(&path).unwrap_err();
         assert!(error.to_string().contains("non-finite model weight"));
     }
 

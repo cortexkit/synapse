@@ -20,6 +20,65 @@ async fn cleanup(root: PathBuf, state: Arc<ModuleState>) {
 use std::sync::atomic::{AtomicUsize, Ordering};
 const MODEL: &str = "parakeet-tdt-0.6b-v3";
 
+#[test]
+fn catalog_transcribe_runtime_config_names_cached_assets() {
+    let (root, state) = fixture("media-cache-config", false);
+    let entry = state.runtime.release_catalog.entry(MODEL).unwrap();
+    let backend = entry
+        .backends
+        .iter()
+        .find(|b| b.backend == "metal")
+        .unwrap();
+    let profile = backend.profile.as_deref().unwrap();
+    let mut spec = catalog_profile_lane_spec(&state, entry, backend, profile, false).unwrap();
+
+    // Ingest tiny stand-ins in the download cache; only the load inputs are tested.
+    let ingest = |name, format: &str, bytes: &[u8]| {
+        let source = root.join(name);
+        fs::write(&source, bytes).unwrap();
+        state
+            .model_cache
+            .ingest(ModelCacheIngest {
+                source_url: local_file_url(&source),
+                expected_digest: None,
+                format: format.into(),
+                tokenizer_path: None,
+                pin_module_id: None,
+            })
+            .unwrap()
+            .digest
+    };
+    let weights = ingest("model.safetensors", "safetensors", b"test weights");
+    let config_bytes = br#"{"model_type":"parakeet_tdt","encoder_config":{"hidden_size":1024,"num_hidden_layers":24},"decoder_hidden_size":640}"#;
+    let config = ingest("config.json", "json", config_bytes);
+    let weights_path = state.model_cache.blob_path(&weights);
+    let config_path = state.model_cache.blob_path(&config);
+    spec.model_locator = ModelAssetLocator::CacheDigest { digest: weights };
+    assert!(spec.config_locator.is_some());
+    spec.config_locator = Some(ModelAssetLocator::CacheDigest { digest: config });
+
+    assert!(weights_path.is_file());
+    assert!(weights_path.extension().is_none());
+    assert!(!weights_path.with_file_name("config.json").exists());
+    let load =
+        transcribe_runtime_config(&spec, &state.model_cache, DEFAULT_MICROLLM_MAX_TOKENS).unwrap();
+    let runtime = transcribe_host::TranscribeProfile::pinned(profile)
+        .unwrap()
+        .runtime_config(&load.runtime);
+    assert_eq!(Path::new(&runtime.values["model_path"]), weights_path);
+    assert_eq!(Path::new(&runtime.values["artifact_path"]), weights_path);
+    let configured = runtime
+        .values
+        .get("config_path")
+        .expect("catalog transcribe config path must be passed to the engine");
+    assert_eq!(Path::new(configured), config_path);
+    assert_eq!(fs::read(configured).unwrap(), config_bytes);
+
+    drop(load);
+    drop(state);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn fixture(label: &str, installed: bool) -> (PathBuf, Arc<ModuleState>) {
     let (root, mut state) = catalog_runtime_tests::isolated_catalog_state(label, false);
     let runtime = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().runtime).unwrap();
