@@ -8068,31 +8068,45 @@ async fn cache_pin(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
         .as_deref()
         .unwrap_or(&state.module_id)
         .to_string();
-    let result: Result<ModelCacheMeta, ModelCacheError> =
+    if params.source_url.is_none() && params.digest.is_none() {
+        return channel_error(
+            "invalid_request",
+            "cache.pin requires either source_url or digest",
+        );
+    }
+    // Ingest copies, hashes and may fetch over HTTP with a blocking client,
+    // which panics on a Tokio runtime thread; run it on the blocking pool.
+    let cache = Arc::clone(&state.model_cache);
+    let result = tokio::task::spawn_blocking(move || -> Result<ModelCacheMeta, ModelCacheError> {
         if let Some(source_url) = params.source_url {
-            state.model_cache.ingest(ModelCacheIngest {
+            cache.ingest(ModelCacheIngest {
                 source_url,
                 expected_digest: params.expected_digest.or(params.digest),
                 format: params.format.unwrap_or_else(|| "unknown".to_string()),
                 tokenizer_path: params.tokenizer_path,
                 pin_module_id: Some(module_id),
             })
-        } else if let Some(digest) = params.digest {
-            state.model_cache.pin(&digest, &module_id)
         } else {
-            return channel_error(
-                "invalid_request",
-                "cache.pin requires either source_url or digest",
-            );
-        };
+            let digest = params.digest.expect("checked above");
+            cache.pin(&digest, &module_id)
+        }
+    })
+    .await;
 
     match result {
-        Ok(meta) => result_outcome(json!({
+        Ok(Ok(meta)) => result_outcome(json!({
             "module_generation": state.module_generation,
             "cache_root": state.model_cache.root().to_string_lossy(),
             "artifact": meta,
         })),
-        Err(error) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
+        Ok(Err(error)) => result_outcome(error_payload(&state, cache_error_to_wire(error))),
+        Err(error) => result_outcome(error_payload(
+            &state,
+            WireOperationError::from_stable(
+                StableError::engine_crashed(Some(250)),
+                format!("cache.pin blocking task failed: {error}"),
+            ),
+        )),
     }
 }
 
