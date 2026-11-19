@@ -33,9 +33,95 @@ fn u32le(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
+/// Facts a valid WAV states in its format and data chunks, known without
+/// decoding or allocating any sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WavInfo {
+    /// Mono sample count at the input rate, before resampling.
+    pub sample_frames: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+impl WavInfo {
+    /// Same ceiling duration as [`Audio::duration_ms`].
+    pub fn duration_ms(&self) -> u64 {
+        (self.sample_frames * 1000).div_ceil(u64::from(self.sample_rate))
+    }
+
+    /// Length [`resample`] produces for this input: the ceiling 16-kHz count.
+    pub fn samples_16khz(&self) -> u64 {
+        (self.sample_frames * u64::from(SAMPLE_RATE)).div_ceil(u64::from(self.sample_rate))
+    }
+}
+
+/// A container that passed validation, with its sample bytes still encoded.
+struct Container<'a> {
+    codec: u16,
+    channels: u16,
+    rate: u32,
+    width: usize,
+    block: usize,
+    data: &'a [u8],
+}
+
+impl Container<'_> {
+    fn info(&self) -> WavInfo {
+        WavInfo {
+            sample_frames: (self.data.len() / self.block) as u64,
+            sample_rate: self.rate,
+            channels: self.channels,
+        }
+    }
+
+    fn sample(&self, sample: &[u8]) -> Result<f32> {
+        let x = if self.codec == 1 {
+            f32::from(i16::from_le_bytes(sample.try_into().unwrap())) / 32768.0
+        } else {
+            f32::from_le_bytes(sample.try_into().unwrap())
+        };
+        if x.is_finite() {
+            Ok(x)
+        } else {
+            Err(invalid("non-finite sample"))
+        }
+    }
+}
+
+/// Accepts exactly the input [`decode_wav`] accepts and reports its sample
+/// count, rate and channels. Samples are only checked in place, so admission
+/// can refuse bad audio without materializing a decoded copy.
+pub fn inspect_wav(bytes: &[u8]) -> Result<WavInfo> {
+    let container = container(bytes)?;
+    // PCM16 samples are always finite; only float data needs a scan.
+    if container.codec != 1 {
+        for sample in container.data.chunks_exact(container.width) {
+            container.sample(sample)?;
+        }
+    }
+    Ok(container.info())
+}
+
 /// Validate the entire RIFF before decoding any samples. Unknown chunks are
 /// allowed, but their lengths and word padding must still fit the container.
 pub fn decode_wav(bytes: &[u8]) -> Result<Audio> {
+    let container = container(bytes)?;
+    let mut samples = Vec::with_capacity(container.data.len() / container.block);
+    for frame in container.data.chunks_exact(container.block) {
+        let mut sum = 0.0f64;
+        for sample in frame.chunks_exact(container.width) {
+            sum += f64::from(container.sample(sample)?);
+        }
+        samples.push((sum / f64::from(container.channels)) as f32);
+    }
+    Ok(Audio {
+        samples,
+        sample_rate: container.rate,
+        channels: container.channels,
+    })
+}
+
+fn container(bytes: &[u8]) -> Result<Container<'_>> {
     if bytes.len() > MAX_AUDIO_BYTES || bytes.len() < 12 {
         return Err(invalid("WAV size"));
     }
@@ -107,26 +193,13 @@ pub fn decode_wav(bytes: &[u8]) -> Result<Audio> {
     if data.is_empty() || data.len() % block != 0 {
         return Err(invalid("empty or partial sample frame"));
     }
-    let mut samples = Vec::with_capacity(data.len() / block);
-    for frame in data.chunks_exact(block) {
-        let mut sum = 0.0f64;
-        for sample in frame.chunks_exact(width) {
-            let x = if codec == 1 {
-                f32::from(i16::from_le_bytes(sample.try_into().unwrap())) / 32768.0
-            } else {
-                f32::from_le_bytes(sample.try_into().unwrap())
-            };
-            if !x.is_finite() {
-                return Err(invalid("non-finite sample"));
-            }
-            sum += f64::from(x);
-        }
-        samples.push((sum / f64::from(channels)) as f32);
-    }
-    Ok(Audio {
-        samples,
-        sample_rate: rate,
+    Ok(Container {
+        codec,
         channels,
+        rate,
+        width,
+        block,
+        data,
     })
 }
 

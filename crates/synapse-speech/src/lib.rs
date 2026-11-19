@@ -8,7 +8,7 @@ pub mod qwen;
 mod text;
 mod timing;
 
-pub use audio::{decode_wav, resample, Audio, MAX_AUDIO_BYTES, SAMPLE_RATE};
+pub use audio::{decode_wav, inspect_wav, resample, Audio, WavInfo, MAX_AUDIO_BYTES, SAMPLE_RATE};
 pub use decode::{greedy, DecodeOutput, Joint, JointLogits, TraceStep, Triple};
 pub use frontend::{actual_mel_frames, valid_encoder_frames, valid_mel_frames, Features, Frontend};
 pub use text::{Tokenizer, Transcript, Word, TOKENIZER_SHA256};

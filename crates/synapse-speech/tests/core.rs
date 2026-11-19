@@ -46,6 +46,16 @@ fn wav_scaling_downmix_and_extensible_subformats() {
             .collect();
         let decoded = decode_wav(&wav(3, 32, 192000, 2, &floats, extensible)).unwrap();
         assert_eq!(decoded.samples, [3.0, -3.0]);
+        let info = inspect_wav(&wav(3, 32, 192000, 2, &floats, extensible)).unwrap();
+        assert_eq!(
+            (info.sample_frames, info.sample_rate, info.channels),
+            (2, 192000, 2)
+        );
+        assert_eq!(info.duration_ms(), decoded.duration_ms());
+        assert_eq!(
+            info.samples_16khz(),
+            decoded.samples_16khz().unwrap().len() as u64
+        );
     }
     let pcm = [0; 16];
     assert_eq!(
@@ -111,6 +121,11 @@ fn c5_refusals_are_invalid_audio_before_features() {
         assert!(
             matches!(frontend.process_wav(input), Err(Error::InvalidAudio(_))),
             "case {index}"
+        );
+        // Admission inspects without decoding and must refuse the same input.
+        assert!(
+            matches!(inspect_wav(input), Err(Error::InvalidAudio(_))),
+            "inspect case {index}"
         );
     }
 }
