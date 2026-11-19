@@ -165,6 +165,9 @@ __global__ void mask_softmax(
         sum += value;
     }
     sum = warp_sum(sum);
+    // Every warp must have read the maximum from reductions[0] before warp 0
+    // overwrites that slot with its partial sum.
+    __syncthreads();
     if (lane == 0) reductions[warp] = sum;
     __syncthreads();
     sum = threadIdx.x < blockDim.x / 32 ? reductions[lane] : 0.0f;

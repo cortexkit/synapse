@@ -150,6 +150,9 @@ __global__ void causal_softmax(half *scores, const uint8_t *mask, int batch, int
         sum += exponential;
     }
     sum = warp_sum(sum);
+    // Every warp must have read the maximum from reductions[0] before warp 0
+    // overwrites that slot with its partial sum.
+    __syncthreads();
     if (lane == 0) reductions[warp] = sum;
     __syncthreads();
     sum = threadIdx.x < blockDim.x / 32 ? reductions[lane] : 0.0f;
