@@ -782,7 +782,12 @@ pub(crate) async fn run(
     // Windows Python installs as `python`; `python3` there is only the Store's
     // install prompt, which exits without running anything.
     let python = if cfg!(windows) { "python" } else { "python3" };
-    let prepared = synapse_core::without_launch_nonce_tokio(tokio::process::Command::new(python))
+    let mut command =
+        synapse_core::without_launch_nonce_tokio(tokio::process::Command::new(python));
+    // The sealed fixtures are UTF-8. Without UTF-8 mode, Windows Python reads
+    // text with the locale's code page and fails on the first non-ASCII byte.
+    command.env("PYTHONUTF8", "1");
+    let prepared = command
         .arg(
             options
                 .checkout
