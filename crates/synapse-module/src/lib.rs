@@ -6977,6 +6977,9 @@ async fn upfront_execution_permit(
 // Dropping the caller's JoinHandle leaves the task reading the worker's reply
 // running. Never abort that task after dispatch: it must drain the entire reply
 // before releasing the shared connection, or the next request could consume it.
+// In-process Metal calls use the same bound: started GPU work cannot be
+// cancelled, so it finishes inside its blocking task, which keeps the execution
+// permit and lane guards until the engine returns.
 async fn await_worker_completion<T>(
     handle: tokio::task::JoinHandle<Result<T, EngineError>>,
     deadline: Option<tokio::time::Instant>,
@@ -6985,7 +6988,7 @@ async fn await_worker_completion<T>(
     let expired = || {
         WireOperationError::from_stable(
             StableError::deadline_exceeded(),
-            "caller deadline expired; worker exchange continues draining",
+            "caller deadline expired; started engine work continues draining",
         )
     };
     let joined = match deadline {
@@ -7001,7 +7004,7 @@ async fn await_worker_completion<T>(
         .map_err(|error| {
             WireOperationError::from_stable(
                 StableError::engine_crashed(Some(100)),
-                format!("worker owner join failed: {error}"),
+                format!("engine owner join failed: {error}"),
             )
         })?
         .map_err(|error| worker_error_to_wire(error, catalog_lane))
@@ -7080,7 +7083,8 @@ async fn execute_embedding_with_catalog_guard(
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
             let submitted_at = Instant::now();
-            tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
+                let _activity = _activity;
                 let entered_at = Instant::now();
                 if profile {
                     tracing::debug!(
@@ -7093,7 +7097,9 @@ async fn execute_embedding_with_catalog_guard(
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
                 let _lane_execution = lane_execution;
-                if let Some(id) = fault_lane.as_deref() { catalog_engine_fault(id,"serve")?; }
+                if let Some(id) = fault_lane.as_deref() {
+                    catalog_engine_fault(id, "serve")?;
+                }
                 let mutex_started = Instant::now();
                 let engine = engine.lock().map_err(|_| EngineError {
                     stage: EngineErrorStage::Inference,
@@ -7110,6 +7116,9 @@ async fn execute_embedding_with_catalog_guard(
                         "mutex_acquired"
                     );
                 }
+                // The task may start late in the blocking pool or wait on the
+                // engine mutex; never begin GPU work for a caller already gone.
+                worker_dispatch_deadline(deadline)?;
                 let inference_started = Instant::now();
                 let result = engine.embed_batch(&loaded_model, batch);
                 if profile {
@@ -7122,15 +7131,9 @@ async fn execute_embedding_with_catalog_guard(
                     );
                 }
                 result
-            })
-            .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("embedding worker join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
+            });
+            // No catalog lane id: owned Metal errors keep the plain engine mapping.
+            await_worker_completion(handle, deadline, None).await
         }
         #[cfg(unix)]
         EmbedBackend::DirectAne(engine) => {
@@ -7341,7 +7344,8 @@ async fn execute_rerank_with_catalog_guard(
             })?;
             let engine = Arc::clone(engine);
             let loaded_model = model.loaded_model.clone();
-            tokio::task::spawn_blocking(move || {
+            let handle = tokio::task::spawn_blocking(move || {
+                let _activity = _activity;
                 let _permit = permit;
                 let _catalog_guard = catalog_guard;
                 let _lane_execution = lane_execution;
@@ -7355,16 +7359,12 @@ async fn execute_rerank_with_catalog_guard(
                     retry_after_ms: Some(100),
                     safe_to_retry_same_request: true,
                 })?;
+                // As for embedding: no GPU work starts after the caller's deadline.
+                worker_dispatch_deadline(deadline)?;
                 engine.rerank_pairs(&loaded_model, pairs)
-            })
-            .await
-            .map_err(|error| {
-                WireOperationError::from_stable(
-                    StableError::engine_crashed(Some(100)),
-                    format!("owned-metal rerank join failed: {error}"),
-                )
-            })?
-            .map_err(engine_error_to_wire)
+            });
+            // No catalog lane id: owned Metal errors keep the plain engine mapping.
+            await_worker_completion(handle, deadline, None).await
         }
         EmbedBackend::Worker(engine) => {
             let engine = Arc::clone(engine);
