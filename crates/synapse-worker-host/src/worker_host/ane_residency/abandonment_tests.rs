@@ -5,9 +5,19 @@ use std::time::Duration;
 /// A caller that goes away while its request waits for the worker stream,
 /// before anything reached the wire, must withdraw that request: it must not
 /// run once the stream frees up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dropped_caller_withdraws_queued_inference() {
+#[test]
+fn dropped_caller_withdraws_queued_inference() {
+    // The mock engine builds its own runtime, so it is made outside the test's.
     let (engine, control) = module_mock_engine_controlled();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(withdraws_queued_inference(engine, control));
+}
+
+async fn withdraws_queued_inference(engine: Arc<DirectAneEngine>, control: ModuleMockControl) {
     let sequence = || vec![vec![7u32; 10]];
     // Make the shape resident first, so later requests wait only for the stream.
     engine.infer(sequence(), false, None).await.unwrap();
