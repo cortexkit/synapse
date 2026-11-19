@@ -2382,6 +2382,7 @@ pub mod ane_residency {
     const ADMISSION_HANDOFF: std::time::Duration = std::time::Duration::from_millis(250);
     #[cfg(test)]
     mod admission_trace;
+    mod load_metadata;
     mod scheduler;
     mod transcribe;
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
@@ -6101,7 +6102,6 @@ pub mod ane_residency {
             let pooling = config.pooling;
             let normalize = config.normalize;
             let timeout = config.request_timeout;
-            let load_timeout = super::liveness::SETUP_IDLE;
             let connector = direct_worker_connector(config, &supervisor);
             let channel =
                 Arc::new(runtime.block_on(AneWorkerChannel::connect(id, max_frame, connector))?);
@@ -6112,57 +6112,13 @@ pub mod ane_residency {
                 format: artifact.format.clone(),
                 runtime_config: runtime_config.values.clone(),
             };
-            let loaded = runtime.block_on(async {
-                // The worker checks aned's cache while it loads; any admission
-                // that completes after this instant saw the cache later.
-                let check_started = tokio::time::Instant::now();
-                let (response, _) =
-                    tokio::time::timeout(load_timeout, channel.exchange(&request, None))
-                        .await
-                        .map_err(|_| {
-                            AneResidencyError::Channel("LOAD deadline exceeded".into())
-                        })??;
-                match response {
-                    WorkerResponse::Loaded {
-                        req_id,
-                        model_ref,
-                        dims,
-                        buckets: Some(buckets),
-                        ane_cached_shapes,
-                        ..
-                    } if request.req_id() == Some(req_id.as_str()) => {
-                        // A worker that checked aned's compile cache reports
-                        // the cached rungs; one that did not leaves them all
-                        // unknown, which predicts compiles as before.
-                        if let Some(cached) = &ane_cached_shapes {
-                            supervisor.record_compile_cache(
-                                &model_ref,
-                                &buckets,
-                                cached,
-                                check_started,
-                            )?;
-                        }
-                        AneServing::new(
-                            channel.clone(),
-                            supervisor.clone(),
-                            AneServingMetadata {
-                                model_ref,
-                                buckets,
-                                dims,
-                                pooling,
-                                normalize,
-                                timeout,
-                            },
-                        )
-                    }
-                    WorkerResponse::Err { code, msg, .. } => {
-                        Err(AneResidencyError::WorkerErr { code, msg })
-                    }
-                    other => Err(AneResidencyError::Channel(format!(
-                        "invalid LOAD response: {other:?}"
-                    ))),
-                }
-            });
+            let loaded = runtime.block_on(channel.load_serving(
+                &supervisor,
+                &request,
+                pooling,
+                normalize,
+                timeout,
+            ));
             match loaded {
                 Ok(serving) => Ok(Self {
                     serving: Arc::new(serving),
@@ -6309,31 +6265,6 @@ pub mod ane_residency {
     }
 
     impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> AneServing<S> {
-        pub fn new(
-            channel: Arc<AneWorkerChannel<S>>,
-            supervisor: AneResidencySupervisor,
-            metadata: AneServingMetadata,
-        ) -> Result<Self, AneResidencyError> {
-            if metadata.buckets.last() != Some(&8192)
-                || metadata.buckets.first().is_none_or(|n| *n == 0)
-                || metadata.buckets.windows(2).any(|pair| pair[0] >= pair[1])
-                || metadata.dims == 0
-            {
-                return Err(AneResidencyError::Channel(
-                    "LOAD returned invalid bucket or dimension metadata".into(),
-                ));
-            }
-            Ok(Self {
-                channel,
-                supervisor,
-                metadata,
-                active_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                preparing_packed: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(test)]
-                recovery_gate: Mutex::new(None),
-            })
-        }
-
         #[cfg(test)]
         async fn hold_before_recovery(&self) {
             let gate = self.recovery_gate.lock().unwrap().take();

@@ -241,12 +241,27 @@ mod tests {
     use std::collections::HashSet;
     use synapse_core::{AneExecutable, DEFAULT_MAX_FRAME_BYTES};
 
+    #[cfg(unix)]
+    const PARAKEET_PROFILE: &str = "parakeet-tdt-0.6b-v3.ane-direct-worker";
+    #[cfg(unix)]
+    const PARAKEET_REF: &str = "ane-direct:parakeet-tdt-0.6b-v3.ane-direct-worker:0";
+
     type MockChannel = (
         Arc<AneWorkerChannel<tokio::io::DuplexStream>>,
         Arc<Mutex<Vec<(bool, usize)>>>,
     );
 
     async fn mock_channel(id: &str) -> MockChannel {
+        // The worker advertises the full ladder even though serving caps audio
+        // duration. It reports no embedding dimension for transcription.
+        mock_channel_with_load(id, 0, &[128, 256, 512, 1024, 2048, 4096, 8192]).await
+    }
+
+    async fn mock_channel_with_load(
+        id: &str,
+        dims: usize,
+        buckets: &'static [usize],
+    ) -> MockChannel {
         let admitted = Arc::new(Mutex::new(Vec::new()));
         let seen = admitted.clone();
         let connector: AneWorkerConnector<tokio::io::DuplexStream> = Box::new(move || {
@@ -259,6 +274,29 @@ mod tests {
                         read_json::<WorkerRequest, _>(&mut worker, DEFAULT_MAX_FRAME_BYTES).await
                     {
                         let response = match request {
+                            WorkerRequest::Load {
+                                req_id,
+                                artifact_digest,
+                                runtime_config,
+                                ..
+                            } => WorkerResponse::Loaded {
+                                req_id,
+                                model_ref: format!(
+                                    "ane-direct:{}:{artifact_digest}",
+                                    runtime_config["profile"]
+                                ),
+                                dims,
+                                cold_load_ms: 0,
+                                buckets: Some(buckets.to_vec()),
+                                ane_cached_shapes: Some(vec![]),
+                                transcribe_revision: (runtime_config["operation"] == "transcribe")
+                                    .then(|| synapse_core::TranscribeRevision {
+                                        kernel_revision:
+                                            synapse_core::ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION
+                                                .into(),
+                                        decode_rule: synapse_speech::DECODE_RULE_REVISION.into(),
+                                    }),
+                            },
                             WorkerRequest::AneAdmitShape {
                                 req_id,
                                 model_ref,
@@ -348,18 +386,57 @@ mod tests {
         (channel, admitted)
     }
 
-    // Runs a real transcription through `AneServing`, which is Unix-only.
+    #[cfg(unix)]
+    async fn load_mock_serving(
+        channel: &Arc<AneWorkerChannel<tokio::io::DuplexStream>>,
+        supervisor: &AneResidencySupervisor,
+        config: RuntimeConfig,
+    ) -> Result<AneServing<tokio::io::DuplexStream>, AneResidencyError> {
+        channel
+            .load_serving(
+                supervisor,
+                &WorkerRequest::Load {
+                    req_id: channel.next_req_id("load"),
+                    artifact_path: "mock.safetensors".into(),
+                    artifact_digest: "0".into(),
+                    format: "safetensors-package".into(),
+                    runtime_config: config.values,
+                },
+                synapse_core::WorkerPooling::Mean,
+                false,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+    }
+
+    #[cfg(unix)]
+    fn parakeet_config() -> RuntimeConfig {
+        crate::exchange::TranscribeProfile::pinned(PARAKEET_PROFILE)
+            .unwrap()
+            .runtime_config(&RuntimeConfig::default())
+    }
+
+    // Runs the Unix serving path against a mock worker, without ANE hardware.
     #[cfg(unix)]
     #[tokio::test]
     async fn transcribe_parakeet_encoder_ladder_four_shapes_fit_an_otherwise_empty_budget() {
         let (channel, admitted) = mock_channel("speech-only").await;
         let worker: Arc<dyn AneShapeWorker> = channel.clone();
-        let model_ref = "ane-direct:parakeet-tdt-0.6b-v3.ane-direct-worker:0";
-        assert_eq!(worker.executable_count(model_ref).unwrap(), 24);
+        assert_eq!(worker.executable_count(PARAKEET_REF).unwrap(), 24);
         let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        let serving = Arc::new(
+            load_mock_serving(&channel, &supervisor, parakeet_config())
+                .await
+                .unwrap(),
+        );
         let mut leases = Vec::new();
         for shape in [128, 256, 512, 1024] {
-            leases.push(supervisor.lease(&worker, model_ref, shape).await.unwrap());
+            leases.push(
+                supervisor
+                    .lease(&worker, PARAKEET_REF, shape)
+                    .await
+                    .unwrap(),
+            );
         }
         assert_eq!(supervisor.inner.lock().reserved_executables(), 96);
         assert_eq!(
@@ -367,21 +444,6 @@ mod tests {
             [(true, 128), (true, 256), (true, 512), (true, 1024)]
         );
         drop(leases);
-        let serving = Arc::new(
-            AneServing::new(
-                channel,
-                supervisor.clone(),
-                AneServingMetadata {
-                    model_ref: model_ref.into(),
-                    dims: 1024,
-                    buckets: ANE_SHAPE_LADDER.to_vec(),
-                    pooling: synapse_core::WorkerPooling::Mean,
-                    normalize: false,
-                    timeout: std::time::Duration::from_secs(30),
-                },
-            )
-            .unwrap(),
-        );
         let result = serving
             .transcribe_with_frames(
                 TranscribeRequest {
@@ -407,23 +469,68 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn transcribe_load_requires_a_nonzero_increasing_ladder_covering_the_frame_limit() {
+        let pinned = parakeet_config();
+        let mut shorter = pinned.clone();
+        // A shorter request envelope may be served by a shorter ladder.
+        shorter
+            .values
+            .insert("max_encoder_frames".into(), "1024".into());
+        let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        for (config, buckets, accepted) in [
+            (&shorter, &[128, 256, 512, 1024][..], true),
+            (&pinned, &[128, 256, 512, 1024][..], false),
+            (&shorter, &[128, 256, 512][..], false),
+            (&shorter, &[][..], false),
+            (&shorter, &[0, 128, 1024][..], false),
+            (&shorter, &[128, 512, 256, 1024][..], false),
+            (&shorter, &[128, 128, 1024][..], false),
+        ] {
+            let (channel, _) = mock_channel_with_load("speech-ladder", 0, buckets).await;
+            let result = load_mock_serving(&channel, &supervisor, config.clone()).await;
+            if accepted {
+                result.unwrap().retire().await.unwrap();
+            } else {
+                assert!(
+                    matches!(result, Err(AneResidencyError::Channel(msg))
+                    if msg == "LOAD returned invalid bucket or dimension metadata"),
+                    "{buckets:?}"
+                );
+                channel.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedding_load_refuses_a_ladder_ending_below_8192() {
+        let (channel, _) = mock_channel_with_load("embedding-ladder", 384, &[128, 256, 1024]).await;
+        let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
+        let config = RuntimeConfig {
+            values: BTreeMap::from([
+                (
+                    "profile".into(),
+                    "gte-modernbert-base.ane-direct-worker".into(),
+                ),
+                ("operation".into(), "embed".into()),
+            ]),
+        };
+        assert!(
+            matches!(load_mock_serving(&channel, &supervisor, config).await,
+            Err(AneResidencyError::Channel(msg)) if msg == "LOAD returned invalid bucket or dimension metadata")
+        );
+        channel.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn speech_self_check_admission_holds_only_an_ordinary_temporary_lease() {
         let (channel, events) = mock_channel("speech-self-check").await;
         let supervisor = AneResidencySupervisor::new(AneResidencyLimits::default());
         let serving = Arc::new(
-            AneServing::new(
-                channel.clone(),
-                supervisor.clone(),
-                AneServingMetadata {
-                    model_ref: "ane-direct:parakeet-tdt-0.6b-v3.ane-direct-worker:0".into(),
-                    dims: 1024,
-                    buckets: ANE_SHAPE_LADDER.to_vec(),
-                    pooling: synapse_core::WorkerPooling::Mean,
-                    normalize: false,
-                    timeout: std::time::Duration::from_secs(30),
-                },
-            )
-            .unwrap(),
+            load_mock_serving(&channel, &supervisor, parakeet_config())
+                .await
+                .unwrap(),
         );
         let lease = serving.admit_self_check(129).await.unwrap();
         assert_eq!(*events.lock().unwrap(), [(true, 256)]);
