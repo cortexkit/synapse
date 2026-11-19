@@ -369,7 +369,7 @@ async fn counters(
 ) -> Result<(u64, u64)> {
     let value = call(client, "certify.observations", json!({}), deadline).await?;
     if value["available"] != true {
-        return Err(refuse("certify.observations unavailable"));
+        return Err(refuse(format!("certify.observations unavailable: {value}")));
     }
     let sent = match source {
         CounterSource::InProcess(lane) => {
