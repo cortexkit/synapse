@@ -2807,6 +2807,8 @@ struct TranscribeCatalogConfig {
 #[path = "catalog_lane_tests.rs"]
 mod catalog_lane_tests;
 
+mod catalog_remove;
+
 #[derive(Clone, Debug)]
 struct OwnedCatalogConfig {
     family: OwnedFamily,
@@ -17955,7 +17957,6 @@ fn catalog_holders(
     Ok(holders)
 }
 async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome {
-    use store::CatalogBlobCache;
     let params: ModelsRemoveParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return channel_error("invalid_request", e.to_string()),
@@ -17985,7 +17986,10 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
             .map(|i| i.manifest_digest.clone())
             .collect::<BTreeSet<_>>();
         invalidate_validated_readiness(&state.runtime);
-        let freed = state
+        // Commit the metadata removal before unlinking any blob. Unlinking
+        // cannot be rolled back, so a crash or unlink error afterwards must
+        // leave extra bytes for cache.gc, never install rows naming missing files.
+        let digests = state
             .store
             .sqlite()
             .with_conn_fenced(|tx| {
@@ -18008,32 +18012,19 @@ async fn models_remove(state: Arc<ModuleState>, params: Value) -> HandlerOutcome
                     "DELETE FROM catalog_self_checks WHERE catalog_id=?1",
                     [&entry.id],
                 )?;
-                let mut freed = 0u64;
-                for digest in digests {
-                    if !catalog_blob_referenced(tx, &digest)?
-                        && !CatalogCache(&state.model_cache)
-                            .is_pinned(&digest)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
-                    {
-                        freed = freed.saturating_add(
-                            CatalogCache(&state.model_cache)
-                                .delete_blob(&digest)
-                                .map_err(|e| {
-                                    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-                                })?,
-                        );
-                    }
-                }
-                freed =
-                    freed.saturating_add(reclaim_unrooted_owned_packages(tx, &state.model_cache)?);
-                Ok(freed)
+                Ok(digests)
             })
             .map_err(catalog_store_error)?;
         invalidate_validated_readiness(&state.runtime);
-        let mut slots = state.runtime.catalog.lock().expect("runtime catalog");
-        for b in &entry.backends {
-            slots.remove(&catalog::lane_id(&entry.id, &b.backend));
+        {
+            let mut slots = state.runtime.catalog.lock().expect("runtime catalog");
+            for b in &entry.backends {
+                slots.remove(&catalog::lane_id(&entry.id, &b.backend));
+            }
         }
+        // A removed lane may have carried a failed self-check finding.
+        state.runtime.findings_changed.notify_one();
+        let freed = catalog_remove::reclaim_unrooted_blobs(&state, &digests);
         Ok(json!({"catalog_id":entry.id,"removed_manifests":manifests,"freed_bytes":freed}))
     })();
     match result {

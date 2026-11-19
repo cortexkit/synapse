@@ -635,6 +635,9 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   entry manifest. A committed binding is reusable while the entry is complete.
   Size-correct digest blobs are reused without network; only missing or
   wrong-size blobs are fetched. Every fetched body is size- and SHA-256-verified.
+  A body is refused as `artifact_invalid` at the first chunk that would take it
+  past its pinned size, before that chunk is staged; that refusal carries
+  `actual_sha256: null` and the bytes received so far as `actual_size`.
   The shared flat status shapes are `{job_id, state: queued}`, `{job_id,
   state: downloading, bytes_done, bytes_total}`, `{job_id, state: verifying}`,
   `{job_id, state: committed}`, `{job_id, state: failed, error}` and `{job_id,
@@ -657,7 +660,9 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
 - **`models.remove`** (mutate) `{catalog_id}` → `{catalog_id, removed_manifests[],
   freed_bytes}`. Removes every current and stale install and its self-check
   rows, then unlinks only unreferenced member blobs and owned compiled packages.
-  Freed bytes are the on-disk bytes actually unlinked. Checks, in order: a
+  Freed bytes are the on-disk bytes actually unlinked. The row removal commits
+  before any unlink; a blob whose unlink then fails stays on disk unreferenced,
+  for `cache.gc` to reclaim, and the removal still succeeds. Checks, in order: a
   derived lane id is `invalid_request {model_id, catalog_id}`; an absent catalog
   id is `unknown_model {model_id}`; any active holder is `model_in_use
   {catalog_id, holders[]}`. Holders are `{kind: loaded, model_id}`, `{kind: job,
