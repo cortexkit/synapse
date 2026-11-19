@@ -469,6 +469,10 @@ void ShapePlan::compute(StageProfile *profile) {
 // to match the uncaptured result bit for bit; with replay disabled no graph is
 // captured, because run() would never launch it.
 void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output) {
+    // Logged before the first forward so the GEMM choices for a shape are on
+    // record even when the capture check below rejects it.
+    const MatmulPlan *matmuls[] = {&hq, &hkv, &qh, &hi, &ih, &qk, &pv};
+    for (const MatmulPlan *plan : matmuls) std::fprintf(stderr, "CUDA Qwen3 algo %dx%d %s: id=%d split_k=%d reduction=%u workspace=%zu\n", batch, seq, plan->name.c_str(), plan->algorithm_id, plan->split_k, plan->reduction_scheme, plan->workspace_bytes);
     size_t ids_bytes = static_cast<size_t>(batch) * seq * sizeof(uint32_t);
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
@@ -490,7 +494,31 @@ void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *h
         FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
         std::vector<float> captured(output.count);
         FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
-        if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) throw std::runtime_error("Qwen3 captured output differs from uncaptured output");
+        if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) {
+            // Report how far apart the two runs are and how many values differ:
+            // a few last-bit differences point at reduction order, while large
+            // or non-finite values point at reads of memory nothing wrote.
+            float maximum = 0.0f;
+            size_t maximum_index = 0, differing = 0, non_finite = 0, first_index = output.count;
+            for (size_t index = 0; index < output.count; ++index) {
+                if (std::memcmp(&uncaptured[index], &captured[index], sizeof(float)) == 0) continue;
+                ++differing;
+                if (first_index == output.count) first_index = index;
+                float difference = std::abs(uncaptured[index] - captured[index]);
+                if (!std::isfinite(difference)) {
+                    ++non_finite;
+                } else if (difference > maximum) {
+                    maximum = difference;
+                    maximum_index = index;
+                }
+            }
+            std::ostringstream message;
+            message << "Qwen3 captured output differs from uncaptured output; differing=" << differing << "/" << output.count
+                    << " non_finite=" << non_finite << " first_index=" << first_index << " first_row=" << first_index / hidden
+                    << " max_abs=" << maximum << " index=" << maximum_index
+                    << " uncaptured=" << uncaptured[maximum_index] << " captured=" << captured[maximum_index];
+            throw std::runtime_error(message.str());
+        }
     }
     std::memcpy(host_output, uncaptured.data(), output.count * sizeof(float));
     std::fprintf(stderr, "CUDA Qwen3 shape %dx%d: arena=%zu workspace=%zu captured_exact=%s launches=%d gqa=two-group-strided kv_repeat_bytes=0 stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, context->graphs_enabled ? "true" : "not_captured", layer_count * (15 + 2 * (query_heads / kv_heads)) + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);

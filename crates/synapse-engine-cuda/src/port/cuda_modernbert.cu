@@ -487,7 +487,7 @@ void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mas
     std::memcpy(host_output, uncaptured.data(), output.count * sizeof(float));
     std::fprintf(stderr, "CUDA ModernBERT shape %dx%d: arena=%zu workspace=%zu captured_exact=%s launches=%d band_mask=precomputed gqa=none stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, context->graphs_enabled ? "true" : "not_captured", layer_count * 15 + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
     const MatmulPlan *plans[] = {&h3h, &hh, &h2i, &ih, &qk_plan, &pv_plan};
-    for (const MatmulPlan *plan : plans) std::fprintf(stderr, "CUDA ModernBERT algo %dx%d %s: id=%d split_k=%d workspace=%zu\n", batch, seq, plan->name.c_str(), plan->algorithm_id, plan->split_k, plan->workspace_bytes);
+    for (const MatmulPlan *plan : plans) std::fprintf(stderr, "CUDA ModernBERT algo %dx%d %s: id=%d split_k=%d reduction=%u workspace=%zu\n", batch, seq, plan->name.c_str(), plan->algorithm_id, plan->split_k, plan->reduction_scheme, plan->workspace_bytes);
 }
 
 void ShapePlan::run(const void *input, const uint8_t *host_mask, float *host_output) {

@@ -276,6 +276,9 @@ struct MatmulPlan {
     size_t workspace_bytes = 0;
     int algorithm_id = -1;
     int split_k = 1;
+    // How split-K partial sums are combined (cublasLtReductionScheme_t);
+    // recorded only so the per-shape log can show it.
+    uint32_t reduction_scheme = 0;
 
     MatmulPlan() = default;
     MatmulPlan(const MatmulPlan &) = delete;
@@ -293,6 +296,7 @@ struct MatmulPlan {
             workspace_bytes = other.workspace_bytes;
             algorithm_id = other.algorithm_id;
             split_k = other.split_k;
+            reduction_scheme = other.reduction_scheme;
             other.operation = nullptr;
             other.a_layout = other.b_layout = other.c_layout = nullptr;
         }
@@ -360,6 +364,7 @@ inline MatmulPlan select_matmul(
     plan.workspace_bytes = result.workspaceSize;
     FAMILY_CUBLAS_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&plan.algorithm, CUBLASLT_ALGO_CONFIG_ID, &plan.algorithm_id, sizeof(plan.algorithm_id), nullptr));
     FAMILY_CUBLAS_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&plan.algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &plan.split_k, sizeof(plan.split_k), nullptr));
+    FAMILY_CUBLAS_CHECK(cublasLtMatmulAlgoConfigGetAttribute(&plan.algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &plan.reduction_scheme, sizeof(plan.reduction_scheme), nullptr));
     return plan;
 }
 
