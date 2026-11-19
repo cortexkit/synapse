@@ -47,6 +47,10 @@ pub struct Engine {
     decoded_frames: usize,
     #[cfg(test)]
     layer_capture: Option<LayerCapture>,
+    #[cfg(test)]
+    debug_dispatch_limit: Option<usize>,
+    #[cfg(test)]
+    debug_disjoint_bindings: bool,
 }
 
 impl Engine {
@@ -104,6 +108,10 @@ impl Engine {
             decoded_frames: 0,
             #[cfg(test)]
             layer_capture: None,
+            #[cfg(test)]
+            debug_dispatch_limit: None,
+            #[cfg(test)]
+            debug_disjoint_bindings: false,
         })
     }
 
@@ -154,6 +162,31 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn debug_clear_capture(&mut self) {
         self.layer_capture = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_set_encoder_probe(
+        &mut self,
+        dispatch_limit: Option<usize>,
+        disjoint_bindings: bool,
+    ) -> Result<()> {
+        let capacity = super::SPEECH_BATCH_CAPACITY;
+        ensure!(
+            dispatch_limit.is_none_or(|limit| (1..=capacity).contains(&limit)),
+            "SYNAPSE_VULKAN_SPEECH_DISPATCH_LIMIT must be in 1..={capacity}"
+        );
+        self.debug_dispatch_limit = dispatch_limit;
+        self.debug_disjoint_bindings = disjoint_bindings;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_encoder_readback_path(&self) -> &'static str {
+        if self.arena.mapped {
+            "mapped"
+        } else {
+            "staging"
+        }
     }
 
     #[cfg(test)]
@@ -342,7 +375,26 @@ impl Engine {
             rows,
         )
     }
-    fn residual(&self, other: &str, rows: usize, scale: f32) -> Result<()> {
+    fn residual(
+        &self,
+        hidden: &'static str,
+        other: &str,
+        rows: usize,
+        scale: f32,
+    ) -> Result<&'static str> {
+        let output = hidden;
+        // The subsampling workspace is no longer live. Ping-pong through it to
+        // separate the bindings without introducing a copy dispatch.
+        #[cfg(test)]
+        let output = if self.debug_disjoint_bindings {
+            if hidden == "hidden" {
+                "sub_a"
+            } else {
+                "hidden"
+            }
+        } else {
+            output
+        };
         self.run(
             Params {
                 op: 103,
@@ -351,15 +403,20 @@ impl Engine {
                 scale,
                 ..Default::default()
             },
-            [
-                "hidden", "dummy", "hidden", other, "dummy", "dummy", "dummy",
-            ],
+            [hidden, "dummy", output, other, "dummy", "dummy", "dummy"],
             rows * 1024,
-        )
+        )?;
+        Ok(output)
     }
-    fn ff(&self, layer: &str, index: usize, rows: usize) -> Result<()> {
+    fn ff(
+        &self,
+        hidden: &'static str,
+        layer: &str,
+        index: usize,
+        rows: usize,
+    ) -> Result<&'static str> {
         self.norm(
-            "hidden",
+            hidden,
             "norm",
             &format!("{layer}.norm_feed_forward{index}"),
             rows,
@@ -373,9 +430,17 @@ impl Engine {
             4096,
             false,
         )?;
-        self.simple(102, "ff", "ff", rows, 4096)?;
+        let activated = "ff";
+        // Neither feed-forward block overlaps the lifetime of attention scores.
+        #[cfg(test)]
+        let activated = if self.debug_disjoint_bindings {
+            "scores"
+        } else {
+            activated
+        };
+        self.simple(102, "ff", activated, rows, 4096)?;
         self.linear(
-            "ff",
+            activated,
             "out",
             &format!("{layer}.feed_forward{index}.linear2"),
             rows,
@@ -383,7 +448,7 @@ impl Engine {
             1024,
             false,
         )?;
-        self.residual("out", rows, 0.5)
+        self.residual(hidden, "out", rows, 0.5)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -399,6 +464,15 @@ impl Engine {
         // A failed request may have left unsubmitted work. Never replay it in
         // the next request, whose scratch buffers are about to be overwritten.
         self.batch.borrow_mut().pending.clear();
+        #[cfg(test)]
+        if self.debug_disjoint_bindings {
+            for (name, cols) in [("sub_a", 1024), ("scores", 4096)] {
+                ensure!(
+                    self.arena.descriptor(name)?.range >= (rows * cols * 4) as u64,
+                    "encoder probe workspace {name} is too small for {rows} rows"
+                );
+            }
+        }
         let mut input = synapse_core::encode_f32_frame(mel);
         self.arena.transfer("mel", &mut input, true)?;
         for start in (0..rows).step_by(TILE) {
@@ -501,8 +575,8 @@ impl Engine {
         )?;
         for i in 0..24 {
             let layer = format!("encoder.layers.{i}");
-            self.ff(&layer, 1, rows)?;
-            self.norm("hidden", "norm", &format!("{layer}.norm_self_att"), rows)?;
+            let hidden = self.ff("hidden", &layer, 1, rows)?;
+            self.norm(hidden, "norm", &format!("{layer}.norm_self_att"), rows)?;
             let att = format!("{layer}.self_attn");
             self.query_key_value(&att, rows)?;
             self.linear(
@@ -558,8 +632,8 @@ impl Engine {
                 1024,
                 false,
             )?;
-            self.residual("out", rows, 1.)?;
-            self.norm("hidden", "norm", &format!("{layer}.norm_conv"), rows)?;
+            let hidden = self.residual(hidden, "out", rows, 1.)?;
+            self.norm(hidden, "norm", &format!("{layer}.norm_conv"), rows)?;
             let conv = format!("{layer}.conv");
             self.linear(
                 "norm",
@@ -623,9 +697,9 @@ impl Engine {
                 1024,
                 false,
             )?;
-            self.residual("norm", rows, 1.)?;
-            self.ff(&layer, 2, rows)?;
-            self.norm("hidden", "norm", &format!("{layer}.norm_out"), rows)?;
+            let hidden = self.residual(hidden, "norm", rows, 1.)?;
+            let hidden = self.ff(hidden, &layer, 2, rows)?;
+            self.norm(hidden, "norm", &format!("{layer}.norm_out"), rows)?;
             self.simple(112, "norm", "hidden", rows * 1024, 1)?;
             self.flush()?;
             #[cfg(test)]
@@ -656,17 +730,23 @@ impl Engine {
         observe: bool,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<Output> {
-        let valid_encoder_frames = transcribe::with_validated_input(
-            mel,
-            mel_rows,
-            valid,
-            self.maximum,
-            |valid_encoder_frames, rows| {
-                self.batch.borrow_mut().policy = SpeechBatchPolicy::for_rung(rows);
-                self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
-                Ok(valid_encoder_frames)
-            },
-        )?;
+        let valid_encoder_frames =
+            transcribe::with_validated_input(
+                mel,
+                mel_rows,
+                valid,
+                self.maximum,
+                |valid_encoder_frames, rows| {
+                    let policy = SpeechBatchPolicy::for_rung(rows);
+                    #[cfg(test)]
+                    let policy = self.debug_dispatch_limit.map_or(policy, |dispatch_limit| {
+                        SpeechBatchPolicy { dispatch_limit }
+                    });
+                    self.batch.borrow_mut().policy = policy;
+                    self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
+                    Ok(valid_encoder_frames)
+                },
+            )?;
         // Observation only copies the finished encoder. The projection and joint
         // evaluations are identical in both modes.
         let encoder = if observe {

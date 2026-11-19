@@ -10,6 +10,9 @@ use std::{
 use synapse_core::{decode_decode_trace_frame, decode_transcript_frame};
 use synapse_parity::speech::{self, Artifact, SpeechObservation, SpeechProfile, SpeechRefusal};
 
+#[path = "transcribe_repeat.rs"]
+mod repeat;
+
 #[derive(Default, serde::Serialize)]
 struct GroupTiming {
     cases: usize,
@@ -519,6 +522,7 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let audio = env_path("SYNAPSE_VULKAN_SPEECH_AUDIO");
     let evidence = env_path("SYNAPSE_VULKAN_SPEECH_EVIDENCE");
     let filter = std::env::var("SYNAPSE_VULKAN_SPEECH_FILTER").ok();
+    let probe = repeat::Probe::from_env();
     std::fs::create_dir_all(&evidence).unwrap();
     let manifest = crate::manifest();
     let profile_id = "parakeet-tdt-0.6b-v3.owned-vulkan";
@@ -544,6 +548,12 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
         })
         .collect();
     assert!(!fixtures.is_empty(), "filter selected no fixtures");
+    if probe.is_some() {
+        assert!(
+            filter.as_ref().is_some_and(|prefix| !prefix.is_empty()) && fixtures.len() == 1,
+            "the repeat probe requires SYNAPSE_VULKAN_SPEECH_FILTER to select one fixture"
+        );
+    }
     let index: Value =
         serde_json::from_slice(&std::fs::read(audio.join("inputs.json")).unwrap()).unwrap();
     let started = Instant::now();
@@ -586,14 +596,17 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
     let mut group_timings: BTreeMap<String, GroupTiming> = BTreeMap::new();
     let mut fixture_timings = Vec::new();
     let mut heap_usage_peak = heap_usage(&loaded);
-    let mut findings_log =
-        std::fs::File::create(evidence.join("vulkan-fixture-findings.jsonl")).unwrap();
+    let mut findings_log = probe
+        .is_none()
+        .then(|| std::fs::File::create(evidence.join("vulkan-fixture-findings.jsonl")).unwrap());
     let (mut invariant, mut longest, mut largest_ladder) = (0, 0f64, 0);
     for fixture in &fixtures {
         let LoadedEngine::Speech(engine) = &mut loaded.engine else {
             panic!("wrong engine");
         };
-        crate::transcribe_layers::attach(engine, &fixture.id, &evidence).unwrap();
+        if probe.is_none() {
+            crate::transcribe_layers::attach(engine, &fixture.id, &evidence).unwrap();
+        }
         let row = rows[fixture.id.as_str()];
         let frames = row["mel_frames"].as_u64().unwrap() as usize;
         let valid = row["valid_mel_frames"].as_u64().unwrap() as usize;
@@ -617,6 +630,11 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             assert_eq!(features.valid_mel_frames, valid);
             features.values
         };
+        if let Some(probe) = probe {
+            assert!(!over, "the repeat probe requires an in-limit fixture");
+            probe.run(&mut loaded, &fixture.id, &mel, frames, valid);
+            return;
+        }
         let prepare_s = prepare_started.elapsed().as_secs_f64();
         let inference_started = Instant::now();
         eprintln!(
@@ -748,7 +766,7 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             if let Some(finding) = &finding {
                 trace_findings.push(finding.clone());
             }
-            writeln!(findings_log,"{}",json!({"fixture":fixture.id,"encoder_min_cosine":cosine,"encoder_ok":encoder_ok,"trace_ok":trace_ok,"trace_finding":finding})).unwrap();
+            writeln!(findings_log.as_mut().unwrap(),"{}",json!({"fixture":fixture.id,"encoder_min_cosine":cosine,"encoder_ok":encoder_ok,"trace_ok":trace_ok,"trace_finding":finding})).unwrap();
             println!(
                 "{} encoder_min_cosine={cosine:?} trace_ok={trace_ok}",
                 fixture.id
