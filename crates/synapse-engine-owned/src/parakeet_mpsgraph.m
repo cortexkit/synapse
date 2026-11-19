@@ -50,6 +50,9 @@ uint64_t synapse_parakeet_peak_footprint_bytes(void) {
 @property MPSGraphTensorData *rowMask;
 @property MPSGraphTensorData *pairMask;
 @property MPSGraphTensorData *positions;
+// Rung the cached positions table was built for. Tracked apart from rung,
+// which changes before the table is rebuilt and stays changed if begin fails.
+@property NSUInteger positionsRung;
 @property NSUInteger rung;
 @property NSUInteger validMel;
 @end
@@ -266,14 +269,21 @@ int32_t synapse_parakeet_begin(void *raw, const float *mel, uint64_t rung, uint6
             for (NSUInteger i=0;i<n;i++) for (NSUInteger j=0;j<n;j++) pv[i*t+j]=1;
             c.pairMask = data(c,pv,@[@1,@(t),@(t)]);
         }
-        NSMutableData *positions = [NSMutableData dataWithLength:(2*t-1)*1024*sizeof(float)];
-        float *pos = positions.mutableBytes;
-        for (NSUInteger i=0;i<2*t-1;i++) for (NSUInteger j=0;j<512;j++) {
-            float inv = 1.0f/powf(10000.0f,(float)(j*2)/1024.0f);
-            float angle = (float)((int64_t)t-1-(int64_t)i)*inv;
-            pos[i*1024+j*2] = sinf(angle); pos[i*1024+j*2+1] = cosf(angle);
+        // The relative-position table depends only on the rung, and the graphs
+        // only read it, so it is rebuilt only when the rung changes. Assigning
+        // the new buffer after it is created releases the old one; if creation
+        // fails, the old table stays tagged with its own rung and is not reused.
+        if (!c.positions || c.positionsRung != t) {
+            NSMutableData *positions = [NSMutableData dataWithLength:(2*t-1)*1024*sizeof(float)];
+            float *pos = positions.mutableBytes;
+            for (NSUInteger i=0;i<2*t-1;i++) for (NSUInteger j=0;j<512;j++) {
+                float inv = 1.0f/powf(10000.0f,(float)(j*2)/1024.0f);
+                float angle = (float)((int64_t)t-1-(int64_t)i)*inv;
+                pos[i*1024+j*2] = sinf(angle); pos[i*1024+j*2+1] = cosf(angle);
+            }
+            c.positions = data(c,pos,@[@(2*t-1),@1024]);
+            c.positionsRung = t;
         }
-        c.positions = data(c,pos,@[@(2*t-1),@1024]);
         return 0;
     } @catch(NSException *e) { return failure(e); } }
 }
