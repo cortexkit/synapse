@@ -179,7 +179,8 @@ async fn certify_snapshot_includes_a_loaded_transcribe_only_lane() {
     let cache = lane_cache(&runtime, &lane);
     assert_eq!(
         certify_observations::snapshot(&runtime).await["available"],
-        false
+        true,
+        "an unloaded lane has done no engine work, so the snapshot is complete"
     );
 
     let profile = TranscribeProfile::pinned("parakeet-tdt-0.6b-v3.owned-metal").unwrap();

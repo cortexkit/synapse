@@ -322,7 +322,14 @@ async fn transcribe_above_limit_requires_c4_details_and_no_engine_or_shape_work(
     let submitted = json!({"job_id":"limit-refusal"});
     let failed = json!({"status":"failed","failure":good["error"]});
     let source = CounterSource::InProcess("metal-lane");
-    for (count, passes) in [(Some(7), true), (Some(8), false), (None, false)] {
+    // An unloaded lane reports no counter: zero when nothing had run before
+    // (a fresh store refusing its first recording), a regression when it had.
+    for (before, count, passes) in [
+        (7, Some(7), true),
+        (7, Some(8), false),
+        (7, None, false),
+        (0, None, true),
+    ] {
         let mut after = json!({"available":true,"worker_requests":{},"admitted_count":0});
         if let Some(count) = count {
             after["in_process_transcribe_engine_invocations"] = json!({"metal-lane":count});
@@ -334,7 +341,7 @@ async fn transcribe_above_limit_requires_c4_details_and_no_engine_or_shape_work(
             &submitted,
             &profile,
             source,
-            (7, 0),
+            (before, 0),
             deadline(),
         )
         .await;

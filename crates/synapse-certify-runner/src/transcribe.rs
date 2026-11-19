@@ -372,8 +372,14 @@ async fn counters(
         return Err(refuse(format!("certify.observations unavailable: {value}")));
     }
     let sent = match source {
+        // A lane missing from the map isn't loaded, so its engine hasn't run.
         CounterSource::InProcess(lane) => {
-            number(&value["in_process_transcribe_engine_invocations"], lane)?
+            match value["in_process_transcribe_engine_invocations"].get(lane) {
+                None => 0,
+                Some(count) => count
+                    .as_u64()
+                    .ok_or_else(|| refuse("invalid in-process engine counter"))?,
+            }
         }
         CounterSource::Worker => value["worker_requests"]
             .as_object()

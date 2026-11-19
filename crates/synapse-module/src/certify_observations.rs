@@ -20,7 +20,12 @@ pub(super) async fn handle(state: Arc<ModuleState>) -> HandlerOutcome {
 pub(super) async fn snapshot(runtime: &RuntimeState) -> Value {
     let transcribe = media_jobs::certify_counters(runtime).await;
     let models = runtime.loaded_models();
-    let mut available = !models.is_empty() || !transcribe.is_empty();
+    // A lane that isn't loaded has done no engine work, so it reports nothing
+    // and the snapshot stays complete. Only a loaded backend that can't report
+    // its counter makes the snapshot unavailable. Certification reads this
+    // before a fresh store has loaded anything, to prove that a refusal
+    // happened without loading the engine.
+    let mut available = true;
     let mut requests = BTreeMap::new();
     let mut in_process = BTreeMap::new();
     for (lane, counter) in transcribe {
