@@ -2703,6 +2703,15 @@ impl Scheduler {
                     "direct-ANE prewarm admission refused by the worker; the lane's prewarm ends"
                 );
             }
+            Err(error) if error.code() == Some(ERR_ANE_TEMP_SPACE_LOW) => {
+                // The worker refused for lack of temp space before compiling a
+                // layer, and discards the layers it had already compiled for
+                // this shape. Its other resident shapes are healthy, so it is
+                // not restarted: only this reservation is refunded, and the
+                // caller gets a retryable refusal.
+                state.slots.remove(&key);
+                self.answer_owner(state, &key, owner, error, effects);
+            }
             Err(error) => {
                 // A definite refusal from the worker means nothing can still
                 // be compiling: release the gate at once (the reservation stays

@@ -332,12 +332,22 @@ impl Model {
         let hidden = self.profile.n("hidden_size");
         let dim = self.profile.n("head_dim");
         ane::autoreleasepool(|_| {
+            // Like standalone admission, refuse a layer compile when the temp
+            // volume is short of space; a layer aned holds compiled loads
+            // without writing and is not checked.
+            let dir = std::env::temp_dir();
             let mut executables = Vec::new();
             for layer in 0..self.profile.n("num_hidden_layers") {
                 let (graph, _) = build_graph(self, layer, width, &mode)?;
-                executables.push(compile_layer(&graph, layer, |graph| {
-                    graph.compile(NSQualityOfService::UserInteractive)
-                })?);
+                executables.push(compile_layer_checking_space(
+                    &graph,
+                    layer,
+                    || crate::backend::temp_volume_available(&dir),
+                    &dir,
+                    |graph, before_compile| {
+                        graph.compile_gated(NSQualityOfService::UserInteractive, before_compile)
+                    },
+                )?);
                 progress()?;
             }
             Ok(TightProgram {
@@ -360,6 +370,29 @@ fn compile_layer(
     compile: impl FnOnce(&Graph) -> std::result::Result<Executable, ane::Error>,
 ) -> Result<Executable> {
     compile(graph).with_context(|| format!("tight layer {layer}"))
+}
+
+/// Compiles one packed layer through the binding's gated compile, which runs
+/// the temp-space check only when the layer is not already compiled. A
+/// binding error gets the layer context; a temp-space refusal is returned as
+/// it is, so its `ane_temp_space_low` wire code stays at the front.
+fn compile_layer_checking_space(
+    graph: &Graph,
+    layer: usize,
+    available: impl Fn() -> std::io::Result<u64>,
+    dir: &std::path::Path,
+    compile_gated: impl FnOnce(
+        &Graph,
+        &mut dyn FnMut() -> Result<()>,
+    ) -> std::result::Result<Executable, anyhow::Error>,
+) -> Result<Executable> {
+    compile_gated(graph, &mut || {
+        crate::backend::ensure_compile_temp_space(dir, available())
+    })
+    .or_else(|error| match error.downcast::<ane::Error>() {
+        Ok(error) => compile_layer(graph, layer, |_| Err(error)),
+        Err(other) => Err(other),
+    })
 }
 
 impl TightProgram {
@@ -547,6 +580,51 @@ pub(crate) mod tests {
             );
         }
     }
+    /// A packed layer that is not already compiled is refused before the
+    /// compiler writes anything when the temp volume is short of space, with
+    /// the retryable `ane_temp_space_low` code at the front.
+    #[test]
+    fn packed_compile_refuses_on_low_temp_space_before_compiling() {
+        let compiled = std::cell::Cell::new(false);
+        let failure = compile_layer_checking_space(
+            &Graph::new(),
+            3,
+            || Ok(crate::backend::MIN_COMPILE_TEMP_FREE_BYTES - 1),
+            std::path::Path::new("/tmp"),
+            |_, before_compile| {
+                before_compile()?;
+                compiled.set(true);
+                Err(ane::Error::Compile("stand-in compiler stops here".into()).into())
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(!compiled.get(), "nothing may compile on a full disk");
+        match crate::worker::request_error(None, &failure) {
+            synapse_core::WorkerResponse::Err { code, .. } => {
+                assert_eq!(code, "ane_temp_space_low", "{failure:#}")
+            }
+            other => panic!("unexpected admission failure: {other:?}"),
+        }
+        // With room, the compile runs and its failure keeps the layer context.
+        let failure = compile_layer_checking_space(
+            &Graph::new(),
+            3,
+            || Ok(crate::backend::MIN_COMPILE_TEMP_FREE_BYTES),
+            std::path::Path::new("/tmp"),
+            |_, before_compile| {
+                before_compile()?;
+                Err(ane::Error::Compile("stand-in compiler stops here".into()).into())
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            format!("{failure:#}").starts_with("tight layer 3: "),
+            "{failure:#}"
+        );
+    }
+
     #[test]
     pub(crate) fn runtime_rope_coefficients_match_actual_graph_constant_bits() {
         for width in [256, 384, 512] {

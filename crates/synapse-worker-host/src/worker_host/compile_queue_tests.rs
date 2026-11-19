@@ -133,6 +133,8 @@ struct FakeCompileWorker {
     /// The worker refuses the next admission for lack of Neural Engine
     /// resources.
     exhaust_next_admit: std::sync::atomic::AtomicBool,
+    /// The worker refuses the next admission for lack of temp space.
+    temp_space_next_admit: std::sync::atomic::AtomicBool,
     fail_next_evict: std::sync::atomic::AtomicBool,
     /// Holds the next admission once it has reached the worker.
     admit_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
@@ -248,6 +250,12 @@ impl AneShapeWorker for FakeCompileWorker {
                 return Err(AneResidencyError::WorkerErr {
                     code: ERR_ANE_RESOURCES_EXHAUSTED.into(),
                     msg: "injected resource refusal".into(),
+                });
+            }
+            if self.temp_space_next_admit.swap(false, Ordering::SeqCst) {
+                return Err(AneResidencyError::WorkerErr {
+                    code: ERR_ANE_TEMP_SPACE_LOW.into(),
+                    msg: "injected temp space refusal".into(),
                 });
             }
             let (layers, _) = fake_compile_profile(model_ref, shape);
@@ -374,6 +382,7 @@ fn fake_handle(compiler: &Arc<SharedCompiler>, id: &str) -> Arc<FakeCompileWorke
         transport_fail_next_admit: Default::default(),
         refuse_next_admit_before_wire: Default::default(),
         exhaust_next_admit: Default::default(),
+        temp_space_next_admit: Default::default(),
         fail_next_evict: Default::default(),
         admit_gate: Mutex::new(None),
         pre_wire_gate: Mutex::new(None),

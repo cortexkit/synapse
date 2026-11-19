@@ -643,6 +643,32 @@ async fn failed_admission_holds_the_gate_until_exit_is_confirmed() {
     assert_queue_idle(&supervisor);
 }
 
+/// A worker that refuses a cold compile for lack of temp space keeps its
+/// healthy resident shapes: only that request's reservation is refunded, the
+/// worker is not restarted, and the caller gets a retryable refusal.
+#[tokio::test(start_paused = true)]
+async fn temp_space_refusal_refunds_only_its_reservation_and_keeps_residents() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let worker = fake_handle(&compiler, "low-disk");
+    let worker_dyn: Arc<dyn AneShapeWorker> = worker.clone();
+    drop(supervisor.lease(&worker_dyn, QUEUE_GTE, 128).await.unwrap());
+    worker.temp_space_next_admit.store(true, Ordering::SeqCst);
+    let refused = ask_at(&supervisor, &compiler, &worker_dyn, QUEUE_GTE, 512, compiler.now(), None)
+        .await
+        .unwrap();
+    assert_eq!(refused.code.as_deref(), Some(ERR_ANE_TEMP_SPACE_LOW), "{refused:?}");
+    assert_eq!(refused.retry_after_ms, Some(ANE_RESOURCES_RETRY_AFTER_MS));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let state = supervisor.inner.lock();
+    assert!(!state.recovering.contains("low-disk"), "the worker was restarted");
+    assert_eq!(worker.generation(), 0);
+    assert!(state.slots.contains_key(&queue_key("low-disk", QUEUE_GTE, 128)));
+    assert!(!state.slots.contains_key(&queue_key("low-disk", QUEUE_GTE, 512)));
+    assert_eq!(state.reserved_executables(), 22);
+    assert!(!state.compile_running());
+}
+
 /// A worker that answers an admission with an error is not compiling
 /// anything, so the compile gate is free at once, even while that worker's
 /// recovery waits for one of its leases to drain.

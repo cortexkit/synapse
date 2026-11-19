@@ -2270,7 +2270,7 @@ impl std::fmt::Display for TempSpaceRefusal {
 
 impl std::error::Error for TempSpaceRefusal {}
 
-fn ensure_compile_temp_space(dir: &Path, available: std::io::Result<u64>) -> Result<()> {
+pub(crate) fn ensure_compile_temp_space(dir: &Path, available: std::io::Result<u64>) -> Result<()> {
     match available {
         Ok(available_bytes) if available_bytes >= MIN_COMPILE_TEMP_FREE_BYTES => Ok(()),
         Ok(available_bytes) => Err(TempSpaceRefusal::Low {
@@ -2289,7 +2289,7 @@ fn ensure_compile_temp_space(dir: &Path, available: std::io::Result<u64>) -> Res
 
 /// Bytes an unprivileged process can still write on the volume holding `dir`.
 /// Space macOS reports as purgeable is not counted.
-fn temp_volume_available(dir: &Path) -> std::io::Result<u64> {
+pub(crate) fn temp_volume_available(dir: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();

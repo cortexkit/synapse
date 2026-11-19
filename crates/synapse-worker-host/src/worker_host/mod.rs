@@ -2370,6 +2370,9 @@ pub mod ane_residency {
     mod transcribe;
     pub const ERR_ANE_RESOURCES_EXHAUSTED: &str = "ane_resources_exhausted";
     pub const ANE_RESOURCES_RETRY_AFTER_MS: u64 = 250;
+    /// The worker refused a cold compile because the temp volume is short of
+    /// space. Transient: retryable with the resource retry delay.
+    pub const ERR_ANE_TEMP_SPACE_LOW: &str = "ane_temp_space_low";
     /// A request is blocked on a shape compile: its deadline expired while it
     /// waited for one, or the compile queue predicts its shape will be ready
     /// only after that deadline. The model is loaded; a retry joins the same
@@ -2658,6 +2661,9 @@ pub mod ane_residency {
                     Self::Quarantined { retry_after_ms }
                     | Self::ResourcesExhausted { retry_after_ms, .. }
                     | Self::ShapeCompiling { retry_after_ms, .. } => Some(*retry_after_ms),
+                    _ if self.code() == Some(ERR_ANE_TEMP_SPACE_LOW) => {
+                        Some(ANE_RESOURCES_RETRY_AFTER_MS)
+                    }
                     _ => None,
                 },
                 safe_to_retry_same_request: matches!(
@@ -2665,7 +2671,7 @@ pub mod ane_residency {
                     Self::ResourcesExhausted { .. }
                         | Self::ShapeCompiling { .. }
                         | Self::Quarantined { .. }
-                ),
+                ) || self.code() == Some(ERR_ANE_TEMP_SPACE_LOW),
             }
         }
         pub fn code(&self) -> Option<&str> {

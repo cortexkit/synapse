@@ -4475,7 +4475,9 @@ fn ane_residency_error_to_wire(
     if let Some(code) = error.code() {
         wire.code = code.to_owned();
     }
-    if error.code() == Some(worker_host::ane_residency::ERR_ANE_RESOURCES_EXHAUSTED) {
+    if error.code() == Some(worker_host::ane_residency::ERR_ANE_RESOURCES_EXHAUSTED)
+        || error.code() == Some(worker_host::ane_residency::ERR_ANE_TEMP_SPACE_LOW)
+    {
         wire.class = ErrorClass::Transient;
         wire.retry_after_ms = Some(worker_host::ane_residency::ANE_RESOURCES_RETRY_AFTER_MS);
         wire.safe_to_retry_same_request = true;
@@ -11759,6 +11761,15 @@ mod tests {
             "partial inference response".into(),
         ));
         assert!(!wire.safe_to_retry_same_request);
+        // Low temp space is environmental: freeing space makes a retry work.
+        let wire = ane_residency_error_to_wire(AneResidencyError::WorkerErr {
+            code: "ane_temp_space_low".into(),
+            msg: "disk full".into(),
+        });
+        assert_eq!(wire.code, "ane_temp_space_low");
+        assert_eq!(wire.class, ErrorClass::Transient);
+        assert_eq!(wire.retry_after_ms, Some(250));
+        assert!(wire.safe_to_retry_same_request);
     }
 
     #[tokio::test]
