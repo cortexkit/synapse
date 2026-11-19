@@ -308,6 +308,8 @@ jobs:
           esac
           printf '{\n  "requires_core": "0.21.6"\n}\n' > dist/release-manifest.json
           python3 -c "import json;d=json.load(open('dist/release-manifest.json'));assert d['requires_core']=='0.21.6',d"
+          # The tag gate verifies every inventory entry against a sidecar.
+          (cd dist && sha256sum release-manifest.json > release-manifest.json.sha256)
       - name: Upload assets to candidate draft
         env:
           GH_TOKEN: ${{ github.token }}

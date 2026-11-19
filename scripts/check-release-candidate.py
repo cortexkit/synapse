@@ -153,7 +153,10 @@ def require_inventory(inventory, candidate):
         raise Refused("candidate must remain a draft")
     names = {asset["name"] for asset in candidate["assets"]}
     expected = {entry["asset"] for entry in inventory["assets"]}
-    expected |= {name + inventory["sidecar_suffix"] for name in expected if name.endswith(".zip")}
+    # The tag gate (crates/synapse-release-checks/check.py extract) verifies every
+    # inventory entry against its sidecar, metadata included, so the draft must
+    # carry one for each entry or the tag refuses a candidate that passed here.
+    expected |= {name + inventory["sidecar_suffix"] for name in expected}
     if not expected <= names:
         raise Refused(f"missing candidate assets: {sorted(expected - names)}")
     print(f"checked {len(expected)} candidate assets and sidecars")
@@ -262,7 +265,8 @@ class GuardSelfTests(unittest.TestCase):
     def test_inventory_completeness(self):
         inventory = {"assets": [{"asset": "worker.zip"}, {"asset": "release-manifest.json"}],
                      "sidecar_suffix": ".sha256"}
-        assets = [{"name": name} for name in ("worker.zip", "worker.zip.sha256", "release-manifest.json")]
+        assets = [{"name": name} for name in ("worker.zip", "worker.zip.sha256", "release-manifest.json",
+                                              "release-manifest.json.sha256")]
         require_inventory(inventory, {"isDraft": True, "assets": assets})
         for index in range(len(assets)):
             self.assert_refused("missing candidate assets", require_inventory, inventory,
