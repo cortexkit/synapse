@@ -2,6 +2,7 @@
 
 #include <cfloat>
 #include <cstdio>
+#include <list>
 
 using namespace synapse_cuda_family;
 
@@ -232,7 +233,7 @@ struct ShapePlan {
     ShapePlan(ModernContext *owner, int b, int s, int h, int nh, int inter, int layers, float eps, float global_theta, float local_theta, int half_window);
     ~ShapePlan();
     template <typename T> void compute(StageProfile *profile = nullptr);
-    void initialize_and_verify(const void *input, const uint8_t *host_mask);
+    void initialize_and_verify(const void *input, const uint8_t *host_mask, float *host_output);
     void run(const void *input, const uint8_t *host_mask, float *host_output);
 };
 
@@ -246,6 +247,31 @@ struct ModernContext {
     std::vector<DeviceLayer> layers;
     DeviceAllocation<float> final_norm;
     std::unordered_map<std::string, std::unique_ptr<ShapePlan>> plans;
+    // Bounded shape-plan retention. Each plan owns an arena sized for its
+    // exact (batch, seq) shape, including a heads x seq x seq score buffer
+    // and a seq x seq band mask, so a long-lived lane serving many distinct
+    // lengths would otherwise keep one such arena per length until VRAM runs
+    // out. Keep the same two warm shapes as the Qwen3 engine; a miss evicts
+    // the least-recently-used plan before allocating, so at most two arenas
+    // are ever resident.
+    static constexpr size_t max_plans = 2;
+    std::list<std::string> plan_lru;
+
+    // Promotes `key` to most-recently-used, then trims the least-recently-used
+    // plan until at most max_plans remain. Callers only touch a key they just
+    // inserted or found, so that plan is at the front and is never the victim.
+    // Erasing a map entry destroys the plan, which frees its graph and device
+    // allocations.
+    void touch_plan(const std::string &key) {
+        if (plans.find(key) == plans.end()) return;
+        plan_lru.remove(key);
+        plan_lru.push_front(key);
+        while (plan_lru.size() > max_plans) {
+            std::string victim = plan_lru.back();
+            plan_lru.pop_back();
+            plans.erase(victim);
+        }
+    }
 
     ModernContext(bool graphs, bool use_f16) : graphs_enabled(graphs), f16(use_f16) {
         FAMILY_CUDA_CHECK(cudaFree(nullptr));
@@ -253,6 +279,7 @@ struct ModernContext {
         FAMILY_CUBLAS_CHECK(cublasLtCreate(&lt));
     }
     ~ModernContext() {
+        plan_lru.clear();
         plans.clear();
         if (lt) cublasLtDestroy(lt);
         if (stream) cudaStreamDestroy(stream);
@@ -413,7 +440,12 @@ void ShapePlan::compute(StageProfile *profile) {
     FAMILY_CUDA_CHECK(cudaGetLastError());
 }
 
-void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mask) {
+// Runs the first forward for a newly built plan and writes its result to
+// host_output, so a shape miss serves this request without a further run.
+// With graph replay enabled it also captures the graph and requires one replay
+// to match the uncaptured result bit for bit; with replay disabled no graph is
+// captured, because run() would never launch it.
+void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mask, float *host_output) {
     size_t input_bytes = static_cast<size_t>(batch) * seq * hidden * (context->f16 ? sizeof(half) : sizeof(float));
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
@@ -424,31 +456,36 @@ void ShapePlan::initialize_and_verify(const void *input, const uint8_t *host_mas
     std::unordered_map<std::string, double> stage_ms = profile.collect();
     std::vector<float> uncaptured(output.count);
     FAMILY_CUDA_CHECK(cudaMemcpy(uncaptured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
-    FAMILY_CUDA_CHECK(cudaStreamBeginCapture(context->stream, cudaStreamCaptureModeThreadLocal));
-    if (context->f16) compute<half>(); else compute<float>();
-    FAMILY_CUDA_CHECK(cudaStreamEndCapture(context->stream, &graph));
-    FAMILY_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
-    FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
-    FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
-    std::vector<float> captured(output.count);
-    FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
-    if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) {
-        float maximum = 0.0f;
-        size_t maximum_index = 0;
-        for (size_t index = 0; index < output.count; ++index) {
-            float difference = std::abs(uncaptured[index] - captured[index]);
-            if (difference > maximum) {
-                maximum = difference;
-                maximum_index = index;
+    if (context->graphs_enabled) {
+        FAMILY_CUDA_CHECK(cudaStreamBeginCapture(context->stream, cudaStreamCaptureModeThreadLocal));
+        if (context->f16) compute<half>(); else compute<float>();
+        FAMILY_CUDA_CHECK(cudaStreamEndCapture(context->stream, &graph));
+        FAMILY_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(x0, input, input_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        std::vector<float> captured(output.count);
+        FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
+        if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) {
+            float maximum = 0.0f;
+            size_t maximum_index = 0;
+            for (size_t index = 0; index < output.count; ++index) {
+                float difference = std::abs(uncaptured[index] - captured[index]);
+                if (difference > maximum) {
+                    maximum = difference;
+                    maximum_index = index;
+                }
             }
+            std::ostringstream message;
+            message << "ModernBERT captured output differs from uncaptured output; max_abs=" << maximum << " index=" << maximum_index;
+            throw std::runtime_error(message.str());
         }
-        std::ostringstream message;
-        message << "ModernBERT captured output differs from uncaptured output; max_abs=" << maximum << " index=" << maximum_index;
-        throw std::runtime_error(message.str());
     }
-    std::fprintf(stderr, "CUDA ModernBERT shape %dx%d: arena=%zu workspace=%zu captured_exact=true launches=%d band_mask=precomputed gqa=none stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, layer_count * 15 + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
+    // Copy out only after every upload of `input` has finished: in f32 mode the
+    // caller passes the same buffer as both input and output.
+    std::memcpy(host_output, uncaptured.data(), output.count * sizeof(float));
+    std::fprintf(stderr, "CUDA ModernBERT shape %dx%d: arena=%zu workspace=%zu captured_exact=%s launches=%d band_mask=precomputed gqa=none stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, context->graphs_enabled ? "true" : "not_captured", layer_count * 15 + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
     const MatmulPlan *plans[] = {&h3h, &hh, &h2i, &ih, &qk_plan, &pv_plan};
     for (const MatmulPlan *plan : plans) std::fprintf(stderr, "CUDA ModernBERT algo %dx%d %s: id=%d split_k=%d workspace=%zu\n", batch, seq, plan->name.c_str(), plan->algorithm_id, plan->split_k, plan->workspace_bytes);
 }
@@ -509,11 +546,24 @@ int32_t synapse_cuda_modernbert_forward(
         std::string key = shape_key(batch, seq);
         auto found = context->plans.find(key);
         if (found == context->plans.end()) {
+            if (context->plans.size() >= ModernContext::max_plans) {
+                // Make room before allocating so the new arena never coexists
+                // with a third one. Wait for the stream first so no queued
+                // kernel still uses the victim's buffers when they are freed.
+                FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+                const std::string victim = context->plan_lru.back();
+                context->plan_lru.pop_back();
+                context->plans.erase(victim);
+            }
             auto plan = std::make_unique<ShapePlan>(context, batch, seq, hidden, heads, intermediate, layer_count, epsilon, global_theta, local_theta, local_half_window);
-            plan->initialize_and_verify(input, attention_mask);
-            found = context->plans.emplace(key, std::move(plan)).first;
+            // The first forward already produced this request's output.
+            plan->initialize_and_verify(input, attention_mask, output);
+            context->plans.emplace(key, std::move(plan));
+            context->touch_plan(key);
+            return 0;
         }
         found->second->run(input, attention_mask, output);
+        context->touch_plan(key);
         return 0;
     } catch (const std::exception &error) {
         synapse_cuda_set_last_error(error.what());

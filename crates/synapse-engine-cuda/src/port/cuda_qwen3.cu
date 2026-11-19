@@ -232,7 +232,7 @@ struct ShapePlan {
     ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int kvh, int hd, int inter, int layers, float eps, float theta);
     ~ShapePlan();
     void compute(StageProfile *profile = nullptr);
-    void initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask);
+    void initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output);
     void run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output);
 };
 
@@ -463,7 +463,12 @@ void ShapePlan::compute(StageProfile *profile) {
     FAMILY_CUDA_CHECK(cudaGetLastError());
 }
 
-void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask) {
+// Runs the first forward for a newly built plan and writes its result to
+// host_output, so a shape miss serves this request without a further run.
+// With graph replay enabled it also captures the graph and requires one replay
+// to match the uncaptured result bit for bit; with replay disabled no graph is
+// captured, because run() would never launch it.
+void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output) {
     size_t ids_bytes = static_cast<size_t>(batch) * seq * sizeof(uint32_t);
     size_t mask_bytes = static_cast<size_t>(batch) * seq;
     FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
@@ -474,18 +479,21 @@ void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *h
     std::unordered_map<std::string, double> stage_ms = profile.collect();
     std::vector<float> uncaptured(output.count);
     FAMILY_CUDA_CHECK(cudaMemcpy(uncaptured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
-    FAMILY_CUDA_CHECK(cudaStreamBeginCapture(context->stream, cudaStreamCaptureModeThreadLocal));
-    compute();
-    FAMILY_CUDA_CHECK(cudaStreamEndCapture(context->stream, &graph));
-    FAMILY_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
-    FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
-    FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
-    FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
-    std::vector<float> captured(output.count);
-    FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
-    if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) throw std::runtime_error("Qwen3 captured output differs from uncaptured output");
-    std::fprintf(stderr, "CUDA Qwen3 shape %dx%d: arena=%zu workspace=%zu captured_exact=true launches=%d gqa=two-group-strided kv_repeat_bytes=0 stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, layer_count * (15 + 2 * (query_heads / kv_heads)) + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
+    if (context->graphs_enabled) {
+        FAMILY_CUDA_CHECK(cudaStreamBeginCapture(context->stream, cudaStreamCaptureModeThreadLocal));
+        compute();
+        FAMILY_CUDA_CHECK(cudaStreamEndCapture(context->stream, &graph));
+        FAMILY_CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        std::vector<float> captured(output.count);
+        FAMILY_CUDA_CHECK(cudaMemcpy(captured.data(), output.pointer, output.count * sizeof(float), cudaMemcpyDeviceToHost));
+        if (std::memcmp(uncaptured.data(), captured.data(), output.count * sizeof(float)) != 0) throw std::runtime_error("Qwen3 captured output differs from uncaptured output");
+    }
+    std::memcpy(host_output, uncaptured.data(), output.count * sizeof(float));
+    std::fprintf(stderr, "CUDA Qwen3 shape %dx%d: arena=%zu workspace=%zu captured_exact=%s launches=%d gqa=two-group-strided kv_repeat_bytes=0 stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, context->graphs_enabled ? "true" : "not_captured", layer_count * (15 + 2 * (query_heads / kv_heads)) + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
 }
 
 void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output) {
@@ -557,13 +565,13 @@ int32_t synapse_cuda_qwen3_forward(
                 context->plans.erase(victim);
             }
             auto plan = std::make_unique<ShapePlan>(context, batch, seq, hidden, query_heads, kv_heads, head_dim, intermediate, layer_count, epsilon, rope_theta);
-            plan->initialize_and_verify(token_ids, attention_mask);
-            found = context->plans.emplace(key, std::move(plan)).first;
-            // Keep map and LRU membership aligned even if run() throws.
+            // The first forward already produced this request's output, so the
+            // plan is cached only once it has succeeded.
+            plan->initialize_and_verify(token_ids, attention_mask, output);
+            context->plans.emplace(key, std::move(plan));
             context->touch_plan(key);
+            return 0;
         }
-        // Promote successful cache hits after the stream is idle. New plans
-        // are already tracked above so a failed run cannot orphan an arena.
         found->second->run(token_ids, attention_mask, output);
         context->touch_plan(key);
         return 0;
