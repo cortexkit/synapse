@@ -2809,6 +2809,9 @@ mod catalog_lane_tests;
 
 mod catalog_remove;
 
+#[cfg(test)]
+mod request_path_tests;
+
 #[derive(Clone, Debug)]
 struct OwnedCatalogConfig {
     family: OwnedFamily,
