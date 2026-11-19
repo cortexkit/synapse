@@ -593,6 +593,7 @@ mod tests {
             logs: LogRing::new(),
             worker_generation: 1,
             packed: None,
+            max_frame: synapse_core::DEFAULT_MAX_FRAME_BYTES,
             unusable: false,
         });
         let peer = tokio::spawn(async move {

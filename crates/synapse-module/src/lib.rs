@@ -21,6 +21,7 @@ mod diagnostics_findings;
 mod embed_job;
 mod engram_catalog;
 mod event_outbox;
+mod health;
 mod lane_pause;
 mod slot_wait;
 pub use backend_check::check_backend;
@@ -8039,10 +8040,7 @@ async fn admission_status(state: Arc<ModuleState>) -> HandlerOutcome {
 
 fn worker_health_for_model(model: &EmbeddingModel) -> Option<worker_host::WorkerHostHealth> {
     match &model.backend {
-        EmbedBackend::Worker(engine) => engine
-            .lock()
-            .ok()
-            .and_then(|engine| engine.health_snapshot().ok()),
+        EmbedBackend::Worker(engine) => health::worker_health(engine),
         #[cfg(unix)]
         EmbedBackend::DirectAne(_) => None,
         #[cfg(feature = "test-support")]
@@ -9959,6 +9957,7 @@ mod tests {
                     pid: None,
                     stream: host,
                     packed: Some(synapse_core::PackedCapability::tight256()),
+                    max_frame: None,
                     confirm_exit: Box::pin(async move {
                         task.await
                             .map_err(|error| AneResidencyError::Channel(error.to_string()))?;

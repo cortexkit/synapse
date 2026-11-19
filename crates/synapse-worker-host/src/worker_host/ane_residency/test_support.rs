@@ -626,6 +626,7 @@ pub(super) fn module_mock_engine_for_owner(
                 pid: None,
                 packed: None,
                 stream,
+                max_frame: None,
                 confirm_exit: Box::pin(async move {
                     task.await
                         .map_err(|e| AneResidencyError::Channel(e.to_string()))?;

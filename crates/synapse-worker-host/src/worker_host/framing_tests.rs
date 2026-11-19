@@ -30,6 +30,7 @@ async fn malformed_reply_faults(corruption: Corruption) {
         logs: LogRing::new(),
         worker_generation: 1,
         packed: None,
+        max_frame: synapse_core::DEFAULT_MAX_FRAME_BYTES,
         unusable: false,
     });
     let peer = tokio::spawn(async move {
@@ -202,4 +203,106 @@ async fn progress_between_terminal_header_and_raw_faults_real_host() {
 #[tokio::test]
 async fn terminal_header_does_not_renew_raw_deadline_real_host() {
     malformed_reply_faults(Corruption::LateRawAfterHeader).await;
+}
+
+/// A request too large for the frame limit agreed with this worker is the
+/// caller's error: it is refused before anything is written, the worker keeps
+/// running, and no crash is charged.
+#[tokio::test]
+async fn oversized_request_is_refused_locally_without_faulting_the_worker() {
+    let mut host = WorkerHost::new(WorkerHostConfig::new("/bin/false", std::env::temp_dir()));
+    let peer = super::test_support::attach_mock_worker(&mut host, |request, raw| match request {
+        WorkerRequest::Load { req_id, .. } => (
+            WorkerResponse::Loaded {
+                req_id: req_id.clone(),
+                model_ref: "mock".into(),
+                dims: 1,
+                cold_load_ms: 0,
+                buckets: None,
+                ane_cached_shapes: None,
+                transcribe_revision: None,
+            },
+            None,
+        ),
+        WorkerRequest::EmbedBatch { req_id, .. } => {
+            let ids = synapse_core::decode_i32_frame(raw.unwrap()).unwrap();
+            (
+                WorkerResponse::Vectors {
+                    req_id: req_id.clone(),
+                    dims: 1,
+                    n: 1,
+                },
+                Some(encode_f32_frame(&[ids.len() as f32])),
+            )
+        }
+        other => panic!("unexpected request {other:?}"),
+    });
+    let mut cfg = RuntimeConfig::default();
+    cfg.values
+        .insert("artifact_path".into(), "/tmp/framing-fixture".into());
+    let model = host
+        .load_model(
+            &ValidatedArtifact {
+                digest: String::new(),
+                format: "mock".into(),
+            },
+            &cfg,
+        )
+        .await
+        .unwrap();
+    // The worker agreed to a smaller limit than the host's configured one:
+    // the header fits, the raw token frame (400 bytes) does not.
+    host.connection.as_mut().unwrap().max_frame = 256;
+    let error = host
+        .embed_batch(
+            &model,
+            TokenBatch {
+                items: vec![vec![7; 100]],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, WorkerHostError::WorkerErr { code, .. } if code == "invalid_request"),
+        "{error:?}"
+    );
+    assert!(
+        !error
+            .to_engine_error(EngineErrorStage::Inference)
+            .safe_to_retry_same_request
+    );
+    assert_eq!(host.health_snapshot().crash_count_window, 0);
+    assert!(host.connection.as_ref().is_some_and(|c| !c.unusable));
+    // The same worker still serves a request that fits.
+    let vectors = host
+        .embed_batch(
+            &model,
+            TokenBatch {
+                items: vec![vec![7; 3]],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(vectors, vec![vec![3.0]]);
+    host.kill_current().await;
+    assert_eq!(
+        peer.await.unwrap().len(),
+        2,
+        "only LOAD and the fitting request were sent"
+    );
+}
+
+/// A worker start that fails (here the binary exits before connecting)
+/// removes the socket file it created, as a successful start does.
+#[tokio::test]
+async fn failed_worker_start_leaves_no_socket_file() {
+    let dir = std::env::temp_dir().join(format!("synapse-sock-{}", nonce_hex16()));
+    let mut config = WorkerHostConfig::new("/bin/false", &dir);
+    config.handshake_timeout = Duration::from_millis(200);
+    config.worker_id = "socket-cleanup".into();
+    let mut host = WorkerHost::new(config);
+    assert!(host.start_worker().await.is_err());
+    let socket = synapse_core::worker_socket_path(&dir, "socket-cleanup");
+    assert!(!socket.exists(), "{} was left behind", socket.display());
+    let _ = std::fs::remove_dir_all(&dir);
 }

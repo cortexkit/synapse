@@ -17,8 +17,9 @@ use tokio::task::JoinHandle;
 use super::{WorkerHost, WorkerHostError};
 
 /// How long the host waits for a killed worker process to exit before treating
-/// the exit as unconfirmed. The direct-ANE channel uses the same bound when it
-/// retires or restarts its worker, including on Neural Engine pause.
+/// the exit as unconfirmed. `AneWorkerChannel`, the host's connection to a
+/// direct Neural Engine worker, uses the same bound when it retires or
+/// restarts that worker, including on Neural Engine pause.
 pub(crate) const OWNER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Killed worker processes whose exit has not been confirmed yet.

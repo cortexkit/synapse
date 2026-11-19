@@ -74,6 +74,7 @@ pub async fn channel() -> (
                 pid: None,
                 stream: module,
                 packed: None,
+                max_frame: None,
                 confirm_exit: Box::pin(async move {
                     peer.await
                         .map_err(|error| AneResidencyError::Channel(error.to_string()))

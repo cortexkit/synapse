@@ -21,6 +21,44 @@ pub(super) const INFERENCE_IDLE: Duration = Duration::from_secs(120);
 // duration; the caller's absolute deadline is a separate limit.
 pub(super) const SETUP_IDLE: Duration = Duration::from_secs(600);
 
+/// Checks what an exchange would send before anything is written: the
+/// serialized request header and its raw frame must each fit `max_frame` (the
+/// limit negotiated with this worker), and a transcription's raw mel frame must
+/// match its header. A failure is the caller's invalid request, answered like a
+/// worker's own `invalid_request`; it is not a worker fault, so the caller
+/// neither restarts the worker nor charges it a crash.
+pub(super) fn preflight(
+    request: &WorkerRequest,
+    raw: Option<&[u8]>,
+    max_frame: u32,
+) -> Result<(), WorkerHostError> {
+    let invalid = |msg: String| WorkerHostError::WorkerErr {
+        code: "invalid_request".into(),
+        msg,
+    };
+    if matches!(request, WorkerRequest::Transcribe { .. }) {
+        let raw = raw.ok_or_else(|| invalid("TRANSCRIBE requires a raw mel frame".into()))?;
+        request
+            .validate_raw_frame(raw)
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    let header = serde_json::to_vec(request)
+        .map_err(|error| invalid(format!("encode request header: {error}")))?;
+    for (frame, len) in [
+        ("request header", Some(header.len())),
+        ("raw frame", raw.map(<[u8]>::len)),
+    ] {
+        if len.is_some_and(|len| len > max_frame as usize) {
+            return Err(invalid(format!(
+                "{} {frame} of {} bytes exceeds the worker frame limit of {max_frame} bytes",
+                request.wire_type(),
+                len.unwrap_or_default()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &WorkerRequest,

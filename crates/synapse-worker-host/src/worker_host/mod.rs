@@ -18,12 +18,11 @@ use synapse_core::{
     WorkerTransportStream, DEFAULT_MAX_FRAME_BYTES,
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::runtime::Runtime;
 
-const STDERR_RING_BYTES: usize = 8 * 1024;
-
+mod worker_logs;
+use worker_logs::{spawn_pipe_reader, LogRing, WorkerForwardLimiter, WorkerLogContext};
 #[cfg(all(test, unix))]
 mod quarantine_tests;
 
@@ -150,39 +149,14 @@ pub enum WorkerHostError {
     },
 }
 
-#[derive(Clone, Debug)]
-struct LogRing {
-    bytes: Arc<Mutex<Vec<u8>>>,
-}
-
-impl LogRing {
-    fn new() -> Self {
-        Self {
-            bytes: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn push(&self, bytes: &[u8]) {
-        let mut guard = self.bytes.lock().expect("stderr ring mutex poisoned");
-        guard.extend_from_slice(bytes);
-        if guard.len() > STDERR_RING_BYTES {
-            let drain = guard.len() - STDERR_RING_BYTES;
-            guard.drain(0..drain);
-        }
-    }
-
-    fn tail(&self) -> String {
-        let guard = self.bytes.lock().expect("stderr ring mutex poisoned");
-        String::from_utf8_lossy(&guard).into_owned()
-    }
-}
-
 struct WorkerConnection {
     stream: WorkerTransportStream,
     child: Child,
     logs: LogRing,
     worker_generation: u64,
     packed: Option<synapse_core::PackedCapability>,
+    /// Frame limit agreed in the handshake: the smaller of ours and the worker's.
+    max_frame: u32,
     unusable: bool,
 }
 
@@ -199,42 +173,6 @@ impl Drop for GenericExchangeGuard<'_> {
             // child as lifecycle, not a crash charged to the later caller.
             *self.unusable = true;
         }
-    }
-}
-
-#[derive(Default)]
-struct WorkerLogContext {
-    job_id: Option<String>,
-}
-
-struct WorkerForwardLimiter {
-    cap: u32,
-    window_started: Instant,
-    forwarded: u32,
-    dropped: u64,
-}
-
-impl WorkerForwardLimiter {
-    fn new(cap: u32) -> Self {
-        Self {
-            cap,
-            window_started: Instant::now(),
-            forwarded: 0,
-            dropped: 0,
-        }
-    }
-
-    fn admit(&mut self, now: Instant) -> Option<u64> {
-        if now.duration_since(self.window_started) >= Duration::from_secs(1) {
-            self.window_started = now;
-            self.forwarded = 0;
-        }
-        if self.forwarded >= self.cap {
-            self.dropped = self.dropped.saturating_add(1);
-            return None;
-        }
-        self.forwarded = self.forwarded.saturating_add(1);
-        Some(std::mem::take(&mut self.dropped))
     }
 }
 
@@ -773,7 +711,9 @@ impl WorkerHost {
                 ensure_req_id(&req_id, &got)?;
                 crate::exchange::validate_worker_load(
                     cfg,
-                    self.config.max_frame,
+                    self.connection
+                        .as_ref()
+                        .map_or(self.config.max_frame, |connection| connection.max_frame),
                     transcribe_revision.as_ref(),
                 )?;
                 Ok((model_ref, dims, cold_load_ms, buckets))
@@ -815,6 +755,11 @@ impl WorkerHost {
         self.exit_fence_check()?;
         let (endpoint, listener) =
             prepare_listener(&self.config.runtime_dir, &self.config.worker_id)?;
+        // The worker connects through the socket file only during the
+        // handshake. Remove it when this attempt ends, however it ends, so
+        // engines that use a fresh worker id each time leave no files behind.
+        #[cfg(unix)]
+        let _socket_file = RemoveSocketOnDrop(endpoint.clone());
         let nonce = nonce_hex16();
         let mut command =
             synapse_core::without_launch_nonce_tokio(Command::new(&self.config.worker_bin));
@@ -912,6 +857,7 @@ impl WorkerHost {
             logs,
             worker_generation: worker_generation_from_nonce(&nonce)?,
             packed: hello.packed,
+            max_frame: self.config.max_frame.min(hello.max_frame),
             unusable: false,
         });
         Ok(())
@@ -954,6 +900,8 @@ impl WorkerHost {
         };
         let connection = self.connection.as_mut().expect("connected worker");
         let generation = connection.worker_generation;
+        let max_frame = connection.max_frame;
+        liveness::preflight(&request, raw.as_deref(), max_frame)?;
         let mut exchange_guard = GenericExchangeGuard {
             unusable: &mut connection.unusable,
             completed: false,
@@ -962,7 +910,7 @@ impl WorkerHost {
             &mut connection.stream,
             &request,
             raw.as_deref(),
-            self.config.max_frame,
+            max_frame,
             cuda,
             idle_override,
             collection,
@@ -1149,6 +1097,15 @@ impl WorkerEngine {
     pub fn health_snapshot(&self) -> Result<WorkerHostHealth, WorkerHostError> {
         let mut host = self.lock_host()?;
         Ok(host.health_snapshot())
+    }
+
+    /// Like [`Self::health_snapshot`], but `None` instead of waiting while a
+    /// request or teardown holds the host.
+    pub fn try_health_snapshot(&self) -> Option<WorkerHostHealth> {
+        self.host
+            .try_lock()
+            .ok()
+            .map(|mut host| host.health_snapshot())
     }
 
     /// Reads this model's crash fence without expiring it or restarting a worker.
@@ -1469,110 +1426,22 @@ impl GenerateEngine for WorkerEngine {
     }
 }
 
-fn spawn_pipe_reader<R>(
-    stream: &'static str,
-    mut reader: R,
-    ring: LogRing,
-    worker_id: String,
-    model_id: String,
-    context: Arc<Mutex<WorkerLogContext>>,
-    limiter: Arc<Mutex<WorkerForwardLimiter>>,
-) where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let prefix = format!("[{stream}] ");
-        let mut buffer = [0_u8; 512];
-        let mut partial = Vec::new();
-        loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    ring.push(prefix.as_bytes());
-                    ring.push(&buffer[..n]);
-                    partial.extend_from_slice(&buffer[..n]);
-                    while let Some(newline) = partial.iter().position(|byte| *byte == b'\n') {
-                        let mut complete = partial.drain(..=newline).collect::<Vec<_>>();
-                        complete.pop();
-                        if complete.last() == Some(&b'\r') {
-                            complete.pop();
-                        }
-                        forward_worker_line(
-                            &worker_id,
-                            stream,
-                            &model_id,
-                            &String::from_utf8_lossy(&complete),
-                            &context,
-                            &limiter,
-                        );
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn forward_worker_line(
-    worker_id: &str,
-    stream: &str,
-    model_id: &str,
-    line: &str,
-    context: &Mutex<WorkerLogContext>,
-    limiter: &Mutex<WorkerForwardLimiter>,
-) {
-    let dropped = match limiter.lock() {
-        Ok(mut limiter) => match limiter.admit(Instant::now()) {
-            Some(dropped) => dropped,
-            None => return,
-        },
-        Err(_) => return,
-    };
-    let job_id = context
-        .lock()
-        .ok()
-        .and_then(|context| context.job_id.clone());
-    match (job_id.as_deref(), dropped) {
-        (Some(job_id), 0) => tracing::info!(
-            target: "worker",
-            worker = worker_id,
-            stream,
-            model_id,
-            job_id,
-            "{line}"
-        ),
-        (Some(job_id), dropped) => tracing::info!(
-            target: "worker",
-            worker = worker_id,
-            stream,
-            model_id,
-            job_id,
-            dropped,
-            "{line}"
-        ),
-        (None, 0) => tracing::info!(
-            target: "worker",
-            worker = worker_id,
-            stream,
-            model_id,
-            "{line}"
-        ),
-        (None, dropped) => tracing::info!(
-            target: "worker",
-            worker = worker_id,
-            stream,
-            model_id,
-            dropped,
-            "{line}"
-        ),
-    }
-}
-
 fn worker_transport_label() -> &'static str {
     if cfg!(windows) {
         "named-pipe-worker"
     } else {
         "unix-socket-worker"
+    }
+}
+
+/// Removes a worker's Unix socket file when dropped.
+#[cfg(unix)]
+struct RemoveSocketOnDrop(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RemoveSocketOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -2321,6 +2190,8 @@ mod tests {
 /// workers are driven through [`AneShapeWorker`], whose connection is held only
 /// for a single exchange ([`AneWorkerChannel`]).
 pub mod ane_residency {
+    #[cfg(all(test, unix))]
+    mod abandonment_tests;
     #[cfg(any(test, feature = "test-support"))]
     pub mod ane_quarantine_support;
     #[cfg(test)]
@@ -2506,6 +2377,12 @@ pub mod ane_residency {
         fn drop(&mut self) {
             self.0.abandoned.store(true, Ordering::Release);
             self.0.abandonment.notify_waiters();
+        }
+    }
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
         }
     }
 
@@ -4790,6 +4667,9 @@ pub mod ane_residency {
         pub pid: Option<u32>,
         pub stream: S,
         pub packed: Option<synapse_core::PackedCapability>,
+        /// Frame limit agreed in this worker's handshake, when the connector
+        /// knows it; otherwise the channel's configured limit applies.
+        pub max_frame: Option<u32>,
         pub confirm_exit: BoxFuture<'static, Result<(), AneResidencyError>>,
     }
 
@@ -5329,8 +5209,13 @@ pub mod ane_residency {
         {
             self.exchange_inference_checked(request, raw, deadline, io_timeout, None, permit)
                 .await
+                .map(|(response, raw, _)| (response, raw))
         }
 
+        /// [`Self::exchange_inference`], also returning a serving reply's
+        /// decoded values, already checked to be finite, so the caller does not
+        /// decode and scan the frame a second time.
+        #[allow(clippy::type_complexity)]
         async fn exchange_inference_checked<P>(
             &self,
             request: &WorkerRequest,
@@ -5339,7 +5224,7 @@ pub mod ane_residency {
             io_timeout: std::time::Duration,
             expected_dims: Option<usize>,
             permit: P,
-        ) -> Result<(WorkerResponse, Option<Vec<u8>>), AneResidencyError>
+        ) -> Result<(WorkerResponse, Option<Vec<u8>>, Option<Vec<f32>>), AneResidencyError>
         where
             P: Future<Output = Result<ExchangePermit, AneResidencyError>>,
         {
@@ -5409,6 +5294,7 @@ pub mod ane_residency {
                     WorkerResponse::Scores { .. } => true,
                     _ => false,
                 };
+                let mut decoded = None;
                 if serving {
                     let values =
                         synapse_core::decode_f32_frame(raw.as_deref().ok_or_else(|| {
@@ -5429,8 +5315,9 @@ pub mod ane_residency {
                         faults.last_generation = None;
                         faults.until = None;
                     }
+                    decoded = Some(values);
                 }
-                Ok((response, raw))
+                Ok((response, raw, decoded))
             });
             if matches!(&result, Err(AneResidencyError::Channel(_)))
                 && self.generation() == generation
@@ -5500,8 +5387,14 @@ pub mod ane_residency {
                     msg: "HELLO lacks packed capability".into(),
                 });
             }
+            let max_frame = session.max_frame.unwrap_or(self.max_frame);
+            super::liveness::preflight(request, raw, max_frame).map_err(|error| match error {
+                super::WorkerHostError::WorkerErr { code, msg } => {
+                    AneResidencyError::WorkerErr { code, msg }
+                }
+                other => AneResidencyError::Channel(other.to_string()),
+            })?;
             let stream = &mut session.stream;
-            let max_frame = self.max_frame;
             ensure_request_live()?;
             let mut exchange_guard = ExchangeFaultGuard {
                 faulted: &self.faulted,
@@ -5535,7 +5428,7 @@ pub mod ane_residency {
             drop(rpc_clock);
             match result {
                 Ok((response, raw)) => {
-                    transcribe::validate_loaded_request(request, &response, self.max_frame)?;
+                    transcribe::validate_loaded_request(request, &response, max_frame)?;
                     exchange_guard.completed = true;
                     if matches!(
                         request,
@@ -5852,6 +5745,7 @@ pub mod ane_residency {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 let reload = async {
+                    let max_frame = fresh.max_frame.unwrap_or(self.max_frame);
                     for (model_ref, mut request) in models {
                         let req_id = self.next_req_id("reload");
                         if let WorkerRequest::Load { req_id: id, .. } = &mut request {
@@ -5861,7 +5755,7 @@ pub mod ane_residency {
                             &mut fresh.stream,
                             &request,
                             None,
-                            self.max_frame,
+                            max_frame,
                             false,
                             None,
                         )
@@ -5874,9 +5768,7 @@ pub mod ane_residency {
                                 ..
                             } if got == &req_id && got_ref == &model_ref => {
                                 transcribe::validate_loaded_request(
-                                    &request,
-                                    &response,
-                                    self.max_frame,
+                                    &request, &response, max_frame,
                                 )?;
                             }
                             other => {
@@ -6031,6 +5923,7 @@ pub mod ane_residency {
                     stream,
                     mut child,
                     packed,
+                    max_frame,
                     ..
                 } = host.connection.take().ok_or_else(|| {
                     AneResidencyError::Channel("spawned worker has no connection".into())
@@ -6038,6 +5931,7 @@ pub mod ane_residency {
                 Ok(AneWorkerSession {
                     pid: child.id(),
                     packed,
+                    max_frame: Some(max_frame),
                     stream,
                     confirm_exit: Box::pin(async move {
                         match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
@@ -6151,15 +6045,20 @@ pub mod ane_residency {
             permits: Option<PermitSource>,
         ) -> Result<Vec<Vec<f32>>, AneResidencyError> {
             let serving = self.serving.clone();
-            self.runtime
+            let task = self
+                .runtime
                 .as_ref()
                 .expect("live ANE runtime")
                 .spawn(async move {
                     serving
                         .infer_permitted(sequences, rerank, deadline, guards, permits)
                         .await
-                })
-                .await
+                });
+            // The request's abandonment guard lives in that task. Abort it when
+            // this caller goes away, so queued work that has not reached the
+            // wire is withdrawn; dispatched work drains in its own task.
+            let _abort_on_drop = AbortOnDrop(task.abort_handle());
+            task.await
                 .map_err(|error| AneResidencyError::Channel(error.to_string()))?
         }
 
@@ -6693,9 +6592,7 @@ pub mod ane_residency {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                 return Err(lease_deadline_expired());
             }
-            use synapse_core::{
-                decode_f32_frame, encode_i32_frame, WorkerSequence, WorkerTokenItem,
-            };
+            use synapse_core::{encode_i32_frame, WorkerSequence, WorkerTokenItem};
             let ids: Vec<i32> = sequences
                 .iter()
                 .flatten()
@@ -6756,7 +6653,7 @@ pub mod ane_residency {
                     None => Ok(Box::new(()) as ExchangePermit),
                 }
             };
-            let (response, raw) = self
+            let (response, _, values) = self
                 .channel
                 .exchange_inference_checked(
                     &request,
@@ -6786,13 +6683,11 @@ pub mod ane_residency {
                     )))
                 }
             }
-            let raw = raw
+            // The checked exchange decoded the reply and found every value
+            // finite; only the count is left to check.
+            let values = values
                 .ok_or_else(|| AneResidencyError::Channel("missing inference raw frame".into()))?;
-            let values = decode_f32_frame(&raw)
-                .map_err(|error| AneResidencyError::Channel(error.to_string()))?;
-            if values.len() != sequences.len().saturating_mul(dims)
-                || values.iter().any(|v| !v.is_finite())
-            {
+            if values.len() != sequences.len().saturating_mul(dims) {
                 return Err(AneResidencyError::Channel(
                     "invalid inference output count or value".into(),
                 ));
@@ -6867,6 +6762,7 @@ pub mod ane_residency {
                             pid: None,
                             packed: None,
                             stream,
+                            max_frame: None,
                             confirm_exit: Box::pin(async move {
                                 let mut child = {
                                     let mut children = children.lock().unwrap();
@@ -8360,6 +8256,7 @@ pub mod ane_residency {
                         pid: None,
                         stream: host,
                         packed: hello.packed,
+                        max_frame: None,
                         confirm_exit: Box::pin(async move {
                             task.await
                                 .map_err(|e| AneResidencyError::Channel(e.to_string()))?;
@@ -9102,6 +8999,7 @@ pub mod ane_residency {
                             pid: None,
                             packed: None,
                             stream: host,
+                            max_frame: None,
                             confirm_exit: Box::pin(async move {
                                 task.await.map_err(|error| {
                                     AneResidencyError::Channel(error.to_string())
@@ -11276,6 +11174,7 @@ pub mod ane_residency {
                         pid: None,
                         packed: None,
                         stream: host,
+                        max_frame: None,
                         confirm_exit: Box::pin(async move {
                             task.await.map_err(|error| {
                                 AneResidencyError::Channel(format!("mock owner exit: {error}"))

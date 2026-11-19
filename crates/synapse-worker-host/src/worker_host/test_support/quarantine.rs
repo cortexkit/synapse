@@ -35,6 +35,7 @@ pub(crate) fn peer(
         logs: LogRing::new(),
         worker_generation: generation,
         packed: None,
+        max_frame: synapse_core::DEFAULT_MAX_FRAME_BYTES,
         unusable: false,
     });
     tokio::spawn(async move {

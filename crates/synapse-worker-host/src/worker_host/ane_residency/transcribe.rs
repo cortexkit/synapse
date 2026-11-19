@@ -371,6 +371,7 @@ mod tests {
                     stream: module,
                     pid: None,
                     packed: None,
+                    max_frame: None,
                     confirm_exit: Box::pin(async move {
                         peer.await
                             .map_err(|e| AneResidencyError::Channel(e.to_string()))
