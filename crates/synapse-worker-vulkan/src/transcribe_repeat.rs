@@ -4,6 +4,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
+#[path = "transcribe_repeat_load.rs"]
+mod host_load;
+
 const REPEAT: &str = "SYNAPSE_VULKAN_SPEECH_REPEAT";
 const CAPTURE: &str = "SYNAPSE_VULKAN_SPEECH_CAPTURE_LAYERS";
 const LIMIT: &str = "SYNAPSE_VULKAN_SPEECH_DISPATCH_LIMIT";
@@ -14,6 +17,7 @@ pub(super) struct Probe {
     capture: bool,
     dispatch_limit: Option<usize>,
     disjoint: bool,
+    host_load: host_load::Config,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -37,9 +41,13 @@ impl Probe {
         let capture = env(CAPTURE);
         let dispatch_limit = env(LIMIT);
         let disjoint = env(DISJOINT);
+        let host_load = host_load::Config::from_env();
         let Some(count) = env(REPEAT) else {
             assert!(
-                capture.is_none() && dispatch_limit.is_none() && disjoint.is_none(),
+                capture.is_none()
+                    && dispatch_limit.is_none()
+                    && disjoint.is_none()
+                    && host_load.is_none(),
                 "encoder probe switches require {REPEAT}"
             );
             return None;
@@ -58,6 +66,7 @@ impl Probe {
                     .unwrap_or_else(|_| panic!("{LIMIT} must be an integer"))
             }),
             disjoint: enabled(disjoint.as_deref(), DISJOINT),
+            host_load: host_load.unwrap_or_default(),
         })
     }
 
@@ -93,6 +102,7 @@ impl Probe {
 
         let mut first_encoder = None;
         let mut first_layers = Vec::new();
+        let load = host_load::Running::start(self.host_load).unwrap();
         for run in 1..=self.count {
             let started = Instant::now();
             // Keep the normal final observation so the hash is available even
@@ -125,6 +135,9 @@ impl Probe {
                 first_encoder = Some(hash);
                 first_layers = layers;
             }
+        }
+        if let Some(load) = load {
+            load.report().unwrap();
         }
     }
 }
