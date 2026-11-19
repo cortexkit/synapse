@@ -78,12 +78,7 @@ fn qwen3_shape_plans_stay_bounded_and_bit_identical() {
 fn check_family(profile_id: &str, family: ModelFamily, package_var: &str) {
     let package = std::env::var(package_var)
         .unwrap_or_else(|_| panic!("set {package_var} to the converted {profile_id} package path"));
-    let modes = match std::env::var("SYNAPSE_CUDA_PLAN_GRAPHS").as_deref() {
-        Err(_) | Ok("both") => vec![true, false],
-        Ok("on") => vec![true],
-        Ok("off") => vec![false],
-        Ok(other) => panic!("SYNAPSE_CUDA_PLAN_GRAPHS must be on, off or both, got {other}"),
-    };
+    let modes = graph_modes();
     let runs: Vec<_> = modes
         .iter()
         .map(|&graphs| drive(profile_id, family, &package, graphs))
@@ -108,29 +103,7 @@ fn drive(
     package: &str,
     graphs: bool,
 ) -> Vec<(usize, Vec<f32>)> {
-    let profile = Profile::select(profile_id, Some("embed"))
-        .unwrap_or_else(|error| panic!("select {profile_id}: {error}"));
-    if let Some(mib) = env_number("SYNAPSE_CUDA_PLAN_POISON_MIB") {
-        poison_free_device_memory(mib);
-    }
-    let mut engine = OwnedCudaEmbedEngine::serving(family);
-    let mut config = RuntimeConfig::default();
-    for (key, value) in [
-        ("model_path", package),
-        ("artifact_path", package),
-        ("profile", profile_id),
-        ("operation", "embed"),
-        ("cuda_graphs", if graphs { "1" } else { "0" }),
-    ] {
-        config.values.insert(key.to_owned(), value.to_owned());
-    }
-    let artifact = ValidatedArtifact {
-        digest: profile.package_digest.clone(),
-        format: "safetensors-package".to_owned(),
-    };
-    let model = engine
-        .load(&artifact, &config)
-        .unwrap_or_else(|error| panic!("load {profile_id} graphs={graphs}: {error:?}"));
+    let (mut engine, model) = load_engine(profile_id, family, package, graphs);
 
     let mut vectors = Vec::new();
     if let Some(lengths) = lengths_override() {
@@ -159,6 +132,94 @@ fn drive(
     engine.unload(&model);
     drop(engine);
     vectors
+}
+
+/// Loads one model through the production profile path (profile selection,
+/// header and digest validation, hardware floor), as the CUDA worker does.
+fn load_engine(
+    profile_id: &str,
+    family: ModelFamily,
+    package: &str,
+    graphs: bool,
+) -> (OwnedCudaEmbedEngine, LoadedModel) {
+    let profile = Profile::select(profile_id, Some("embed"))
+        .unwrap_or_else(|error| panic!("select {profile_id}: {error}"));
+    if let Some(mib) = env_number("SYNAPSE_CUDA_PLAN_POISON_MIB") {
+        poison_free_device_memory(mib);
+    }
+    let mut engine = OwnedCudaEmbedEngine::serving(family);
+    let mut config = RuntimeConfig::default();
+    for (key, value) in [
+        ("model_path", package),
+        ("artifact_path", package),
+        ("profile", profile_id),
+        ("operation", "embed"),
+        ("cuda_graphs", if graphs { "1" } else { "0" }),
+    ] {
+        config.values.insert(key.to_owned(), value.to_owned());
+    }
+    let artifact = ValidatedArtifact {
+        digest: profile.package_digest.clone(),
+        format: "safetensors-package".to_owned(),
+    };
+    let model = engine
+        .load(&artifact, &config)
+        .unwrap_or_else(|error| panic!("load {profile_id} graphs={graphs}: {error:?}"));
+    (engine, model)
+}
+
+/// Lengths that reproduced a Qwen3 failure on an RTX 3060: the first five
+/// build and evict plans for longer shapes, then 513 is a new, shorter shape
+/// whose first forward and first graph replay disagreed. Each length on its
+/// own in a new process passed.
+const AFTER_EVICTIONS: [usize; 6] = [512, 1024, 2048, 3072, 4096, 513];
+
+/// Embeds the last length of the list in a newly loaded engine first, as the
+/// reference, then runs the whole list in a second engine and requires the
+/// last length's result (its cache miss and its cache hit) to equal the
+/// reference bit for bit. With graph replay on, a failure of the engine's own
+/// capture check surfaces as a panic carrying the engine's diagnosis.
+#[test]
+#[ignore = "needs an NVIDIA GPU, --features cuda and SYNAPSE_CUDA_PLAN_QWEN3_PACKAGE"]
+fn qwen3_shape_after_evictions_matches_a_fresh_engine() {
+    let profile_id = "qwen3-embedding-0.6b.owned-cuda";
+    let package_var = "SYNAPSE_CUDA_PLAN_QWEN3_PACKAGE";
+    let package = std::env::var(package_var)
+        .unwrap_or_else(|_| panic!("set {package_var} to the converted {profile_id} package path"));
+    let lengths = lengths_override().unwrap_or_else(|| AFTER_EVICTIONS.to_vec());
+    let last = *lengths.last().expect("at least one length");
+    for graphs in graph_modes() {
+        let (mut fresh, fresh_model) =
+            load_engine(profile_id, ModelFamily::Qwen3, &package, graphs);
+        let reference = fresh
+            .embed_one(&fresh_model, token_ids(last))
+            .unwrap_or_else(|error| panic!("fresh length {last} graphs={graphs}: {error:?}"));
+        fresh.unload(&fresh_model);
+        drop(fresh);
+
+        let (mut engine, model) = load_engine(profile_id, ModelFamily::Qwen3, &package, graphs);
+        let mut vectors = Vec::new();
+        run_lengths(&engine, &model, &lengths, graphs, &mut vectors);
+        engine.unload(&model);
+        drop(engine);
+        let (_, after) = vectors.last().expect("one vector per length");
+        assert!(
+            same_bits(after, &reference),
+            "length {last} graphs={graphs}: the result after {lengths:?} differs from a fresh engine's result"
+        );
+        println!(
+            "length {last} graphs={graphs}: result after {lengths:?} equals the fresh engine's"
+        );
+    }
+}
+
+fn graph_modes() -> Vec<bool> {
+    match std::env::var("SYNAPSE_CUDA_PLAN_GRAPHS").as_deref() {
+        Err(_) | Ok("both") => vec![true, false],
+        Ok("on") => vec![true],
+        Ok("off") => vec![false],
+        Ok(other) => panic!("SYNAPSE_CUDA_PLAN_GRAPHS must be on, off or both, got {other}"),
+    }
 }
 
 /// Embeds each length twice (a cache miss, then a hit) and returns the device

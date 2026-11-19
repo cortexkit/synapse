@@ -233,6 +233,7 @@ struct ShapePlan {
     ~ShapePlan();
     void compute(StageProfile *profile = nullptr);
     void initialize_and_verify(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output);
+    void append_repeat_diagnosis(std::ostringstream &message, const uint32_t *host_ids, const uint8_t *host_mask, const std::vector<float> &uncaptured, const std::vector<float> &captured);
     void run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output);
 };
 
@@ -517,11 +518,48 @@ void ShapePlan::initialize_and_verify(const uint32_t *host_ids, const uint8_t *h
                     << " non_finite=" << non_finite << " first_index=" << first_index << " first_row=" << first_index / hidden
                     << " max_abs=" << maximum << " index=" << maximum_index
                     << " uncaptured=" << uncaptured[maximum_index] << " captured=" << captured[maximum_index];
+            append_repeat_diagnosis(message, host_ids, host_mask, uncaptured, captured);
             throw std::runtime_error(message.str());
         }
     }
     std::memcpy(host_output, uncaptured.data(), output.count * sizeof(float));
     std::fprintf(stderr, "CUDA Qwen3 shape %dx%d: arena=%zu workspace=%zu captured_exact=%s launches=%d gqa=two-group-strided kv_repeat_bytes=0 stage_projection_mlp_gemm=%.3fms stage_attention_gemm=%.3fms stage_score_softmax=%.3fms stage_pointwise_layout=%.3fms stage_final_norm_output=%.3fms\n", batch, seq, arena_bytes, workspace.count, context->graphs_enabled ? "true" : "not_captured", layer_count * (15 + 2 * (query_heads / kv_heads)) + 2, stage_ms["projection_mlp_gemm"], stage_ms["attention_gemm"], stage_ms["score_softmax"], stage_ms["pointwise_layout"], stage_ms["final_norm_output"]);
+}
+
+// Only called after the first uncaptured forward and the first graph replay
+// disagreed. Runs each mode once more on the same inputs and appends which
+// results agree, so the error shows which run is the odd one out:
+// - only uncaptured #1 disagrees: the plan's very first forward saw state that
+//   later forwards do not (for example memory not yet written);
+// - each mode repeats itself but the two modes differ: stream execution and
+//   graph replay compute different things;
+// - a mode does not repeat itself: the forward is not deterministic.
+void ShapePlan::append_repeat_diagnosis(std::ostringstream &message, const uint32_t *host_ids, const uint8_t *host_mask, const std::vector<float> &uncaptured, const std::vector<float> &captured) {
+    size_t ids_bytes = static_cast<size_t>(batch) * seq * sizeof(uint32_t);
+    size_t mask_bytes = static_cast<size_t>(batch) * seq;
+    size_t output_bytes = output.count * sizeof(float);
+    try {
+        std::vector<float> uncaptured_again(output.count), captured_again(output.count);
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+        compute();
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpy(uncaptured_again.data(), output.pointer, output_bytes, cudaMemcpyDeviceToHost));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(token_ids.pointer, host_ids, ids_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpyAsync(mask.pointer, host_mask, mask_bytes, cudaMemcpyHostToDevice, context->stream));
+        FAMILY_CUDA_CHECK(cudaGraphLaunch(graph_exec, context->stream));
+        FAMILY_CUDA_CHECK(cudaStreamSynchronize(context->stream));
+        FAMILY_CUDA_CHECK(cudaMemcpy(captured_again.data(), output.pointer, output_bytes, cudaMemcpyDeviceToHost));
+        auto same = [&](const std::vector<float> &left, const std::vector<float> &right) {
+            return std::memcmp(left.data(), right.data(), output_bytes) == 0 ? "true" : "false";
+        };
+        message << "; repeat: uncaptured2==uncaptured1=" << same(uncaptured_again, uncaptured)
+                << " uncaptured2==captured1=" << same(uncaptured_again, captured)
+                << " captured2==captured1=" << same(captured_again, captured)
+                << " captured2==uncaptured1=" << same(captured_again, uncaptured);
+    } catch (const std::exception &error) {
+        message << "; repeat failed: " << error.what();
+    }
 }
 
 void ShapePlan::run(const uint32_t *host_ids, const uint8_t *host_mask, float *host_output) {
