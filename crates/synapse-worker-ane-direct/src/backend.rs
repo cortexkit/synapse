@@ -823,9 +823,6 @@ impl Model {
         } else {
             &resident.b
         };
-        let raw = surface.read_f32();
-        stages.emit("final_readback_fp16_to_fp32");
-        profile.phase("output_readback");
         // CLS pooling and last-token readout consume only one row. The
         // ModernBERT classifier needs every unpadded row for mean pooling.
         let positions: Vec<usize> = if self.profile.modern() && self.profile.operation() == "rerank"
@@ -836,6 +833,17 @@ impl Model {
         } else {
             vec![tokens.len() - 1]
         };
+        // Gather just those rows from the surface's converted scratch buffer,
+        // then release the surface, instead of copying the whole output tensor.
+        let gathered: Vec<Vec<f32>> = {
+            let raw = surface.as_f32_slice();
+            positions
+                .iter()
+                .map(|&position| (0..hidden).map(|c| raw[c * shape + position]).collect())
+                .collect()
+        };
+        stages.emit("final_readback_fp16_to_fp32");
+        profile.phase("output_readback");
         let columns = positions.len();
         let mut normalized = vec![0.0; hidden * columns];
         let norm_weight = if self.profile.modern() {
@@ -843,8 +851,7 @@ impl Model {
         } else {
             Some(self.tensor(&format!("{}norm.weight", self.profile.prefix()))?)
         };
-        for (column, position) in positions.into_iter().enumerate() {
-            let mut row: Vec<_> = (0..hidden).map(|c| raw[c * shape + position]).collect();
+        for (column, mut row) in gathered.into_iter().enumerate() {
             rms_cpu(&mut row, norm_weight, self.profile.f("norm_eps"));
             for c in 0..hidden {
                 normalized[c * columns + column] = row[c];

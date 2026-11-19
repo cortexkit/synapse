@@ -333,8 +333,8 @@ impl Model {
         let dim = self.profile.n("head_dim");
         ane::autoreleasepool(|_| {
             // Like standalone admission, refuse a layer compile when the temp
-            // volume is short of space; a layer aned holds compiled loads
-            // without writing and is not checked.
+            // volume is short of space. A layer the `aned` daemon already holds
+            // compiled is loaded without writing anything and is not checked.
             let dir = std::env::temp_dir();
             let mut executables = Vec::new();
             for layer in 0..self.profile.n("num_hidden_layers") {
@@ -480,21 +480,23 @@ impl TightProgram {
             executable.run_cached(inputs, &[dst])?;
             progress()?;
         }
-        let raw = if self.executables.len().is_multiple_of(2) {
-            self.a.read_f32()
+        let surface = if self.executables.len().is_multiple_of(2) {
+            &self.a
         } else {
-            self.b.read_f32()
+            &self.b
         };
         let norm = model.tensor(&format!("{}norm.weight", p.prefix()))?;
-        Ok(ends
+        // Gather each row's last token from the surface's converted scratch
+        // buffer, then release the surface, instead of copying the whole tensor.
+        let rows: Vec<Vec<f32>> = {
+            let raw = surface.as_f32_slice();
+            ends.iter()
+                .map(|&end| (0..hidden).map(|c| raw[c * self.width + end]).collect())
+                .collect()
+        };
+        Ok(rows
             .into_iter()
-            .map(|end| {
-                embedding_tail(
-                    (0..hidden).map(|c| raw[c * self.width + end]).collect(),
-                    norm,
-                    p.f("norm_eps"),
-                )
-            })
+            .map(|row| embedding_tail(row, norm, p.f("norm_eps")))
             .collect())
     }
 }
