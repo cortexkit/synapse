@@ -595,6 +595,17 @@ fn checked_output(output: Value) -> Answer<Value> {
     Ok(output)
 }
 
+/// Directory for a worker's IPC endpoint, shared by embedding, reranking and
+/// transcription workers. Unix socket paths must fit `sun_path` (104 bytes on
+/// macOS, 108 on Linux), so this stays a short runtime directory rather than
+/// the module's data folder, whose depth depends on the user's home path.
+pub(crate) fn worker_runtime_dir(spec: &StoredModelConfig) -> PathBuf {
+    spec.worker_runtime_dir
+        .clone()
+        .or_else(|| env::var_os(worker_runtime_dir_env_var(&spec.engine)).map(PathBuf::from))
+        .unwrap_or_else(|| env::temp_dir().join("synapse-workers"))
+}
+
 struct TranscribeRuntimeConfig {
     runtime: RuntimeConfig,
     _model: LocatedAsset,
@@ -666,10 +677,7 @@ fn load_host(
         .or_else(|| env::var_os(worker_binary_env_var(&spec.engine)).map(PathBuf::from))
         .or_else(|| resolve_worker_binary_sibling(&spec.engine))
         .ok_or_else(|| TranscribeHostError::Profile("worker binary unavailable".into()))?;
-    let directory = persistence::directory(state)
-        .map_err(|e| TranscribeHostError::Profile(e.0.to_string()))?
-        .join("workers");
-    let mut worker = worker_host::WorkerHostConfig::new(binary, directory);
+    let mut worker = worker_host::WorkerHostConfig::new(binary, worker_runtime_dir(&spec));
     worker.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     worker.model_id = Some(spec.model_id.clone());
     worker.catalog_lane = Some(spec.model_id.clone());

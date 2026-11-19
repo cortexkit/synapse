@@ -4672,7 +4672,6 @@ fn load_worker_backend_blocking(
     }
 
     let worker_bin_var = worker_binary_env_var(&spec.engine);
-    let worker_runtime_dir_var = worker_runtime_dir_env_var(&spec.engine);
     let worker_bin = spec
         .worker_bin
         .clone()
@@ -4684,12 +4683,7 @@ fn load_worker_backend_blocking(
                 spec.engine, spec.model_id, worker_bin_var
             ))
         })?;
-    let runtime_dir = spec
-        .worker_runtime_dir
-        .clone()
-        .or_else(|| env::var_os(&worker_runtime_dir_var).map(PathBuf::from))
-        .unwrap_or_else(|| env::temp_dir().join("synapse-workers"));
-    let mut config = WorkerHostConfig::new(worker_bin, runtime_dir);
+    let mut config = WorkerHostConfig::new(worker_bin, media_jobs::worker_runtime_dir(spec));
     let _ = worker_load_context.timeout;
     config.worker_id = format!("synapse-{}-{}", spec.engine, spec.model_id);
     config.model_id = Some(spec.model_id.clone());
