@@ -186,6 +186,16 @@ class ReleaseChecks(unittest.TestCase):
             with self.subTest(edit=edit):
                 self.rejects(check.benchmark, bad, self.cells())
 
+    def test_benchmark_waiver_applies_only_to_its_version(self):
+        entries, _, assets, _, report_dir = self.evidence_fixture()
+        (report_dir / 'report.json').unlink()
+        module = self.root / 'crates/synapse-module/Cargo.toml'
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text('[package]\nname = "synapse-module"\nversion = "0.1.0-alpha.3"\n')
+        check.evidence(self.root, 'a' * 40, assets, entries)
+        module.write_text('[package]\nname = "synapse-module"\nversion = "0.1.0-alpha.4"\n')
+        self.rejects(check.evidence, self.root, 'a' * 40, assets, entries)
+
     def test_benchmark_refuses_dropped_status(self):
         report = self.report()
         report['cells'][-1].update(status='dropped', metrics={'p50': None})

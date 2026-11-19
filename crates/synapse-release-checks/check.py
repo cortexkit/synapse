@@ -115,6 +115,22 @@ def cuda_models(cells):
     return {model for row, model in cells if ROW_BACKENDS[row] == 'cuda'}
 
 
+# Versions approved to publish without the competitor benchmark, each with who
+# approved it and why. The key is the release version, so a waiver ends at the
+# next version bump and the benchmark is required again.
+BENCHMARK_WAIVERS = {
+    '0.1.0-alpha.3': 'Ufuk, 2026-11-19: publish without the first competitor '
+                     'benchmark; run it before the next release.',
+}
+
+
+def release_version(root):
+    text = (root / 'crates/synapse-module/Cargo.toml').read_text()
+    match = re.search(r'^version = "([^"]+)"$', text, re.M)
+    require(match, 'module crate version missing')
+    return match.group(1)
+
+
 def source(root):
     require(Path(git(root, 'rev-parse', '--show-toplevel')).resolve() == root.resolve(),
             'checkout must be the repository root')
@@ -277,8 +293,10 @@ def evidence(root, s, assets, entries):
         stress = load(cert / 'ane-direct-stress.json')
         stress_evidence(stress)
     require((cert / 'RELEASE-NOTES.md').is_file(), 'missing release notes')
-    report_dir = root / 'docs/evidence/benchmark' / s
-    benchmark(load(report_dir / 'report.json'), benchmark_cells(root))
+    report = root / 'docs/evidence/benchmark' / s / 'report.json'
+    # A report that exists is always checked, even for a waived version.
+    if report.exists() or release_version(root) not in BENCHMARK_WAIVERS:
+        benchmark(load(report), benchmark_cells(root))
 
 
 def main():
