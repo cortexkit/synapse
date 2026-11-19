@@ -67,6 +67,26 @@ pub(super) type Prepared = Result<Option<AneShapeLease>, AneResidencyError>;
 /// fires just after the scheduler answered gets the same answer.
 const RECENT_ANSWERS: usize = 1024;
 
+/// Records the answer given to request `id`, then drops the oldest answers
+/// until at most [`RECENT_ANSWERS`] remain.
+fn remember_answer(answered: &mut VecDeque<(u64, AnswerKind)>, id: u64, kind: AnswerKind) {
+    answered.push_back((id, kind));
+    while answered.len() > RECENT_ANSWERS {
+        answered.pop_front();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn remembering_an_answer_trims_an_oversized_history() {
+    let mut answered: VecDeque<_> = (0..RECENT_ANSWERS as u64 + 10)
+        .map(|id| (id, AnswerKind::DeadlineExceeded))
+        .collect();
+    remember_answer(&mut answered, u64::MAX, AnswerKind::DeadlineExceeded);
+    assert_eq!(answered.len(), RECENT_ANSWERS);
+    assert_eq!(answered.back().map(|(id, _)| *id), Some(u64::MAX));
+}
+
 pub(super) enum Msg {
     Want(Want),
     /// Something requests do not report in detail changed: a request went
@@ -526,6 +546,9 @@ pub(super) struct Scheduler {
     /// Workers whose lane was already given a prewarm, so a repeated
     /// readiness signal for the same worker starts nothing.
     prewarmed: BTreeSet<String>,
+    /// The worker each retirement or prewarm marker belongs to, held weakly
+    /// so the markers can be dropped once nothing can name that worker again.
+    marked: BTreeMap<String, std::sync::Weak<dyn AneShapeWorker>>,
     #[cfg(test)]
     _exit_signal: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -582,6 +605,7 @@ impl Scheduler {
                 prewarms: BTreeMap::new(),
                 prewarm_recheck: None,
                 prewarmed: BTreeSet::new(),
+                marked: BTreeMap::new(),
             },
             tx,
         )
@@ -707,6 +731,8 @@ impl Scheduler {
                 ),
                 Msg::Retire { worker, reply } => {
                     let id = worker.worker_id().to_owned();
+                    self.forget_gone_workers(&mut state);
+                    self.marked.insert(id.clone(), Arc::downgrade(&worker));
                     state.retired.insert(id.clone());
                     state.recovering.insert(id.clone());
                     // A retired worker compiles nothing more, so its queued
@@ -822,7 +848,9 @@ impl Scheduler {
                     notify,
                 } => {
                     let id = worker.worker_id().to_owned();
+                    self.forget_gone_workers(&mut state);
                     if !state.retired.contains(&id) && self.prewarmed.insert(id.clone()) {
+                        self.marked.insert(id.clone(), Arc::downgrade(&worker));
                         tracing::info!(
                             target: "worker",
                             lane = %lane,
@@ -1011,6 +1039,26 @@ impl Scheduler {
         }
     }
 
+    /// Drops the retirement and prewarm markers of workers that nothing
+    /// references any more and whose retirement has finished. A request always
+    /// carries its worker, so once that worker is gone no late request can be
+    /// refused by these markers; keeping them would only grow with every reload.
+    fn forget_gone_workers(&mut self, state: &mut State) {
+        let gone: Vec<String> = self
+            .marked
+            .iter()
+            .filter(|(id, worker)| {
+                worker.strong_count() == 0 && !self.retirements.contains_key(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            self.marked.remove(&id);
+            self.prewarmed.remove(&id);
+            state.retired.remove(&id);
+        }
+    }
+
     fn recent(&self, id: u64) -> Option<AnswerKind> {
         self.answered
             .iter()
@@ -1031,10 +1079,7 @@ impl Scheduler {
         state.leave_queue(id);
         effects.progress = true;
         if let Answer::Failed(error) = &answer {
-            self.answered.push_back((id, AnswerKind::of(error)));
-            if self.answered.len() > RECENT_ANSWERS {
-                self.answered.pop_front();
-            }
+            remember_answer(&mut self.answered, id, AnswerKind::of(error));
         }
         match waiter.reply {
             Reply::Lease(sender) => effects.leases.push((sender, answer)),
@@ -1175,7 +1220,7 @@ impl Scheduler {
             true if owns_compile => {
                 let error = self.expiry_answer(state, id, now, true);
                 let kind = AnswerKind::of(&error);
-                self.answered.push_back((id, kind.clone()));
+                remember_answer(&mut self.answered, id, kind.clone());
                 Some(kind)
             }
             true => {

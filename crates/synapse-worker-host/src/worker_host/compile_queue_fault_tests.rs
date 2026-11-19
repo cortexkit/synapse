@@ -669,6 +669,23 @@ async fn temp_space_refusal_refunds_only_its_reservation_and_keeps_residents() {
     assert!(!state.compile_running());
 }
 
+/// Retirement and prewarm markers go once their worker is gone, so repeated
+/// lane reloads do not accumulate them; a live retired worker stays fenced.
+#[tokio::test(start_paused = true)]
+async fn retirement_markers_go_with_their_worker() {
+    let compiler = SharedCompiler::new(1.0);
+    let supervisor = queue_supervisor();
+    let old = fake_worker(&compiler, "old");
+    supervisor.retire(&old, async { Ok(()) }).await.unwrap();
+    assert!(supervisor.inner.lock().retired.contains("old"));
+    drop(old);
+    let next = fake_worker(&compiler, "next");
+    supervisor.retire(&next, async { Ok(()) }).await.unwrap();
+    let state = supervisor.inner.lock();
+    assert!(!state.retired.contains("old"), "a gone worker's marker stayed");
+    assert!(state.retired.contains("next"), "a live retired worker lost its fence");
+}
+
 /// A worker that answers an admission with an error is not compiling
 /// anything, so the compile gate is free at once, even while that worker's
 /// recovery waits for one of its leases to drain.
