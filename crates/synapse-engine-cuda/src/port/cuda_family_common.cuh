@@ -266,6 +266,17 @@ inline void copy_float(DeviceAllocation<float> &target, const float *source, siz
     FAMILY_CUDA_CHECK(cudaMemcpy(target.pointer, source, count * sizeof(float), cudaMemcpyHostToDevice));
 }
 
+// Uploads a table that kernels on `stream` will read, and returns only once
+// the bytes are in device memory. A plain cudaMemcpy from pageable host memory
+// runs on the legacy default stream and may return before its DMA lands;
+// kernels on a cudaStreamNonBlocking stream do not wait for that stream, so
+// they could read whatever the allocation held before.
+inline void copy_float_ordered(DeviceAllocation<float> &target, const float *source, size_t count, cudaStream_t stream) {
+    target.allocate(count);
+    FAMILY_CUDA_CHECK(cudaMemcpyAsync(target.pointer, source, count * sizeof(float), cudaMemcpyHostToDevice, stream));
+    FAMILY_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 struct MatmulPlan {
     std::string name;
     cublasLtMatmulDesc_t operation = nullptr;

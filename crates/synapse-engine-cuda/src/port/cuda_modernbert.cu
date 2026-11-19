@@ -344,7 +344,7 @@ ShapePlan::ShapePlan(ModernContext *owner, int b, int s, int h, int nh, int inte
 
     std::vector<float> band(seq * seq, 0.0f);
     for (int query = 0; query < seq; ++query) for (int key = 0; key < seq; ++key) if (std::abs(query - key) > half_window) band[query * seq + key] = -10000.0f;
-    copy_float(band_mask, band.data(), band.size());
+    copy_float_ordered(band_mask, band.data(), band.size(), owner->stream);
     auto make_rope = [&](float theta, DeviceAllocation<float> &cos_target, DeviceAllocation<float> &sin_target) {
         std::vector<float> cosine(seq * head_dim), sine(seq * head_dim);
         for (int position = 0; position < seq; ++position) for (int index = 0; index < head_dim / 2; ++index) {
@@ -354,8 +354,8 @@ ShapePlan::ShapePlan(ModernContext *owner, int b, int s, int h, int nh, int inte
             cosine[position * head_dim + index] = cosine[position * head_dim + head_dim / 2 + index] = c;
             sine[position * head_dim + index] = sine[position * head_dim + head_dim / 2 + index] = sn;
         }
-        copy_float(cos_target, cosine.data(), cosine.size());
-        copy_float(sin_target, sine.data(), sine.size());
+        copy_float_ordered(cos_target, cosine.data(), cosine.size(), owner->stream);
+        copy_float_ordered(sin_target, sine.data(), sine.size(), owner->stream);
     };
     make_rope(global_theta, global_cos, global_sin);
     make_rope(local_theta, local_cos, local_sin);

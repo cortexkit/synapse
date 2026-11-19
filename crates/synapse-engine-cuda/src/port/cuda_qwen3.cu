@@ -328,6 +328,9 @@ struct QwenContext {
         size_t total = static_cast<size_t>(vocab) * width;
         embeddings.allocate(total);
         FAMILY_CUDA_CHECK(cudaMemcpy(embeddings.pointer, host_embeddings, total * sizeof(half), cudaMemcpyHostToDevice));
+        // The copy above may return before its DMA lands, and embed_gather runs
+        // on this context's non-blocking stream, which does not wait for it.
+        FAMILY_CUDA_CHECK(cudaDeviceSynchronize());
         embeddings_loaded = true;
         std::fprintf(stderr, "CUDA Qwen3 persistent embeddings: vocab=%d hidden=%d bytes=%zu\n", vocab, width, total * sizeof(half));
     }
@@ -369,8 +372,8 @@ ShapePlan::ShapePlan(QwenContext *owner, int b, int s, int h, int qh_count, int 
         host_cos[position * head_dim + index] = host_cos[position * head_dim + head_dim / 2 + index] = c;
         host_sin[position * head_dim + index] = host_sin[position * head_dim + head_dim / 2 + index] = sn;
     }
-    copy_float(cosine, host_cos.data(), host_cos.size());
-    copy_float(sine, host_sin.data(), host_sin.size());
+    copy_float_ordered(cosine, host_cos.data(), host_cos.size(), owner->stream);
+    copy_float_ordered(sine, host_sin.data(), host_sin.size(), owner->stream);
 
     hq = select_matmul(owner->lt, "hq", CUDA_R_16F, rows, query_heads * head_dim, hidden, true);
     hkv = select_matmul(owner->lt, "hkv", CUDA_R_16F, rows, kv_heads * head_dim, hidden, true);
