@@ -220,6 +220,18 @@ mod tests {
             std::fs::write(&source, b"shared file identity").unwrap();
             assert_eq!(std::fs::read(&linked).unwrap(), b"shared file identity");
         }
+        // Speech shards re-hash every executed artifact where the worker runs
+        // it, CUDA runtime files included.
+        let executed = layout
+            .artifacts
+            .iter()
+            .map(|a| synapse_certify::Artifact {
+                role: a.role.clone(),
+                file: a.file.clone(),
+                sha256: synapse_certify::digest(&assets, &a.file).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        crate::transcribe::verify_shard_binaries(&layout, &executed).unwrap();
         let env = layout
             .environment()
             .into_iter()

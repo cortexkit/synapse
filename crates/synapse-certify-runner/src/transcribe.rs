@@ -652,16 +652,21 @@ async fn collect(
     Ok(collected)
 }
 
-fn verify_shard_binaries(
+pub(crate) fn verify_shard_binaries(
     layout: &crate::assets::Layout,
     artifacts: &[synapse_certify::Artifact],
 ) -> Result<()> {
     for artifact in artifacts {
         let path = match artifact.role.as_str() {
             "ck-synapse" => layout.candidate.clone(),
-            role if role.starts_with("cuda-runtime:") => {
-                layout.root.join(role.trim_start_matches("cuda-runtime:"))
-            }
+            // Layout links each CUDA runtime file beside the worker alias, the
+            // directory the worker loads its DLLs from.
+            role if role.starts_with("cuda-runtime:") => layout
+                .worker
+                .as_deref()
+                .and_then(Path::parent)
+                .ok_or_else(|| refuse("candidate worker alias missing"))?
+                .join(role.trim_start_matches("cuda-runtime:")),
             _ => layout
                 .worker
                 .clone()
