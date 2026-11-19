@@ -19,6 +19,9 @@ mod persistence;
 mod tests;
 
 const RETENTION_MS: u64 = 3_600_000;
+/// How long an expired job keeps its replay tombstone (binding and id) and a
+/// gone object keeps its row, measured from the end of result retention.
+const TOMBSTONE_MS: u64 = 24 * 3_600_000;
 const UPLOAD_MAX: u64 = 256 * 1024 * 1024;
 const STORAGE_MAX: u64 = 1024 * 1024 * 1024;
 const LANE_MAX: u64 = 16;
@@ -28,13 +31,69 @@ const PAGE: usize = 512 * 1024;
 pub(super) struct Runtime {
     gate: Mutex<()>,
     lanes: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<Lane>>>>,
+    /// Signalled when a queued job is cancelled or passes its deadline.
+    changed: tokio::sync::Notify,
+    /// Submits per lane that passed the install check but have not yet
+    /// recorded their job; catalog removal treats them as holders.
+    admitting: Mutex<BTreeMap<String, usize>>,
     #[cfg(test)]
     runner: Mutex<Option<Arc<TestRunner>>>,
+    #[cfg(test)]
+    loader: Mutex<Option<Arc<TestLoader>>>,
+    #[cfg(test)]
+    admission_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     clock: Mutex<Option<u64>>,
 }
 #[cfg(test)]
 type TestRunner = dyn Fn(&str, &[u8]) -> Result<Value, Fault> + Send + Sync;
+#[cfg(test)]
+type TestLoader = dyn Fn(&str) -> Result<transcribe_host::TranscribeHost, transcribe_host::TranscribeHostError>
+    + Send
+    + Sync;
+
+/// Marks a submit that is between its install check and its job record, so
+/// catalog removal cannot delete the lane's files while the gates are open.
+struct AdmissionLease {
+    runtime: Arc<RuntimeState>,
+    lane: String,
+}
+
+impl AdmissionLease {
+    fn new(runtime: &Arc<RuntimeState>, lane: &str) -> Self {
+        *runtime
+            .media
+            .admitting
+            .lock()
+            .expect("media admissions")
+            .entry(lane.into())
+            .or_default() += 1;
+        Self {
+            runtime: runtime.clone(),
+            lane: lane.into(),
+        }
+    }
+}
+
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        let mut admitting = self.runtime.media.admitting.lock().expect("media admissions");
+        if let Some(count) = admitting.get_mut(&self.lane) {
+            *count -= 1;
+            if *count == 0 {
+                admitting.remove(&self.lane);
+            }
+        }
+    }
+}
+
+/// Runs synchronous media work (SQLite, files, WAV inspection) on the blocking
+/// pool, so it never stalls the async threads serving other requests.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Answer<T> + Send + 'static) -> Answer<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|error| Err(internal(error)))
+}
 
 fn clock_ms(state: &ModuleState) -> u64 {
     #[cfg(test)]
@@ -229,21 +288,29 @@ pub(super) async fn handle(
     } else if method == "certify.transcribe_observe_rerun" {
         observe_rerun(state.clone(), owner, params).await
     } else if method == "certify.transcribe_measurements" {
-        persistence::measurements(&state, owner, params)
+        let (state, owner) = (state.clone(), owner.to_owned());
+        blocking(move || persistence::measurements(&state, &owner, params)).await
     } else {
-        let _gate = state.runtime.media.gate.lock().expect("media gate");
-        persistence::sweep(&state, clock_ms(&state)).and_then(|_| match method {
-            "media.upload_begin" => persistence::upload_begin(&state, owner, params),
-            "media.upload_append" => persistence::upload_append(&state, owner, params),
-            "media.upload_status" => persistence::upload_status(&state, owner, params),
-            "media.upload_commit" => persistence::upload_commit(&state, owner, params),
-            "media.read" => persistence::read(&state, owner, params),
-            "media.status" | "media.result" | "media.cancel" => {
-                persistence::job_answer(&state, owner, method, params)
-            }
-            "certify.transcribe_observation" => persistence::observation(&state, owner, params),
-            _ => Err(fault("unknown_method", None)),
+        let (state, owner, method) = (state.clone(), owner.to_owned(), method.to_owned());
+        blocking(move || {
+            let owner = owner.as_str();
+            let _gate = state.runtime.media.gate.lock().expect("media gate");
+            persistence::sweep(&state, clock_ms(&state)).and_then(|_| match method.as_str() {
+                "media.upload_begin" => persistence::upload_begin(&state, owner, params),
+                "media.upload_append" => persistence::upload_append(&state, owner, params),
+                "media.upload_status" => persistence::upload_status(&state, owner, params),
+                "media.upload_commit" => persistence::upload_commit(&state, owner, params),
+                "media.read" => persistence::read(&state, owner, params),
+                "media.status" | "media.result" | "media.cancel" => {
+                    persistence::job_answer(&state, owner, &method, params)
+                }
+                "certify.transcribe_observation" => {
+                    persistence::observation(&state, owner, params)
+                }
+                _ => Err(fault("unknown_method", None)),
+            })
         })
+        .await
     };
     outcome(answer)
 }
@@ -290,133 +357,27 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
     if !(1..=128).contains(&client.chars().count()) {
         return Err(invalid("client_job_id"));
     }
-    let binding = persistence::binding(&params);
     let admitted = {
-        let _gate = state.runtime.media.gate.lock().expect("media gate");
-        persistence::sweep(&state, clock_ms(&state))?;
-        if let Some(id) = persistence::replay(&state, owner, client, &binding)? {
-            return Ok(json!({"job_id":id}));
-        }
-        let request: SubmitRequest = parse(params.clone(), "params")?;
-        if request.kind != Kind::Transcribe {
-            return Err(unsupported("kind"));
-        }
-        let cortexkit_role_media::jobs::JobInput::Transcribe(input) = &request.input else {
-            return Err(invalid("input"));
-        };
-        if request.model.chars().count() > 256 {
-            return Err(invalid("model"));
-        }
-        if request
-            .decision_id
-            .as_ref()
-            .is_some_and(|v| v.chars().count() > 256)
-        {
-            return Err(invalid("decision_id"));
-        }
-        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk");
-        let (entry, backend) = select(&state, &request.model)?;
-        let lane = catalog::lane_id(&entry.id, &backend.backend);
-        // Choose the lane before checking pause, install or quarantine. None of
-        // these transient states can redirect a catalog id to a different lane.
-        let pause = lane_pause::admit(&state.runtime, &lane).map_err(wire)?;
-        let serving = lane_serving_gate(&state.runtime, &lane)
-            .try_read_owned()
-            .map_err(|_| fault("model_loading", None))?;
-        let guard = (pause, serving);
-        if current_catalog_install(&state, &entry, &backend.backend)
-            .map_err(wire)?
-            .is_none()
-        {
-            let mut e = fault("model_not_installed", None);
-            e.0["detail"]["download_op"] = json!("models.download");
-            return Err(e);
-        }
-        let check = catalog_self_check_projection(&state, &entry, &backend).map_err(wire)?;
-        if check["state"] == "failed" {
-            return Err(wire(catalog_self_check_failed(
-                &entry,
-                &backend,
-                check["check_id"].as_str().unwrap_or(""),
-                &check["reason"],
-            )));
-        }
-        if let Ok(mut cached) = lane_cache(&state.runtime, &lane).try_lock() {
-            if let Some((until, error)) = &cached.retry {
-                if Instant::now() < *until {
-                    return Err(error.clone());
-                }
-            }
-            cached.retry = None;
-            if let Some(retry) = cached
-                .host
-                .as_ref()
-                .and_then(|host| host.quarantine_retry_after_ms())
-            {
-                return Err(quarantined(&lane, retry));
-            }
-        }
-        let audio = input.audio.clone();
-        objects::check_media(&audio).map_err(|e| Fault(serde_json::json!({"code":e.code,"message":e.code,"detail":{"class":"permanent","field":"audio"}})))?;
-        if audio.bytes > UPLOAD_MAX {
-            return Err(input_limit("max_input_bytes"));
-        }
-        persistence::check_lane_capacity(&state, &lane)?;
-        let bytes = persistence::audio_bytes(&state, owner, &audio)?;
-        if !cortexkit_role_media::describe::mime_matches("audio/wav", &audio.mime) {
-            return Err(unsupported("input.audio.mime"));
-        }
-        if input.language.as_ref().is_some_and(|hint| {
-            entry.languages.as_ref().is_none_or(|languages| {
-                !languages.iter().any(|language| {
-                    cortexkit_role_media::describe::language_matches(language, hint)
-                })
-            })
-        }) {
-            return Err(unsupported("input.language"));
-        }
-        if input.bias.is_some() {
-            return Err(unsupported("input.bias"));
-        }
-        let decoded = synapse_speech::decode_wav(&bytes).map_err(|_| invalid("audio"))?;
-        let profile =
-            transcribe_host::TranscribeProfile::pinned(backend.profile.as_deref().unwrap_or(""))
-                .map_err(internal)?;
-        let samples = (decoded.samples.len() as u64 * 16_000).div_ceil(decoded.sample_rate as u64);
-        let frames = synapse_speech::valid_encoder_frames(samples);
-        let max_duration_ms = backend
-            .effective_max_duration_ms()
-            .expect("transcribe duration");
-        if audio
-            .duration_ms
-            .is_some_and(|duration| duration > max_duration_ms)
-        {
-            return Err(input_limit("max_duration_ms"));
-        }
-        // A lane certified below its profile's duration serves only up to that
-        // cap, so its frame limit is the cap's frame count, not the profile's.
-        let max_encoder_frames = synapse_speech::valid_encoder_frames(max_duration_ms * 16)
-            .min(profile.max_encoder_frames as u64);
-        let duration_failure =
-            if decoded.duration_ms() > max_duration_ms || frames > max_encoder_frames {
-                let mut e = input_limit("max_duration_ms");
-                e.0["detail"]["duration_ms"] = json!(decoded.duration_ms());
-                e.0["detail"]["max_duration_ms"] = json!(max_duration_ms);
-                e.0["detail"]["valid_encoder_frames"] = json!(frames);
-                e.0["detail"]["max_encoder_frames"] = json!(max_encoder_frames);
-                Some(e)
-            } else {
-                None
-            };
-        let id = persistence::admit(&state, owner, &request, &binding, &lane, &audio, &bytes)?;
-        (id, entry, backend, guard, duration_failure)
+        let (state, owner) = (state.clone(), owner.to_owned());
+        blocking(move || admit_submission(&state, &owner, params)).await?
     };
-    let (id, entry, backend, guard, duration_failure) = admitted;
+    let (id, entry, backend, guard, duration_failure) = match admitted {
+        Admission::Replay(id) => return Ok(json!({"job_id":id})),
+        Admission::Job {
+            id,
+            entry,
+            backend,
+            guard,
+            duration_failure,
+        } => (id, entry, backend, guard, duration_failure),
+    };
     let job_id = id.clone();
     tokio::spawn(async move {
         let lane = catalog::lane_id(&entry.id, &backend.backend);
-        let lock = lane_cache(&state.runtime, &lane);
-        let mut owner = lock.lock_owned().await;
+        // Returning here drops the admission guards with the task.
+        let Some(mut owner) = wait_for_lane(&state, &job_id, &lane).await else {
+            return;
+        };
         let _ = tokio::task::spawn_blocking(move || {
             let cached = &mut *owner;
             let _pause_guard = guard;
@@ -439,6 +400,266 @@ async fn submit(state: Arc<ModuleState>, owner: &str, params: Value) -> Answer<V
     Ok(json!({"job_id":id}))
 }
 
+type AdmissionGuard = (
+    Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    tokio::sync::OwnedRwLockReadGuard<()>,
+);
+
+enum Admission {
+    Replay(String),
+    Job {
+        id: String,
+        entry: catalog::CatalogEntry,
+        backend: catalog::CatalogBackend,
+        guard: AdmissionGuard,
+        duration_failure: Option<Fault>,
+    },
+}
+
+/// Admits a submit in three steps so that reading and inspecting a large
+/// recording never holds a shared lock: checks under the media gate (the
+/// catalog-disk lock only for the install decision), then reading, inspection
+/// and staging with no lock held, then a recheck and the job record under the
+/// media gate again. Run it on the blocking pool.
+fn admit_submission(state: &Arc<ModuleState>, owner: &str, params: Value) -> Answer<Admission> {
+    let binding = persistence::binding(&params);
+    let client = string(&params, "client_job_id")?.to_owned();
+    let gate = state.runtime.media.gate.lock().expect("media gate");
+    persistence::sweep(state, clock_ms(state))?;
+    if let Some(id) = persistence::replay(state, owner, &client, &binding)? {
+        return Ok(Admission::Replay(id));
+    }
+    let request: SubmitRequest = parse(params, "params")?;
+    if request.kind != Kind::Transcribe {
+        return Err(unsupported("kind"));
+    }
+    let cortexkit_role_media::jobs::JobInput::Transcribe(input) = &request.input else {
+        return Err(invalid("input"));
+    };
+    if request.model.chars().count() > 256 {
+        return Err(invalid("model"));
+    }
+    if request
+        .decision_id
+        .as_ref()
+        .is_some_and(|v| v.chars().count() > 256)
+    {
+        return Err(invalid("decision_id"));
+    }
+    let (entry, backend, lane, guard, lease) = {
+        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk");
+        let (entry, backend) = select(state, &request.model)?;
+        let lane = catalog::lane_id(&entry.id, &backend.backend);
+        // Choose the lane before checking pause, install or quarantine. None of
+        // these transient states can redirect a catalog id to a different lane.
+        let pause = lane_pause::admit(&state.runtime, &lane).map_err(wire)?;
+        let serving = lane_serving_gate(&state.runtime, &lane)
+            .try_read_owned()
+            .map_err(|_| fault("model_loading", None))?;
+        if current_catalog_install(state, &entry, &backend.backend)
+            .map_err(wire)?
+            .is_none()
+        {
+            let mut e = fault("model_not_installed", None);
+            e.0["detail"]["download_op"] = json!("models.download");
+            return Err(e);
+        }
+        // Taken before the disk lock is released, so a removal either ran
+        // before the install check above or sees this submit as a holder.
+        let lease = AdmissionLease::new(&state.runtime, &lane);
+        (entry, backend, lane, (pause, serving), lease)
+    };
+    let check = catalog_self_check_projection(state, &entry, &backend).map_err(wire)?;
+    if check["state"] == "failed" {
+        return Err(wire(catalog_self_check_failed(
+            &entry,
+            &backend,
+            check["check_id"].as_str().unwrap_or(""),
+            &check["reason"],
+        )));
+    }
+    if let Ok(mut cached) = lane_cache(&state.runtime, &lane).try_lock() {
+        if let Some((until, error)) = &cached.retry {
+            if Instant::now() < *until {
+                return Err(error.clone());
+            }
+        }
+        cached.retry = None;
+        if let Some(retry) = cached
+            .host
+            .as_ref()
+            .and_then(|host| host.quarantine_retry_after_ms())
+        {
+            return Err(quarantined(&lane, retry));
+        }
+    }
+    let audio = input.audio.clone();
+    objects::check_media(&audio).map_err(|e| Fault(serde_json::json!({"code":e.code,"message":e.code,"detail":{"class":"permanent","field":"audio"}})))?;
+    if audio.bytes > UPLOAD_MAX {
+        return Err(input_limit("max_input_bytes"));
+    }
+    persistence::check_lane_capacity(state, &lane)?;
+    // Inline audio is bounded by the message limit and decodes here; an
+    // uploaded object is only checked against its facts and read later.
+    let inline = persistence::check_audio(state, owner, &audio)?;
+    if !cortexkit_role_media::describe::mime_matches("audio/wav", &audio.mime) {
+        return Err(unsupported("input.audio.mime"));
+    }
+    if input.language.as_ref().is_some_and(|hint| {
+        entry.languages.as_ref().is_none_or(|languages| {
+            !languages.iter().any(|language| {
+                cortexkit_role_media::describe::language_matches(language, hint)
+            })
+        })
+    }) {
+        return Err(unsupported("input.language"));
+    }
+    if input.bias.is_some() {
+        return Err(unsupported("input.bias"));
+    }
+    if inline.is_some() {
+        // Refuse a full store before writing the staged file.
+        persistence::capacity(state, audio.bytes)?;
+    }
+    drop(gate);
+
+    let is_inline = inline.is_some();
+    let bytes = match inline {
+        Some(bytes) => bytes,
+        None => persistence::read_object(state, audio.object_id.as_deref().unwrap_or(""))?,
+    };
+    #[cfg(test)]
+    {
+        let probe = state.runtime.media.admission_probe.lock().unwrap().clone();
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+    // The header gives the duration; samples are only checked in place. The
+    // lane decodes the accepted recording once, when it runs the job.
+    let wav = synapse_speech::inspect_wav(&bytes).map_err(|_| invalid("audio"))?;
+    let samples = wav.samples_16khz();
+    // Shorter than one mel hop: no engine can encode it, on any retry.
+    if synapse_speech::valid_mel_frames(samples) == 0 {
+        return Err(invalid("audio"));
+    }
+    let profile =
+        transcribe_host::TranscribeProfile::pinned(backend.profile.as_deref().unwrap_or(""))
+            .map_err(internal)?;
+    let frames = synapse_speech::valid_encoder_frames(samples);
+    let max_duration_ms = backend
+        .effective_max_duration_ms()
+        .expect("transcribe duration");
+    if audio
+        .duration_ms
+        .is_some_and(|duration| duration > max_duration_ms)
+    {
+        return Err(input_limit("max_duration_ms"));
+    }
+    // A lane certified below its profile's duration serves only up to that
+    // cap, so its frame limit is the cap's frame count, not the profile's.
+    let max_encoder_frames = synapse_speech::valid_encoder_frames(max_duration_ms * 16)
+        .min(profile.max_encoder_frames as u64);
+    let duration_failure = if wav.duration_ms() > max_duration_ms || frames > max_encoder_frames {
+        let mut e = input_limit("max_duration_ms");
+        e.0["detail"]["duration_ms"] = json!(wav.duration_ms());
+        e.0["detail"]["max_duration_ms"] = json!(max_duration_ms);
+        e.0["detail"]["valid_encoder_frames"] = json!(frames);
+        e.0["detail"]["max_encoder_frames"] = json!(max_encoder_frames);
+        Some(e)
+    } else {
+        None
+    };
+    let staged = if is_inline {
+        Some(persistence::stage(state, &bytes)?)
+    } else {
+        None
+    };
+    drop(bytes);
+
+    let recorded = (|| {
+        let _gate = state.runtime.media.gate.lock().expect("media gate");
+        // The gate was released while reading, so another submit may have
+        // recorded this client_job_id or filled the lane, and the object may
+        // have expired.
+        if let Some(id) = persistence::replay(state, owner, &client, &binding)? {
+            return Ok(Admission::Replay(id));
+        }
+        persistence::check_lane_capacity(state, &lane)?;
+        if !is_inline {
+            persistence::check_audio(state, owner, &audio)?;
+        }
+        let id = persistence::admit(
+            state,
+            owner,
+            &request,
+            &binding,
+            &lane,
+            &audio,
+            staged.as_deref(),
+        )?;
+        Ok(Admission::Job {
+            id,
+            entry,
+            backend,
+            guard,
+            duration_failure,
+        })
+    })();
+    drop(lease);
+    if !matches!(recorded, Ok(Admission::Job { .. })) {
+        if let Some(staged) = &staged {
+            persistence::discard(state, staged);
+        }
+    }
+    recorded
+}
+
+/// Waits for the lane's owner lock while the job is still queued. A queued
+/// job that is cancelled or passes its deadline stops waiting, which drops its
+/// admission guards at once; only work that has started holds the lane until
+/// it drains. `persistence::start` stays the final check before dispatch.
+async fn wait_for_lane(
+    state: &Arc<ModuleState>,
+    job: &str,
+    lane: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<Lane>> {
+    // Created once so the job keeps its place in the lock's queue.
+    let acquire = lane_cache(&state.runtime, lane).lock_owned();
+    tokio::pin!(acquire);
+    loop {
+        let changed = state.runtime.media.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let queued = {
+            let (state, job) = (state.clone(), job.to_owned());
+            blocking(move || persistence::queued_deadline(&state, &job)).await
+        };
+        let deadline = match queued {
+            Ok(Some(deadline)) => deadline,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::error!(error = %error.0, "media job could not read its queue state");
+                return None;
+            }
+        };
+        let wait = deadline.map(|deadline| {
+            Duration::from_millis(deadline.saturating_sub(clock_ms(state)).max(1))
+        });
+        tokio::select! {
+            biased;
+            owner = &mut acquire => return Some(owner),
+            _ = &mut changed => {}
+            _ = async {
+                match wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+    }
+}
+
 fn run(
     state: &ModuleState,
     entry: &catalog::CatalogEntry,
@@ -455,29 +676,7 @@ fn run(
         }
     }
     let lane = catalog_transcribe_lane(entry, backend).map_err(wire)?;
-    if cached.host.is_none() {
-        match transcribe_self_check::ensure(
-            state,
-            &lane,
-            || load_host(state, entry, backend),
-            |_| {},
-        )
-        .map_err(wire)
-        {
-            Ok(host) => {
-                cached.host = Some(host);
-                cached.retry = None;
-            }
-            Err(error) => {
-                if error.0["code"] == "engine_crashed" {
-                    let delay = error.0["detail"]["retry_after_ms"].as_u64().unwrap_or(1000);
-                    cached.retry =
-                        Some((Instant::now() + Duration::from_millis(delay), error.clone()));
-                }
-                return Err(error);
-            }
-        }
-    }
+    ensure_host(state, entry, backend, &lane, cached).map_err(wire)?;
     let host = cached.host.as_ref().expect("loaded speech host");
     let result = if observe {
         host.transcribe(audio, |_| {})
@@ -526,6 +725,76 @@ fn run(
     Ok(output)
 }
 
+/// Loads the lane's host through its speech self-check unless one is cached.
+/// A transient failure is remembered so submits refuse until it may pass.
+fn ensure_host(
+    state: &ModuleState,
+    entry: &catalog::CatalogEntry,
+    backend: &catalog::CatalogBackend,
+    lane: &transcribe_self_check::Lane,
+    cached: &mut Lane,
+) -> Result<(), WireOperationError> {
+    if cached.host.is_some() {
+        return Ok(());
+    }
+    let load = || {
+        #[cfg(test)]
+        {
+            let loader = state.runtime.media.loader.lock().unwrap().clone();
+            if let Some(loader) = loader {
+                return loader(&catalog::lane_id(&entry.id, &backend.backend));
+            }
+        }
+        load_host(state, entry, backend)
+    };
+    match transcribe_self_check::ensure(state, lane, load, |_| {}) {
+        Ok(host) => {
+            cached.host = Some(host);
+            cached.retry = None;
+            Ok(())
+        }
+        Err(error) => {
+            if error.code == "engine_crashed" {
+                let delay = error.retry_after_ms.unwrap_or(1000);
+                cached.retry = Some((
+                    Instant::now() + Duration::from_millis(delay),
+                    wire(error.clone()),
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Startup revalidation of a speech lane whose earlier self-check pass no
+/// longer applies to the current key. It takes the guards `media.submit`
+/// takes and loads the host through the same lane owner and self-check, and
+/// leaves the host cached for the lane's next job.
+pub(super) async fn revalidate(
+    state: Arc<ModuleState>,
+    entry: catalog::CatalogEntry,
+    backend: catalog::CatalogBackend,
+) -> Result<(), WireOperationError> {
+    let lane = catalog::lane_id(&entry.id, &backend.backend);
+    let pause = lane_pause::admit(&state.runtime, &lane)?;
+    let serving = lane_serving_gate(&state.runtime, &lane)
+        .try_read_owned()
+        .map_err(|_| {
+            WireOperationError::from_stable(
+                StableError::model_loading(Some(250)),
+                "speech lane is busy; revalidation skipped",
+            )
+        })?;
+    let check = catalog_transcribe_lane(&entry, &backend)?;
+    let mut cached = lane_cache(&state.runtime, &lane).lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guards = (pause, serving);
+        ensure_host(&state, &entry, &backend, &check, &mut cached)
+    })
+    .await
+    .map_err(|error| transient_model_load_error(format!("speech revalidation: {error}")))?
+}
+
 fn measurement_snapshot(
     backend: &str,
     result: &transcribe_host::TranscribeResult,
@@ -546,26 +815,30 @@ async fn observe_rerun(state: Arc<ModuleState>, owner: &str, params: Value) -> A
         return Err(fault("certify_observation_disabled", None));
     }
     let (entry, backend, bytes, object, guard) = {
-        let _gate = state.runtime.media.gate.lock().expect("media gate");
-        let input = persistence::rerun_input(&state, owner, &params)?;
-        let _disk = state.runtime.catalog_disk.lock().expect("catalog disk");
-        let (entry, backend) = select(&state, &input.lane)?;
-        if backend.fingerprint != input.fingerprint {
-            return Err(fault("object_mismatch", Some("job_id")));
-        }
-        let pause = lane_pause::admit(&state.runtime, &input.lane).map_err(wire)?;
-        let serving = lane_serving_gate(&state.runtime, &input.lane)
-            .try_read_owned()
-            .map_err(|_| fault("model_loading", None))?;
-        if current_catalog_install(&state, &entry, &backend.backend)
-            .map_err(wire)?
-            .is_none()
-        {
-            return Err(fault("model_not_installed", None));
-        }
-        persistence::check_lane_capacity(&state, &input.lane)?;
-        persistence::claim_rerun(&state, &input.object)?;
-        (entry, backend, input.bytes, input.object, (pause, serving))
+        let (state, owner) = (state.clone(), owner.to_owned());
+        blocking(move || {
+            let _gate = state.runtime.media.gate.lock().expect("media gate");
+            let input = persistence::rerun_input(&state, &owner, &params)?;
+            let _disk = state.runtime.catalog_disk.lock().expect("catalog disk");
+            let (entry, backend) = select(&state, &input.lane)?;
+            if backend.fingerprint != input.fingerprint {
+                return Err(fault("object_mismatch", Some("job_id")));
+            }
+            let pause = lane_pause::admit(&state.runtime, &input.lane).map_err(wire)?;
+            let serving = lane_serving_gate(&state.runtime, &input.lane)
+                .try_read_owned()
+                .map_err(|_| fault("model_loading", None))?;
+            if current_catalog_install(&state, &entry, &backend.backend)
+                .map_err(wire)?
+                .is_none()
+            {
+                return Err(fault("model_not_installed", None));
+            }
+            persistence::check_lane_capacity(&state, &input.lane)?;
+            persistence::claim_rerun(&state, &input.object)?;
+            Ok((entry, backend, input.bytes, input.object, (pause, serving)))
+        })
+        .await?
     };
     // The detached task owns the upload and lane guards even if the caller stops waiting.
     tokio::spawn(async move {
@@ -735,11 +1008,15 @@ fn quarantined(lane: &str, retry: u64) -> Fault {
     e.0["detail"]["retry_after_ms"] = json!(retry);
     e
 }
-pub(super) async fn unload(
+/// `held` stays alive until every blocking unload has finished, so a caller's
+/// lane guards outlive it even if the caller stops waiting.
+pub(super) async fn unload<G: Send + Sync + 'static>(
     runtime: &RuntimeState,
     model: Option<&str>,
     neural_only: bool,
+    held: G,
 ) -> Result<(), WireOperationError> {
+    let held = Arc::new(held);
     let lanes = runtime
         .media
         .lanes
@@ -759,14 +1036,22 @@ pub(super) async fn unload(
         .map(|(_, lane)| lane.clone())
         .collect::<Vec<_>>();
     for lane in lanes {
-        let mut lane = lane.lock().await;
-        if let Some(mut host) = lane.host.take() {
-            tokio::task::spawn_blocking(move || host.unload())
-                .await
-                .map_err(|e| transient_model_load_error(e.to_string()))?
-                .map_err(|e| transient_model_load_error(e.to_string()))?;
-        }
-        lane.retry = None;
+        let mut lane = lane.lock_owned().await;
+        let held = held.clone();
+        // The blocking task owns the lane guard. If this future is dropped (a
+        // pause deadline, resume or cancelled caller), the lane stays locked
+        // until the old host has retired, so no new host can load beside it.
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            if let Some(mut host) = lane.host.take() {
+                host.unload()
+                    .map_err(|e| transient_model_load_error(e.to_string()))?;
+            }
+            lane.retry = None;
+            Ok::<_, WireOperationError>(())
+        })
+        .await
+        .map_err(|e| transient_model_load_error(e.to_string()))??;
     }
     Ok(())
 }
@@ -790,6 +1075,17 @@ pub(super) fn holders(
             Ok(lane) if lane.host.is_none() => {}
             _ => holders.push(json!({"kind":"media_lane","lane_id":id})),
         }
+    }
+    for (id, _) in state
+        .runtime
+        .media
+        .admitting
+        .lock()
+        .expect("media admissions")
+        .iter()
+        .filter(|(id, _)| id.starts_with(&prefix))
+    {
+        holders.push(json!({"kind":"request","lease_id":format!("media-submit:{id}")}));
     }
     let pending = state
         .store

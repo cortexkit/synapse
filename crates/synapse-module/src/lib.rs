@@ -3711,7 +3711,16 @@ async fn model_unload(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         .resolve_reserved(&params.model_id)
         .is_some_and(|(entry, _)| entry.task == "transcribe")
     {
-        return match media_jobs::unload(&state.runtime, Some(&params.model_id), false).await {
+        // The unload keeps this call's lane guards until the host has retired,
+        // even if the caller stops waiting.
+        return match media_jobs::unload(
+            &state.runtime,
+            Some(&params.model_id),
+            false,
+            catalog_guards,
+        )
+        .await
+        {
             Ok(()) => result_outcome(json!({"model_id":params.model_id,"state":"unloaded"})),
             Err(error) => result_outcome(error_payload(&state, error)),
         };
@@ -18446,8 +18455,8 @@ fn start_catalog_revalidation(state: Arc<ModuleState>) {
             let lane = catalog::lane_id(&entry.id, &backend.backend);
             tracing::info!(target: "synapse.catalog", model_id = %lane,
                 "catalog self-check scheduled: no result for the current key");
-            match ensure_catalog_lane_ready(state.clone(), entry, backend, None).await {
-                Ok(_) => tracing::info!(target: "synapse.catalog", model_id = %lane,
+            match revalidate_catalog_lane(state.clone(), entry, backend).await {
+                Ok(()) => tracing::info!(target: "synapse.catalog", model_id = %lane,
                     "catalog self-check passed at startup"),
                 Err(error) => tracing::warn!(target: "synapse.catalog", model_id = %lane,
                     code = %error.code, error = %error.message,
@@ -18456,6 +18465,21 @@ fn start_catalog_revalidation(state: Arc<ModuleState>) {
         }
         diagnostics_findings::refresh(&state);
     });
+}
+
+/// Speech lanes have no embedding model slot: their self-check belongs to the
+/// media lane owner that serves `media.submit`, not to the embedding loader.
+async fn revalidate_catalog_lane(
+    state: Arc<ModuleState>,
+    entry: catalog::CatalogEntry,
+    backend: catalog::CatalogBackend,
+) -> Result<(), WireOperationError> {
+    if entry.task == "transcribe" {
+        return media_jobs::revalidate(state, entry, backend).await;
+    }
+    ensure_catalog_lane_ready(state, entry, backend, None)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) fn catalog_self_check_id(

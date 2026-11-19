@@ -43,6 +43,12 @@ pub fn prepare_wav(
     // that exact count for admission, including the input-duration refusal.
     let samples = (audio.samples.len() as u64 * 16_000).div_ceil(audio.sample_rate as u64) as usize;
     let valid_encoder_frames = synapse_speech::valid_encoder_frames(samples as u64) as usize;
+    // A clip shorter than one mel hop leaves no valid frame for any engine to
+    // encode. That is a property of the audio, so refuse it as invalid audio
+    // here rather than let every engine reject it as a retryable fault.
+    if synapse_speech::valid_mel_frames(samples as u64) == 0 {
+        return Err(synapse_speech::Error::InvalidAudio("shorter than one mel hop").into());
+    }
     // Keep the numerical profile intact for identity and worker negotiation;
     // serving must also obey the independently certified catalog duration.
     let max_duration_ms = crate::catalog::compiled_catalog()
@@ -94,7 +100,10 @@ enum Backend {
     #[cfg(unix)]
     Ane(crate::worker_host::ane_residency::DirectAneEngine),
     #[cfg(test)]
-    InProcessTest(Box<dyn Fn(TranscribeRequest) -> Result<TranscribeOutput, EngineError> + Send>),
+    InProcessTest(
+        Box<dyn Fn(TranscribeRequest) -> Result<TranscribeOutput, EngineError> + Send>,
+        Option<Box<dyn FnMut() + Send>>,
+    ),
 }
 
 pub(crate) enum CertifyCounter {
@@ -186,9 +195,18 @@ impl TranscribeHost {
         Self {
             profile,
             mode: ObservationMode::Certification,
-            backend: Backend::InProcessTest(Box::new(run)),
+            backend: Backend::InProcessTest(Box::new(run), None),
             in_process_engine_invocations: Some(AtomicU64::new(0)),
         }
+    }
+
+    /// Runs `hook` inside `unload`, so a test can hold an unload in progress.
+    #[cfg(test)]
+    pub(crate) fn with_unload_hook_for_test(mut self, hook: impl FnMut() + Send + 'static) -> Self {
+        if let Backend::InProcessTest(_, unload) = &mut self.backend {
+            *unload = Some(Box::new(hook));
+        }
+        self
     }
 
     #[cfg(all(test, unix))]
@@ -334,7 +352,11 @@ impl TranscribeHost {
             #[cfg(unix)]
             Backend::Ane(engine) => engine.unload()?,
             #[cfg(test)]
-            Backend::InProcessTest(_) => {}
+            Backend::InProcessTest(_, unload) => {
+                if let Some(unload) = unload {
+                    unload();
+                }
+            }
         }
         Ok(())
     }
@@ -402,7 +424,7 @@ impl TranscribeHost {
         }
         let (output, transcript_frame, observation, progress) = match &self.backend {
             #[cfg(test)]
-            Backend::InProcessTest(run) => (
+            Backend::InProcessTest(run, _) => (
                 run(prepared.request).map_err(TranscribeHostError::Engine)?,
                 None,
                 None,
@@ -457,7 +479,7 @@ impl TranscribeHost {
             }
         };
         #[cfg(test)]
-        if matches!(&self.backend, Backend::InProcessTest(_)) {
+        if matches!(&self.backend, Backend::InProcessTest(..)) {
             timing.finish(last.elapsed());
         }
         let tail = std::time::Instant::now();

@@ -1,6 +1,7 @@
 use super::*;
 
 mod conformance;
+mod request_paths;
 mod results;
 
 async fn cleanup(root: PathBuf, state: Arc<ModuleState>) {
@@ -947,6 +948,7 @@ async fn media_restart_fails_only_nonterminal_work_and_retains_objects_for_one_h
     for name in ["queued", "running", "cancelled", "done"] {
         let p = request(name);
         let typed = serde_json::from_value(p.clone()).unwrap();
+        let staged = persistence::stage(&state, &bytes).unwrap();
         let id = persistence::admit(
             &state,
             "alice",
@@ -954,7 +956,7 @@ async fn media_restart_fails_only_nonterminal_work_and_retains_objects_for_one_h
             &persistence::binding(&p),
             &lane,
             &m,
-            &bytes,
+            Some(&staged),
         )
         .unwrap();
         if name == "running" {
@@ -1120,7 +1122,7 @@ async fn media_quarantine_never_falls_back_and_submit_does_not_store() {
             .count(),
         0
     );
-    unload(&state.runtime, None, false).await.unwrap();
+    unload(&state.runtime, None, false, ()).await.unwrap();
     drop(state);
     fs::remove_dir_all(root).unwrap();
 }

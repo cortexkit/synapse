@@ -430,8 +430,10 @@ of ten-minute support. Input duration is `ceil(sample_frames * 1000 / sample_rat
 before resampling. The resampled 16 kHz sample count also determines
 `valid_encoder_frames`, which must not exceed that lane's certified frame limit.
 Both checks precede engine work; there is no silent truncation or hidden
-chunking. Zero-sample WAVs, truncated chunks, other codecs/bit depths and
-out-of-range channel counts or rates are invalid audio.
+chunking. Zero-sample WAVs, clips shorter than one 10 ms mel hop (fewer than
+160 samples after resampling to 16 kHz, so no valid encoder frame), truncated
+chunks, other codecs/bit depths and out-of-range channel counts or rates are
+invalid audio, refused permanent `invalid_params {field: "audio"}` at submit.
 
 The direct Neural Engine Parakeet lane (`parakeet-tdt-0.6b-v3-ane`) currently
 serves audio up to 81,850 ms, the longest duration certified on hardware; Metal,
@@ -451,7 +453,15 @@ become gone on restart. Committed uploads survive restart and remain at least
 one hour after commit, or the later of job end and last result/read. Terminal
 jobs/results/replays survive restart; queued/running jobs become failed with
 transient `module_restarted`. Retention sweeps remove expired audio and results;
-startup also removes orphaned audio. These retention, replay and word-shape
+startup also removes orphaned audio. An expired job keeps only a replay
+tombstone (its replay binding and job id) for 24 hours after its result
+expires: a replay inside that window returns the original id, while
+`media.status`/`media.result` answer `unknown_job`. After the window the row is
+deleted and the `client_job_id` is free, so a replay starts new work. A gone
+object's row is kept for the same window, so a lost upload still answers
+`upload_gone`, then deleted. Audio whose file cannot be removed stays committed and counted
+against the 1 GiB bound, is retried by later sweeps, and does not fail other
+calls. These retention, replay and word-shape
 rules apply to this media surface.
 
 #### Reading certification observation frames

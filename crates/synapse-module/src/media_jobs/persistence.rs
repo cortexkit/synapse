@@ -51,7 +51,7 @@ fn create(state: &ModuleState, id: &str, bytes: &[u8]) -> Answer<()> {
     f.write_all(bytes).map_err(internal)?;
     f.sync_all().map_err(internal)
 }
-fn capacity(state: &ModuleState, bytes: u64) -> Answer<()> {
+pub(super) fn capacity(state: &ModuleState, bytes: u64) -> Answer<()> {
     let reserved: u64 = db(state, |c| {
         c.query_row(
             "SELECT coalesce(sum(bytes),0) FROM media_objects WHERE state != 'gone'",
@@ -205,7 +205,7 @@ pub(super) fn read(state: &ModuleState, owner: &str, p: Value) -> Answer<Value> 
     };
     extend(state, &o.id, clock_ms(state))?;
     mutate(state, |t| {
-        t.execute("UPDATE media_jobs SET retained_ms=max(retained_ms,?2) WHERE object_id=?1 OR json_extract(result,'$.output_object.object_id')=?1",params![o.id,clock_ms(state)+RETENTION_MS])?;
+        t.execute("UPDATE media_jobs SET retained_ms=max(retained_ms,?2) WHERE expired=0 AND (object_id=?1 OR json_extract(result,'$.output_object.object_id')=?1)",params![o.id,clock_ms(state)+RETENTION_MS])?;
         Ok(())
     })?;
     Ok(json!({"data":base64_encode(&bytes)}))
@@ -215,8 +215,22 @@ pub(super) fn audio_bytes(
     owner: &str,
     audio: &objects::MediaValue,
 ) -> Answer<Vec<u8>> {
+    match check_audio(state, owner, audio)? {
+        Some(bytes) => Ok(bytes),
+        None => read_object(state, audio.object_id.as_deref().unwrap_or("")),
+    }
+}
+
+/// Returns inline audio decoded, or checks an uploaded object against the
+/// stated facts and returns `None`; its bytes are read by `read_object`,
+/// outside the media gate.
+pub(super) fn check_audio(
+    state: &ModuleState,
+    owner: &str,
+    audio: &objects::MediaValue,
+) -> Answer<Option<Vec<u8>>> {
     if let Some(data) = &audio.data {
-        return STANDARD.decode(data).map_err(|_| invalid("audio"));
+        return STANDARD.decode(data).map(Some).map_err(|_| invalid("audio"));
     }
     let o = object(
         state,
@@ -235,7 +249,43 @@ pub(super) fn audio_bytes(
             return Err(fault("object_mismatch", Some("input.audio")));
         }
     }
-    fs::read(path(state, &o.id)?).map_err(|_| fault("unknown_object", None))
+    Ok(None)
+}
+
+pub(super) fn read_object(state: &ModuleState, id: &str) -> Answer<Vec<u8>> {
+    fs::read(path(state, id)?).map_err(|_| fault("unknown_object", None))
+}
+
+/// Writes inline audio to a new object file before the media gate is taken
+/// to record the job. `discard` removes it if admission then refuses.
+pub(super) fn stage(state: &ModuleState, bytes: &[u8]) -> Answer<String> {
+    let id = new_id(state)?;
+    create(state, &id, bytes)?;
+    Ok(id)
+}
+
+pub(super) fn discard(state: &ModuleState, id: &str) {
+    if let Ok(path) = path(state, id) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// The deadline of a job that is still queued, or `None` once it has left the
+/// queue (started, cancelled, expired or otherwise terminal).
+pub(super) fn queued_deadline(state: &ModuleState, id: &str) -> Answer<Option<Option<u64>>> {
+    let _gate = state.runtime.media.gate.lock().expect("media gate");
+    expire_deadlines(state, clock_ms(state))?;
+    let row: Option<(String, Option<u64>)> = db(state, |c| {
+        c.query_row(
+            "SELECT state,deadline_ms FROM media_jobs WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    })?;
+    Ok(row
+        .filter(|(status, _)| status == "queued")
+        .map(|(_, deadline)| deadline))
 }
 
 pub(super) fn binding(p: &Value) -> Value {
@@ -289,6 +339,8 @@ pub(super) fn check_lane_capacity(state: &ModuleState, lane: &str) -> Answer<()>
         Ok(())
     }
 }
+/// Records the job, and for inline audio the object staged by `stage`. Call
+/// under the media gate.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit(
     state: &ModuleState,
@@ -297,22 +349,19 @@ pub(super) fn admit(
     binding: &Value,
     lane: &str,
     audio: &objects::MediaValue,
-    bytes: &[u8],
+    staged: Option<&str>,
 ) -> Answer<String> {
-    let new_object = audio.object_id.is_none();
+    let new_object = staged.is_some();
     if new_object {
         capacity(state, audio.bytes)?;
     }
     let id = new_id(state)?;
-    let object_id = match &audio.object_id {
-        Some(id) => id.clone(),
-        None => new_id(state)?,
+    let object_id = match staged {
+        Some(id) => id.to_owned(),
+        None => audio.object_id.clone().unwrap_or_default(),
     };
-    if new_object {
-        create(state, &object_id, bytes)?;
-    }
     let now = clock_ms(state);
-    let result = mutate(state, |t| {
+    mutate(state, |t| {
         if new_object {
             t.execute("INSERT INTO media_objects(id,owner,mime,bytes,sha256,state,received,retained_ms) VALUES(?1,?2,?3,?4,?5,'committed',?4,?6)",params![object_id,owner,audio.mime,audio.bytes,audio.sha256,now+RETENTION_MS])?;
         }
@@ -322,11 +371,7 @@ pub(super) fn admit(
             params![object_id, now + RETENTION_MS],
         )?;
         Ok(())
-    });
-    if result.is_err() && new_object {
-        let _ = fs::remove_file(path(state, &object_id)?);
-    }
-    result?;
+    })?;
     Ok(id)
 }
 
@@ -444,11 +489,15 @@ pub(super) fn finish(state: &ModuleState, id: &str, result: Answer<Value>) -> An
 }
 fn expire_deadlines(state: &ModuleState, now: u64) -> Answer<()> {
     let error = failure(fault("deadline_exceeded", None)).to_string();
-    mutate(state, |t| {
+    let expired = mutate(state, |t| {
         t.execute("UPDATE media_objects SET retained_ms=max(retained_ms,?1) WHERE id IN (SELECT object_id FROM media_jobs WHERE state IN ('queued','running') AND deadline_ms <= ?2)",params![now+RETENTION_MS,now])?;
-        t.execute("UPDATE media_jobs SET state='failed',failure=?1,retained_ms=?2 WHERE state IN ('queued','running') AND deadline_ms<=?3",params![error,now+RETENTION_MS,now])?;
-        Ok(())
-    })
+        t.execute("UPDATE media_jobs SET state='failed',failure=?1,retained_ms=?2 WHERE state IN ('queued','running') AND deadline_ms<=?3",params![error,now+RETENTION_MS,now])
+    })?;
+    if expired > 0 {
+        // Queued jobs waiting for their lane re-check their state on this signal.
+        state.runtime.media.changed.notify_waiters();
+    }
+    Ok(())
 }
 pub(super) fn job_answer(
     state: &ModuleState,
@@ -470,6 +519,8 @@ pub(super) fn job_answer(
                 t.execute("UPDATE media_jobs SET state='cancelled',retained_ms=?2 WHERE id=?1 AND state IN ('queued','running')",params![id,clock_ms(state)+RETENTION_MS])?;
                 Ok(())
             })?;
+            // A queued job waiting for its lane stops waiting on this signal.
+            state.runtime.media.changed.notify_waiters();
             extend(state, &object, clock_ms(state))?;
             return Ok(json!({"status":"cancelled"}));
         }
@@ -547,10 +598,18 @@ pub(super) fn sweep(state: &ModuleState, now: u64) -> Answer<()> {
         ids
     })?;
     for id in ids {
+        // A file that cannot be removed (for example one another process holds
+        // open without delete sharing on Windows) keeps its object committed, so
+        // it stays charged against the storage quota and the next sweep retries
+        // it. It must not stop housekeeping for other rows or fail other calls.
         match fs::remove_file(path(state, &id)?) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(internal(e)),
+            Err(e) => {
+                tracing::warn!(object_id = %id, error = %e,
+                    "media retention could not remove expired audio; a later sweep retries it");
+                continue;
+            }
         };
         mutate(state, |t| {
             t.execute(
@@ -560,9 +619,21 @@ pub(super) fn sweep(state: &ModuleState, now: u64) -> Answer<()> {
             Ok(())
         })?;
     }
+    let tombstone_cutoff = now.saturating_sub(TOMBSTONE_MS);
     mutate(state, |t| {
-        t.execute("DELETE FROM media_observation_pages WHERE job_id IN (SELECT id FROM media_jobs WHERE state NOT IN ('queued','running') AND retained_ms<=?1)",[now])?;
-        t.execute("UPDATE media_jobs SET result=NULL,transcribe_measurements=NULL,expired=1 WHERE state NOT IN ('queued','running') AND retained_ms<=?1",[now])?;
+        t.execute("DELETE FROM media_observation_pages WHERE job_id IN (SELECT id FROM media_jobs WHERE expired=0 AND state NOT IN ('queued','running') AND retained_ms<=?1)",[now])?;
+        // An expired job keeps only its replay binding and id, so a replay
+        // inside the tombstone window still returns the original id.
+        t.execute("UPDATE media_jobs SET result=NULL,failure=NULL,transcribe_measurements=NULL,transcribe_fingerprint=NULL,expired=1 WHERE expired=0 AND state NOT IN ('queued','running') AND retained_ms<=?1",[now])?;
+        // Metadata is bounded by live work plus one tombstone window: after it
+        // the client_job_id is free again and a replay starts new work.
+        t.execute(
+            "DELETE FROM media_jobs WHERE expired=1 AND retained_ms<=?1",
+            [tombstone_cutoff],
+        )?;
+        // Gone objects keep their row for the same window, so a lost upload
+        // still answers upload_gone rather than unknown_upload until then.
+        t.execute("DELETE FROM media_objects WHERE state='gone' AND retained_ms<=?1 AND NOT EXISTS(SELECT 1 FROM media_jobs WHERE object_id=media_objects.id)",[tombstone_cutoff])?;
         Ok(())
     })
 }
