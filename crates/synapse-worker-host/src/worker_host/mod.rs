@@ -30,6 +30,7 @@ mod quarantine_tests;
 // A finite cool-down lets a quarantined catalog lane recover unattended.
 pub const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
 mod errors;
+mod exit_fence;
 mod liveness;
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod test_support;
@@ -294,6 +295,7 @@ pub struct WorkerHost {
     model_counter: u64,
     log_context: Arc<Mutex<WorkerLogContext>>,
     forward_limiter: Arc<Mutex<WorkerForwardLimiter>>,
+    exit_fence: exit_fence::ExitFence,
 }
 
 impl WorkerHost {
@@ -319,6 +321,7 @@ impl WorkerHost {
             model_counter: 0,
             log_context: Arc::new(Mutex::new(WorkerLogContext::default())),
             forward_limiter,
+            exit_fence: Default::default(),
         }
     }
 
@@ -617,6 +620,7 @@ impl WorkerHost {
     }
 
     pub async fn ping(&mut self) -> Result<WorkerPing, WorkerHostError> {
+        self.exit_fence_check()?;
         let req_id = self.next_req_id("ping");
         let response = self
             .send_request(
@@ -743,6 +747,7 @@ impl WorkerHost {
         if let Some(error) = self.quarantine_error(crash_key) {
             return Err(error);
         }
+        self.exit_fence_check()?;
         let artifact_path = artifact_path(cfg)?;
         let req_id = self.next_req_id("load");
         let request = WorkerRequest::Load {
@@ -807,6 +812,7 @@ impl WorkerHost {
     }
 
     async fn start_worker(&mut self) -> Result<(), WorkerHostError> {
+        self.exit_fence_check()?;
         let (endpoint, listener) =
             prepare_listener(&self.config.runtime_dir, &self.config.worker_id)?;
         let nonce = nonce_hex16();
@@ -896,8 +902,7 @@ impl WorkerHost {
         {
             Ok(stream) => stream,
             Err(error) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                self.reap_child(child, None).await;
                 return Err(error.into());
             }
         };
@@ -1014,12 +1019,11 @@ impl WorkerHost {
     }
 
     async fn kill_current(&mut self) -> String {
-        let Some(mut connection) = self.connection.take() else {
+        let Some(connection) = self.connection.take() else {
             self.forget_worker_model_refs();
             return String::new();
         };
-        let _ = connection.child.kill().await;
-        let _ = connection.child.wait().await;
+        self.reap_child(connection.child, None).await;
         self.forget_worker_model_refs();
         connection.logs.tail()
     }
@@ -1268,18 +1272,14 @@ impl WorkerEngine {
 
     /// Pause draining has already fenced inference. Confirm process exit before
     /// releasing the inherited hardware lock; an UNLOAD acknowledgement alone
-    /// leaves the worker process (and its descriptor) alive.
+    /// leaves the worker process (and its descriptor) alive. An exit not
+    /// confirmed in time keeps the lock and fails this attempt; a retry
+    /// succeeds once the background reaper has confirmed it.
     pub fn shutdown_for_pause(&self) -> Result<(), WorkerHostError> {
         let mut host = self.lock_host()?;
         self.runtime().block_on(async {
-            if let Some(connection) = host.connection.as_mut() {
-                if connection.child.try_wait()?.is_none() {
-                    connection.child.start_kill()?;
-                }
-                connection.child.wait().await?;
-            }
-            host.connection.take();
-            host.forget_worker_model_refs();
+            host.kill_current().await;
+            host.exit_fence_check()?;
             host.config.inherited_lane_lock.take();
             Ok(())
         })
@@ -1288,7 +1288,7 @@ impl WorkerEngine {
 
 /// How long a drop waits for its worker child to be killed and reaped.
 ///
-/// `kill_current` sends a kill and awaits the child's exit, which a live worker
+/// A drop sends a kill and awaits the child's exit, which a live worker
 /// completes in milliseconds. The budget exists so a wedged child or a held host
 /// mutex cannot stall shutdown indefinitely, not to accommodate a slow one.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
@@ -1300,14 +1300,34 @@ impl Drop for WorkerEngine {
         };
         let host = Arc::clone(&self.host);
         let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
-        let teardown = move || {
-            if let Ok(mut host) = host.lock() {
-                let _ = runtime.block_on(host.kill_current());
-            }
-            drop(runtime);
-            let _ = finished_tx.send(());
-        };
         let budget = self.teardown_budget;
+        let teardown = move || {
+            // Wait at most the teardown budget for the child to exit. Past
+            // that, a detached thread keeps this runtime (and so the reaper
+            // task) and the host, with any inherited lane lock, alive until
+            // the exit is confirmed, without blocking the dropping thread.
+            let pending = host.lock().map_or_else(
+                |_| Vec::new(),
+                |mut host| {
+                    if let Some(connection) = host.connection.take() {
+                        runtime.block_on(host.reap_child(connection.child, Some(budget)));
+                    }
+                    host.exit_fence.take_pending()
+                },
+            );
+            if pending.is_empty() {
+                drop(runtime);
+                let _ = finished_tx.send(());
+            } else {
+                let _ = finished_tx.send(());
+                std::thread::spawn(move || {
+                    for reaper in pending {
+                        let _ = runtime.block_on(reaper);
+                    }
+                    drop(host);
+                });
+            }
+        };
         if tokio::runtime::Handle::try_current().is_ok() {
             // Dropped on a thread that is driving a tokio runtime (module
             // state teardown): block_on here — or even dropping the engine
@@ -5079,7 +5099,7 @@ pub mod ane_residency {
                 // Compiling/loading all 22 GTE layers at length 8192 took 115.495s
                 // in debug; 600s leaves headroom for that but bounds a silent worker.
                 shape_rpc_timeout: std::time::Duration::from_secs(600),
-                owner_exit_timeout: std::time::Duration::from_secs(30),
+                owner_exit_timeout: super::exit_fence::OWNER_EXIT_TIMEOUT,
                 holder: Mutex::new(StreamHolder::default()),
                 pid: Mutex::new(stream_pid),
                 #[cfg(test)]
