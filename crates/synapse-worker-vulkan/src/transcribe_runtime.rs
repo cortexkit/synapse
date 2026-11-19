@@ -2,8 +2,8 @@
 //! runs on the host; its predictor and joint run on the GPU when the device
 //! supports that decoder, and on the host otherwise.
 use super::{
-    speech_decode::GpuJoint, Arena, Params, Prepared, SpeechBatch, SpeechBatchPolicy,
-    SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE,
+    speech_decode::GpuJoint, Arena, Params, Prepared, SpeechBatch, SPEECH_GEMM_BIAS,
+    SPEECH_GEMM_THREE,
 };
 use crate::transcribe::{self, joint::HostJoint, TILE};
 use anyhow::{ensure, Result};
@@ -48,8 +48,6 @@ pub struct Engine {
     #[cfg(test)]
     layer_capture: Option<LayerCapture>,
     #[cfg(test)]
-    debug_dispatch_limit: Option<usize>,
-    #[cfg(test)]
     debug_disjoint_bindings: bool,
 }
 
@@ -79,6 +77,7 @@ impl Engine {
         // it is only loaded when the GPU decoder is unavailable.
         let (decoder, host_reason) = match GpuJoint::new(&arena) {
             Ok(joint) => (Decoder::Gpu(joint), None),
+            Err(error) if crate::driver_failure::is_fatal(&error) => return Err(error),
             Err(error) => (
                 Decoder::Host(HostJoint::load(header, data)),
                 Some(format!("{error:#}")),
@@ -108,8 +107,6 @@ impl Engine {
             decoded_frames: 0,
             #[cfg(test)]
             layer_capture: None,
-            #[cfg(test)]
-            debug_dispatch_limit: None,
             #[cfg(test)]
             debug_disjoint_bindings: false,
         })
@@ -175,9 +172,17 @@ impl Engine {
             dispatch_limit.is_none_or(|limit| (1..=capacity).contains(&limit)),
             "SYNAPSE_VULKAN_SPEECH_DISPATCH_LIMIT must be in 1..={capacity}"
         );
-        self.debug_dispatch_limit = dispatch_limit;
+        self.batch.get_mut().dispatch_limit_override = dispatch_limit;
         self.debug_disjoint_bindings = disjoint_bindings;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_submission_stats(
+        &self,
+    ) -> (super::speech_batch_policy::SubmissionStats, usize) {
+        let mut batch = self.batch.borrow_mut();
+        (std::mem::take(&mut batch.stats), batch.dispatch_limit())
     }
 
     #[cfg(test)]
@@ -730,23 +735,23 @@ impl Engine {
         observe: bool,
         progress: &mut impl FnMut() -> Result<()>,
     ) -> Result<Output> {
-        let valid_encoder_frames =
-            transcribe::with_validated_input(
-                mel,
-                mel_rows,
-                valid,
-                self.maximum,
-                |valid_encoder_frames, rows| {
-                    let policy = SpeechBatchPolicy::for_rung(rows);
-                    #[cfg(test)]
-                    let policy = self.debug_dispatch_limit.map_or(policy, |dispatch_limit| {
-                        SpeechBatchPolicy { dispatch_limit }
-                    });
-                    self.batch.borrow_mut().policy = policy;
-                    self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
-                    Ok(valid_encoder_frames)
-                },
-            )?;
+        let valid_encoder_frames = transcribe::with_validated_input(
+            mel,
+            mel_rows,
+            valid,
+            self.maximum,
+            |valid_encoder_frames, rows| {
+                let mut batch = self.batch.borrow_mut();
+                batch.policy.select_rung(rows);
+                #[cfg(test)]
+                {
+                    batch.stats = Default::default();
+                }
+                drop(batch);
+                self.encoder(mel, mel_rows, valid, rows, valid_encoder_frames, progress)?;
+                Ok(valid_encoder_frames)
+            },
+        )?;
         // Observation only copies the finished encoder. The projection and joint
         // evaluations are identical in both modes.
         let encoder = if observe {

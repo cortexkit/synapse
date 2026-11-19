@@ -1,4 +1,13 @@
-use std::{collections::BTreeMap, ffi::CStr, io::Cursor, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ffi::CStr,
+    io::Cursor,
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, ensure, Context, Result};
 use ash::{vk, Entry};
@@ -9,8 +18,13 @@ use synapse_parity::{
 
 use crate::{
     admission::{Adapter, Required},
+    driver_failure::{allocation_failure, QueueWaitFailed},
     Padded, SHADERS,
 };
+
+#[path = "speech_batch_policy.rs"]
+mod speech_batch_policy;
+use speech_batch_policy::{SpeechBatchPolicy, SPEECH_BATCH_CAPACITY};
 
 struct Instance {
     _entry: Entry,
@@ -235,6 +249,7 @@ struct Device {
     speech: vk::Pipeline,
     speech_gemm: vk::Pipeline,
     heap_index: u32,
+    retirement_unknown: AtomicBool,
 }
 impl Drop for Device {
     fn drop(&mut self) {
@@ -258,6 +273,10 @@ impl Drop for Device {
 }
 
 impl Device {
+    fn retirement_unknown(&self) -> bool {
+        self.retirement_unknown.load(Relaxed)
+    }
+
     fn new(required: Required) -> Result<Arc<Self>> {
         Self::with_instance(required, instance()?, AdapterChoice::Admitted)
     }
@@ -420,6 +439,7 @@ impl Device {
             attention: vk::Pipeline::null(),
             speech: vk::Pipeline::null(),
             speech_gemm: vk::Pipeline::null(),
+            retirement_unknown: AtomicBool::new(false),
         };
         let raw = &device.raw;
         let pool = unsafe {
@@ -483,7 +503,15 @@ impl Device {
         Ok(Arc::new(device))
     }
 
-    fn submit(&self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+    fn submit(self: &Arc<Self>, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        self.submit_timed(record, false).map(|_| ())
+    }
+
+    fn submit_timed(
+        self: &Arc<Self>,
+        record: impl FnOnce(vk::CommandBuffer),
+        measure: bool,
+    ) -> Result<Duration> {
         let info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -497,16 +525,37 @@ impl Device {
             )?;
         }
         record(command);
-        unsafe {
+        let elapsed = unsafe {
             self.raw.end_command_buffer(command)?;
             let commands = [command];
             let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
-            self.raw
-                .queue_submit(self.queue, &submits, vk::Fence::null())?;
-            self.raw.queue_wait_idle(self.queue)?;
+            let started = measure.then(Instant::now);
+            let submitted = self
+                .raw
+                .queue_submit(self.queue, &submits, vk::Fence::null());
+            // Vulkan treats DEVICE_LOST like success for resource lifetime, so
+            // even a submit that returns it needs a wait before resources can drop.
+            let waited = if submitted.is_ok() || submitted == Err(vk::Result::ERROR_DEVICE_LOST) {
+                self.raw.queue_wait_idle(self.queue)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = waited {
+                if error == vk::Result::ERROR_DEVICE_LOST {
+                    self.raw.free_command_buffers(self.pool, &[command]);
+                } else if !self.retirement_unknown.swap(true, Relaxed) {
+                    // The queue may still be using these objects. Keep them
+                    // and the Vulkan loader alive until the worker exits.
+                    std::mem::forget(Arc::clone(self));
+                }
+                return Err(QueueWaitFailed(error).into());
+            }
+            let elapsed = started.map_or(Duration::ZERO, |started| started.elapsed());
             self.raw.free_command_buffers(self.pool, &[command]);
-        }
-        Ok(())
+            submitted?;
+            elapsed
+        };
+        Ok(elapsed)
     }
 }
 
@@ -517,6 +566,9 @@ struct TransferBuffer {
 }
 impl Drop for TransferBuffer {
     fn drop(&mut self) {
+        if self.device.retirement_unknown() {
+            return;
+        }
         unsafe {
             self.device.raw.destroy_buffer(self.buffer, None);
             self.device.raw.free_memory(self.memory, None);
@@ -535,6 +587,9 @@ struct Arena {
 }
 impl Drop for Arena {
     fn drop(&mut self) {
+        if self.device.retirement_unknown() {
+            return;
+        }
         unsafe {
             self.device.raw.destroy_buffer(self.buffer, None);
             self.device.raw.free_memory(self.memory, None);
@@ -601,7 +656,8 @@ impl Arena {
                     .memory_type_index(memory_type),
                 None,
             )
-        }?;
+        }
+        .map_err(allocation_failure)?;
         arena.memory = memory;
         arena.mapped = mapped;
         unsafe {
@@ -868,33 +924,6 @@ fn speech_groups(params: &Params, count: u32) -> u32 {
     }
 }
 
-const SPEECH_BATCH_CAPACITY: usize = 128;
-
-// Large attention tiles can keep a Windows GPU busy long enough that combining
-// many dispatches approaches its two-second timeout. Above this padded frame
-// rung, retain the old engine's one-dispatch-per-submit granularity instead.
-const MAX_BATCHED_SPEECH_RUNG: usize = 1024;
-
-struct SpeechBatchPolicy {
-    dispatch_limit: usize,
-}
-
-impl SpeechBatchPolicy {
-    fn for_rung(rung: usize) -> Self {
-        Self {
-            dispatch_limit: if rung > MAX_BATCHED_SPEECH_RUNG {
-                1
-            } else {
-                SPEECH_BATCH_CAPACITY
-            },
-        }
-    }
-
-    fn submit_after(&self, pending: usize) -> bool {
-        pending >= self.dispatch_limit
-    }
-}
-
 struct SpeechDispatch {
     params: Params,
     descriptors: Vec<vk::DescriptorBufferInfo>,
@@ -908,6 +937,10 @@ struct SpeechBatch {
     pool: vk::DescriptorPool,
     pending: Vec<SpeechDispatch>,
     policy: SpeechBatchPolicy,
+    #[cfg(test)]
+    dispatch_limit_override: Option<usize>,
+    #[cfg(test)]
+    stats: speech_batch_policy::SubmissionStats,
 }
 
 impl SpeechBatch {
@@ -927,8 +960,20 @@ impl SpeechBatch {
             device,
             pool,
             pending: Vec::with_capacity(SPEECH_BATCH_CAPACITY),
-            policy: SpeechBatchPolicy::for_rung(0),
+            policy: SpeechBatchPolicy::default(),
+            #[cfg(test)]
+            dispatch_limit_override: None,
+            #[cfg(test)]
+            stats: Default::default(),
         })
+    }
+
+    fn dispatch_limit(&self) -> usize {
+        #[cfg(test)]
+        if let Some(limit) = self.dispatch_limit_override {
+            return limit;
+        }
+        self.policy.dispatch_limit()
     }
 
     fn push(
@@ -949,7 +994,7 @@ impl SpeechBatch {
             descriptors,
             groups,
         });
-        if self.policy.submit_after(self.pending.len()) {
+        if self.pending.len() >= self.dispatch_limit() {
             self.flush()?;
         }
         Ok(())
@@ -991,93 +1036,107 @@ impl SpeechBatch {
                 .collect();
             unsafe { device.raw.update_descriptor_sets(&writes, &[]) };
         }
-        device.submit(|command| unsafe {
-            // Make uploads visible once. Between dispatches, compute-to-compute
-            // ordering covers read-after-write and write-after-write dependencies,
-            // and keeps scratch writes from overtaking preceding reads.
-            let before = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-            device.raw.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &before,
-                &[],
-                &[],
-            );
-            for (index, (dispatch, &set)) in dispatches.iter().zip(&sets).enumerate() {
-                if index > 0 {
-                    let dependency = [vk::MemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                        .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                        )];
-                    device.raw.cmd_pipeline_barrier(
-                        command,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &dependency,
-                        &[],
-                        &[],
-                    );
-                }
-                let pipeline = if dispatch.params.op == 100 {
-                    device.speech_gemm
-                } else {
-                    device.speech
-                };
-                device
-                    .raw
-                    .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
-                device.raw.cmd_bind_descriptor_sets(
+        let elapsed = device.submit_timed(
+            |command| unsafe {
+                // Make uploads visible once. Between dispatches, compute-to-compute
+                // ordering covers read-after-write and write-after-write dependencies,
+                // and keeps scratch writes from overtaking preceding reads.
+                let before = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+                device.raw.cmd_pipeline_barrier(
                     command,
-                    vk::PipelineBindPoint::COMPUTE,
-                    device.pipeline_layout,
-                    0,
-                    &[set],
+                    vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &before,
+                    &[],
                     &[],
                 );
-                let bytes: Vec<_> = dispatch
-                    .params
-                    .words()
-                    .into_iter()
-                    .flat_map(u32::to_ne_bytes)
-                    .collect();
-                device.raw.cmd_push_constants(
+                for (index, (dispatch, &set)) in dispatches.iter().zip(&sets).enumerate() {
+                    if index > 0 {
+                        let dependency = [vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            )];
+                        device.raw.cmd_pipeline_barrier(
+                            command,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &dependency,
+                            &[],
+                            &[],
+                        );
+                    }
+                    let pipeline = if dispatch.params.op == 100 {
+                        device.speech_gemm
+                    } else {
+                        device.speech
+                    };
+                    device
+                        .raw
+                        .cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    device.raw.cmd_bind_descriptor_sets(
+                        command,
+                        vk::PipelineBindPoint::COMPUTE,
+                        device.pipeline_layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    let bytes: Vec<_> = dispatch
+                        .params
+                        .words()
+                        .into_iter()
+                        .flat_map(u32::to_ne_bytes)
+                        .collect();
+                    device.raw.cmd_push_constants(
+                        command,
+                        device.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &bytes,
+                    );
+                    device.raw.cmd_dispatch(
+                        command,
+                        dispatch.groups.min(65535),
+                        dispatch.groups.div_ceil(65535),
+                        1,
+                    );
+                }
+                let after = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
+                device.raw.cmd_pipeline_barrier(
                     command,
-                    device.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    &bytes,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &after,
+                    &[],
+                    &[],
                 );
-                device.raw.cmd_dispatch(
-                    command,
-                    dispatch.groups.min(65535),
-                    dispatch.groups.div_ceil(65535),
-                    1,
-                );
-            }
-            let after = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)];
-            device.raw.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &after,
-                &[],
-                &[],
-            );
-        })
+            },
+            true,
+        )?;
+        #[cfg(test)]
+        self.stats.record(dispatches.len(), elapsed);
+        #[cfg(test)]
+        if self.dispatch_limit_override.is_some() {
+            return Ok(());
+        }
+        self.policy.completed(dispatches.len(), elapsed);
+        Ok(())
     }
 }
 
 impl Drop for SpeechBatch {
     fn drop(&mut self) {
+        if self.device.retirement_unknown() {
+            return;
+        }
         unsafe { self.device.raw.destroy_descriptor_pool(self.pool, None) };
     }
 }
@@ -1905,34 +1964,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::attention_lanes;
-    use super::SpeechBatchPolicy;
     use super::{speech_gemm_groups, speech_groups, Params, SPEECH_GEMM_BIAS, SPEECH_GEMM_THREE};
-
-    #[test]
-    fn transcribe_long_rungs_submit_each_dispatch_before_accumulating_more_work() {
-        for rung in [2048, 4096, 8192] {
-            let policy = SpeechBatchPolicy::for_rung(rung);
-            let mut pending = 0;
-            let mut submissions = Vec::new();
-            // The longest rung has 26 fixed and 3*64 tiled attention dispatches.
-            for _ in 0..218 {
-                pending += 1;
-                if policy.submit_after(pending) {
-                    submissions.push(pending);
-                    pending = 0;
-                }
-            }
-            if pending > 0 {
-                submissions.push(pending);
-            }
-            assert_eq!(submissions, vec![1; 218], "rung {rung}");
-        }
-        for rung in [128, 256, 512, 1024] {
-            let policy = SpeechBatchPolicy::for_rung(rung);
-            assert!(!policy.submit_after(127));
-            assert!(policy.submit_after(128));
-        }
-    }
 
     #[test]
     fn transcribe_gemm_register_tiles_cover_ragged_rows_columns_and_offsets() {

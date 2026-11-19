@@ -29,6 +29,7 @@ mod quarantine_tests;
 
 // A finite cool-down lets a quarantined catalog lane recover unattended.
 pub const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
+mod errors;
 mod liveness;
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod test_support;
@@ -128,6 +129,8 @@ pub enum WorkerHostError {
     },
     #[error("worker returned {code}: {msg}")]
     WorkerErr { code: String, msg: String },
+    #[error("Vulkan LOAD refused for lack of device memory: {msg}")]
+    DeviceMemoryExhausted { msg: String },
     /// The worker's HELLO was refused because its manifest digest or kernel
     /// revision differs from the lane's (`manifest_mismatch`,
     /// `kernel_revision_mismatch`). Distinct from a worker `ERR` at LOAD.
@@ -144,46 +147,6 @@ pub enum WorkerHostError {
         key: String,
         retry_after_ms: Option<u64>,
     },
-}
-
-impl WorkerHostError {
-    pub fn to_engine_error(&self, stage: EngineErrorStage) -> EngineError {
-        EngineError {
-            stage: if matches!(self, Self::Quarantined { .. }) {
-                EngineErrorStage::WorkerCrash
-            } else {
-                stage
-            },
-            risk_class: EngineRiskClass::AbortCapable,
-            message: self.to_string(),
-            retry_after_ms: match self {
-                Self::WorkerErr { code, .. }
-                    if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED =>
-                {
-                    Some(ane_residency::ANE_RESOURCES_RETRY_AFTER_MS)
-                }
-                Self::Quarantined { retry_after_ms, .. } => *retry_after_ms,
-                Self::WorkerErr { .. } | Self::HelloRefused { .. } => None,
-                _ => Some(250),
-            },
-            safe_to_retry_same_request: matches!(
-                self,
-                Self::EngineCrashed { .. }
-                    | Self::Quarantined {
-                        retry_after_ms: Some(_),
-                        ..
-                    }
-            ) || matches!(self, Self::WorkerErr {code, ..} if code == ane_residency::ERR_ANE_RESOURCES_EXHAUSTED),
-        }
-    }
-
-    /// The typed code of a worker `ERR` or of a HELLO refusal.
-    pub fn code(&self) -> Option<&str> {
-        match self {
-            Self::WorkerErr { code, .. } | Self::HelloRefused { code, .. } => Some(code),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -811,7 +774,7 @@ impl WorkerHost {
                 Ok((model_ref, dims, cold_load_ms, buckets))
             }
             Ok((WorkerResponse::Err { code, msg, .. }, _)) => {
-                Err(WorkerHostError::WorkerErr { code, msg })
+                Err(WorkerHostError::load_refusal(code, msg))
             }
             Ok((other, _)) => Err(WorkerHostError::Protocol(format!(
                 "LOAD returned unexpected response {other:?}"

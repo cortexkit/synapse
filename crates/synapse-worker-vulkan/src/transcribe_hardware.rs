@@ -511,7 +511,7 @@ fn load_hardware() -> Loaded {
         DEFAULT_MAX_FRAME_BYTES,
         crate::enumerate,
     )
-    .unwrap_or_else(|code| panic!("LOAD failed: {code}"))
+    .unwrap_or_else(|error| panic!("LOAD failed: {error:?}"))
 }
 
 #[test]

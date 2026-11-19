@@ -145,6 +145,8 @@ message. A failed download carries `error` beside `state` in its flat status.
   never substitute catalog fingerprints.
 - `engine_crashed` — transient on catalog paths, `retry_after_ms: 250`, safe to
   retry; includes load/runtime failure or the 2000 ms self-check ceiling.
+  A Vulkan device-memory allocation refusal during load uses the same retry
+  delay with `detail.reason: "device_memory_exhausted"`; it does not add a crash strike.
   A quarantined catalog worker also uses this code, never `probe_required`:
   `retry_after_ms` is the remaining time in its fixed ten-minute cool-down and
   `details` is `{lane_id, quarantined: true}`. The next serving request after

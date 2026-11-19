@@ -52,6 +52,56 @@ fn err(req_id: Option<String>, code: &str, msg: impl Into<String>) -> WorkerResp
         msg: msg.into(),
     }
 }
+
+#[derive(Debug)]
+enum RequestError {
+    Reply(String),
+    #[cfg(feature = "vulkan")]
+    Fatal(anyhow::Error),
+}
+
+impl From<String> for RequestError {
+    fn from(code: String) -> Self {
+        Self::Reply(code)
+    }
+}
+
+impl From<&str> for RequestError {
+    fn from(code: &str) -> Self {
+        code.to_owned().into()
+    }
+}
+
+impl RequestError {
+    fn response(self, req_id: &str) -> Result<WorkerResponse> {
+        match self {
+            Self::Reply(code) => Ok(err(Some(req_id.into()), &code, &code)),
+            #[cfg(feature = "vulkan")]
+            Self::Fatal(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn from_inference(error: anyhow::Error) -> Self {
+        if crate::driver_failure::is_fatal(&error) {
+            Self::Fatal(error)
+        } else {
+            error.to_string().into()
+        }
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn from_load(error: anyhow::Error) -> Self {
+        if crate::driver_failure::is_fatal(&error) {
+            Self::Fatal(error)
+        } else if error.is::<crate::driver_failure::DeviceAllocationExhausted>() {
+            synapse_core::VULKAN_LOAD_DEVICE_MEMORY_EXHAUSTED.into()
+        } else {
+            runtime_error_code(error).into()
+        }
+    }
+}
+
 fn digest(value: &str) -> &str {
     value.strip_prefix("sha256:").unwrap_or(value)
 }
@@ -81,6 +131,15 @@ pub fn preflight(
     lookup: impl FnOnce() -> std::result::Result<Vec<Adapter>, String>,
     open_header: impl FnOnce() -> std::result::Result<Header, String>,
 ) -> std::result::Result<(Model, Profile, Adapter, Header), String> {
+    preflight_with(config, artifact_digest, lookup, open_header)
+}
+
+fn preflight_with<E: From<String> + for<'a> From<&'a str>>(
+    config: &BTreeMap<String, String>,
+    artifact_digest: &str,
+    lookup: impl FnOnce() -> std::result::Result<Vec<Adapter>, E>,
+    open_header: impl FnOnce() -> std::result::Result<Header, E>,
+) -> std::result::Result<(Model, Profile, Adapter, Header), E> {
     let manifest = crate::manifest();
     let profile = config
         .get("profile")
@@ -213,7 +272,7 @@ pub fn request_loop<S: Read + Write>(
                         loaded = Some(model);
                         response
                     }
-                    Err(code) => err(Some(req_id.clone()), &code, &code),
+                    Err(error) => error.response(req_id)?,
                 }
             }
             WorkerRequest::Unload { req_id, model_ref } => {
@@ -289,7 +348,7 @@ pub fn request_loop<S: Read + Write>(
                         write_frame(stream, &synapse_core::encode_f32_frame(&values), max_frame)?;
                         continue;
                     }
-                    Err(code) => err(Some(req_id.clone()), &code, &code),
+                    Err(error) => error.response(req_id)?,
                 }
             }
             WorkerRequest::RerankSequences {
@@ -327,7 +386,7 @@ pub fn request_loop<S: Read + Write>(
                         write_frame(stream, &synapse_core::encode_f32_frame(&values), max_frame)?;
                         continue;
                     }
-                    Err(code) => err(Some(req_id.clone()), &code, &code),
+                    Err(error) => error.response(req_id)?,
                 }
             }
             _ => WorkerResponse::unsupported_request(&request),
@@ -369,7 +428,7 @@ fn serve_transcribe(
     }
     match result {
         Ok(output) => crate::transcribe::write_output(stream, req_id, &output, observe, max_frame)?,
-        Err(code) => write_json_frame(stream, &err(Some(req_id.into()), &code, &code), max_frame)?,
+        Err(error) => write_json_frame(stream, &error.response(req_id)?, max_frame)?,
     }
     Ok(())
 }
@@ -380,7 +439,7 @@ fn load(
     config: &BTreeMap<String, String>,
     max_frame: u32,
     lookup: impl FnOnce() -> std::result::Result<Vec<Adapter>, String>,
-) -> std::result::Result<Loaded, String> {
+) -> std::result::Result<Loaded, RequestError> {
     if let Some(profile) = config
         .get("profile")
         .and_then(|id| crate::manifest().profiles.get(id).cloned())
@@ -407,17 +466,19 @@ fn load(
         select(lookup()?, required)?;
         // Keep the admitted logical device alive before opening the package;
         // loader or instance startup must not occur again after artifact reads.
-        let context = crate::runtime::prepare(required).map_err(runtime_error_code)?;
+        let context = crate::runtime::prepare(required).map_err(RequestError::from_load)?;
         let adapters = vec![context.adapter.clone()];
         prepared = Some(context);
         Ok(adapters)
     };
-    let preflight = preflight(config, artifact_digest, lookup, || {
+    #[cfg(not(feature = "vulkan"))]
+    let lookup = || lookup().map_err(RequestError::from);
+    let preflight = preflight_with::<RequestError>(config, artifact_digest, lookup, || {
         if package_path.is_dir() {
             package_path = package_path.join("model.safetensors");
         }
         let header = synapse_parity::safetensors::read_header_bytes(&package_path)
-            .map_err(|_| "artifact_invalid".to_owned())?;
+            .map_err(|_| "artifact_invalid")?;
         parse_header_json(&header).map_err(|_| "artifact_invalid".into())
     })?;
     #[cfg(feature = "vulkan")]
@@ -481,7 +542,7 @@ fn load(
                     &header,
                     data,
                 )
-                .map_err(runtime_error_code)?,
+                .map_err(RequestError::from_load)?,
             ))
         } else {
             LoadedEngine::Tokens(Box::new(
@@ -493,7 +554,7 @@ fn load(
                     &header,
                     data,
                 )
-                .map_err(runtime_error_code)?,
+                .map_err(RequestError::from_load)?,
             ))
         };
         Ok(Loaded {
@@ -535,7 +596,7 @@ fn infer_progress(
     lengths: &[usize],
     raw: &[u8],
     progress: &mut impl FnMut() -> Result<()>,
-) -> std::result::Result<Vec<f32>, String> {
+) -> std::result::Result<Vec<f32>, RequestError> {
     let model = loaded
         .filter(|m| m.model_ref == model_ref)
         .ok_or("model_not_loaded")?;
@@ -569,7 +630,7 @@ fn infer_progress(
         };
         engine
             .infer_progress(&sequences, progress)
-            .map_err(|e| e.to_string())
+            .map_err(RequestError::from_inference)
     }
     #[cfg(not(feature = "vulkan"))]
     {
@@ -587,7 +648,7 @@ fn transcribe_progress(
     raw: &[u8],
     observe: bool,
     progress: &mut impl FnMut() -> Result<()>,
-) -> std::result::Result<crate::transcribe::Output, String> {
+) -> std::result::Result<crate::transcribe::Output, RequestError> {
     let model = loaded
         .filter(|m| m.model_ref == model_ref)
         .ok_or("model_not_loaded")?;
@@ -602,7 +663,7 @@ fn transcribe_progress(
         };
         engine
             .transcribe(&mel, mel_frames, valid, observe, progress)
-            .map_err(|e| e.to_string())
+            .map_err(RequestError::from_inference)
     }
     #[cfg(not(feature = "vulkan"))]
     {
@@ -847,6 +908,54 @@ mod tests {
             runtime_error_code(anyhow::anyhow!("pipeline creation failed")),
             "vulkan_load_failed"
         );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_fatal_device_errors_do_not_complete_the_exchange() {
+        use crate::driver_failure::QueueWaitFailed;
+        use ash::vk::Result as VkResult;
+
+        for error in [
+            anyhow::Error::from(VkResult::ERROR_DEVICE_LOST).context("submit"),
+            anyhow::Error::from(QueueWaitFailed(VkResult::ERROR_OUT_OF_HOST_MEMORY)),
+        ] {
+            let error = RequestError::from_inference(error)
+                .response("request")
+                .unwrap_err();
+            assert!(crate::driver_failure::is_fatal(&error));
+        }
+        let validation = RequestError::from_inference(anyhow::anyhow!("duration_limit"));
+        assert!(
+            matches!(validation.response("request"), Ok(WorkerResponse::Err { code, .. }) if code == "duration_limit")
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn vulkan_load_distinguishes_driver_allocation_oom_from_other_refusals() {
+        use crate::driver_failure::allocation_failure;
+        use ash::vk::Result as VkResult;
+
+        let error =
+            allocation_failure(VkResult::ERROR_OUT_OF_DEVICE_MEMORY).context("allocate arena");
+        assert!(
+            matches!(RequestError::from_load(error).response("load"), Ok(WorkerResponse::Err { code, .. }) if code == synapse_core::VULKAN_LOAD_DEVICE_MEMORY_EXHAUSTED)
+        );
+        for (error, expected) in [
+            (
+                VkResult::ERROR_OUT_OF_DEVICE_MEMORY.into(),
+                "vulkan_load_failed",
+            ),
+            (
+                anyhow::anyhow!("vulkan_insufficient_memory"),
+                "vulkan_insufficient_memory",
+            ),
+        ] {
+            assert!(
+                matches!(RequestError::from_load(error).response("load"), Ok(WorkerResponse::Err { code, .. }) if code == expected)
+            );
+        }
     }
 
     fn eligible() -> Adapter {

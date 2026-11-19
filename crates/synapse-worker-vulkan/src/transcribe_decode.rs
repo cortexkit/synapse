@@ -170,8 +170,9 @@ pub(super) struct GpuJoint {
 
 impl Drop for GpuJoint {
     fn drop(&mut self) {
-        // Every submission waited for the queue to go idle, so nothing here is
-        // still in use. Destroying null handles is a no-op in Vulkan.
+        if self.device.retirement_unknown() {
+            return;
+        }
         unsafe {
             let raw = &self.device.raw;
             raw.destroy_pipeline(self.pipeline, None);

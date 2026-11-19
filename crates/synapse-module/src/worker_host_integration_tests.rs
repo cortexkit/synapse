@@ -6,6 +6,76 @@ use std::time::{Duration, Instant};
 use synapse_core::{EngineErrorStage, TokenBatch};
 
 #[tokio::test]
+async fn vulkan_load_oom_is_retryable_without_counting_as_a_crash() {
+    use synapse_core::{
+        ValidatedArtifact, WorkerRequest, WorkerResponse, VULKAN_LOAD_DEVICE_MEMORY_EXHAUSTED,
+    };
+
+    let lane = "catalog-test-vulkan";
+    let mut config = WorkerHostConfig::new("/bin/false", std::env::temp_dir());
+    config.catalog_lane = Some(lane.into());
+    let mut host = WorkerHost::new(config);
+    let peer = crate::worker_host::test_support::attach_mock_worker(&mut host, |request, _| {
+        let WorkerRequest::Load {
+            req_id,
+            artifact_path,
+            ..
+        } = request
+        else {
+            panic!("expected LOAD")
+        };
+        let code = if artifact_path == "fixture-oom" {
+            VULKAN_LOAD_DEVICE_MEMORY_EXHAUSTED
+        } else {
+            "vulkan_load_failed"
+        };
+        (
+            WorkerResponse::Err {
+                req_id: Some(req_id.clone()),
+                code: code.into(),
+                msg: code.into(),
+            },
+            None,
+        )
+    });
+    let artifact = ValidatedArtifact {
+        digest: "mock".into(),
+        format: "safetensors".into(),
+    };
+    let cfg = |path: &str| RuntimeConfig {
+        values: BTreeMap::from([("artifact_path".into(), path.into())]),
+    };
+    for _ in 0..2 {
+        let error = host
+            .load_model(&artifact, &cfg("fixture-oom"))
+            .await
+            .unwrap_err();
+        let engine = error.to_engine_error(EngineErrorStage::Load);
+        assert_eq!(engine.stage, EngineErrorStage::DeviceMemoryExhausted);
+        let wire = crate::worker_error_to_wire(engine, Some(lane));
+        assert_eq!(wire.code, "engine_crashed");
+        assert!(matches!(wire.class, crate::ErrorClass::Transient));
+        assert_eq!(wire.retry_after_ms, Some(250));
+        assert_eq!(
+            wire.details,
+            Some(serde_json::json!({"reason":"device_memory_exhausted"}))
+        );
+        assert!(wire.safe_to_retry_same_request);
+    }
+    let error = host
+        .load_model(&artifact, &cfg("fixture-bad-artifact"))
+        .await
+        .unwrap_err();
+    let wire =
+        crate::worker_error_to_wire(error.to_engine_error(EngineErrorStage::Load), Some(lane));
+    assert_eq!(wire.code, "artifact_invalid");
+    assert_eq!(host.health_snapshot().crash_count_window, 0);
+    assert_eq!(host.health_snapshot().quarantined_models, 0);
+    drop(host);
+    assert_eq!(peer.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn quarantined_catalog_lane_returns_transient_engine_crashed_with_remaining_cooldown() {
     let (mut host, model, root) = quarantined_host(true).await;
     let before = host.request_count();

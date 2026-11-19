@@ -1,5 +1,7 @@
 pub mod admission;
 pub mod allocation;
+#[cfg(feature = "vulkan")]
+mod driver_failure;
 pub mod protocol;
 #[cfg(feature = "vulkan")]
 pub mod runtime;

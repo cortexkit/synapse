@@ -108,6 +108,10 @@ impl Probe {
             // Keep the normal final observation so the hash is available even
             // when no intermediate readbacks are enabled.
             let (output, _, _) = exchange(loaded, id, mel, frames, valid, true, None);
+            let LoadedEngine::Speech(engine) = &loaded.engine else {
+                unreachable!("wrong engine")
+            };
+            let (submission_stats, next_dispatch_limit) = engine.debug_submission_stats();
             let hash = encoder_hash(&output.encoder_output.expect("missing final encoder"));
             let layers = captured.take();
             assert!(layers.iter().map(|(name, _)| name).eq(&names));
@@ -127,6 +131,8 @@ impl Probe {
                     "capture_layers": self.capture,
                     "first_differing_layer": first_difference,
                     "dispatch_limit_override": self.dispatch_limit,
+                    "next_dispatch_limit": next_dispatch_limit,
+                    "encoder_submissions": submission_stats,
                     "disjoint_bindings": self.disjoint,
                     "elapsed_s": started.elapsed().as_secs_f64(),
                 }})

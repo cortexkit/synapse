@@ -21,10 +21,14 @@ pub enum EngineRiskClass {
 #[serde(rename_all = "snake_case")]
 pub enum EngineErrorStage {
     Load,
+    DeviceMemoryExhausted,
     Inference,
     Unload,
     WorkerCrash,
 }
+
+/// Worker LOAD reply code for a device allocation refused by the Vulkan driver.
+pub const VULKAN_LOAD_DEVICE_MEMORY_EXHAUSTED: &str = "vulkan_device_memory_exhausted";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EngineError {

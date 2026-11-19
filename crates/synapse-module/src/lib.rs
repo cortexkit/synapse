@@ -43,6 +43,8 @@ mod certify_observations;
 mod media_jobs;
 pub mod transcribe_host;
 pub use synapse_worker_host::worker_host;
+mod worker_error;
+use worker_error::{engine_error_to_wire, transcribe_load_error_to_wire, worker_error_to_wire};
 #[cfg(all(test, unix))]
 mod worker_host_integration_tests;
 /// Plain, compiled lane declarations and tasks for offline certification. The
@@ -7742,38 +7744,6 @@ async fn execute_generate(
             .record_completed_tokens((output.n_prompt as u64).saturating_add(output.n_gen as u64));
     }
     result
-}
-
-// The generic host uses WorkerCrash only for quarantine on serving calls.
-// Ordinary transport failures use the operation's inference/load stage.
-// Catalog serving retries after a cool-down; it does not require the caller to
-// run a legacy worker probe and record approval before serving can resume.
-fn worker_error_to_wire(error: EngineError, catalog_lane: Option<&str>) -> WireOperationError {
-    if let Some(lane_id) = catalog_lane.filter(|_| error.stage == EngineErrorStage::WorkerCrash) {
-        let retry_after_ms = error
-            .retry_after_ms
-            .unwrap_or(worker_host::CATALOG_QUARANTINE_COOLDOWN.as_millis() as u64);
-        let mut wire = WireOperationError::from_stable(
-            StableError::engine_crashed(Some(retry_after_ms)),
-            error.message,
-        );
-        wire.details = Some(json!({ "lane_id": lane_id, "quarantined": true }));
-        return wire;
-    }
-    engine_error_to_wire(error)
-}
-
-fn engine_error_to_wire(error: EngineError) -> WireOperationError {
-    if error.stage == EngineErrorStage::Load {
-        return artifact_invalid_error(error.message);
-    }
-    if error.stage == EngineErrorStage::WorkerCrash && error.retry_after_ms.is_none() {
-        return WireOperationError::from_stable(StableError::probe_required(), error.message);
-    }
-    WireOperationError::from_stable(
-        StableError::engine_crashed(error.retry_after_ms),
-        error.message,
-    )
 }
 
 fn batch_items(
@@ -18571,7 +18541,7 @@ mod transcribe_self_check {
         let execution = (|| {
             phase("loading");
             // Loading a worker host validates its reported transcription revisions.
-            let host = load().map_err(|e| crashed(e.to_string()))?;
+            let host = load().map_err(transcribe_load_error_to_wire)?;
             if host.profile().id != lane.profile {
                 return Err(crashed("self-check host profile differs from lane"));
             }
