@@ -16909,10 +16909,13 @@ async fn acquire_lane_execution(
     }
 }
 fn download_publish_lock(runtime: &RuntimeState, id: &str) -> Arc<Mutex<()>> {
-    runtime
-        .download_locks
-        .lock()
-        .expect("download lock map")
+    let mut locks = runtime.download_locks.lock().expect("download lock map");
+    // Every holder or waiter of a job's fence keeps a clone of its Arc, and
+    // clones are only made here under the map lock. An entry the map alone
+    // still references therefore has no user and can go, which bounds the map
+    // by the fences in use rather than by every job id ever seen.
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks
         .entry(id.into())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -17480,23 +17483,25 @@ fn catalog_call_fault(id: &str, call: &str) -> Result<(), WireOperationError> {
 async fn execute_catalog_download(state: Arc<ModuleState>, record: JobRecord) {
     let result = fetch_catalog_download(&state, &record).await;
     if let Err(error) = result {
+        let fail_state = state.clone();
+        let fail_record = record.clone();
         if let Err(error) = catalog_download_blocking(move || {
-            let lock = download_publish_lock(&state.runtime, &record.job_id);
+            let lock = download_publish_lock(&fail_state.runtime, &fail_record.job_id);
             let _publish = lock.lock().expect("publish lock");
-            let _disk = state
+            let _disk = fail_state
                 .runtime
                 .catalog_disk
                 .lock()
                 .expect("catalog disk lock");
             let value = serde_json::to_value(error).expect("wire error");
-            match state.store.end_download_job(
-                &record.job_id,
+            match fail_state.store.end_download_job(
+                &fail_record.job_id,
                 store::DownloadEnd::Failed { error_json: &value },
-                &CatalogCache(&state.model_cache),
+                &CatalogCache(&fail_state.model_cache),
                 now_ms(),
             ) {
                 Ok(store::DownloadTransition::Applied { .. }) => {
-                    state.runtime.admission_telemetry.record_job_failed()
+                    fail_state.runtime.admission_telemetry.record_job_failed()
                 }
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "download failure transaction failed"),
@@ -17508,6 +17513,14 @@ async fn execute_catalog_download(state: Arc<ModuleState>, record: JobRecord) {
             tracing::warn!(error = %error.message, "download failure cleanup task failed");
         }
     }
+    // Progress is only reported while this task runs; drop the counters once
+    // the job has ended so a finished or purged job leaves nothing in memory.
+    state
+        .runtime
+        .download_bytes
+        .lock()
+        .expect("download counters")
+        .remove(&record.job_id);
 }
 
 // Download disk transactions and hashing must not occupy a Tokio runtime worker:
@@ -17529,7 +17542,7 @@ async fn fetch_catalog_download(
     use store::CatalogBlobCache;
     let plan_state = state.clone();
     let plan_record = record.clone();
-    let (entry, manifest, targets, files, staging) = catalog_download_blocking(move || {
+    let planned = catalog_download_blocking(move || {
         let entry = plan_state
             .runtime
             .release_catalog
@@ -17576,6 +17589,25 @@ async fn fetch_catalog_download(
             })
             .map(|f| f.size_bytes)
             .sum::<u64>();
+        // Cancellation deletes staging under the publish fence. Check that the
+        // job is still live and create staging under the same fence, so a
+        // cancel that lands before this task starts cannot be followed by a
+        // staging directory nothing would ever remove.
+        let lock = download_publish_lock(&plan_state.runtime, &plan_record.job_id);
+        let _publish = lock.lock().expect("publish lock");
+        let _disk = plan_state
+            .runtime
+            .catalog_disk
+            .lock()
+            .expect("catalog disk lock");
+        if !plan_state
+            .store
+            .get_job(&plan_record.job_id)
+            .map_err(catalog_store_error)?
+            .is_some_and(|j| store::is_download_non_terminal(&j.state))
+        {
+            return Ok(None);
+        }
         plan_state
             .runtime
             .download_bytes
@@ -17585,9 +17617,12 @@ async fn fetch_catalog_download(
         let staging = catalog_staging(&plan_state.model_cache, &plan_record.job_id);
         fs::create_dir_all(&staging)
             .map_err(|e| download_error("", "storage_full", None, e.to_string()))?;
-        Ok((entry, manifest, targets, files, staging))
+        Ok(Some((entry, manifest, targets, files, staging)))
     })
     .await?;
+    let Some((entry, manifest, targets, files, staging)) = planned else {
+        return Ok(());
+    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
@@ -17695,6 +17730,14 @@ async fn fetch_catalog_download(
             let Some(body) = body else {
                 break;
             };
+            // Refuse an oversized body at the first chunk that would pass the
+            // pinned size, before writing it, so a wrong or endless response
+            // cannot fill the cache filesystem. The final size and digest
+            // checks below still decide whether a complete body matches.
+            let received = size.saturating_add(body.len() as u64);
+            if received > file.size_bytes {
+                return Err(catalog_artifact_error(file, None, Some(received)));
+            }
             let write_state = state.clone();
             let write_record = record.clone();
             let write_file = file.clone();
