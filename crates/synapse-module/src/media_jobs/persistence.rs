@@ -230,7 +230,10 @@ pub(super) fn check_audio(
     audio: &objects::MediaValue,
 ) -> Answer<Option<Vec<u8>>> {
     if let Some(data) = &audio.data {
-        return STANDARD.decode(data).map(Some).map_err(|_| invalid("audio"));
+        return STANDARD
+            .decode(data)
+            .map(Some)
+            .map_err(|_| invalid("audio"));
     }
     let o = object(
         state,

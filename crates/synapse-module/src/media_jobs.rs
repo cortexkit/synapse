@@ -77,7 +77,12 @@ impl AdmissionLease {
 
 impl Drop for AdmissionLease {
     fn drop(&mut self) {
-        let mut admitting = self.runtime.media.admitting.lock().expect("media admissions");
+        let mut admitting = self
+            .runtime
+            .media
+            .admitting
+            .lock()
+            .expect("media admissions");
         if let Some(count) = admitting.get_mut(&self.lane) {
             *count -= 1;
             if *count == 0 {
@@ -89,7 +94,9 @@ impl Drop for AdmissionLease {
 
 /// Runs synchronous media work (SQLite, files, WAV inspection) on the blocking
 /// pool, so it never stalls the async threads serving other requests.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Answer<T> + Send + 'static) -> Answer<T> {
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Answer<T> + Send + 'static,
+) -> Answer<T> {
     tokio::task::spawn_blocking(work)
         .await
         .unwrap_or_else(|error| Err(internal(error)))
@@ -304,9 +311,7 @@ pub(super) async fn handle(
                 "media.status" | "media.result" | "media.cancel" => {
                     persistence::job_answer(&state, owner, &method, params)
                 }
-                "certify.transcribe_observation" => {
-                    persistence::observation(&state, owner, params)
-                }
+                "certify.transcribe_observation" => persistence::observation(&state, owner, params),
                 _ => Err(fault("unknown_method", None)),
             })
         })
@@ -405,6 +410,9 @@ type AdmissionGuard = (
     tokio::sync::OwnedRwLockReadGuard<()>,
 );
 
+// Built once per submit and immediately destructured, so the size gap
+// between the variants costs nothing worth a heap allocation.
+#[allow(clippy::large_enum_variant)]
 enum Admission {
     Replay(String),
     Job {
@@ -507,9 +515,9 @@ fn admit_submission(state: &Arc<ModuleState>, owner: &str, params: Value) -> Ans
     }
     if input.language.as_ref().is_some_and(|hint| {
         entry.languages.as_ref().is_none_or(|languages| {
-            !languages.iter().any(|language| {
-                cortexkit_role_media::describe::language_matches(language, hint)
-            })
+            !languages
+                .iter()
+                .any(|language| cortexkit_role_media::describe::language_matches(language, hint))
         })
     }) {
         return Err(unsupported("input.language"));
@@ -643,9 +651,8 @@ async fn wait_for_lane(
                 return None;
             }
         };
-        let wait = deadline.map(|deadline| {
-            Duration::from_millis(deadline.saturating_sub(clock_ms(state)).max(1))
-        });
+        let wait = deadline
+            .map(|deadline| Duration::from_millis(deadline.saturating_sub(clock_ms(state)).max(1)));
         tokio::select! {
             biased;
             owner = &mut acquire => return Some(owner),
