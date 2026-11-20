@@ -139,16 +139,23 @@ async fn media_submit_reads_and_inspects_audio_outside_shared_locks() {
         .await
         .unwrap();
     // The submit now holds its recording; neither shared lock may be held.
-    assert!(state.runtime.catalog_disk.try_lock().is_ok());
-    let unknown = tokio::time::timeout(
+    let disk_free = state.runtime.catalog_disk.try_lock().is_ok();
+    let status = tokio::time::timeout(
         Duration::from_secs(10),
         call(&state, "alice", "media.status", json!({"job_id":"missing"})),
     )
-    .await
-    .expect("media.status must not wait for another submit's audio")
-    .unwrap_err();
-    assert_eq!(unknown.0["code"], "unknown_job");
+    .await;
+    // Release before asserting, so a failure reports instead of hanging on
+    // the blocked admission at runtime shutdown.
     release.open();
+    assert!(
+        disk_free,
+        "catalog-disk lock must be free while audio is read"
+    );
+    let unknown = status
+        .expect("media.status must not wait for another submit's audio")
+        .unwrap_err();
+    assert_eq!(unknown.0["code"], "unknown_job");
     let id = submit.await.unwrap().unwrap()["job_id"].clone();
     assert_eq!(done(&state, id.as_str().unwrap()).await["status"], "done");
     *state.runtime.media.admission_probe.lock().unwrap() = None;
@@ -195,11 +202,14 @@ async fn media_interrupted_unload_keeps_the_lane_locked_until_the_host_retires()
     unloading.abort();
     let _ = unloading.await;
     let cache = lane_cache(&state.runtime, &lane);
+    let locked = cache.try_lock().is_err();
+    // Release before asserting, so a failure reports instead of hanging on
+    // the blocked unload at runtime shutdown.
+    release.open();
     assert!(
-        cache.try_lock().is_err(),
+        locked,
         "the lane must stay locked until its old host has retired"
     );
-    release.open();
     let retired = tokio::time::timeout(Duration::from_secs(10), cache.lock())
         .await
         .expect("the unload finishes once released");
