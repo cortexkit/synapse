@@ -107,10 +107,14 @@ jobs:
             choco install ninja -y --no-progress
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
+      # Pin the VS 2022 toolset (14.44) that CUDA 13.2's nvcc supports. With the
+      # image's newer default toolset, nvcc's cudafe++ front end crashes with an
+      # access violation while compiling the CUDA kernels.
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
           arch: x64
+          toolset: '14.44'
       - name: Select the x64 MSVC linker for Cargo
         if: runner.os == 'Windows'
         shell: pwsh
