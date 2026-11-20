@@ -18,15 +18,19 @@ mod catalog;
 mod catalog_migration;
 mod catalog_probe;
 mod diagnostics_findings;
+mod embed_job;
 mod engram_catalog;
 mod event_outbox;
 mod lane_pause;
+mod slot_wait;
 pub use backend_check::check_backend;
 use backend_check::{backend_reason, detected_catalog_backends, resolve_worker_binary_sibling};
 mod settings;
 use catalog_migration::migrate_compiled_catalog_digests;
 #[cfg(test)]
 mod detection_tests;
+#[cfg(test)]
+mod embed_request_tests;
 #[cfg(test)]
 mod rerank_readout_tests;
 #[cfg(all(test, unix))]
@@ -972,6 +976,7 @@ struct RuntimeState {
     catalog_disk: Mutex<()>,
     self_check_holders: Mutex<BTreeMap<String, String>>,
     catalog_jobs: Mutex<BTreeMap<String, String>>,
+    embed_digest_writers: embed_job::DigestWriters,
     inline: InlineConfig,
     jobs: JobConfig,
     worker_load_timeout: Duration,
@@ -1850,6 +1855,7 @@ impl RuntimeState {
             catalog_disk: Mutex::new(()),
             self_check_holders: Mutex::new(BTreeMap::new()),
             catalog_jobs: Mutex::new(BTreeMap::new()),
+            embed_digest_writers: Default::default(),
             inline,
             jobs,
             worker_load_timeout,
@@ -3945,18 +3951,29 @@ async fn wait_for_model_loaded(
                 format!("unknown model_id '{model_id}'"),
             ));
         };
-        match (&snapshot.state, snapshot.loaded.clone()) {
-            (ModelRuntimeState::Ready, Some(model)) => return Ok(model),
-            (ModelRuntimeState::Failed(error), _) => return Err(error.clone()),
-            _ => {}
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero()
-            || tokio::time::timeout(remaining, snapshot.notify.notified())
-                .await
-                .is_err()
-        {
-            return Err(model_load_timeout_error(model_id, timeout_ms));
+        // Read the slot again only after subscribing to its wake-up.
+        let read = || match model_slot_snapshot(runtime, model_id) {
+            None => slot_wait::SlotCheck::Settled(Err(WireOperationError::from_stable(
+                StableError::artifact_invalid(),
+                format!("unknown model_id '{model_id}'"),
+            ))),
+            Some(slot) if !Arc::ptr_eq(&slot.notify, &snapshot.notify) => {
+                slot_wait::SlotCheck::Changed
+            }
+            Some(slot) => match (&slot.state, slot.loaded.clone()) {
+                (ModelRuntimeState::Ready, Some(model)) => slot_wait::SlotCheck::Settled(Ok(model)),
+                (ModelRuntimeState::Failed(error), _) => {
+                    slot_wait::SlotCheck::Settled(Err(error.clone()))
+                }
+                _ => slot_wait::SlotCheck::Pending,
+            },
+        };
+        match slot_wait::check_then_wait(&snapshot.notify, deadline, read).await {
+            Ok(settled) => return settled,
+            Err(slot_wait::SlotWait::Recheck) => {}
+            Err(slot_wait::SlotWait::TimedOut) => {
+                return Err(model_load_timeout_error(model_id, timeout_ms))
+            }
         }
     }
 }
@@ -5522,18 +5539,8 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let catalog_pairs = match preflight_catalog_sequences(
-        &state,
-        params.model.as_deref(),
-        params.required_fingerprint.as_deref(),
-        params.target_fingerprint.as_deref(),
-        Some(&params.query),
-        &candidates,
-    ) {
-        Ok(pairs) => pairs,
-        Err(error) => return result_outcome(error_payload(&state, error)),
-    };
-    let catalog_request = catalog_pairs.is_some();
+    // The fixed candidate limit needs no tokenization, so it refuses before
+    // the catalog preflight composes and tokenizes every query/document pair.
     if params.candidates.len() > state.runtime.inline.max_items {
         return result_outcome(error_payload(
             &state,
@@ -5547,6 +5554,18 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ),
         ));
     }
+    let catalog_pairs = match preflight_catalog_sequences(
+        &state,
+        params.model.as_deref(),
+        params.required_fingerprint.as_deref(),
+        params.target_fingerprint.as_deref(),
+        Some(&params.query),
+        &candidates,
+    ) {
+        Ok(pairs) => pairs,
+        Err(error) => return result_outcome(error_payload(&state, error)),
+    };
+    let catalog_request = catalog_pairs.is_some();
 
     let request_deadline = request_started
         + Duration::from_millis(
@@ -5606,7 +5625,7 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
     texts.push(params.query.as_str());
     texts.extend(params.candidates.iter().map(String::as_str));
     let request_bytes = request_bytes_for_texts(texts.iter().copied());
-    let tokenized = match model.tokenizer.tokenize_batch_without_special_tokens(texts) {
+    let mut tokenized = match model.tokenizer.tokenize_batch_without_special_tokens(texts) {
         Ok(tokenized) => tokenized,
         Err(error) => {
             return result_outcome(error_payload(
@@ -5615,7 +5634,9 @@ async fn rerank_score(state: Arc<ModuleState>, params: Value) -> HandlerOutcome 
             ))
         }
     };
-    let mut token_items = tokenized.batch.items.clone();
+    // Only the token counts and disclosures are read from `tokenized` after
+    // this, so the raw ids move out instead of being copied.
+    let mut token_items = std::mem::take(&mut tokenized.batch.items);
     let query = token_items.remove(0);
     let candidate_token_counts = if catalog_request {
         owned_pairs
@@ -6015,6 +6036,11 @@ async fn submit_embed_batch_job(
 
     let record = admission.record().clone();
     let job_minted = matches!(admission, JobAdmission::Admitted(_));
+    if let Err(error) =
+        embed_job::refuse_foreign_retained_pages(&state, &admission, &work.model.fingerprint.0)
+    {
+        return result_outcome(error_payload(&state, error));
+    }
     if job_minted {
         state.runtime.admission_telemetry.record_job_minted();
         log_job_admitted(&work.model.model_id, &record.job_id);
@@ -6033,6 +6059,13 @@ async fn execute_embed_batch_job(
     job_id: String,
     mut work: EmbedBatchJobWork,
 ) {
+    // Jobs sharing a digest share its pages; the claim below then counts the
+    // pages an earlier writer committed.
+    let _writer = state
+        .runtime
+        .embed_digest_writers
+        .acquire(&work.request_digest)
+        .await;
     let record = match state
         .store
         .claim_job_attempt(&job_id, state.module_generation, now_ms())
@@ -6044,6 +6077,13 @@ async fn execute_embed_batch_job(
             return;
         }
     };
+    if let Err(error) =
+        embed_job::check_retained_fingerprint(&state.store, &record, &work.model.fingerprint.0)
+    {
+        let transient = error.class == ErrorClass::Transient;
+        fail_job_with_wire_error(&state, &job_id, transient, error);
+        return;
+    }
 
     let _pause_guard = match lane_pause::admit(&state.runtime, &work.model.model_id) {
         Ok(guard) => guard,
@@ -6055,6 +6095,7 @@ async fn execute_embed_batch_job(
 
     let started = Instant::now();
     let requested_tokens = work.total_tokens;
+    let deadline = embed_job::execution_deadline(&record);
     let committed_ids = match state.store.committed_item_ids(&record.request_digest) {
         Ok(ids) => ids,
         Err(error) => {
@@ -6115,7 +6156,7 @@ async fn execute_embed_batch_job(
             "module_generation": state.module_generation,
         });
         match state.store.finish_job(&job_id, &summary, now_ms()) {
-            Ok(()) => {
+            Ok(true) => {
                 state.runtime.admission_telemetry.record_job_completed();
                 log_job_done(
                     &work.model.model_id,
@@ -6125,6 +6166,7 @@ async fn execute_embed_batch_job(
                     started,
                 );
             }
+            Ok(false) => fail_job_with_wire_error(&state, &job_id, true, embed_job::ended_error()),
             Err(error) => fail_job_with_wire_error(
                 &state,
                 &job_id,
@@ -6144,7 +6186,7 @@ async fn execute_embed_batch_job(
         work.tokenized.batch.clone(),
         work.total_tokens,
         work.request_bytes,
-        None,
+        deadline,
         Some(&job_id),
     )
     .await
@@ -6208,7 +6250,7 @@ async fn execute_embed_batch_job(
         }
     }
     match state.store.finish_job(&job_id, &summary, now_ms()) {
-        Ok(()) => {
+        Ok(true) => {
             state.runtime.admission_telemetry.record_job_completed();
             log_job_done(
                 &work.model.model_id,
@@ -6218,6 +6260,8 @@ async fn execute_embed_batch_job(
                 started,
             );
         }
+        // The job ended first, normally at its execution TTL; that outcome stands.
+        Ok(false) => fail_job_with_wire_error(&state, &job_id, true, embed_job::ended_error()),
         Err(error) => fail_job_with_wire_error(
             &state,
             &job_id,
@@ -6277,6 +6321,14 @@ async fn execute_embedding_quanta(
     let mut dispatch_count = 0_usize;
     let mut scheduler_wait_ms = 0.0_f64;
     while batch_cursor < engine_batches.len() {
+        // Expired work starts no further quanta; an engine call already
+        // dispatched drains under its own guards.
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(WireOperationError::from_stable(
+                StableError::deadline_exceeded(),
+                "execution deadline passed between embedding quanta",
+            ));
+        }
         let wait_started = Instant::now();
         let Some(dispatch) = scheduler.next_dispatch(&SystemClock) else {
             scheduler_wait_ms += wait_started.elapsed().as_secs_f64() * 1_000.0;
@@ -7754,7 +7806,7 @@ fn batch_items(
         return Err("embed.batch accepts either items or texts, not both".to_string());
     }
     if !items.is_empty() {
-        return Ok(items
+        let items = items
             .into_iter()
             .enumerate()
             .map(|(index, item)| match item {
@@ -7764,7 +7816,18 @@ fn batch_items(
                     text,
                 },
             })
-            .collect());
+            .collect::<Vec<_>>();
+        // Results and checkpoints are keyed by item id, so two inputs sharing
+        // one id could not both be stored or resumed. Ids synthesized from a
+        // bare string's position count too.
+        let mut seen = BTreeSet::new();
+        if let Some(duplicate) = items.iter().find(|item| !seen.insert(item.id.as_str())) {
+            return Err(format!(
+                "embed.batch item id '{}' is used by more than one item",
+                duplicate.id
+            ));
+        }
+        return Ok(items);
     }
     Ok(texts
         .into_iter()
@@ -9030,9 +9093,9 @@ mod tests {
     const ANE_TEST_LANE: &str = "gte-modernbert-base-ane";
 
     #[cfg(unix)]
-    struct AneLaneFixture {
+    pub(super) struct AneLaneFixture {
         root: PathBuf,
-        state: Arc<ModuleState>,
+        pub(super) state: Arc<ModuleState>,
         engine: Arc<worker_host::ane_residency::DirectAneEngine>,
         control: worker_host::ane_residency::ModuleMockControl,
     }
@@ -9104,7 +9167,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn finish_ane_lane_fixture(fixture: AneLaneFixture) {
+    pub(super) async fn finish_ane_lane_fixture(fixture: AneLaneFixture) {
         let AneLaneFixture {
             root,
             state,
@@ -9731,17 +9794,19 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const PACKING_TEST_LANE: &str = "qwen3-embedding-0.6b-ane";
+    pub(super) const PACKING_TEST_LANE: &str = "qwen3-embedding-0.6b-ane";
     #[cfg(unix)]
     const PACKING_TEST_MODEL: &str = "ane-direct:qwen3-embedding-0.6b.ane-direct-worker:pinned";
 
     #[cfg(unix)]
     #[derive(Default)]
-    struct PackingPeer {
+    pub(super) struct PackingPeer {
         requests: Vec<synapse_core::WorkerRequest>,
         admission_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         inference_gate: Option<(Arc<Notify>, Arc<Notify>)>,
         corrupt: bool,
+        /// Answers the next inference with a worker error instead of vectors.
+        pub(super) fail_next_inference: bool,
     }
 
     #[cfg(unix)]
@@ -9818,6 +9883,17 @@ mod tests {
                                 if let Some((started, release)) = gate {
                                     started.notify_one();
                                     release.notified().await;
+                                }
+                                if std::mem::take(&mut peer.lock().unwrap().fail_next_inference) {
+                                    let failed = WorkerResponse::Err {
+                                        req_id: Some(req_id.clone()),
+                                        code: "injected".into(),
+                                        msg: "injected inference failure".into(),
+                                    };
+                                    if write_json(&mut worker, &failed, max).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
                                 }
                                 let packed = matches!(request, WorkerRequest::EmbedPacked { .. });
                                 if let WorkerRequest::EmbedPacked { passes, .. } = &request {
@@ -9912,7 +9988,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn packing_lane_fixture(
+    pub(super) async fn packing_lane_fixture(
         config: ModuleConfig,
         passed: bool,
     ) -> (AneLaneFixture, Arc<Mutex<PackingPeer>>) {
@@ -14139,7 +14215,7 @@ mod tests {
     // Only the Unix-only catalog worker tests call this; gate it with them so
     // Windows builds don't see it as dead code.
     #[cfg(unix)]
-    fn catalog_test_state(
+    pub(super) fn catalog_test_state(
         dir: &Path,
         descriptor: &StorageDescriptor,
         id: &str,
@@ -14487,8 +14563,10 @@ mod tests {
                     json!({"model":lane,"items":[item.clone()]}),
                     "row-8193",
                 );
-                let mut items =
-                    vec![json!({"id":"short","text":"a"}); state.runtime.inline.max_items];
+                // Distinct ids: a repeated id is refused before the sequence check.
+                let mut items = (0..state.runtime.inline.max_items)
+                    .map(|row| json!({"id":format!("short-{row}"),"text":"a"}))
+                    .collect::<Vec<_>>();
                 items.push(item);
                 assert_catalog_boundary_refusal(
                     &state,
@@ -19510,7 +19588,7 @@ async fn numerical_profile_preload_check(
     profile: &str,
     references: synapse_certify::self_check::References,
     held_guard: Option<HeldLaneGate>,
-) -> Result<synapse_parity::evaluator::SubsetEvaluation, WireOperationError> {
+) -> Result<synapse_parity::evaluator::SubsetEvaluation, ProfileCheckError> {
     use synapse_parity::evaluator::{ObservedCase, Output};
     let mut outputs = BTreeMap::new();
     for case in &references.cases {
@@ -19532,7 +19610,8 @@ async fn numerical_profile_preload_check(
                 None,
                 held_guard.clone(),
             )
-            .await?;
+            .await
+            .map_err(ProfileCheckError::Interrupted)?;
             let vector = vectors
                 .into_iter()
                 .next()
@@ -19563,7 +19642,8 @@ async fn numerical_profile_preload_check(
                 None,
                 held_guard.clone(),
             )
-            .await?;
+            .await
+            .map_err(ProfileCheckError::Interrupted)?;
             let score =
                 scores.scores.into_iter().next().ok_or_else(|| {
                     profile_preload_check_error(profile, "missing self-check score")
@@ -19598,7 +19678,24 @@ async fn numerical_profile_preload_check(
         &references.fixtures,
         &outputs,
     )
-    .map_err(|error| profile_preload_check_error(profile, &error.to_string()))
+    .map_err(|error| profile_preload_check_error(profile, &error.to_string()).into())
+}
+
+/// Why a numerical self-check produced no evaluation.
+enum ProfileCheckError {
+    /// Running a reference input failed, for example because the worker
+    /// crashed. The check never compared any output, so it stays pending and
+    /// the next request runs it again.
+    Interrupted(WireOperationError),
+    /// The references, inputs or outputs themselves were unusable; the check
+    /// is recorded as failed for its key.
+    Rejected(WireOperationError),
+}
+
+impl From<WireOperationError> for ProfileCheckError {
+    fn from(error: WireOperationError) -> Self {
+        Self::Rejected(error)
+    }
 }
 
 async fn ensure_profile_preload_ready(
@@ -19977,7 +20074,13 @@ async fn check_profile_model(
         match numerical_profile_preload_check(state, &model, profile, references, Some(gate)).await
         {
             Ok(evaluation) => evaluation,
-            Err(error) => {
+            Err(ProfileCheckError::Interrupted(error)) => {
+                // No output was compared, so a persisted failure would wrongly
+                // disable the lane for this key after the engine recovers.
+                catalog_complete_check(state, &id, generation, "pending", None)?;
+                return Err(error);
+            }
+            Err(ProfileCheckError::Rejected(error)) => {
                 let reason = serde_json::to_string(&error).expect("wire error serializes");
                 catalog_complete_check(state, &id, generation, "failed", Some(&reason))?;
                 return Err(profile_preload_check_error(profile, &reason));
@@ -20342,7 +20445,30 @@ fn catalog_file_stamp(path: &Path) -> Option<[String; 5]> {
                 .to_string(),
         ])
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        // The Windows counterparts of device, inode and ctime. A volume that
+        // reports no file id or change time gets no stamp, so its files are
+        // always hashed.
+        let identity = synapse_native_probe::windows::file_identity(&file).ok()?;
+        if identity.file_id == [0; 16] || identity.change_time == 0 {
+            return None;
+        }
+        Some([
+            identity.volume_serial.to_string(),
+            hex::encode(identity.file_id),
+            metadata.file_size().to_string(),
+            metadata.last_write_time().to_string(),
+            identity.change_time.to_string(),
+        ])
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None
@@ -20902,6 +21028,17 @@ async fn submit_catalog_embed_job(
         }
     };
     let record = admission.record().clone();
+    if let Err(error) =
+        embed_job::refuse_foreign_retained_pages(&state, &admission, &backend.fingerprint)
+    {
+        state
+            .runtime
+            .catalog_jobs
+            .lock()
+            .expect("catalog jobs")
+            .remove(&record.job_id);
+        return result_outcome(error_payload(&state, error));
+    }
     let response = job_status_payload(&state, &record);
     if matches!(admission, JobAdmission::Admitted(_)) {
         state.runtime.admission_telemetry.record_job_minted();

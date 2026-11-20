@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use synapse_core::{EngineIdentity, Fingerprint, MachineProfile, NumericProfileId};
 use thiserror::Error;
 
+#[cfg(test)]
+mod job_tests;
 mod registration_reconciliation;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -2044,8 +2046,12 @@ impl SynapseStore {
         let claim = self.store.with_conn_fenced(|tx| {
             expire_jobs_tx(tx, now_ms as i64)?;
             let active_attempt_id = new_job_id(job_id, module_generation, now_ms);
+            // Pages belong to the digest, so an attempt starts after every page
+            // another job for the same digest committed since this one was admitted.
             let changed = tx.execute(
-                "UPDATE jobs SET state = ?1, updated_ms = ?2, active_attempt_id = ?3
+                "UPDATE jobs SET state = ?1, updated_ms = ?2, active_attempt_id = ?3,
+                     page_count = (SELECT COUNT(1) FROM result_pages p
+                                   WHERE p.request_digest = jobs.request_digest)
                  WHERE job_id = ?4 AND module_generation = ?5 AND state = ?6
                    AND active_attempt_id IS NULL AND execution_expires_ms > ?2",
                 params![
@@ -2092,7 +2098,7 @@ impl SynapseStore {
                 now_ms,
             )?;
         }
-        self.finish_job(job_id, result_json, now_ms)
+        self.finish_job(job_id, result_json, now_ms).map(drop)
     }
 
     pub fn commit_job_page(
@@ -2109,6 +2115,9 @@ impl SynapseStore {
             ));
         }
         self.store.with_conn_fenced(|tx| {
+            // A job past its execution TTL fails here even if no poll or sweep
+            // has expired it yet, so a late attempt cannot publish pages.
+            expire_job_tx(tx, job_id, now_ms as i64)?;
             let (request_digest, visible_page_count, state, kind): (String, i64, String, String) =
                 tx.query_row(
                     "SELECT request_digest, page_count, state, kind FROM jobs WHERE job_id = ?1",
@@ -2163,26 +2172,39 @@ impl SynapseStore {
         Ok(())
     }
 
+    /// Marks an active job done. Returns `false`, changing nothing, when the
+    /// job already ended, including by passing its execution TTL: a recorded
+    /// terminal outcome is never replaced.
     pub fn finish_job(
         &self,
         job_id: &str,
         result_json: &Value,
         now_ms: u64,
-    ) -> Result<(), SynapseStoreError> {
+    ) -> Result<bool, SynapseStoreError> {
         let result_bytes = serde_json::to_vec(result_json)?;
-        self.store.with_conn_fenced(|tx| {
-            tx.execute(
+        let finished = self.store.with_conn_fenced(|tx| {
+            expire_job_tx(tx, job_id, now_ms as i64)?;
+            let changed = tx.execute(
                 "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
                      execution_expires_ms = NULL, active_attempt_id = NULL,
                      result_json = ?3, error_json = NULL
-                 WHERE job_id = ?4",
-                params![JOB_STATE_DONE, now_ms as i64, result_bytes, job_id],
+                 WHERE job_id = ?4 AND state IN (?5, ?6)",
+                params![
+                    JOB_STATE_DONE,
+                    now_ms as i64,
+                    result_bytes,
+                    job_id,
+                    JOB_STATE_QUEUED,
+                    JOB_STATE_RUNNING,
+                ],
             )?;
-            Ok(())
+            Ok(changed > 0)
         })?;
-        Ok(())
+        Ok(finished)
     }
 
+    /// Records the failure of an active job. A job that already ended,
+    /// including by passing its execution TTL, keeps its recorded outcome.
     pub fn fail_job(
         &self,
         job_id: &str,
@@ -2197,12 +2219,20 @@ impl SynapseStore {
             JOB_STATE_FAILED_PERMANENT
         };
         self.store.with_conn_fenced(|tx| {
+            expire_job_tx(tx, job_id, now_ms as i64)?;
             tx.execute(
                 "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
                      execution_expires_ms = NULL, active_attempt_id = NULL,
                      error_json = ?3, result_json = NULL
-                 WHERE job_id = ?4",
-                params![state, now_ms as i64, error_bytes, job_id],
+                 WHERE job_id = ?4 AND state IN (?5, ?6)",
+                params![
+                    state,
+                    now_ms as i64,
+                    error_bytes,
+                    job_id,
+                    JOB_STATE_QUEUED,
+                    JOB_STATE_RUNNING,
+                ],
             )?;
             Ok(())
         })?;
@@ -3449,6 +3479,23 @@ fn cache_error(action: &str, subject: &str, error: std::io::Error) -> rusqlite::
     )))
 }
 fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Result<usize> {
+    expire_jobs_where_tx(tx, None, now_ms)
+}
+
+fn expire_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    expire_jobs_where_tx(tx, Some(job_id), now_ms).map(drop)
+}
+
+/// Fails every active job past its execution TTL, or only `job_id` when given.
+fn expire_jobs_where_tx(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
     let execution_error = serde_json::to_vec(&serde_json::json!({
         "code": "deadline_exceeded",
         "class": "transient",
@@ -3460,50 +3507,29 @@ fn expire_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Resu
     // execution_expires_ms, and the kind filter keeps them exempt even if a
     // deadline were ever written. They end only through their own commit,
     // cancel or failure transactions, which also clean up their blobs.
-    let execution_expired = tx.execute(
-        "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
-             execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
-         WHERE state IN (?4, ?5) AND execution_expires_ms <= ?2 AND kind <> ?6",
-        params![
-            JOB_STATE_FAILED_TRANSIENT,
-            now_ms,
-            execution_error,
-            JOB_STATE_QUEUED,
-            JOB_STATE_RUNNING,
-            DOWNLOAD_JOB_KIND,
-        ],
-    )?;
-    Ok(execution_expired)
-}
-
-fn expire_job_tx(
-    tx: &rusqlite::Transaction<'_>,
-    job_id: &str,
-    now_ms: i64,
-) -> rusqlite::Result<()> {
-    let execution_error = serde_json::to_vec(&serde_json::json!({
-        "code": "deadline_exceeded",
-        "class": "transient",
-        "safe_to_retry_same_request": false,
-        "message": "durable job execution TTL expired",
-    }))
-    .expect("execution expiry error serializes");
+    // A separate predicate per scope keeps the single-job form on the primary key.
+    let scope = if job_id.is_some() {
+        "job_id = ?7"
+    } else {
+        "?7 IS NULL"
+    };
     tx.execute(
-        "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
-             execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
-         WHERE job_id = ?4 AND state IN (?5, ?6) AND execution_expires_ms <= ?2
-           AND kind <> ?7",
+        &format!(
+            "UPDATE jobs SET state = ?1, updated_ms = ?2, terminal_at_ms = ?2,
+                 execution_expires_ms = NULL, active_attempt_id = NULL, error_json = ?3
+             WHERE {scope} AND state IN (?4, ?5) AND execution_expires_ms <= ?2
+               AND kind <> ?6"
+        ),
         params![
             JOB_STATE_FAILED_TRANSIENT,
             now_ms,
             execution_error,
-            job_id,
             JOB_STATE_QUEUED,
             JOB_STATE_RUNNING,
             DOWNLOAD_JOB_KIND,
+            job_id,
         ],
-    )?;
-    Ok(())
+    )
 }
 
 fn purge_retained_jobs_tx(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> rusqlite::Result<usize> {
@@ -3932,7 +3958,7 @@ mod tests {
         }
     }
 
-    fn admit(
+    pub(super) fn admit(
         store: &SynapseStore,
         request_key: &str,
         request_digest: &str,
@@ -4055,149 +4081,6 @@ mod tests {
             assert_eq!(job.error_json.unwrap()["code"], "module_restarted");
         }
         assert!(store.get_job_page(&running, 0).unwrap().is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn request_key_rejects_a_different_digest_and_same_digest_creates_a_fresh_attempt() {
-        let (root, descriptor) = temp_descriptor("request-key");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let generation = store.next_module_generation().unwrap();
-        let first = admit(&store, "same-key", "digest-a", generation, 100, 1_000, 500);
-        let first_id = first.record().job_id.clone();
-        let same = admit(&store, "same-key", "digest-a", generation, 101, 1_000, 500);
-        assert!(matches!(same, JobAdmission::Existing(_)));
-        assert_eq!(same.record().job_id, first_id);
-
-        let conflict = store
-            .admit_job(
-                "same-key",
-                "digest-b",
-                "embed.batch",
-                generation,
-                &serde_json::json!({"items": 2}),
-                102,
-                1_000,
-                500,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            conflict,
-            SynapseStoreError::IdempotencyConflict { .. }
-        ));
-
-        store
-            .fail_job(
-                &first_id,
-                true,
-                &serde_json::json!({"code": "module_restarted"}),
-                103,
-            )
-            .unwrap();
-        let fresh = admit(&store, "same-key", "digest-a", generation, 104, 1_000, 500);
-        assert!(matches!(fresh, JobAdmission::Admitted(_)));
-        assert_ne!(fresh.record().job_id, first_id);
-        assert!(store.get_job_at(&first_id, 105).unwrap().is_some());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn page_commit_rolls_back_as_a_unit_and_resume_skips_committed_ids() {
-        let (root, descriptor) = temp_descriptor("atomic-page");
-        let store = SynapseStore::open(&descriptor).unwrap();
-        let generation = store.next_module_generation().unwrap();
-        let job_id = admit(
-            &store,
-            "page-key",
-            "page-digest",
-            generation,
-            1_000,
-            1_000,
-            100,
-        )
-        .record()
-        .job_id
-        .clone();
-        assert!(store.mark_job_running(&job_id, generation, 1_001).unwrap());
-        let active_attempt_id = store
-            .get_job_at(&job_id, 1_001)
-            .unwrap()
-            .unwrap()
-            .active_attempt_id
-            .unwrap();
-        assert_ne!(active_attempt_id, job_id);
-        assert!(matches!(
-            store.claim_job_attempt(&job_id, generation, 1_001).unwrap(),
-            JobAttemptClaim::Attached {
-                active_attempt_id: attached,
-                ..
-            } if attached == active_attempt_id
-        ));
-        assert!(store
-            .commit_job_page(&job_id, 0, br#"{"page":0}"#, &[], 1_002)
-            .is_err());
-        let duplicate_items = [
-            CheckpointItem {
-                item_id: "item-1".to_string(),
-                result: vec![1],
-            },
-            CheckpointItem {
-                item_id: "item-1".to_string(),
-                result: vec![2],
-            },
-        ];
-        assert!(store
-            .commit_job_page(&job_id, 0, br#"{"page":0}"#, &duplicate_items, 1_002)
-            .is_err());
-        assert_eq!(store.checkpoint_count("page-digest").unwrap(), 0);
-        assert_eq!(
-            store
-                .get_job_at(&job_id, 1_003)
-                .unwrap()
-                .unwrap()
-                .page_count,
-            0
-        );
-        assert!(store.get_job_page(&job_id, 0).unwrap().is_none());
-
-        store
-            .commit_job_page(
-                &job_id,
-                0,
-                br#"{"page":0}"#,
-                &[CheckpointItem {
-                    item_id: "item-1".to_string(),
-                    result: vec![1],
-                }],
-                1_004,
-            )
-            .unwrap();
-        store
-            .fail_job(
-                &job_id,
-                true,
-                &serde_json::json!({"code": "module_restarted"}),
-                1_005,
-            )
-            .unwrap();
-        let resumed = admit(
-            &store,
-            "page-key",
-            "page-digest",
-            generation,
-            1_006,
-            1_000,
-            100,
-        );
-        assert_eq!(resumed.record().page_count, 1);
-        assert_eq!(
-            store.committed_item_ids("page-digest").unwrap(),
-            ["item-1".to_string()].into_iter().collect()
-        );
-        assert!(store
-            .get_job_page(&resumed.record().job_id, 0)
-            .unwrap()
-            .is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6077,7 +5960,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    fn temp_descriptor(label: &str) -> (std::path::PathBuf, StorageDescriptor) {
+    pub(super) fn temp_descriptor(label: &str) -> (std::path::PathBuf, StorageDescriptor) {
         let root = std::env::temp_dir().join(format!(
             "synapse-store-{label}-{}-{}",
             std::process::id(),

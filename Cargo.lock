@@ -7319,6 +7319,7 @@ dependencies = [
  "synapse-core",
  "synapse-engine-owned",
  "synapse-module",
+ "synapse-native-probe",
  "synapse-parity",
  "synapse-speech",
  "synapse-store",

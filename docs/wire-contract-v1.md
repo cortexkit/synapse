@@ -190,7 +190,10 @@ message. A failed download carries `error` beside `state` in its flat status.
   promised delay. A deadline that covers a first-time compile (about 30 s for
   short inputs, minutes for 4096 tokens and more) avoids this code.
 - `idempotency_conflict` — permanent, not safe to retry unchanged; replace a
-  download key bound to a different digest.
+  download key bound to a different digest. An `embed.batch` job whose retained
+  pages were computed under a fingerprint other than the one the model now
+  resolves to is refused the same way, at submit or when its attempt starts;
+  resubmit with a new `request_key`.
 
 ## 3. Common request fields (acceptance constraints)
 
@@ -591,7 +594,9 @@ Operator examples: `ck-synapse-opctl lanes pause --minutes 45 --reason measureme
   latency path. Full envelope incl. fingerprint/equivalent_to (one-comparison
   hot path).
 - **embed.batch** {model, items[{id, text}], …} — inline under the byte/item
-  budget; over budget → job: {job_id} back immediately.
+  budget; over budget → job: {job_id} back immediately. Item ids must be
+  unique, counting the position ids given to bare-string items; a repeated id
+  is channel-level `invalid_request` naming it, before any tokenization.
   - **embed.result** {job_id, cursor?, max_page_bytes?} — committed pages are
     readable while the job is still running; `pages_available` on job status
     is the visible committed-page count. The default page is 512 KiB; page
@@ -894,7 +899,15 @@ later failure.
 The request digest binds the operation, model, constraints, ordered item IDs and
 per-item content hashes. Reusing a request key with different content returns
 permanent `idempotency_conflict`. Same-key/same-digest resubmission resumes from
-committed item IDs.
+committed item IDs. Pages belong to the digest: jobs for the same content under
+different request keys run one at a time, and a later one starts from every
+page an earlier one committed. Pages are never attached to or resumed under a
+different resolved fingerprint (`idempotency_conflict`).
+
+A job's execution TTL bounds its whole attempt, including lane waits and every
+engine call. Once it passes, the job fails with `deadline_exceeded`, no further
+page commits, and a late finish or failure from the attempt never replaces
+that outcome.
 
 `embed.query`, `embed.batch` and `rerank.score` ignore retired request fields
 `accept_declared` and `allow_equivalent`. `microllm.oneshot` remains strict:
