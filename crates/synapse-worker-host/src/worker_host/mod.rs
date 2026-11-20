@@ -2379,7 +2379,9 @@ pub mod ane_residency {
             self.0.abandonment.notify_waiters();
         }
     }
+    #[cfg(unix)]
     struct AbortOnDrop(tokio::task::AbortHandle);
+    #[cfg(unix)]
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
             self.0.abort();
