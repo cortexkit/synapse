@@ -26,6 +26,10 @@ use crate::{
 mod speech_batch_policy;
 use speech_batch_policy::{SpeechBatchPolicy, SPEECH_BATCH_CAPACITY};
 
+#[cfg(test)]
+#[path = "transcribe_timing.rs"]
+pub(crate) mod speech_timing;
+
 struct Instance {
     _entry: Entry,
     raw: ash::Instance,
@@ -249,6 +253,8 @@ struct Device {
     speech: vk::Pipeline,
     speech_gemm: vk::Pipeline,
     heap_index: u32,
+    #[cfg(test)]
+    timestamp_valid_bits: u32,
     retirement_unknown: AtomicBool,
 }
 impl Drop for Device {
@@ -430,6 +436,8 @@ impl Device {
             physical,
             queue,
             heap_index,
+            #[cfg(test)]
+            timestamp_valid_bits: queues[family as usize].timestamp_valid_bits,
             pool: vk::CommandPool::null(),
             descriptor_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -663,6 +671,8 @@ impl Arena {
         unsafe {
             device.raw.bind_buffer_memory(buffer, memory, 0)?;
         }
+        #[cfg(test)]
+        speech_timing::report_arena(&arena, memory_type, &props);
         Ok(arena)
     }
 
@@ -745,6 +755,10 @@ impl Arena {
             )
         }?;
         staging.memory = memory;
+        #[cfg(test)]
+        if req.size >= speech_timing::LARGE_BUFFER {
+            speech_timing::report_allocation(&props, name, "staging", req.size, index);
+        }
         unsafe {
             device.raw.bind_buffer_memory(buffer, memory, 0)?;
         }
@@ -928,6 +942,8 @@ struct SpeechDispatch {
     params: Params,
     descriptors: Vec<vk::DescriptorBufferInfo>,
     groups: u32,
+    #[cfg(test)]
+    label: Option<String>,
 }
 
 /// Keeps descriptor sets immutable until the complete layer has finished. The
@@ -941,6 +957,8 @@ struct SpeechBatch {
     dispatch_limit_override: Option<usize>,
     #[cfg(test)]
     stats: speech_batch_policy::SubmissionStats,
+    #[cfg(test)]
+    timing: Option<speech_timing::Timing>,
 }
 
 impl SpeechBatch {
@@ -965,6 +983,8 @@ impl SpeechBatch {
             dispatch_limit_override: None,
             #[cfg(test)]
             stats: Default::default(),
+            #[cfg(test)]
+            timing: None,
         })
     }
 
@@ -993,6 +1013,16 @@ impl SpeechBatch {
             params,
             descriptors,
             groups,
+            #[cfg(test)]
+            label: self.timing.as_ref().map(|_| {
+                let weight = buffers[1];
+                if weight == "dummy" {
+                    buffers[2]
+                } else {
+                    weight
+                }
+                .to_owned()
+            }),
         });
         if self.pending.len() >= self.dispatch_limit() {
             self.flush()?;
@@ -1005,6 +1035,8 @@ impl SpeechBatch {
             return Ok(());
         }
         let dispatches = std::mem::take(&mut self.pending);
+        #[cfg(test)]
+        let started = self.timing.as_mut().map(|t| t.begin_group(&dispatches));
         let device = &self.device;
         // The preceding flush waited for completion. No pending command buffer
         // references sets from this pool when it is reset.
@@ -1038,6 +1070,10 @@ impl SpeechBatch {
         }
         let elapsed = device.submit_timed(
             |command| unsafe {
+                #[cfg(test)]
+                if let Some(timing) = &self.timing {
+                    timing.record_start(command);
+                }
                 // Make uploads visible once. Between dispatches, compute-to-compute
                 // ordering covers read-after-write and write-after-write dependencies,
                 // and keeps scratch writes from overtaking preceding reads.
@@ -1118,9 +1154,17 @@ impl SpeechBatch {
                     &[],
                     &[],
                 );
+                #[cfg(test)]
+                if let Some(timing) = &self.timing {
+                    timing.record_end(command);
+                }
             },
             true,
         )?;
+        #[cfg(test)]
+        if let Some((timing, started)) = self.timing.as_mut().zip(started) {
+            timing.finish_group(started, elapsed)?;
+        }
         #[cfg(test)]
         self.stats.record(dispatches.len(), elapsed);
         #[cfg(test)]

@@ -697,7 +697,20 @@ fn run(
         match e {
             transcribe_host::TranscribeHostError::Audio(_)
             | transcribe_host::TranscribeHostError::DurationLimit(_) => invalid("audio"),
-            _ => fault("engine_crashed", None),
+            error => {
+                let audio_duration_ms = synapse_speech::inspect_wav(audio)
+                    .ok()
+                    .map(|wav| wav.duration_ms());
+                tracing::warn!(
+                    target: "synapse.media",
+                    lane_id = %catalog::lane_id(&entry.id, &backend.backend),
+                    audio_bytes = audio.len(),
+                    audio_duration_ms,
+                    %error,
+                    "speech engine failed"
+                );
+                fault("engine_crashed", None)
+            }
         }
     })?;
     if !observe {

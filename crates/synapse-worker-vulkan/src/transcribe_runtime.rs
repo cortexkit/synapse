@@ -290,6 +290,42 @@ impl Engine {
     fn flush(&self) -> Result<()> {
         self.batch.borrow_mut().flush()
     }
+
+    #[cfg(test)]
+    fn timing_phase(&self, name: &str, layer: bool) {
+        if let Some(timing) = &mut self.batch.borrow_mut().timing {
+            timing.enter(name, layer);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_time_encoder(
+        &mut self,
+        mel: &[f32],
+        mel_rows: usize,
+        valid: usize,
+        expected_frames: usize,
+    ) -> Result<()> {
+        transcribe::with_validated_input(mel, mel_rows, valid, self.maximum, |frames, rows| {
+            ensure!(frames == expected_frames, "unexpected ladder shape");
+            super::speech_timing::event(serde_json::json!({
+                "event": "encoder_shape", "valid_encoder_frames": frames, "padded_rows": rows,
+            }));
+            let batch = self.batch.get_mut();
+            batch.policy.select_rung(rows);
+            batch.timing = Some(super::speech_timing::Timing::new(&self.arena.device)?);
+            let started = std::time::Instant::now();
+            self.encoder(mel, mel_rows, valid, rows, frames, &mut || {
+                super::speech_timing::event(serde_json::json!({
+                    "event": "encoder_progress", "wall_ms_since_encoder_start":
+                        started.elapsed().as_secs_f64() * 1e3,
+                }));
+                Ok(())
+            })?;
+            self.timing_phase("encoder_finished", false);
+            Ok(())
+        })
+    }
     fn simple(&self, op: u32, input: &str, output: &str, rows: usize, cols: usize) -> Result<()> {
         self.run(
             Params {
@@ -478,8 +514,12 @@ impl Engine {
                 );
             }
         }
+        #[cfg(test)]
+        self.timing_phase("mel_upload", false);
         let mut input = synapse_core::encode_f32_frame(mel);
         self.arena.transfer("mel", &mut input, true)?;
+        #[cfg(test)]
+        self.timing_phase("subsampling", false);
         for start in (0..rows).step_by(TILE) {
             let n = TILE.min(rows - start);
             let mut source = "mel";
@@ -569,6 +609,8 @@ impl Engine {
         }
         #[cfg(test)]
         self.capture_layer("subsampling", valid_encoder)?;
+        #[cfg(test)]
+        self.timing_phase("position", false);
         self.run(
             Params {
                 op: 105,
@@ -578,7 +620,13 @@ impl Engine {
             ["dummy", "dummy", "pos", "dummy", "dummy", "dummy", "dummy"],
             (2 * rows - 1) * 1024,
         )?;
+        // For shorter inputs the pending position dispatch can share the
+        // first layer's submission. This probe times only unbatched inputs.
         for i in 0..24 {
+            #[cfg(test)]
+            if self.batch.borrow().timing.is_some() {
+                self.timing_phase(&format!("layer-{i:02}"), true);
+            }
             let layer = format!("encoder.layers.{i}");
             let hidden = self.ff("hidden", &layer, 1, rows)?;
             self.norm(hidden, "norm", &format!("{layer}.norm_self_att"), rows)?;
@@ -711,6 +759,8 @@ impl Engine {
             self.capture_layer(&format!("layer-{i:02}"), valid_encoder)?;
             progress()?;
         }
+        #[cfg(test)]
+        self.timing_phase("projection", false);
         self.linear(
             "hidden",
             "projected",

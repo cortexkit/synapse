@@ -13,6 +13,9 @@ use synapse_parity::speech::{self, Artifact, SpeechObservation, SpeechProfile, S
 #[path = "transcribe_repeat.rs"]
 mod repeat;
 
+#[path = "transcribe_timing_hardware.rs"]
+mod timing;
+
 #[derive(Default, serde::Serialize)]
 struct GroupTiming {
     cases: usize,

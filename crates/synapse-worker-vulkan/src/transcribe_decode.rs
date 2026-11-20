@@ -344,6 +344,14 @@ impl GpuJoint {
                 None,
             )
         }?;
+        #[cfg(test)]
+        super::speech_timing::report_allocation(
+            &properties,
+            "decode_readback",
+            "readback",
+            requirements.size,
+            memory_type,
+        );
         unsafe {
             raw.bind_buffer_memory(joint.readback, joint.readback_memory, 0)?;
             joint.mapped = raw

@@ -111,6 +111,89 @@ fn certification_mock(
 
 #[cfg(unix)]
 #[tokio::test]
+async fn media_engine_crash_warns_with_original_error_lane_and_audio_length() {
+    use synapse_core::{WorkerRequest, WorkerResponse};
+
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (root, state) = fixture("media-engine-crash-warn", true);
+    let task_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let (entry, backend) = select(&task_state, MODEL).unwrap();
+        let lane_id = catalog::lane_id(&entry.id, &backend.backend);
+        let engine =
+            worker_host::WorkerEngine::new(worker_host::WorkerHostConfig::new("unused", "unused"))
+                .unwrap();
+        let model = engine.insert_loaded_model_for_test("speech".into(), 1024, 0, None);
+        engine.attach_mock_worker_frames_for_test(|request, _| {
+            let WorkerRequest::Transcribe { req_id, .. } = request else {
+                panic!("unexpected request");
+            };
+            vec![(
+                WorkerResponse::Err {
+                    req_id: Some(req_id.clone()),
+                    code: "device_failure".into(),
+                    msg: "fixture queue wait failed".into(),
+                },
+                None,
+            )]
+        });
+        let mut cached = Lane {
+            host: Some(transcribe_host::TranscribeHost::worker_for_test(
+                selected_profile(&task_state),
+                engine,
+                model,
+            )),
+            ..Lane::default()
+        };
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || {
+            run(
+                &task_state,
+                &entry,
+                &backend,
+                &wav(4008),
+                &mut cached,
+                false,
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.0, fault("engine_crashed", None).0);
+        let captured = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured
+                .lines()
+                .any(|line| line.contains("WARN synapse.media:")
+                    && line.contains(&format!("lane_id={lane_id}"))
+                    && line.contains("audio_duration_ms=251")
+                    && line.contains("worker returned device_failure: fixture queue wait failed")),
+            "missing speech engine warning: {captured}"
+        );
+    })
+    .await
+    .unwrap();
+    cleanup(root, state).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn transcribe_certification_snapshot_units_and_backend_nullability_from_mock() {
     let result = tokio::task::spawn_blocking(|| {
         certification_mock(
