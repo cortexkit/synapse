@@ -69,9 +69,9 @@ url = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-log = { workspace = true }
 # Exact releases keep the bus client and its naming/transport types version-aligned.
-cortexkit-bus-client = "=0.1.9"
+cortexkit-bus-client = "=0.1.10"
 cortexkit-bus-naming = "=0.5.1"
-cortexkit-bus-nats = "=0.5.4"
+cortexkit-bus-nats = "=0.5.5"
 cortexkit-bus-trait = "=0.3.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 cortexkit-role-media = "=0.1.11"
