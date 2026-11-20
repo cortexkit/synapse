@@ -49,7 +49,7 @@ pub struct Padded {
     pub width: usize,
 }
 
-pub fn pad(sequences: &[Vec<i32>], pad_id: i32) -> Result<Padded, String> {
+fn padding_width(sequences: &[Vec<i32>]) -> Result<usize, String> {
     let width = sequences.iter().map(Vec::len).max().unwrap_or(0);
     if width > 8192 {
         return Err("sequence_too_long".into());
@@ -57,6 +57,11 @@ pub fn pad(sequences: &[Vec<i32>], pad_id: i32) -> Result<Padded, String> {
     if width == 0 || sequences.iter().any(Vec::is_empty) {
         return Err("invalid_tokens".into());
     }
+    Ok(width)
+}
+
+pub fn pad(sequences: &[Vec<i32>], pad_id: i32) -> Result<Padded, String> {
+    let width = padding_width(sequences)?;
     let mut ids = Vec::new();
     let mut mask = Vec::new();
     for sequence in sequences {
@@ -73,10 +78,38 @@ pub fn pad(sequences: &[Vec<i32>], pad_id: i32) -> Result<Padded, String> {
     })
 }
 
+#[cfg(any(feature = "vulkan", test))]
+fn for_each_inference_row(
+    sequences: &[Vec<i32>],
+    pad_id: i32,
+    mut run_row: impl FnMut(&Padded) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // Reject malformed batches before running any rows.
+    padding_width(sequences).map_err(anyhow::Error::msg)?;
+    for sequence in sequences {
+        let row = pad(std::slice::from_ref(sequence), pad_id).map_err(anyhow::Error::msg)?;
+        run_row(&row)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn mixed_lengths_dispatch_at_each_rows_own_width() {
+        let sequences = [vec![1; 7], vec![2; 1_000], vec![3; 300]];
+        let mut dispatched = Vec::new();
+        for_each_inference_row(&sequences, 0, |row| {
+            dispatched.push(row.width);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(dispatched, [7, 1_000, 300]);
+    }
+
     #[test]
     fn embedded_binding_is_derived_from_bytes() {
         assert_eq!(

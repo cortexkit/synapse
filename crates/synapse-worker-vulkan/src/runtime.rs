@@ -1365,22 +1365,14 @@ impl Engine {
             longest <= self.profile.vulkan_sub_batch_max_tokens.unwrap() as usize,
             "sequence_too_long"
         );
-        let padded =
-            crate::pad(sequences, self.model.grammar()?.pad.id as i32).map_err(|e| anyhow!(e))?;
         let mut result = Vec::new();
-        // The arena is sized for one maximum-context sequence. Reuse it without
-        // changing the request's batch-longest padding or splitting a sequence.
-        for (index, &length) in padded.lengths.iter().enumerate() {
-            let range = index * padded.width..(index + 1) * padded.width;
-            let sub = Padded {
-                ids: padded.ids[range.clone()].to_vec(),
-                mask: padded.mask[range].to_vec(),
-                lengths: vec![length],
-                width: padded.width,
-            };
-            result.extend(self.forward(&sub, progress)?);
+        // The arena holds one sequence at a time. Run each row at its own width
+        // to avoid projecting and attending to padding from longer rows.
+        crate::for_each_inference_row(sequences, self.model.grammar()?.pad.id as i32, |row| {
+            result.extend(self.forward(row, progress)?);
             progress()?;
-        }
+            Ok(())
+        })?;
         Ok(result)
     }
 

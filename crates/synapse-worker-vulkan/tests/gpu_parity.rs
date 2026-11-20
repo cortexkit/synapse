@@ -2,8 +2,12 @@
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
-use synapse_parity::manifest::{Operation, MODEL_SLUGS};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+use synapse_parity::manifest::{Family, Manifest, Operation, MODEL_SLUGS};
 use synapse_worker_vulkan::{admission::requirements, runtime::Engine};
 
 #[derive(Deserialize)]
@@ -75,13 +79,61 @@ fn checked_cosine(slug: &str, case: &Case, vector: &[f32]) -> f64 {
         / (norm * reference_norm)
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+fn read_fixture(repo: &Path, slug: &str) -> Fixture {
+    let fixture: Fixture = serde_json::from_slice(
+        &std::fs::read(repo.join(format!(
+            "bench/parity/fixtures/{slug}/{slug}.ref-v1.transformers-5.16.1.seed-0.json"
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fixture.model, slug);
+    fixture
+}
+
+fn load_engine(manifest: &Manifest, packages: &Path, slug: &str) -> Engine {
+    let model = manifest.models[slug].clone();
+    let profile_name = format!("{slug}.owned-vulkan");
+    let profile = manifest.profiles[&profile_name].clone();
+    let required = requirements(manifest, Some(slug)).unwrap();
+    #[cfg(all(target_os = "macos", feature = "moltenvk-diagnostic"))]
+    let prepared = synapse_worker_vulkan::runtime::prepare_moltenvk_parity(
+        &PathBuf::from(
+            std::env::var_os("SYNAPSE_MOLTENVK_LOADER").expect("actual SDK loader dylib"),
+        ),
+        required,
+    )
+    .unwrap();
+    #[cfg(not(all(target_os = "macos", feature = "moltenvk-diagnostic")))]
+    let prepared = synapse_worker_vulkan::runtime::prepare(required).unwrap();
+    let package = packages.join(slug);
+    assert!(!package.join("config.json").exists());
+    let bytes = std::fs::read(package.join("model.safetensors")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        profile
+            .converted_package_digest
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("sha256:")
+    );
+    synapse_parity::safetensors::verify_package_structure(&bytes, &profile_name).unwrap();
+    let (header, data) = synapse_parity::safetensors::split_file(&bytes).unwrap();
+    let header = synapse_parity::safetensors::parse_header_json(header).unwrap();
+    Engine::load(model, profile, prepared, required, &header, data).unwrap()
+}
+
 #[test]
 #[ignore = "requires GPU, converted SYNAPSE_VULKAN_TEST_PACKAGES; macOS additionally requires moltenvk-diagnostic and SYNAPSE_MOLTENVK_LOADER"]
 fn four_models_match_reference_vectors_scores_window_and_padding() {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
+    let repo = repo_root();
     let root = PathBuf::from(
         std::env::var_os("SYNAPSE_VULKAN_TEST_PACKAGES").expect("converted package root"),
     );
@@ -89,45 +141,8 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
     let manifest = synapse_worker_vulkan::manifest();
     let mut outputs: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     for slug in MODEL_SLUGS {
-        let model = manifest.models[slug].clone();
-        let profile = manifest.profiles[&format!("{slug}.owned-vulkan")].clone();
-        let required = requirements(&manifest, Some(slug)).unwrap();
-        #[cfg(all(target_os = "macos", feature = "moltenvk-diagnostic"))]
-        let prepared = synapse_worker_vulkan::runtime::prepare_moltenvk_parity(
-            &PathBuf::from(
-                std::env::var_os("SYNAPSE_MOLTENVK_LOADER").expect("actual SDK loader dylib"),
-            ),
-            required,
-        )
-        .unwrap();
-        #[cfg(not(all(target_os = "macos", feature = "moltenvk-diagnostic")))]
-        let prepared = synapse_worker_vulkan::runtime::prepare(required).unwrap();
-        let package = root.join(slug);
-        assert!(!package.join("config.json").exists());
-        let bytes = std::fs::read(package.join("model.safetensors")).unwrap();
-        assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
-            profile
-                .converted_package_digest
-                .as_deref()
-                .unwrap()
-                .trim_start_matches("sha256:")
-        );
-        synapse_parity::safetensors::verify_package_structure(
-            &bytes,
-            &format!("{slug}.owned-vulkan"),
-        )
-        .unwrap();
-        let (header, data) = synapse_parity::safetensors::split_file(&bytes).unwrap();
-        let header = synapse_parity::safetensors::parse_header_json(header).unwrap();
-        let fixture: Fixture = serde_json::from_slice(
-            &std::fs::read(repo.join(format!(
-                "bench/parity/fixtures/{slug}/{slug}.ref-v1.transformers-5.16.1.seed-0.json"
-            )))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(fixture.model, slug);
+        let model = &manifest.models[slug];
+        let fixture = read_fixture(&repo, slug);
         let selected: Vec<&Case> = fixture
             .cases
             .iter()
@@ -149,9 +164,7 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
             "must exercise padding"
         );
         let sequences: Vec<_> = selected.iter().map(|c| c.input_ids.clone()).collect();
-        let engine =
-            Engine::load(model.clone(), profile, prepared, required, &header, data).unwrap();
-        drop(bytes);
+        let engine = load_engine(&manifest, &root, slug);
         let actual = engine.infer(&sequences).unwrap();
         assert!(actual.iter().all(|v| v.is_finite()));
         if model.operation == Operation::Embed {
@@ -242,5 +255,89 @@ fn four_models_match_reference_vectors_scores_window_and_padding() {
     // Optional dump of every output, to compare two kernel revisions directly.
     if let Some(path) = std::env::var_os("SYNAPSE_VULKAN_PARITY_OUTPUTS") {
         std::fs::write(path, serde_json::to_vec(&outputs).unwrap()).unwrap();
+    }
+}
+
+fn check_row_bits(
+    engine: &Engine,
+    slug: &str,
+    dim: usize,
+    rows: &[Vec<i32>],
+    output_dir: Option<&Path>,
+) -> std::time::Duration {
+    let width = rows.iter().map(Vec::len).max().unwrap();
+    let start = Instant::now();
+    let batch = engine.infer(rows).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(batch.len(), rows.len() * dim, "{slug} output shape");
+    for (row, actual) in rows.iter().zip(batch.chunks_exact(dim)) {
+        let len = row.len();
+        let alone = engine.infer(std::slice::from_ref(row)).unwrap();
+        assert_eq!(alone.len(), dim, "{slug} singleton output shape");
+        let mut differing_values = 0;
+        let mut differing_bits = 0;
+        let mut max_abs_diff = 0.0f32;
+        for (&a, &b) in actual.iter().zip(&alone) {
+            assert!(a.is_finite() && b.is_finite(), "{slug} {len}/{width}");
+            let diff = a.to_bits() ^ b.to_bits();
+            differing_values += usize::from(diff != 0);
+            differing_bits += diff.count_ones();
+            max_abs_diff = max_abs_diff.max((a - b).abs());
+        }
+        assert!(
+            differing_values == 0,
+            "{slug}: {len}-token row in a {width}-token batch differs from singleton in \
+             {differing_values}/{dim} values ({differing_bits} bits, max abs diff {max_abs_diff:e})"
+        );
+        println!(
+            "ROW_WIDTH_IDENTITY {slug} row={len} batch_max={width} values={dim} bit-identical"
+        );
+        if let Some(dir) = output_dir {
+            let bytes: Vec<_> = actual.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("{slug}-{len}-of-{width}.f32le")), bytes).unwrap();
+        }
+    }
+    elapsed
+}
+
+#[test]
+fn mixed_length_rows_match_singletons_bit_for_bit() {
+    let Some(packages) = std::env::var_os("SYNAPSE_VULKAN_TEST_PACKAGES") else {
+        eprintln!("SKIP mixed_length_rows_match_singletons_bit_for_bit: SYNAPSE_VULKAN_TEST_PACKAGES is unset");
+        return;
+    };
+    let packages = PathBuf::from(packages);
+    let output_dir = std::env::var_os("SYNAPSE_VULKAN_ROW_WIDTH_OUTPUTS").map(PathBuf::from);
+    let manifest = synapse_worker_vulkan::manifest();
+    let repo = repo_root();
+    for slug in MODEL_SLUGS {
+        let model = &manifest.models[slug];
+        let dim = model.output().unwrap().dimension as usize;
+        let fixture = read_fixture(&repo, slug);
+        let tokens = |id| &fixture.cases.iter().find(|c| c.id == id).unwrap().input_ids;
+        let rows: Vec<_> = if model.architecture.family == Family::Modernbert {
+            [7, 300, 1_000]
+                .map(|len| tokens("long-8192")[..len].to_vec())
+                .into()
+        } else {
+            ["boundary-129", "boundary-513"]
+                .map(|id| tokens(id).clone())
+                .into()
+        };
+        let engine = load_engine(&manifest, &packages, slug);
+        check_row_bits(&engine, slug, dim, &rows, output_dir.as_deref());
+        // Keep the longer timing case opt-in; software Vulkan is much slower.
+        if output_dir.is_some() && slug == "gte-reranker-modernbert-base" {
+            let rows = [
+                tokens("short-0").clone(),
+                tokens("long-8192")[..4_096].to_vec(),
+            ];
+            assert_eq!(rows[0].len(), 32);
+            let elapsed = check_row_bits(&engine, slug, dim, &rows, output_dir.as_deref());
+            println!(
+                "ROW_WIDTH_TIMING {slug} 32+4096 {:.3} ms",
+                elapsed.as_secs_f64() * 1_000.0
+            );
+        }
     }
 }
