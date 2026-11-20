@@ -5,7 +5,7 @@ use super::*;
 async fn catalog_quarantine_cooldown_reopens_serving_with_zero_strikes() {
     let (mut host, model, root) = quarantined_host(true).await;
     let start = host.clock.unwrap();
-    host.clock = Some(start + CATALOG_QUARANTINE_COOLDOWN - Duration::from_millis(1));
+    host.clock = Some(start + QUARANTINE_COOLDOWN - Duration::from_millis(1));
     let refused = host.embed_batch(&model, batch()).await.unwrap_err();
     assert!(matches!(
         refused,
@@ -14,7 +14,7 @@ async fn catalog_quarantine_cooldown_reopens_serving_with_zero_strikes() {
             ..
         }
     ));
-    host.clock = Some(start + CATALOG_QUARANTINE_COOLDOWN);
+    host.clock = Some(start + QUARANTINE_COOLDOWN);
     let fresh = peer(&mut host, 3, false);
     let before = host.request_count();
     assert_eq!(

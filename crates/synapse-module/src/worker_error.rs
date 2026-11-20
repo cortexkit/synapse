@@ -10,15 +10,18 @@ pub(super) fn worker_error_to_wire(
     error: EngineError,
     catalog_lane: Option<&str>,
 ) -> WireOperationError {
-    if let Some(lane_id) = catalog_lane.filter(|_| error.stage == EngineErrorStage::WorkerCrash) {
+    if error.stage == EngineErrorStage::WorkerCrash {
         let retry_after_ms = error
             .retry_after_ms
-            .unwrap_or(worker_host::CATALOG_QUARANTINE_COOLDOWN.as_millis() as u64);
+            .unwrap_or(worker_host::QUARANTINE_COOLDOWN.as_millis() as u64);
         let mut wire = WireOperationError::from_stable(
             StableError::engine_crashed(Some(retry_after_ms)),
             error.message,
         );
-        wire.details = Some(json!({ "lane_id": lane_id, "quarantined": true }));
+        wire.details = Some(match catalog_lane {
+            Some(lane_id) => json!({ "lane_id": lane_id, "quarantined": true }),
+            None => json!({ "quarantined": true }),
+        });
         return wire;
     }
     engine_error_to_wire(error)
@@ -35,9 +38,6 @@ pub(super) fn engine_error_to_wire(error: EngineError) -> WireOperationError {
     }
     if error.stage == EngineErrorStage::Load {
         return artifact_invalid_error(error.message);
-    }
-    if error.stage == EngineErrorStage::WorkerCrash && error.retry_after_ms.is_none() {
-        return WireOperationError::from_stable(StableError::probe_required(), error.message);
     }
     WireOperationError::from_stable(
         StableError::engine_crashed(error.retry_after_ms),

@@ -147,12 +147,12 @@ message. A failed download carries `error` beside `state` in its flat status.
   retry; includes load/runtime failure or the 2000 ms self-check ceiling.
   A Vulkan device-memory allocation refusal during load uses the same retry
   delay with `detail.reason: "device_memory_exhausted"`; it does not add a crash strike.
-  A quarantined catalog worker also uses this code, never `probe_required`:
+  A quarantined worker also uses this code, never `probe_required`:
   `retry_after_ms` is the remaining time in its fixed ten-minute cool-down and
-  `details` is `{lane_id, quarantined: true}`. The next serving request after
+  `details` is `{lane_id, quarantined: true}` (`{quarantined: true}` for a
+  preload lane, which has no catalog lane id). The next serving request after
   expiry starts a fresh worker with zero strikes. Unload/reload or a module
-  restart clears catalog quarantine immediately. Non-catalog worker quarantine
-  still reports permanent `probe_required`.
+  restart clears quarantine immediately.
   Worker crash, protocol fault and no-progress hang each add one consecutive
   strike; two strikes quarantine. Only fully drained successful serving work
   (embed, rerank/score or generation) clears strikes. LOAD/reload, PING,

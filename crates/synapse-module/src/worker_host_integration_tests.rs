@@ -100,17 +100,25 @@ async fn quarantined_catalog_lane_returns_transient_engine_crashed_with_remainin
     std::fs::remove_dir_all(root).unwrap();
 }
 
+// Preload lanes (llama generation) have no manual re-check either, so a
+// quarantine must answer transiently and lift after the same cool-down.
 #[tokio::test]
-async fn quarantined_legacy_lane_keeps_probe_required_without_auto_recovery() {
+async fn quarantined_preload_lane_answers_transiently_and_recovers_after_cooldown() {
     let (mut host, model, root) = quarantined_host(false).await;
-    host.advance_clock_for_test(CATALOG_QUARANTINE_COOLDOWN);
     let error = host.embed_batch(&model, batch()).await.unwrap_err();
     let wire =
         crate::worker_error_to_wire(error.to_engine_error(EngineErrorStage::Inference), None);
-    assert_eq!(wire.code, "probe_required");
-    assert!(matches!(wire.class, crate::ErrorClass::Permanent));
-    assert_eq!(wire.retry_after_ms, None);
-    assert_eq!(wire.details, None);
+    assert_eq!(wire.code, "engine_crashed");
+    assert!(matches!(wire.class, crate::ErrorClass::Transient));
+    assert_eq!(wire.retry_after_ms, Some(600_000));
+    assert_eq!(wire.details, Some(serde_json::json!({"quarantined": true})));
+    host.advance_clock_for_test(QUARANTINE_COOLDOWN);
+    assert_eq!(host.health_snapshot().quarantined_models, 1);
+    let after = host.embed_batch(&model, batch()).await;
+    assert!(
+        !matches!(after, Err(WorkerHostError::Quarantined { .. })),
+        "quarantine must lift after the cool-down: {after:?}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

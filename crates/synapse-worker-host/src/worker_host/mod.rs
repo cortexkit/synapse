@@ -26,8 +26,9 @@ use worker_logs::{spawn_pipe_reader, LogRing, WorkerForwardLimiter, WorkerLogCon
 #[cfg(all(test, unix))]
 mod quarantine_tests;
 
-// A finite cool-down lets a quarantined catalog lane recover unattended.
-pub const CATALOG_QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
+// A finite cool-down lets a quarantined lane recover unattended. There is no
+// manual re-check to lift a quarantine, so every lane gets the same cool-down.
+pub const QUARANTINE_COOLDOWN: Duration = Duration::from_secs(600);
 mod errors;
 mod exit_fence;
 mod liveness;
@@ -521,15 +522,13 @@ impl WorkerHost {
         let Some(loaded) = self.loaded_models.remove(&model.model_id) else {
             return Ok(());
         };
-        if self.config.catalog_lane.is_some() {
-            if self.quarantined.remove(&loaded.crash_key) {
-                if let Some(notify) = &self.config.findings_changed {
-                    notify.notify_one();
-                }
+        if self.quarantined.remove(&loaded.crash_key) {
+            if let Some(notify) = &self.config.findings_changed {
+                notify.notify_one();
             }
-            self.quarantine_until.remove(&loaded.crash_key);
-            self.crashes.remove(&loaded.crash_key);
         }
+        self.quarantine_until.remove(&loaded.crash_key);
+        self.crashes.remove(&loaded.crash_key);
         let Some(worker_model_ref) = loaded.worker_model_ref else {
             return Ok(());
         };
@@ -995,32 +994,27 @@ impl WorkerHost {
         if !self.quarantined.contains(key) {
             return None;
         }
-        let retry_after_ms = if self.config.catalog_lane.is_some() {
-            let until = *self
-                .quarantine_until
-                .get(key)
-                .expect("catalog quarantine has expiry");
-            let now = self.now();
-            if now >= until {
-                self.quarantined.remove(key);
-                if let Some(notify) = &self.config.findings_changed {
-                    notify.notify_one();
-                }
-                self.quarantine_until.remove(key);
-                self.crashes.remove(key);
-                return None;
+        let until = *self
+            .quarantine_until
+            .get(key)
+            .expect("quarantine has expiry");
+        let now = self.now();
+        if now >= until {
+            self.quarantined.remove(key);
+            if let Some(notify) = &self.config.findings_changed {
+                notify.notify_one();
             }
-            Some(
+            self.quarantine_until.remove(key);
+            self.crashes.remove(key);
+            return None;
+        }
+        Some(WorkerHostError::Quarantined {
+            key: key.into(),
+            retry_after_ms: Some(
                 u64::try_from(until.duration_since(now).as_millis())
                     .unwrap_or(u64::MAX)
                     .max(1),
-            )
-        } else {
-            None
-        };
-        Some(WorkerHostError::Quarantined {
-            key: key.into(),
-            retry_after_ms,
+            ),
         })
     }
 
@@ -1029,10 +1023,8 @@ impl WorkerHost {
         let entries = self.crashes.entry(key.clone()).or_default();
         *entries += 1;
         if *entries >= self.config.crash_budget.max_crashes {
-            if self.config.catalog_lane.is_some() {
-                self.quarantine_until
-                    .insert(key.clone(), now + CATALOG_QUARANTINE_COOLDOWN);
-            }
+            self.quarantine_until
+                .insert(key.clone(), now + QUARANTINE_COOLDOWN);
             if self.quarantined.insert(key) {
                 if let Some(notify) = &self.config.findings_changed {
                     notify.notify_one();
@@ -1765,7 +1757,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        host.clock = Some(now + CATALOG_QUARANTINE_COOLDOWN);
+        host.clock = Some(now + QUARANTINE_COOLDOWN);
         assert!(host.quarantine_error("model").is_none());
         assert!(
             tokio::time::timeout(Duration::from_millis(1), notify.notified())
@@ -5008,7 +5000,7 @@ pub mod ane_residency {
                 faults.last_generation = Some(generation);
                 faults.strikes += 1;
                 if faults.strikes >= 2 {
-                    faults.until = Some(faults.now() + super::CATALOG_QUARANTINE_COOLDOWN);
+                    faults.until = Some(faults.now() + super::QUARANTINE_COOLDOWN);
                 }
             }
         }
