@@ -17,6 +17,13 @@ mod shards;
 #[cfg(test)]
 mod tests;
 
+/// Time for the whole speech row: every corpus recording across all shards,
+/// plus installs, the first-load self-check and the observe-off rerun. The
+/// slowest certified speech GPU, the AMD integrated GPU on the Windows AMD row,
+/// grades about 820 recordings an hour, so the embed/rerank budget of one hour
+/// ends that row before its corpus does. Three hours covers it with margin.
+const SPEECH_RUN_BUDGET: Duration = Duration::from_secs(3 * 3600);
+
 fn err(e: impl std::fmt::Display) -> synapse_certify::Error {
     refuse(e.to_string())
 }
@@ -693,7 +700,7 @@ async fn collect_shards(
     let shards = shards::partition(inputs)?;
     let is_sharded = shards.len() > 1;
     let mirror = crate::mirror::Mirror::start(&options.mirror).await?;
-    let deadline = Instant::now() + crate::catalog::RUN_BUDGET;
+    let deadline = Instant::now() + SPEECH_RUN_BUDGET;
     let mut first_pin: Option<Pin> = None;
     let mut all = Collected::default();
     let parity = options.checkout.join("bench/parity");
