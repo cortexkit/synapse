@@ -23,12 +23,13 @@ pub(crate) fn event(value: Value) {
 )]
 pub(crate) fn supervise(test: &str, finished_phase: &str) {
     let started = Instant::now();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--nocapture", "--exact", test])
-        .env(CHILD, "1")
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child =
+        synapse_core::without_launch_nonce(Command::new(std::env::current_exe().unwrap()))
+            .args(["--ignored", "--nocapture", "--exact", test])
+            .env(CHILD, "1")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
     let stderr = BufReader::new(child.stderr.take().unwrap());
     let (send, receive) = mpsc::channel();
     thread::spawn(move || {

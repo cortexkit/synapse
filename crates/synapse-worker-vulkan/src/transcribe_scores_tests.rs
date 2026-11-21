@@ -31,12 +31,13 @@ fn legacy_pipeline(device: &Device) -> Result<vk::Pipeline> {
     let sdk = std::path::PathBuf::from(std::env::var_os("VULKAN_SDK").context("pinned build SDK")?);
     let temporary = tempfile::tempdir()?;
     let output = temporary.path().join("legacy.spv");
-    let compilation = std::process::Command::new(sdk.join("bin/glslc"))
-        .args(["-O", "-fshader-stage=compute", "--target-env=vulkan1.2"])
-        .arg(root.join("tests/transcribe_scores_legacy.comp"))
-        .arg("-o")
-        .arg(&output)
-        .output()?;
+    let compilation =
+        synapse_core::without_launch_nonce(std::process::Command::new(sdk.join("bin/glslc")))
+            .args(["-O", "-fshader-stage=compute", "--target-env=vulkan1.2"])
+            .arg(root.join("tests/transcribe_scores_legacy.comp"))
+            .arg("-o")
+            .arg(&output)
+            .output()?;
     ensure!(
         compilation.status.success(),
         "compile legacy score shader: {}",
