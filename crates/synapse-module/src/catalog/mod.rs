@@ -2548,7 +2548,7 @@ mod tests {
             (
                 "parakeet-tdt-0.6b-v3",
                 "vulkan",
-                "45950f49f8fcb32bf84bbcfd17202a44630b17b950efd5d15737c2cddde9c98f",
+                "2db5308d1a3612e99e9e507c4ffe2fe85096cf8f8eeea5d6e15a8e0de85b9393",
             ),
         ];
         assert_eq!(

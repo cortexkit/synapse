@@ -64,7 +64,9 @@ fn transcribe_scores_match_legacy_shader_byte_for_byte() -> Result<()> {
         (19, 10, 15, 9),
         (33, 17, 31, 16),
         (37, 8, 16, 24),
-        // This host tile crosses the first 65,535 workgroups. Some scores
+        // A full 128-query block at seq 8,192, the size the encoder dispatches,
+        // needs more than 65,535 workgroups, so the grid spills into a second
+        // row. Some scores
         // remain unmasked in the second grid row, so its indices are exercised.
         (8192, 128, 70, 0),
     ] {
