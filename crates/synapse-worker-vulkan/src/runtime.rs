@@ -211,6 +211,14 @@ fn compute_pipeline(
         .find(|(n, _)| *n == name)
         .context("missing embedded shader")?
         .1;
+    compute_pipeline_from_spirv(raw, pipeline_layout, bytes)
+}
+
+fn compute_pipeline_from_spirv(
+    raw: &ash::Device,
+    pipeline_layout: vk::PipelineLayout,
+    bytes: &[u8],
+) -> Result<vk::Pipeline> {
     let code = ash::util::read_spv(&mut Cursor::new(bytes))?;
     let module = unsafe {
         raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
@@ -918,6 +926,9 @@ const SPEECH_GEMM_BIAS: u32 = 1;
 /// Speech GEMM flag: compute three projections of one input in one dispatch,
 /// with weights at bindings 1, 3 and 4 and outputs at bindings 2, 5 and 6.
 const SPEECH_GEMM_THREE: u32 = 2;
+const SPEECH_SCORE_OP: u32 = 106;
+// Query and key axes per workgroup in transcribe_scores.comp.
+const SPEECH_SCORE_TILE: u32 = 8;
 
 fn speech_gemm_groups(params: &Params) -> u32 {
     let matrices = if params.flags & SPEECH_GEMM_THREE != 0 {
@@ -951,6 +962,7 @@ struct SpeechDispatch {
 struct SpeechBatch {
     device: Arc<Device>,
     pool: vk::DescriptorPool,
+    scores: vk::Pipeline,
     pending: Vec<SpeechDispatch>,
     policy: SpeechBatchPolicy,
     #[cfg(test)]
@@ -974,9 +986,10 @@ impl SpeechBatch {
                 None,
             )
         }?;
-        Ok(Self {
+        let mut batch = Self {
             device,
             pool,
+            scores: vk::Pipeline::null(),
             pending: Vec::with_capacity(SPEECH_BATCH_CAPACITY),
             policy: SpeechBatchPolicy::default(),
             #[cfg(test)]
@@ -985,7 +998,15 @@ impl SpeechBatch {
             stats: Default::default(),
             #[cfg(test)]
             timing: None,
-        })
+        };
+        // Only speech needs this pipeline. Separating it also keeps the score
+        // tiles' shared memory out of softmax and the other speech operations.
+        batch.scores = compute_pipeline(
+            &batch.device.raw,
+            batch.device.pipeline_layout,
+            "transcribe_scores",
+        )?;
+        Ok(batch)
     }
 
     fn dispatch_limit(&self) -> usize {
@@ -1008,7 +1029,11 @@ impl SpeechBatch {
             .iter()
             .map(|name| arena.descriptor(name))
             .collect::<Result<_>>()?;
-        let groups = speech_groups(&params, count);
+        let groups = if params.op == SPEECH_SCORE_OP {
+            params.rows.div_ceil(SPEECH_SCORE_TILE) * 8 * params.seq.div_ceil(SPEECH_SCORE_TILE)
+        } else {
+            speech_groups(&params, count)
+        };
         self.pending.push(SpeechDispatch {
             params,
             descriptors,
@@ -1106,10 +1131,10 @@ impl SpeechBatch {
                             &[],
                         );
                     }
-                    let pipeline = if dispatch.params.op == 100 {
-                        device.speech_gemm
-                    } else {
-                        device.speech
+                    let pipeline = match dispatch.params.op {
+                        100 => device.speech_gemm,
+                        SPEECH_SCORE_OP => self.scores,
+                        _ => device.speech,
                     };
                     device
                         .raw
@@ -1181,9 +1206,16 @@ impl Drop for SpeechBatch {
         if self.device.retirement_unknown() {
             return;
         }
-        unsafe { self.device.raw.destroy_descriptor_pool(self.pool, None) };
+        unsafe {
+            self.device.raw.destroy_pipeline(self.scores, None);
+            self.device.raw.destroy_descriptor_pool(self.pool, None);
+        }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "transcribe_scores_tests.rs"]
+mod transcribe_scores_tests;
 
 /// Push-constant operation code for self-attention. Only the attention
 /// pipeline (shaders/attention.comp) implements it; it is kept out of the

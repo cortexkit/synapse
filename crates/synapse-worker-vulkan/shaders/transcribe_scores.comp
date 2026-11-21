@@ -1,0 +1,72 @@
+#version 450
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Input { float x[]; };
+layout(set=0,binding=2,std430) writeonly buffer Output { float y[]; };
+layout(set=0,binding=3,std430) readonly buffer Other { uint z[]; };
+layout(set=0,binding=4,std430) readonly buffer Bias { uint b[]; };
+layout(set=0,binding=5,std430) readonly buffer Extra { uint c[]; };
+layout(set=0,binding=6,std430) readonly buffer Values { uint v[]; };
+layout(push_constant) uniform Params {
+    uint op; uint rows; uint cols; uint inner;
+    uint seq; uint heads; uint kv_heads; uint dim;
+    uint flags; uint offset; uint stride; uint window;
+    float eps; float theta; float scale; float unused;
+} p;
+float hb(uint i) { return uintBitsToFloat(b[i]); }
+float hc(uint i) { return uintBitsToFloat(c[i]); }
+
+// Load adjacent channels together instead of having adjacent lanes fetch
+// different 1024-float-strided keys. Eight queries reuse eight key rows and
+// fifteen shifted relative rows. The extra column spreads accesses at fixed
+// d across shared-memory banks. Both arrays together take 11,868 bytes.
+const uint TILE = 8; // SPEECH_SCORE_TILE in runtime.rs
+const uint WIDTH = 128;
+shared float keys[TILE][WIDTH+1];
+shared float relative[2*TILE-1][WIDTH+1];
+
+void main() {
+    uint group=gl_WorkGroupID.y*gl_NumWorkGroups.x+gl_WorkGroupID.x;
+    uint key_tiles=(p.seq+TILE-1)/TILE;
+    uint row_base=(group/key_tiles/8)*TILE;
+    if(row_base>=p.rows) return;
+    uint head=(group/key_tiles)%8;
+    uint key_base=(group%key_tiles)*TILE;
+    uint query_base=p.offset+row_base;
+    uint lane=gl_LocalInvocationID.x, q_lane=lane/TILE, k_lane=lane%TILE;
+    uint row=row_base+q_lane, query=query_base+q_lane, key=key_base+k_lane;
+    bool in_output=row<p.rows && key<p.seq;
+    uint i=(row*8+head)*p.seq+key;
+    // Whole masked tiles bypass the loads. All lanes of a mixed tile still
+    // participate in filling the shared arrays before masking individual scores.
+    if(query_base>=p.window || key_base>=p.window) {
+        if(in_output) y[i]=-10000.0;
+        return;
+    }
+    for(uint element=lane;element<TILE*WIDTH;element+=64) {
+        uint k=element/WIDTH, d=element%WIDTH;
+        if(key_base+k<min(p.seq,p.window))
+            keys[k][d]=uintBitsToFloat(z[(key_base+k)*1024+head*WIDTH+d]);
+    }
+    // The smallest relative index pairs the last query with the first key.
+    // A ragged query or key tile can put that nominal span outside v.
+    int rel_start=int(p.seq)-int(query_base)+int(key_base)-int(TILE);
+    for(uint element=lane;element<(2*TILE-1)*WIDTH;element+=64) {
+        uint r=element/WIDTH, d=element%WIDTH;
+        int rel=rel_start+int(r);
+        if(rel>=0 && rel<int(2*p.seq-1))
+            relative[r][d]=uintBitsToFloat(v[uint(rel)*1024+head*WIDTH+d]);
+    }
+    barrier();
+    if(!in_output) return;
+    if(query>=p.window || key>=p.window) { y[i]=-10000.0; return; }
+
+    float ac=0.0, bd=0.0;
+    uint rel=TILE-1-q_lane+k_lane;
+    for(uint d=0;d<128;d++) {
+        uint ch=head*128+d;
+        float q=x[query*1024+ch];
+        ac+=(q+hb(ch))*keys[k_lane][d];
+        bd+=(q+hc(ch))*relative[rel][d];
+    }
+    y[i]=(ac+bd)*inversesqrt(128.0);
+}

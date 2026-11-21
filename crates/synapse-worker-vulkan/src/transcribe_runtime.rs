@@ -3,7 +3,7 @@
 //! supports that decoder, and on the host otherwise.
 use super::{
     speech_decode::GpuJoint, Arena, Params, Prepared, SpeechBatch, SPEECH_GEMM_BIAS,
-    SPEECH_GEMM_THREE,
+    SPEECH_GEMM_THREE, SPEECH_SCORE_OP,
 };
 use crate::transcribe::{self, joint::HostJoint, TILE};
 use anyhow::{ensure, Result};
@@ -651,7 +651,10 @@ impl Engine {
                     ..Default::default()
                 };
                 self.run(
-                    Params { op: 106, ..params },
+                    Params {
+                        op: SPEECH_SCORE_OP,
+                        ..params
+                    },
                     [
                         "q",
                         "dummy",

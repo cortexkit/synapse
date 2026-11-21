@@ -68,19 +68,6 @@ void main() {
         uint d=i%1024;
         float angle=float(int(p.rows)-1-int(i/1024))*pow(10000.0,-float(d/2)*2.0/1024.0);
         y[i]=(d%2==0)?sin(angle):cos(angle);
-    } else if(p.op==106) { // Content and shifted relative-position attention scores.
-        if(i>=p.rows*8*p.seq) return;
-        uint key=i%p.seq, head=(i/p.seq)%8, query=i/(8*p.seq)+p.offset;
-        if(query>=p.window || key>=p.window) { y[i]=-10000.0; return; }
-        float ac=0.0, bd=0.0;
-        uint rel=p.seq-1-query+key;
-        for(uint d=0;d<128;d++) {
-            uint ch=head*128+d;
-            float q=x[query*1024+ch];
-            ac+=(q+hb(ch))*fz(key*1024+ch);
-            bd+=(q+hc(ch))*fv(rel*1024+ch);
-        }
-        y[i]=(ac+bd)*inversesqrt(128.0);
     } else if(p.op==107) { // The reference uses finite masking, then zeros masked probabilities.
         if(i>=p.rows*8) return;
         uint query=i/8+p.offset;

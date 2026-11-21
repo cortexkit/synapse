@@ -48,7 +48,7 @@ pub const METAL_KERNEL_REVISION: &str = "owned-metal-graph-4-bucket-2";
 pub const METAL_TRANSCRIBE_KERNEL_REVISION: &str = "owned-metal-transcribe-v2";
 pub const ANE_DIRECT_TRANSCRIBE_KERNEL_REVISION: &str = "ane-direct-transcribe-v1";
 pub const CUDA_TRANSCRIBE_KERNEL_REVISION: &str = "owned-cuda-transcribe-v2-f32";
-pub const VULKAN_TRANSCRIBE_KERNEL_REVISION: &str = "owned-vulkan-transcribe-v5-f32";
+pub const VULKAN_TRANSCRIBE_KERNEL_REVISION: &str = "owned-vulkan-transcribe-v6-f32";
 
 #[cfg(test)]
 mod tests {

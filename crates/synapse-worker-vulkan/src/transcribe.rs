@@ -517,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             synapse_core::worker_engine_names::VULKAN_TRANSCRIBE_KERNEL_REVISION,
-            "owned-vulkan-transcribe-v5-f32"
+            "owned-vulkan-transcribe-v6-f32"
         );
     }
 
@@ -613,7 +613,12 @@ mod tests {
         } else {
             "bin/glslc"
         });
-        for name in ["transcribe", "transcribe_gemm", "transcribe_decode"] {
+        for name in [
+            "transcribe",
+            "transcribe_gemm",
+            "transcribe_scores",
+            "transcribe_decode",
+        ] {
             let source = if name == "transcribe" {
                 source.clone()
             } else {
@@ -652,7 +657,12 @@ mod tests {
     #[cfg(feature = "vulkan")]
     #[test]
     fn transcribe_shader_has_no_half_precision_float_type() {
-        for name in ["transcribe", "transcribe_gemm", "transcribe_decode"] {
+        for name in [
+            "transcribe",
+            "transcribe_gemm",
+            "transcribe_scores",
+            "transcribe_decode",
+        ] {
             let bytes = crate::SHADERS
                 .iter()
                 .find(|(shader, _)| *shader == name)
