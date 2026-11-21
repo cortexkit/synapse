@@ -674,6 +674,7 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
             ];
             assert_eq!(progress, 0);
             expected_refusals.push(fixture.id.clone());
+            println!("encoder_sha256 {} refused", fixture.id);
         } else {
             graded.push(fixture.id.clone());
             if let Some(agreement) =
@@ -693,6 +694,11 @@ fn vulkan_transcribe_certifies_tensor_trace_wer_and_observation_invariance() {
                 .expect("missing encoder observation");
             assert_eq!(encoder.len(), fixture.valid_encoder_frames as usize * 1024);
             assert!(encoder.iter().all(|v| v.is_finite()));
+            println!(
+                "encoder_sha256 {} {}",
+                fixture.id,
+                repeat::encoder_hash(encoder)
+            );
             // Keep every fixture's first-decision finding, including failures.
             // The final evaluator still enforces the numerical gates.
             let reference_encoder = fixture.encoder.as_ref().map(|artifact| {

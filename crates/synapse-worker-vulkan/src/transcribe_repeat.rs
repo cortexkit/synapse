@@ -148,7 +148,7 @@ impl Probe {
     }
 }
 
-fn encoder_hash(values: &[f32]) -> String {
+pub(super) fn encoder_hash(values: &[f32]) -> String {
     format!(
         "{:x}",
         Sha256::digest(synapse_core::encode_f32_frame(values))
