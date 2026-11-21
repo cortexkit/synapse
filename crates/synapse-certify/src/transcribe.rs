@@ -202,6 +202,22 @@ pub fn validate_record(
     Ok(())
 }
 
+/// Compares a record's stored WER table with the one re-derived from its
+/// graded text. The stored values have been through JSON, and serde_json's
+/// default parser can land one ULP away from the digits written, so exact
+/// float equality refuses honest records. A real disagreement in graded text
+/// moves a WER by at least one word over the split, many orders above this
+/// bound.
+fn same_split_wer(
+    recorded: &BTreeMap<String, [f64; 2]>,
+    derived: &BTreeMap<String, [f64; 2]>,
+) -> bool {
+    recorded.len() == derived.len()
+        && recorded.iter().zip(derived).all(|((rk, rv), (dk, dv))| {
+            rk == dk && rv.iter().zip(dv).all(|(a, b)| (a - b).abs() <= 1e-12)
+        })
+}
+
 pub fn validate_claims(
     r: &TranscribeRecord,
     fixtures: &[SpeechFixture],
@@ -378,7 +394,7 @@ pub fn validate_claims(
         return Err(refuse("executed ladder mismatch"));
     }
     let split_wer = speech::grade_wer(wer).map_err(|e| refuse(e.to_string()))?;
-    if split_wer.is_empty() || r.split_wer != split_wer {
+    if split_wer.is_empty() || !same_split_wer(&r.split_wer, &split_wer) {
         return Err(refuse("split WER mismatch"));
     }
     if !r.observe_rerun.bit_identical
@@ -754,6 +770,21 @@ mod tests {
                 Ok(bad) => assert!(validate_claims(&bad, &fixtures, &catalog).is_err()),
             }
         }
+    }
+
+    #[test]
+    fn split_wer_read_back_from_json_matches_the_rederived_value() {
+        // serde_json's default parser reads this digit string one ULP below
+        // the value the runner wrote; real speech records contain such values.
+        let text = "0.037022449783379284";
+        let derived: f64 = text.parse().unwrap();
+        let read_back: f64 = serde_json::from_str(text).unwrap();
+        let map = |v: f64| BTreeMap::from([("split".to_string(), [v, v])]);
+        assert!(same_split_wer(&map(read_back), &map(derived)));
+        assert!(!same_split_wer(&map(derived + 1e-9), &map(derived)));
+        let mut extra = map(derived);
+        extra.insert("other".into(), [0.0, 0.0]);
+        assert!(!same_split_wer(&extra, &map(derived)));
     }
 
     #[test]
