@@ -1232,6 +1232,23 @@ async fn quiet_knob_restart_keeps_assignment_but_omitted_model_uses_catalog_defa
 async fn embed_query_deadline_one_returns_typed_rejection() {
     let preloads = deterministic_preload_config();
     let (_daemon, _module, mut consumer, route) = open_route_with_preloads(Some(&preloads)).await;
+    // Serve one request first so the preload has finished: while a model is
+    // still loading, an expired deadline correctly answers model_loading,
+    // which is not the admission path this test pins.
+    let warm = route_request(
+        &mut consumer,
+        route,
+        6,
+        serde_json::json!({
+            "method": "embed.query",
+            "params": { "model": "test-minilm", "text": "warm up" }
+        }),
+    )
+    .await;
+    assert!(
+        warm["result"]["error"].is_null(),
+        "warm-up failed: {warm:?}"
+    );
 
     let body = route_request(
         &mut consumer,
