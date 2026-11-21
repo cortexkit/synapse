@@ -446,12 +446,28 @@ fn canonical_checkout_round_trip_and_unknown_fields_rejected() {
     for record in &records {
         write_record(record, &assets.0).unwrap();
     }
+    // The tag check requires the stress report and release notes beside the
+    // row folders, so the record walk must accept exactly those two files.
+    let commit = assets
+        .0
+        .join("docs/evidence/certification")
+        .join("a".repeat(40));
+    std::fs::write(commit.join("ane-direct-stress.json"), "{}").unwrap();
+    std::fs::write(commit.join("RELEASE-NOTES.md"), "notes").unwrap();
     assert_eq!(
         validate_checkout(&assets.0, &assets.0, &"a".repeat(40), &catalog())
             .unwrap()
             .len(),
         30
     );
+    std::fs::write(commit.join("stray.txt"), "x").unwrap();
+    assert_eq!(
+        validate_checkout(&assets.0, &assets.0, &"a".repeat(40), &catalog())
+            .unwrap_err()
+            .to_string(),
+        "certification_refused: record_path_mismatch"
+    );
+    std::fs::remove_file(commit.join("stray.txt")).unwrap();
     let mut value = serde_json::to_value(&records[0]).unwrap();
     value["reuse_certified"] = true.into();
     assert!(serde_json::from_value::<Record>(value).is_err());

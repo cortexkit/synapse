@@ -187,6 +187,11 @@ pub fn validate_records(
     Ok(found.into_iter().collect())
 }
 
+/// Neural Engine stress report kept at the root of a commit's evidence folder.
+pub const COMMIT_STRESS_REPORT: &str = "ane-direct-stress.json";
+/// Release notes kept at the root of a commit's evidence folder.
+pub const COMMIT_RELEASE_NOTES: &str = "RELEASE-NOTES.md";
+
 /// Enumerates the evidence directory, including extra records, rather than
 /// reading only expected paths and silently overlooking an undeclared cell.
 pub fn validate_checkout(
@@ -206,11 +211,19 @@ pub fn validate_checkout(
     let rows = std::fs::read_dir(&directory).map_err(|error| refuse(error.to_string()))?;
     for row in rows {
         let row = row.map_err(|error| refuse(error.to_string()))?;
-        if !row
-            .file_type()
-            .map_err(|error| refuse(error.to_string()))?
-            .is_dir()
+        let file_type = row.file_type().map_err(|error| refuse(error.to_string()))?;
+        // The release gate keeps two non-record files beside the row folders:
+        // the Neural Engine stress report and the release notes. The Python
+        // tag check validates both; any other loose file is still refused.
+        if file_type.is_file()
+            && matches!(
+                row.file_name().to_str(),
+                Some(COMMIT_STRESS_REPORT | COMMIT_RELEASE_NOTES)
+            )
         {
+            continue;
+        }
+        if !file_type.is_dir() {
             return Err(refuse("record_path_mismatch"));
         }
         let row_id = row
