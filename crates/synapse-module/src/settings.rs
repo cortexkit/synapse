@@ -13,31 +13,33 @@ use tokio::sync::watch;
 
 pub(super) const SYNAPSE_CONFIG_PATH_ENV: &str = "SYNAPSE_CONFIG_PATH";
 
-fn field(kind: &str, description: &str, default: impl Into<Value>) -> Value {
-    json!({"type": kind, "description": description, "default": default.into(),
+// Every setting carries a `title`: the desktop's settings page uses it as the
+// field's label, and falls back to the raw key when it is missing.
+fn field(kind: &str, title: &str, description: &str, default: impl Into<Value>) -> Value {
+    json!({"type": kind, "title": title, "description": description, "default": default.into(),
         "x-ck-apply": "module_restart", "x-ck-layers": ["user"]})
 }
 
-fn unsigned(description: &str, default: impl Into<Value>) -> Value {
-    let mut field = field("integer", description, default);
+fn unsigned(title: &str, description: &str, default: impl Into<Value>) -> Value {
+    let mut field = field("integer", title, description, default);
     field["minimum"] = json!(0);
     field
 }
 
-fn u32_field(description: &str, default: u32) -> Value {
-    let mut field = unsigned(description, default);
+fn u32_field(title: &str, description: &str, default: u32) -> Value {
+    let mut field = unsigned(title, description, default);
     field["maximum"] = json!(u32::MAX);
     field
 }
 
-fn section(description: &str, properties: Value) -> Value {
+fn section(title: &str, description: &str, properties: Value) -> Value {
     let defaults = properties
         .as_object()
         .unwrap()
         .iter()
         .map(|(name, schema)| (name.clone(), schema["default"].clone()))
         .collect::<serde_json::Map<_, _>>();
-    let mut schema = field("object", description, defaults);
+    let mut schema = field("object", title, description, defaults);
     schema["unevaluatedProperties"] = json!(false);
     schema["properties"] = properties;
     schema
@@ -46,40 +48,45 @@ fn section(description: &str, properties: Value) -> Value {
 fn preload_schema() -> Value {
     // Defaults on item properties are annotations only: the gate replaces the
     // whole array without merging item defaults. Omitted options stay omitted.
-    let text = |description| field("string", description, "");
-    let required_text = |description| {
-        let mut schema = text(description);
+    let text = |title, description| field("string", title, description, "");
+    let required_text = |title, description| {
+        let mut schema = text(title, description);
         schema["x-ck-required"] = json!(true);
         schema
     };
-    let mut schema = field("array", "Models to register during startup.", json!([]));
+    let mut schema = field(
+        "array",
+        "Startup models",
+        "Models to register during startup.",
+        json!([]),
+    );
     schema["items"] = json!({
-        "type": "object", "unevaluatedProperties": false,
+        "type": "object", "title": "Startup model", "unevaluatedProperties": false,
         "properties": {
-            "engine": required_text("Engine that serves the model."),
-            "model_path": required_text("Path to the model artifact."),
-            "tokenizer_path": required_text("Path to the tokenizer artifact."),
-            "model_id": text("Model identifier; if omitted, derived from the engine and list position."),
-            "profile": text("Manifest profile; required for embedding and reranking preloads."),
-            "prompt_template": text("Prompt template for the model."),
-            "task": text("Model task; if omitted, inferred from the engine."),
-            "artifact_digest": text("Expected digest of the model artifact."),
-            "format": text("Model artifact format."),
-            "pooling": text("Embedding pooling strategy."),
-            "normalize": field("boolean", "Normalize embedding vectors.", false),
-            "max_tokens": unsigned("Model context limit in tokens.", 0),
-            "quant": text("Model quantization label."),
-            "backend": text("Backend name for the model."),
-            "family": text("Model architecture family."),
-            "dtype": text("Numerical data type."),
-            "kernel_revision": text("Kernel revision for the model."),
-            "ptx_virtual_arch": text("CUDA PTX virtual architecture."),
-            "minimum_device_cc": field("number", "Minimum CUDA compute capability.", 0),
-            "minimum_cuda_driver_api": u32_field("Minimum CUDA driver API version.", 0),
-            "execution": text("Execution mode for the model."),
-            "attention_units": unsigned("Attention unit count for the model.", 0),
-            "worker_bin": text("Path to the worker executable."),
-            "worker_runtime_dir": text("Path to the worker runtime directory.")
+            "engine": required_text("Engine", "Engine that serves the model."),
+            "model_path": required_text("Model path", "Path to the model artifact."),
+            "tokenizer_path": required_text("Tokenizer path", "Path to the tokenizer artifact."),
+            "model_id": text("Model ID", "Model identifier; if omitted, derived from the engine and list position."),
+            "profile": text("Profile", "Manifest profile; required for embedding and reranking preloads."),
+            "prompt_template": text("Prompt template", "Prompt template for the model."),
+            "task": text("Task", "Model task; if omitted, inferred from the engine."),
+            "artifact_digest": text("Artifact digest", "Expected digest of the model artifact."),
+            "format": text("Format", "Model artifact format."),
+            "pooling": text("Pooling", "Embedding pooling strategy."),
+            "normalize": field("boolean", "Normalize vectors", "Normalize embedding vectors.", false),
+            "max_tokens": unsigned("Context limit", "Model context limit in tokens.", 0),
+            "quant": text("Quantization", "Model quantization label."),
+            "backend": text("Backend", "Backend name for the model."),
+            "family": text("Architecture family", "Model architecture family."),
+            "dtype": text("Data type", "Numerical data type."),
+            "kernel_revision": text("Kernel revision", "Kernel revision for the model."),
+            "ptx_virtual_arch": text("CUDA PTX architecture", "CUDA PTX virtual architecture."),
+            "minimum_device_cc": field("number", "Minimum CUDA compute capability", "Minimum CUDA compute capability.", 0),
+            "minimum_cuda_driver_api": u32_field("Minimum CUDA driver", "Minimum CUDA driver API version.", 0),
+            "execution": text("Execution mode", "Execution mode for the model."),
+            "attention_units": unsigned("Attention units", "Attention unit count for the model.", 0),
+            "worker_bin": text("Worker executable", "Path to the worker executable."),
+            "worker_runtime_dir": text("Worker runtime folder", "Path to the worker runtime directory.")
         }
     });
     schema
@@ -88,42 +95,43 @@ fn preload_schema() -> Value {
 pub(super) fn schema() -> &'static Schema {
     static SCHEMA: OnceLock<Schema> = OnceLock::new();
     SCHEMA.get_or_init(|| {
-        let mut knob = field("string", "Machine-wide performance policy.", PerfKnob::default().as_str());
+        let mut knob = field("string", "Performance policy", "Machine-wide performance policy.", PerfKnob::default().as_str());
         knob["enum"] = json!(["performance", "balanced", "quiet"]);
         let raw = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Synapse",
             "type": "object", "unevaluatedProperties": false, "x-ck-layers": ["user"],
             "properties": {
-                "hf_endpoint": field("string", "Base URL for Hugging Face model downloads.", default_hf_endpoint()),
-                "cache_max_bytes": unsigned("Model cache size budget in bytes.", DEFAULT_CACHE_MAX_BYTES),
-                "microllm_max_tokens": u32_field("Maximum tokens for MicroLLM generation.", DEFAULT_MICROLLM_MAX_TOKENS),
+                "hf_endpoint": field("string", "Model download address", "Base URL for Hugging Face model downloads.", default_hf_endpoint()),
+                "cache_max_bytes": unsigned("Model cache size", "Model cache size budget in bytes.", DEFAULT_CACHE_MAX_BYTES),
+                "microllm_max_tokens": u32_field("Generation token limit", "Maximum tokens for MicroLLM generation.", DEFAULT_MICROLLM_MAX_TOKENS),
                 "knob": knob,
-                "inline": section("Limits for synchronous model requests.", json!({
-                    "max_items": unsigned("Maximum items in one inline request.", DEFAULT_INLINE_MAX_ITEMS),
-                    "max_tokens": unsigned("Maximum input tokens in one inline request.", DEFAULT_INLINE_MAX_TOKENS),
-                    "byte_budget": unsigned("Byte budget for in-flight inline requests.", DEFAULT_INLINE_BYTE_BUDGET),
-                    "max_queue_ms": unsigned("Maximum time to queue an inline request, in milliseconds.", DEFAULT_MAX_QUEUE_MS),
-                    "deadline_ms": unsigned("Inline request deadline in milliseconds.", DEFAULT_DEADLINE_MS),
-                    "estimated_execution_ms": unsigned("Estimated inline execution time for admission, in milliseconds.", DEFAULT_ESTIMATED_EXECUTION_MS),
-                    "max_concurrent_workers": unsigned("Maximum concurrent inline workers.", DEFAULT_MAX_CONCURRENT_WORKERS)
+                "inline": section("Direct requests", "Limits for synchronous model requests.", json!({
+                    "max_items": unsigned("Items per request", "Maximum items in one inline request.", DEFAULT_INLINE_MAX_ITEMS),
+                    "max_tokens": unsigned("Tokens per request", "Maximum input tokens in one inline request.", DEFAULT_INLINE_MAX_TOKENS),
+                    "byte_budget": unsigned("In-flight byte budget", "Byte budget for in-flight inline requests.", DEFAULT_INLINE_BYTE_BUDGET),
+                    "max_queue_ms": unsigned("Queue wait limit (ms)", "Maximum time to queue an inline request, in milliseconds.", DEFAULT_MAX_QUEUE_MS),
+                    "deadline_ms": unsigned("Request deadline (ms)", "Inline request deadline in milliseconds.", DEFAULT_DEADLINE_MS),
+                    "estimated_execution_ms": unsigned("Estimated run time (ms)", "Estimated inline execution time for admission, in milliseconds.", DEFAULT_ESTIMATED_EXECUTION_MS),
+                    "max_concurrent_workers": unsigned("Concurrent workers", "Maximum concurrent inline workers.", DEFAULT_MAX_CONCURRENT_WORKERS)
                 })),
-                "jobs": section("Limits and retention for background jobs.", json!({
-                    "execution_ttl_ms": unsigned("Time allowed for job execution, in milliseconds.", DEFAULT_JOB_EXECUTION_TTL_MS),
-                    "result_retention_ttl_ms": unsigned("Time to retain completed job results, in milliseconds.", DEFAULT_JOB_RESULT_RETENTION_TTL_MS),
-                    "result_page_bytes": unsigned("Target size of a job result page, in bytes.", DEFAULT_JOB_RESULT_PAGE_BYTES),
-                    "bulk_quantum_tokens": unsigned("Token quantum when scheduling bulk jobs.", DEFAULT_JOB_BULK_QUANTUM_TOKENS)
+                "jobs": section("Background jobs", "Limits and retention for background jobs.", json!({
+                    "execution_ttl_ms": unsigned("Run time limit (ms)", "Time allowed for job execution, in milliseconds.", DEFAULT_JOB_EXECUTION_TTL_MS),
+                    "result_retention_ttl_ms": unsigned("Result retention (ms)", "Time to retain completed job results, in milliseconds.", DEFAULT_JOB_RESULT_RETENTION_TTL_MS),
+                    "result_page_bytes": unsigned("Result page size", "Target size of a job result page, in bytes.", DEFAULT_JOB_RESULT_PAGE_BYTES),
+                    "bulk_quantum_tokens": unsigned("Bulk scheduling quantum", "Token quantum when scheduling bulk jobs.", DEFAULT_JOB_BULK_QUANTUM_TOKENS)
                 })),
-                "worker": section("Worker process settings.", json!({
-                    "load_timeout_ms": unsigned("Worker model load timeout in milliseconds.", DEFAULT_WORKER_LOAD_TIMEOUT_MS)
+                "worker": section("Workers", "Worker process settings.", json!({
+                    "load_timeout_ms": unsigned("Model load timeout (ms)", "Worker model load timeout in milliseconds.", DEFAULT_WORKER_LOAD_TIMEOUT_MS)
                 })),
-                "log": section("Performance and worker logging settings.", json!({
-                    "perf_interval_secs": unsigned("Interval for performance summaries in seconds; zero disables them.", 0),
-                    "worker_forward_lines_per_sec": u32_field("Maximum forwarded log lines per second from a worker.", DEFAULT_WORKER_FORWARD_LINES_PER_SEC)
+                "log": section("Logging", "Performance and worker logging settings.", json!({
+                    "perf_interval_secs": unsigned("Performance summary interval (s)", "Interval for performance summaries in seconds; zero disables them.", 0),
+                    "worker_forward_lines_per_sec": u32_field("Worker log lines per second", "Maximum forwarded log lines per second from a worker.", DEFAULT_WORKER_FORWARD_LINES_PER_SEC)
                 })),
-                "ane_direct": section("Direct Apple Neural Engine serving settings.", json!({
-                    "tight_packing": field("boolean", "Enable tight packing on the direct ANE lane.", false)
+                "ane_direct": section("Apple Neural Engine", "Direct Apple Neural Engine serving settings.", json!({
+                    "tight_packing": field("boolean", "Tight packing", "Enable tight packing on the direct ANE lane.", false)
                 })),
-                "certify_observation": field("boolean", "Disclose engine-bound observations for the release certification runner only.", false),
+                "certify_observation": field("boolean", "Certification observations", "Disclose engine-bound observations for the release certification runner only.", false),
                 "preload_models": preload_schema()
             }
         });

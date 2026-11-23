@@ -45,6 +45,29 @@ fn settings_schema_is_valid_and_matches_manifest() {
 }
 
 #[test]
+fn every_declared_setting_has_a_title() {
+    // The desktop labels each field with its title and shows the raw key
+    // when one is missing, so walk every property, nested and array items too.
+    fn walk(path: &str, schema: &Value, missing: &mut Vec<String>) {
+        if schema["title"].as_str().is_none_or(str::is_empty) {
+            missing.push(path.to_string());
+        }
+        if let Some(properties) = schema["properties"].as_object() {
+            for (key, child) in properties {
+                walk(&format!("{path}/{key}"), child, missing);
+            }
+        }
+        if schema["items"].is_object() {
+            walk(&format!("{path}[]"), &schema["items"], missing);
+        }
+    }
+    let mut missing = Vec::new();
+    walk("", schema().normalized(), &mut missing);
+    assert!(missing.is_empty(), "settings without a title: {missing:?}");
+    assert_eq!(schema().normalized()["title"], "Synapse");
+}
+
+#[test]
 fn settings_review_accepts_live_file_and_decodes_to_legacy_config() {
     // The live file sets exactly the default values. The daemon still needs
     // rows for both keys because their sources change from default to user.
