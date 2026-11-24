@@ -386,10 +386,17 @@ fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLe
                 "synapse singleton lease held: only one synapse module may run machine-wide \
                  (module={module_id}, scope={SYNAPSE_SINGLETON_LEASE_SCOPE})"
             );
+            // A refused start comes from outside the daemon's own launch, so
+            // name who started it: this process, its arguments and its parent.
+            let (parent_pid, parent_command) = refused_start_parent();
             tracing::warn!(
                 target: "admission",
                 module = %module_id,
                 scope = SYNAPSE_SINGLETON_LEASE_SCOPE,
+                pid = std::process::id(),
+                argv = ?env::args_os().collect::<Vec<_>>(),
+                parent_pid = ?parent_pid,
+                parent_command = ?parent_command,
                 "synapse singleton lease held: only one synapse module may run machine-wide"
             );
             Err(ModuleError::SingletonHeld(message))
@@ -397,6 +404,26 @@ fn acquire_synapse_singleton_lease(module_id: &str) -> Result<SynapseSingletonLe
         Err(cortexkit_lease::LeaseError::Io(error)) => {
             Err(ModuleError::Config(format!("singleton lease io: {error}")))
         }
+    }
+}
+
+/// Best-effort parent pid and command line for the singleton refusal log.
+/// Windows exposes no parent pid in std, so both are `None` there.
+fn refused_start_parent() -> (Option<u32>, Option<String>) {
+    #[cfg(unix)]
+    {
+        let parent = std::os::unix::process::parent_id();
+        let command = synapse_core::without_launch_nonce(std::process::Command::new("ps"))
+            .args(["-o", "command=", "-p", &parent.to_string()])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+        (Some(parent), command)
+    }
+    #[cfg(not(unix))]
+    {
+        (None, None)
     }
 }
 
