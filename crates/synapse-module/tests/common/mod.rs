@@ -244,8 +244,12 @@ pub async fn read_frame_timeout(stream: &mut TcpStream) -> Frame {
 }
 
 pub async fn route_open(stream: &mut TcpStream, corr: u64) -> TestRoute {
-    let mut last_error = String::new();
-    for attempt in 0..10 {
+    // Synapse answers module_warming until its settings arrive and startup
+    // finishes, which can take well over 5 s on a loaded Windows runner, so
+    // retry for the same setup bound the other waits use, not a fixed count.
+    let until = Instant::now() + SETUP_TIMEOUT;
+    let mut attempt = 0;
+    loop {
         let target = RouteTarget::ManagementSurface {
             module_id: MODULE_ID.to_string(),
         };
@@ -272,19 +276,20 @@ pub async fn route_open(stream: &mut TcpStream, corr: u64) -> TestRoute {
                     epoch: value["route_epoch"].as_u64().unwrap() as u32,
                 };
             }
-            FrameType::Error if is_retryable_startup_error(&frame.body) && attempt < 9 => {
-                last_error = String::from_utf8_lossy(&frame.body).to_string();
+            FrameType::Error
+                if is_retryable_startup_error(&frame.body) && Instant::now() < until =>
+            {
+                attempt += 1;
                 sleep(Duration::from_millis(500)).await;
             }
             _ => {
                 panic!(
-                    "route.open should succeed: {}",
+                    "route.open should succeed within {SETUP_TIMEOUT:?}: {}",
                     String::from_utf8_lossy(&frame.body)
                 );
             }
         }
     }
-    panic!("route.open timed out after retries: {last_error}");
 }
 
 fn is_retryable_startup_error(body: &[u8]) -> bool {
