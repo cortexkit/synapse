@@ -203,7 +203,7 @@ jobs:
             rm nextest.tar.gz
             echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
           else
-            curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+            curl --retry 3 --retry-delay 10 --retry-all-errors -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
           fi
       - name: skeleton e2e
         working-directory: synapse
