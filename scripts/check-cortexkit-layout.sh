@@ -2,9 +2,11 @@
 # Nothing under .cortexkit/ may be tracked except the allowed folders and files.
 #
 # The fleet layout keeps internal material (design notes, investigations, tool state)
-# under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/ and
-# WORKER.md there. The check lists every tracked path under .cortexkit/ and refuses any
-# outside that list. Listing only tracked files that are also ignored (`git ls-files -ci`)
+# under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/,
+# WORKER.md and top-level project settings files (.cortexkit/<module>.jsonc, which the
+# daemon reads as project settings) there. The check lists every tracked path under
+# .cortexkit/ and refuses any outside that list. Listing only tracked files that are also
+# ignored (`git ls-files -ci`)
 # is not enough: a stray `!` rule in .gitignore can un-ignore a private file, and then
 # it is tracked without being ignored.
 #
@@ -35,6 +37,9 @@ disallowed=""
 while IFS= read -r path; do
   case "$path" in
     ""|.cortexkit/release-notes/*|.cortexkit/skills/*|.cortexkit/rules/*|.cortexkit/WORKER.md) ;;
+    # A case `*` also matches `/`, so a settings file counts only with no folder below.
+    .cortexkit/*/*) disallowed="$disallowed$path"$'\n' ;;
+    .cortexkit/*.jsonc) ;;
     *) disallowed="$disallowed$path"$'\n' ;;
   esac
 done <<<"$tracked"
