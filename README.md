@@ -1,7 +1,12 @@
 # Synapse
 
+> [!WARNING]
+> **Alpha.** Synapse is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Synapse is a local inference service on the subc bus. It provides embedding,
-reranking and small-model generation through the `synapse` module, with explicit
+reranking, batch speech-to-text and small-model generation through the `synapse` module, with explicit
 model installation, stable numerical identity, bounded scheduling and durable
 result pages. Owned engines and supervised workers isolate inference from the
 management surface. Modules needing hosted inference call providers directly.
