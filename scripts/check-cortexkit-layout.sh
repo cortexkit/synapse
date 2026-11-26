@@ -37,10 +37,11 @@ disallowed=""
 while IFS= read -r path; do
   case "$path" in
     ""|.cortexkit/release-notes/*|.cortexkit/skills/*|.cortexkit/rules/*|.cortexkit/WORKER.md) ;;
-    # A case `*` also matches `/`, so a settings file counts only with no folder below.
-    .cortexkit/*/*) disallowed="$disallowed$path"$'\n' ;;
-    .cortexkit/*.jsonc) ;;
-    *) disallowed="$disallowed$path"$'\n' ;;
+    *)
+      # A project settings file sits directly under .cortexkit/ and is named after
+      # its module, the same pattern the fleet's allowlist uses.
+      [[ "$path" =~ ^\.cortexkit/[a-z0-9-]+\.jsonc$ ]] || disallowed="$disallowed$path"$'\n'
+      ;;
   esac
 done <<<"$tracked"
 if [ -n "$disallowed" ]; then
